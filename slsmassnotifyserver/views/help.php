@@ -93,8 +93,11 @@ $shellConfigPath = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notific
 	<ul>
 		<li><code>GET ?resource=status</code> <?php echo _('returns status JSON.'); ?></li>
 		<li><code>GET ?resource=events&amp;limit=25</code> <?php echo _('returns recent event records.'); ?></li>
-		<li><code>GET ?resource=config</code> <?php echo _('returns non-secret configuration metadata.'); ?></li>
-		<li><code>POST {"action":"send_announcement","message":"...","targets":["1000"],"desktop":true}</code> <?php echo _('sends an announcement through the Mass Notify path.'); ?></li>
+		<li><code>GET ?resource=config</code> <?php echo _('returns redacted configuration. Add include_secrets=1 only from trusted clients when full credentials are required.'); ?></li>
+		<li><code>POST {"action":"send_announcement","message":"...","targets":["1000"],"groups":["Operations"],"desktop":true,"tts":true}</code> <?php echo _('sends an announcement, optionally with TTS audio and announcement groups.'); ?></li>
+		<li><code>POST {"action":"send_announcement","message":"...","style":"colored","title":"Announcement","background_color":"#991b1b"}</code> <?php echo _('renders a colored announcement image where supported by the endpoint format.'); ?></li>
+		<li><code>POST {"action":"trigger_nws_test"}</code> <?php echo _('starts the configured NWS test workflow using normal cooldown and recipient rules.'); ?></li>
+		<li><code>POST {"action":"update_config","settings":{...},"apply":false}</code> <?php echo _('updates allowlisted centralized config fields. Set apply to true only when the remote client should immediately write live config.'); ?></li>
 	</ul>
 
 	<h3><?php echo _('Email and Discord'); ?></h3>

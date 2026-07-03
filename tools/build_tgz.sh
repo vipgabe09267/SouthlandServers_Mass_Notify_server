@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODULE="slsmassnotifyserver"
-VERSION="0.0.1-beta"
+VERSION="0.0.2-beta"
 DIST_DIR="${ROOT_DIR}/dist"
 PACKAGE="${DIST_DIR}/${MODULE}-${VERSION}.tgz"
 

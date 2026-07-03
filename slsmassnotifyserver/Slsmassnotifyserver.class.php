@@ -79,7 +79,7 @@ class Slsmassnotifyserver implements \BMO
 	{
 		return [
 			'settings' => $this->getActiveSettings(),
-			'version' => '0.0.1-beta',
+			'version' => '0.0.2-beta',
 		];
 	}
 
@@ -787,7 +787,7 @@ class Slsmassnotifyserver implements \BMO
 		];
 	}
 
-	public function sendSipNotifyAnnouncement($extensions, $message, $massNotify = true, $ttsAudio = false, $groups = [])
+	public function sendSipNotifyAnnouncement($extensions, $message, $massNotify = true, $ttsAudio = false, $groups = [], array $options = [])
 	{
 		if (!$this->isSetupComplete($this->getActiveSettings())) {
 			return [
@@ -890,12 +890,26 @@ class Slsmassnotifyserver implements \BMO
 			$notifyDelay = (int)($audioResult['notify_delay_seconds'] ?? 0);
 		}
 
+			$style = strtolower(trim((string)($options['style'] ?? 'standard')));
+			$image = in_array($style, ['colored', 'image', 'nws'], true) || !empty($options['image']);
+			$title = trim((string)($options['title'] ?? 'Announcement'));
+			if ($title === '') {
+				$title = 'Announcement';
+			}
+			$title = function_exists('mb_substr') ? mb_substr($title, 0, 80) : substr($title, 0, 80);
+			$backgroundColor = $this->normalizeHexColor((string)($options['background_color'] ?? '#1f2937'), '#1f2937');
+
 			$cmd = '/usr/bin/python3 '
 				. escapeshellarg(self::VISUAL_PUSH_SCRIPT)
 				. ' --announcement '
 				. escapeshellarg($message)
 				. ' --targets '
 				. escapeshellarg(implode(',', array_values($selected)));
+			if ($image) {
+				$cmd .= ' --announcement-image'
+					. ' --announcement-title ' . escapeshellarg($title)
+					. ' --announcement-bg-color ' . escapeshellarg($backgroundColor);
+			}
 			if (!$massNotify) {
 				$cmd .= ' --no-api';
 			}
@@ -1764,6 +1778,199 @@ class Slsmassnotifyserver implements \BMO
 			'message' => _('Announcement group deleted.'),
 			'groups' => $this->getAnnouncementGroups(),
 		];
+	}
+
+	public function controlApiSendAnnouncement(array $payload)
+	{
+		$message = trim((string)($payload['message'] ?? $payload['body'] ?? $payload['text'] ?? ''));
+		$targets = $this->normalizeRecipientExtensions($payload['targets'] ?? $payload['extensions'] ?? []);
+		$groups = $this->normalizeControlGroupSelectors($payload['groups'] ?? $payload['announcement_groups'] ?? []);
+		$options = is_array($payload['options'] ?? null) ? $payload['options'] : [];
+		foreach (['style', 'image', 'title', 'background_color'] as $key) {
+			if (array_key_exists($key, $payload)) {
+				$options[$key] = $payload[$key];
+			}
+		}
+
+		return $this->sendSipNotifyAnnouncement(
+			$targets,
+			$message,
+			!empty($payload['desktop']),
+			!empty($payload['tts']),
+			$groups,
+			$options
+		);
+	}
+
+	public function controlApiTriggerNwsTest(array $payload = [])
+	{
+		$mode = trim((string)($payload['mode'] ?? 'tts'));
+		$triggerName = trim((string)($payload['trigger_name'] ?? 'Control API'));
+		if ($triggerName === '') {
+			$triggerName = 'Control API';
+		}
+		$triggerName = function_exists('mb_substr') ? mb_substr($triggerName, 0, 80) : substr($triggerName, 0, 80);
+		return $this->triggerTest($mode, '', $triggerName);
+	}
+
+	public function controlApiConfig(array $payload = [])
+	{
+		$includeSecrets = !empty($payload['include_secrets']);
+		$settings = $this->getActiveSettings();
+		if (!$includeSecrets) {
+			$settings = $this->redactConfigSecrets($settings);
+		}
+		return [
+			'success' => true,
+			'config' => $settings,
+			'pending' => $this->getPendingSettings() !== null,
+		];
+	}
+
+	public function controlApiUpdateConfig(array $payload)
+	{
+		if (!$this->isSetupComplete($this->getActiveSettings())) {
+			return [
+				'success' => false,
+				'message' => $this->getSetupRequiredMessage(),
+				'errors' => [$this->getSetupRequiredMessage()],
+			];
+		}
+
+		$settingsPatch = is_array($payload['settings'] ?? null) ? $payload['settings'] : (is_array($payload['config'] ?? null) ? $payload['config'] : []);
+		if (empty($settingsPatch)) {
+			return [
+				'success' => false,
+				'message' => _('No config settings were provided.'),
+				'errors' => [_('Provide a settings object to update.')],
+			];
+		}
+
+		$current = $this->getPendingSettings() ?? $this->getActiveSettings();
+		$merged = $this->mergeControlConfigPatch($current, $settingsPatch);
+		$normalized = $this->normalizeSettings($merged);
+		try {
+			if (!empty($payload['apply'])) {
+				$this->persistAppliedSettings($normalized);
+				if (is_file(self::PENDING_SETTINGS_JSON)) {
+					@unlink(self::PENDING_SETTINGS_JSON);
+				}
+				return [
+					'success' => true,
+					'message' => _('Control API config changes applied.'),
+					'pending' => false,
+				];
+			}
+			$this->persistPendingSettings($normalized);
+			return [
+				'success' => true,
+				'message' => _('Control API config changes saved. Apply config to make them live.'),
+				'pending' => true,
+			];
+		} catch (\Throwable $e) {
+			return [
+				'success' => false,
+				'message' => _('Unable to update config.'),
+				'errors' => [$e->getMessage()],
+			];
+		}
+	}
+
+	private function normalizeControlGroupSelectors($groups)
+	{
+		$known = [];
+		foreach ($this->getAnnouncementGroups() as $group) {
+			$id = (string)($group['id'] ?? '');
+			$name = strtolower(trim((string)($group['name'] ?? '')));
+			if ($id !== '') {
+				$known[$id] = $id;
+			}
+			if ($name !== '' && $id !== '') {
+				$known[$name] = $id;
+			}
+		}
+		$selected = [];
+		foreach ((array)$groups as $group) {
+			$key = trim((string)$group);
+			$lookup = strtolower($key);
+			if (isset($known[$key])) {
+				$selected[$known[$key]] = $known[$key];
+			} elseif (isset($known[$lookup])) {
+				$selected[$known[$lookup]] = $known[$lookup];
+			}
+		}
+		return array_values($selected);
+	}
+
+	private function normalizeHexColor($value, $fallback)
+	{
+		$value = trim((string)$value);
+		if (preg_match('/^#[0-9A-Fa-f]{6}$/', $value)) {
+			return strtolower($value);
+		}
+		return $fallback;
+	}
+
+	private function redactConfigSecrets(array $settings)
+	{
+		foreach (['desktop_api_token'] as $key) {
+			if (array_key_exists($key, $settings)) {
+				$settings[$key] = '[redacted]';
+			}
+		}
+		if (is_array($settings['control_api'] ?? null) && array_key_exists('api_key', $settings['control_api'])) {
+			$settings['control_api']['api_key'] = '[redacted]';
+		}
+		if (is_array($settings['ami'] ?? null) && array_key_exists('password', $settings['ami'])) {
+			$settings['ami']['password'] = '[redacted]';
+		}
+		if (is_array($settings['sipnotify']['endpoints'] ?? null)) {
+			foreach ($settings['sipnotify']['endpoints'] as $index => $endpoint) {
+				if (is_array($endpoint) && array_key_exists('password', $endpoint)) {
+					$settings['sipnotify']['endpoints'][$index]['password'] = '[redacted]';
+				}
+			}
+		}
+		return $settings;
+	}
+
+	private function mergeControlConfigPatch(array $current, array $patch)
+	{
+		$patch = $this->removeRedactedPlaceholders($patch);
+		$allowed = [
+			'enabled', 'alert_recipients', 'mail_to', 'discord_webhook_url',
+			'quiet_hours_enabled', 'quiet_hours_start', 'quiet_hours_end', 'quiet_critical_events',
+			'nws_api_base_url', 'nws_zone', 'alert_email_subject', 'alert_email_body',
+			'test_email_subject', 'test_email_body', 'opening_tone', 'closing_tone',
+			'nws_piper_voice', 'announcement_piper_voice', 'nws_tts_volume',
+			'announcement_tts_volume', 'log_retention_days', 'control_api',
+			'sipnotify', 'announcement_groups', 'updates',
+		];
+		foreach ($allowed as $key) {
+			if (!array_key_exists($key, $patch)) {
+				continue;
+			}
+			if (is_array($patch[$key]) && is_array($current[$key] ?? null) && in_array($key, ['control_api', 'sipnotify', 'updates'], true)) {
+				$current[$key] = array_replace($current[$key], $patch[$key]);
+			} else {
+				$current[$key] = $patch[$key];
+			}
+		}
+		return $current;
+	}
+
+	private function removeRedactedPlaceholders(array $value)
+	{
+		foreach ($value as $key => $item) {
+			if ($item === '[redacted]') {
+				unset($value[$key]);
+				continue;
+			}
+			if (is_array($item)) {
+				$value[$key] = $this->removeRedactedPlaceholders($item);
+			}
+		}
+		return $value;
 	}
 
 	private function getControlApiUrl(array $settings)

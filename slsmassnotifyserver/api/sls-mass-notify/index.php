@@ -65,6 +65,35 @@ function recent_events(int $limit): array
     return array_reverse($events);
 }
 
+function freepbx_module()
+{
+    static $module = null;
+    if ($module !== null) {
+        return $module;
+    }
+    $freepbxConfig = '/etc/freepbx.conf';
+    if (!is_readable($freepbxConfig)) {
+        respond(503, ['ok' => false, 'error' => 'freepbx_unavailable']);
+    }
+    global $amp_conf;
+    $bootstrap_settings = [
+        'freepbx_auth' => false,
+        'skip_astman' => true,
+    ];
+    require_once $freepbxConfig;
+    try {
+        $fw = \FreePBX::Create();
+        $module = $fw->Slsmassnotifyserver;
+    } catch (\Throwable $e) {
+        try {
+            $module = \FreePBX::Slsmassnotifyserver();
+        } catch (\Throwable $e2) {
+            respond(503, ['ok' => false, 'error' => 'module_unavailable']);
+        }
+    }
+    return $module;
+}
+
 function sanitize_targets($value): array
 {
     $targets = [];
@@ -94,19 +123,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         respond(200, ['ok' => true, 'resource' => 'events', 'events' => recent_events((int)($_GET['limit'] ?? 25))]);
     }
     if ($resource === 'config') {
-        respond(200, [
-            'ok' => true,
-            'resource' => 'config',
-            'nws_zone' => $config['nws_zone'] ?? '',
-            'sipnotify' => [
-                'base_url' => $config['sipnotify']['base_url'] ?? '',
-                'endpoints' => array_map(static function ($endpoint) {
-                    unset($endpoint['password']);
-                    return $endpoint;
-                }, (array)($config['sipnotify']['endpoints'] ?? [])),
-            ],
-            'announcement_groups' => $config['announcement_groups'] ?? [],
-        ]);
+        $result = freepbx_module()->controlApiConfig(['include_secrets' => !empty($_GET['include_secrets'])]);
+        respond(!empty($result['success']) ? 200 : 400, ['ok' => !empty($result['success']), 'resource' => 'config'] + $result);
     }
     respond(200, ['ok' => true, 'resource' => 'status', 'status' => read_json_file(STATUS_FILE)]);
 }
@@ -121,34 +139,26 @@ if (!is_array($body)) {
 }
 
 $action = strtolower(trim((string)($body['action'] ?? '')));
-if ($action !== 'send_announcement') {
-    respond(400, ['ok' => false, 'error' => 'unsupported_action']);
-}
-$message = trim((string)($body['message'] ?? ''));
-if ($message === '') {
-    respond(400, ['ok' => false, 'error' => 'message_required']);
-}
-$message = function_exists('mb_substr') ? mb_substr($message, 0, 500) : substr($message, 0, 500);
-$targets = sanitize_targets($body['targets'] ?? []);
-$desktop = !empty($body['desktop']);
-if (empty($targets) && !$desktop) {
-    respond(400, ['ok' => false, 'error' => 'targets_or_desktop_required']);
-}
-if (!is_executable(SIPNOTIFY_SCRIPT)) {
-    respond(503, ['ok' => false, 'error' => 'notify_script_unavailable']);
+$module = freepbx_module();
+
+if ($action === 'send_announcement') {
+    $result = $module->controlApiSendAnnouncement($body);
+    respond(!empty($result['success']) ? 200 : 400, ['ok' => !empty($result['success']), 'action' => $action] + $result);
 }
 
-$cmd = '/usr/bin/python3 ' . escapeshellarg(SIPNOTIFY_SCRIPT)
-    . ' --announcement ' . escapeshellarg($message)
-    . ' --targets ' . escapeshellarg(implode(',', $targets));
-if (!$desktop) {
-    $cmd .= ' --no-api';
+if ($action === 'test_nws' || $action === 'trigger_nws_test') {
+    $result = $module->controlApiTriggerNwsTest($body);
+    respond(!empty($result['success']) ? 200 : 400, ['ok' => !empty($result['success']), 'action' => $action] + $result);
 }
-if ($desktop && empty($targets)) {
-    $cmd .= ' --api-only';
+
+if ($action === 'get_config') {
+    $result = $module->controlApiConfig($body);
+    respond(!empty($result['success']) ? 200 : 400, ['ok' => !empty($result['success']), 'action' => $action] + $result);
 }
-exec($cmd . ' 2>&1', $output, $exit);
-if ($exit !== 0) {
-    respond(500, ['ok' => false, 'error' => 'send_failed', 'details' => trim(implode(' ', $output))]);
+
+if ($action === 'update_config') {
+    $result = $module->controlApiUpdateConfig($body);
+    respond(!empty($result['success']) ? 200 : 400, ['ok' => !empty($result['success']), 'action' => $action] + $result);
 }
-respond(200, ['ok' => true, 'action' => 'send_announcement', 'targets' => $targets, 'desktop' => $desktop]);
+
+respond(400, ['ok' => false, 'error' => 'unsupported_action']);

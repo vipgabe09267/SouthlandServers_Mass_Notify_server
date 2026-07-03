@@ -38,36 +38,8 @@ $updates = is_array($settings['updates'] ?? null) ? $settings['updates'] : [];
 				<?php } ?>
 			<?php } ?>
 			<form method="post">
-
-				<h3><?php echo _('Control API'); ?></h3>
-				<div class="row">
-					<div class="col-md-3">
-						<div class="form-group">
-							<label><?php echo _('Enabled'); ?></label>
-							<select class="form-control" name="control_api[enabled]">
-								<option value="0" <?php echo empty($control['enabled']) ? 'selected' : ''; ?>><?php echo _('No'); ?></option>
-								<option value="1" <?php echo !empty($control['enabled']) ? 'selected' : ''; ?>><?php echo _('Yes'); ?></option>
-							</select>
-						</div>
-					</div>
-					<div class="col-md-9">
-						<div class="form-group">
-							<label><?php echo _('Endpoint'); ?></label>
-							<input class="form-control" type="text" readonly value="<?php echo htmlspecialchars($control_api_url ?? ''); ?>">
-						</div>
-					</div>
-				</div>
-				<div class="form-group">
-					<label><?php echo _('API Key'); ?></label>
-					<div class="input-group">
-						<input class="form-control" id="control_api_key" name="control_api[api_key]" type="text" value="<?php echo htmlspecialchars($control['api_key'] ?? ''); ?>">
-						<span class="input-group-btn">
-							<button type="button" class="btn btn-default" id="copy_control_api_key"><?php echo _('Copy'); ?></button>
-							<button type="submit" class="btn btn-warning" name="slsmassnotifyserver_action" value="regenerate_control_api_key" onclick="return confirm('<?php echo htmlspecialchars(_('Regenerate the Control API key? Existing API clients using the old key will stop working after you apply changes.')); ?>');"><?php echo _('Regenerate'); ?></button>
-						</span>
-					</div>
-					<p class="help-block"><?php echo _('Use Authorization: Bearer <key> or X-API-Key. Disabled by default. Regeneration is staged until Apply Config is run.'); ?></p>
-				</div>
+				<input type="hidden" name="control_api[enabled]" value="<?php echo empty($control['enabled']) ? '0' : '1'; ?>">
+				<input type="hidden" name="control_api[api_key]" value="<?php echo htmlspecialchars($control['api_key'] ?? ''); ?>">
 
 				<h3><?php echo _('TTS Settings'); ?></h3>
 				<div class="row">
@@ -146,6 +118,54 @@ $updates = is_array($settings['updates'] ?? null) ? $settings['updates'] : [];
 			<form method="post" style="margin-bottom: 15px;">
 				<button type="submit" class="btn btn-default" name="slsmassnotifyserver_action" value="export_config"><?php echo _('Download .config'); ?></button>
 			</form>
+			<div class="panel panel-warning" style="border-width: 2px;">
+				<div class="panel-heading">
+					<strong><?php echo _('Control API'); ?></strong>
+				</div>
+				<div class="panel-body">
+					<p class="text-warning">
+						<?php echo _('Remote management can send announcements, trigger NWS tests, read status/logs, and update normalized Mass Notifications config. Keep this disabled unless a trusted remote controller needs it.'); ?>
+					</p>
+					<form method="post">
+						<div class="row">
+							<div class="col-md-3">
+								<div class="form-group">
+									<label><?php echo _('Enabled'); ?></label>
+									<select class="form-control" name="control_api[enabled]">
+										<option value="0" <?php echo empty($control['enabled']) ? 'selected' : ''; ?>><?php echo _('No'); ?></option>
+										<option value="1" <?php echo !empty($control['enabled']) ? 'selected' : ''; ?>><?php echo _('Yes'); ?></option>
+									</select>
+								</div>
+							</div>
+							<div class="col-md-9">
+								<div class="form-group">
+									<label><?php echo _('Endpoint'); ?></label>
+									<input class="form-control" type="text" readonly value="<?php echo htmlspecialchars($control_api_url ?? ''); ?>">
+								</div>
+							</div>
+						</div>
+						<div class="form-group">
+							<label><?php echo _('API Key'); ?></label>
+							<div class="input-group">
+								<input class="form-control" id="control_api_key" name="control_api[api_key]" type="text" value="<?php echo htmlspecialchars($control['api_key'] ?? ''); ?>">
+								<span class="input-group-btn">
+									<button type="button" class="btn btn-default" id="copy_control_api_key"><?php echo _('Copy'); ?></button>
+									<button type="submit" class="btn btn-warning" name="slsmassnotifyserver_action" value="regenerate_control_api_key" onclick="return confirm('<?php echo htmlspecialchars(_('Regenerate the Control API key? Existing API clients using the old key will stop working after you apply changes.')); ?>');"><?php echo _('Regenerate'); ?></button>
+								</span>
+							</div>
+							<p class="help-block"><?php echo _('Use Authorization: Bearer <key> or X-API-Key. Save stages changes; Apply Config makes them live.'); ?></p>
+						</div>
+						<input type="hidden" name="announcement_piper_voice" value="<?php echo htmlspecialchars($settings['announcement_piper_voice'] ?? ''); ?>">
+						<input type="hidden" name="nws_piper_voice" value="<?php echo htmlspecialchars($settings['nws_piper_voice'] ?? ''); ?>">
+						<input type="hidden" name="announcement_tts_volume" value="<?php echo (int)($settings['announcement_tts_volume'] ?? 50); ?>">
+						<input type="hidden" name="nws_tts_volume" value="<?php echo (int)($settings['nws_tts_volume'] ?? 85); ?>">
+						<input type="hidden" name="log_retention_days" value="<?php echo (int)($settings['log_retention_days'] ?? 90); ?>">
+						<input type="hidden" name="updates[github_enabled]" value="<?php echo empty($updates['github_enabled']) ? '0' : '1'; ?>">
+						<input type="hidden" name="updates[channel]" value="<?php echo htmlspecialchars($updates['channel'] ?? 'beta'); ?>">
+						<button type="submit" class="btn btn-warning" name="slsmassnotifyserver_action" value="save_other_settings"><?php echo _('Save Control API'); ?></button>
+					</form>
+				</div>
+			</div>
 			<div class="panel panel-danger">
 				<div class="panel-heading"><?php echo _('Danger Zone'); ?></div>
 				<div class="panel-body">

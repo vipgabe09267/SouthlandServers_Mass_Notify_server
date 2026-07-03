@@ -6,7 +6,7 @@ Southland Servers Mass Notifications Server is an open-source AGPLv3 FreePBX mod
 
 The system stores its configuration in a transplantable central `.config` file and supports token-protected APIs, configurable phone-brand endpoints, announcement groups, quiet hours, notification log retention, uploaded tones, installer-downloaded Piper voices, and NWS zone settings. It is designed for organizations that want PBX-integrated EAS-style notifications without depending on a closed vendor platform, while keeping phone delivery, desktop clients, weather alerting, and alert history manageable from FreePBX.
 
-Current public beta release: `0.0.1-beta`.
+Current public beta release: `0.0.2-beta`.
 
 ## Status
 
@@ -61,7 +61,7 @@ From the repository root:
 The package is written to:
 
 ```text
-dist/slsmassnotifyserver-0.0.1-beta.tgz
+dist/slsmassnotifyserver-0.0.2-beta.tgz
 ```
 
 ## Install
@@ -73,7 +73,7 @@ cd /tmp
 curl -fsSL -o sls-install.sh \
   https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/main/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.0.1-beta/slsmassnotifyserver-0.0.1-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.0.2-beta/slsmassnotifyserver-0.0.2-beta.tgz' \
 ./sls-install.sh
 ```
 
@@ -89,13 +89,13 @@ Custom/local FreePBX module signatures normally show as `Unknown`. That is accep
 
 ## Install From A Local `.tgz`
 
-Use this only if you already downloaded or built the release package and uploaded it to `/tmp/slsmassnotifyserver-0.0.1-beta.tgz` on the PBX.
+Use this only if you already downloaded or built the release package and uploaded it to `/tmp/slsmassnotifyserver-0.0.2-beta.tgz` on the PBX.
 
 ```bash
 cd /tmp
-tar -tzf /tmp/slsmassnotifyserver-0.0.1-beta.tgz >/dev/null
+tar -tzf /tmp/slsmassnotifyserver-0.0.2-beta.tgz >/dev/null
 rm -rf /var/www/html/admin/modules/slsmassnotifyserver
-tar -xzf /tmp/slsmassnotifyserver-0.0.1-beta.tgz -C /var/www/html/admin/modules/
+tar -xzf /tmp/slsmassnotifyserver-0.0.2-beta.tgz -C /var/www/html/admin/modules/
 fwconsole ma install slsmassnotifyserver
 /usr/local/bin/sls_mass_notify/sls_mass_notify_install_piper_voices.sh
 fwconsole reload

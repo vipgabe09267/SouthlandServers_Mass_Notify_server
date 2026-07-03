@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.0.2-beta
+
+- Expanded the Control API with authenticated remote announcement delivery, optional Piper TTS audio, announcement group targeting, colored/image announcement options, NWS test triggering, redacted config reads, and allowlisted config updates.
+- Moved the Control API settings into a warning panel above Danger Zone in Other Settings.
+- Added Control API Help documentation for TTS announcements, colored announcements, NWS tests, and config updates.
+- Hardened Control API config reads and updates so secrets are redacted by default and `[redacted]` placeholders are not written back over live credentials.
+
 ## 0.0.1-beta
 
 - Initial public beta staging.
