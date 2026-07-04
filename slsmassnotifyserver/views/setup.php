@@ -260,15 +260,19 @@ $dismissible = !empty($dismissible);
 					</div>
 				</div>
 				<div class="row" style="margin-top: 12px;">
-					<div class="col-md-4">
+					<div class="col-md-3">
 						<label><?php echo _('Announcement Volume'); ?></label>
 						<input class="form-control" name="announcement_tts_volume" type="number" min="1" max="200" value="<?php echo (int)($settings['announcement_tts_volume'] ?? 50); ?>">
 					</div>
-					<div class="col-md-4">
+					<div class="col-md-3">
 						<label><?php echo _('NWS Volume'); ?></label>
 						<input class="form-control" name="nws_tts_volume" type="number" min="1" max="200" value="<?php echo (int)($settings['nws_tts_volume'] ?? 85); ?>">
 					</div>
-					<div class="col-md-4">
+					<div class="col-md-3">
+						<label><?php echo _('TTS Max Seconds'); ?></label>
+						<input class="form-control" name="tts_max_seconds" type="number" min="1" max="600" value="<?php echo (int)($settings['tts_max_seconds'] ?? 30); ?>">
+					</div>
+					<div class="col-md-3">
 						<label><?php echo _('Notification Log Retention Days'); ?></label>
 						<input class="form-control" name="log_retention_days" type="number" min="1" max="365" value="<?php echo (int)($settings['log_retention_days'] ?? 90); ?>">
 					</div>

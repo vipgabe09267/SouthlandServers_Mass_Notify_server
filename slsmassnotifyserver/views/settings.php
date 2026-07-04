@@ -221,7 +221,7 @@ for ($hour = 0; $hour < 24; $hour++) {
 
 				<h3><?php echo _('NWS Audio and Piper TTS'); ?></h3>
 				<p class="help-block">
-					<?php echo _('Live weather audio now uses a short opening tone, a generated Piper TTS summary from the NWS alert payload, and a short closing tone. Generated speech is capped at 20 seconds.'); ?>
+					<?php echo _('Live weather audio now uses a short opening tone, a generated Piper TTS summary from the NWS alert payload, and a short closing tone. Generated speech defaults to 30 seconds and can be capped at up to 600 seconds.'); ?>
 					<code>/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sounds</code>
 				</p>
 				<div class="row">
@@ -269,7 +269,7 @@ for ($hour = 0; $hour < 24; $hour++) {
 				<div class="well">
 					<strong><?php echo _('Piper Voice'); ?></strong>
 					<div style="margin-top: 8px;"><code><?php echo htmlspecialchars($settings['piper_voice'] ?? '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices/en_US-lessac-low.onnx'); ?></code></div>
-					<div class="text-muted"><?php echo sprintf(_('Maximum spoken summary: %s seconds'), (int)($settings['tts_max_seconds'] ?? 20)); ?></div>
+					<div class="text-muted"><?php echo sprintf(_('Maximum spoken summary: %s seconds'), (int)($settings['tts_max_seconds'] ?? 30)); ?></div>
 				</div>
 
 				<div style="margin-top: 20px;">

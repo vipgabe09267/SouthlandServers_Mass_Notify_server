@@ -106,7 +106,7 @@ $availableTones = is_array($available_tones ?? null) ? $available_tones : [];
 
 				<h3><?php echo _('Audio Configuration'); ?></h3>
 				<p class="help-block">
-					<?php echo _('These tones are shared by live NWS alerts, manual tests, and dashboard announcement TTS audio. Piper TTS speech is capped at 20 seconds.'); ?>
+					<?php echo _('These tones are shared by live NWS alerts, manual tests, and dashboard announcement TTS audio. Piper TTS speech defaults to 30 seconds and can be capped at up to 600 seconds.'); ?>
 				</p>
 				<div class="row">
 					<div class="col-md-5">
@@ -141,7 +141,7 @@ $availableTones = is_array($available_tones ?? null) ? $available_tones : [];
 				<div class="well">
 					<strong><?php echo _('Piper TTS'); ?></strong>
 					<div style="margin-top: 8px;"><code><?php echo htmlspecialchars($settings['piper_voice'] ?? '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices/en_US-lessac-low.onnx'); ?></code></div>
-					<div class="text-muted"><?php echo sprintf(_('Maximum spoken audio: %s seconds'), (int)($settings['tts_max_seconds'] ?? 20)); ?></div>
+					<div class="text-muted"><?php echo sprintf(_('Maximum spoken audio: %s seconds'), (int)($settings['tts_max_seconds'] ?? 30)); ?></div>
 				</div>
 
 				<div class="table-responsive">

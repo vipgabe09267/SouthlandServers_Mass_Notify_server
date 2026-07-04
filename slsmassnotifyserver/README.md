@@ -6,7 +6,7 @@ Southland Servers Mass Notifications Server is an open-source AGPLv3 FreePBX mod
 
 The system stores its configuration in a transplantable central `.config` file and supports token-protected APIs, configurable phone-brand endpoints, announcement groups, quiet hours, notification log retention, uploaded tones, installer-downloaded Piper voices, and NWS zone settings. It is designed for organizations that want PBX-integrated EAS-style notifications without depending on a closed vendor platform, while keeping phone delivery, desktop clients, weather alerting, and alert history manageable from FreePBX.
 
-Current public beta release: `0.0.2-beta`.
+Current public beta release: `0.0.3-beta`.
 
 ## Status
 
@@ -61,10 +61,12 @@ From the repository root:
 The package is written to:
 
 ```text
-dist/slsmassnotifyserver-0.0.2-beta.tgz
+dist/slsmassnotifyserver-0.0.3-beta.tgz
 ```
 
 ## Install
+
+### **Recommended** Release Installer
 
 Run this on the FreePBX server as `root` or a sudo-capable administrator.
 
@@ -73,7 +75,7 @@ cd /tmp
 curl -fsSL -o sls-install.sh \
   https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/main/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.0.2-beta/slsmassnotifyserver-0.0.2-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.0.3-beta/slsmassnotifyserver-0.0.3-beta.tgz' \
 ./sls-install.sh
 ```
 
@@ -89,27 +91,27 @@ Custom/local FreePBX module signatures normally show as `Unknown`. That is accep
 
 ## Install From A Local `.tgz`
 
-Use this only if you already downloaded or built the release package and uploaded it to `/tmp/slsmassnotifyserver-0.0.2-beta.tgz` on the PBX.
+Use this only if you already downloaded or built the release package and uploaded it to `/tmp/slsmassnotifyserver-0.0.3-beta.tgz` on the PBX.
 
 ```bash
 cd /tmp
-tar -tzf /tmp/slsmassnotifyserver-0.0.2-beta.tgz >/dev/null
-rm -rf /var/www/html/admin/modules/slsmassnotifyserver
-tar -xzf /tmp/slsmassnotifyserver-0.0.2-beta.tgz -C /var/www/html/admin/modules/
-fwconsole ma install slsmassnotifyserver
-/usr/local/bin/sls_mass_notify/sls_mass_notify_install_piper_voices.sh
-fwconsole reload
-asterisk -rx "dialplan reload"
+tar -tzf /tmp/slsmassnotifyserver-0.0.3-beta.tgz >/dev/null
+curl -fsSL -o sls-install.sh \
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/main/tools/install_release.sh
+chmod +x sls-install.sh
+SLS_MASS_NOTIFY_TGZ=/tmp/slsmassnotifyserver-0.0.3-beta.tgz ./sls-install.sh
 ```
 
 ## Uninstall
 
-This removes the FreePBX module but leaves the central `.config` and runtime data in place so the deployment can be restored later.
+This removes the FreePBX module, runtime scripts, API folders, Apache config, sound symlinks, local signing artifacts, and temporary installer files. Central config files under `/var/lib/asterisk/SLS_Mass_Notifications_Plugin` are preserved when present so the deployment can be restored later.
 
 ```bash
-fwconsole ma uninstall slsmassnotifyserver || true
-fwconsole ma delete slsmassnotifyserver || true
-fwconsole reload
+cd /tmp
+curl -fsSL -o sls-uninstall.sh \
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/main/tools/uninstall_release.sh
+chmod +x sls-uninstall.sh
+./sls-uninstall.sh
 ```
 
 ## Post-Install Check

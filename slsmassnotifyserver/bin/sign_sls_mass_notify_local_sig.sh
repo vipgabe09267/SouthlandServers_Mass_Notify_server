@@ -3,8 +3,6 @@ set -euo pipefail
 
 MODULE="${1:-$(basename "$(pwd)")}"
 MODULE_DIR="/var/www/html/admin/modules/${MODULE}"
-SECURE_DIR="/etc/freepbx.secure"
-SECURE_SIG="${SECURE_DIR}/${MODULE}.sig"
 MODULE_SIG="${MODULE_DIR}/module.sig"
 SIGN_HOME="/root/.gnupg-sls-mass-notify"
 SIGNEDBY="Southland Servers Mass Notifications Local Signing <root@$(hostname -f 2>/dev/null || hostname)>"
@@ -19,6 +17,26 @@ trap cleanup EXIT
 if [ ! -d "$MODULE_DIR" ]; then
 	echo "Missing module directory: $MODULE_DIR" >&2
 	exit 1
+fi
+
+FREEPBX_GPG_HOME="$(php -r '
+global $amp_conf;
+$bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
+include "/etc/freepbx.conf";
+$gpg = FreePBX::GPG();
+$ref = new ReflectionClass($gpg);
+if ($ref->hasMethod("getGpgLocation")) {
+	$method = $ref->getMethod("getGpgLocation");
+	$method->setAccessible(true);
+	echo $method->invoke($gpg);
+} else {
+	echo "/var/lib/asterisk/.gnupg";
+}
+exit(0);
+')"
+
+if [ -z "$FREEPBX_GPG_HOME" ]; then
+	FREEPBX_GPG_HOME="/var/lib/asterisk/.gnupg"
 fi
 
 install -d -m 700 "$SIGN_HOME"
@@ -51,14 +69,11 @@ HEADER=';################################################
 ;# fail validation and be marked as invalid!    #
 ;################################################'
 
-install -d -m 755 "$SECURE_DIR"
-
 {
 	printf '%s\n' "$HEADER"
 	printf '[config]\n'
-	printf 'version=2\n'
+	printf 'version=1\n'
 	printf 'hash=sha256\n'
-	printf 'type=local\n'
 	printf 'signedwith=%s\n' "$KEYID"
 	printf "signedby='%s'\n" "$SIGNEDBY"
 	printf 'repo=local\n'
@@ -68,47 +83,59 @@ install -d -m 755 "$SECURE_DIR"
 	find . -type f ! -name 'module.sig' ! -name '*.pyc' ! -path '*/__pycache__/*' -printf '%P\n' | LC_ALL=C sort | while IFS= read -r relative_file; do
 		printf '%s = %s\n' "$relative_file" "$(sha256sum "$relative_file" | awk '{print $1}')"
 	done
-} > "$WORKDIR/${MODULE}.secure.plain"
+} > "$WORKDIR/module.plain"
 
 GNUPGHOME="$SIGN_HOME" gpg --batch --yes --pinentry-mode loopback --passphrase '' \
 	--local-user "$KEYID" --clearsign \
-	--output "$WORKDIR/${MODULE}.secure.sig" "$WORKDIR/${MODULE}.secure.plain"
-
-install -m 644 -o root -g root "$WORKDIR/${MODULE}.secure.sig" "$SECURE_SIG"
-SECURE_HASH="$(sha256sum "$SECURE_SIG" | awk '{print $1}')"
-
-{
-	printf '%s\n' "$HEADER"
-	printf '[config]\n'
-	printf 'version=2\n'
-	printf 'hash=sha256\n'
-	printf 'type=local\n'
-	printf 'signedwith=%s\n' "$KEYID"
-	printf "signedby='%s'\n" "$SIGNEDBY"
-	printf 'repo=local\n'
-	printf 'timestamp=%s\n' "$TIMESTAMP"
-	printf '[hashes]\n'
-	printf '%s.sig = %s\n' "$MODULE" "$SECURE_HASH"
-} > "$WORKDIR/${MODULE}.module.plain"
-
-GNUPGHOME="$SIGN_HOME" gpg --batch --yes --pinentry-mode loopback --passphrase '' \
-	--local-user "$KEYID" --clearsign \
-	--output "$WORKDIR/module.sig" "$WORKDIR/${MODULE}.module.plain"
+	--output "$WORKDIR/module.sig" "$WORKDIR/module.plain"
 
 install -m 664 -o asterisk -g asterisk "$WORKDIR/module.sig" "$MODULE_SIG"
 
-install -d -m 700 -o asterisk -g asterisk /home/asterisk/.gnupg
 GNUPGHOME="$SIGN_HOME" gpg --armor --export "$KEYID" > "$WORKDIR/public.asc"
-chown asterisk:asterisk "$WORKDIR/public.asc"
-su -s /bin/bash asterisk -c "gpg --homedir /home/asterisk/.gnupg --batch --import '$WORKDIR/public.asc' >/dev/null 2>&1 || true"
-su -s /bin/bash asterisk -c "printf '${FINGERPRINT}:1:\n' | gpg --homedir /home/asterisk/.gnupg --import-ownertrust >/dev/null 2>&1 || true"
+
+trust_home_as_user() {
+	local home="$1"
+	local user="$2"
+	local group="$3"
+
+	[ -n "$home" ] || return 0
+	install -d -m 700 -o "$user" -g "$group" "$home"
+	chown "$user:$group" "$WORKDIR/public.asc"
+	if [ "$user" = "root" ]; then
+		GNUPGHOME="$home" gpg --batch --import "$WORKDIR/public.asc" >/dev/null 2>&1 || true
+		printf '%s:6:\n' "$FINGERPRINT" | GNUPGHOME="$home" gpg --import-ownertrust >/dev/null 2>&1 || true
+		GNUPGHOME="$home" gpg --check-trustdb >/dev/null 2>&1 || true
+	else
+		su -s /bin/bash "$user" -c "GNUPGHOME='$home' gpg --batch --import '$WORKDIR/public.asc' >/dev/null 2>&1 || true"
+		su -s /bin/bash "$user" -c "printf '${FINGERPRINT}:6:\n' | GNUPGHOME='$home' gpg --import-ownertrust >/dev/null 2>&1 || true"
+		su -s /bin/bash "$user" -c "GNUPGHOME='$home' gpg --check-trustdb >/dev/null 2>&1 || true"
+	fi
+	chown -R "$user:$group" "$home" 2>/dev/null || true
+	chmod 700 "$home" 2>/dev/null || true
+}
+
+declare -A TRUSTED_HOMES=()
+for home in "$FREEPBX_GPG_HOME" "/home/asterisk/.gnupg" "/var/lib/asterisk/.gnupg"; do
+	if [ -n "$home" ] && [ -z "${TRUSTED_HOMES[$home]+x}" ]; then
+		TRUSTED_HOMES[$home]=1
+		trust_home_as_user "$home" asterisk asterisk
+	fi
+done
+trust_home_as_user "/root/.gnupg" root root
 
 SIGN_MODULE="$MODULE" php -r '
+global $amp_conf;
+$bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
 include "/etc/freepbx.conf";
 $module = getenv("SIGN_MODULE");
-$mod = FreePBX::GPG()->verifyModule($module);
+$result = FreePBX::GPG()->verifyModule($module);
 FreePBX::Database()
 	->prepare("UPDATE modules SET signature = ? WHERE modulename = ?")
-	->execute([json_encode($mod), $module]);
-echo json_encode($mod, JSON_PRETTY_PRINT), "\n";
+	->execute([json_encode($result), $module]);
+echo json_encode($result, JSON_PRETTY_PRINT), "\n";
+$status = (int)($result["status"] ?? 0);
+if (($status & 129) !== 129) {
+	exit(1);
+}
+exit(0);
 '

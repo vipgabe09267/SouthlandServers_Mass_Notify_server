@@ -16,6 +16,7 @@ $shellConfigPath = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notific
 		<li><?php echo _('This is beta software. Test on a non-critical PBX before relying on it for emergency workflows.'); ?></li>
 		<li><?php echo _('The module is designed to keep deployment settings outside module code in a centralized .config file so updates do not overwrite local configuration.'); ?></li>
 		<li><?php echo _('Custom/local FreePBX module signatures normally show as Unknown. Altered means the module should be signed again on that PBX.'); ?></li>
+		<li><?php echo _('Other Settings shows the installed package version and whether the known release status is LATEST or an update is available.'); ?></li>
 	</ul>
 
 	<h3><?php echo _('Core Workflows'); ?></h3>
@@ -108,6 +109,7 @@ $shellConfigPath = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notific
 	<ul>
 		<li><?php echo _('Piper voices are selected separately for announcements and NWS alerts.'); ?></li>
 		<li><?php echo _('Volume controls are saved as percentages and applied to the final Asterisk WAV conversion.'); ?></li>
+		<li><?php echo _('Generated Piper speech defaults to 30 seconds and can be capped anywhere from 1 to 600 seconds.'); ?></li>
 		<li><?php echo _('Opening and closing tones can be selected or uploaded from the SIP Notify/NWS settings pages.'); ?></li>
 		<li><?php echo _('Audio delivery uses the private Asterisk context sls-alert-audio and does not require a public paging group such as *6767.'); ?></li>
 	</ul>

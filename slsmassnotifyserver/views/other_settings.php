@@ -9,6 +9,8 @@ $hasPendingChanges = !empty($has_pending_changes);
 $voices = is_array($available_voices ?? null) ? $available_voices : [];
 $control = is_array($settings['control_api'] ?? null) ? $settings['control_api'] : [];
 $updates = is_array($settings['updates'] ?? null) ? $settings['updates'] : [];
+$packageStatus = is_array($package_update_status ?? null) ? $package_update_status : ['state' => 'latest', 'label' => 'LATEST'];
+$packageStatusClass = (($packageStatus['state'] ?? '') === 'update') ? 'label-warning' : 'label-success';
 ?>
 <div class="container-fluid">
 	<?php echo load_view(__DIR__ . '/hero.php', ['hero_image' => $hero_image ?? '']); ?>
@@ -62,55 +64,78 @@ $updates = is_array($settings['updates'] ?? null) ? $settings['updates'] : [];
 						</div>
 					</div>
 				</div>
-				<div class="row">
-					<div class="col-md-6">
-						<div class="form-group">
-							<label><?php echo _('NWS TTS Voice'); ?></label>
-							<select class="form-control" name="nws_piper_voice">
+					<div class="row">
+						<div class="col-md-4">
+							<div class="form-group">
+								<label><?php echo _('NWS TTS Voice'); ?></label>
+								<select class="form-control" name="nws_piper_voice">
 								<?php foreach ($voices as $voice) { ?>
 									<option value="<?php echo htmlspecialchars($voice['path']); ?>" <?php echo ($settings['nws_piper_voice'] ?? '') === $voice['path'] ? 'selected' : ''; ?>>
 										<?php echo htmlspecialchars($voice['name']); ?>
 									</option>
 								<?php } ?>
 							</select>
+							</div>
+						</div>
+						<div class="col-md-4">
+							<div class="form-group">
+								<label><?php echo _('NWS Volume'); ?></label>
+								<input class="form-control" name="nws_tts_volume" type="number" min="1" max="200" value="<?php echo (int)($settings['nws_tts_volume'] ?? 85); ?>">
+							</div>
+						</div>
+						<div class="col-md-4">
+							<div class="form-group">
+								<label><?php echo _('TTS Max Seconds'); ?></label>
+								<input class="form-control" name="tts_max_seconds" type="number" min="1" max="600" value="<?php echo (int)($settings['tts_max_seconds'] ?? 30); ?>">
+								<p class="help-block"><?php echo _('Caps generated Piper speech. Default is 30 seconds. Maximum is 600 seconds.'); ?></p>
+							</div>
 						</div>
 					</div>
-					<div class="col-md-6">
-						<div class="form-group">
-							<label><?php echo _('NWS Volume'); ?></label>
-							<input class="form-control" name="nws_tts_volume" type="number" min="1" max="200" value="<?php echo (int)($settings['nws_tts_volume'] ?? 85); ?>">
-						</div>
-					</div>
-				</div>
 				<h3><?php echo _('Log Retention'); ?></h3>
 				<div class="form-group">
 					<label><?php echo _('Notification Log Retention Days'); ?></label>
 					<input class="form-control" name="log_retention_days" type="number" min="1" max="365" value="<?php echo (int)($settings['log_retention_days'] ?? 90); ?>">
 					<p class="help-block"><?php echo _('Stores notification log entries for 1 to 365 days. Default is 90 days.'); ?></p>
 				</div>
-				<h3><?php echo _('Updates'); ?></h3>
-				<div class="row">
-					<div class="col-md-6">
-						<div class="form-group">
-							<label><?php echo _('Automatic GitHub Updates'); ?></label>
-							<select class="form-control" name="updates[github_enabled]">
+					<h3><?php echo _('Updates'); ?></h3>
+					<div class="row">
+						<div class="col-md-4">
+							<div class="form-group">
+								<label><?php echo _('Automatic GitHub Updates'); ?></label>
+								<select class="form-control" name="updates[github_enabled]">
 								<option value="0" <?php echo empty($updates['github_enabled']) ? 'selected' : ''; ?>><?php echo _('Disabled'); ?></option>
 								<option value="1" <?php echo !empty($updates['github_enabled']) ? 'selected' : ''; ?>><?php echo _('Enabled'); ?></option>
 							</select>
 							<p class="help-block"><?php echo _('When enabled, future update tooling should use the GitHub release channel without changing this central config.'); ?></p>
+							</div>
 						</div>
-					</div>
-					<div class="col-md-6">
-						<div class="form-group">
-							<label><?php echo _('Update Channel'); ?></label>
-							<select class="form-control" name="updates[channel]">
+						<div class="col-md-4">
+							<div class="form-group">
+								<label><?php echo _('Update Channel'); ?></label>
+								<select class="form-control" name="updates[channel]">
 								<option value="beta" <?php echo (($updates['channel'] ?? 'beta') === 'beta') ? 'selected' : ''; ?>><?php echo _('Beta'); ?></option>
 								<option value="stable" <?php echo (($updates['channel'] ?? '') === 'stable') ? 'selected' : ''; ?>><?php echo _('Stable'); ?></option>
 							</select>
-							<p class="help-block"><?php echo htmlspecialchars($updates['repository'] ?? 'vipgabe09267/SouthlandServers_Mass_Notify_server'); ?></p>
+								<p class="help-block"><?php echo htmlspecialchars($updates['repository'] ?? 'vipgabe09267/SouthlandServers_Mass_Notify_server'); ?></p>
+							</div>
+						</div>
+						<div class="col-md-4">
+							<div class="form-group">
+								<label><?php echo _('Installed Package Version'); ?></label>
+								<p class="form-control-static">
+									<code><?php echo htmlspecialchars($package_version ?? 'unknown'); ?></code>
+									<span class="label <?php echo $packageStatusClass; ?>"><?php echo htmlspecialchars($packageStatus['label'] ?? 'LATEST'); ?></span>
+								</p>
+								<?php if (!empty($packageStatus['last_checked'])) { ?>
+									<p class="help-block"><?php echo sprintf(_('Last update check: %s'), htmlspecialchars($packageStatus['last_checked'])); ?></p>
+								<?php } elseif (!empty($packageStatus['message'])) { ?>
+									<p class="help-block"><?php echo htmlspecialchars($packageStatus['message']); ?></p>
+								<?php } else { ?>
+									<p class="help-block"><?php echo _('This is the module package version currently installed on this PBX.'); ?></p>
+								<?php } ?>
+							</div>
 						</div>
 					</div>
-				</div>
 				<button type="submit" class="btn btn-primary" name="slsmassnotifyserver_action" value="save_other_settings"><?php echo _('Save'); ?></button>
 			</form>
 			<hr>
@@ -159,6 +184,7 @@ $updates = is_array($settings['updates'] ?? null) ? $settings['updates'] : [];
 						<input type="hidden" name="nws_piper_voice" value="<?php echo htmlspecialchars($settings['nws_piper_voice'] ?? ''); ?>">
 						<input type="hidden" name="announcement_tts_volume" value="<?php echo (int)($settings['announcement_tts_volume'] ?? 50); ?>">
 						<input type="hidden" name="nws_tts_volume" value="<?php echo (int)($settings['nws_tts_volume'] ?? 85); ?>">
+						<input type="hidden" name="tts_max_seconds" value="<?php echo (int)($settings['tts_max_seconds'] ?? 30); ?>">
 						<input type="hidden" name="log_retention_days" value="<?php echo (int)($settings['log_retention_days'] ?? 90); ?>">
 						<input type="hidden" name="updates[github_enabled]" value="<?php echo empty($updates['github_enabled']) ? '0' : '1'; ?>">
 						<input type="hidden" name="updates[channel]" value="<?php echo htmlspecialchars($updates['channel'] ?? 'beta'); ?>">

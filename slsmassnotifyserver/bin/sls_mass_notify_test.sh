@@ -18,7 +18,7 @@ PIPER_BIN="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/venv/bin/piper"
 PIPER_VOICE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices/en_US-lessac-low.onnx"
 PIPER_NWS_VOICE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices/en_US-lessac-low.onnx"
 PIPER_NWS_VOLUME="0.85"
-PIPER_MAX_SECONDS="20"
+PIPER_MAX_SECONDS="30"
 LOG="${LOG:-/var/log/sls_mass_notify.log}"
 EVENTS_LOG="${EVENTS_LOG:-/var/log/sls_mass_notify_events.jsonl}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-90}"
@@ -284,9 +284,9 @@ generate_test_tts_audio() {
 
   if command -v soxi >/dev/null 2>&1; then
     duration="$(soxi -D "$output_file" 2>/dev/null || echo 0)"
-    if awk "BEGIN { exit !($duration > ${PIPER_MAX_SECONDS:-20}) }"; then
+    if awk "BEGIN { exit !($duration > ${PIPER_MAX_SECONDS:-30}) }"; then
       trimmed_file="${output_file}.trimmed"
-      if sox "$output_file" "$trimmed_file" trim 0 "${PIPER_MAX_SECONDS:-20}" >> "$LOG" 2>&1; then
+      if sox "$output_file" "$trimmed_file" trim 0 "${PIPER_MAX_SECONDS:-30}" >> "$LOG" 2>&1; then
         mv "$trimmed_file" "$output_file"
       else
         rm -f "$trimmed_file"

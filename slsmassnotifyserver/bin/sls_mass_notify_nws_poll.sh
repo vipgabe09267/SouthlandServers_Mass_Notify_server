@@ -25,7 +25,7 @@ PIPER_BIN="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/venv/bin/piper"
 PIPER_VOICE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices/en_US-lessac-low.onnx"
 PIPER_NWS_VOICE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices/en_US-lessac-low.onnx"
 PIPER_NWS_VOLUME="0.85"
-PIPER_MAX_SECONDS="20"
+PIPER_MAX_SECONDS="30"
 SEEN_ALERTS="${SEEN_ALERTS:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/seen_alerts.txt}"
 PROCESSED_ALERTS="${PROCESSED_ALERTS:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/processed_alert_keys.txt}"
 EVENT_COOLDOWN_FILE="${EVENT_COOLDOWN_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/event_cooldowns.txt}"
@@ -502,7 +502,7 @@ build_tts_text() {
   local alert_b64="$1"
 
   ALERT_B64="$alert_b64" \
-  PIPER_MAX_SECONDS="${PIPER_MAX_SECONDS:-20}" \
+  PIPER_MAX_SECONDS="${PIPER_MAX_SECONDS:-30}" \
   python3 - <<'PY'
 import base64
 import json
@@ -557,8 +557,8 @@ elif "fire" in event_lower or "red flag" in event_lower:
 else:
     action = instruction or headline or description or "Monitor local weather information for instructions."
 
-max_seconds = max(1, min(20, int(os.environ.get("PIPER_MAX_SECONDS", "20") or "20")))
-word_limit = max(18, min(40, max_seconds * 2))
+max_seconds = max(1, min(600, int(os.environ.get("PIPER_MAX_SECONDS", "30") or "30")))
+word_limit = max(18, min(1200, max_seconds * 2))
 message = f"Weather alert. {event} for {area}. {action}"
 print(shorten_words(message, word_limit))
 PY
@@ -621,9 +621,9 @@ generate_tts_audio() {
 
   if command -v soxi >/dev/null 2>&1; then
     duration="$(soxi -D "$output_file" 2>/dev/null || echo 0)"
-    if awk "BEGIN { exit !($duration > ${PIPER_MAX_SECONDS:-20}) }"; then
+    if awk "BEGIN { exit !($duration > ${PIPER_MAX_SECONDS:-30}) }"; then
       trimmed_file="${output_file}.trimmed"
-      if sox "$output_file" "$trimmed_file" trim 0 "${PIPER_MAX_SECONDS:-20}" >> "$LOG" 2>&1; then
+      if sox "$output_file" "$trimmed_file" trim 0 "${PIPER_MAX_SECONDS:-30}" >> "$LOG" 2>&1; then
         mv "$trimmed_file" "$output_file"
       else
         rm -f "$trimmed_file"
