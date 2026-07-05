@@ -2,12 +2,12 @@
 set -euo pipefail
 
 MODULE="${SLS_MASS_NOTIFY_MODULE:-slsmassnotifyserver}"
-TGZ="${SLS_MASS_NOTIFY_TGZ:-/tmp/slsmassnotifyserver-0.0.3-beta.tgz}"
+TGZ="${SLS_MASS_NOTIFY_TGZ:-/tmp/slsmassnotifyserver-0.0.4-beta.tgz}"
 URL="${SLS_MASS_NOTIFY_TGZ_URL:-${1:-}}"
 SHA256="${SLS_MASS_NOTIFY_SHA256:-}"
 TOKEN="${SLS_MASS_NOTIFY_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
 LOG_FILE="${SLS_MASS_NOTIFY_INSTALL_LOG:-/tmp/slsmassnotifyserver-install.log}"
-EXPECTED_TGZ_SHA256="79051f5fcbb209c03673ee9be47164d41b2a830d6803d91ce2fdfa8e58fab3fa"
+EXPECTED_TGZ_SHA256="42be44a2bd31b65d6e2c5cbb2a9f47a49732a7e13a1e64f100c15c538aaf3e05"
 
 log() {
   printf '%s\n' "$*"
@@ -84,8 +84,8 @@ verify_tgz() {
   actual_sha="$(sha256sum "$TGZ" | awk '{print $1}')"
   if [ -n "$SHA256" ]; then
     echo "$SHA256  $TGZ" | sha256sum -c -
-  elif [ "$EXPECTED_TGZ_SHA256" != "__SLS_MASS_NOTIFY_003_SHA256__" ] && [ "$(basename "$TGZ")" = "slsmassnotifyserver-0.0.3-beta.tgz" ] && [ "$actual_sha" != "$EXPECTED_TGZ_SHA256" ]; then
-    log "$TGZ does not match the current slsmassnotifyserver-0.0.3-beta package."
+  elif [ "$EXPECTED_TGZ_SHA256" != "__SLS_MASS_NOTIFY_004_SHA256__" ] && [ "$(basename "$TGZ")" = "slsmassnotifyserver-0.0.4-beta.tgz" ] && [ "$actual_sha" != "$EXPECTED_TGZ_SHA256" ]; then
+    log "$TGZ does not match the current slsmassnotifyserver-0.0.4-beta package."
     log "Expected SHA256: $EXPECTED_TGZ_SHA256"
     log "Actual SHA256:   $actual_sha"
     log "Remove the stale local TGZ or install with SLS_MASS_NOTIFY_TGZ_URL so the current release is downloaded."
@@ -100,12 +100,31 @@ module_known() {
   fwconsole ma list 2>/dev/null | grep -Eq "\\|[[:space:]]*$1[[:space:]]*\\|"
 }
 
-remove_existing_module_registration() {
+prepare_module_directory() {
   if module_known "$MODULE"; then
-    fwconsole ma uninstall "$MODULE" >>"$LOG_FILE" 2>&1 || true
-    fwconsole ma delete "$MODULE" >>"$LOG_FILE" 2>&1 || true
+    log "Existing SLS Mass Notify module detected; preserving config and overlaying module files."
   fi
   rm -rf "/var/www/html/admin/modules/$MODULE"
+}
+
+sync_module_version() {
+  php -r '
+require "/etc/freepbx.conf";
+$module = getenv("SLS_MASS_NOTIFY_MODULE") ?: "slsmassnotifyserver";
+$xmlPath = "/var/www/html/admin/modules/" . $module . "/module.xml";
+if (!is_readable($xmlPath)) {
+    exit(0);
+}
+$xml = simplexml_load_file($xmlPath);
+$version = $xml && isset($xml->version) ? trim((string)$xml->version) : "";
+if ($version === "") {
+    exit(0);
+}
+$db = \FreePBX::Database();
+$stmt = $db->prepare("UPDATE modules SET version = ? WHERE modulename = ?");
+$stmt->execute([$version, $module]);
+exit(0);
+' >>"$LOG_FILE" 2>&1 || true
 }
 
 refresh_module_install() {
@@ -216,6 +235,7 @@ sign_and_verify_touched_modules() {
 
   modules_to_sign=("$MODULE")
   [ -d /var/www/html/admin/modules/dashboard ] && modules_to_sign+=("dashboard")
+  [ -d /var/www/html/admin/modules/framework ] && modules_to_sign+=("framework")
 
   for module_name in "${modules_to_sign[@]}"; do
     "$signer" "$module_name" >>"$LOG_FILE" 2>&1 || {
@@ -247,6 +267,14 @@ verify_install() {
   sign_and_verify_touched_modules
   fwconsole ma list | egrep -i 'slsmassnotifyserver|dashboard|framework|Module'
   asterisk -rx "dialplan show 1000@sls-alert-audio"
+  asterisk -rx "module show like res_pjsip_notify.so" | grep -q "res_pjsip_notify.so" || {
+    log "Asterisk res_pjsip_notify.so is not loaded; SIP NOTIFY cannot work."
+    exit 1
+  }
+  grep -q "SLS Mass Notifications SIP NOTIFY Templates" /etc/asterisk/sip_notify_custom.conf || {
+    log "Managed SIP NOTIFY templates were not installed in /etc/asterisk/sip_notify_custom.conf."
+    exit 1
+  }
   if [ ! -x /usr/local/bin/piper ]; then
     log "Piper wrapper was not created at /usr/local/bin/piper."
     exit 1
@@ -261,10 +289,11 @@ verify_install() {
     exit 1
   fi
   python3 -m py_compile /usr/local/bin/sls_mass_notify/sls_notify.py
+  python3 /usr/local/bin/sls_mass_notify/sls_notify.py --list-endpoints-json >/tmp/sls-mass-notify-endpoints.json
   php -l /var/www/html/admin/modules/slsmassnotifyserver/Slsmassnotifyserver.class.php >/dev/null
-  code="$(curl -k -s -o /tmp/sls-sipnotify-api.out -w '%{http_code}' http://127.0.0.1/api/sipnotify/yealink || true)"
+  code="$(curl -k -s -o /tmp/sls-sipnotify-api.out -w '%{http_code}' http://127.0.0.1/api/sipnotify/desktop || true)"
   if [ "$code" != "401" ]; then
-    log "SIP Notify API smoke test expected HTTP 401 for /api/sipnotify/yealink, got $code. See /tmp/sls-sipnotify-api.out."
+    log "Desktop notification API smoke test expected HTTP 401 for /api/sipnotify/desktop, got $code. See /tmp/sls-sipnotify-api.out."
     exit 1
   fi
   ls -lh /var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices
@@ -278,13 +307,15 @@ main() {
   preflight_python
   download_tgz
   verify_tgz
-  remove_existing_module_registration
+  prepare_module_directory
   tar -xzf "$TGZ" -C /var/www/html/admin/modules/
   fwconsole ma install "$MODULE" >>"$LOG_FILE" 2>&1 || {
     log "fwconsole install reported an error; continuing to runtime refresh and signing. See $LOG_FILE."
   }
   fwconsole ma enable "$MODULE" >>"$LOG_FILE" 2>&1 || true
+  SLS_MASS_NOTIFY_MODULE="$MODULE" sync_module_version
   ensure_runtime_installed
+  asterisk -rx "module reload res_pjsip_notify.so" >>"$LOG_FILE" 2>&1 || true
   /usr/local/bin/sls_mass_notify/sls_mass_notify_install_piper_voices.sh || {
     log "Packaged Piper installer reported an error; attempting direct Piper runtime repair. See $LOG_FILE."
   }
@@ -295,6 +326,7 @@ main() {
   repair_runtime_permissions
   sign_and_verify_touched_modules
   fwconsole reload
+  asterisk -rx "module reload res_pjsip_notify.so" >>"$LOG_FILE" 2>&1 || true
   repair_runtime_permissions
   sign_and_verify_touched_modules
   fwconsole reload

@@ -4,10 +4,10 @@ $setupModal = (string)($setup_modal ?? '');
 $page = trim((string)($requested_page ?? ''));
 $titleMap = [
 	'main' => _('Notification Logs'),
-	'settings' => _('NWS Settings'),
-	'testing' => _('NWS Testing'),
-	'sipnotify_settings' => _('SipNotify Settings'),
-	'other_settings' => _('Other Settings'),
+	'settings' => _('NWS Alerts'),
+	'testing' => _('NWS Alerts'),
+	'nws_alerts' => _('NWS Alerts'),
+	'other_settings' => _('General Settings'),
 	'help' => _('Help'),
 ];
 $title = $titleMap[$page] ?? _('Mass Notifications');

@@ -3,6 +3,8 @@ $typeOptions = [
 	'' => _('All Events'),
 	'nws' => _('NWS Weather Alerts'),
 	'test' => _('Manual Tests'),
+	'announcement' => _('Announcements'),
+	'announcement_audio' => _('Announcement Audio'),
 ];
 $limitOptions = [50, 100, 200, 500];
 $statusCards = is_array($status_summary ?? null) ? $status_summary : [];

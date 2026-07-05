@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODULE="slsmassnotifyserver"
-VERSION="0.0.3-beta"
+VERSION="$(php -r '$x=simplexml_load_file($argv[1]); if (!$x) exit(1); echo (string)$x->version;' "${ROOT_DIR}/${MODULE}/module.xml")"
 DIST_DIR="${ROOT_DIR}/dist"
 PACKAGE="${DIST_DIR}/${MODULE}-${VERSION}.tgz"
 

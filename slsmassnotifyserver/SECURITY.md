@@ -8,7 +8,8 @@ Security fixes are currently targeted at the latest public beta release only.
 
 | Version | Supported |
 | --- | --- |
-| `0.0.3-beta` | Yes |
+| `0.0.4-beta` | Yes |
+| `0.0.3-beta` | No |
 | `0.0.2-beta` | No |
 | Older beta builds | No |
 
@@ -45,7 +46,7 @@ Credentials are generated on fresh installs and preserved during normal updates.
 - Use HTTPS for all API and media endpoints.
 - Keep the Control API disabled unless it is actively needed.
 - Restrict FreePBX administrator access to trusted users and trusted networks.
-- Use strong endpoint passwords for SIP NOTIFY phone-brand endpoints.
+- Use strong desktop client passwords and keep the Control API disabled unless it is needed.
 - Rotate the desktop app token and Control API key if they are exposed.
 - Keep AMI access bound to localhost unless a deployment has a specific, reviewed need.
 - Do not expose Asterisk manager ports directly to the public internet.
@@ -55,7 +56,7 @@ Credentials are generated on fresh installs and preserved during normal updates.
 
 ## Security Boundaries
 
-The SIP Notify API and Control API are intended for authenticated clients only. The desktop app endpoint uses bearer-token authentication. Phone-brand endpoints use the configured endpoint authentication model. The Control API is disabled by default and must be explicitly enabled before use.
+The desktop notification API and Control API are intended for authenticated clients only. Desktop app clients use per-client usernames and passwords. Phone SIP NOTIFY delivery is sent directly by Asterisk/PJSIP to registered endpoints. The Control API is disabled by default and must be explicitly enabled before use.
 
 The module does not replace FreePBX system hardening. Firewall rules, TLS certificates, fail2ban policies, OS patching, mail transport security, and SIP trunk security remain the responsibility of the PBX administrator.
 

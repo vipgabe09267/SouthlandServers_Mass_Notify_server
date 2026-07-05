@@ -4,9 +4,9 @@
 
 Southland Servers Mass Notifications Server is an open-source AGPLv3 FreePBX module that turns a PBX into a centralized alerting and mass notification server. It provides a unified interface for sending SIP NOTIFY visual alerts, desktop app notifications, dashboard announcements, NWS weather alerts, and optional Piper TTS audio paging through Asterisk.
 
-The system stores its configuration in a transplantable central `.config` file and supports token-protected APIs, configurable phone-brand endpoints, announcement groups, quiet hours, notification log retention, uploaded tones, installer-downloaded Piper voices, and NWS zone settings. It is designed for organizations that want PBX-integrated EAS-style notifications without depending on a closed vendor platform, while keeping phone delivery, desktop clients, weather alerting, and alert history manageable from FreePBX.
+The system stores its configuration in a transplantable central `.config` file and supports token-protected APIs, Asterisk/PJSIP phone delivery, authenticated desktop clients, announcement groups, quiet hours, notification log retention, uploaded tones, installer-downloaded Piper voices, and NWS zone settings. It is designed for organizations that want PBX-integrated EAS-style notifications without depending on a closed vendor platform, while keeping phone delivery, desktop clients, weather alerting, and alert history manageable from FreePBX.
 
-Current public beta release: `0.0.3-beta`.
+Current public beta release: `0.0.4-beta`.
 
 ## Status
 
@@ -15,7 +15,7 @@ Pre-release beta staging. Review and test on a non-critical FreePBX 17 system be
 ## What It Installs
 
 - FreePBX module raw name: `slsmassnotifyserver`
-- FreePBX menu: `Mass Notifications`
+- FreePBX menu: `Mass Notify`
 - Dashboard widget: `SIP NOTIFY Announcements`
 - Runtime scripts: `/usr/local/bin/sls_mass_notify`
 - Central data/config folder: `/var/lib/asterisk/SLS_Mass_Notifications_Plugin`
@@ -61,7 +61,7 @@ From the repository root:
 The package is written to:
 
 ```text
-dist/slsmassnotifyserver-0.0.3-beta.tgz
+dist/slsmassnotifyserver-0.0.4-beta.tgz
 ```
 
 ## Install
@@ -75,7 +75,7 @@ cd /tmp
 curl -fsSL -o sls-install.sh \
   https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/main/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.0.3-beta/slsmassnotifyserver-0.0.3-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.0.4-beta/slsmassnotifyserver-0.0.4-beta.tgz' \
 ./sls-install.sh
 ```
 
@@ -91,15 +91,15 @@ Custom/local FreePBX module signatures normally show as `Unknown`. That is accep
 
 ## Install From A Local `.tgz`
 
-Use this only if you already downloaded or built the release package and uploaded it to `/tmp/slsmassnotifyserver-0.0.3-beta.tgz` on the PBX.
+Use this only if you already downloaded or built the release package and uploaded it to `/tmp/slsmassnotifyserver-0.0.4-beta.tgz` on the PBX.
 
 ```bash
 cd /tmp
-tar -tzf /tmp/slsmassnotifyserver-0.0.3-beta.tgz >/dev/null
+tar -tzf /tmp/slsmassnotifyserver-0.0.4-beta.tgz >/dev/null
 curl -fsSL -o sls-install.sh \
   https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/main/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ=/tmp/slsmassnotifyserver-0.0.3-beta.tgz ./sls-install.sh
+SLS_MASS_NOTIFY_TGZ=/tmp/slsmassnotifyserver-0.0.4-beta.tgz ./sls-install.sh
 ```
 
 ## Uninstall
@@ -136,7 +136,7 @@ FreePBX module installs are not a safe place for interactive questions, so the m
 6. If NWS is enabled, enter the zone or county code and choose NWS recipient extensions.
 7. Configure quiet hours and critical bypass events.
 8. Choose whether to enable the Control API. A random API key is generated when needed.
-9. Choose the SIP NOTIFY endpoints/phone brands this PBX should expose.
+9. Configure desktop app clients and phone delivery defaults. Phone SIP NOTIFY is sent directly through Asterisk/PJSIP; no per-brand API endpoint setup is required.
 10. Select announcement and NWS Piper voices.
 11. Set announcement and NWS TTS volumes.
 12. Set notification log retention.
@@ -175,19 +175,17 @@ Do not edit generated runtime files as the primary configuration method. Use the
 Before major updates, download the central `.config` from:
 
 ```text
-Mass Notifications > Other Settings > Danger Zone
+Mass Notify > General Settings > Danger Zone
 ```
 
 To restore a deployment, upload the saved `.config` from the same page and apply changes. Replacing the config overwrites plugin settings such as endpoints, groups, tokens, voices, NWS settings, quiet hours, and log retention.
 
 ## APIs
 
-Desktop/SIP Notify API:
+Desktop notification API:
 
 ```text
-https://pbx.example.com/api/sipnotify
 https://pbx.example.com/api/sipnotify/desktop
-https://pbx.example.com/api/sipnotify/yealink
 ```
 
 Control API:
@@ -196,7 +194,7 @@ Control API:
 https://pbx.example.com/api/sls-mass-notify
 ```
 
-The desktop endpoint uses the SLS Mass Notify App token. Phone-brand endpoints use their configured username/password. The Control API is disabled by default and uses its own API key.
+Desktop clients use their configured username and password. Phone SIP NOTIFY payloads are pushed by Asterisk/PJSIP to registered endpoints, and the sender chooses the payload style from the detected endpoint vendor. The Control API is disabled by default and uses its own API key.
 
 ## Logs
 
@@ -210,7 +208,7 @@ Primary logs:
 /var/lib/asterisk/SLS_Mass_Notifications_Plugin/status.json
 ```
 
-Log retention is configured in `Mass Notifications > Other Settings`; default retention is 90 days, maximum is 365 days.
+Log retention is configured in `Mass Notify > General Settings`; default retention is 90 days, maximum is 365 days.
 
 ## Validation Commands
 
@@ -252,9 +250,9 @@ The dashboard announcement widget can send SIP NOTIFY text/image payloads, publi
 
 Yes. New installs show a setup modal on the Dashboard announcement widget and Mass Notifications pages until the beta warning, AGPL notice, EULA, and first-run configuration are accepted. Existing deployments keep their central `.config` and are not forced through the wizard during an update.
 
-### How do phone-brand endpoints authenticate?
+### Do phones need separate API endpoints?
 
-The desktop app endpoint uses a bearer token. Phone-brand endpoints use configured username/password credentials.
+No. Phones receive SIP NOTIFY directly from Asterisk/PJSIP. Desktop clients use `/api/sipnotify/desktop` with their assigned username and password.
 
 ### Can I regenerate credentials?
 

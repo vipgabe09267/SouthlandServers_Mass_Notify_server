@@ -11,7 +11,7 @@ unset($_SESSION['slsmassnotifyserver_other_save_result'], $_SESSION['slsmassnoti
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 	$action = $_POST['slsmassnotifyserver_action'] ?? '';
 	if ($action === 'save_other_settings') {
-		$_SESSION['slsmassnotifyserver_other_save_result'] = $slsmassnotifyserver->saveOtherSettings($_POST);
+		$_SESSION['slsmassnotifyserver_other_save_result'] = $slsmassnotifyserver->saveOtherSettings($_POST, $_FILES);
 		header('Location: config.php?display=slsmassnotifyserver_other');
 		exit;
 	} elseif ($action === 'regenerate_control_api_key') {
@@ -26,6 +26,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 		exit;
 	} elseif ($action === 'import_config') {
 		$_SESSION['slsmassnotifyserver_other_import_result'] = $slsmassnotifyserver->importConfigUpload($_FILES['config_upload'] ?? []);
+		header('Location: config.php?display=slsmassnotifyserver_other');
+		exit;
+	} elseif ($action === 'repair_installation') {
+		$_SESSION['slsmassnotifyserver_other_save_result'] = $slsmassnotifyserver->repairInstallation();
 		header('Location: config.php?display=slsmassnotifyserver_other');
 		exit;
 	} elseif ($action === 'apply_settings') {

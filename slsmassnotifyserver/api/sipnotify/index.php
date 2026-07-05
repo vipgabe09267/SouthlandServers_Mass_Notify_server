@@ -5,6 +5,7 @@ declare(strict_types=1);
 const EVENTS_FILE = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sipnotify/sipnotify_events.jsonl';
 const SETTINGS_FILE = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config';
 const LEGACY_SETTINGS_FILE = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications-' . 'settings.json';
+const DESKTOP_LAST_SEEN_FILE = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/desktop-last-seen.json';
 const MAX_LIMIT = 100;
 const DEFAULT_LIMIT = 25;
 const RETENTION_MAX_EVENTS = 1000;
@@ -96,7 +97,7 @@ function endpoint_config(string $slug, array $settings): ?array
     $config = sipnotify_config($settings);
     $endpoints = is_array($config['endpoints'] ?? null) ? $config['endpoints'] : [];
     if (empty($endpoints) && $slug === 'desktop') {
-        return ['slug' => 'desktop', 'brand' => 'SLS Mass Notify Desktop App', 'enabled' => '1', 'auth_type' => 'token'];
+        return ['slug' => 'desktop', 'brand' => 'SLS Mass Notify Desktop App', 'enabled' => '1', 'auth_type' => 'desktop'];
     }
     foreach ($endpoints as $endpoint) {
         if (!is_array($endpoint)) {
@@ -107,6 +108,74 @@ function endpoint_config(string $slug, array $settings): ?array
         }
     }
     return null;
+}
+
+function decrypt_desktop_password(string $encoded, array $settings): string
+{
+    if (!function_exists('openssl_decrypt') || strpos($encoded, 'v1:') !== 0) {
+        return '';
+    }
+    $key = base64_decode((string)($settings['desktop_auth_key'] ?? ''), true);
+    $raw = base64_decode(substr($encoded, 3), true);
+    if (!is_string($key) || strlen($key) !== 32 || !is_string($raw) || strlen($raw) < 29) {
+        return '';
+    }
+    $iv = substr($raw, 0, 12);
+    $tag = substr($raw, 12, 16);
+    $cipher = substr($raw, 28);
+    $plain = openssl_decrypt($cipher, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag);
+    return is_string($plain) ? $plain : '';
+}
+
+function authorized_desktop_username(array $settings, string $basicUser, string $basicPass): string
+{
+    $clients = is_array($settings['desktop_clients'] ?? null) ? $settings['desktop_clients'] : [];
+    foreach ($clients as $client) {
+        if (!is_array($client) || empty($client['enabled'])) {
+            continue;
+        }
+        $username = (string)($client['username'] ?? '');
+        $password = decrypt_desktop_password((string)($client['password_enc'] ?? ''), $settings);
+        if ($username !== '' && $password !== '' && hash_equals($username, $basicUser) && hash_equals($password, $basicPass)) {
+            return $username;
+        }
+    }
+    return '';
+}
+
+function desktop_client_by_username(array $settings, string $username): array
+{
+    foreach ((array)($settings['desktop_clients'] ?? []) as $client) {
+        if (is_array($client) && (string)($client['username'] ?? '') === $username) {
+            return $client;
+        }
+    }
+    return [];
+}
+
+function update_desktop_seen(array $settings, string $username): void
+{
+    if ($username === '') {
+        return;
+    }
+    $client = desktop_client_by_username($settings, $username);
+    $data = [];
+    if (is_readable(DESKTOP_LAST_SEEN_FILE)) {
+        $decoded = json_decode((string)file_get_contents(DESKTOP_LAST_SEEN_FILE), true);
+        $data = is_array($decoded) ? $decoded : [];
+    }
+    $data[$username] = [
+        'seen_at' => gmdate('c'),
+        'ip' => (string)($_SERVER['REMOTE_ADDR'] ?? ''),
+        'client_id' => (string)($client['client_id'] ?? ''),
+        'name' => (string)($client['name'] ?? ''),
+    ];
+    $dir = dirname(DESKTOP_LAST_SEEN_FILE);
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0755, true);
+    }
+    @file_put_contents(DESKTOP_LAST_SEEN_FILE, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n", LOCK_EX);
+    @chmod(DESKTOP_LAST_SEEN_FILE, 0660);
 }
 
 function x(string $value): string
@@ -302,21 +371,33 @@ if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
 }
 
 $authorized = false;
+$authorizedDesktopUsername = '';
 $expectedToken = trim((string)($settings['desktop_api_token'] ?? ''));
 $providedToken = bearer_token();
-if (($endpoint['auth_type'] ?? '') === 'token' && $expectedToken !== '' && $providedToken !== '' && hash_equals($expectedToken, $providedToken)) {
+if ($endpointSlug !== 'desktop' && ($endpoint['auth_type'] ?? '') === 'token' && $expectedToken !== '' && $providedToken !== '' && hash_equals($expectedToken, $providedToken)) {
     $authorized = true;
 }
 
 [$basicUser, $basicPass] = basic_credentials();
+$desktopUsername = '';
+if ($endpointSlug === 'desktop') {
+    $desktopUsername = authorized_desktop_username($settings, $basicUser, $basicPass);
+    if ($desktopUsername !== '') {
+        $authorized = true;
+        $authorizedDesktopUsername = $desktopUsername;
+    }
+}
 $expectedUser = (string)($endpoint['username'] ?? '');
 $expectedPass = (string)($endpoint['password'] ?? '');
-if (($endpoint['auth_type'] ?? 'basic') === 'basic' && $expectedUser !== '' && $expectedPass !== '' && hash_equals($expectedUser, $basicUser) && hash_equals($expectedPass, $basicPass)) {
+if ($endpointSlug !== 'desktop' && ($endpoint['auth_type'] ?? 'basic') === 'basic' && $expectedUser !== '' && $expectedPass !== '' && hash_equals($expectedUser, $basicUser) && hash_equals($expectedPass, $basicPass)) {
     $authorized = true;
 }
 
 if (!$authorized) {
     respond(401, ['ok' => false, 'error' => 'unauthorized']);
+}
+if ($endpointSlug === 'desktop' && $authorizedDesktopUsername !== '') {
+    update_desktop_seen($settings, $authorizedDesktopUsername);
 }
 
 $limit = (int)($_GET['limit'] ?? DEFAULT_LIMIT);
@@ -338,6 +419,13 @@ if (is_readable(EVENTS_FILE)) {
 			}
 			$created = strtotime((string)($decoded['created_at'] ?? '')) ?: time();
 			if ($created >= $cutoff) {
+				if ($endpointSlug === 'desktop' && $authorizedDesktopUsername !== '') {
+					$desktopAll = !empty($decoded['desktop_all']);
+					$desktopRecipients = is_array($decoded['desktop_recipients'] ?? null) ? $decoded['desktop_recipients'] : [];
+					if (!$desktopAll && !empty($desktopRecipients) && !in_array($authorizedDesktopUsername, $desktopRecipients, true)) {
+						continue;
+					}
+				}
 				$retained[] = $decoded;
 			}
 		}

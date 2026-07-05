@@ -5,7 +5,39 @@ $modulePath = dirname(__DIR__);
 $moduleRaw = basename($modulePath);
 $settingsPath = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config';
 $shellConfigPath = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.conf';
+$diagnostics = is_array($diagnostics ?? null) ? $diagnostics : [];
+$endpointDiagnostics = array_values((array)($diagnostics['endpoints'] ?? []));
+$desktopDiagnostics = array_values((array)($diagnostics['desktop_clients'] ?? []));
+$controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? []));
 ?>
+<style>
+.sls-help-scroll-table {
+	max-height: 300px;
+	overflow-y: auto;
+	overflow-x: auto;
+	margin-bottom: 12px;
+}
+.sls-help-scroll-table table {
+	margin-bottom: 0;
+}
+.sls-help-scroll-table td,
+.sls-help-scroll-table th {
+	vertical-align: middle !important;
+	overflow-wrap: anywhere;
+}
+.sls-help-diagnostics .panel {
+	margin-bottom: 16px;
+}
+.sls-help-diagnostics .panel-heading h4 {
+	margin: 0;
+	font-size: 15px;
+	font-weight: 600;
+}
+.sls-help-diagnostics code {
+	white-space: normal;
+	word-break: break-word;
+}
+</style>
 <div class="container-fluid">
 	<?php echo load_view(__DIR__ . '/hero.php', ['hero_image' => $hero_image ?? '']); ?>
 	<h2><?php echo _('Help'); ?></h2>
@@ -16,15 +48,117 @@ $shellConfigPath = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notific
 		<li><?php echo _('This is beta software. Test on a non-critical PBX before relying on it for emergency workflows.'); ?></li>
 		<li><?php echo _('The module is designed to keep deployment settings outside module code in a centralized .config file so updates do not overwrite local configuration.'); ?></li>
 		<li><?php echo _('Custom/local FreePBX module signatures normally show as Unknown. Altered means the module should be signed again on that PBX.'); ?></li>
-		<li><?php echo _('Other Settings shows the installed package version and whether the known release status is LATEST or an update is available.'); ?></li>
+		<li><?php echo _('General Settings shows the installed package version and whether the known release status is LATEST or an update is available.'); ?></li>
 	</ul>
+
+	<h3><?php echo _('Diagnostics'); ?></h3>
+	<div class="sls-help-diagnostics">
+		<div class="panel panel-default">
+			<div class="panel-heading"><h4><?php echo _('System Checks'); ?></h4></div>
+			<div class="panel-body">
+				<div class="sls-help-scroll-table">
+					<table class="table table-condensed table-striped">
+						<thead><tr><th><?php echo _('Check'); ?></th><th><?php echo _('State'); ?></th><th><?php echo _('Detail'); ?></th></tr></thead>
+						<tbody>
+							<?php foreach ((array)($diagnostics['checks'] ?? []) as $check) { ?>
+								<tr>
+									<td><?php echo htmlspecialchars($check['label'] ?? ''); ?></td>
+									<td><?php echo !empty($check['ok']) ? '<span class="label label-success">OK</span>' : '<span class="label label-warning">Check</span>'; ?></td>
+									<td><code><?php echo htmlspecialchars((string)($check['detail'] ?? '')); ?></code></td>
+								</tr>
+							<?php } ?>
+						</tbody>
+					</table>
+				</div>
+			</div>
+		</div>
+		<div class="panel panel-default">
+			<div class="panel-heading"><h4><?php echo _('Detected Phone Endpoints'); ?></h4></div>
+			<div class="panel-body">
+			<?php if (empty($endpointDiagnostics)) { ?>
+				<p class="text-muted"><?php echo _('No registered phone endpoints were detected or AMI endpoint detection is unavailable.'); ?></p>
+			<?php } else { ?>
+				<div class="sls-help-scroll-table">
+					<table class="table table-condensed table-striped">
+						<thead><tr><th><?php echo _('Ext'); ?></th><th><?php echo _('Format'); ?></th><th><?php echo _('User Agent'); ?></th></tr></thead>
+						<tbody>
+							<?php foreach ($endpointDiagnostics as $endpoint) { ?>
+								<tr>
+									<td><?php echo htmlspecialchars($endpoint['extension'] ?? ''); ?></td>
+									<td>
+										<?php if (!empty($endpoint['unknown'])) { ?>
+											<span class="label label-warning">&#9733; <?php echo _('Unknown'); ?></span>
+										<?php } else { ?>
+											<span class="label label-info"><?php echo htmlspecialchars($endpoint['format'] ?? ''); ?></span>
+										<?php } ?>
+									</td>
+									<td><?php echo htmlspecialchars($endpoint['user_agent'] ?? ''); ?></td>
+								</tr>
+							<?php } ?>
+						</tbody>
+					</table>
+				</div>
+			<?php } ?>
+			</div>
+		</div>
+		<div class="panel panel-default">
+			<div class="panel-heading"><h4><?php echo _('Desktop Clients'); ?></h4></div>
+			<div class="panel-body">
+				<?php if (empty($desktopDiagnostics)) { ?>
+					<p class="text-muted"><?php echo _('No desktop clients are configured.'); ?></p>
+				<?php } else { ?>
+					<div class="sls-help-scroll-table">
+						<table class="table table-condensed table-striped">
+							<thead><tr><th><?php echo _('Client'); ?></th><th><?php echo _('Last Seen'); ?></th><th><?php echo _('State'); ?></th></tr></thead>
+							<tbody>
+								<?php foreach ($desktopDiagnostics as $client) { ?>
+									<tr>
+										<td><?php echo htmlspecialchars(($client['name'] ?? '') . ' (' . ($client['client_id'] ?? '') . ')'); ?></td>
+										<td><?php echo htmlspecialchars(($client['last_seen_at'] ?? '') ?: _('Never')); ?> <?php echo !empty($client['last_seen_ip']) ? htmlspecialchars(' from ' . $client['last_seen_ip']) : ''; ?></td>
+										<td>
+											<?php $state = (string)($client['state'] ?? 'never'); ?>
+											<span class="label <?php echo $state === 'recent' ? 'label-success' : ($state === 'stale' ? 'label-warning' : 'label-default'); ?>"><?php echo htmlspecialchars($state); ?></span>
+										</td>
+									</tr>
+								<?php } ?>
+							</tbody>
+						</table>
+					</div>
+				<?php } ?>
+			</div>
+		</div>
+		<div class="panel panel-default">
+			<div class="panel-heading"><h4><?php echo _('Recent Control API Use'); ?></h4></div>
+			<div class="panel-body">
+				<?php if (empty($controlApiAudit)) { ?>
+					<p class="text-muted"><?php echo _('No Control API audit entries are available.'); ?></p>
+				<?php } else { ?>
+					<div class="sls-help-scroll-table">
+						<table class="table table-condensed table-striped">
+							<thead><tr><th><?php echo _('Time'); ?></th><th><?php echo _('IP'); ?></th><th><?php echo _('Action'); ?></th><th><?php echo _('Status'); ?></th></tr></thead>
+							<tbody>
+								<?php foreach ($controlApiAudit as $event) { ?>
+									<tr>
+										<td><?php echo htmlspecialchars($event['created_at'] ?? ''); ?></td>
+										<td><?php echo htmlspecialchars($event['ip'] ?? ''); ?></td>
+										<td><?php echo htmlspecialchars($event['action'] ?? ''); ?></td>
+										<td><?php echo htmlspecialchars((string)($event['status'] ?? '')); ?></td>
+									</tr>
+								<?php } ?>
+							</tbody>
+						</table>
+					</div>
+				<?php } ?>
+			</div>
+		</div>
+	</div>
 
 	<h3><?php echo _('Core Workflows'); ?></h3>
 	<ul>
 		<li><?php echo _('Live NWS polling runs from cron, reads the centralized config, polls the configured NWS API zone, deduplicates alert chains, applies quiet hours, generates Piper TTS, queues direct Asterisk audio calls, and sends SIP NOTIFY visuals.'); ?></li>
 		<li><?php echo _('Dashboard announcements can send phone SIP NOTIFY text, publish to the SLS Mass Notify desktop API, and optionally queue Piper TTS audio first.'); ?></li>
 		<li><?php echo _('Manual NWS tests use the same direct audio context and SIP NOTIFY sender as live alerts.'); ?></li>
-		<li><?php echo _('Desktop clients poll the token-protected desktop endpoint and display the newest event when latest.id changes.'); ?></li>
+		<li><?php echo _('Desktop clients poll the authenticated desktop endpoint with their assigned username and password, then display the newest event when latest.id changes.'); ?></li>
 	</ul>
 
 	<h3><?php echo _('First-Run Setup'); ?></h3>
@@ -34,8 +168,8 @@ $shellConfigPath = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notific
 		<li><?php echo _('Accept the AGPL-3.0 license notice.'); ?></li>
 		<li><?php echo _('Read and accept the EULA.'); ?></li>
 		<li><?php echo _('Choose whether to enable the NWS weather-alert system.'); ?></li>
-		<li><?php echo _('If NWS is enabled, enter the zone/county code and choose recipient extensions.'); ?></li>
-		<li><?php echo _('Choose Control API, SIP NOTIFY endpoints, TTS voices, TTS volume, and notification log retention.'); ?></li>
+			<li><?php echo _('If NWS is enabled, enter the zone/county code and choose recipient extensions.'); ?></li>
+			<li><?php echo _('Choose Control API, desktop clients, TTS voices, TTS volume, and notification log retention.'); ?></li>
 	</ol>
 	<p><?php echo _('NWS zone/county codes can be found at:'); ?> <a href="https://www.weather.gov/gis/ZoneCounty" target="_blank" rel="noopener noreferrer">https://www.weather.gov/gis/ZoneCounty</a></p>
 
@@ -48,8 +182,8 @@ $shellConfigPath = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notific
 		<li><code>/usr/local/bin/sls_mass_notify/config.ini</code> <?php echo _('generated Python SIP NOTIFY sender configuration.'); ?></li>
 		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_nws_poll.sh</code> <?php echo _('live NWS poller.'); ?></li>
 		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_test.sh</code> <?php echo _('manual test sender.'); ?></li>
-		<li><code>/usr/local/bin/sls_mass_notify/sls_notify.py</code> <?php echo _('SIP NOTIFY and desktop journal publisher.'); ?></li>
-		<li><code>/var/www/html/api/sipnotify</code> <?php echo _('desktop and phone-brand SIP NOTIFY API endpoint.'); ?></li>
+			<li><code>/usr/local/bin/sls_mass_notify/sls_notify.py</code> <?php echo _('SIP NOTIFY and desktop journal publisher.'); ?></li>
+			<li><code>/var/www/html/api/sipnotify</code> <?php echo _('desktop notification API endpoint and SIP NOTIFY compatibility route.'); ?></li>
 		<li><code>/var/www/html/api/sls-mass-notify</code> <?php echo _('optional Control API endpoint.'); ?></li>
 		<li><code>/etc/asterisk/extensions_custom.conf</code> <?php echo _('managed direct audio context sls-alert-audio.'); ?></li>
 	</ul>
@@ -57,14 +191,14 @@ $shellConfigPath = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notific
 	<h3><?php echo _('Central Config, Backup, and Restore'); ?></h3>
 	<p><?php echo _('All user-facing Mass Notifications settings should be stored in the central .config file. Generated runtime files are rebuilt from it and should not be edited as the primary configuration method.'); ?></p>
 	<ul>
-		<li><?php echo _('Download the current .config from Other Settings before major updates.'); ?></li>
+		<li><?php echo _('Download the current .config from General Settings before major updates.'); ?></li>
 		<li><?php echo _('Upload a replacement .config only when intentionally restoring or transplanting a deployment. Replacing it overwrites tokens, endpoints, voices, announcement groups, NWS settings, quiet hours, and retention settings.'); ?></li>
 		<li><?php echo _('FreePBX backup support exports the module settings payload where the module backup hook is available. Keep an external .config backup anyway.'); ?></li>
 	</ul>
 
 	<h3><?php echo _('NWS Weather Alerts'); ?></h3>
 	<ul>
-		<li><?php echo _('NWS polling is optional and can be disabled during setup or from NWS Settings.'); ?></li>
+		<li><?php echo _('NWS polling is optional and can be disabled during setup or from NWS Alerts.'); ?></li>
 		<li><?php echo _('Supported event names are mapped internally to priorities, SIP NOTIFY colors, quiet-hour behavior, and TTS summaries.'); ?></li>
 		<li><?php echo _('Quiet hours suppress non-critical configured alerts. Critical bypass events can still notify during quiet hours.'); ?></li>
 		<li><?php echo _('TTS is limited to short important alert summaries rather than reading the full NWS alert text.'); ?></li>
@@ -72,21 +206,19 @@ $shellConfigPath = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notific
 
 	<h3><?php echo _('Dashboard Announcements'); ?></h3>
 	<ul>
-		<li><?php echo _('The dashboard widget can target online registered extensions, announcement groups, the desktop app, or a combination.'); ?></li>
-		<li><?php echo _('Announcement groups can include online or offline extensions. Offline extensions are skipped when sending and the UI warns the sender.'); ?></li>
+		<li><?php echo _('The dashboard widget can target online registered extensions, all phones, selected desktop clients, all desktops, announcement groups, or a combination.'); ?></li>
+		<li><?php echo _('Announcement groups can include online or offline extensions plus desktop app clients. Offline extensions are skipped when sending and the UI warns the sender.'); ?></li>
 		<li><?php echo _('If TTS Audio is enabled, the module queues opening tone, Piper TTS, and closing tone first, then sends the text notification after the audio starts.'); ?></li>
 		<li><?php echo _('A short cooldown prevents repeated accidental announcement sends.'); ?></li>
 	</ul>
 
 	<h3><?php echo _('SIP NOTIFY and Desktop API'); ?></h3>
-	<p><?php echo _('The base endpoint is generated from the PBX hostname. The desktop endpoint uses a bearer token. Phone-brand endpoints use their configured username and password.'); ?></p>
+	<p><?php echo _('Phones receive SIP NOTIFY pushes directly from Asterisk/PJSIP using their registered endpoints. Desktop clients poll the desktop API with their assigned username and password.'); ?></p>
 	<ul>
-		<li><code>/api/sipnotify</code> <?php echo _('defaults to the desktop JSON endpoint.'); ?></li>
-		<li><code>/api/sipnotify/desktop</code> <?php echo _('returns JSON for the SLS Mass Notify desktop app.'); ?></li>
-		<li><code>/api/sipnotify/yealink</code> <?php echo _('returns Yealink XML payloads.'); ?></li>
-		<li><code>/api/sipnotify/cisco</code>, <code>/polycom</code>, <code>/grandstream</code>, <code>/snom</code>, <code>/fanvil</code>, <code>/mitel</code> <?php echo _('return brand-specific or compatible XML where supported.'); ?></li>
+		<li><code>/api/sipnotify/desktop</code> <?php echo _('returns JSON for the SLS Mass Notify desktop app. Use HTTP Basic authentication with the desktop client username and password configured in General Settings.'); ?></li>
+		<li><?php echo _('Each desktop only receives events sent to all desktops, events targeted to its username, or legacy untargeted records.'); ?></li>
 	</ul>
-	<p><?php echo _('Vendor firmware and provisioning settings can affect XML push behavior. Test each phone brand and firmware before relying on it for emergency workflows.'); ?></p>
+	<p><?php echo _('Vendor firmware and provisioning settings can affect XML push behavior. Test each detected endpoint format and firmware before relying on it for emergency workflows.'); ?></p>
 
 	<h3><?php echo _('Control API'); ?></h3>
 	<p><?php echo _('Endpoint:'); ?> <code><?php echo htmlspecialchars($controlUrl); ?></code></p>
@@ -95,7 +227,8 @@ $shellConfigPath = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notific
 		<li><code>GET ?resource=status</code> <?php echo _('returns status JSON.'); ?></li>
 		<li><code>GET ?resource=events&amp;limit=25</code> <?php echo _('returns recent event records.'); ?></li>
 		<li><code>GET ?resource=config</code> <?php echo _('returns redacted configuration. Add include_secrets=1 only from trusted clients when full credentials are required.'); ?></li>
-		<li><code>POST {"action":"send_announcement","message":"...","targets":["1000"],"groups":["Operations"],"desktop":true,"tts":true}</code> <?php echo _('sends an announcement, optionally with TTS audio and announcement groups.'); ?></li>
+		<li><code>POST {"action":"send_announcement","message":"...","targets":["1000"],"groups":["Operations"],"desktop_clients":["cli_a1b2c3"],"tts":true}</code> <?php echo _('sends an announcement, optionally with TTS audio, phone targets, desktop client IDs, and announcement groups.'); ?></li>
+		<li><code>POST {"action":"send_announcement","message":"...","all_phones":true,"all_desktops":true}</code> <?php echo _('targets every currently available phone and every configured desktop client.'); ?></li>
 		<li><code>POST {"action":"send_announcement","message":"...","style":"colored","title":"Announcement","background_color":"#991b1b"}</code> <?php echo _('renders a colored announcement image where supported by the endpoint format.'); ?></li>
 		<li><code>POST {"action":"trigger_nws_test"}</code> <?php echo _('starts the configured NWS test workflow using normal cooldown and recipient rules.'); ?></li>
 		<li><code>POST {"action":"update_config","settings":{...},"apply":false}</code> <?php echo _('updates allowlisted centralized config fields. Set apply to true only when the remote client should immediately write live config.'); ?></li>
@@ -131,7 +264,7 @@ python3 -m py_compile /usr/local/bin/sls_mass_notify/sls_notify.py</pre>
 
 	<h3><?php echo _('Troubleshooting'); ?></h3>
 	<ul>
-		<li><?php echo _('Desktop app unauthorized: confirm the desktop token under SIP Notify Settings matches the app token and test /api/sipnotify/desktop with Authorization: Bearer <token>.'); ?></li>
+		<li><?php echo _('Desktop app unauthorized: confirm the desktop client is enabled in General Settings and test /api/sipnotify/desktop with that client username and password.'); ?></li>
 		<li><?php echo _('Phone SIP NOTIFY missing: confirm the target extension is registered, AMI user slsmassnotify exists, and /var/log/sls_mass_notify_push.log has no AMI errors.'); ?></li>
 		<li><?php echo _('Audio missing: confirm dialplan show <extension>@sls-alert-audio works, Piper generated a WAV under the TTS folder, and Asterisk can read the generated sound path.'); ?></li>
 		<li><?php echo _('Module says Altered: remove generated caches such as __pycache__ if present, run the local signing helper, then fwconsole reload.'); ?></li>
@@ -147,5 +280,5 @@ python3 -m py_compile /usr/local/bin/sls_mass_notify/sls_notify.py</pre>
 	<p><?php echo _('Report bugs at:'); ?> <a href="https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/issues" target="_blank" rel="noopener noreferrer">https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/issues</a></p>
 	<p><?php echo _('Project information:'); ?> <a href="https://southlandservers.xyz/projects" target="_blank" rel="noopener noreferrer">https://southlandservers.xyz/projects</a></p>
 	<p><?php echo _('Community/support Discord:'); ?> <a href="https://southlandservers.xyz/discord" target="_blank" rel="noopener noreferrer">https://southlandservers.xyz/discord</a></p>
-	<p><?php echo _('Credits: Southland Servers Group, FreePBX/Asterisk, National Weather Service API, Piper TTS, and supported SIP phone vendors.'); ?></p>
-</div>
+		<p><?php echo _('Credits: Southland Servers Group, FreePBX/Asterisk, National Weather Service API, Piper TTS, and supported SIP phone vendors.'); ?></p>
+	</div>

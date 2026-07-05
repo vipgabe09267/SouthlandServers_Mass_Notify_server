@@ -1,6 +1,7 @@
 <?php
 $announcementTargets = is_array($announcement_targets ?? null) ? $announcement_targets : [];
 $announcementGroupTargets = is_array($announcement_group_targets ?? null) ? $announcement_group_targets : $announcementTargets;
+$desktopClients = is_array($announcement_desktop_clients ?? null) ? $announcement_desktop_clients : [];
 $announcementGroups = is_array($announcement_groups ?? null) ? $announcement_groups : [];
 $announcementCooldown = (int)($announcement_cooldown_remaining ?? 0);
 $announcementState = is_array($announcement_state ?? null) ? $announcement_state : [];
@@ -8,6 +9,38 @@ $quietHoursActive = !empty($announcementState['quiet_hours_active']);
 $setupComplete = !empty($setup_complete);
 $setupModal = (string)($setup_modal ?? '');
 ?>
+<style>
+#dashboard-sls-mass-notify-announcement .sls-target-list {
+	max-height: 145px;
+	overflow-y: auto;
+	overflow-x: hidden;
+	padding-right: 6px;
+	margin-bottom: 6px;
+}
+#dashboard-sls-mass-notify-announcement .modal .sls-target-list {
+	max-height: 260px;
+}
+#dashboard-sls-mass-notify-announcement .sls-target-list .checkbox,
+#dashboard-sls-mass-notify-announcement .sls-target-list .checkbox-inline {
+	display: block;
+	min-height: 24px;
+	margin-top: 0;
+	margin-bottom: 6px;
+	overflow-wrap: anywhere;
+	word-break: break-word;
+}
+#dashboard-sls-mass-notify-announcement .sls-target-list .col-sm-4,
+#dashboard-sls-mass-notify-announcement .sls-target-list .col-sm-6,
+#dashboard-sls-mass-notify-announcement .sls-target-list .col-sm-12 {
+	margin-bottom: 4px;
+}
+#dashboard-sls-mass-notify-announcement .sls-dashboard-target-row .form-group {
+	margin-bottom: 10px;
+}
+#dashboard-sls-mass-notify-announcement textarea {
+	resize: vertical;
+}
+</style>
 <div class="container-fluid" id="dashboard-sls-mass-notify-announcement" data-quiet-hours-active="<?php echo $quietHoursActive ? '1' : '0'; ?>">
 	<?php if (!$setupComplete) { ?>
 		<div class="alert alert-warning">
@@ -45,37 +78,78 @@ $setupModal = (string)($setup_modal ?? '');
 		<div class="form-group">
 			<div class="clearfix">
 				<label class="pull-left"><?php echo _('Announcement Groups'); ?></label>
-				<button type="button" class="btn btn-xs btn-default pull-right" id="dashboard-announcement-new-group" <?php echo empty($announcementGroupTargets) ? 'disabled' : ''; ?>><?php echo _('Create New Announcement Group'); ?></button>
+				<button type="button" class="btn btn-xs btn-default pull-right" id="dashboard-announcement-new-group" <?php echo empty($announcementGroupTargets) && empty($desktopClients) ? 'disabled' : ''; ?>><?php echo _('Create New Announcement Group'); ?></button>
 			</div>
 			<div id="dashboard-announcement-groups" style="margin-top: 6px;"></div>
-			<p class="help-block"><?php echo _('Groups can include online or offline extensions. Offline extensions are skipped when an announcement is sent.'); ?></p>
+			<p class="help-block"><?php echo _('Groups can include extensions and desktop app clients. Offline extensions are skipped when an announcement is sent.'); ?></p>
 		</div>
-		<div class="form-group">
-			<label><?php echo _('Individual Extensions'); ?></label>
-			<?php if (empty($announcementTargets)) { ?>
-				<div class="alert alert-warning">
-					<?php echo _('No online registered PJSIP extensions are currently available for SIP NOTIFY.'); ?>
-				</div>
-			<?php } else { ?>
-				<?php foreach ($announcementTargets as $target) { ?>
-					<div class="checkbox">
-						<label>
-							<input type="checkbox" name="announcement_extensions[]" value="<?php echo htmlspecialchars($target['extension']); ?>">
-							<?php echo htmlspecialchars($target['extension']); ?>
-							<?php if ($target['name'] !== '') { ?>
-								<?php echo ' - ' . htmlspecialchars($target['name']); ?>
-							<?php } ?>
-							<span class="text-muted">
-								<?php echo !empty($target['registered']) ? _('registered') : _('not registered'); ?>
-							</span>
-						</label>
+		<div class="row sls-dashboard-target-row">
+			<div class="col-sm-6">
+				<div class="form-group">
+					<div class="clearfix">
+						<label class="pull-left"><?php echo _('Phone Targets'); ?></label>
 					</div>
-				<?php } ?>
-			<?php } ?>
+					<label class="checkbox-inline" style="margin-bottom: 6px;">
+						<input type="checkbox" name="announcement_all_phones" value="1">
+						<?php echo _('All Phones'); ?>
+					</label>
+					<?php if (empty($announcementTargets)) { ?>
+						<div class="alert alert-warning">
+							<?php echo _('No online registered PJSIP extensions are currently available for SIP NOTIFY.'); ?>
+						</div>
+					<?php } else { ?>
+						<div id="dashboard-extension-list" class="row sls-target-list">
+						<?php foreach ($announcementTargets as $target) { ?>
+							<div class="col-sm-12 dashboard-extension-row">
+								<div class="checkbox">
+									<label>
+										<input type="checkbox" name="announcement_extensions[]" value="<?php echo htmlspecialchars($target['extension']); ?>">
+										<?php echo htmlspecialchars($target['extension']); ?>
+										<?php if ($target['name'] !== '') { ?>
+											<?php echo ' - ' . htmlspecialchars($target['name']); ?>
+										<?php } ?>
+										<span class="text-muted">
+											<?php echo !empty($target['registered']) ? _('registered') : _('not registered'); ?>
+										</span>
+									</label>
+								</div>
+							</div>
+						<?php } ?>
+						</div>
+					<?php } ?>
+				</div>
+			</div>
+			<div class="col-sm-6">
+				<div class="form-group">
+					<div class="clearfix">
+						<label class="pull-left"><?php echo _('Desktop App Targets'); ?></label>
+					</div>
+					<label class="checkbox-inline" style="display:block; margin-left: 0;">
+						<input type="checkbox" name="announcement_all_desktops" value="1">
+						<?php echo _('All Desktops'); ?>
+					</label>
+					<?php if (empty($desktopClients)) { ?>
+						<p class="help-block"><?php echo _('No desktop app clients are configured yet. Add clients under Mass Notifications, General Settings.'); ?></p>
+					<?php } else { ?>
+						<div class="row sls-target-list">
+							<?php foreach ($desktopClients as $client) { ?>
+								<?php if (empty($client['enabled'])) { continue; } ?>
+								<div class="col-sm-12 dashboard-desktop-row">
+									<label class="checkbox-inline">
+											<input type="checkbox" name="announcement_desktop_clients[]" value="<?php echo htmlspecialchars($client['username'] ?? ''); ?>">
+											<?php echo htmlspecialchars($client['name'] ?? 'Desktop App'); ?>
+											<span class="text-muted"><?php echo htmlspecialchars($client['client_id'] ?? $client['username'] ?? ''); ?></span>
+								</label>
+							</div>
+							<?php } ?>
+						</div>
+					<?php } ?>
+				</div>
+			</div>
 		</div>
 		<div class="form-group">
 			<label for="dashboard_announcement_body"><?php echo _('Message'); ?></label>
-			<textarea class="form-control" id="dashboard_announcement_body" name="announcement_body" rows="4" maxlength="500" placeholder="<?php echo htmlspecialchars(_('Announcement text')); ?>"></textarea>
+			<textarea class="form-control" id="dashboard_announcement_body" name="announcement_body" rows="3" maxlength="500" placeholder="<?php echo htmlspecialchars(_('Announcement text')); ?>"></textarea>
 			<p class="help-block"><?php echo _('Phones display the title "Announcement" and this message body.'); ?></p>
 		</div>
 		<div class="form-group">
@@ -83,18 +157,12 @@ $setupModal = (string)($setup_modal ?? '');
 			<div class="row">
 				<div class="col-sm-4">
 					<label class="checkbox-inline">
-						<input type="checkbox" name="announcement_mass_notify" value="1" checked>
-						<?php echo _('Desktop App'); ?>
-					</label>
-				</div>
-				<div class="col-sm-4">
-					<label class="checkbox-inline">
 						<input type="checkbox" name="announcement_tts_audio" value="1" checked>
 						<?php echo _('TTS Audio'); ?>
 					</label>
 				</div>
 			</div>
-			<p class="help-block"><?php echo _('Desktop App publishes to SLS Mass Notify. TTS Audio pages selected extensions with the configured opening tone, Piper voice, and closing tone.'); ?></p>
+			<p class="help-block"><?php echo _('TTS Audio pages selected phone extensions with the configured opening tone, Piper voice, and closing tone. Desktop app delivery is controlled by the desktop target selections above.'); ?></p>
 		</div>
 		<button type="submit" id="dashboard-sls-mass-notify-announcement-submit" class="btn btn-warning" <?php echo $announcementCooldown > 0 ? 'disabled' : ''; ?>>
 			<?php echo _('Send Announcement'); ?>
@@ -123,7 +191,7 @@ $setupModal = (string)($setup_modal ?? '');
 							<?php if (empty($announcementGroupTargets)) { ?>
 								<div class="alert alert-warning"><?php echo _('No PJSIP extensions are currently configured.'); ?></div>
 							<?php } else { ?>
-								<div class="row">
+								<div class="row sls-target-list">
 									<?php foreach ($announcementGroupTargets as $target) { ?>
 										<div class="col-sm-4">
 											<label class="checkbox-inline">
@@ -137,6 +205,25 @@ $setupModal = (string)($setup_modal ?? '');
 												</span>
 											</label>
 										</div>
+									<?php } ?>
+								</div>
+							<?php } ?>
+						</div>
+						<div class="form-group">
+							<label><?php echo _('Desktop App Clients'); ?></label>
+							<?php if (empty($desktopClients)) { ?>
+								<div class="alert alert-warning"><?php echo _('No desktop app clients are currently configured.'); ?></div>
+							<?php } else { ?>
+								<div class="row sls-target-list">
+									<?php foreach ($desktopClients as $client) { ?>
+										<?php if (empty($client['enabled'])) { continue; } ?>
+										<div class="col-sm-6">
+											<label class="checkbox-inline">
+													<input type="checkbox" name="group_desktop_clients[]" value="<?php echo htmlspecialchars($client['username'] ?? ''); ?>">
+													<?php echo htmlspecialchars($client['name'] ?? 'Desktop App'); ?>
+													<span class="text-muted"><?php echo htmlspecialchars($client['client_id'] ?? $client['username'] ?? ''); ?></span>
+												</label>
+											</div>
 									<?php } ?>
 								</div>
 							<?php } ?>
@@ -155,6 +242,7 @@ $setupModal = (string)($setup_modal ?? '');
 (function() {
 	var initialGroups = <?php echo json_encode(array_values($announcementGroups), JSON_UNESCAPED_SLASHES); ?>;
 	var onlineExtensions = <?php echo json_encode(array_values(array_map(static function ($target) { return (string)($target['extension'] ?? ''); }, $announcementTargets)), JSON_UNESCAPED_SLASHES); ?>;
+	var desktopClients = <?php echo json_encode(array_values($desktopClients), JSON_UNESCAPED_SLASHES); ?>;
 	var root = document.getElementById('dashboard-sls-mass-notify-announcement');
 	if (!root || root.getAttribute('data-ready') === '1') {
 		return;
@@ -174,6 +262,12 @@ $setupModal = (string)($setup_modal ?? '');
 		return;
 	}
 	var groups = Array.isArray(initialGroups) ? initialGroups : [];
+		var desktopLookup = {};
+		(Array.isArray(desktopClients) ? desktopClients : []).forEach(function(client) {
+			if (client && client.username) {
+				desktopLookup[client.username] = (client.name || client.username) + (client.client_id ? ' (' + client.client_id + ')' : '');
+			}
+		});
 	var onlineLookup = {};
 	onlineExtensions.forEach(function(extension) {
 		if (extension !== '') {
@@ -204,7 +298,16 @@ $setupModal = (string)($setup_modal ?? '');
 			label.appendChild(document.createTextNode(' ' + (group.name || 'Group') + ' '));
 			var muted = document.createElement('span');
 			muted.className = 'text-muted';
-			muted.textContent = '(' + ((group.extensions || []).join(', ')) + ')';
+			var groupParts = [];
+			if ((group.extensions || []).length) {
+				groupParts.push('Phones: ' + (group.extensions || []).join(', '));
+			}
+			if ((group.desktop_clients || []).length) {
+				groupParts.push('Desktops: ' + (group.desktop_clients || []).map(function(username) {
+					return desktopLookup[username] || username;
+				}).join(', '));
+			}
+			muted.textContent = '(' + groupParts.join(' | ') + ')';
 			label.appendChild(muted);
 			row.appendChild(label);
 			var edit = document.createElement('button');
@@ -230,6 +333,11 @@ $setupModal = (string)($setup_modal ?? '');
 		(group.extensions || []).forEach(function(extension) { selected[extension] = true; });
 		Array.prototype.forEach.call(groupForm.querySelectorAll('input[name="group_extensions[]"]'), function(input) {
 			input.checked = !!selected[input.value];
+		});
+		var selectedDesktops = {};
+		(group.desktop_clients || []).forEach(function(username) { selectedDesktops[username] = true; });
+		Array.prototype.forEach.call(groupForm.querySelectorAll('input[name="group_desktop_clients[]"]'), function(input) {
+			input.checked = !!selectedDesktops[input.value];
 		});
 		groupModal.modal('show');
 	}

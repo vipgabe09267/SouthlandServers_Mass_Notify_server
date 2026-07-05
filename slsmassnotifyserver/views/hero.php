@@ -7,7 +7,7 @@
 		<div class="col-md-9" style="padding: 10px 0;">
 			<h1 style="margin-top: 0;"><?php echo _('Southland Servers Mass Notification Plugin'); ?></h1>
 			<p class="text-muted" style="font-size: 16px; margin-bottom: 0; line-height: 1.45;">
-				<?php echo _('SouthlandServers Mass Notification Server is an open-source FreePBX plugin for managing and delivering SIP NOTIFY/EAS-style alerts. It hosts alert payloads over HTTPS and provides a centralized interface for sending Yealink-style XML and image notifications to supported devices and clients.'); ?>
+				<?php echo _('SouthlandServers Mass Notification Server is an open-source FreePBX plugin for managing and delivering SIP NOTIFY/EAS-style alerts. It hosts alert payloads over HTTPS and provides a centralized interface for sending SIP NOTIFY text, image, desktop, and TTS notifications to supported devices and clients.'); ?>
 			</p>
 		</div>
 	</div>

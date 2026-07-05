@@ -35,7 +35,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action
 		$_POST['announcement_body'] ?? '',
 		!empty($_POST['announcement_mass_notify']),
 		!empty($_POST['announcement_tts_audio']),
-		$_POST['announcement_groups'] ?? []
+		$_POST['announcement_groups'] ?? [],
+		[
+			'phones_all' => !empty($_POST['announcement_all_phones']),
+			'desktop_all' => !empty($_POST['announcement_all_desktops']),
+			'desktop_clients' => $_POST['announcement_desktop_clients'] ?? [],
+		]
 	));
 }
 
@@ -43,7 +48,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action
 	slsmassnotifyserver_json_response($slsmassnotifyserver->saveAnnouncementGroup(
 		$_POST['group_id'] ?? '',
 		$_POST['group_name'] ?? '',
-		$_POST['group_extensions'] ?? []
+		$_POST['group_extensions'] ?? [],
+		$_POST['group_desktop_clients'] ?? []
 	));
 }
 

@@ -3,6 +3,10 @@
 $saveResult = $save_result ?? null;
 $applyResult = $apply_result ?? null;
 $hasPendingChanges = !empty($has_pending_changes);
+$settingsDisplay = $settings_display ?? 'slsmassnotifyserver_settings';
+$showTestSection = !empty($show_test_section);
+$testResult = $test_result ?? null;
+$cooldownRemaining = (int)($cooldown_remaining ?? 0);
 $placeholderHelp = "{{event}}, {{severity}}, {{message_type}}, {{audio}}, {{page_group}}, {{alert_id}}, {{zone}}, {{time}}, {{source_name}}, {{trigger_source}}, {{trigger_extension}}, {{trigger_name}}, {{audio_sequence}}";
 $hourOptions = [];
 for ($hour = 0; $hour < 24; $hour++) {
@@ -15,13 +19,13 @@ for ($hour = 0; $hour < 24; $hour++) {
 			<?php echo load_view(__DIR__ . '/hero.php', ['hero_image' => $hero_image]); ?>
 			<div style="display: flex; justify-content: space-between; gap: 15px; align-items: flex-start;">
 				<div>
-					<h1><?php echo _('NWS Settings'); ?></h1>
+					<h1><?php echo $showTestSection ? _('NWS Alerts') : _('NWS Settings'); ?></h1>
 					<p class="text-muted">
-						<?php echo _('Save changes here, then apply them to push the updated configuration into the live scripts.'); ?>
+						<?php echo _('Test and configure weather-alert delivery, then apply saved changes to push the updated configuration into the live scripts.'); ?>
 					</p>
 				</div>
 				<?php if ($hasPendingChanges) { ?>
-					<form method="post" action="config.php?display=slsmassnotifyserver_settings">
+					<form method="post" action="config.php?display=<?php echo htmlspecialchars($settingsDisplay); ?>">
 						<input type="hidden" name="slsmassnotifyserver_action" value="apply_settings">
 						<button type="submit" class="btn btn-danger"><?php echo _('Apply Changes'); ?></button>
 					</form>
@@ -60,7 +64,113 @@ for ($hour = 0; $hour < 24; $hour++) {
 				</div>
 			<?php } ?>
 
-			<form method="post" action="config.php?display=slsmassnotifyserver_settings" enctype="multipart/form-data">
+			<?php if ($showTestSection) { ?>
+				<div class="panel panel-default">
+					<div class="panel-heading">
+						<h3 class="panel-title"><?php echo _('Manual NWS Test'); ?></h3>
+					</div>
+					<div class="panel-body">
+						<p class="text-muted">
+							<?php echo _('Trigger a manual Piper TTS alert using the configured opening and closing tones.'); ?>
+						</p>
+
+						<div id="sls-test-cooldown-alert" class="alert alert-warning" <?php echo empty($cooldownRemaining) ? 'style="display: none;"' : ''; ?>>
+							<span id="sls-test-cooldown-text" data-remaining="<?php echo (int)$cooldownRemaining; ?>">
+								<?php echo !empty($cooldownRemaining) ? sprintf(_('Manual testing is on cooldown. Wait %s seconds before triggering another test.'), (int)$cooldownRemaining) : ''; ?>
+							</span>
+						</div>
+
+						<div id="sls-test-result" style="display: none;"></div>
+
+						<?php if (is_array($testResult)) { ?>
+							<div class="alert alert-<?php echo !empty($testResult['success']) ? 'success' : 'warning'; ?>">
+								<?php echo htmlspecialchars($testResult['message']); ?>
+							</div>
+						<?php } ?>
+
+						<form id="sls-test-form" method="post" action="config.php?display=<?php echo htmlspecialchars($settingsDisplay); ?>">
+							<input type="hidden" name="slsmassnotifyserver_action" value="trigger_test">
+							<input type="hidden" name="ajax" value="1">
+
+							<div class="alert alert-danger">
+								<?php echo _('Warning: this test will trigger all configured NWS audio recipients.'); ?>
+							</div>
+
+							<button type="submit" id="sls-test-submit" class="btn btn-danger" <?php echo !empty($cooldownRemaining) ? 'disabled' : ''; ?>><?php echo _('Trigger Piper TTS Test'); ?></button>
+						</form>
+					</div>
+				</div>
+
+				<script>
+				(function() {
+					var form = document.getElementById('sls-test-form');
+					var submit = document.getElementById('sls-test-submit');
+					var cooldownAlert = document.getElementById('sls-test-cooldown-alert');
+					var cooldownText = document.getElementById('sls-test-cooldown-text');
+					var result = document.getElementById('sls-test-result');
+					if (!form || !submit || !cooldownAlert || !cooldownText || !result) {
+						return;
+					}
+					var remaining = parseInt(cooldownText.getAttribute('data-remaining') || '0', 10) || 0;
+					function renderCooldown() {
+						if (remaining > 0) {
+							submit.disabled = true;
+							cooldownAlert.style.display = 'block';
+							cooldownText.textContent = 'Manual testing is on cooldown. Wait ' + remaining + ' seconds before triggering another test.';
+							return;
+						}
+						submit.disabled = false;
+						cooldownAlert.style.display = 'none';
+						cooldownText.textContent = '';
+					}
+					setInterval(function() {
+						if (remaining > 0) {
+							remaining -= 1;
+							renderCooldown();
+						}
+					}, 1000);
+					setInterval(function() {
+						fetch('config.php?display=<?php echo htmlspecialchars($settingsDisplay); ?>&slsmassnotifyserver_action=cooldowns', {credentials: 'same-origin'})
+							.then(function(response) { return response.json(); })
+							.then(function(data) {
+								if (data && data.cooldowns && data.cooldowns.test) {
+									remaining = parseInt(data.cooldowns.test.remaining || '0', 10) || 0;
+									renderCooldown();
+								}
+							})
+							.catch(function() {});
+					}, 10000);
+					form.addEventListener('submit', function(event) {
+						event.preventDefault();
+						if (remaining > 0 || !confirm('Are you sure you wish to trigger a test? This will trigger all configured NWS recipients.')) {
+							return;
+						}
+						submit.disabled = true;
+						var body = new FormData(form);
+						fetch(form.action, {method: 'POST', credentials: 'same-origin', body: body})
+							.then(function(response) { return response.json(); })
+							.then(function(data) {
+								result.style.display = 'block';
+								result.className = 'alert alert-' + (data && data.success ? 'success' : 'warning');
+								result.textContent = data && data.message ? data.message : 'Test request finished.';
+								if (data && data.cooldowns && data.cooldowns.test) {
+									remaining = parseInt(data.cooldowns.test.remaining || '0', 10) || 0;
+								}
+								renderCooldown();
+							})
+							.catch(function() {
+								result.style.display = 'block';
+								result.className = 'alert alert-danger';
+								result.textContent = 'Test request failed.';
+								renderCooldown();
+							});
+					});
+					renderCooldown();
+				}());
+				</script>
+			<?php } ?>
+
+			<form method="post" action="config.php?display=<?php echo htmlspecialchars($settingsDisplay); ?>" enctype="multipart/form-data">
 				<input type="hidden" name="slsmassnotifyserver_action" value="save_settings">
 
 				<div class="row">
@@ -121,7 +231,7 @@ for ($hour = 0; $hour < 24; $hour++) {
 						<div class="form-group">
 							<label for="mail_to"><?php echo _('Notification Emails'); ?></label>
 							<textarea class="form-control" id="mail_to" name="mail_to" rows="3"><?php echo htmlspecialchars($settings['mail_to']); ?></textarea>
-							<p class="help-block"><?php echo _('Use one recipient per line or separate them with commas. Leave blank to disable notification emails.'); ?></p>
+							<p class="help-block"><?php echo _('Use one recipient per line or separate them with commas. Leave blank to disable notification emails. Messages are sent through the PBX server mail transport/Postfix configuration.'); ?></p>
 						</div>
 					</div>
 					<div class="col-md-4">
@@ -270,6 +380,36 @@ for ($hour = 0; $hour < 24; $hour++) {
 					<strong><?php echo _('Piper Voice'); ?></strong>
 					<div style="margin-top: 8px;"><code><?php echo htmlspecialchars($settings['piper_voice'] ?? '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices/en_US-lessac-low.onnx'); ?></code></div>
 					<div class="text-muted"><?php echo sprintf(_('Maximum spoken summary: %s seconds'), (int)($settings['tts_max_seconds'] ?? 30)); ?></div>
+				</div>
+
+				<h3><?php echo _('Preview'); ?></h3>
+				<p class="help-block"><?php echo _('Preview shows representative generated output only. It does not send SIP NOTIFY, desktop notifications, email, Discord, or audio.'); ?></p>
+				<div class="row">
+					<div class="col-md-6">
+						<label><?php echo _('Example TTS Summary'); ?></label>
+						<pre><?php echo htmlspecialchars(sprintf('Weather alert for %s. Tornado Watch. Conditions are favorable for tornadoes. Monitor official sources and be ready to shelter if warnings are issued.', $settings['nws_zone'] ?: 'your configured zone')); ?></pre>
+					</div>
+					<div class="col-md-6">
+						<label><?php echo _('Example Desktop Payload'); ?></label>
+						<pre><?php echo htmlspecialchars(json_encode([
+							'kind' => 'alert',
+							'event' => 'Tornado Watch',
+							'priority' => 'urgent',
+							'zone' => $settings['nws_zone'] ?? '',
+							'description' => 'Representative NWS alert summary.',
+						], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)); ?></pre>
+					</div>
+				</div>
+				<div class="row">
+					<div class="col-md-6">
+						<label><?php echo _('Example Phone XML'); ?></label>
+						<pre><?php echo htmlspecialchars("<YealinkIPPhoneTextScreen Beep='yes' Timeout='0'>\n  <Title>NWS ALERT</Title>\n  <Text>Tornado Watch for " . ($settings['nws_zone'] ?: 'configured zone') . "</Text>\n</YealinkIPPhoneTextScreen>"); ?></pre>
+					</div>
+					<div class="col-md-6">
+						<label><?php echo _('Example Email Subject'); ?></label>
+						<pre><?php echo htmlspecialchars(str_replace('{{event}}', 'Tornado Watch', (string)($settings['alert_email_subject'] ?? 'NWS alert triggered - {{event}}'))); ?></pre>
+						<p class="help-block"><?php echo _('Emails use the PBX server mail transport/Postfix configuration.'); ?></p>
+					</div>
 				</div>
 
 				<div style="margin-top: 20px;">

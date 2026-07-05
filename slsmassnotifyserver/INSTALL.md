@@ -39,7 +39,7 @@ After installing the module:
 7. Select NWS recipient extensions.
 8. Configure quiet hours and critical bypass events.
 9. Choose whether to enable the Control API. It is disabled by default.
-10. Select the SIP NOTIFY phone-brand endpoints to expose.
+10. Configure desktop app clients and confirm phone SIP NOTIFY delivery. Phones receive pushes directly through Asterisk/PJSIP; no per-brand API endpoint setup is required.
 11. Select the announcement TTS voice and NWS TTS voice.
 12. Set announcement and NWS TTS volumes.
 13. Set notification log retention.
@@ -54,7 +54,7 @@ fwconsole reload
 
 NWS zone codes can be found from weather.gov forecast and alert pages. County codes look like `TXC491`; forecast zones look like `TXZ163`.
 
-`fwconsole ma install` cannot safely ask interactive questions, so the mandatory setup wizard is implemented as this first-run FreePBX UI modal. Leave NWS disabled if the deployment only needs manual announcements, desktop notifications, or SIP NOTIFY endpoints.
+`fwconsole ma install` cannot safely ask interactive questions, so the mandatory setup wizard is implemented as this first-run FreePBX UI modal. Leave NWS disabled if the deployment only needs manual announcements, desktop notifications, SIP NOTIFY phone pushes, or TTS audio.
 
 ## Update Safety
 
@@ -64,7 +64,7 @@ Module code is installed under FreePBX modules. Runtime configuration is stored 
 /var/lib/asterisk/SLS_Mass_Notifications_Plugin
 ```
 
-Updates should not overwrite the central settings file. Use **Other Settings > Download .config** before major updates.
+Updates should not overwrite the central settings file. Use **General Settings > Download .config** before major updates.
 
 ## FAQ
 
@@ -82,11 +82,11 @@ The source of truth is:
 
 ### What should be backed up?
 
-Back up the central `.config` file. The UI also provides download/upload controls under **Other Settings > Danger Zone**.
+Back up the central `.config` file. The UI also provides download/upload controls under **General Settings > Danger Zone**.
 
 ### Can I install without NWS weather alerts?
 
-Yes. Leave NWS disabled and use dashboard announcements, desktop notifications, SIP NOTIFY endpoints, and TTS audio.
+Yes. Leave NWS disabled and use dashboard announcements, desktop notifications, SIP NOTIFY phone pushes, and TTS audio.
 
 ### Does audio require a FreePBX paging group?
 
