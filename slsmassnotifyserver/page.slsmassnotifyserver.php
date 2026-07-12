@@ -6,13 +6,31 @@ $saveResult = null;
 $setupResult = $_SESSION['slsmassnotifyserver_setup_result'] ?? null;
 unset($_SESSION['slsmassnotifyserver_setup_result']);
 
-function slsmassnotifyserver_json_response(array $payload)
+function slsmassnotifyserver_json_response(array $payload, $status = 200)
 {
 	while (ob_get_level() > 0) {
 		@ob_end_clean();
 	}
+	http_response_code((int)$status);
 	header('Content-Type: application/json');
+	header('Cache-Control: no-store');
+	header('X-Content-Type-Options: nosniff');
 	echo json_encode($payload);
+	exit;
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$slsmassnotifyserver->validateCsrfToken($_POST['slsmassnotifyserver_csrf'] ?? '')) {
+	$csrfResult = [
+		'success' => false,
+		'message' => _('The request security token is invalid or expired. Reload the page and try again.'),
+		'cooldown_remaining' => 0,
+	];
+	$csrfAction = (string)($_POST['slsmassnotifyserver_action'] ?? '');
+	if (in_array($csrfAction, ['send_announcement', 'save_announcement_group', 'delete_announcement_group'], true)) {
+		slsmassnotifyserver_json_response($csrfResult, 403);
+	}
+	$_SESSION['slsmassnotifyserver_setup_result'] = $csrfResult;
+	header('Location: config.php?display=slsmassnotifyserver');
 	exit;
 }
 

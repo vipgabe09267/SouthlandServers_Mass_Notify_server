@@ -4,7 +4,6 @@ $controlUrl = $control_api_url ?? '';
 $modulePath = dirname(__DIR__);
 $moduleRaw = basename($modulePath);
 $settingsPath = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config';
-$shellConfigPath = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.conf';
 $diagnostics = is_array($diagnostics ?? null) ? $diagnostics : [];
 $endpointDiagnostics = array_values((array)($diagnostics['endpoints'] ?? []));
 $desktopDiagnostics = array_values((array)($diagnostics['desktop_clients'] ?? []));
@@ -50,6 +49,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 		<li><?php echo _('Custom/local FreePBX module signatures normally show as Unknown. Altered means the module should be signed again on that PBX.'); ?></li>
 		<li><?php echo _('General Settings shows the installed package version and whether the known release status is LATEST or an update is available.'); ?></li>
 	</ul>
+	<p><?php echo _('Generated phone images use the Public PBX Hostname and Phone Image Transport configured in General Settings. HTTP is the compatibility default for legacy Yealink models such as the T48G. Select HTTPS only when target phones trust the PBX certificate and support its TLS configuration; authenticated APIs remain HTTPS.'); ?></p>
 
 	<h3><?php echo _('Diagnostics'); ?></h3>
 	<div class="sls-help-diagnostics">
@@ -80,18 +80,21 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 			<?php } else { ?>
 				<div class="sls-help-scroll-table">
 					<table class="table table-condensed table-striped">
-						<thead><tr><th><?php echo _('Ext'); ?></th><th><?php echo _('Format'); ?></th><th><?php echo _('User Agent'); ?></th></tr></thead>
+						<thead><tr><th><?php echo _('Ext'); ?></th><th><?php echo _('Format'); ?></th><th><?php echo _('Contacts'); ?></th><th><?php echo _('User Agent'); ?></th></tr></thead>
 						<tbody>
 							<?php foreach ($endpointDiagnostics as $endpoint) { ?>
 								<tr>
 									<td><?php echo htmlspecialchars($endpoint['extension'] ?? ''); ?></td>
 									<td>
+										<?php $formats = array_values((array)($endpoint['formats'] ?? [$endpoint['format'] ?? 'unknown'])); ?>
 										<?php if (!empty($endpoint['unknown'])) { ?>
 											<span class="label label-warning">&#9733; <?php echo _('Unknown'); ?></span>
 										<?php } else { ?>
-											<span class="label label-info"><?php echo htmlspecialchars($endpoint['format'] ?? ''); ?></span>
+											<span class="label label-info"><?php echo htmlspecialchars(implode(', ', $formats)); ?></span>
 										<?php } ?>
+										<?php if (!empty($endpoint['override'])) { ?><span class="label label-default"><?php echo _('override'); ?></span><?php } ?>
 									</td>
+									<td><?php echo (int)($endpoint['contacts'] ?? 1); ?></td>
 									<td><?php echo htmlspecialchars($endpoint['user_agent'] ?? ''); ?></td>
 								</tr>
 							<?php } ?>
@@ -178,21 +181,23 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 		<li><code><?php echo htmlspecialchars($modulePath); ?></code> <?php echo sprintf(_('FreePBX module UI and PHP class for module raw name %s.'), htmlspecialchars($moduleRaw)); ?></li>
 		<li><code><?php echo htmlspecialchars($settingsPath); ?></code> <?php echo _('central applied configuration file. This JSON .config file is the source of truth for local settings.'); ?></li>
 		<li><code>/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.pending.config</code> <?php echo _('staged settings waiting for Apply Config.'); ?></li>
-		<li><code><?php echo htmlspecialchars($shellConfigPath); ?></code> <?php echo _('generated shell configuration consumed by scripts.'); ?></li>
-		<li><code>/usr/local/bin/sls_mass_notify/config.ini</code> <?php echo _('generated Python SIP NOTIFY sender configuration.'); ?></li>
 		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_nws_poll.sh</code> <?php echo _('live NWS poller.'); ?></li>
 		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_test.sh</code> <?php echo _('manual test sender.'); ?></li>
-			<li><code>/usr/local/bin/sls_mass_notify/sls_notify.py</code> <?php echo _('SIP NOTIFY and desktop journal publisher.'); ?></li>
-			<li><code>/var/www/html/api/sipnotify</code> <?php echo _('desktop notification API endpoint and SIP NOTIFY compatibility route.'); ?></li>
+		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh</code> <?php echo _('root-owned automatic beta updater.'); ?></li>
+		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_maintenance.sh</code> <?php echo _('root-owned worker for queued installation repairs.'); ?></li>
+		<li><code>/usr/local/bin/sls_mass_notify/piper/venv</code> <?php echo _('root-owned Piper executable environment.'); ?></li>
+		<li><code>/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices</code> <?php echo _('checksum-verified Piper voice models.'); ?></li>
+		<li><code>/usr/local/bin/sls_mass_notify/sls_notify.py</code> <?php echo _('SIP NOTIFY and desktop journal publisher.'); ?></li>
+		<li><code>/var/www/html/api/sipnotify</code> <?php echo _('authenticated desktop notification API endpoint.'); ?></li>
 		<li><code>/var/www/html/api/sls-mass-notify</code> <?php echo _('optional Control API endpoint.'); ?></li>
 		<li><code>/etc/asterisk/extensions_custom.conf</code> <?php echo _('managed direct audio context sls-alert-audio.'); ?></li>
 	</ul>
 
 	<h3><?php echo _('Central Config, Backup, and Restore'); ?></h3>
-	<p><?php echo _('All user-facing Mass Notifications settings should be stored in the central .config file. Generated runtime files are rebuilt from it and should not be edited as the primary configuration method.'); ?></p>
+	<p><?php echo _('All user-facing Mass Notifications settings are stored in the central .config file. Runtime programs read that JSON source directly; there is no generated shell or Python settings copy to drift out of sync.'); ?></p>
 	<ul>
 		<li><?php echo _('Download the current .config from General Settings before major updates.'); ?></li>
-		<li><?php echo _('Upload a replacement .config only when intentionally restoring or transplanting a deployment. Replacing it overwrites tokens, endpoints, voices, announcement groups, NWS settings, quiet hours, and retention settings.'); ?></li>
+		<li><?php echo _('Upload a replacement .config only when intentionally restoring or transplanting a deployment. Replacing it overwrites credentials, desktop clients, phone overrides, voices, announcement groups, NWS settings, quiet hours, and retention settings.'); ?></li>
 		<li><?php echo _('FreePBX backup support exports the module settings payload where the module backup hook is available. Keep an external .config backup anyway.'); ?></li>
 	</ul>
 
@@ -216,7 +221,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 	<p><?php echo _('Phones receive SIP NOTIFY pushes directly from Asterisk/PJSIP using their registered endpoints. Desktop clients poll the desktop API with their assigned username and password.'); ?></p>
 	<ul>
 		<li><code>/api/sipnotify/desktop</code> <?php echo _('returns JSON for the SLS Mass Notify desktop app. Use HTTP Basic authentication with the desktop client username and password configured in General Settings.'); ?></li>
-		<li><?php echo _('Each desktop only receives events sent to all desktops, events targeted to its username, or legacy untargeted records.'); ?></li>
+		<li><?php echo _('Each desktop only receives events sent to all desktops or events explicitly targeted to its username. Legacy records without routing fields are denied.'); ?></li>
 	</ul>
 	<p><?php echo _('Vendor firmware and provisioning settings can affect XML push behavior. Test each detected endpoint format and firmware before relying on it for emergency workflows.'); ?></p>
 
@@ -226,7 +231,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 	<ul>
 		<li><code>GET ?resource=status</code> <?php echo _('returns status JSON.'); ?></li>
 		<li><code>GET ?resource=events&amp;limit=25</code> <?php echo _('returns recent event records.'); ?></li>
-		<li><code>GET ?resource=config</code> <?php echo _('returns redacted configuration. Add include_secrets=1 only from trusted clients when full credentials are required.'); ?></li>
+		<li><code>GET ?resource=config</code> <?php echo _('returns configuration with API keys, AMI credentials, desktop encryption material, desktop passwords, and webhooks redacted. Secrets are never returned by this API.'); ?></li>
 		<li><code>POST {"action":"send_announcement","message":"...","targets":["1000"],"groups":["Operations"],"desktop_clients":["cli_a1b2c3"],"tts":true}</code> <?php echo _('sends an announcement, optionally with TTS audio, phone targets, desktop client IDs, and announcement groups.'); ?></li>
 		<li><code>POST {"action":"send_announcement","message":"...","all_phones":true,"all_desktops":true}</code> <?php echo _('targets every currently available phone and every configured desktop client.'); ?></li>
 		<li><code>POST {"action":"send_announcement","message":"...","style":"colored","title":"Announcement","background_color":"#991b1b"}</code> <?php echo _('renders a colored announcement image where supported by the endpoint format.'); ?></li>
@@ -243,7 +248,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 		<li><?php echo _('Piper voices are selected separately for announcements and NWS alerts.'); ?></li>
 		<li><?php echo _('Volume controls are saved as percentages and applied to the final Asterisk WAV conversion.'); ?></li>
 		<li><?php echo _('Generated Piper speech defaults to 30 seconds and can be capped anywhere from 1 to 600 seconds.'); ?></li>
-		<li><?php echo _('Opening and closing tones can be selected or uploaded from the SIP Notify/NWS settings pages.'); ?></li>
+		<li><?php echo _('Opening and closing tones can be selected or uploaded from General Settings and NWS Alerts.'); ?></li>
 		<li><?php echo _('Audio delivery uses the private Asterisk context sls-alert-audio and does not require a public paging group such as *6767.'); ?></li>
 	</ul>
 

@@ -29,6 +29,7 @@ class SlsMassNotifyAnnouncement {
 				'announcement_groups' => $module->getAnnouncementGroups(),
 				'announcement_cooldown_remaining' => $module->getCooldownState()['announcement']['remaining'] ?? 0,
 				'announcement_state' => $module->getAnnouncementDashboardState(),
+				'csrf_token' => $module->getCsrfToken(),
 			]);
 		} catch (\Throwable $e) {
 			return '<div class="alert alert-warning">' . htmlspecialchars(_('Unable to load SIP NOTIFY announcement controls.')) . '</div>';

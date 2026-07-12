@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.0.5-beta
+
+- Added a separate Phone Image Transport setting. Hosted phone images default to HTTP for legacy Yealink compatibility while authenticated Control and desktop APIs remain HTTPS.
+- Fixed Yealink T48G XML loading failures by removing an undocumented ImageScreen attribute rejected by stricter legacy firmware and using a UTF-8 XML declaration.
+- Fixed uninstall cleanup so FreePBX-managed AMI users are removed from the Manager database instead of allowing `/etc/asterisk/slsmassnotify` to be regenerated on every reload.
+- Removed nested module reinstalls from the FreePBX uninstall hook, cleaned Apache enabled/disabled state, avoided restoring stale Dashboard backups, and added post-uninstall database, file, and stock-module signature verification.
+- Added a scoped PHP CLI compatibility path for FreePBX commands on restricted LXC systems where PCRE JIT memory allocation is denied, without changing the server-wide PHP configuration.
+- Fixed Control API authentication behind Apache rewrites by preserving `Authorization` on both API routes and accepting `X-API-Key` as an alternate header.
+- Added strict Control API JSON size/content-type checks, constant-time key comparison, optional IPv4/IPv6 allowlisting, optional per-IP rate limiting, bounded audit history, and secret-free config responses.
+- Added CSRF validation to every FreePBX state-changing form/AJAX action and HTML-safe JSON encoding for dashboard group, desktop, and extension data.
+- Fixed central-config saves that could overwrite unrelated desktop clients, announcement groups, credentials, phone overrides, or NWS settings. Applied and pending config writes are now locked, private, and atomically replaced.
+- Removed generated shell/Python settings copies. PHP, shell, Python, desktop API, and Control API now read the central `mass-notifications.config` directly so credentials and settings cannot drift between files.
+- Added a configurable Public PBX Hostname for desktop/API/media URLs, fixing systems that generated an unreachable short host such as `https://pbx/...`.
+- Fixed desktop event authorization so each client only receives explicitly targeted or all-desktop records; legacy untargeted records are denied and one client's poll no longer removes another client's events.
+- Fixed NWS status writes that could fail while delivery continued, validated GeoJSON structure before reporting a successful poll, and added actionable feature/event counts to status diagnostics.
+- Hardened NWS requests with bounded retries, IPv4 fallback, response-size limits, an explicit `status=actual` query, and the required project User-Agent. Failed TTS or visual delivery is no longer marked processed, allowing a later poll to retry without replaying audio already queued.
+- Fixed alert-chain deduplication so time-only updates and referenced reissues do not repeatedly page, while dry runs never mark an alert processed or send email, Discord, audio, phone, or desktop notifications.
+- Improved multi-contact extension handling by retaining every reachable PJSIP contact, detecting all vendor formats present, logging the decision, and supporting per-extension manual overrides including `yealink_text` fallback.
+- Fixed Yealink image consistency and delay by rendering one canonical 8-bit, non-interlaced PNG/XML payload per send and reusing it for phone and desktop delivery. Generated phone media/XML names now include cryptographically random components.
+- Corrected Cisco Multiplatform payload delivery to use the documented `XML-Service` event with a hosted `CiscoIPPhoneExecute`/`CiscoIPPhoneText` flow, while documenting the vendor's digest-authentication requirement.
+- Added one second of leading silence to the single combined NWS/test/announcement WAV so auto-answer setup cannot clip the opening tone. The dialplan now filters sound-path characters before playback.
+- Moved the Piper executable environment into the root-owned runtime tree while keeping models and generated audio in the Asterisk data tree. The installer pins packaging tools, installs `piper-tts==1.4.2`, and verifies every voice model against a pinned revision and SHA-256 hash.
+- Fixed the Repair Installation button so it queues a real root-owned maintenance worker instead of reporting success when the FreePBX web user lacked permission to repair system files.
+- Reworked automatic beta updates as a root-owned, disabled-by-default job restricted to the official repository, exact beta tags, GitHub-provided SHA-256 asset digests, and the installer from the same immutable tag.
+- Hardened release installation with config hash preservation, safe TGZ path/type/size validation, runtime permission repair after `fwconsole chown`, API/dialplan/Piper smoke tests, and trusted local verification of the SLS, Dashboard, and Framework files modified by the integration.
+- Reworked uninstall cleanup to remove runtime, cron, API, Apache, signing-key trust, dashboard/framework integration, and obsolete menu artifacts while preserving the central config, config backups, and uploaded tones unless an explicit purge is requested.
+- Added a release build gate that checks PHP/shell/Python/XML syntax, duplicate documentation parity, required files, embedded credentials, generated artifacts, unsafe archive members, expanded size, module identity, and reproducible TGZ metadata before packaging.
+
 ## 0.0.4-beta
 
 - Added Help diagnostics for runtime health, detected phone endpoint formats, desktop client last-seen state, and recent Control API use.

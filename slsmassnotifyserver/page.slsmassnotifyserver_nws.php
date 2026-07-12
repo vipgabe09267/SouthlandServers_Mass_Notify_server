@@ -19,6 +19,24 @@ if (($_REQUEST['slsmassnotifyserver_action'] ?? '') === 'cooldowns') {
 	exit;
 }
 
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$slsmassnotifyserver->validateCsrfToken($_POST['slsmassnotifyserver_csrf'] ?? '')) {
+	$result = [
+		'success' => false,
+		'message' => _('The request security token is invalid or expired. Reload the page and try again.'),
+		'errors' => [],
+	];
+	if (($_POST['ajax'] ?? '') === '1') {
+		http_response_code(403);
+		header('Content-Type: application/json');
+		header('Cache-Control: no-store');
+		echo json_encode($result);
+		exit;
+	}
+	$_SESSION['slsmassnotifyserver_save_result'] = $result;
+	header('Location: config.php?display=slsmassnotifyserver_nws');
+	exit;
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 	$action = $_POST['slsmassnotifyserver_action'] ?? '';
 	if ($action === 'trigger_test') {

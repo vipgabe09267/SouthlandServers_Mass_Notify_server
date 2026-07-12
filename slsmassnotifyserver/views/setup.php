@@ -4,15 +4,7 @@ $settings = is_array($settings ?? null) ? $settings : [];
 $saveResult = $save_result ?? null;
 $extensions = is_array($available_extensions ?? null) ? $available_extensions : [];
 $voices = is_array($available_voices ?? null) ? $available_voices : [];
-$brandOptions = is_array($brands ?? null) ? $brands : [];
 $setup = is_array($settings['setup'] ?? null) ? $settings['setup'] : [];
-$sipnotify = is_array($settings['sipnotify'] ?? null) ? $settings['sipnotify'] : [];
-$endpointMap = [];
-foreach ((array)($sipnotify['endpoints'] ?? []) as $endpoint) {
-	if (is_array($endpoint) && !empty($endpoint['slug'])) {
-		$endpointMap[$endpoint['slug']] = $endpoint;
-	}
-}
 $criticalEvents = is_array($settings['quiet_critical_events'] ?? null) ? $settings['quiet_critical_events'] : [];
 $selectedRecipients = array_fill_keys((array)($settings['alert_recipients'] ?? []), true);
 $dismissible = !empty($dismissible);
@@ -104,8 +96,9 @@ $dismissible = !empty($dismissible);
 				</div>
 			<?php } ?>
 
-			<form method="post" action="config.php?display=slsmassnotifyserver">
-				<input type="hidden" name="slsmassnotifyserver_action" value="save_setup_wizard">
+				<form method="post" action="config.php?display=slsmassnotifyserver">
+					<input type="hidden" name="slsmassnotifyserver_action" value="save_setup_wizard">
+					<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars((string)($csrf_token ?? '')); ?>">
 
 				<h3><?php echo _('Required Acknowledgements'); ?></h3>
 				<div class="checkbox">
@@ -202,6 +195,19 @@ $dismissible = !empty($dismissible);
 
 				<h3><?php echo _('Remote API'); ?></h3>
 				<div class="form-group">
+					<label><?php echo _('Public PBX Hostname'); ?></label>
+					<input class="form-control" name="public_pbx_host" value="<?php echo htmlspecialchars($settings['public_pbx_host'] ?? ($settings['sipnotify']['pbx_host'] ?? '')); ?>" placeholder="pbx.example.com">
+					<p class="help-block"><?php echo _('Used for desktop API links and phone image URLs. Change this if auto-detection shows only a short hostname such as pbx.'); ?></p>
+				</div>
+				<div class="form-group">
+					<label><?php echo _('Phone Image Transport'); ?></label>
+					<select class="form-control" name="sipnotify_media_scheme">
+						<option value="http" <?php echo (($settings['sipnotify']['media_scheme'] ?? 'http') === 'http') ? 'selected' : ''; ?>><?php echo _('HTTP - Legacy phone compatibility'); ?></option>
+						<option value="https" <?php echo (($settings['sipnotify']['media_scheme'] ?? 'http') === 'https') ? 'selected' : ''; ?>><?php echo _('HTTPS - Requires phone-compatible certificate and TLS'); ?></option>
+					</select>
+					<p class="help-block"><?php echo _('This affects generated phone image files only. Control and desktop API authentication remain HTTPS.'); ?></p>
+				</div>
+				<div class="form-group">
 					<label><?php echo _('Enable Control API'); ?></label>
 					<select class="form-control" name="control_api_enabled">
 						<option value="0" <?php echo empty($settings['control_api']['enabled']) ? 'selected' : ''; ?>><?php echo _('No'); ?></option>
@@ -210,26 +216,8 @@ $dismissible = !empty($dismissible);
 					<p class="help-block"><?php echo htmlspecialchars($settings['control_api']['base_url'] ?? ''); ?></p>
 				</div>
 
-				<h3><?php echo _('SIP NOTIFY Endpoints'); ?></h3>
-				<div class="row">
-					<?php foreach ($endpointMap as $slug => $endpoint) { ?>
-						<div class="col-md-3">
-							<label class="checkbox-inline">
-								<input type="checkbox" name="sipnotify_endpoints[<?php echo htmlspecialchars($slug); ?>]" value="1" <?php echo !empty($endpoint['enabled']) ? 'checked' : ''; ?>>
-								<?php echo htmlspecialchars($endpoint['brand'] ?? ucfirst($slug)); ?>
-							</label>
-						</div>
-					<?php } ?>
-					<?php foreach ($brandOptions as $slug => $brand) { ?>
-						<?php if (isset($endpointMap[$slug])) { continue; } ?>
-						<div class="col-md-3">
-							<label class="checkbox-inline">
-								<input type="checkbox" name="sipnotify_endpoints[<?php echo htmlspecialchars($slug); ?>]" value="1">
-								<?php echo htmlspecialchars($brand); ?>
-							</label>
-						</div>
-					<?php } ?>
-				</div>
+				<h3><?php echo _('SIP NOTIFY Phones'); ?></h3>
+				<p class="help-block"><?php echo _('Phone notifications are sent directly through Asterisk/PJSIP to registered extensions. The sender detects common phone vendors from registered contacts. Manual format overrides can be added later in General Settings if an endpoint is unknown or needs a forced format.'); ?></p>
 
 				<h3><?php echo _('TTS Settings'); ?></h3>
 				<?php

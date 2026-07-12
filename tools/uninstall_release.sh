@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+umask 027
+
 MODULE="${SLS_MASS_NOTIFY_MODULE:-slsmassnotifyserver}"
 DATA_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin"
+SIGN_HOME="/root/.gnupg-sls-mass-notify"
+PURGE_CONFIG="${SLS_MASS_NOTIFY_PURGE_CONFIG:-0}"
 CONFIG_TMP=""
+SIGNING_FINGERPRINT=""
 
 log() {
   printf '%s\n' "$*"
@@ -20,50 +25,146 @@ require_freepbx() {
   }
 }
 
-preserve_config() {
-  [ -d "$DATA_DIR" ] || return 0
-  CONFIG_TMP="$(mktemp -d /tmp/slsmassnotifyserver-config.XXXXXX)"
-  for name in \
-    mass-notifications.config \
-    mass-notifications.pending.config \
-    mass-notifications.conf \
-    mass-notifications-settings.json \
-    mass-notifications-settings.pending.json
-  do
-    [ -f "$DATA_DIR/$name" ] && cp -p "$DATA_DIR/$name" "$CONFIG_TMP/$name"
-  done
-  find "$DATA_DIR" -maxdepth 1 -type f \( -name '*.config' -o -name '*.conf' \) -exec cp -p {} "$CONFIG_TMP/" \; 2>/dev/null || true
+run_fwconsole() {
+  # PCRE JIT allocation can be denied by otherwise healthy unprivileged LXC
+  # containers. Limit this compatibility override to the uninstall process.
+  php -d pcre.jit=0 "$(command -v fwconsole)" "$@"
 }
 
-restore_config() {
+module_registry_exists() {
+  SLS_MODULE_NAME="$MODULE" php -d pcre.jit=0 -r '
+$bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
+require "/etc/freepbx.conf";
+$statement = \FreePBX::Database()->prepare("SELECT COUNT(*) FROM modules WHERE modulename = ?");
+$statement->execute([(string)getenv("SLS_MODULE_NAME")]);
+exit((int)$statement->fetchColumn() > 0 ? 0 : 1);
+'
+}
+
+remove_module_registration() {
+  if module_registry_exists; then
+    if ! run_fwconsole ma uninstall "$MODULE" >/tmp/slsmassnotifyserver-uninstall-module.log 2>&1; then
+      log "FreePBX reported an error while uninstalling $MODULE; checking whether its registry row was removed."
+    fi
+  fi
+  if module_registry_exists; then
+    run_fwconsole ma disable "$MODULE" >>/tmp/slsmassnotifyserver-uninstall-module.log 2>&1 || true
+    run_fwconsole ma delete "$MODULE" >>/tmp/slsmassnotifyserver-uninstall-module.log 2>&1 || true
+  fi
+  if module_registry_exists; then
+    log "FreePBX left the $MODULE registry row behind; removing that single stale row before deleting module files."
+    SLS_MODULE_NAME="$MODULE" php -d pcre.jit=0 -r '
+$bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
+require "/etc/freepbx.conf";
+$statement = \FreePBX::Database()->prepare("DELETE FROM modules WHERE modulename = ?");
+$statement->execute([(string)getenv("SLS_MODULE_NAME")]);
+exit(0);
+'
+  fi
+  if module_registry_exists; then
+    log "Unable to remove the $MODULE registry row. Module files were not deleted."
+    return 1
+  fi
+  rm -rf "/var/www/html/admin/modules/$MODULE"
+}
+
+capture_signing_fingerprint() {
+  [ -d "$SIGN_HOME" ] || return 0
+  SIGNING_FINGERPRINT="$(GNUPGHOME="$SIGN_HOME" gpg --batch --with-colons --list-keys 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')"
+}
+
+preserve_user_data() {
+  [ "$PURGE_CONFIG" != "1" ] || return 0
+  [ -d "$DATA_DIR" ] || return 0
+  CONFIG_TMP="$(mktemp -d /tmp/slsmassnotifyserver-config.XXXXXX)"
+  for name in mass-notifications.config mass-notifications.pending.config; do
+    [ -f "$DATA_DIR/$name" ] && cp -p "$DATA_DIR/$name" "$CONFIG_TMP/$name"
+  done
+  [ -d "$DATA_DIR/config-backups" ] && cp -a "$DATA_DIR/config-backups" "$CONFIG_TMP/config-backups"
+  # Uploaded tones are binary user data referenced by the central config.
+  [ -d "$DATA_DIR/sounds/tones" ] && {
+    mkdir -p "$CONFIG_TMP/sounds"
+    cp -a "$DATA_DIR/sounds/tones" "$CONFIG_TMP/sounds/tones"
+  }
+}
+
+restore_user_data() {
   [ -n "$CONFIG_TMP" ] && [ -d "$CONFIG_TMP" ] || return 0
-  if find "$CONFIG_TMP" -type f | grep -q .; then
+  if find "$CONFIG_TMP" -type f -print -quit | grep -q .; then
     mkdir -p "$DATA_DIR"
-    cp -p "$CONFIG_TMP"/* "$DATA_DIR/" 2>/dev/null || true
+    cp -a "$CONFIG_TMP"/. "$DATA_DIR/"
     chown -R asterisk:asterisk "$DATA_DIR" 2>/dev/null || true
     chmod 0750 "$DATA_DIR" 2>/dev/null || true
-    find "$DATA_DIR" -maxdepth 1 -type f -exec chmod 0640 {} + 2>/dev/null || true
+    [ -d "$DATA_DIR/config-backups" ] && chmod 0750 "$DATA_DIR/config-backups" 2>/dev/null || true
+    [ -d "$DATA_DIR/sounds" ] && chmod 0755 "$DATA_DIR/sounds" 2>/dev/null || true
+    [ -d "$DATA_DIR/sounds/tones" ] && chmod 0755 "$DATA_DIR/sounds/tones" 2>/dev/null || true
+    find "$DATA_DIR" -maxdepth 1 -type f -name '*.config' -exec chmod 0640 {} + 2>/dev/null || true
+    find "$DATA_DIR/config-backups" -type f -exec chmod 0640 {} + 2>/dev/null || true
+    find "$DATA_DIR/sounds/tones" -type f -name '*.wav' -exec chmod 0644 {} + 2>/dev/null || true
   fi
   rm -rf "$CONFIG_TMP"
+  CONFIG_TMP=""
 }
 
 remove_menu_patch() {
   local path="/var/www/html/admin/views/menu_items.php"
   [ -w "$path" ] || return 0
   python3 - "$path" <<'PY'
+import re
 import sys
+
 path = sys.argv[1]
 with open(path, "r", encoding="utf-8", errors="ignore") as handle:
     data = handle.read()
-start = "\t// SLS Mass Notifications menu placement: keep Mass Notifications after UCP/User Panel.\n"
-needle = "\telse if ($a == 'other')\n\t\treturn 1;\n"
-idx = data.find(start)
-if idx != -1:
-    end = data.find(needle, idx)
-    if end != -1:
-        data = data[:idx] + data[end:]
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(data)
+
+data = re.sub(
+    r"\t// SLS Mass Notifications menu placement:.*?(?=\telse if \(\$a == 'other'\)\n\t\treturn 1;\n)",
+    "",
+    data,
+    flags=re.S,
+)
+for label in ("mass notifications", "mass notify"):
+    for block in (
+        f"\telse if ($a == '{label}' && $b == 'other')\n\t\treturn -1;\n",
+        f"\telse if ($a == 'other' && $b == '{label}')\n\t\treturn 1;\n",
+        f"\telse if ($a == '{label}' && $b == 'user panel')\n\t\treturn 1;\n",
+        f"\telse if ($a == 'user panel' && $b == '{label}')\n\t\treturn -1;\n",
+        f"\telse if ($a == '{label}')\n\t\treturn 1;\n",
+        f"\telse if ($b == '{label}')\n\t\treturn -1;\n",
+    ):
+        data = data.replace(block, "")
+
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write(data)
+PY
+}
+
+remove_legacy_dashboard_patch() {
+  local path="/var/www/html/admin/modules/dashboard/sections/Overview.class.php"
+  [ -w "$path" ] || return 0
+  python3 - "$path" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+    data = handle.read()
+data = re.sub(
+    r"\n\s*\$final\[\$i\]\s*=\s*\$this->checkSlsMassNotify\(\);\s*"
+    r"\$final\[\$i\]\['title'\]\s*=\s*_\(\"Mass Notifications Plugin\"\);\s*\$i\+\+;\s*",
+    "\n",
+    data,
+    flags=re.S,
+)
+data = re.sub(
+    r"\n\s*private function checkSlsMassNotify\(\)\s*\{.*?"
+    r"(?=\n\s*private function genAlertGlyphicon\()",
+    "\n",
+    data,
+    flags=re.S,
+)
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write(data)
 PY
 }
 
@@ -74,6 +175,7 @@ remove_managed_block() {
   python3 - "$path" "$name" <<'PY'
 import re
 import sys
+
 path, name = sys.argv[1], sys.argv[2]
 with open(path, "r", encoding="utf-8", errors="ignore") as handle:
     data = handle.read()
@@ -90,31 +192,124 @@ PY
 }
 
 disable_apache_conf() {
-  if command -v a2disconf >/dev/null; then
-    a2disconf sls-mass-notify >/dev/null 2>&1 || true
-  fi
+  command -v a2disconf >/dev/null && a2disconf sls-mass-notify >/dev/null 2>&1 || true
   rm -f /etc/apache2/conf-enabled/sls-mass-notify.conf
   rm -f /etc/apache2/conf-available/sls-mass-notify.conf
   rm -f /var/lib/apache2/conf/enabled_by_admin/sls-mass-notify
+	  rm -f /var/lib/apache2/conf/disabled_by_admin/sls-mass-notify
   systemctl reload apache2 >/dev/null 2>&1 || true
+}
+
+remove_freepbx_manager_users() {
+  SLS_CONFIG="$DATA_DIR/mass-notifications.config" php -d pcre.jit=0 <<'PHP'
+<?php
+$bootstrap_settings = ['freepbx_auth' => false, 'skip_astman' => true];
+require '/etc/freepbx.conf';
+$candidates = ['slsmassnotify', 'sls_mass_notify', 'nws_push'];
+$path = (string)getenv('SLS_CONFIG');
+if ($path !== '' && is_readable($path)) {
+    $settings = json_decode((string)file_get_contents($path), true);
+    $configured = is_array($settings) ? (string)($settings['ami']['username'] ?? '') : '';
+    if ($configured !== '') {
+        $candidates[] = $configured;
+    }
+}
+$candidates = array_values(array_unique(array_filter($candidates)));
+try {
+    $manager = \FreePBX::Manager();
+    foreach ($candidates as $username) {
+        if ($manager->isExist_manager($username, true)) {
+            $manager->del_manager($username, true);
+        }
+    }
+} catch (Throwable $managerError) {
+    $database = \FreePBX::Database();
+    $statement = $database->prepare('DELETE FROM manager WHERE name = ?');
+    foreach ($candidates as $username) {
+        $statement->execute([$username]);
+    }
+}
+exit(0);
+PHP
+  rm -f /etc/asterisk/slsmassnotify
+}
+
+verify_freepbx_cleanup() {
+	  if module_registry_exists; then
+	    log "Uninstall verification failed; the $MODULE FreePBX registry row remains."
+	    return 1
+	  fi
+  SLS_CONFIG="$DATA_DIR/mass-notifications.config" php -d pcre.jit=0 <<'PHP'
+<?php
+$bootstrap_settings = ['freepbx_auth' => false, 'skip_astman' => true];
+require '/etc/freepbx.conf';
+$candidates = ['slsmassnotify', 'sls_mass_notify', 'nws_push'];
+$path = (string)getenv('SLS_CONFIG');
+if ($path !== '' && is_readable($path)) {
+    $settings = json_decode((string)file_get_contents($path), true);
+    $configured = is_array($settings) ? (string)($settings['ami']['username'] ?? '') : '';
+    if ($configured !== '') {
+        $candidates[] = $configured;
+    }
+}
+$candidates = array_values(array_unique(array_filter($candidates)));
+$database = \FreePBX::Database();
+$statement = $database->prepare('SELECT COUNT(*) FROM manager WHERE name = ?');
+foreach ($candidates as $username) {
+    $statement->execute([$username]);
+    if ((int)$statement->fetchColumn() > 0) {
+        fwrite(STDERR, "FreePBX AMI user remains after uninstall: {$username}\n");
+        exit(1);
+    }
+}
+exit(0);
+PHP
+	  local stock_module
+	  for stock_module in dashboard framework; do
+	    [ -d "/var/www/html/admin/modules/$stock_module" ] || continue
+	    SLS_VERIFY_MODULE="$stock_module" php -d pcre.jit=0 -r '
+$bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
+require "/etc/freepbx.conf";
+$result = \FreePBX::GPG()->verifyModule((string)getenv("SLS_VERIFY_MODULE"));
+$status = (int)($result["status"] ?? 0);
+if (($status & 129) !== 129) {
+    fwrite(STDERR, json_encode($result, JSON_PRETTY_PRINT) . PHP_EOL);
+    exit(1);
+}
+exit(0);
+'
+	  done
+  local artifact
+  for artifact in \
+    /etc/apache2/conf-enabled/sls-mass-notify.conf \
+    /etc/apache2/conf-available/sls-mass-notify.conf \
+    /var/lib/apache2/conf/enabled_by_admin/sls-mass-notify \
+    /var/lib/apache2/conf/disabled_by_admin/sls-mass-notify \
+    /etc/asterisk/slsmassnotify; do
+    if [ -e "$artifact" ] || [ -L "$artifact" ]; then
+      log "Uninstall verification failed; managed artifact remains: $artifact"
+      return 1
+    fi
+  done
 }
 
 remove_piper_wrapper() {
   local wrapper="/usr/local/bin/piper"
-  local piper_bin="$DATA_DIR/piper/venv/bin/piper"
-  if [ -L "$wrapper" ] && [ "$(readlink "$wrapper")" = "$piper_bin" ]; then
+  local legacy_piper_bin="$DATA_DIR/piper/venv/bin/piper"
+  local piper_bin="/usr/local/bin/sls_mass_notify/piper/venv/bin/piper"
+  if [ -L "$wrapper" ] && { [ "$(readlink "$wrapper")" = "$piper_bin" ] || [ "$(readlink "$wrapper")" = "$legacy_piper_bin" ]; }; then
     rm -f "$wrapper"
-  elif [ -f "$wrapper" ] && grep -q "$piper_bin" "$wrapper" 2>/dev/null; then
+  elif [ -f "$wrapper" ] && grep -Eq "SLS_Mass_Notifications_Plugin/piper|sls_mass_notify/piper" "$wrapper" 2>/dev/null; then
     rm -f "$wrapper"
   fi
 }
 
 remove_runtime_files() {
-  rm -rf /usr/local/bin/sls_mass_notify
   remove_piper_wrapper
+  rm -rf /usr/local/bin/sls_mass_notify
+  rm -f /usr/local/bin/nwsalerts_ensure_menu_patch.sh
   rm -f /usr/local/sbin/sign_sls_mass_notify_local_sig.sh
   rm -f /usr/local/sbin/sign_sls_mass_notify_local_sig.sh.bak-*
-  rm -rf /root/.gnupg-sls-mass-notify
   rm -f /etc/freepbx.secure/slsmassnotifyserver.sig
   rm -rf /var/lib/asterisk/sounds/SLS_Mass_Notifications_Plugin
   rm -rf /var/lib/asterisk/sounds/en/SLS_Mass_Notifications_Plugin
@@ -125,34 +320,107 @@ remove_runtime_files() {
   rm -rf /var/www/html/sls_mass_notify
   rm -rf /etc/asterisk/slsmassnotify
   rm -rf "$DATA_DIR"
+  rm -f /var/log/sls_mass_notify.log
+  rm -f /var/log/sls_mass_notify_events.jsonl
+  rm -f /var/log/sls_mass_notify_push.log
   rm -f /tmp/slsmassnotifyserver-*.tgz
   rm -f /tmp/slsmassnotifyserver-install.log
   rm -f /tmp/sls-install.sh /tmp/sls-install.sh.bak-*
   rm -f /tmp/sls-uninstall.sh /tmp/sls-uninstall.sh.bak-*
+  rm -rf /tmp/sls-mass-notify-*
+  rm -f /var/tmp/nws_last_clear.ts
 }
 
 remove_cron() {
-  crontab -l 2>/dev/null | grep -v 'sls_mass_notify_nws_poll.sh' | crontab - 2>/dev/null || true
+  local user
+  local tmp
+  for user in root asterisk; do
+    tmp="$(mktemp /tmp/slsmassnotifyserver-cron.XXXXXX)"
+    crontab -u "$user" -l 2>/dev/null \
+      | grep -vE 'sls_mass_notify_(nws_poll|update|maintenance)\.sh|nwsalerts_ensure_menu_patch\.sh' > "$tmp" || true
+    crontab -u "$user" "$tmp" 2>/dev/null || true
+    rm -f "$tmp"
+  done
+}
+
+restore_stock_modules() {
+  rm -f /var/www/html/admin/modules/dashboard/sections/SlsMassNotifyAnnouncement.class.php
+  rm -f /var/www/html/admin/modules/dashboard/views/sections/sls-mass-notify-announcement.php
+	  remove_legacy_dashboard_patch
+	  run_fwconsole ma refreshsignatures >/dev/null 2>&1 || true
+  for stock_module in dashboard framework; do
+	    [ -d "/var/www/html/admin/modules/$stock_module" ] || continue
+	    if grep -q '^repo=local$' "/var/www/html/admin/modules/$stock_module/module.sig" 2>/dev/null || \
+	      ! SLS_VERIFY_MODULE="$stock_module" php -d pcre.jit=0 -r '
+$bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
+require "/etc/freepbx.conf";
+$result = \FreePBX::GPG()->verifyModule((string)getenv("SLS_VERIFY_MODULE"));
+$status = (int)($result["status"] ?? 0);
+exit(($status & 129) === 129 ? 0 : 1);
+'; then
+	      run_fwconsole ma -f downloadinstall "$stock_module" >/dev/null 2>&1 || \
+        log "Warning: unable to redownload the stock $stock_module module; run fwconsole ma -f downloadinstall $stock_module when repository access is available."
+    fi
+  done
+	  run_fwconsole ma refreshsignatures >/dev/null 2>&1 || true
+}
+
+remove_trusted_signing_key() {
+  [ -n "$SIGNING_FINGERPRINT" ] || {
+    rm -rf "$SIGN_HOME"
+    return 0
+  }
+  local home
+  local user
+  local command
+  for home in /root/.gnupg /home/asterisk/.gnupg /var/lib/asterisk/.gnupg; do
+    [ -d "$home" ] || continue
+    if [ "$home" = "/root/.gnupg" ]; then
+      user="root"
+      GNUPGHOME="$home" gpg --batch --yes --delete-key "$SIGNING_FINGERPRINT" >/dev/null 2>&1 || true
+      printf '%s:2:\n' "$SIGNING_FINGERPRINT" | GNUPGHOME="$home" gpg --import-ownertrust >/dev/null 2>&1 || true
+    else
+      user="asterisk"
+      command="GNUPGHOME=$(printf '%q' "$home") gpg --batch --yes --delete-key $(printf '%q' "$SIGNING_FINGERPRINT") >/dev/null 2>&1 || true"
+      su -s /bin/bash "$user" -c "$command" || true
+      command="printf '%s:2:\\n' $(printf '%q' "$SIGNING_FINGERPRINT") | GNUPGHOME=$(printf '%q' "$home") gpg --import-ownertrust >/dev/null 2>&1 || true"
+      su -s /bin/bash "$user" -c "$command" || true
+    fi
+  done
+  rm -rf "$SIGN_HOME"
 }
 
 main() {
   require_freepbx
-  preserve_config
-  fwconsole ma uninstall "$MODULE" >/dev/null 2>&1 || true
-  fwconsole ma delete "$MODULE" >/dev/null 2>&1 || true
-  rm -rf "/var/www/html/admin/modules/$MODULE"
+  capture_signing_fingerprint
+  preserve_user_data
+	  remove_freepbx_manager_users
+	  remove_module_registration
   remove_cron
   remove_menu_patch
+	  remove_legacy_dashboard_patch
+  remove_managed_block /etc/asterisk/sip_notify_custom.conf "SLS Mass Notifications SIP NOTIFY Templates"
   remove_managed_block /etc/asterisk/extensions_custom.conf "SLS Mass Notifications Dialplan"
   remove_managed_block /etc/asterisk/manager_custom.conf "SLS Mass Notifications AMI"
   disable_apache_conf
   remove_runtime_files
-  restore_config
+  restore_user_data
+  restore_stock_modules
+  remove_trusted_signing_key
   asterisk -rx "dialplan reload" >/dev/null 2>&1 || true
+  asterisk -rx "module reload res_pjsip_notify.so" >/dev/null 2>&1 || true
   asterisk -rx "manager reload" >/dev/null 2>&1 || true
-  fwconsole ma refreshsignatures >/dev/null 2>&1 || true
-  fwconsole reload
-  log "SLS Mass Notify uninstall cleanup finished. Central config files were preserved when present."
+	  run_fwconsole reload
+	  remove_freepbx_manager_users
+	  asterisk -rx "manager reload" >/dev/null 2>&1 || true
+	  verify_freepbx_cleanup
+  if [ "$PURGE_CONFIG" = "1" ]; then
+    log "SLS Mass Notify uninstall cleanup finished. Configuration and user data were purged."
+  else
+    log "SLS Mass Notify uninstall cleanup finished. Central config, config backups, and uploaded tones were preserved."
+  fi
 }
 
-main "$@"
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

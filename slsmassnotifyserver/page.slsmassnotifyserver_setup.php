@@ -5,6 +5,16 @@ $slsmassnotifyserver = \FreePBX::create()->Slsmassnotifyserver;
 $saveResult = $_SESSION['slsmassnotifyserver_setup_result'] ?? null;
 unset($_SESSION['slsmassnotifyserver_setup_result']);
 
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$slsmassnotifyserver->validateCsrfToken($_POST['slsmassnotifyserver_csrf'] ?? '')) {
+	$_SESSION['slsmassnotifyserver_setup_result'] = [
+		'success' => false,
+		'message' => _('The request security token is invalid or expired. Reload the page and try again.'),
+		'errors' => [],
+	];
+	header('Location: config.php?display=slsmassnotifyserver');
+	exit;
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action'] ?? '') === 'save_setup_wizard') {
 	$_SESSION['slsmassnotifyserver_setup_result'] = $slsmassnotifyserver->saveSetupWizard($_POST);
 	header('Location: config.php?display=slsmassnotifyserver');

@@ -7,6 +7,7 @@ $settingsDisplay = $settings_display ?? 'slsmassnotifyserver_settings';
 $showTestSection = !empty($show_test_section);
 $testResult = $test_result ?? null;
 $cooldownRemaining = (int)($cooldown_remaining ?? 0);
+$csrfToken = (string)($csrf_token ?? '');
 $placeholderHelp = "{{event}}, {{severity}}, {{message_type}}, {{audio}}, {{page_group}}, {{alert_id}}, {{zone}}, {{time}}, {{source_name}}, {{trigger_source}}, {{trigger_extension}}, {{trigger_name}}, {{audio_sequence}}";
 $hourOptions = [];
 for ($hour = 0; $hour < 24; $hour++) {
@@ -25,8 +26,9 @@ for ($hour = 0; $hour < 24; $hour++) {
 					</p>
 				</div>
 				<?php if ($hasPendingChanges) { ?>
-					<form method="post" action="config.php?display=<?php echo htmlspecialchars($settingsDisplay); ?>">
-						<input type="hidden" name="slsmassnotifyserver_action" value="apply_settings">
+						<form method="post" action="config.php?display=<?php echo htmlspecialchars($settingsDisplay); ?>">
+							<input type="hidden" name="slsmassnotifyserver_action" value="apply_settings">
+							<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
 						<button type="submit" class="btn btn-danger"><?php echo _('Apply Changes'); ?></button>
 					</form>
 				<?php } ?>
@@ -88,8 +90,9 @@ for ($hour = 0; $hour < 24; $hour++) {
 							</div>
 						<?php } ?>
 
-						<form id="sls-test-form" method="post" action="config.php?display=<?php echo htmlspecialchars($settingsDisplay); ?>">
-							<input type="hidden" name="slsmassnotifyserver_action" value="trigger_test">
+							<form id="sls-test-form" method="post" action="config.php?display=<?php echo htmlspecialchars($settingsDisplay); ?>">
+								<input type="hidden" name="slsmassnotifyserver_action" value="trigger_test">
+								<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
 							<input type="hidden" name="ajax" value="1">
 
 							<div class="alert alert-danger">
@@ -170,8 +173,9 @@ for ($hour = 0; $hour < 24; $hour++) {
 				</script>
 			<?php } ?>
 
-			<form method="post" action="config.php?display=<?php echo htmlspecialchars($settingsDisplay); ?>" enctype="multipart/form-data">
-				<input type="hidden" name="slsmassnotifyserver_action" value="save_settings">
+				<form method="post" action="config.php?display=<?php echo htmlspecialchars($settingsDisplay); ?>" enctype="multipart/form-data">
+					<input type="hidden" name="slsmassnotifyserver_action" value="save_settings">
+					<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
 
 				<div class="row">
 					<div class="col-md-4">

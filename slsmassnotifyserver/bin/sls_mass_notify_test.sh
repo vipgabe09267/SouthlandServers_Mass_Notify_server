@@ -1,20 +1,17 @@
 #!/bin/bash
 # Southland Servers Mass Notifications Server by the Southland Servers Group
 
-PAGE_GROUP=""
 SLS_CALLERID_NAME="SLS Mass Notification System"
 SLS_CALLERID_NUM="SLS"
 SLS_AUDIO_CONTEXT="sls-alert-audio"
 NWS_ALERT_RECIPIENTS=()
-SOUNDS_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sounds"
-SLS_SOUND_PREFIX="SLS_Mass_Notifications_Plugin"
 SLS_TONE_SOUND_PREFIX="SLS_Mass_Notifications_Plugin/tones"
 SLS_TTS_SOUND_PREFIX="SLS_Mass_Notifications_Plugin/tts"
 SLS_TONES_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sounds/tones"
 SLS_TTS_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sounds/tts"
 SLS_OPENING_TONE="opening_Paging_Tone_Opening"
 SLS_CLOSING_TONE="closing_Paging_Tone_Closing"
-PIPER_BIN="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/venv/bin/piper"
+PIPER_BIN="/usr/local/bin/sls_mass_notify/piper/venv/bin/piper"
 PIPER_VOICE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices/en_US-lessac-low.onnx"
 PIPER_NWS_VOICE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices/en_US-lessac-low.onnx"
 PIPER_NWS_VOLUME="0.85"
@@ -22,7 +19,8 @@ PIPER_MAX_SECONDS="30"
 LOG="${LOG:-/var/log/sls_mass_notify.log}"
 EVENTS_LOG="${EVENTS_LOG:-/var/log/sls_mass_notify_events.jsonl}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-90}"
-CONFIG_FILE="${CONFIG_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.conf}"
+CONFIG_JSON_FILE="${CONFIG_JSON_FILE:-${CONFIG_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config}}"
+CONFIG_LOADER="${CONFIG_LOADER:-/usr/local/bin/sls_mass_notify/sls_config.py}"
 COOLDOWN_FILE="${COOLDOWN_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/test-cooldown.ts}"
 STATUS_FILE="${STATUS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/status.json}"
 FAULT_STATE_FILE="${FAULT_STATE_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/fault.state}"
@@ -57,6 +55,7 @@ timestamp_now() {
 prune_event_log() {
   [ -r "$EVENTS_LOG" ] || return 0
   LOG_PATH="$EVENTS_LOG" RETENTION_DAYS="$LOG_RETENTION_DAYS" python3 - <<'PY'
+import fcntl
 import json
 import os
 import time
@@ -72,29 +71,35 @@ cutoff = time.time() - (days * 86400)
 retained = []
 changed = False
 try:
-    with open(path, "r", encoding="utf-8") as handle:
+    with open(path, "r+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         lines = [line.rstrip("\n") for line in handle if line.strip()]
+        for line in lines:
+            try:
+                item = json.loads(line)
+            except Exception:
+                changed = True
+                continue
+            value = str(item.get("logged_at") or item.get("created_at") or "")
+            try:
+                ts = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                ts = time.time()
+            if ts >= cutoff:
+                retained.append(json.dumps(item, separators=(",", ":")))
+            else:
+                changed = True
+        if changed:
+            handle.seek(0)
+            handle.truncate(0)
+            if retained:
+                handle.write("\n".join(retained) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    os.chmod(path, 0o640)
 except FileNotFoundError:
     raise SystemExit(0)
-for line in lines:
-    try:
-        item = json.loads(line)
-    except Exception:
-        changed = True
-        continue
-    value = str(item.get("logged_at") or item.get("created_at") or "")
-    try:
-        ts = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-    except Exception:
-        ts = time.time()
-    if ts >= cutoff:
-        retained.append(json.dumps(item, separators=(",", ":")))
-    else:
-        changed = True
-if changed:
-    with open(path, "w", encoding="utf-8") as handle:
-        if retained:
-            handle.write("\n".join(retained) + "\n")
 PY
 }
 
@@ -104,31 +109,34 @@ update_status() {
   STATUS_FILE_PATH="$STATUS_FILE" \
   STATUS_PATCH_JSON="$patch_json" \
   python3 - <<'PY'
+import fcntl
 import json
 import os
 
 path = os.environ["STATUS_FILE_PATH"]
 patch = json.loads(os.environ["STATUS_PATCH_JSON"])
 
-data = {}
-if os.path.exists(path):
+os.makedirs(os.path.dirname(path), mode=0o750, exist_ok=True)
+with open(path, "a+", encoding="utf-8") as handle:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    handle.seek(0)
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            loaded = json.load(handle)
-            if isinstance(loaded, dict):
-                data = loaded
+        loaded = json.load(handle)
+        data = loaded if isinstance(loaded, dict) else {}
     except Exception:
         data = {}
-
-for key, value in patch.items():
-    data[key] = value
-
-with open(path, "w", encoding="utf-8") as handle:
+    data.update(patch)
+    handle.seek(0)
+    handle.truncate(0)
     json.dump(data, handle, indent=2, sort_keys=True)
     handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+os.chmod(path, 0o640)
 PY
 
-  chmod 644 "$STATUS_FILE" 2>/dev/null || true
+  chmod 0640 "$STATUS_FILE" 2>/dev/null || true
   chown asterisk:asterisk "$STATUS_FILE" 2>/dev/null || true
 }
 
@@ -161,7 +169,7 @@ Time: ${now}"
 
   if send_notification_email "$subject" "$body"; then
     printf '%s\n' "$fault_key" > "$FAULT_STATE_FILE"
-    chmod 644 "$FAULT_STATE_FILE" 2>/dev/null || true
+    chmod 0640 "$FAULT_STATE_FILE" 2>/dev/null || true
     chown asterisk:asterisk "$FAULT_STATE_FILE" 2>/dev/null || true
     update_status "$(printf '{"fault_email_sent_at":%s}' "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$now")")"
   fi
@@ -191,8 +199,10 @@ append_event_log() {
   SOURCE_NAME="$SOURCE_NAME" \
   TRIGGER_EXTENSION="$TRIGGER_EXTENSION" \
   TRIGGER_NAME="$TRIGGER_NAME" \
+  EVENT_STATUS="$TEST_DELIVERY_STATUS" \
   EVENTS_LOG_PATH="$EVENTS_LOG" \
   python3 - <<'PY'
+import fcntl
 import json
 import os
 from datetime import datetime, timezone
@@ -201,7 +211,7 @@ payload = {
     "event_id": os.environ["EVENT_ID"],
     "logged_at": datetime.now(timezone.utc).astimezone().isoformat(),
     "type": "test",
-    "status": "triggered",
+    "status": os.environ.get("EVENT_STATUS", "triggered"),
     "system_name": os.environ.get("SOURCE_NAME", ""),
     "source_extension": os.environ.get("SOURCE_EXTENSION", ""),
     "source_name": os.environ.get("SOURCE_NAME", ""),
@@ -219,7 +229,12 @@ payload = {
 }
 
 with open(os.environ["EVENTS_LOG_PATH"], "a", encoding="utf-8") as handle:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
     handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+os.chmod(os.environ["EVENTS_LOG_PATH"], 0o640)
 PY
 }
 
@@ -245,6 +260,7 @@ generate_test_tts_audio() {
   local trimmed_file
   local duration
   local text
+  local generation_timeout
 
   if [ ! -x "$PIPER_BIN" ]; then
     echo "$(date): ERROR — Piper binary not executable: $PIPER_BIN" >> "$LOG"
@@ -264,7 +280,10 @@ generate_test_tts_audio() {
   tmp_file="$(mktemp /tmp/sls_test_tts_XXXXXX.wav)"
   output_file="${SLS_TTS_DIR}/${base_name}.wav"
 
-  if ! printf '%s\n' "$text" | timeout 25 "$PIPER_BIN" --model "${PIPER_NWS_VOICE:-$PIPER_VOICE}" --volume "1.00" --output-file "$tmp_file" >> "$LOG" 2>&1; then
+  generation_timeout=$((PIPER_MAX_SECONDS * 2 + 30))
+  [ "$generation_timeout" -lt 25 ] && generation_timeout=25
+  [ "$generation_timeout" -gt 900 ] && generation_timeout=900
+  if ! printf '%s\n' "$text" | timeout "$generation_timeout" "$PIPER_BIN" --model "${PIPER_NWS_VOICE:-$PIPER_VOICE}" --volume "1.00" --output-file "$tmp_file" >> "$LOG" 2>&1; then
     rm -f "$tmp_file"
     echo "$(date): ERROR — Piper TTS generation failed for manual test" >> "$LOG"
     return 1
@@ -285,7 +304,7 @@ generate_test_tts_audio() {
   if command -v soxi >/dev/null 2>&1; then
     duration="$(soxi -D "$output_file" 2>/dev/null || echo 0)"
     if awk "BEGIN { exit !($duration > ${PIPER_MAX_SECONDS:-30}) }"; then
-      trimmed_file="${output_file}.trimmed"
+		trimmed_file="${output_file}.trimmed.wav"
       if sox "$output_file" "$trimmed_file" trim 0 "${PIPER_MAX_SECONDS:-30}" >> "$LOG" 2>&1; then
         mv "$trimmed_file" "$output_file"
       else
@@ -358,7 +377,7 @@ trigger_visual_test() {
 
   if [ ! -x /usr/local/bin/sls_mass_notify/sls_notify.py ]; then
     echo "$(date): Visual test skipped — /usr/local/bin/sls_mass_notify/sls_notify.py is not executable" >> "$LOG"
-    return 0
+    return 1
   fi
 
   event="Manual NWS Test"
@@ -368,18 +387,23 @@ trigger_visual_test() {
   targets="$(get_nws_recipient_targets)"
   if [ -z "$targets" ]; then
     echo "$(date): Visual test skipped — no NWS recipient extensions configured" >> "$LOG"
-    return 0
+    return 1
   fi
 
-  echo "$(date): Queueing visual test image — Event: $event | Audio: $sound" >> "$LOG"
-  nohup /usr/bin/python3 /usr/local/bin/sls_mass_notify/sls_notify.py \
+  echo "$(date): Sending visual test image — Event: $event" >> "$LOG"
+  if ! /usr/bin/timeout 45 /usr/bin/python3 /usr/local/bin/sls_mass_notify/sls_notify.py \
     --event "$event" \
     --severity "$severity" \
-    --area "Williamson County TX" \
+    --area "${NWS_ZONE:-Configured NWS zone}" \
     --description "$description" \
     --test-id "$test_id" \
     --targets "$targets" \
-    >> "$LOG" 2>&1 &
+    --no-retry \
+    >> "$LOG" 2>&1; then
+    echo "$(date): ERROR — Visual test delivery failed" >> "$LOG"
+    return 1
+  fi
+  return 0
 }
 
 get_nws_recipient_targets() {
@@ -416,7 +440,7 @@ Application: Wait
 Data: 1
 CALL
     chown asterisk:asterisk "$callfile" 2>/dev/null || true
-    chmod 777 "$callfile"
+    chmod 0640 "$callfile"
     if ! mv "$callfile" "$SPOOL/"; then
       echo "$(date): ERROR — Unable to move test call file for $recipient into $SPOOL" >> "$LOG"
       rm -f "$callfile" 2>/dev/null || true
@@ -434,9 +458,39 @@ CALL
   return 0
 }
 
-if [ -r "$CONFIG_FILE" ]; then
-  # Generated by the FreePBX Mass Notifications settings page.
-  . "$CONFIG_FILE"
+load_central_config() {
+  local dump_file
+  local key
+  local value
+
+  if [ ! -x "$CONFIG_LOADER" ] || [ ! -r "$CONFIG_JSON_FILE" ]; then
+    echo "$(date): ERROR - Central config or config loader is unavailable" >> "$LOG"
+    return 1
+  fi
+  dump_file="$(mktemp /tmp/sls_mass_notify_config.XXXXXX)" || return 1
+  if ! /usr/bin/python3 "$CONFIG_LOADER" "$CONFIG_JSON_FILE" > "$dump_file" 2>>"$LOG"; then
+    rm -f "$dump_file"
+    return 1
+  fi
+
+  NWS_ALERT_RECIPIENTS=()
+  while IFS= read -r -d '' key && IFS= read -r -d '' value; do
+    case "$key" in
+      NWS_ALERT_RECIPIENT) NWS_ALERT_RECIPIENTS+=("$value") ;;
+      NWS_ALERTS_ENABLED|PUBLIC_PBX_HOST|NWS_API_BASE_URL|NWS_ZONE|SLS_OPENING_TONE|SLS_CLOSING_TONE|PIPER_BIN|PIPER_NWS_VOICE|PIPER_ANNOUNCEMENT_VOICE|PIPER_NWS_VOLUME|PIPER_ANNOUNCEMENT_VOLUME|PIPER_MAX_SECONDS|LOG_RETENTION_DAYS|MAIL_TO|DISCORD_WEBHOOK_URL|QUIET_HOURS_ENABLED|QUIET_HOURS_START|QUIET_HOURS_END|MAIL_FROM_NAME|MAIL_FROM_ADDR|ALERT_EMAIL_SUBJECT|ALERT_EMAIL_BODY|TEST_EMAIL_SUBJECT|TEST_EMAIL_BODY|AMI_USERNAME|AMI_PASSWORD|GITHUB_UPDATES_ENABLED|GITHUB_UPDATES_REPOSITORY|GITHUB_UPDATES_CHANNEL)
+        printf -v "$key" '%s' "$value"
+        ;;
+    esac
+  done < "$dump_file"
+  rm -f "$dump_file"
+  PIPER_VOICE="$PIPER_NWS_VOICE"
+  return 0
+}
+
+if ! load_central_config; then
+  update_status "$(printf '{"last_test_at":%s,"last_test_status":"fault","last_test_message":"Central configuration is invalid or unavailable."}' \
+    "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$(timestamp_now)")")"
+  exit 1
 fi
 prune_event_log
 DELIVERY_TARGETS="$(get_nws_recipient_targets)"
@@ -469,12 +523,16 @@ if [ "$LAST_RUN" -gt 0 ] && [ $((NOW_TS - LAST_RUN)) -lt "$COOLDOWN_SECONDS" ]; 
 fi
 
 printf '%s\n' "$NOW_TS" > "$COOLDOWN_FILE"
-chmod 644 "$COOLDOWN_FILE" 2>/dev/null || true
+chmod 0640 "$COOLDOWN_FILE" 2>/dev/null || true
 chown asterisk:asterisk "$COOLDOWN_FILE" 2>/dev/null || true
 
 send_notification_email() {
   local subject="$1"
   local body="$2"
+
+  subject="$(printf '%s' "$subject" | tr '\r\n' '  ')"
+  MAIL_FROM_NAME="$(printf '%s' "$MAIL_FROM_NAME" | tr '\r\n' '  ')"
+  MAIL_FROM_ADDR="$(printf '%s' "$MAIL_FROM_ADDR" | tr -d '\r\n')"
 
   if [ -z "$(printf '%s' "$MAIL_TO" | tr -d '[:space:]')" ]; then
     echo "$(date): Notification email skipped — no recipients configured" >> "$LOG"
@@ -600,9 +658,6 @@ except Exception as exc:
 PY
 }
 
-# Wait for phone to hang up before paging
-sleep 3
-
 echo "$(date): Manual Piper TTS test alert triggered" >> "$LOG"
 
 TTS_FILE="$(generate_test_tts_audio)"
@@ -619,13 +674,6 @@ if [ -z "$AUDIO_SEQUENCE" ]; then
   exit 1
 fi
 
-echo "Playing: $AUDIO_SEQUENCE"
-if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
-  echo "$(date): Dry run — would queue visual test image" >> "$LOG"
-else
-  trigger_visual_test "Piper_TTS"
-fi
-
 # Build call files using the same direct audio path as live NWS alerts.
 if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
   echo "$(date): Dry run — would queue test call files using $AUDIO_SEQUENCE to recipients: ${NWS_ALERT_RECIPIENTS[*]}" >> "$LOG"
@@ -635,18 +683,36 @@ else
   fi
 fi
 
+# Let the auto-answer call enter media before placing the visual screen on top.
+if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
+  echo "$(date): Dry run — would send visual test image after audio starts" >> "$LOG"
+else
+  sleep 2
+  if ! trigger_visual_test; then
+    report_fault "visual" "Manual NWS test SIP NOTIFY delivery failed"
+    exit 1
+  fi
+fi
+
 echo "$(date): Test audio queued — $AUDIO_SEQUENCE" >> "$LOG"
 DELIVERY_TS="$(timestamp_now)"
-update_status "$(printf '{"last_delivery_at":%s,"last_delivery_status":"queued","last_delivery_source":"test","last_delivery_event":"Manual NWS Test","last_delivery_audio":%s,"last_delivery_message":%s,"last_delivery_page_group":%s}' \
+TEST_DELIVERY_STATUS="queued"
+TEST_DELIVERY_MESSAGE="Queued manual Piper TTS test"
+if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
+  TEST_DELIVERY_STATUS="dry_run"
+  TEST_DELIVERY_MESSAGE="Dry run completed for manual Piper TTS test"
+fi
+update_status "$(printf '{"last_delivery_at":%s,"last_delivery_status":%s,"last_delivery_source":"test","last_delivery_event":"Manual NWS Test","last_delivery_audio":%s,"last_delivery_message":%s,"last_delivery_page_group":%s}' \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DELIVERY_TS")" \
+  "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_DELIVERY_STATUS")" \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "Piper TTS")" \
-  "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "Queued manual Piper TTS test")" \
+  "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_DELIVERY_MESSAGE")" \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DELIVERY_TARGETS")")"
-update_status "$(printf '{"last_test_at":%s,"last_test_status":"queued","last_test_message":%s,"last_test_audio":%s}' \
+update_status "$(printf '{"last_test_at":%s,"last_test_status":%s,"last_test_message":%s,"last_test_audio":%s}' \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DELIVERY_TS")" \
-  "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "Queued manual Piper TTS test")" \
+  "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_DELIVERY_STATUS")" \
+  "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_DELIVERY_MESSAGE")" \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "Piper TTS")")"
-clear_fault_state
 CURRENT_TIME="$(date)"
 MAIL_SUBJECT="$(render_template "$TEST_EMAIL_SUBJECT" \
   "event=Manual NWS Test" \
@@ -678,17 +744,24 @@ MAIL_BODY="$(render_template "$TEST_EMAIL_BODY" \
   "trigger_extension=$TRIGGER_EXTENSION" \
   "trigger_name=$TRIGGER_NAME" \
   "audio_sequence=${AUDIO_SEQUENCE}")"
-if ! send_notification_email "$MAIL_SUBJECT" "$MAIL_BODY"; then
-  echo "$(date): ERROR — Test email failed" >> "$LOG"
-  report_fault "email" "Manual test email failed"
-fi
-if ! send_discord_alert "$MAIL_SUBJECT" "$MAIL_BODY" "Manual Test" "Manual NWS Test" "Test" "Test" "Piper TTS" "" "" "$CURRENT_TIME" "FreePBX Dashboard" "$TRIGGER_EXTENSION" "$TRIGGER_NAME" "$AUDIO_SEQUENCE"; then
-  echo "$(date): ERROR — Test Discord webhook failed" >> "$LOG"
-  report_fault "discord" "Manual test Discord webhook failed"
-fi
-append_event_log "$MAIL_SUBJECT" "$MAIL_BODY" "$AUDIO_SEQUENCE"
 if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
+  append_event_log "$MAIL_SUBJECT" "$MAIL_BODY" "$AUDIO_SEQUENCE"
   echo "Dry run complete. No phones were notified."
 else
+  AUX_DELIVERY_OK=1
+  if ! send_notification_email "$MAIL_SUBJECT" "$MAIL_BODY"; then
+    echo "$(date): ERROR - Test email failed" >> "$LOG"
+    report_fault "email" "Manual test email failed"
+    AUX_DELIVERY_OK=0
+  fi
+  if ! send_discord_alert "$MAIL_SUBJECT" "$MAIL_BODY" "Manual Test" "Manual NWS Test" "Test" "Test" "Piper TTS" "" "" "$CURRENT_TIME" "FreePBX Dashboard" "$TRIGGER_EXTENSION" "$TRIGGER_NAME" "$AUDIO_SEQUENCE"; then
+    echo "$(date): ERROR - Test Discord webhook failed" >> "$LOG"
+    report_fault "discord" "Manual test Discord webhook failed"
+    AUX_DELIVERY_OK=0
+  fi
+  append_event_log "$MAIL_SUBJECT" "$MAIL_BODY" "$AUDIO_SEQUENCE"
+  if [ "$AUX_DELIVERY_OK" = "1" ]; then
+    clear_fault_state
+  fi
   echo "Done! Check your phones."
 fi

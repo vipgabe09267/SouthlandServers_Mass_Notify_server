@@ -7,7 +7,7 @@ MODULE_SIG="${MODULE_DIR}/module.sig"
 SIGN_HOME="/root/.gnupg-sls-mass-notify"
 SIGNEDBY="Southland Servers Mass Notifications Local Signing <root@$(hostname -f 2>/dev/null || hostname)>"
 WORKDIR="$(mktemp -d "/tmp/${MODULE}-sls-local-sign.XXXXXX")"
-chmod 755 "$WORKDIR"
+chmod 700 "$WORKDIR"
 
 cleanup() {
 	rm -rf "$WORKDIR"
@@ -89,7 +89,7 @@ GNUPGHOME="$SIGN_HOME" gpg --batch --yes --pinentry-mode loopback --passphrase '
 	--local-user "$KEYID" --clearsign \
 	--output "$WORKDIR/module.sig" "$WORKDIR/module.plain"
 
-install -m 664 -o asterisk -g asterisk "$WORKDIR/module.sig" "$MODULE_SIG"
+install -m 644 -o asterisk -g asterisk "$WORKDIR/module.sig" "$MODULE_SIG"
 
 GNUPGHOME="$SIGN_HOME" gpg --armor --export "$KEYID" > "$WORKDIR/public.asc"
 
@@ -100,15 +100,19 @@ trust_home_as_user() {
 
 	[ -n "$home" ] || return 0
 	install -d -m 700 -o "$user" -g "$group" "$home"
-	chown "$user:$group" "$WORKDIR/public.asc"
 	if [ "$user" = "root" ]; then
-		GNUPGHOME="$home" gpg --batch --import "$WORKDIR/public.asc" >/dev/null 2>&1 || true
-		printf '%s:6:\n' "$FINGERPRINT" | GNUPGHOME="$home" gpg --import-ownertrust >/dev/null 2>&1 || true
-		GNUPGHOME="$home" gpg --check-trustdb >/dev/null 2>&1 || true
+		timeout 30 gpg --homedir "$home" --batch --import "$WORKDIR/public.asc" >/dev/null 2>&1
+		printf '%s:6:\n' "$FINGERPRINT" | timeout 30 gpg --homedir "$home" --batch --import-ownertrust >/dev/null 2>&1
 	else
-		su -s /bin/bash "$user" -c "GNUPGHOME='$home' gpg --batch --import '$WORKDIR/public.asc' >/dev/null 2>&1 || true"
-		su -s /bin/bash "$user" -c "printf '${FINGERPRINT}:6:\n' | GNUPGHOME='$home' gpg --import-ownertrust >/dev/null 2>&1 || true"
-		su -s /bin/bash "$user" -c "GNUPGHOME='$home' gpg --check-trustdb >/dev/null 2>&1 || true"
+		# The work directory is intentionally root-only. Stream the public key so
+		# the FreePBX user never needs pathname access to that directory.
+		timeout 30 su -s /bin/bash "$user" -c "gpg --homedir '$home' --batch --import" < "$WORKDIR/public.asc" >/dev/null 2>&1
+		printf '%s:6:\n' "$FINGERPRINT" | timeout 30 su -s /bin/bash "$user" -c "gpg --homedir '$home' --batch --import-ownertrust" >/dev/null 2>&1
+	fi
+	if [ "$user" = "root" ]; then
+		timeout 30 gpg --homedir "$home" --batch --list-keys "$FINGERPRINT" >/dev/null 2>&1
+	else
+		timeout 30 su -s /bin/bash "$user" -c "gpg --homedir '$home' --batch --list-keys '$FINGERPRINT'" >/dev/null 2>&1
 	fi
 	chown -R "$user:$group" "$home" 2>/dev/null || true
 	chmod 700 "$home" 2>/dev/null || true

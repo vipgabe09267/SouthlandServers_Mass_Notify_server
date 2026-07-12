@@ -13,14 +13,24 @@ $updates = is_array($settings['updates'] ?? null) ? $settings['updates'] : [];
 $desktopClients = is_array($desktop_clients ?? null) ? $desktop_clients : [];
 $packageStatus = is_array($package_update_status ?? null) ? $package_update_status : ['state' => 'latest', 'label' => 'LATEST'];
 $packageStatusClass = (($packageStatus['state'] ?? '') === 'update') ? 'label-warning' : 'label-success';
+$formatOverrides = [];
+$csrfToken = (string)($csrf_token ?? '');
+foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension => $format) {
+	$extension = preg_replace('/[^0-9]/', '', (string)$extension);
+	$format = preg_replace('/[^a-z0-9_-]/', '', strtolower((string)$format));
+	if ($extension !== '' && $format !== '') {
+		$formatOverrides[] = $extension . '=' . $format;
+	}
+}
 ?>
 <div class="container-fluid">
 	<?php echo load_view(__DIR__ . '/hero.php', ['hero_image' => $hero_image ?? '']); ?>
 	<div class="row">
 		<div class="col-sm-12">
 			<?php if ($hasPendingChanges) { ?>
-				<form method="post" class="pull-right" style="margin-bottom: 10px;">
-					<input type="hidden" name="slsmassnotifyserver_action" value="apply_settings">
+					<form method="post" class="pull-right" style="margin-bottom: 10px;">
+						<input type="hidden" name="slsmassnotifyserver_action" value="apply_settings">
+						<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
 					<button type="submit" class="btn btn-danger"><?php echo _('Apply Config'); ?></button>
 				</form>
 			<?php } ?>
@@ -41,6 +51,35 @@ $packageStatusClass = (($packageStatus['state'] ?? '') === 'update') ? 'label-wa
 
 			<form method="post" id="sls-other-settings-form" enctype="multipart/form-data">
 				<input type="hidden" name="slsmassnotifyserver_action" value="save_other_settings">
+				<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
+
+				<h3><?php echo _('Public Access'); ?></h3>
+				<div class="row">
+					<div class="col-md-4">
+						<div class="form-group">
+							<label><?php echo _('Public PBX Hostname'); ?></label>
+							<input class="form-control" name="public_pbx_host" value="<?php echo htmlspecialchars($settings['public_pbx_host'] ?? ($settings['sipnotify']['pbx_host'] ?? '')); ?>" placeholder="pbx.example.com">
+							<p class="help-block"><?php echo _('Used for API links and hosted phone media. Override this if auto-detection produced a short hostname such as pbx.'); ?></p>
+						</div>
+					</div>
+					<div class="col-md-2">
+						<div class="form-group">
+							<label><?php echo _('Phone Image Transport'); ?></label>
+							<select class="form-control" name="sipnotify_media_scheme">
+								<option value="http" <?php echo (($settings['sipnotify']['media_scheme'] ?? 'http') === 'http') ? 'selected' : ''; ?>>HTTP</option>
+								<option value="https" <?php echo (($settings['sipnotify']['media_scheme'] ?? 'http') === 'https') ? 'selected' : ''; ?>>HTTPS</option>
+							</select>
+							<p class="help-block"><?php echo _('HTTP is the compatibility default for legacy phones such as the Yealink T48G. Authenticated APIs remain HTTPS.'); ?></p>
+						</div>
+					</div>
+					<div class="col-md-6">
+						<div class="form-group">
+							<label><?php echo _('Phone Format Overrides'); ?></label>
+							<textarea class="form-control" name="sipnotify_format_overrides" rows="3" placeholder="1190=cisco&#10;1000=yealink"><?php echo htmlspecialchars(implode("\n", $formatOverrides)); ?></textarea>
+								<p class="help-block"><?php echo _('Optional. One extension=format per line. Formats: yealink, yealink_text, cisco, poly, grandstream, fanvil, snom, aastra, sangoma, avaya, vtech, ale, generic. Use yealink_text when a model cannot load generated PNG alerts.'); ?></p>
+						</div>
+					</div>
+				</div>
 
 				<h3><?php echo _('Audio and Announcement Settings'); ?></h3>
 				<div class="row">
@@ -140,7 +179,7 @@ $packageStatusClass = (($packageStatus['state'] ?? '') === 'update') ? 'label-wa
 										<td><input class="form-control input-sm" name="desktop_clients[<?php echo (int)$index; ?>][name]" value="<?php echo htmlspecialchars($client['name'] ?? 'Desktop App'); ?>"></td>
 										<td><input class="form-control input-sm" name="desktop_clients[<?php echo (int)$index; ?>][client_id]" value="<?php echo htmlspecialchars($client['client_id'] ?? ''); ?>"></td>
 										<td><input class="form-control input-sm" name="desktop_clients[<?php echo (int)$index; ?>][username]" value="<?php echo htmlspecialchars($client['username'] ?? ''); ?>"></td>
-										<td><input class="form-control input-sm" name="desktop_clients[<?php echo (int)$index; ?>][password]" value="<?php echo htmlspecialchars($client['password'] ?? ''); ?>"></td>
+										<td><input class="form-control input-sm" name="desktop_clients[<?php echo (int)$index; ?>][password]" value="<?php echo htmlspecialchars($client['password'] ?? ''); ?>" autocomplete="new-password"></td>
 									<td><button type="button" class="btn btn-default btn-sm" data-remove-desktop-client><?php echo _('Delete'); ?></button></td>
 								</tr>
 							<?php } ?>
@@ -181,7 +220,7 @@ $packageStatusClass = (($packageStatus['state'] ?? '') === 'update') ? 'label-wa
 								<input class="form-control" id="control_api_key" name="control_api[api_key]" type="text" value="<?php echo htmlspecialchars($control['api_key'] ?? ''); ?>">
 								<span class="input-group-btn">
 									<button type="button" class="btn btn-default" id="copy_control_api_key"><?php echo _('Copy'); ?></button>
-									<button type="submit" class="btn btn-warning" name="slsmassnotifyserver_action" value="regenerate_control_api_key" onclick="return confirm('<?php echo htmlspecialchars(_('Regenerate the Control API key? Existing API clients using the old key will stop working after you apply changes.')); ?>');"><?php echo _('Regenerate'); ?></button>
+									<button type="submit" class="btn btn-warning" name="slsmassnotifyserver_action" value="regenerate_control_api_key" onclick="return confirm(<?php echo htmlspecialchars(json_encode(_('Regenerate the Control API key? Existing API clients using the old key will stop working after you apply changes.')), ENT_QUOTES, 'UTF-8'); ?>);"><?php echo _('Regenerate'); ?></button>
 								</span>
 							</div>
 						</div>
@@ -259,6 +298,7 @@ $packageStatusClass = (($packageStatus['state'] ?? '') === 'update') ? 'label-wa
 			<hr>
 			<h3><?php echo _('Config Backup'); ?></h3>
 			<form method="post" style="margin-bottom: 15px;">
+				<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
 				<button type="submit" class="btn btn-default" name="slsmassnotifyserver_action" value="export_config"><?php echo _('Download .config'); ?></button>
 			</form>
 			<div class="panel panel-danger">
@@ -266,12 +306,14 @@ $packageStatusClass = (($packageStatus['state'] ?? '') === 'update') ? 'label-wa
 				<div class="panel-body">
 					<h4><?php echo _('Installer Health'); ?></h4>
 					<p class="text-danger"><?php echo _('Repair Installation refreshes runtime files, permissions, Apache API routes, cron, dialplan, dashboard widget files, and local signatures. It does not replace your central .config, but it may reload FreePBX and Asterisk dialplan.'); ?></p>
-					<form method="post" style="margin-bottom: 18px;" onsubmit="return confirm('<?php echo htmlspecialchars(_('Are you sure you want to repair/reinstall the Mass Notifications integration now? This may reload FreePBX and Asterisk dialplan. Your central .config will not be replaced.')); ?>');">
+					<form method="post" style="margin-bottom: 18px;" onsubmit="return confirm(<?php echo htmlspecialchars(json_encode(_('Are you sure you want to repair/reinstall the Mass Notifications integration now? This may reload FreePBX and Asterisk dialplan. Your central .config will not be replaced.')), ENT_QUOTES, 'UTF-8'); ?>);">
+						<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
 						<button type="submit" class="btn btn-warning" name="slsmassnotifyserver_action" value="repair_installation"><?php echo _('Repair Installation'); ?></button>
 					</form>
 					<hr>
 					<p class="text-danger"><?php echo _('Replacing the config file wipes the current plugin data and overwrites API keys, desktop clients, voices, announcement groups, NWS settings, and retention settings.'); ?></p>
-					<form method="post" enctype="multipart/form-data" onsubmit="return confirm('<?php echo htmlspecialchars(_('Replace the Mass Notifications config? This requires Apply Config to become live.')); ?>');">
+					<form method="post" enctype="multipart/form-data" onsubmit="return confirm(<?php echo htmlspecialchars(json_encode(_('Replace the Mass Notifications config? This requires Apply Config to become live.')), ENT_QUOTES, 'UTF-8'); ?>);">
+						<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
 						<div class="form-group">
 							<label><?php echo _('Upload .config'); ?></label>
 							<input type="file" name="config_upload" accept=".config,application/json">
@@ -285,14 +327,6 @@ $packageStatusClass = (($packageStatus['state'] ?? '') === 'update') ? 'label-wa
 </div>
 <script>
 (function() {
-	function rand(chars) {
-		var out = '';
-		var alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
-		for (var i = 0; i < chars; i++) {
-			out += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
-		}
-		return out;
-	}
 	var copyButton = document.getElementById('copy_control_api_key');
 	var controlKey = document.getElementById('control_api_key');
 	if (copyButton && controlKey) {
@@ -317,19 +351,16 @@ $packageStatusClass = (($packageStatus['state'] ?? '') === 'update') ? 'label-wa
 	});
 		add.addEventListener('click', function() {
 			var index = nextIndex();
-			var clientId = 'cli_' + rand(6).toLowerCase();
-			var username = 'sls' + rand(6);
-			var password = rand(24);
-			var row = document.createElement('tr');
+				var row = document.createElement('tr');
 		row.setAttribute('data-desktop-client-row', '1');
 		row.innerHTML =
 			'<td><input type="hidden" name="desktop_clients[' + index + '][id]" value="">' +
 				'<input type="hidden" name="desktop_clients[' + index + '][password_enc]" value="">' +
 				'<input type="checkbox" name="desktop_clients[' + index + '][enabled]" value="1" checked></td>' +
 				'<td><input class="form-control input-sm" name="desktop_clients[' + index + '][name]" value="Desktop App"></td>' +
-				'<td><input class="form-control input-sm" name="desktop_clients[' + index + '][client_id]" value="' + clientId + '"></td>' +
-				'<td><input class="form-control input-sm" name="desktop_clients[' + index + '][username]" value="' + username + '"></td>' +
-				'<td><input class="form-control input-sm" name="desktop_clients[' + index + '][password]" value="' + password + '"></td>' +
+					'<td><input class="form-control input-sm" name="desktop_clients[' + index + '][client_id]" value="" placeholder="Generated on save"></td>' +
+					'<td><input class="form-control input-sm" name="desktop_clients[' + index + '][username]" value="" placeholder="Generated on save"></td>' +
+					'<td><input class="form-control input-sm" name="desktop_clients[' + index + '][password]" value="" placeholder="Generated on save" autocomplete="new-password"></td>' +
 			'<td><button type="button" class="btn btn-default btn-sm" data-remove-desktop-client>Delete</button></td>';
 		table.appendChild(row);
 	});

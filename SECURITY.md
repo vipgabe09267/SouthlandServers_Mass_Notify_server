@@ -8,7 +8,10 @@ Security fixes are currently targeted at the latest public beta release only.
 
 | Version | Supported |
 | --- | --- |
-| `0.0.2-beta` | Yes |
+| `0.0.5-beta` | Yes |
+| `0.0.4-beta` | No |
+| `0.0.3-beta` | No |
+| `0.0.2-beta` | No |
 | Older beta builds | No |
 
 ## Reporting
@@ -24,16 +27,15 @@ Project and community links:
 
 Please include the module version, FreePBX version, Asterisk version, relevant logs, reproduction steps, and whether the issue affects authentication, authorization, file writes, command execution, SIP NOTIFY delivery, TTS generation, or external API access.
 
-Do not post live API keys, SIP endpoint passwords, AMI credentials, bearer tokens, `.config` files, or production logs containing sensitive alert content in public issues.
+Do not post live API keys, desktop client passwords, AMI credentials, bearer tokens, `.config` files, or production logs containing sensitive alert content in public issues.
 
 ## Secrets
 
-API keys, endpoint passwords, AMI credentials, notification groups, and deployment settings are stored in the central Mass Notifications config and should not be committed to Git.
+API keys, encrypted desktop client passwords, AMI credentials, notification groups, and deployment settings are stored in the central Mass Notifications config and should not be committed to Git.
 
 Do not publish:
 
 - `/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config`
-- generated runtime `config.ini`
 - production logs
 - generated TTS audio
 
@@ -43,9 +45,10 @@ Credentials are generated on fresh installs and preserved during normal updates.
 
 - Use HTTPS for all API and media endpoints.
 - Keep the Control API disabled unless it is actively needed.
+- If the Control API is enabled, consider enabling its IP allowlist and per-IP rate limit.
 - Restrict FreePBX administrator access to trusted users and trusted networks.
-- Use strong endpoint passwords for SIP NOTIFY phone-brand endpoints.
-- Rotate the desktop app token and Control API key if they are exposed.
+- Use strong desktop client passwords and keep the Control API disabled unless it is needed.
+- Rotate desktop client credentials and the Control API key if they are exposed.
 - Keep AMI access bound to localhost unless a deployment has a specific, reviewed need.
 - Do not expose Asterisk manager ports directly to the public internet.
 - Review notification logs regularly and configure retention according to local policy.
@@ -54,13 +57,21 @@ Credentials are generated on fresh installs and preserved during normal updates.
 
 ## Security Boundaries
 
-The SIP Notify API and Control API are intended for authenticated clients only. The desktop app endpoint uses bearer-token authentication. Phone-brand endpoints use the configured endpoint authentication model. The Control API is disabled by default and must be explicitly enabled before use.
+The desktop notification API and Control API are intended for authenticated clients only. Desktop app clients use per-client usernames and passwords over HTTPS, and event records are filtered by explicit desktop routing fields. Legacy untargeted records are denied. The Control API is disabled by default, uses constant-time key comparison, supports optional IPv4/IPv6 allowlisting and rate limiting, records a bounded audit trail, limits JSON request size, and never returns stored secrets in config responses.
+
+FreePBX UI mutations use a module CSRF token. Uploaded tones are size-limited and decoded/re-encoded by SoX; imported config files are size-limited and schema-validated before staging. NWS and announcement text is passed to subprocesses as argument arrays or shell-escaped values, and ImageMagick text metacharacters are neutralized before rendering.
+
+Executable runtime under `/usr/local/bin/sls_mass_notify`, including Piper, maintenance, and updater code, is owned by `root:root`. Mutable deployment data remains under the Asterisk data folder. The root updater only accepts the official beta repository, requires GitHub release SHA-256 metadata, and executes the installer from the matching immutable release tag. Automatic updates remain disabled by default.
+
+Phone SIP NOTIFY delivery is sent directly by Asterisk/PJSIP to registered endpoints. Vendor XML support is model-, firmware-, provisioning-, authentication-, and certificate-dependent; do not interpret a successful AMI send as proof that a phone displayed the payload.
 
 The module does not replace FreePBX system hardening. Firewall rules, TLS certificates, fail2ban policies, OS patching, mail transport security, and SIP trunk security remain the responsibility of the PBX administrator.
 
 ## Dependency Security
 
-The installer uses Debian packages and downloads Piper TTS voice models during installation. Use a trusted network for installation, verify release checksums, and rerun the installer or repair script only from the official project source.
+The installer uses Debian packages, creates a dedicated Piper virtual environment with pinned packaging tools and `piper-tts`, and downloads Piper voice models from a pinned repository revision with exact SHA-256 verification. Release TGZ paths and metadata are validated before extraction. Use a trusted network for installation, verify release checksums, and run installers only from the official project source.
+
+The project locally signs its custom module and the FreePBX modules containing managed integration files. The signing key is generated on each PBX and trusted only in that PBX's FreePBX GPG home. This detects later local file alteration but is not a publisher-distributed release signature or a substitute for verifying the release download.
 
 ## Disclosure Target
 

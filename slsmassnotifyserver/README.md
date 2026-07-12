@@ -4,9 +4,9 @@
 
 Southland Servers Mass Notifications Server is an open-source AGPLv3 FreePBX module that turns a PBX into a centralized alerting and mass notification server. It provides a unified interface for sending SIP NOTIFY visual alerts, desktop app notifications, dashboard announcements, NWS weather alerts, and optional Piper TTS audio paging through Asterisk.
 
-The system stores its configuration in a transplantable central `.config` file and supports token-protected APIs, Asterisk/PJSIP phone delivery, authenticated desktop clients, announcement groups, quiet hours, notification log retention, uploaded tones, installer-downloaded Piper voices, and NWS zone settings. It is designed for organizations that want PBX-integrated EAS-style notifications without depending on a closed vendor platform, while keeping phone delivery, desktop clients, weather alerting, and alert history manageable from FreePBX.
+The system stores its configuration in a transplantable central `.config` file and supports authenticated APIs, Asterisk/PJSIP phone delivery, per-client desktop credentials, announcement groups, quiet hours, notification log retention, uploaded tones, installer-downloaded Piper voices, and NWS zone settings. It is designed for organizations that want PBX-integrated EAS-style notifications without depending on a closed vendor platform, while keeping phone delivery, desktop clients, weather alerting, and alert history manageable from FreePBX.
 
-Current public beta release: `0.0.4-beta`.
+Current public beta release: `0.0.5-beta`.
 
 ## Status
 
@@ -33,7 +33,7 @@ Pre-release beta staging. Review and test on a non-critical FreePBX 17 system be
 - Python 3
 - `curl`
 - `sox`
-- Piper TTS. The installer creates the local Piper virtualenv, installs `piper-tts`, and downloads the configured voices.
+- Piper TTS. The installer creates a root-owned virtual environment under `/usr/local/bin/sls_mass_notify/piper`, installs pinned Piper packaging dependencies and `piper-tts`, and downloads checksum-verified voice models.
 
 Piper voices downloaded during install:
 
@@ -61,7 +61,7 @@ From the repository root:
 The package is written to:
 
 ```text
-dist/slsmassnotifyserver-0.0.4-beta.tgz
+dist/slsmassnotifyserver-0.0.5-beta.tgz
 ```
 
 ## Install
@@ -75,7 +75,7 @@ cd /tmp
 curl -fsSL -o sls-install.sh \
   https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/main/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.0.4-beta/slsmassnotifyserver-0.0.4-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.0.5-beta/slsmassnotifyserver-0.0.5-beta.tgz' \
 ./sls-install.sh
 ```
 
@@ -91,20 +91,20 @@ Custom/local FreePBX module signatures normally show as `Unknown`. That is accep
 
 ## Install From A Local `.tgz`
 
-Use this only if you already downloaded or built the release package and uploaded it to `/tmp/slsmassnotifyserver-0.0.4-beta.tgz` on the PBX.
+Use this only if you already downloaded or built the release package and uploaded it to `/tmp/slsmassnotifyserver-0.0.5-beta.tgz` on the PBX.
 
 ```bash
 cd /tmp
-tar -tzf /tmp/slsmassnotifyserver-0.0.4-beta.tgz >/dev/null
+tar -tzf /tmp/slsmassnotifyserver-0.0.5-beta.tgz >/dev/null
 curl -fsSL -o sls-install.sh \
   https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/main/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ=/tmp/slsmassnotifyserver-0.0.4-beta.tgz ./sls-install.sh
+SLS_MASS_NOTIFY_TGZ=/tmp/slsmassnotifyserver-0.0.5-beta.tgz ./sls-install.sh
 ```
 
 ## Uninstall
 
-This removes the FreePBX module, runtime scripts, API folders, Apache config, sound symlinks, local signing artifacts, and temporary installer files. Central config files under `/var/lib/asterisk/SLS_Mass_Notifications_Plugin` are preserved when present so the deployment can be restored later.
+This removes the FreePBX module, its Manager/AMI database user, runtime scripts, API folders, Apache state, sound symlinks, local signing artifacts, and temporary installer files. It then verifies that managed records and generated files are gone and that the stock Dashboard and Framework signatures are valid. Central config files under `/var/lib/asterisk/SLS_Mass_Notifications_Plugin` are preserved when present so the deployment can be restored later.
 
 ```bash
 cd /tmp
@@ -119,8 +119,9 @@ chmod +x sls-uninstall.sh
 ```bash
 fwconsole ma list | egrep -i 'slsmassnotifyserver|dashboard|Module'
 asterisk -rx "dialplan show 1000@sls-alert-audio"
-python3 -m py_compile /usr/local/bin/sls_mass_notify/sls_notify.py
+python3 -c 'compile(open("/usr/local/bin/sls_mass_notify/sls_notify.py", encoding="utf-8").read(), "sls_notify.py", "exec")'
 php -l /var/www/html/admin/modules/slsmassnotifyserver/Slsmassnotifyserver.class.php
+curl -k -s -o /tmp/sls-control-api.out -w '%{http_code}' http://127.0.0.1/api/sls-mass-notify/
 ```
 
 
@@ -140,7 +141,7 @@ FreePBX module installs are not a safe place for interactive questions, so the m
 10. Select announcement and NWS Piper voices.
 11. Set announcement and NWS TTS volumes.
 12. Set notification log retention.
-13. Complete setup. The wizard writes the central `.config`, generated shell config, and Python runtime config.
+13. Complete setup. The wizard writes the central `.config`; shell and Python services read that file directly.
 
 NWS zone/county examples:
 
@@ -161,14 +162,7 @@ Live configuration is stored outside the module so updates do not overwrite it:
 /var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config
 ```
 
-That JSON `.config` file is the source of truth. The module generates runtime files from it:
-
-```text
-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.conf
-/usr/local/bin/sls_mass_notify/config.ini
-```
-
-Do not edit generated runtime files as the primary configuration method. Use the FreePBX UI or transplant the central `.config` file.
+That JSON `.config` file is the only settings source of truth. Shell, Python, PHP, API, desktop-client, announcement-group, NWS, TTS, and phone-format settings are normalized into it and runtime services read it directly. Use the FreePBX UI or transplant the central `.config` file; obsolete generated `mass-notifications.conf` and `config.ini` copies are removed during install.
 
 ## Backup And Restore
 
@@ -195,6 +189,15 @@ https://pbx.example.com/api/sls-mass-notify
 ```
 
 Desktop clients use their configured username and password. Phone SIP NOTIFY payloads are pushed by Asterisk/PJSIP to registered endpoints, and the sender chooses the payload style from the detected endpoint vendor. The Control API is disabled by default and uses its own API key.
+
+If generated API or image links show a short hostname such as `https://pbx/...`, set `Mass Notify > General Settings > Public PBX Hostname` to the real DNS name clients and phones can reach. Phone Image Transport defaults to HTTP for legacy Yealink compatibility and can be changed to HTTPS when every target phone trusts the PBX certificate and supports its TLS configuration. Authenticated APIs remain HTTPS.
+
+If a phone vendor is detected incorrectly, use `Mass Notify > General Settings > Phone Format Overrides` with one mapping per line:
+
+```text
+1190=cisco
+1000=yealink
+```
 
 ## Logs
 
@@ -232,7 +235,7 @@ The source of truth is:
 /var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config
 ```
 
-Generated shell and Python config files are rebuilt from that central file.
+Runtime services read and validate that central file directly.
 
 ### Will updates overwrite my settings?
 
@@ -256,11 +259,19 @@ No. Phones receive SIP NOTIFY directly from Asterisk/PJSIP. Desktop clients use 
 
 ### Can I regenerate credentials?
 
-Yes. The SLS Mass Notify App token and Control API key can be regenerated from the FreePBX UI. Fresh installs automatically generate new random credentials during setup; updates keep existing credentials from the central `.config` file unless you intentionally regenerate them. Regenerating either credential requires updating clients that use it.
+Yes. The Control API key can be regenerated, and desktop clients can be given new per-client usernames/passwords from the FreePBX UI. Fresh installs generate random Control API, desktop encryption, desktop client, and AMI credentials. Updates preserve credentials in the central `.config` unless an administrator intentionally changes them.
 
 ### Does the Control API allow remote control?
 
 Only if enabled. It is disabled by default and protected by its own API key.
+
+### How do automatic updates work?
+
+Automatic updates are disabled by default. When enabled, a root-owned job checks only the official beta repository, accepts release assets that include a GitHub SHA-256 digest, downloads the installer from the matching immutable release tag, and supplies the expected digest to the installer. The Asterisk service account cannot replace the updater or Piper executable runtime.
+
+### Are all phone models guaranteed to display SIP NOTIFY payloads?
+
+No. The module implements documented XML families and detects registered-contact User-Agents, but actual behavior depends on model, firmware, XML push provisioning, SIP NOTIFY authentication, and HTTPS certificate trust. Use a manual format override when detection is wrong, use `yealink_text` when a Yealink cannot retrieve an image, and test every target model before emergency use. Mixed-vendor phones sharing one extension receive endpoint-level pushes and should be tested especially carefully.
 
 ### What happens during quiet hours?
 

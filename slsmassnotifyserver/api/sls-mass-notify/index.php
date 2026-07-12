@@ -2,9 +2,9 @@
 // Southland Servers Mass Notifications Server by the Southland Servers Group
 
 declare(strict_types=1);
+ini_set('display_errors', '0');
 
 const CONFIG_FILE = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config';
-const LEGACY_CONFIG_FILE = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications-' . 'settings.json';
 const STATUS_FILE = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/status.json';
 const EVENTS_FILE = '/var/log/sls_mass_notify_events.jsonl';
 const SIPNOTIFY_SCRIPT = '/usr/local/bin/sls_mass_notify/sls_notify.py';
@@ -23,21 +23,49 @@ function respond(int $code, array $payload): void
 
 function config(): array
 {
-    $path = is_readable(CONFIG_FILE) ? CONFIG_FILE : LEGACY_CONFIG_FILE;
-    if (!is_readable($path)) {
-        respond(503, ['ok' => false, 'error' => 'config_unavailable']);
+	if (!is_readable(CONFIG_FILE)) {
+		respond(503, ['ok' => false, 'error' => 'config_unavailable']);
+	}
+	$decoded = json_decode((string)file_get_contents(CONFIG_FILE), true);
+    if (!is_array($decoded)) {
+        respond(503, ['ok' => false, 'error' => 'config_invalid']);
     }
-    $decoded = json_decode((string)file_get_contents($path), true);
-    return is_array($decoded) ? $decoded : [];
+    return $decoded;
+}
+
+function request_header_value(string $name): string
+{
+    $serverKey = 'HTTP_' . strtoupper(str_replace('-', '_', $name));
+    foreach ([$serverKey, 'REDIRECT_' . $serverKey] as $key) {
+        $value = trim((string)($_SERVER[$key] ?? ''));
+        if ($value !== '') {
+            return $value;
+        }
+    }
+    foreach (['apache_request_headers', 'getallheaders'] as $function) {
+        if (!function_exists($function)) {
+            continue;
+        }
+        $headers = $function();
+        if (!is_array($headers)) {
+            continue;
+        }
+        foreach ($headers as $key => $value) {
+            if (strcasecmp((string)$key, $name) === 0) {
+                return trim((string)$value);
+            }
+        }
+    }
+    return '';
 }
 
 function provided_key(): string
 {
-    $header = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
+    $header = request_header_value('Authorization');
     if (preg_match('/^Bearer\s+(.+)$/i', $header, $matches)) {
         return trim($matches[1]);
     }
-    return trim((string)($_SERVER['HTTP_X_API_KEY'] ?? ''));
+    return request_header_value('X-API-Key');
 }
 
 function client_ip(): string
@@ -45,21 +73,35 @@ function client_ip(): string
     return trim((string)($_SERVER['REMOTE_ADDR'] ?? ''));
 }
 
-function ipv4_cidr_match(string $ip, string $cidr): bool
+function cidr_match(string $ip, string $cidr): bool
 {
-    if (strpos($cidr, '/') === false || !filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+    if (strpos($cidr, '/') === false || !filter_var($ip, FILTER_VALIDATE_IP)) {
         return false;
     }
     [$network, $bits] = explode('/', $cidr, 2);
-    if (!filter_var($network, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+    if (!filter_var($network, FILTER_VALIDATE_IP)) {
         return false;
     }
     $bits = (int)$bits;
-    if ($bits < 0 || $bits > 32) {
+    $packedIp = @inet_pton($ip);
+    $packedNetwork = @inet_pton($network);
+    if (!is_string($packedIp) || !is_string($packedNetwork) || strlen($packedIp) !== strlen($packedNetwork)) {
         return false;
     }
-    $mask = $bits === 0 ? 0 : (-1 << (32 - $bits));
-    return ((ip2long($ip) & $mask) === (ip2long($network) & $mask));
+    $maxBits = strlen($packedIp) * 8;
+    if ($bits < 0 || $bits > $maxBits) {
+        return false;
+    }
+    $wholeBytes = intdiv($bits, 8);
+    $remainingBits = $bits % 8;
+    if ($wholeBytes > 0 && substr($packedIp, 0, $wholeBytes) !== substr($packedNetwork, 0, $wholeBytes)) {
+        return false;
+    }
+    if ($remainingBits === 0) {
+        return true;
+    }
+    $mask = (0xff << (8 - $remainingBits)) & 0xff;
+    return (ord($packedIp[$wholeBytes]) & $mask) === (ord($packedNetwork[$wholeBytes]) & $mask);
 }
 
 function ip_allowed(array $control, string $ip): bool
@@ -73,7 +115,7 @@ function ip_allowed(array $control, string $ip): bool
         if ($item === '') {
             continue;
         }
-        if (hash_equals($item, $ip) || ipv4_cidr_match($ip, $item)) {
+        if (hash_equals($item, $ip) || cidr_match($ip, $item)) {
             return true;
         }
     }
@@ -88,11 +130,16 @@ function control_rate_allowed(array $control, string $ip): bool
     $limit = (int)($control['rate_limit_per_minute'] ?? 60);
     $limit = min(600, max(1, $limit));
     $bucket = gmdate('YmdHi');
-    $data = [];
-    if (is_readable(CONTROL_API_RATE_FILE)) {
-        $decoded = json_decode((string)file_get_contents(CONTROL_API_RATE_FILE), true);
-        $data = is_array($decoded) ? $decoded : [];
+    $handle = @fopen(CONTROL_API_RATE_FILE, 'c+');
+    if ($handle === false || !flock($handle, LOCK_EX)) {
+        if (is_resource($handle)) {
+            fclose($handle);
+        }
+        return false;
     }
+    rewind($handle);
+    $decoded = json_decode((string)stream_get_contents($handle), true);
+    $data = is_array($decoded) ? $decoded : [];
     $data = array_filter($data, static function ($entry) use ($bucket) {
         return is_array($entry) && (($entry['bucket'] ?? '') === $bucket);
     });
@@ -101,8 +148,13 @@ function control_rate_allowed(array $control, string $ip): bool
     $entry['bucket'] = $bucket;
     $entry['count'] = (int)($entry['count'] ?? 0) + 1;
     $data[$key] = $entry;
-    @file_put_contents(CONTROL_API_RATE_FILE, json_encode($data, JSON_UNESCAPED_SLASHES) . "\n", LOCK_EX);
-    @chmod(CONTROL_API_RATE_FILE, 0660);
+    rewind($handle);
+    ftruncate($handle, 0);
+    fwrite($handle, json_encode($data, JSON_UNESCAPED_SLASHES) . "\n");
+    fflush($handle);
+    flock($handle, LOCK_UN);
+    fclose($handle);
+    @chmod(CONTROL_API_RATE_FILE, 0640);
     return $entry['count'] <= $limit;
 }
 
@@ -118,9 +170,17 @@ function audit_control_api(string $ip, string $action, int $status, bool $ok): v
     ];
     $dir = dirname(CONTROL_API_AUDIT_LOG);
     if (!is_dir($dir)) {
-        @mkdir($dir, 0755, true);
+        @mkdir($dir, 0750, true);
     }
-    $lines = is_readable(CONTROL_API_AUDIT_LOG) ? (file(CONTROL_API_AUDIT_LOG, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: []) : [];
+    $handle = @fopen(CONTROL_API_AUDIT_LOG, 'c+');
+    if ($handle === false || !flock($handle, LOCK_EX)) {
+        if (is_resource($handle)) {
+            fclose($handle);
+        }
+        return;
+    }
+    rewind($handle);
+    $lines = preg_split('/\R/', (string)stream_get_contents($handle), -1, PREG_SPLIT_NO_EMPTY) ?: [];
     $cutoff = time() - (30 * 86400);
     $kept = [];
     foreach ($lines as $line) {
@@ -131,8 +191,14 @@ function audit_control_api(string $ip, string $action, int $status, bool $ok): v
         }
     }
     $kept[] = json_encode($record, JSON_UNESCAPED_SLASHES);
-    @file_put_contents(CONTROL_API_AUDIT_LOG, implode("\n", $kept) . "\n", LOCK_EX);
-    @chmod(CONTROL_API_AUDIT_LOG, 0660);
+    $kept = array_slice($kept, -10000);
+    rewind($handle);
+    ftruncate($handle, 0);
+    fwrite($handle, implode("\n", $kept) . "\n");
+    fflush($handle);
+    flock($handle, LOCK_UN);
+    fclose($handle);
+    @chmod(CONTROL_API_AUDIT_LOG, 0640);
 }
 
 function read_json_file(string $path): array
@@ -206,6 +272,12 @@ function sanitize_targets($value): array
 $config = config();
 $control = is_array($config['control_api'] ?? null) ? $config['control_api'] : [];
 $clientIp = client_ip();
+$https = !empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off';
+$loopback = in_array($clientIp, ['127.0.0.1', '::1'], true);
+if (!$https && !$loopback) {
+    audit_control_api($clientIp, 'https_required', 426, false);
+    respond(426, ['ok' => false, 'error' => 'https_required']);
+}
 if (empty($control['enabled'])) {
     audit_control_api($clientIp, 'disabled', 403, false);
     respond(403, ['ok' => false, 'error' => 'control_api_disabled']);
@@ -232,49 +304,79 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         respond(200, ['ok' => true, 'resource' => 'events', 'events' => recent_events((int)($_GET['limit'] ?? 25))]);
     }
     if ($resource === 'config') {
-        $result = freepbx_module()->controlApiConfig(['include_secrets' => !empty($_GET['include_secrets'])]);
-        audit_control_api($clientIp, 'get_config', !empty($result['success']) ? 200 : 400, !empty($result['success']));
-        respond(!empty($result['success']) ? 200 : 400, ['ok' => !empty($result['success']), 'resource' => 'config'] + $result);
+        try {
+            $result = freepbx_module()->controlApiConfig();
+            audit_control_api($clientIp, 'get_config', !empty($result['success']) ? 200 : 400, !empty($result['success']));
+            respond(!empty($result['success']) ? 200 : 400, ['ok' => !empty($result['success']), 'resource' => 'config'] + $result);
+        } catch (\Throwable $exception) {
+            error_log('SLS Mass Notify Control API config read failure: ' . $exception->getMessage());
+            audit_control_api($clientIp, 'get_config', 500, false);
+            respond(500, ['ok' => false, 'error' => 'internal_error']);
+        }
     }
     audit_control_api($clientIp, 'get_status', 200, true);
     respond(200, ['ok' => true, 'resource' => 'status', 'status' => read_json_file(STATUS_FILE)]);
 }
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    audit_control_api($clientIp, 'method_not_allowed', 405, false);
     respond(405, ['ok' => false, 'error' => 'method_not_allowed']);
 }
 
-$body = json_decode((string)file_get_contents('php://input'), true);
+$contentType = strtolower(trim((string)($_SERVER['CONTENT_TYPE'] ?? '')));
+if (strpos($contentType, 'application/json') !== 0) {
+    audit_control_api($clientIp, 'unsupported_media_type', 415, false);
+    respond(415, ['ok' => false, 'error' => 'content_type_must_be_json']);
+}
+
+$contentLength = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);
+if ($contentLength > 65536) {
+    audit_control_api($clientIp, 'request_too_large', 413, false);
+    respond(413, ['ok' => false, 'error' => 'request_too_large']);
+}
+$rawBody = (string)file_get_contents('php://input');
+if (strlen($rawBody) > 65536) {
+    audit_control_api($clientIp, 'request_too_large', 413, false);
+    respond(413, ['ok' => false, 'error' => 'request_too_large']);
+}
+$body = json_decode($rawBody, true);
 if (!is_array($body)) {
+    audit_control_api($clientIp, 'invalid_json', 400, false);
     respond(400, ['ok' => false, 'error' => 'invalid_json']);
 }
 
 $action = strtolower(trim((string)($body['action'] ?? '')));
-$module = freepbx_module();
+try {
+    $module = freepbx_module();
 
-if ($action === 'send_announcement') {
-    $result = $module->controlApiSendAnnouncement($body);
-    audit_control_api($clientIp, $action, !empty($result['success']) ? 200 : 400, !empty($result['success']));
-    respond(!empty($result['success']) ? 200 : 400, ['ok' => !empty($result['success']), 'action' => $action] + $result);
+    if ($action === 'send_announcement') {
+        $result = $module->controlApiSendAnnouncement($body);
+        audit_control_api($clientIp, $action, !empty($result['success']) ? 200 : 400, !empty($result['success']));
+        respond(!empty($result['success']) ? 200 : 400, ['ok' => !empty($result['success']), 'action' => $action] + $result);
+    }
+
+    if ($action === 'test_nws' || $action === 'trigger_nws_test') {
+        $result = $module->controlApiTriggerNwsTest($body);
+        audit_control_api($clientIp, $action, !empty($result['success']) ? 200 : 400, !empty($result['success']));
+        respond(!empty($result['success']) ? 200 : 400, ['ok' => !empty($result['success']), 'action' => $action] + $result);
+    }
+
+    if ($action === 'get_config') {
+        $result = $module->controlApiConfig($body);
+        audit_control_api($clientIp, $action, !empty($result['success']) ? 200 : 400, !empty($result['success']));
+        respond(!empty($result['success']) ? 200 : 400, ['ok' => !empty($result['success']), 'action' => $action] + $result);
+    }
+
+    if ($action === 'update_config') {
+        $result = $module->controlApiUpdateConfig($body);
+        audit_control_api($clientIp, $action, !empty($result['success']) ? 200 : 400, !empty($result['success']));
+        respond(!empty($result['success']) ? 200 : 400, ['ok' => !empty($result['success']), 'action' => $action] + $result);
+    }
+
+    audit_control_api($clientIp, $action ?: 'unsupported_action', 400, false);
+    respond(400, ['ok' => false, 'error' => 'unsupported_action']);
+} catch (\Throwable $exception) {
+    error_log('SLS Mass Notify Control API failure: ' . $exception->getMessage());
+    audit_control_api($clientIp, $action ?: 'internal_error', 500, false);
+    respond(500, ['ok' => false, 'error' => 'internal_error']);
 }
-
-if ($action === 'test_nws' || $action === 'trigger_nws_test') {
-    $result = $module->controlApiTriggerNwsTest($body);
-    audit_control_api($clientIp, $action, !empty($result['success']) ? 200 : 400, !empty($result['success']));
-    respond(!empty($result['success']) ? 200 : 400, ['ok' => !empty($result['success']), 'action' => $action] + $result);
-}
-
-if ($action === 'get_config') {
-    $result = $module->controlApiConfig($body);
-    audit_control_api($clientIp, $action, !empty($result['success']) ? 200 : 400, !empty($result['success']));
-    respond(!empty($result['success']) ? 200 : 400, ['ok' => !empty($result['success']), 'action' => $action] + $result);
-}
-
-if ($action === 'update_config') {
-    $result = $module->controlApiUpdateConfig($body);
-    audit_control_api($clientIp, $action, !empty($result['success']) ? 200 : 400, !empty($result['success']));
-    respond(!empty($result['success']) ? 200 : 400, ['ok' => !empty($result['success']), 'action' => $action] + $result);
-}
-
-audit_control_api($clientIp, $action ?: 'unsupported_action', 400, false);
-respond(400, ['ok' => false, 'error' => 'unsupported_action']);

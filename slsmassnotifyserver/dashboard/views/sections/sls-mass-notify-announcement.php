@@ -8,6 +8,7 @@ $announcementState = is_array($announcement_state ?? null) ? $announcement_state
 $quietHoursActive = !empty($announcementState['quiet_hours_active']);
 $setupComplete = !empty($setup_complete);
 $setupModal = (string)($setup_modal ?? '');
+$csrfToken = (string)($csrf_token ?? '');
 ?>
 <style>
 #dashboard-sls-mass-notify-announcement .sls-target-list {
@@ -73,8 +74,9 @@ $setupModal = (string)($setup_modal ?? '');
 	<?php return; ?>
 	<?php } ?>
 	<div id="dashboard-sls-mass-notify-announcement-result" style="display: none;"></div>
-	<form id="dashboard-sls-mass-notify-announcement-form" method="post" action="config.php?display=slsmassnotifyserver">
-		<input type="hidden" name="slsmassnotifyserver_action" value="send_announcement">
+		<form id="dashboard-sls-mass-notify-announcement-form" method="post" action="config.php?display=slsmassnotifyserver">
+			<input type="hidden" name="slsmassnotifyserver_action" value="send_announcement">
+			<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
 		<div class="form-group">
 			<div class="clearfix">
 				<label class="pull-left"><?php echo _('Announcement Groups'); ?></label>
@@ -181,6 +183,7 @@ $setupModal = (string)($setup_modal ?? '');
 					</div>
 					<div class="modal-body">
 						<input type="hidden" name="slsmassnotifyserver_action" value="save_announcement_group">
+						<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
 						<input type="hidden" id="dashboard_group_id" name="group_id" value="">
 						<div class="form-group">
 							<label for="dashboard_group_name"><?php echo _('Group Name'); ?></label>
@@ -240,9 +243,9 @@ $setupModal = (string)($setup_modal ?? '');
 </div>
 <script>
 (function() {
-	var initialGroups = <?php echo json_encode(array_values($announcementGroups), JSON_UNESCAPED_SLASHES); ?>;
-	var onlineExtensions = <?php echo json_encode(array_values(array_map(static function ($target) { return (string)($target['extension'] ?? ''); }, $announcementTargets)), JSON_UNESCAPED_SLASHES); ?>;
-	var desktopClients = <?php echo json_encode(array_values($desktopClients), JSON_UNESCAPED_SLASHES); ?>;
+	var initialGroups = <?php echo json_encode(array_values($announcementGroups), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
+	var onlineExtensions = <?php echo json_encode(array_values(array_map(static function ($target) { return (string)($target['extension'] ?? ''); }, $announcementTargets)), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
+	var desktopClients = <?php echo json_encode(array_values($desktopClients), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
 	var root = document.getElementById('dashboard-sls-mass-notify-announcement');
 	if (!root || root.getAttribute('data-ready') === '1') {
 		return;
@@ -347,6 +350,7 @@ $setupModal = (string)($setup_modal ?? '');
 		}
 		var body = new FormData();
 		body.append('slsmassnotifyserver_action', 'delete_announcement_group');
+		body.append('slsmassnotifyserver_csrf', <?php echo json_encode($csrfToken); ?>);
 		body.append('group_id', id);
 			fetch(form.action, {method: 'POST', credentials: 'same-origin', body: body})
 				.then(parseJsonResponse)

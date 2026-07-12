@@ -2,11 +2,14 @@
 import argparse
 import base64
 import configparser
+import fcntl
+import hashlib
 import html
 import json
 import logging
 import os
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -16,12 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import requests
-
-
-BASE_DIR = Path("/usr/local/bin/sls_mass_notify")
-CONFIG_FILE = BASE_DIR / "config.ini"
-SEEN_FILE = BASE_DIR / "seen_alerts.json"
+CENTRAL_SETTINGS_FILE = Path("/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config")
 LOCAL_TZ = ZoneInfo(os.environ.get("TZ") or "UTC")
 DEFAULT_API_EVENTS_FILE = Path("/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sipnotify/sipnotify_events.jsonl")
 
@@ -171,10 +169,19 @@ class AmiClient:
     def send(self, fields):
         lines = []
         for key, value in fields.items():
+            key = str(key)
+            if not key or "\r" in key or "\n" in key or ":" in key:
+                raise ValueError("Invalid AMI field name")
             if isinstance(value, list):
                 for item in value:
+                    item = str(item)
+                    if "\r" in item or "\n" in item:
+                        raise ValueError(f"AMI field {key} contains a line break")
                     lines.append(f"{key}: {item}")
             else:
+                value = str(value)
+                if "\r" in value or "\n" in value:
+                    raise ValueError(f"AMI field {key} contains a line break")
                 lines.append(f"{key}: {value}")
         data = "\r\n".join(lines) + "\r\n\r\n"
         self.sock.sendall(data.encode("utf-8"))
@@ -218,10 +225,55 @@ class AmiClient:
 
 
 def load_config():
-    config = configparser.ConfigParser()
-    if not config.read(CONFIG_FILE):
-        raise RuntimeError(f"Unable to read {CONFIG_FILE}")
-    return config
+    config = configparser.ConfigParser(interpolation=None)
+    if CENTRAL_SETTINGS_FILE.is_file():
+        try:
+            settings = json.loads(CENTRAL_SETTINGS_FILE.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Unable to read central config {CENTRAL_SETTINGS_FILE}: {exc}") from exc
+        if not isinstance(settings, dict):
+            raise RuntimeError(f"Central config {CENTRAL_SETTINGS_FILE} is not a JSON object")
+
+        ami = settings.get("ami") if isinstance(settings.get("ami"), dict) else {}
+        sipnotify = settings.get("sipnotify") if isinstance(settings.get("sipnotify"), dict) else {}
+        host = str(settings.get("public_pbx_host") or sipnotify.get("pbx_host") or "localhost").strip()
+        host = re.sub(r"^https?://", "", host, flags=re.I).split("/", 1)[0].strip()
+        if not re.match(r"^[A-Za-z0-9.-]+$", host):
+            host = "localhost"
+        media_scheme = str(sipnotify.get("media_scheme") or "http").strip().lower()
+        if media_scheme not in {"http", "https"}:
+            media_scheme = "http"
+
+        config.read_dict({
+            "nws": {
+                "zone": str(settings.get("nws_zone") or ""),
+                "api_base_url": str(settings.get("nws_api_base_url") or "https://api.weather.gov"),
+                "poll_interval": "60",
+            },
+            "ami": {
+                "host": "127.0.0.1",
+                "port": "5038",
+                "username": str(ami.get("username") or "slsmassnotify"),
+                "password": str(ami.get("password") or ""),
+            },
+            "logging": {"log_file": "/var/log/sls_mass_notify_push.log"},
+            "visual": {
+                "web_dir": "/var/www/html/sls_mass_notify",
+                "public_base_url": f"{media_scheme}://{host}/sls_mass_notify",
+                "image_width": "480",
+                "image_height": "272",
+                "retry_delays": "",
+            },
+            "api": {"events_file": str(DEFAULT_API_EVENTS_FILE)},
+            "endpoint_format_overrides": {
+                str(endpoint): str(fmt)
+                for endpoint, fmt in (sipnotify.get("format_overrides") or {}).items()
+                if str(endpoint).isdigit()
+            },
+        })
+        return config
+
+    raise RuntimeError(f"Unable to read central config {CENTRAL_SETTINGS_FILE}")
 
 
 def setup_logging(log_file):
@@ -266,6 +318,13 @@ def format_time(value):
 def truncate(value, length):
     value = " ".join((value or "").split())
     return value[:length]
+
+
+def imagemagick_text(value, limit=220):
+    value = str(value or "").replace("\x00", "").replace("%", "%%")
+    if value.startswith("@"):
+        value = " " + value
+    return value[:limit]
 
 
 def description_lines(description):
@@ -314,9 +373,9 @@ def image_text_lines(alert):
 
 
 def safe_alert_filename(alert):
-    import hashlib
-    raw = alert.get("id") or alert.get("properties", {}).get("id") or str(time.time())
-    return "alert_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24] + ".png"
+    raw = str(alert.get("id") or alert.get("properties", {}).get("id") or time.time())
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    return f"alert_{digest}_{secrets.token_hex(10)}.png"
 
 
 def compact_identifier(value):
@@ -327,7 +386,6 @@ def alert_chain_key(alert):
     props = alert.get("properties", {})
     alert_id = compact_identifier(alert.get("id") or props.get("id"))
     event = (props.get("event") or "").strip()
-    severity = (props.get("severity") or "").strip()
     references = props.get("references") or []
     reference_id = ""
 
@@ -345,7 +403,7 @@ def alert_chain_key(alert):
                 if reference_id:
                     break
 
-    return f"{event}|{severity}|{reference_id or alert_id}"
+    return f"{event}|{reference_id or alert_id}"
 
 
 def render_alert_image(config, alert):
@@ -358,26 +416,27 @@ def render_alert_image(config, alert):
     public_base_url = config.get("visual", "public_base_url", fallback="https://PBX_HOST/sls_mass_notify").rstrip("/")
     web_dir.mkdir(parents=True, exist_ok=True)
     output = web_dir / safe_alert_filename(alert)
-    lines = image_text_lines(alert)
+    lines = [imagemagick_text(line) for line in image_text_lines(alert)]
 
     command = [
         "convert",
         "-size", f"{width}x{height}", f"xc:{colors['background']}",
         "-fill", colors["header"], "-draw", f"rectangle 0,0 {width},70",
         "-fill", colors["accent"], "-draw", f"rectangle 0,70 {width},78",
-        "-font", "Helvetica-Bold", "-fill", "#ffffff", "-gravity", "North",
+        "-font", "DejaVu-Sans-Bold", "-fill", "#ffffff", "-gravity", "North",
         "-pointsize", "30", "-annotate", "+0+16", colors["label"],
-        "-font", "Helvetica-Bold", "-fill", "#ffffff", "-gravity", "North",
+        "-font", "DejaVu-Sans-Bold", "-fill", "#ffffff", "-gravity", "North",
         "-pointsize", "28", "-annotate", "+0+82", lines[0],
-        "-font", "Helvetica", "-fill", "#ffffff", "-gravity", "NorthWest",
+        "-font", "DejaVu-Sans", "-fill", "#ffffff", "-gravity", "NorthWest",
         "-pointsize", "18", "-annotate", "+28+124", lines[1],
         "-pointsize", "18", "-annotate", "+28+148", lines[2],
         "-pointsize", "18", "-annotate", "+28+172", lines[3],
         "-pointsize", "17", "-annotate", "+28+196", lines[4],
-        "-font", "Helvetica-Bold", "-fill", colors["accent"], "-gravity", "SouthWest",
+        "-font", "DejaVu-Sans-Bold", "-fill", colors["accent"], "-gravity", "SouthWest",
         "-pointsize", "17", "-annotate", "+28+30", lines[5],
         "-pointsize", "17", "-annotate", "+28+10", lines[6],
-        str(output),
+        "-alpha", "off", "-depth", "8", "-interlace", "none",
+        "PNG24:" + str(output),
     ]
     result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
@@ -395,7 +454,10 @@ def render_alert_image(config, alert):
 
 def prune_old_images(web_dir, max_age_seconds=259200):
     cutoff = time.time() - max_age_seconds
-    for path in web_dir.glob("alert_*.png"):
+    candidates = []
+    for pattern in ("alert_*.png", "announcement_*.png", "phone_payload_*.xml"):
+        candidates.extend(web_dir.glob(pattern))
+    for path in candidates:
         try:
             if path.stat().st_mtime < cutoff:
                 path.unlink()
@@ -406,8 +468,8 @@ def prune_old_images(web_dir, max_age_seconds=259200):
 
 def yealink_image_xml(image_url, beep="yes"):
     return (
-        "<?xml version='1.0' encoding='ISO-8859-1'?>"
-        f"<YealinkIPPhoneImageScreen destroyOnExit='no' Beep='{html.escape(beep)}' Timeout='0' LockIn='no' mode='fullscreen'>"
+        "<?xml version='1.0' encoding='UTF-8'?>"
+        f"<YealinkIPPhoneImageScreen Beep='{html.escape(beep)}' Timeout='0' LockIn='no' mode='fullscreen'>"
         f"<Image horizontalAlign='middle' verticalAlign='middle'>{html.escape(image_url)}</Image>"
         "</YealinkIPPhoneImageScreen>"
     )
@@ -492,6 +554,39 @@ def cisco_text_xml(title, message):
     )
 
 
+def cisco_execute_xml(url):
+    return (
+        "<?xml version='1.0' encoding='UTF-8'?>"
+        "<CiscoIPPhoneExecute>"
+        f"<ExecuteItem Priority='0' URL='{html.escape(url, quote=True)}'/>"
+        "</CiscoIPPhoneExecute>"
+    )
+
+
+def hosted_phone_payload(config, xml_payload):
+    web_dir = Path(config.get("visual", "web_dir", fallback="/var/www/html/sls_mass_notify"))
+    public_base_url = config.get("visual", "public_base_url", fallback="https://PBX_HOST/sls_mass_notify").rstrip("/")
+    web_dir.mkdir(parents=True, exist_ok=True)
+    payload_hash = hashlib.sha256(xml_payload.encode("utf-8")).hexdigest()[:12]
+    output = web_dir / f"phone_payload_{payload_hash}_{secrets.token_hex(10)}.xml"
+    tmp = output.with_name(output.name + f".tmp.{os.getpid()}")
+    with tmp.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(xml_payload)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, output)
+    try:
+        import grp
+        import pwd
+        os.chown(output, pwd.getpwnam("asterisk").pw_uid, grp.getgrnam("asterisk").gr_gid)
+    except Exception:
+        pass
+    prune_old_images(web_dir)
+    return f"{public_base_url}/{output.name}"
+
+
 def snom_text_xml(title, message):
     return (
         "<?xml version='1.0' encoding='UTF-8'?>"
@@ -506,7 +601,7 @@ def poly_text_xml(title, message):
     return (
         "<?xml version='1.0' encoding='UTF-8'?>"
         "<PolycomIPPhone>"
-        f"<Data priority='critical'>{html.escape(title + chr(10) + clean_payload_text(message))}</Data>"
+        f"<Data priority='critical'>{html.escape(title)}&#10;{html.escape(clean_payload_text(message))}</Data>"
         "</PolycomIPPhone>"
     )
 
@@ -574,14 +669,13 @@ def render_announcement_image(config, title, message, background_color="#1f2937"
     public_base_url = config.get("visual", "public_base_url", fallback="https://PBX_HOST/sls_mass_notify").rstrip("/")
     web_dir.mkdir(parents=True, exist_ok=True)
 
-    title = (title or "Announcement").strip()[:48] or "Announcement"
+    title = imagemagick_text((title or "Announcement").strip(), 48) or "Announcement"
     cleaned = " ".join((message or "").split()).strip() or "Announcement"
-    body_lines = textwrap.wrap(cleaned, width=34, break_long_words=False, break_on_hyphens=False)[:5]
+    body_lines = [imagemagick_text(line) for line in textwrap.wrap(cleaned, width=34, break_long_words=False, break_on_hyphens=False)[:5]]
     while len(body_lines) < 5:
         body_lines.append("")
 
-    image_id = re.sub(r"[^A-Za-z0-9_-]+", "_", f"{title}_{cleaned}")[:80] or "announcement"
-    output = web_dir / ("announcement_" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "_" + str(abs(hash(image_id)))[:10] + ".png")
+    output = web_dir / ("announcement_" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "_" + secrets.token_hex(12) + ".png")
     background_color = normalize_hex_color(background_color)
     background_image_path = Path(background_image) if background_image else None
 
@@ -601,15 +695,16 @@ def render_announcement_image(config, title, message, background_color="#1f2937"
 
     command.extend([
         "-fill", "#fbbf24", "-draw", f"rectangle 0,72 {width},78",
-        "-font", "Helvetica-Bold", "-fill", "#ffffff", "-gravity", "North",
+        "-font", "DejaVu-Sans-Bold", "-fill", "#ffffff", "-gravity", "North",
         "-pointsize", "30", "-annotate", "+0+18", title,
-        "-font", "Helvetica", "-fill", "#ffffff", "-gravity", "NorthWest",
+        "-font", "DejaVu-Sans", "-fill", "#ffffff", "-gravity", "NorthWest",
         "-pointsize", "20", "-annotate", "+30+108", body_lines[0],
         "-pointsize", "20", "-annotate", "+30+136", body_lines[1],
         "-pointsize", "20", "-annotate", "+30+164", body_lines[2],
         "-pointsize", "20", "-annotate", "+30+192", body_lines[3],
         "-pointsize", "20", "-annotate", "+30+220", body_lines[4],
-        str(output),
+        "-alpha", "off", "-depth", "8", "-interlace", "none",
+        "PNG24:" + str(output),
     ])
     result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
@@ -638,47 +733,6 @@ def build_xml(config, alert):
         return build_text_xml(alert)
 
 
-def load_seen():
-    if not SEEN_FILE.exists():
-        return {}
-    try:
-        with SEEN_FILE.open() as handle:
-            data = json.load(handle)
-        if isinstance(data, dict):
-            return data
-    except Exception as exc:
-        logging.warning("Unable to read seen alert file %s: %s", SEEN_FILE, exc)
-    return {}
-
-
-def save_seen(seen):
-    tmp = SEEN_FILE.with_suffix(".tmp")
-    with tmp.open("w") as handle:
-        json.dump(seen, handle, indent=2, sort_keys=True)
-    os.replace(tmp, SEEN_FILE)
-
-
-def cleanup_seen(seen, active_ids):
-    now = datetime.now(timezone.utc)
-    cleaned = {}
-    for alert_id, expires in seen.items():
-        expires_dt = parse_time(expires)
-        if alert_id in active_ids or expires_dt is None or expires_dt > now:
-            cleaned[alert_id] = expires
-        else:
-            logging.info("Removed expired alert from seen cache: %s", alert_id)
-    return cleaned
-
-
-def fetch_alerts(zone):
-    url = f"https://api.weather.gov/alerts/active?zone={zone}"
-    headers = {"User-Agent": "SouthlandServers-FreePBX-NWS-VisualPush/1.0"}
-    response = requests.get(url, headers=headers, timeout=20)
-    response.raise_for_status()
-    data = response.json()
-    return data.get("features", [])
-
-
 def normalize_target_list(value):
     targets = set()
     for item in (value or "").replace(";", ",").split(","):
@@ -696,6 +750,51 @@ def normalize_desktop_target_list(value):
         if item:
             targets.add(item[:48])
     return targets
+
+
+PHONE_FORMAT_ALIASES = {
+    "polycom": "poly",
+    "poly-com": "poly",
+    "mitel": "aastra",
+    "generic_xml": "generic",
+    "yealink_xml": "yealink",
+    "cisco_xml": "cisco",
+}
+
+SUPPORTED_PHONE_FORMATS = {
+    "yealink",
+    "yealink_text",
+    "cisco",
+    "poly",
+    "grandstream",
+    "fanvil",
+    "snom",
+    "aastra",
+    "sangoma",
+    "avaya",
+    "vtech",
+    "ale",
+    "generic",
+    "unknown",
+}
+
+
+def normalize_phone_format(value):
+    fmt = re.sub(r"[^a-z0-9_-]+", "", (value or "").strip().lower())
+    fmt = PHONE_FORMAT_ALIASES.get(fmt, fmt)
+    return fmt if fmt in SUPPORTED_PHONE_FORMATS else ""
+
+
+def endpoint_format_overrides(config):
+    overrides = {}
+    if not config.has_section("endpoint_format_overrides"):
+        return overrides
+    for endpoint, fmt in config.items("endpoint_format_overrides"):
+        endpoint = re.sub(r"[^0-9]+", "", endpoint or "")
+        fmt = normalize_phone_format(fmt)
+        if endpoint and fmt:
+            overrides[endpoint] = fmt
+    return overrides
 
 
 def detect_phone_format(user_agent, endpoint=""):
@@ -723,11 +822,12 @@ def detect_phone_format(user_agent, endpoint=""):
     return "unknown"
 
 
-def get_registered_endpoint_info(ami, allowed_targets=None):
+def get_registered_endpoint_info(ami, allowed_targets=None, format_overrides=None):
     response, events = ami.action({"Action": "PJSIPShowContacts"}, "ContactListComplete")
     if response.get("Response", "").lower() == "error":
         raise RuntimeError(response.get("Message", "PJSIPShowContacts failed"))
     allowed_targets = set(allowed_targets or [])
+    format_overrides = format_overrides or {}
     endpoints = {}
     skipped = []
     registered_statuses = {"reachable", "nonqualified", "avail", "available", "ok", "unknown"}
@@ -752,8 +852,33 @@ def get_registered_endpoint_info(ami, allowed_targets=None):
             continue
         normalized_status = status.lower().split()[0] if status else "unknown"
         if normalized_status in registered_statuses and normalized_status not in blocked_statuses:
-            fmt = detect_phone_format(user_agent, endpoint)
-            endpoints[endpoint] = {"status": status, "user_agent": user_agent, "format": fmt}
+            detected_format = detect_phone_format(user_agent, endpoint)
+            override_format = format_overrides.get(endpoint, "")
+            fmt = override_format or detected_format
+            info = endpoints.setdefault(endpoint, {
+                "status": status,
+                "user_agent": "",
+                "format": fmt,
+                "formats": [],
+                "contacts": [],
+                "override": bool(override_format),
+            })
+            if fmt not in info["formats"]:
+                info["formats"].append(fmt)
+            user_agents = [part for part in info.get("user_agent", "").split(" | ") if part]
+            if user_agent and user_agent not in user_agents:
+                user_agents.append(user_agent)
+            info["user_agent"] = " | ".join(user_agents[:6])
+            info["status"] = status or info.get("status", "")
+            info["format"] = info["formats"][0] if info["formats"] else fmt
+            info["override"] = info.get("override", False) or bool(override_format)
+            info["contacts"].append({
+                "status": status,
+                "user_agent": user_agent,
+                "detected_format": detected_format,
+                "format": fmt,
+                "contact": (event.get("Contact") or "").strip(),
+            })
         else:
             skipped.append((endpoint, status or "Unknown", user_agent))
     for endpoint, status, user_agent in sorted(skipped):
@@ -778,19 +903,28 @@ def build_phone_xml_for_format(config, fmt, payload_type, alert=None, message=""
     if payload_type == "alert":
         if fmt == "yealink":
             return build_xml(config, alert)
+        if fmt == "yealink_text":
+            return build_text_xml(alert)
         alert_title_text, alert_message = phone_title_and_message_from_alert(alert)
-        return text_xml_for_format(fmt, alert_title_text, alert_message)
+        payload = text_xml_for_format(fmt, alert_title_text, alert_message)
+        if fmt == "cisco":
+            return cisco_execute_xml(hosted_phone_payload(config, payload))
+        return payload
     if image and fmt == "yealink":
         return build_announcement_image_xml(config, message, title, background_color, background_image)
-    return text_xml_for_format(fmt, title or "Announcement", message)
+    payload = text_xml_for_format(fmt, title or "Announcement", message)
+    if fmt == "cisco":
+        return cisco_execute_xml(hosted_phone_payload(config, payload))
+    return payload
 
 
 def notify_events_for_format(phone_format):
     phone_format = (phone_format or "yealink").lower()
     events = {
-        "yealink": ["Yealink-xml", "xml"],
-        "cisco": ["CiscoIPPhoneText", "xml"],
-        "fanvil": ["CiscoIPPhoneText", "xml"],
+        "yealink": ["Yealink-xml"],
+        "yealink_text": ["Yealink-xml"],
+        "cisco": ["XML-Service"],
+        "fanvil": ["xml", "CiscoIPPhoneText"],
         "poly": ["polycom-push", "xml"],
         "polycom": ["polycom-push", "xml"],
         "snom": ["snom", "xml"],
@@ -813,6 +947,8 @@ def notify_events_for_format(phone_format):
 
 def notify_content_type_for_format(phone_format):
     phone_format = (phone_format or "yealink").lower()
+    if phone_format in {"yealink", "yealink_text"}:
+        return "application/xml"
     if phone_format in {"poly", "polycom"}:
         return "application/x-com-polycom-spipx"
     return "text/xml"
@@ -821,6 +957,7 @@ def notify_content_type_for_format(phone_format):
 def send_notify(ami, endpoint, xml_payload, phone_format="yealink"):
     content_type = notify_content_type_for_format(phone_format)
     errors = []
+    successes = []
     for event_name in notify_events_for_format(phone_format):
         response, _ = ami.action({
             "Action": "PJSIPNotify",
@@ -832,10 +969,13 @@ def send_notify(ami, endpoint, xml_payload, phone_format="yealink"):
             ],
         })
         if response.get("Response", "").lower() != "error":
-            return f"{response.get('Message', 'sent')} event={event_name} content_type={content_type}"
+            successes.append(f"{event_name}: {response.get('Message', 'sent')}")
+            break
         message = response.get("Message", "PJSIPNotify failed")
         errors.append(f"{event_name}: {message}")
         logging.warning("PJSIPNotify event=%s content_type=%s failed for %s format=%s: %s", event_name, content_type, endpoint, phone_format, message)
+    if successes:
+        return f"{'; '.join(successes)} content_type={content_type}"
     raise RuntimeError("; ".join(errors) if errors else "PJSIPNotify failed")
 
 
@@ -872,8 +1012,32 @@ def append_sipnotify_event(config, record):
     path.parent.mkdir(parents=True, exist_ok=True)
     record = dict(record)
     record["created_at"] = datetime.now(timezone.utc).astimezone().isoformat()
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n")
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.seek(0)
+        lines = [line.rstrip("\n") for line in handle if line.strip()]
+        record_id = str(record.get("id") or "")
+        encoded = json.dumps(record, ensure_ascii=True, separators=(",", ":"))
+        replaced = False
+        if record_id:
+            for index, line in enumerate(lines):
+                try:
+                    existing = json.loads(line)
+                except Exception:
+                    continue
+                if str(existing.get("id") or "") == record_id:
+                    lines[index] = encoded
+                    replaced = True
+        if not replaced:
+            lines.append(encoded)
+        lines = lines[-1000:]
+        handle.seek(0)
+        handle.truncate(0)
+        if lines:
+            handle.write("\n".join(lines) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     try:
         import grp
         import pwd
@@ -906,6 +1070,8 @@ def alert_api_record(alert, xml_payload, extensions, phone_formats=None):
         "image_url": image_url_from_xml(xml_payload),
         "xml": xml_payload,
         "recipients": extensions,
+        "desktop_all": True,
+        "desktop_recipients": [],
         "phone_formats": phone_formats or {},
     }
 
@@ -933,23 +1099,48 @@ def announcement_api_record(alert_id, message, xml_payload, extensions, desktop_
 
 
 def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_results=False, attempt_label="initial"):
+    successes = 0
+    failures = []
     for extension, info in sorted(endpoint_info.items()):
-        phone_format = info.get("format", "yealink")
+        formats = info.get("formats") or [info.get("format", "yealink")]
         user_agent = info.get("user_agent", "")
-        try:
-            xml_payload = payload_builder(phone_format)
-            result = send_notify(ami, extension, xml_payload, phone_format)
-            logging.info("Pushed SIP NOTIFY %s to %s format=%s user_agent=%s attempt=%s: %s", alert_id, extension, phone_format, user_agent or "unknown", attempt_label, result)
-            if print_results:
-                print(f"{extension}: success format={phone_format} ({attempt_label})")
-        except Exception as exc:
-            logging.error("Failed SIP NOTIFY %s to %s format=%s user_agent=%s attempt=%s: %s", alert_id, extension, phone_format, user_agent or "unknown", attempt_label, exc)
-            if print_results:
-                print(f"{extension}: failed format={phone_format} ({attempt_label}) - {exc}")
+        if len(formats) > 1:
+            logging.warning(
+                "Endpoint %s has mixed phone vendors on one extension (%s). Each vendor event will be sent to every registered contact for that endpoint.",
+                extension,
+                ", ".join(formats),
+            )
+        for phone_format in formats:
+            try:
+                xml_payload = payload_builder(phone_format)
+                result = send_notify(ami, extension, xml_payload, phone_format)
+                successes += 1
+                logging.info("Pushed SIP NOTIFY %s to %s format=%s user_agent=%s attempt=%s: %s", alert_id, extension, phone_format, user_agent or "unknown", attempt_label, result)
+                if print_results:
+                    print(f"{extension}: success format={phone_format} ({attempt_label})")
+            except Exception as exc:
+                failures.append(f"{extension}/{phone_format}: {exc}")
+                logging.error("Failed SIP NOTIFY %s to %s format=%s user_agent=%s attempt=%s: %s", alert_id, extension, phone_format, user_agent or "unknown", attempt_label, exc)
+                if print_results:
+                    print(f"{extension}: failed format={phone_format} ({attempt_label}) - {exc}")
+    if failures:
+        raise RuntimeError(f"SIP NOTIFY delivery failed for {len(failures)} target format(s): " + "; ".join(failures))
+    if endpoint_info and successes == 0:
+        raise RuntimeError("SIP NOTIFY did not succeed for any requested endpoint")
+    return successes
 
 
 def endpoint_format_summary(endpoint_info):
-    return {endpoint: {"format": info.get("format", "yealink"), "user_agent": info.get("user_agent", "")} for endpoint, info in sorted(endpoint_info.items())}
+    return {
+        endpoint: {
+            "format": info.get("format", "yealink"),
+            "formats": info.get("formats") or [info.get("format", "yealink")],
+            "user_agent": info.get("user_agent", ""),
+            "contacts": len(info.get("contacts") or []),
+            "override": bool(info.get("override")),
+        }
+        for endpoint, info in sorted(endpoint_info.items())
+    }
 
 
 def push_alert(config, alert, print_results=False, retries=True, targets=None, api_publish=True):
@@ -958,19 +1149,25 @@ def push_alert(config, alert, print_results=False, retries=True, targets=None, a
     event = props.get("event", "Unknown")
     priority = alert_priority(props)
     alert_id = alert.get("id") or props.get("id") or "unknown"
+    requested_extensions = sorted(targets or [])
+    if api_publish:
+        append_sipnotify_event(config, alert_api_record(alert, primary_xml_payload, requested_extensions, {}))
     with AmiClient(
         config["ami"].get("host", "127.0.0.1"),
         config["ami"].getint("port", 5038),
         config["ami"].get("username", "slsmassnotify"),
         config["ami"].get("password", ""),
     ) as ami:
-        endpoint_info = get_registered_endpoint_info(ami, targets)
+        endpoint_info = get_registered_endpoint_info(ami, targets, endpoint_format_overrides(config))
         extensions = sorted(endpoint_info.keys())
         phone_formats = endpoint_format_summary(endpoint_info)
         logging.info("Pushing %s alert %s priority=%s to %d registered endpoints formats=%s", event, alert_id, priority, len(extensions), phone_formats)
         if api_publish:
             append_sipnotify_event(config, alert_api_record(alert, primary_xml_payload, extensions, phone_formats))
-        payload_builder = lambda fmt: build_phone_xml_for_format(config, fmt, "alert", alert=alert)
+        if targets and not extensions:
+            requested = ", ".join(sorted(targets))
+            raise RuntimeError(f"No requested phone endpoints are registered/reachable for SIP NOTIFY: {requested}")
+        payload_builder = lambda fmt: primary_xml_payload if fmt == "yealink" else build_phone_xml_for_format(config, fmt, "alert", alert=alert)
         send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_results, "initial")
         if not retries:
             return
@@ -989,22 +1186,27 @@ def push_announcement(config, message, targets, print_results=True, api_publish=
     if api_only:
         append_sipnotify_event(config, announcement_api_record(alert_id, message, xml_payload, [], desktop_targets, desktop_all))
         return []
+    if api_publish:
+        append_sipnotify_event(
+            config,
+            announcement_api_record(alert_id, message, xml_payload, sorted(targets or []), desktop_targets, desktop_all),
+        )
     with AmiClient(
         config["ami"].get("host", "127.0.0.1"),
         config["ami"].getint("port", 5038),
         config["ami"].get("username", "slsmassnotify"),
         config["ami"].get("password", ""),
     ) as ami:
-        endpoint_info = get_registered_endpoint_info(ami, targets)
+        endpoint_info = get_registered_endpoint_info(ami, targets, endpoint_format_overrides(config))
         extensions = sorted(endpoint_info.keys())
         phone_formats = endpoint_format_summary(endpoint_info)
-        if targets and not extensions:
-            requested = ", ".join(sorted(targets))
-            raise RuntimeError(f"No requested phone endpoints are registered/reachable for SIP NOTIFY: {requested}")
         logging.info("Pushing SIP NOTIFY announcement %s to %d registered endpoints formats=%s", alert_id, len(extensions), phone_formats)
         if api_publish:
             append_sipnotify_event(config, announcement_api_record(alert_id, message, xml_payload, extensions, desktop_targets, desktop_all, phone_formats))
-        payload_builder = lambda fmt: build_phone_xml_for_format(config, fmt, "announcement", message=message, image=image, title=title, background_color=background_color, background_image=background_image)
+        if targets and not extensions:
+            requested = ", ".join(sorted(targets))
+            raise RuntimeError(f"No requested phone endpoints are registered/reachable for SIP NOTIFY: {requested}")
+        payload_builder = lambda fmt: xml_payload if fmt == "yealink" else build_phone_xml_for_format(config, fmt, "announcement", message=message, image=image, title=title, background_color=background_color, background_image=background_image)
         send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_results, "initial")
         return extensions
 
@@ -1055,72 +1257,6 @@ def run_test(config, event="Tornado Warning", severity="Extreme", area="Williams
     push_alert(config, alert, print_results=True, retries=retries)
 
 
-def poll_once(config):
-    zone = config["nws"].get("zone", "TXZ163")
-    seen = load_seen()
-    try:
-        alerts = fetch_alerts(zone)
-    except Exception as exc:
-        logging.error("NWS API failure for zone %s: %s", zone, exc)
-        return
-
-    now = datetime.now(timezone.utc)
-    active_ids = set()
-    new_alerts = []
-    for alert in alerts:
-        props = alert.get("properties", {})
-        alert_id = (alert.get("id") or props.get("id") or "").strip()
-        if not alert_id:
-            logging.warning("Skipping alert without ID: %s", props.get("event", "Unknown"))
-            continue
-        status = (props.get("status") or "").strip()
-        msg_type = (props.get("messageType") or "").strip()
-        if status and status != "Actual":
-            logging.info("Skipping non-actual alert %s event=%s status=%s", alert_id, props.get("event", "Unknown"), status)
-            continue
-        if msg_type == "Cancel":
-            logging.info("Skipping cancelled alert %s event=%s", alert_id, props.get("event", "Unknown"))
-            continue
-        expires = props.get("expires") or ""
-        expires_dt = parse_time(expires)
-        if expires_dt is not None and expires_dt <= now:
-            logging.info("Skipping expired active-feed alert %s event=%s expires=%s", alert_id, props.get("event", "Unknown"), expires)
-            continue
-        chain_key = alert_chain_key(alert)
-        active_ids.add(chain_key)
-        if chain_key not in seen:
-            new_alerts.append(alert)
-
-    seen = cleanup_seen(seen, active_ids)
-
-    if not new_alerts:
-        save_seen(seen)
-        logging.info("NWS poll complete: no new active alerts for %s", zone)
-        return
-
-    for alert in new_alerts:
-        props = alert.get("properties", {})
-        alert_id = alert.get("id") or props.get("id") or "unknown"
-        chain_key = alert_chain_key(alert)
-        try:
-            push_alert(config, alert)
-            seen[chain_key] = props.get("expires") or ""
-            save_seen(seen)
-        except Exception as exc:
-            logging.error("Visual alert push failed for %s: %s", alert_id, exc)
-
-
-def run_daemon(config):
-    interval = max(10, config["nws"].getint("poll_interval", 60))
-    logging.info("Starting NWS visual push daemon for zone %s interval=%s", config["nws"].get("zone", "TXZ163"), interval)
-    while True:
-        try:
-            poll_once(config)
-        except Exception as exc:
-            logging.exception("Unexpected daemon error: %s", exc)
-        time.sleep(interval)
-
-
 def main():
     parser = argparse.ArgumentParser(description="SLS Mass Notify SIP NOTIFY push for supported phones")
     parser.add_argument("--test", action="store_true", help="Send a fake Tornado Warning to registered phones and exit")
@@ -1155,7 +1291,7 @@ def main():
                 config["ami"].get("username", "slsmassnotify"),
                 config["ami"].get("password", ""),
             ) as ami:
-                print(json.dumps(endpoint_format_summary(get_registered_endpoint_info(ami)), sort_keys=True))
+                print(json.dumps(endpoint_format_summary(get_registered_endpoint_info(ami, format_overrides=endpoint_format_overrides(config))), sort_keys=True))
             return 0
         targets = normalize_target_list(args.targets)
         if args.announcement:
@@ -1183,7 +1319,8 @@ def main():
         elif args.test:
             run_test(config, retries=not args.no_retry)
         else:
-            run_daemon(config)
+            parser.print_help(sys.stderr)
+            return 2
     except Exception as exc:
         logging.error("Fatal startup error: %s", exc)
         print(f"ERROR: {exc}", file=sys.stderr)

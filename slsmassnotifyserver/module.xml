@@ -2,7 +2,7 @@
 	<rawname>slsmassnotifyserver</rawname>
 	<repo>custom</repo>
 	<name>Southland Servers Mass Notifications Server</name>
-	<version>0.0.4-beta</version>
+	<version>0.0.5-beta</version>
 	<publisher>Southland Servers</publisher>
 	<license>AGPLv3+</license>
 	<licenselink>http://www.gnu.org/licenses/agpl-3.0.txt</licenselink>
@@ -21,6 +21,11 @@
 	<supported>
 		<version>17.0</version>
 	</supported>
+	<hooks>
+		<dashboard class="Overview" namespace="FreePBX\modules\Dashboard\Sections">
+			<method callingMethod="getSummary" class="Slsmassnotifyserver" namespace="FreePBX\modules">dashboardService</method>
+		</dashboard>
+	</hooks>
 	<location/>
 	<md5sum/>
 </module>

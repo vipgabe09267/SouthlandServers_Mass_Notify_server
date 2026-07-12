@@ -8,6 +8,16 @@ $tokenResult = $_SESSION['slsmassnotifyserver_other_token_result'] ?? null;
 $importResult = $_SESSION['slsmassnotifyserver_other_import_result'] ?? null;
 unset($_SESSION['slsmassnotifyserver_other_save_result'], $_SESSION['slsmassnotifyserver_other_apply_result'], $_SESSION['slsmassnotifyserver_other_token_result'], $_SESSION['slsmassnotifyserver_other_import_result']);
 
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$slsmassnotifyserver->validateCsrfToken($_POST['slsmassnotifyserver_csrf'] ?? '')) {
+	$_SESSION['slsmassnotifyserver_other_save_result'] = [
+		'success' => false,
+		'message' => _('The request security token is invalid or expired. Reload the page and try again.'),
+		'errors' => [],
+	];
+	header('Location: config.php?display=slsmassnotifyserver_other');
+	exit;
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 	$action = $_POST['slsmassnotifyserver_action'] ?? '';
 	if ($action === 'save_other_settings') {
