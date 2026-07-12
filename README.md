@@ -4,9 +4,9 @@
 
 Southland Servers Mass Notifications Server is an open-source AGPLv3 FreePBX module that turns a PBX into a centralized alerting and mass notification server. It provides a unified interface for sending SIP NOTIFY visual alerts, desktop app notifications, dashboard announcements, NWS weather alerts, and optional Piper TTS audio paging through Asterisk.
 
-The system stores its configuration in a transplantable central `.config` file and supports authenticated APIs, Asterisk/PJSIP phone delivery, per-client desktop credentials, announcement groups, quiet hours, notification log retention, uploaded tones, installer-downloaded Piper voices, and NWS zone settings. It is designed for organizations that want PBX-integrated EAS-style notifications without depending on a closed vendor platform, while keeping phone delivery, desktop clients, weather alerting, and alert history manageable from FreePBX.
+The system stores its configuration in a transplantable central `.config` file and supports authenticated APIs, Asterisk/PJSIP phone delivery, per-client desktop credentials, announcement groups, quiet hours, notification log retention, FreePBX System Recordings, installer-downloaded Piper voices, and NWS zone settings. It is designed for organizations that want PBX-integrated EAS-style notifications without depending on a closed vendor platform, while keeping phone delivery, desktop clients, weather alerting, and alert history manageable from FreePBX.
 
-Current public beta release: `0.0.5-beta`.
+Current public beta release: `0.0.6-beta`.
 
 ## Status
 
@@ -61,7 +61,7 @@ From the repository root:
 The package is written to:
 
 ```text
-dist/slsmassnotifyserver-0.0.5-beta.tgz
+dist/slsmassnotifyserver-0.0.6-beta.tgz
 ```
 
 ## Install
@@ -75,7 +75,7 @@ cd /tmp
 curl -fsSL -o sls-install.sh \
   https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/main/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.0.5-beta/slsmassnotifyserver-0.0.5-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.0.6-beta/slsmassnotifyserver-0.0.6-beta.tgz' \
 ./sls-install.sh
 ```
 
@@ -91,15 +91,15 @@ Custom/local FreePBX module signatures normally show as `Unknown`. That is accep
 
 ## Install From A Local `.tgz`
 
-Use this only if you already downloaded or built the release package and uploaded it to `/tmp/slsmassnotifyserver-0.0.5-beta.tgz` on the PBX.
+Use this only if you already downloaded or built the release package and uploaded it to `/tmp/slsmassnotifyserver-0.0.6-beta.tgz` on the PBX.
 
 ```bash
 cd /tmp
-tar -tzf /tmp/slsmassnotifyserver-0.0.5-beta.tgz >/dev/null
+tar -tzf /tmp/slsmassnotifyserver-0.0.6-beta.tgz >/dev/null
 curl -fsSL -o sls-install.sh \
   https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/main/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ=/tmp/slsmassnotifyserver-0.0.5-beta.tgz ./sls-install.sh
+SLS_MASS_NOTIFY_TGZ=/tmp/slsmassnotifyserver-0.0.6-beta.tgz ./sls-install.sh
 ```
 
 ## Uninstall
@@ -269,6 +269,8 @@ Only if enabled. It is disabled by default and protected by its own API key.
 
 Automatic updates are disabled by default. When enabled, a root-owned job checks only the official beta repository, accepts release assets that include a GitHub SHA-256 digest, downloads the installer from the matching immutable release tag, and supplies the expected digest to the installer. The Asterisk service account cannot replace the updater or Piper executable runtime.
 
+Update availability is checked even when automatic installation is disabled. General Settings and Dashboard health show a yellow warning when a newer beta is available. Administrators can use **Update to Latest Release** in General Settings to request an immediate verified update through the root maintenance worker.
+
 ### Are all phone models guaranteed to display SIP NOTIFY payloads?
 
 No. The module implements documented XML families and detects registered-contact User-Agents, but actual behavior depends on model, firmware, XML push provisioning, SIP NOTIFY authentication, and HTTPS certificate trust. Use a manual format override when detection is wrong, use `yealink_text` when a Yealink cannot retrieve an image, and test every target model before emergency use. Mixed-vendor phones sharing one extension receive endpoint-level pushes and should be tested especially carefully.
@@ -279,7 +281,7 @@ Live NWS alerts can be suppressed unless the event is configured as critical. Da
 
 ### Can I use my own tones?
 
-Yes. Opening and closing tones can be uploaded in the UI. Tones are stored under the SLS plugin data folder and are used with Piper TTS audio.
+Yes. Upload the audio through **Admin > System Recordings**, then select that recording as the opening or closing tone in General Settings or NWS Alerts. The module validates and converts the selected recording into managed 8 kHz mono Asterisk audio.
 
 ### Where do I report bugs?
 

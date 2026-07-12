@@ -16,8 +16,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$slsmassnotifyserver->validateCsrf
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action'] ?? '') === 'save_setup_wizard') {
-	$_SESSION['slsmassnotifyserver_setup_result'] = $slsmassnotifyserver->saveSetupWizard($_POST);
-	header('Location: config.php?display=slsmassnotifyserver');
+	$setupSaveResult = $slsmassnotifyserver->saveSetupWizard($_POST);
+	$_SESSION['slsmassnotifyserver_setup_result'] = $setupSaveResult;
+	header('Location: ' . (!empty($setupSaveResult['success']) ? 'index.php' : 'config.php?display=slsmassnotifyserver'));
 	exit;
 }
 

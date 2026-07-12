@@ -6,7 +6,7 @@ namespace FreePBX\modules;
 #[\AllowDynamicProperties]
 class Slsmassnotifyserver implements \BMO
 {
-	const MODULE_VERSION = '0.0.5-beta';
+	const MODULE_VERSION = '0.0.6-beta';
 	const EVENTS_LOG = '/var/log/sls_mass_notify_events.jsonl';
 	const LEGACY_EVENTS_LOG = '/var/log/nws_weather_alert_events.jsonl';
 	const PLUGIN_DATA_DIR = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin';
@@ -39,6 +39,8 @@ class Slsmassnotifyserver implements \BMO
 	const CONTROL_API_AUDIT_LOG = self::PLUGIN_DATA_DIR . '/control-api-audit.jsonl';
 	const CONTROL_API_RATE_FILE = self::PLUGIN_DATA_DIR . '/control-api-ratelimit.json';
 	const REPAIR_REQUEST_FILE = self::PLUGIN_DATA_DIR . '/repair.request';
+	const UPDATE_REQUEST_FILE = self::PLUGIN_DATA_DIR . '/update.request';
+	const UNINSTALL_REQUEST_FILE = self::PLUGIN_DATA_DIR . '/uninstall.request';
 	const TEST_COOLDOWN_SECONDS = 60;
 	const ANNOUNCEMENT_COOLDOWN_SECONDS = 60;
 	const MIN_ANNOUNCEMENT_COOLDOWN_SECONDS = 5;
@@ -160,6 +162,7 @@ class Slsmassnotifyserver implements \BMO
 			case 'settings':
 				return load_view(__DIR__ . '/views/settings.php', [
 					'available_tones' => $this->getAvailableTones(),
+					'available_system_sounds' => $this->getAvailableSystemSounds(),
 					'available_extensions' => $this->getAllPjsipExtensions(),
 					'settings' => $pendingSettings ?? $activeSettings,
 					'active_settings' => $activeSettings,
@@ -174,6 +177,7 @@ class Slsmassnotifyserver implements \BMO
 				$cooldown = $this->getTestCooldownState();
 				return load_view(__DIR__ . '/views/settings.php', [
 					'available_tones' => $this->getAvailableTones(),
+					'available_system_sounds' => $this->getAvailableSystemSounds(),
 					'available_extensions' => $this->getAllPjsipExtensions(),
 					'settings' => $pendingSettings ?? $activeSettings,
 					'active_settings' => $activeSettings,
@@ -199,6 +203,7 @@ class Slsmassnotifyserver implements \BMO
 					'available_extensions' => $this->getAllPjsipExtensions(),
 					'available_voices' => $this->getAvailablePiperVoices(),
 					'available_tones' => $this->getAvailableTones(),
+					'available_system_sounds' => $this->getAvailableSystemSounds(),
 					'desktop_clients' => $this->getDesktopClients($pendingSettings ?? $activeSettings, true),
 					'control_api_url' => $this->getControlApiUrl($pendingSettings ?? $activeSettings),
 						'package_version' => self::MODULE_VERSION,
@@ -387,9 +392,18 @@ class Slsmassnotifyserver implements \BMO
 
 		$defaults = $this->getDefaultSettings();
 		$currentSettings = $this->getPendingSettings() ?? $this->getActiveSettings();
-		$availableToneLookup = array_fill_keys($this->getAvailableTones(), true);
 		$errors = [];
-
+		$availableToneLookup = array_fill_keys($this->getAvailableTones(), true);
+		foreach (['opening', 'closing'] as $prefix) {
+			$selection = (string)($input[$prefix . '_tone'] ?? '');
+			if (strpos($selection, 'system:') === 0) {
+				$importedTone = $this->importSystemSoundAsTone($selection, $prefix, $errors);
+				if ($importedTone !== '') {
+					$input[$prefix . '_tone'] = $importedTone;
+					$availableToneLookup[$importedTone] = true;
+				}
+			}
+		}
 		$enabled = empty($input['enabled']) ? '0' : '1';
 		$postedRecipients = array_key_exists('alert_recipients', $input) ? $input['alert_recipients'] : [];
 		$alertRecipients = $this->normalizeRecipientExtensions($postedRecipients);
@@ -435,17 +449,6 @@ class Slsmassnotifyserver implements \BMO
 		}
 		if ($testEmailBody === '') {
 			$testEmailBody = $defaults['test_email_body'];
-		}
-
-		foreach ([
-			'opening_tone_upload' => 'opening',
-			'closing_tone_upload' => 'closing',
-		] as $field => $prefix) {
-			$uploadedTone = $this->saveUploadedTone($files[$field] ?? null, $prefix, $errors);
-			if ($uploadedTone !== '') {
-				$input[$prefix . '_tone'] = $uploadedTone;
-				$availableToneLookup[$uploadedTone] = true;
-			}
 		}
 
 		$openingTone = $this->normalizeToneName((string)($input['opening_tone'] ?? $currentSettings['opening_tone'] ?? $defaults['opening_tone']));
@@ -524,15 +527,14 @@ class Slsmassnotifyserver implements \BMO
 		$voiceLookup = array_fill_keys(array_column($voices, 'path'), true);
 		$errors = [];
 		$availableToneLookup = array_fill_keys($this->getAvailableTones(), true);
-
-		foreach ([
-			'opening_tone_upload' => 'opening',
-			'closing_tone_upload' => 'closing',
-		] as $field => $prefix) {
-			$uploadedTone = $this->saveUploadedTone($files[$field] ?? null, $prefix, $errors);
-			if ($uploadedTone !== '') {
-				$input[$prefix . '_tone'] = $uploadedTone;
-				$availableToneLookup[$uploadedTone] = true;
+		foreach (['opening', 'closing'] as $prefix) {
+			$selection = (string)($input[$prefix . '_tone'] ?? '');
+			if (strpos($selection, 'system:') === 0) {
+				$importedTone = $this->importSystemSoundAsTone($selection, $prefix, $errors);
+				if ($importedTone !== '') {
+					$input[$prefix . '_tone'] = $importedTone;
+					$availableToneLookup[$importedTone] = true;
+				}
 			}
 		}
 
@@ -590,7 +592,26 @@ class Slsmassnotifyserver implements \BMO
 		];
 		$settings['announcement_groups'] = $settings['announcement_groups'] ?? [];
 		$settings['desktop_auth_key'] = $this->normalizeDesktopAuthKey($settings['desktop_auth_key'] ?? '');
-		$desktopIdentifierErrors = $this->validateDesktopClientIdentifiers($input['desktop_clients'] ?? $settings['desktop_clients'] ?? []);
+		$desktopClientInput = $input['desktop_clients'] ?? $settings['desktop_clients'] ?? [];
+		$existingClientIds = [];
+		foreach ((array)($settings['desktop_clients'] ?? []) as $existingClient) {
+			$existingId = preg_replace('/[^A-Za-z0-9_-]/', '', (string)($existingClient['id'] ?? ''));
+			if ($existingId !== '') {
+				$existingClientIds[$existingId] = (string)($existingClient['client_id'] ?? '');
+			}
+		}
+		foreach ((array)$desktopClientInput as $index => $desktopClient) {
+			if (!is_array($desktopClient)) {
+				continue;
+			}
+			$desktopId = preg_replace('/[^A-Za-z0-9_-]/', '', (string)($desktopClient['id'] ?? ''));
+			if ($desktopId !== '' && isset($existingClientIds[$desktopId])) {
+				$desktopClientInput[$index]['client_id'] = $existingClientIds[$desktopId];
+			} else {
+				$desktopClientInput[$index]['client_id'] = '';
+			}
+		}
+		$desktopIdentifierErrors = $this->validateDesktopClientIdentifiers($desktopClientInput);
 		if (!empty($desktopIdentifierErrors)) {
 			return [
 				'success' => false,
@@ -598,7 +619,7 @@ class Slsmassnotifyserver implements \BMO
 				'errors' => $desktopIdentifierErrors,
 			];
 		}
-		$settings['desktop_clients'] = $this->normalizeDesktopClients($input['desktop_clients'] ?? $settings['desktop_clients'] ?? [], $settings);
+		$settings['desktop_clients'] = $this->normalizeDesktopClients($desktopClientInput, $settings);
 
 		try {
 			$this->persistPendingSettings($settings);
@@ -1596,6 +1617,38 @@ class Slsmassnotifyserver implements \BMO
 		}
 	}
 
+	public function requestManualUpdate()
+	{
+		return $this->queueMaintenanceAction(
+			self::UPDATE_REQUEST_FILE,
+			_('Manual update was queued. The protected maintenance worker will check GitHub and install a newer verified beta release within one minute.')
+		);
+	}
+
+	public function requestCompleteUninstall()
+	{
+		return $this->queueMaintenanceAction(
+			self::UNINSTALL_REQUEST_FILE,
+			_('Complete uninstall was queued. The module, runtime files, APIs, logs, and central configuration will be removed within one minute.')
+		);
+	}
+
+	private function queueMaintenanceAction($path, $successMessage)
+	{
+		$this->ensurePluginDataDir();
+		$temporary = $path . '.tmp.' . bin2hex(random_bytes(4));
+		if (@file_put_contents($temporary, gmdate('c') . "\n", LOCK_EX) === false) {
+			return ['success' => false, 'message' => _('The maintenance action could not be queued.'), 'errors' => [_('Unable to write the protected request marker.')]];
+		}
+		$this->setPrivateOwnership($temporary);
+		if (!@rename($temporary, $path)) {
+			@unlink($temporary);
+			return ['success' => false, 'message' => _('The maintenance action could not be queued.'), 'errors' => [_('Unable to activate the protected request marker.')]];
+		}
+		$this->setPrivateOwnership($path);
+		return ['success' => true, 'message' => $successMessage, 'errors' => []];
+	}
+
 	public function getDiagnosticsSummary()
 	{
 		$settings = $this->getActiveSettings();
@@ -1988,6 +2041,75 @@ class Slsmassnotifyserver implements \BMO
 		}
 		sort($tones, SORT_NATURAL | SORT_FLAG_CASE);
 		return $tones;
+	}
+
+	public function getAvailableSystemSounds()
+	{
+		$root = realpath('/var/lib/asterisk/sounds');
+		if ($root === false) {
+			return [];
+		}
+		$root = rtrim($root, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+		$sounds = [];
+		$seen = [];
+		$customDirectories = array_merge(glob($root . 'custom', GLOB_ONLYDIR) ?: [], glob($root . '*/custom', GLOB_ONLYDIR) ?: []);
+		foreach ($customDirectories as $customDirectory) {
+			foreach (new \DirectoryIterator($customDirectory) as $file) {
+				if (count($sounds) >= 500 || $file->isDot() || !$file->isFile() || !$file->isReadable()) {
+					continue;
+				}
+				$relative = str_replace(DIRECTORY_SEPARATOR, '/', substr($file->getPathname(), strlen($root)));
+				if (!preg_match('#^(?:[A-Za-z0-9_-]+/)?custom/[A-Za-z0-9_. -]+\.(wav|ulaw|gsm|sln|sln16)$#i', $relative)) {
+					continue;
+				}
+				$label = preg_replace('/\.(wav|ulaw|gsm|sln|sln16)$/i', '', $relative);
+				$key = strtolower((string)$label);
+				if (isset($seen[$key])) {
+					continue;
+				}
+				$seen[$key] = true;
+				$sounds[] = ['value' => 'system:' . $relative, 'label' => $label];
+			}
+		}
+		usort($sounds, static function ($left, $right) {
+			return strnatcasecmp((string)$left['label'], (string)$right['label']);
+		});
+		return $sounds;
+	}
+
+	private function importSystemSoundAsTone($selection, $prefix, array &$errors)
+	{
+		$relative = substr((string)$selection, strlen('system:'));
+		if (!preg_match('#^(?:[A-Za-z0-9_-]+/)?custom/[A-Za-z0-9_. -]+\.(wav|ulaw|gsm|sln|sln16)$#i', $relative)) {
+			$errors[] = sprintf(_('The selected %s system recording is invalid.'), $prefix);
+			return '';
+		}
+		$root = realpath('/var/lib/asterisk/sounds');
+		$source = realpath('/var/lib/asterisk/sounds/' . $relative);
+		if ($root === false || $source === false || strpos($source, rtrim($root, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR) !== 0 || !is_readable($source)) {
+			$errors[] = sprintf(_('The selected %s system recording is not readable.'), $prefix);
+			return '';
+		}
+		if ((int)@filesize($source) <= 0 || (int)@filesize($source) > 20 * 1024 * 1024 || !is_executable('/usr/bin/sox')) {
+			$errors[] = sprintf(_('The selected %s system recording cannot be converted.'), $prefix);
+			return '';
+		}
+		$this->ensurePluginDataDir();
+		$name = $this->normalizeToneName($prefix . '_system_' . pathinfo($source, PATHINFO_FILENAME) . '_' . substr(hash('sha256', $relative), 0, 8));
+		$target = self::TONES_DIR . '/' . $name . '.wav';
+		$tmp = $target . '.tmp.' . bin2hex(random_bytes(4)) . '.wav';
+		$command = '/usr/bin/timeout 30 /usr/bin/sox ' . escapeshellarg($source)
+			. ' -r 8000 -c 1 -b 16 ' . escapeshellarg($tmp) . ' 2>&1';
+		exec($command, $output, $exitCode);
+		if ($exitCode !== 0 || !is_file($tmp) || (int)@filesize($tmp) < 44 || !@rename($tmp, $target)) {
+			@unlink($tmp);
+			$errors[] = sprintf(_('Unable to import the selected %s system recording.'), $prefix);
+			return '';
+		}
+		@chmod($target, 0644);
+		@chown($target, 'asterisk');
+		@chgrp($target, 'asterisk');
+		return $name;
 	}
 
 	public function getAvailablePiperVoices()
@@ -3525,6 +3647,7 @@ class Slsmassnotifyserver implements \BMO
 		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_test.sh', $runtimeDir . '/sls_mass_notify_test.sh', 0755);
 		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_update.sh', $runtimeDir . '/sls_mass_notify_update.sh', 0755);
 		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_maintenance.sh', $runtimeDir . '/sls_mass_notify_maintenance.sh', 0755);
+		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_uninstall.sh', $runtimeDir . '/sls_mass_notify_uninstall.sh', 0755);
 		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_install_piper_voices.sh', $runtimeDir . '/sls_mass_notify_install_piper_voices.sh', 0755);
 		$this->copyRuntimeFile(__DIR__ . '/bin/sign_sls_mass_notify_local_sig.sh', '/usr/local/sbin/sign_sls_mass_notify_local_sig.sh', 0755);
 		$this->copyRuntimeDirectory(__DIR__ . '/bin/sls_mass_notify', $runtimeDir, 0755);
@@ -3752,7 +3875,7 @@ class Slsmassnotifyserver implements \BMO
 		if (is_dir(self::PIPER_RUNTIME_DIR . '/venv/bin')) {
 			$this->runCommand('/usr/bin/find ' . escapeshellarg(self::PIPER_RUNTIME_DIR . '/venv/bin') . ' -type f -exec chmod 755 {} +');
 		}
-		foreach (['sls_mass_notify_nws_poll.sh', 'sls_mass_notify_test.sh', 'sls_mass_notify_update.sh', 'sls_mass_notify_maintenance.sh', 'sls_mass_notify_install_piper_voices.sh', 'sls_notify.py', 'sls_config.py'] as $file) {
+		foreach (['sls_mass_notify_nws_poll.sh', 'sls_mass_notify_test.sh', 'sls_mass_notify_update.sh', 'sls_mass_notify_maintenance.sh', 'sls_mass_notify_uninstall.sh', 'sls_mass_notify_install_piper_voices.sh', 'sls_notify.py', 'sls_config.py'] as $file) {
 			$path = self::RUNTIME_DIR . '/' . $file;
 			if (is_file($path)) {
 				@chmod($path, 0755);
@@ -4490,63 +4613,6 @@ class Slsmassnotifyserver implements \BMO
 		$value = preg_replace('/[^A-Za-z0-9_-]+/', '_', $value);
 		$value = trim($value, '_-');
 		return substr($value, 0, 64);
-	}
-
-	private function saveUploadedTone($upload, $prefix, array &$errors)
-	{
-		if (!is_array($upload) || ($upload['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_NO_FILE) {
-			return '';
-		}
-		if (($upload['error'] ?? UPLOAD_ERR_OK) !== UPLOAD_ERR_OK) {
-			$errors[] = sprintf(_('Unable to upload %s tone.'), $prefix);
-			return '';
-		}
-		if ((int)($upload['size'] ?? 0) <= 0 || (int)$upload['size'] > 5 * 1024 * 1024) {
-			$errors[] = sprintf(_('%s tone upload must be a WAV file smaller than 5 MB.'), ucfirst($prefix));
-			return '';
-		}
-
-		$originalName = (string)($upload['name'] ?? '');
-		$extension = strtolower(pathinfo($originalName, PATHINFO_EXTENSION));
-		if ($extension !== 'wav') {
-			$errors[] = sprintf(_('%s tone upload must be a WAV file.'), ucfirst($prefix));
-			return '';
-		}
-		$tmpName = (string)($upload['tmp_name'] ?? '');
-		if ($tmpName === '' || !is_uploaded_file($tmpName)) {
-			$errors[] = sprintf(_('Unable to read uploaded %s tone.'), $prefix);
-			return '';
-		}
-
-		$this->ensurePluginDataDir();
-		$baseName = $this->normalizeToneName($prefix . '_' . pathinfo($originalName, PATHINFO_FILENAME));
-		if ($baseName === '') {
-			$baseName = $prefix . '_tone';
-		}
-		$target = self::TONES_DIR . '/' . $baseName . '.wav';
-		$converted = $target . '.tmp.' . bin2hex(random_bytes(4)) . '.wav';
-		if (!is_executable('/usr/bin/sox')) {
-			$errors[] = _('SoX is required to validate and convert uploaded tones.');
-			return '';
-		}
-		$cmd = '/usr/bin/timeout 20 /usr/bin/sox ' . escapeshellarg($tmpName)
-			. ' -r 8000 -c 1 -b 16 ' . escapeshellarg($converted) . ' 2>&1';
-		exec($cmd, $output, $exitCode);
-		if ($exitCode !== 0 || !is_file($converted) || (int)@filesize($converted) < 44) {
-			@unlink($converted);
-			$errors[] = sprintf(_('Unable to validate and convert uploaded %s tone to Asterisk WAV format.'), $prefix);
-			return '';
-		}
-		if (!@rename($converted, $target)) {
-			@unlink($converted);
-			$errors[] = sprintf(_('Unable to store uploaded %s tone.'), $prefix);
-			return '';
-		}
-
-		@chmod($target, 0644);
-		@chown($target, 'asterisk');
-		@chgrp($target, 'asterisk');
-		return $baseName;
 	}
 
 	private function loadStatusData()

@@ -4,12 +4,12 @@ set -euo pipefail
 umask 027
 
 MODULE="${SLS_MASS_NOTIFY_MODULE:-slsmassnotifyserver}"
-TGZ="${SLS_MASS_NOTIFY_TGZ:-/tmp/slsmassnotifyserver-0.0.5-beta.tgz}"
+TGZ="${SLS_MASS_NOTIFY_TGZ:-/tmp/slsmassnotifyserver-0.0.6-beta.tgz}"
 URL="${SLS_MASS_NOTIFY_TGZ_URL:-${1:-}}"
 SHA256="${SLS_MASS_NOTIFY_SHA256:-}"
 TOKEN="${SLS_MASS_NOTIFY_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
 LOG_FILE="${SLS_MASS_NOTIFY_INSTALL_LOG:-/tmp/slsmassnotifyserver-install.log}"
-EXPECTED_TGZ_SHA256="a46b823d38d86fe01ad7880f94d0ad43101f1c7422c3c3afbb8f26cfde64c196"
+EXPECTED_TGZ_SHA256="42eb8f2c008a0e8ffb2d6534ec65e741aebebde772e17b16510d39f61fd1aaff"
 DATA_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin"
 CONFIG_FILE="$DATA_DIR/mass-notifications.config"
 CONFIG_SNAPSHOT=""
@@ -116,8 +116,8 @@ verify_tgz() {
   actual_sha="$(sha256sum "$TGZ" | awk '{print $1}')"
   if [ -n "$SHA256" ]; then
     echo "$SHA256  $TGZ" | sha256sum -c -
-  elif [ "$EXPECTED_TGZ_SHA256" != "__SLS_MASS_NOTIFY_005_SHA256__" ] && [ "$(basename "$TGZ")" = "slsmassnotifyserver-0.0.5-beta.tgz" ] && [ "$actual_sha" != "$EXPECTED_TGZ_SHA256" ]; then
-    log "$TGZ does not match the current slsmassnotifyserver-0.0.5-beta package."
+  elif [ "$EXPECTED_TGZ_SHA256" != "__SLS_MASS_NOTIFY_006_SHA256__" ] && [ "$(basename "$TGZ")" = "slsmassnotifyserver-0.0.6-beta.tgz" ] && [ "$actual_sha" != "$EXPECTED_TGZ_SHA256" ]; then
+    log "$TGZ does not match the current slsmassnotifyserver-0.0.6-beta package."
     log "Expected SHA256: $EXPECTED_TGZ_SHA256"
     log "Actual SHA256:   $actual_sha"
     log "Remove the stale local TGZ or install with SLS_MASS_NOTIFY_TGZ_URL so the current release is downloaded."
@@ -161,8 +161,8 @@ with tarfile.open(archive, "r:gz") as handle:
     root = ET.fromstring(module_xml.read())
     if (root.findtext("rawname") or "").strip() != module:
         raise SystemExit("module.xml rawname does not match the requested module")
-    if (root.findtext("version") or "").strip() != "0.0.5-beta":
-        raise SystemExit("module.xml does not contain the expected 0.0.5-beta version")
+    if (root.findtext("version") or "").strip() != "0.0.6-beta":
+        raise SystemExit("module.xml does not contain the expected 0.0.6-beta version")
 PY
 }
 
@@ -311,9 +311,10 @@ EOF
     chmod 0755 \
       /usr/local/bin/sls_mass_notify/sls_mass_notify_nws_poll.sh \
       /usr/local/bin/sls_mass_notify/sls_mass_notify_test.sh \
-      /usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh \
-      /usr/local/bin/sls_mass_notify/sls_mass_notify_maintenance.sh \
-      /usr/local/bin/sls_mass_notify/sls_mass_notify_install_piper_voices.sh \
+	  /usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh \
+	  /usr/local/bin/sls_mass_notify/sls_mass_notify_maintenance.sh \
+	  /usr/local/bin/sls_mass_notify/sls_mass_notify_uninstall.sh \
+	  /usr/local/bin/sls_mass_notify/sls_mass_notify_install_piper_voices.sh \
       /usr/local/bin/sls_mass_notify/sls_notify.py \
       /usr/local/bin/sls_mass_notify/sls_config.py 2>/dev/null || true
   fi

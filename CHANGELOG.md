@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.0.6-beta
+
+- Added a Labs colored-announcement designer to the Dashboard with title, background color, and live preview controls. Colored image announcements are explicitly identified as Yealink-only; other supported phone formats continue to receive their vendor-specific text fallback.
+- Hardened generated Yealink alert images with explicit dimensions, 8-bit sRGB PNG output, stripped metadata, non-interlaced encoding, and post-render validation to reduce blank-screen and image-load failures on legacy models.
+- Added FreePBX System Recordings as opening and closing tone choices for both general announcements and NWS alerts. Selected recordings are path-validated, size-limited, and converted into managed 8 kHz mono Asterisk audio.
+- Removed duplicate tone-upload controls from the plugin so administrators use FreePBX System Recordings as the single audio-upload workflow.
+- Reorganized General Settings and NWS Alerts with clearer section headings, compact scrollable lists, and grouped tone selectors that remain manageable on systems with many recordings or clients.
+- Made desktop Client IDs generated and read-only in the UI, and preserved existing IDs server-side during settings saves. Desktop passwords and Control API keys are masked by default with explicit visibility controls.
+- Expanded Phone Format Override guidance with concise examples, the complete supported-vendor list, and a clear notice that unlisted brands are not officially supported.
+- Added a manual **Update to Latest Release** action. Update checks now run even when automatic installation is disabled, while installation still requires either the automatic-update setting or an explicit administrator request.
+- Added yellow update-available indicators to General Settings and the FreePBX Dashboard health status using the same root-owned update-status source.
+- Added a confirmed **Completely Uninstall** action in Danger Zone. The web request uses a protected marker consumed by the root maintenance worker and invokes the same tested standalone uninstaller with full configuration purge.
+- Packaged the standalone uninstaller with the module runtime so queued UI uninstall follows the same cleanup path as the documented CLI uninstall.
+- Improved first-run completion behavior so a successful setup returns administrators to the FreePBX Dashboard instead of opening the NWS page.
+- Updated NWS, Piper, and updater User-Agent/version markers for the `0.0.6-beta` release.
+
 ## 0.0.5-beta
 
 - Added a separate Phone Image Transport setting. Hosted phone images default to HTTP for legacy Yealink compatibility while authenticated Control and desktop APIs remain HTTPS.

@@ -42,6 +42,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 		$_SESSION['slsmassnotifyserver_other_save_result'] = $slsmassnotifyserver->repairInstallation();
 		header('Location: config.php?display=slsmassnotifyserver_other');
 		exit;
+	} elseif ($action === 'manual_update') {
+		$_SESSION['slsmassnotifyserver_other_save_result'] = $slsmassnotifyserver->requestManualUpdate();
+		header('Location: config.php?display=slsmassnotifyserver_other');
+		exit;
+	} elseif ($action === 'complete_uninstall') {
+		$_SESSION['slsmassnotifyserver_other_save_result'] = $slsmassnotifyserver->requestCompleteUninstall();
+		header('Location: config.php?display=slsmassnotifyserver_other');
+		exit;
 	} elseif ($action === 'apply_settings') {
 		$_SESSION['slsmassnotifyserver_other_apply_result'] = $slsmassnotifyserver->applySettings();
 		header('Location: config.php?display=slsmassnotifyserver_other');

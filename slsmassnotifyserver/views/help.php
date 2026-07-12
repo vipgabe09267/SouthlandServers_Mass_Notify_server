@@ -183,8 +183,9 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 		<li><code>/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.pending.config</code> <?php echo _('staged settings waiting for Apply Config.'); ?></li>
 		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_nws_poll.sh</code> <?php echo _('live NWS poller.'); ?></li>
 		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_test.sh</code> <?php echo _('manual test sender.'); ?></li>
-		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh</code> <?php echo _('root-owned automatic beta updater.'); ?></li>
-		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_maintenance.sh</code> <?php echo _('root-owned worker for queued installation repairs.'); ?></li>
+		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh</code> <?php echo _('root-owned manual and automatic beta updater.'); ?></li>
+		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_maintenance.sh</code> <?php echo _('root-owned worker for queued repairs, manual updates, and complete uninstall requests.'); ?></li>
+		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_uninstall.sh</code> <?php echo _('standalone cleanup path used by the confirmed Danger Zone uninstall action.'); ?></li>
 		<li><code>/usr/local/bin/sls_mass_notify/piper/venv</code> <?php echo _('root-owned Piper executable environment.'); ?></li>
 		<li><code>/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices</code> <?php echo _('checksum-verified Piper voice models.'); ?></li>
 		<li><code>/usr/local/bin/sls_mass_notify/sls_notify.py</code> <?php echo _('SIP NOTIFY and desktop journal publisher.'); ?></li>
@@ -214,6 +215,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 		<li><?php echo _('The dashboard widget can target online registered extensions, all phones, selected desktop clients, all desktops, announcement groups, or a combination.'); ?></li>
 		<li><?php echo _('Announcement groups can include online or offline extensions plus desktop app clients. Offline extensions are skipped when sending and the UI warns the sender.'); ?></li>
 		<li><?php echo _('If TTS Audio is enabled, the module queues opening tone, Piper TTS, and closing tone first, then sends the text notification after the audio starts.'); ?></li>
+		<li><?php echo _('The Labs colored-announcement designer provides a title, background color, and preview. Colored image announcements are currently limited to compatible Yealink phones; other vendors receive their text format.'); ?></li>
 		<li><?php echo _('A short cooldown prevents repeated accidental announcement sends.'); ?></li>
 	</ul>
 
@@ -248,8 +250,15 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 		<li><?php echo _('Piper voices are selected separately for announcements and NWS alerts.'); ?></li>
 		<li><?php echo _('Volume controls are saved as percentages and applied to the final Asterisk WAV conversion.'); ?></li>
 		<li><?php echo _('Generated Piper speech defaults to 30 seconds and can be capped anywhere from 1 to 600 seconds.'); ?></li>
-		<li><?php echo _('Opening and closing tones can be selected or uploaded from General Settings and NWS Alerts.'); ?></li>
+		<li><?php echo _('Upload custom audio through FreePBX Admin > System Recordings, then select it as the opening or closing tone in General Settings or NWS Alerts. Selected recordings are validated and converted into managed Asterisk audio.'); ?></li>
 		<li><?php echo _('Audio delivery uses the private Asterisk context sls-alert-audio and does not require a public paging group such as *6767.'); ?></li>
+	</ul>
+
+	<h3><?php echo _('Updates and Removal'); ?></h3>
+	<ul>
+		<li><?php echo _('Update checks run through the root-owned updater and record their result for General Settings and Dashboard health. A newer release produces a yellow warning even when automatic installation is disabled.'); ?></li>
+		<li><?php echo _('Update to Latest Release queues an immediate check and installs only a newer beta release with the expected GitHub asset digest and matching tagged installer.'); ?></li>
+		<li><?php echo _('Completely Uninstall in Danger Zone requires confirmation and permanently removes module code, runtime services, APIs, logs, credentials, backups, tones, and the central configuration. Download a config backup first if the deployment may be restored later.'); ?></li>
 	</ul>
 
 	<h3><?php echo _('Logs and Health Checks'); ?></h3>

@@ -8,7 +8,8 @@ Security fixes are currently targeted at the latest public beta release only.
 
 | Version | Supported |
 | --- | --- |
-| `0.0.5-beta` | Yes |
+| `0.0.6-beta` | Yes |
+| `0.0.5-beta` | No |
 | `0.0.4-beta` | No |
 | `0.0.3-beta` | No |
 | `0.0.2-beta` | No |

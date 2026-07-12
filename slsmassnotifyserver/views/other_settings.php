@@ -8,6 +8,7 @@ $importResult = $import_result ?? null;
 $hasPendingChanges = !empty($has_pending_changes);
 $voices = is_array($available_voices ?? null) ? $available_voices : [];
 $tones = is_array($available_tones ?? null) ? $available_tones : [];
+$systemSounds = is_array($available_system_sounds ?? null) ? $available_system_sounds : [];
 $control = is_array($settings['control_api'] ?? null) ? $settings['control_api'] : [];
 $updates = is_array($settings['updates'] ?? null) ? $settings['updates'] : [];
 $desktopClients = is_array($desktop_clients ?? null) ? $desktop_clients : [];
@@ -23,6 +24,61 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 	}
 }
 ?>
+<style>
+.sls-labs-badge {
+	display: inline-block;
+	margin-left: 6px;
+	vertical-align: middle;
+}
+.sls-format-help {
+	position: relative;
+	display: inline-block;
+	padding: 0;
+	border: 0;
+	background: transparent;
+	color: #337ab7;
+	cursor: help;
+	font-size: 16px;
+	line-height: 1;
+	outline: none;
+}
+.sls-format-help-text {
+	display: none;
+	position: absolute;
+	z-index: 1000;
+	top: 22px;
+	right: 0;
+	width: 360px;
+	max-width: 80vw;
+	padding: 10px 12px;
+	border: 1px solid #9ca3af;
+	background: #fff;
+	color: #1f2937;
+	box-shadow: 0 3px 10px rgba(0, 0, 0, 0.18);
+	font-size: 12px;
+	font-weight: 400;
+	line-height: 1.45;
+	text-align: left;
+	white-space: normal;
+}
+.sls-format-help:hover .sls-format-help-text,
+.sls-format-help:focus .sls-format-help-text {
+	display: block;
+}
+.sls-settings-heading {
+	margin: 28px 0 16px;
+	padding: 0 0 8px;
+	border-bottom: 1px solid #d7dce2;
+	font-size: 18px;
+}
+.sls-settings-intro {
+	margin-bottom: 18px;
+}
+.sls-compact-table {
+	max-height: 330px;
+	overflow: auto;
+}
+</style>
 <div class="container-fluid">
 	<?php echo load_view(__DIR__ . '/hero.php', ['hero_image' => $hero_image ?? '']); ?>
 	<div class="row">
@@ -35,7 +91,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 				</form>
 			<?php } ?>
 			<h2><?php echo _('General Settings'); ?></h2>
-			<p class="text-muted"><?php echo _('Manage audio, desktop app clients, remote API access, updates, retention, and config backup. Phone SIP NOTIFY delivery is pushed directly through Asterisk/PJSIP using selected extensions.'); ?></p>
+			<p class="text-muted sls-settings-intro"><?php echo _('Manage phone delivery, audio, desktop clients, remote access, updates, and recovery settings.'); ?></p>
 			<div class="clearfix"></div>
 
 			<?php foreach ([$saveResult, $applyResult, $tokenResult, $importResult] as $result) { ?>
@@ -53,7 +109,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 				<input type="hidden" name="slsmassnotifyserver_action" value="save_other_settings">
 				<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
 
-				<h3><?php echo _('Public Access'); ?></h3>
+				<h3 class="sls-settings-heading"><?php echo _('Phone Delivery'); ?></h3>
 				<div class="row">
 					<div class="col-md-4">
 						<div class="form-group">
@@ -74,35 +130,59 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 					</div>
 					<div class="col-md-6">
 						<div class="form-group">
-							<label><?php echo _('Phone Format Overrides'); ?></label>
+							<div class="clearfix">
+								<label class="pull-left"><?php echo _('Phone Format Overrides'); ?></label>
+								<span class="pull-right sls-format-help" tabindex="0" role="note" aria-label="<?php echo htmlspecialchars(_('Phone format override examples')); ?>">
+									<i class="fa fa-question-circle" aria-hidden="true"></i>
+									<span class="sls-format-help-text">
+										<strong><?php echo _('Use one entry per line:'); ?></strong><br>
+										<code>1000=yealink</code><br>
+										<code>2000=poly</code> <span class="text-muted"><?php echo _('(Polycom)'); ?></span><br>
+										<code>3000=cisco</code><br>
+										<code>4000=snom</code>
+										<hr style="margin: 8px 0;">
+										<div><?php echo _('Use yealink_text when a model cannot load generated PNG alerts.'); ?></div>
+										<div style="margin-top: 6px;"><strong><?php echo _('Supported phone vendors:'); ?></strong> <?php echo _('Yealink, Cisco, Poly/Polycom, Grandstream, Fanvil, Snom, Aastra/Mitel, Sangoma, Avaya, VTech, and Alcatel-Lucent Enterprise (ALE). Brands not listed here are not officially supported.'); ?></div>
+									</span>
+								</span>
+							</div>
 							<textarea class="form-control" name="sipnotify_format_overrides" rows="3" placeholder="1190=cisco&#10;1000=yealink"><?php echo htmlspecialchars(implode("\n", $formatOverrides)); ?></textarea>
-								<p class="help-block"><?php echo _('Optional. One extension=format per line. Formats: yealink, yealink_text, cisco, poly, grandstream, fanvil, snom, aastra, sangoma, avaya, vtech, ale, generic. Use yealink_text when a model cannot load generated PNG alerts.'); ?></p>
 						</div>
 					</div>
 				</div>
 
-				<h3><?php echo _('Audio and Announcement Settings'); ?></h3>
+				<h3 class="sls-settings-heading"><?php echo _('Audio and TTS'); ?></h3>
 				<div class="row">
 					<div class="col-md-4">
 						<div class="form-group">
 							<label><?php echo _('Opening Tone'); ?></label>
 							<select class="form-control" name="opening_tone">
+								<optgroup label="<?php echo htmlspecialchars(_('Mass Notify tones')); ?>">
 								<?php foreach ($tones as $tone) { ?>
 									<option value="<?php echo htmlspecialchars($tone); ?>" <?php echo ($settings['opening_tone'] ?? '') === $tone ? 'selected' : ''; ?>><?php echo htmlspecialchars($tone); ?></option>
 								<?php } ?>
+								</optgroup>
+								<?php if ($systemSounds) { ?><optgroup label="<?php echo htmlspecialchars(_('FreePBX System Recordings')); ?>">
+								<?php foreach ($systemSounds as $sound) { ?><option value="<?php echo htmlspecialchars($sound['value']); ?>"><?php echo htmlspecialchars($sound['label']); ?></option><?php } ?>
+								</optgroup><?php } ?>
 							</select>
-							<input class="form-control" style="margin-top: 6px;" name="opening_tone_upload" type="file" accept=".wav,audio/wav,audio/x-wav">
+							<p class="help-block"><?php echo _('Upload additional choices in Admin > System Recordings.'); ?></p>
 						</div>
 					</div>
 					<div class="col-md-4">
 						<div class="form-group">
 							<label><?php echo _('Closing Tone'); ?></label>
 							<select class="form-control" name="closing_tone">
+								<optgroup label="<?php echo htmlspecialchars(_('Mass Notify tones')); ?>">
 								<?php foreach ($tones as $tone) { ?>
 									<option value="<?php echo htmlspecialchars($tone); ?>" <?php echo ($settings['closing_tone'] ?? '') === $tone ? 'selected' : ''; ?>><?php echo htmlspecialchars($tone); ?></option>
 								<?php } ?>
+								</optgroup>
+								<?php if ($systemSounds) { ?><optgroup label="<?php echo htmlspecialchars(_('FreePBX System Recordings')); ?>">
+								<?php foreach ($systemSounds as $sound) { ?><option value="<?php echo htmlspecialchars($sound['value']); ?>"><?php echo htmlspecialchars($sound['label']); ?></option><?php } ?>
+								</optgroup><?php } ?>
 							</select>
-							<input class="form-control" style="margin-top: 6px;" name="closing_tone_upload" type="file" accept=".wav,audio/wav,audio/x-wav">
+							<p class="help-block"><?php echo _('System recordings are converted into a managed Asterisk tone when saved.'); ?></p>
 						</div>
 					</div>
 					<div class="col-md-4">
@@ -154,9 +234,9 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 					<p class="help-block"><?php echo _('Caps generated Piper speech. Default is 30 seconds. Maximum is 600 seconds.'); ?></p>
 				</div>
 
-				<h3><?php echo _('Desktop App Clients'); ?></h3>
-					<p class="help-block"><?php echo _('Each desktop app should use its own username and password against /api/sipnotify/desktop. The short Client ID is the persistent selector for Control API desktop targeting. Passwords are AES-encrypted in the central config file.'); ?></p>
-				<div class="table-responsive">
+				<h3 class="sls-settings-heading"><?php echo _('Desktop Clients'); ?></h3>
+					<p class="help-block"><?php echo _('Each desktop app should use its own username and password against /api/sipnotify/desktop. Client IDs are generated automatically and cannot be edited. Passwords are AES-encrypted in the central config file.'); ?></p>
+				<div class="table-responsive sls-compact-table">
 					<table class="table table-striped table-bordered" id="desktop-client-table">
 						<thead>
 								<tr>
@@ -177,9 +257,12 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 										<input type="checkbox" name="desktop_clients[<?php echo (int)$index; ?>][enabled]" value="1" <?php echo !empty($client['enabled']) ? 'checked' : ''; ?>>
 										</td>
 										<td><input class="form-control input-sm" name="desktop_clients[<?php echo (int)$index; ?>][name]" value="<?php echo htmlspecialchars($client['name'] ?? 'Desktop App'); ?>"></td>
-										<td><input class="form-control input-sm" name="desktop_clients[<?php echo (int)$index; ?>][client_id]" value="<?php echo htmlspecialchars($client['client_id'] ?? ''); ?>"></td>
+										<td>
+											<input type="hidden" name="desktop_clients[<?php echo (int)$index; ?>][client_id]" value="<?php echo htmlspecialchars($client['client_id'] ?? ''); ?>">
+											<code><?php echo htmlspecialchars($client['client_id'] ?? _('Generated on save')); ?></code>
+										</td>
 										<td><input class="form-control input-sm" name="desktop_clients[<?php echo (int)$index; ?>][username]" value="<?php echo htmlspecialchars($client['username'] ?? ''); ?>"></td>
-										<td><input class="form-control input-sm" name="desktop_clients[<?php echo (int)$index; ?>][password]" value="<?php echo htmlspecialchars($client['password'] ?? ''); ?>" autocomplete="new-password"></td>
+										<td><div class="input-group input-group-sm"><input class="form-control" name="desktop_clients[<?php echo (int)$index; ?>][password]" type="password" value="<?php echo htmlspecialchars($client['password'] ?? ''); ?>" autocomplete="new-password"><span class="input-group-btn"><button type="button" class="btn btn-default" data-toggle-secret title="<?php echo htmlspecialchars(_('Show or hide password')); ?>" aria-label="<?php echo htmlspecialchars(_('Show or hide password')); ?>"><i class="fa fa-eye" aria-hidden="true"></i></button></span></div></td>
 									<td><button type="button" class="btn btn-default btn-sm" data-remove-desktop-client><?php echo _('Delete'); ?></button></td>
 								</tr>
 							<?php } ?>
@@ -194,7 +277,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 				</div>
 
 				<div class="panel panel-warning" style="border-width: 2px;">
-					<div class="panel-heading"><strong><?php echo _('Control API'); ?></strong></div>
+					<div class="panel-heading"><strong><?php echo _('Control API'); ?></strong><span class="label label-success sls-labs-badge"><i class="fa fa-flask" aria-hidden="true"></i> <?php echo _('Labs'); ?></span></div>
 					<div class="panel-body">
 						<p class="text-warning"><?php echo _('Remote management can send announcements, trigger NWS tests, read status/logs, and update normalized Mass Notifications config. Keep this disabled unless a trusted remote controller needs it.'); ?></p>
 						<div class="row">
@@ -217,8 +300,9 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						<div class="form-group">
 							<label><?php echo _('API Key'); ?></label>
 							<div class="input-group">
-								<input class="form-control" id="control_api_key" name="control_api[api_key]" type="text" value="<?php echo htmlspecialchars($control['api_key'] ?? ''); ?>">
+								<input class="form-control" id="control_api_key" name="control_api[api_key]" type="password" value="<?php echo htmlspecialchars($control['api_key'] ?? ''); ?>" autocomplete="off">
 								<span class="input-group-btn">
+									<button type="button" class="btn btn-default" data-toggle-secret title="<?php echo htmlspecialchars(_('Show or hide API key')); ?>" aria-label="<?php echo htmlspecialchars(_('Show or hide API key')); ?>"><i class="fa fa-eye" aria-hidden="true"></i></button>
 									<button type="button" class="btn btn-default" id="copy_control_api_key"><?php echo _('Copy'); ?></button>
 									<button type="submit" class="btn btn-warning" name="slsmassnotifyserver_action" value="regenerate_control_api_key" onclick="return confirm(<?php echo htmlspecialchars(json_encode(_('Regenerate the Control API key? Existing API clients using the old key will stop working after you apply changes.')), ENT_QUOTES, 'UTF-8'); ?>);"><?php echo _('Regenerate'); ?></button>
 								</span>
@@ -265,7 +349,10 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 					</div>
 				</div>
 
-				<h3><?php echo _('Updates and Retention'); ?></h3>
+				<h3 class="sls-settings-heading"><?php echo _('Updates and Retention'); ?></h3>
+				<?php if (($packageStatus['state'] ?? '') === 'update') { ?>
+					<div class="alert alert-warning"><i class="fa fa-exclamation-triangle" aria-hidden="true"></i> <strong><?php echo htmlspecialchars($packageStatus['label'] ?? _('Update available')); ?></strong><?php if (!empty($packageStatus['message'])) { ?> <?php echo htmlspecialchars($packageStatus['message']); ?><?php } ?></div>
+				<?php } ?>
 				<div class="row">
 					<div class="col-md-3">
 						<label><?php echo _('Notification Log Retention Days'); ?></label>
@@ -287,6 +374,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 					<div class="col-md-3">
 						<label><?php echo _('Installed Package Version'); ?></label>
 						<p class="form-control-static"><code><?php echo htmlspecialchars($package_version ?? 'unknown'); ?></code> <span class="label <?php echo $packageStatusClass; ?>"><?php echo htmlspecialchars($packageStatus['label'] ?? 'LATEST'); ?></span></p>
+						<button type="submit" class="btn btn-default btn-sm" name="slsmassnotifyserver_action" value="manual_update"><i class="fa fa-refresh" aria-hidden="true"></i> <?php echo _('Update to Latest Release'); ?></button>
 					</div>
 				</div>
 
@@ -311,6 +399,13 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						<button type="submit" class="btn btn-warning" name="slsmassnotifyserver_action" value="repair_installation"><?php echo _('Repair Installation'); ?></button>
 					</form>
 					<hr>
+					<h4><?php echo _('Completely Uninstall'); ?></h4>
+					<p class="text-danger"><strong><?php echo _('Warning:'); ?></strong> <?php echo _('This removes the module, runtime services, APIs, logs, desktop clients, credentials, tones, backups, and central configuration. This cannot be undone.'); ?></p>
+					<form method="post" style="margin-bottom: 18px;" onsubmit="return confirm(<?php echo htmlspecialchars(json_encode(_('Are you sure you want to completely uninstall this module? All Mass Notifications configuration and data will be permanently deleted.')), ENT_QUOTES, 'UTF-8'); ?>);">
+						<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
+						<button type="submit" class="btn btn-danger" name="slsmassnotifyserver_action" value="complete_uninstall"><i class="fa fa-trash" aria-hidden="true"></i> <?php echo _('Completely Uninstall'); ?></button>
+					</form>
+					<hr>
 					<p class="text-danger"><?php echo _('Replacing the config file wipes the current plugin data and overwrites API keys, desktop clients, voices, announcement groups, NWS settings, and retention settings.'); ?></p>
 					<form method="post" enctype="multipart/form-data" onsubmit="return confirm(<?php echo htmlspecialchars(json_encode(_('Replace the Mass Notifications config? This requires Apply Config to become live.')), ENT_QUOTES, 'UTF-8'); ?>);">
 						<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
@@ -327,6 +422,23 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 </div>
 <script>
 (function() {
+	document.addEventListener('click', function(event) {
+		var button = event.target.closest('[data-toggle-secret]');
+		if (!button) {
+			return;
+		}
+		var group = button.closest('.input-group');
+		var input = group ? group.querySelector('input') : null;
+		if (!input) {
+			return;
+		}
+		var reveal = input.type === 'password';
+		input.type = reveal ? 'text' : 'password';
+		var icon = button.querySelector('i');
+		if (icon) {
+			icon.className = reveal ? 'fa fa-eye-slash' : 'fa fa-eye';
+		}
+	});
 	var copyButton = document.getElementById('copy_control_api_key');
 	var controlKey = document.getElementById('control_api_key');
 	if (copyButton && controlKey) {
@@ -358,9 +470,9 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 				'<input type="hidden" name="desktop_clients[' + index + '][password_enc]" value="">' +
 				'<input type="checkbox" name="desktop_clients[' + index + '][enabled]" value="1" checked></td>' +
 				'<td><input class="form-control input-sm" name="desktop_clients[' + index + '][name]" value="Desktop App"></td>' +
-					'<td><input class="form-control input-sm" name="desktop_clients[' + index + '][client_id]" value="" placeholder="Generated on save"></td>' +
+					'<td><input type="hidden" name="desktop_clients[' + index + '][client_id]" value=""><code>Generated on save</code></td>' +
 					'<td><input class="form-control input-sm" name="desktop_clients[' + index + '][username]" value="" placeholder="Generated on save"></td>' +
-					'<td><input class="form-control input-sm" name="desktop_clients[' + index + '][password]" value="" placeholder="Generated on save" autocomplete="new-password"></td>' +
+					'<td><div class="input-group input-group-sm"><input class="form-control" name="desktop_clients[' + index + '][password]" type="password" value="" placeholder="Generated on save" autocomplete="new-password"><span class="input-group-btn"><button type="button" class="btn btn-default" data-toggle-secret title="Show or hide password" aria-label="Show or hide password"><i class="fa fa-eye" aria-hidden="true"></i></button></span></div></td>' +
 			'<td><button type="button" class="btn btn-default btn-sm" data-remove-desktop-client>Delete</button></td>';
 		table.appendChild(row);
 	});

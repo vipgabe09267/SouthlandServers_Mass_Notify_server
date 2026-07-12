@@ -41,6 +41,31 @@ $csrfToken = (string)($csrf_token ?? '');
 #dashboard-sls-mass-notify-announcement textarea {
 	resize: vertical;
 }
+#dashboard-sls-mass-notify-announcement .sls-labs-badge {
+	display: inline-block;
+	margin-left: 6px;
+	vertical-align: middle;
+}
+#dashboard-sls-mass-notify-announcement .sls-color-designer {
+	display: none;
+	margin: 10px 0 4px;
+	padding: 12px;
+	border-left: 4px solid #22c55e;
+	background: #f7faf8;
+}
+#dashboard-sls-mass-notify-announcement .sls-color-preview {
+	min-height: 112px;
+	padding: 14px;
+	color: #fff;
+	background: #1f2937;
+	border-radius: 4px;
+	overflow-wrap: anywhere;
+}
+#dashboard-sls-mass-notify-announcement .sls-color-preview-title {
+	font-size: 18px;
+	font-weight: 700;
+	margin-bottom: 8px;
+}
 </style>
 <div class="container-fluid" id="dashboard-sls-mass-notify-announcement" data-quiet-hours-active="<?php echo $quietHoursActive ? '1' : '0'; ?>">
 	<?php if (!$setupComplete) { ?>
@@ -157,11 +182,40 @@ $csrfToken = (string)($csrf_token ?? '');
 		<div class="form-group">
 			<label><?php echo _('Delivery Options'); ?></label>
 			<div class="row">
-				<div class="col-sm-4">
+				<div class="col-sm-5">
 					<label class="checkbox-inline">
 						<input type="checkbox" name="announcement_tts_audio" value="1" checked>
 						<?php echo _('TTS Audio'); ?>
 					</label>
+				</div>
+				<div class="col-sm-7">
+					<label class="checkbox-inline">
+						<input type="checkbox" id="dashboard_announcement_colored" name="announcement_colored" value="1">
+						<?php echo _('Colored Announcement'); ?>
+						<span class="label label-success sls-labs-badge"><i class="fa fa-flask" aria-hidden="true"></i> <?php echo _('Labs'); ?></span>
+					</label>
+					<div class="help-block" style="margin: 3px 0 0 20px;"><small><em><?php echo _('*Yealink phones only*'); ?></em></small></div>
+				</div>
+			</div>
+			<div class="sls-color-designer" id="dashboard_announcement_color_designer" aria-hidden="true">
+				<div class="row">
+					<div class="col-sm-7">
+						<div class="form-group">
+							<label for="dashboard_announcement_title"><?php echo _('Image Title'); ?></label>
+							<input class="form-control" id="dashboard_announcement_title" name="announcement_title" type="text" maxlength="80" value="Announcement">
+						</div>
+						<div class="form-group">
+							<label for="dashboard_announcement_background_color"><?php echo _('Background Color'); ?></label>
+							<input class="form-control" id="dashboard_announcement_background_color" name="announcement_background_color" type="color" value="#1f2937" style="max-width: 100px; padding: 3px;">
+						</div>
+					</div>
+					<div class="col-sm-5">
+						<label><?php echo _('Preview'); ?></label>
+						<div class="sls-color-preview" id="dashboard_announcement_color_preview">
+							<div class="sls-color-preview-title" id="dashboard_announcement_preview_title">Announcement</div>
+							<div id="dashboard_announcement_preview_body"><?php echo _('Announcement text'); ?></div>
+						</div>
+					</div>
 				</div>
 			</div>
 			<p class="help-block"><?php echo _('TTS Audio pages selected phone extensions with the configured opening tone, Piper voice, and closing tone. Desktop app delivery is controlled by the desktop target selections above.'); ?></p>
@@ -261,10 +315,40 @@ $csrfToken = (string)($csrf_token ?? '');
 	var groupModal = $('#dashboard-announcement-group-modal');
 	var groupId = document.getElementById('dashboard_group_id');
 	var groupName = document.getElementById('dashboard_group_name');
+	var coloredToggle = document.getElementById('dashboard_announcement_colored');
+	var colorDesigner = document.getElementById('dashboard_announcement_color_designer');
+	var colorInput = document.getElementById('dashboard_announcement_background_color');
+	var titleInput = document.getElementById('dashboard_announcement_title');
+	var messageInput = document.getElementById('dashboard_announcement_body');
+	var colorPreview = document.getElementById('dashboard_announcement_color_preview');
+	var previewTitle = document.getElementById('dashboard_announcement_preview_title');
+	var previewBody = document.getElementById('dashboard_announcement_preview_body');
 	if (!form || !submit || !cooldown || !result) {
 		return;
 	}
 	var groups = Array.isArray(initialGroups) ? initialGroups : [];
+	function renderColorDesigner() {
+		if (!coloredToggle || !colorDesigner) {
+			return;
+		}
+		var enabled = coloredToggle.checked;
+		colorDesigner.style.display = enabled ? 'block' : 'none';
+		colorDesigner.setAttribute('aria-hidden', enabled ? 'false' : 'true');
+		if (colorPreview && colorInput) {
+			colorPreview.style.backgroundColor = colorInput.value || '#1f2937';
+		}
+		if (previewTitle && titleInput) {
+			previewTitle.textContent = titleInput.value.trim() || 'Announcement';
+		}
+		if (previewBody && messageInput) {
+			previewBody.textContent = messageInput.value.trim() || 'Announcement text';
+		}
+	}
+	[coloredToggle, colorInput, titleInput, messageInput].forEach(function(control) {
+		if (control) {
+			control.addEventListener(control === coloredToggle ? 'change' : 'input', renderColorDesigner);
+		}
+	});
 		var desktopLookup = {};
 		(Array.isArray(desktopClients) ? desktopClients : []).forEach(function(client) {
 			if (client && client.username) {
@@ -485,6 +569,7 @@ $csrfToken = (string)($csrf_token ?? '');
 				});
 	});
 	renderGroups();
+	renderColorDesigner();
 	renderCooldown();
 }());
 </script>

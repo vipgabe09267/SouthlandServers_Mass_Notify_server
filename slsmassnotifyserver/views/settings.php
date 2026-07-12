@@ -8,12 +8,23 @@ $showTestSection = !empty($show_test_section);
 $testResult = $test_result ?? null;
 $cooldownRemaining = (int)($cooldown_remaining ?? 0);
 $csrfToken = (string)($csrf_token ?? '');
+$systemSounds = is_array($available_system_sounds ?? null) ? $available_system_sounds : [];
 $placeholderHelp = "{{event}}, {{severity}}, {{message_type}}, {{audio}}, {{page_group}}, {{alert_id}}, {{zone}}, {{time}}, {{source_name}}, {{trigger_source}}, {{trigger_extension}}, {{trigger_name}}, {{audio_sequence}}";
 $hourOptions = [];
 for ($hour = 0; $hour < 24; $hour++) {
 	$hourOptions[] = sprintf('%02d:00', $hour);
 }
 ?>
+<style>
+.sls-nws-heading {
+	margin: 28px 0 14px;
+	padding-bottom: 8px;
+	border-bottom: 1px solid #d7dce2;
+	font-size: 18px;
+}
+.sls-nws-section-note { margin-bottom: 16px; }
+.sls-nws-scroll { max-height: 240px; overflow: auto; }
+</style>
 <div class="container-fluid">
 	<div class="display full-border">
 		<div class="fpbx-container">
@@ -191,7 +202,7 @@ for ($hour = 0; $hour < 24; $hour++) {
 					<div class="col-md-4">
 						<div class="form-group">
 							<label><?php echo _('NWS Audio Recipients'); ?></label>
-							<div class="well" style="max-height: 220px; overflow: auto;">
+							<div class="well sls-nws-scroll">
 								<?php $selectedRecipients = array_fill_keys((array)($settings['alert_recipients'] ?? []), true); ?>
 								<?php foreach ((array)($available_extensions ?? []) as $extension) { ?>
 									<div class="checkbox">
@@ -252,8 +263,8 @@ for ($hour = 0; $hour < 24; $hour++) {
 					</div>
 				</div>
 
-				<h3><?php echo _('Quiet Hours'); ?></h3>
-				<p class="help-block"><?php echo _('During quiet hours, only selected critical live NWS alerts are delivered. Manual tests are not affected.'); ?></p>
+				<h3 class="sls-nws-heading"><?php echo _('Quiet Hours'); ?></h3>
+				<p class="help-block sls-nws-section-note"><?php echo _('During quiet hours, only selected critical live NWS alerts are delivered. Manual tests are not affected.'); ?></p>
 				<div class="row">
 					<div class="col-md-3">
 						<div class="form-group">
@@ -293,7 +304,7 @@ for ($hour = 0; $hour < 24; $hour++) {
 					<div class="col-md-8">
 						<div class="form-group">
 							<label><?php echo _('Critical Alerts During Quiet Hours'); ?></label>
-							<div class="well" style="max-height: 260px; overflow: auto;">
+							<div class="well sls-nws-scroll">
 								<?php $criticalEvents = array_fill_keys((array)($settings['quiet_critical_events'] ?? []), true); ?>
 								<?php foreach ($events_map as $eventName) { ?>
 									<div class="checkbox">
@@ -308,7 +319,7 @@ for ($hour = 0; $hour < 24; $hour++) {
 					</div>
 				</div>
 
-				<h3><?php echo _('Email Templates'); ?></h3>
+				<h3 class="sls-nws-heading"><?php echo _('Email Templates'); ?></h3>
 				<p class="help-block"><?php echo sprintf(_('Placeholders supported: %s'), htmlspecialchars($placeholderHelp)); ?></p>
 				<div class="row">
 					<div class="col-md-6">
@@ -333,7 +344,7 @@ for ($hour = 0; $hour < 24; $hour++) {
 					</div>
 				</div>
 
-				<h3><?php echo _('NWS Audio and Piper TTS'); ?></h3>
+				<h3 class="sls-nws-heading"><?php echo _('NWS Audio and Piper TTS'); ?></h3>
 				<p class="help-block">
 					<?php echo _('Live weather audio now uses a short opening tone, a generated Piper TTS summary from the NWS alert payload, and a short closing tone. Generated speech defaults to 30 seconds and can be capped at up to 600 seconds.'); ?>
 					<code>/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sounds</code>
@@ -343,7 +354,8 @@ for ($hour = 0; $hour < 24; $hour++) {
 						<div class="form-group">
 							<label for="opening_tone"><?php echo _('Opening Tone'); ?></label>
 							<select class="form-control" id="opening_tone" name="opening_tone">
-								<?php foreach ((array)($available_tones ?? []) as $toneName) { 
+								<optgroup label="<?php echo htmlspecialchars(_('Mass Notify tones')); ?>">
+								<?php foreach ((array)($available_tones ?? []) as $toneName) {
 									if (strpos($toneName, 'opening_') !== 0) continue;
 									$displayName = str_replace('_', ' ', substr($toneName, strlen('opening_')));
 									if ($toneName === 'opening_Paging_Tone_Opening') {
@@ -354,16 +366,20 @@ for ($hour = 0; $hour < 24; $hour++) {
 										<?php echo htmlspecialchars($displayName); ?>
 									</option>
 								<?php } ?>
+								</optgroup>
+								<?php if ($systemSounds) { ?><optgroup label="<?php echo htmlspecialchars(_('FreePBX System Recordings')); ?>">
+								<?php foreach ($systemSounds as $sound) { ?><option value="<?php echo htmlspecialchars($sound['value']); ?>"><?php echo htmlspecialchars($sound['label']); ?></option><?php } ?>
+								</optgroup><?php } ?>
 							</select>
-							<p class="help-block"><?php echo _('WAV uploads are converted to 8 kHz mono for Asterisk playback.'); ?></p>
-							<input class="form-control" id="opening_tone_upload" name="opening_tone_upload" type="file" accept=".wav,audio/wav,audio/x-wav">
+							<p class="help-block"><?php echo _('Upload additional choices in Admin > System Recordings. The selected recording is converted for Asterisk when saved.'); ?></p>
 						</div>
 					</div>
 					<div class="col-md-5">
 						<div class="form-group">
 							<label for="closing_tone"><?php echo _('Closing Tone'); ?></label>
 							<select class="form-control" id="closing_tone" name="closing_tone">
-								<?php foreach ((array)($available_tones ?? []) as $toneName) { 
+								<optgroup label="<?php echo htmlspecialchars(_('Mass Notify tones')); ?>">
+								<?php foreach ((array)($available_tones ?? []) as $toneName) {
 									if (strpos($toneName, 'closing_') !== 0) continue;
 									$displayName = str_replace('_', ' ', substr($toneName, strlen('closing_')));
 									if ($toneName === 'closing_Paging_Tone_Closing') {
@@ -374,9 +390,12 @@ for ($hour = 0; $hour < 24; $hour++) {
 										<?php echo htmlspecialchars($displayName); ?>
 									</option>
 								<?php } ?>
+								</optgroup>
+								<?php if ($systemSounds) { ?><optgroup label="<?php echo htmlspecialchars(_('FreePBX System Recordings')); ?>">
+								<?php foreach ($systemSounds as $sound) { ?><option value="<?php echo htmlspecialchars($sound['value']); ?>"><?php echo htmlspecialchars($sound['label']); ?></option><?php } ?>
+								</optgroup><?php } ?>
 							</select>
-							<p class="help-block"><?php echo _('Use short tones so the complete alert stays concise.'); ?></p>
-							<input class="form-control" id="closing_tone_upload" name="closing_tone_upload" type="file" accept=".wav,audio/wav,audio/x-wav">
+							<p class="help-block"><?php echo _('Use a short System Recording so the complete alert stays concise.'); ?></p>
 						</div>
 					</div>
 				</div>
@@ -386,7 +405,7 @@ for ($hour = 0; $hour < 24; $hour++) {
 					<div class="text-muted"><?php echo sprintf(_('Maximum spoken summary: %s seconds'), (int)($settings['tts_max_seconds'] ?? 30)); ?></div>
 				</div>
 
-				<h3><?php echo _('Preview'); ?></h3>
+				<h3 class="sls-nws-heading"><?php echo _('Preview'); ?></h3>
 				<p class="help-block"><?php echo _('Preview shows representative generated output only. It does not send SIP NOTIFY, desktop notifications, email, Discord, or audio.'); ?></p>
 				<div class="row">
 					<div class="col-md-6">

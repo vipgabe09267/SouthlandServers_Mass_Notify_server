@@ -61,6 +61,7 @@ for required in \
   bin/sls_mass_notify/sls_notify.py bin/sls_mass_notify/sls_config.py \
   bin/sls_mass_notify_nws_poll.sh bin/sls_mass_notify_test.sh \
   bin/sls_mass_notify_update.sh bin/sls_mass_notify_maintenance.sh \
+  bin/sls_mass_notify_uninstall.sh \
   bin/sls_mass_notify_install_piper_voices.sh; do
   [ -f "${ROOT_DIR}/${MODULE}/${required}" ] || {
     printf 'Required module file is missing: %s\n' "$required" >&2

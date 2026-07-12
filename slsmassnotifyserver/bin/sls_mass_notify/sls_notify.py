@@ -435,12 +435,14 @@ def render_alert_image(config, alert):
         "-font", "DejaVu-Sans-Bold", "-fill", colors["accent"], "-gravity", "SouthWest",
         "-pointsize", "17", "-annotate", "+28+30", lines[5],
         "-pointsize", "17", "-annotate", "+28+10", lines[6],
-        "-alpha", "off", "-depth", "8", "-interlace", "none",
+        "-alpha", "off", "-colorspace", "sRGB", "-strip", "-depth", "8", "-interlace", "none",
+        "-define", "png:color-type=2",
         "PNG24:" + str(output),
     ]
     result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
         raise RuntimeError((result.stderr or "ImageMagick convert failed").strip())
+    validate_rendered_png(output, width, height)
     os.chmod(output, 0o644)
     try:
         import grp
@@ -466,19 +468,41 @@ def prune_old_images(web_dir, max_age_seconds=259200):
             logging.warning("Unable to remove old generated alert image %s: %s", path, exc)
 
 
-def yealink_image_xml(image_url, beep="yes"):
+def validate_rendered_png(path, expected_width, expected_height):
+    if not path.is_file() or path.stat().st_size < 128:
+        raise RuntimeError("Generated phone image is missing or empty")
+    result = subprocess.run(
+        ["identify", "-format", "%m %w %h %[depth] %[colorspace]", str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    details = (result.stdout or "").strip()
+    expected = f"PNG {expected_width} {expected_height} 8 sRGB"
+    if result.returncode != 0 or details.lower() != expected.lower():
+        raise RuntimeError(f"Generated phone image failed validation: {details or result.stderr.strip()}")
+
+
+def yealink_image_xml(image_url, beep="yes", width=480, height=272):
+    width = max(1, min(2000, int(width)))
+    height = max(1, min(2000, int(height)))
     return (
         "<?xml version='1.0' encoding='UTF-8'?>"
         f"<YealinkIPPhoneImageScreen Beep='{html.escape(beep)}' Timeout='0' LockIn='no' mode='fullscreen'>"
-        f"<Image horizontalAlign='middle' verticalAlign='middle'>{html.escape(image_url)}</Image>"
+        f"<Image horizontalAlign='middle' verticalAlign='middle' width='{width}' height='{height}'>{html.escape(image_url)}</Image>"
         "</YealinkIPPhoneImageScreen>"
     )
 
 
-def build_image_xml(alert, image_url):
+def build_image_xml(config, alert, image_url):
     event = alert.get("properties", {}).get("event", "")
     beep = alert_beep(event)
-    return yealink_image_xml(image_url, beep)
+    return yealink_image_xml(
+        image_url,
+        beep,
+        config.getint("visual", "image_width", fallback=480),
+        config.getint("visual", "image_height", fallback=272),
+    )
 
 
 def build_text_xml(alert):
@@ -703,12 +727,14 @@ def render_announcement_image(config, title, message, background_color="#1f2937"
         "-pointsize", "20", "-annotate", "+30+164", body_lines[2],
         "-pointsize", "20", "-annotate", "+30+192", body_lines[3],
         "-pointsize", "20", "-annotate", "+30+220", body_lines[4],
-        "-alpha", "off", "-depth", "8", "-interlace", "none",
+        "-alpha", "off", "-colorspace", "sRGB", "-strip", "-depth", "8", "-interlace", "none",
+        "-define", "png:color-type=2",
         "PNG24:" + str(output),
     ])
     result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
         raise RuntimeError((result.stderr or "ImageMagick convert failed").strip())
+    validate_rendered_png(output, width, height)
     os.chmod(output, 0o644)
     try:
         import grp
@@ -722,12 +748,17 @@ def render_announcement_image(config, title, message, background_color="#1f2937"
 
 def build_announcement_image_xml(config, message, title="Announcement", background_color="#1f2937", background_image=""):
     image_url = render_announcement_image(config, title, message, background_color, background_image)
-    return yealink_image_xml(image_url, "yes")
+    return yealink_image_xml(
+        image_url,
+        "yes",
+        config.getint("visual", "image_width", fallback=480),
+        config.getint("visual", "image_height", fallback=272),
+    )
 
 
 def build_xml(config, alert):
     try:
-        return build_image_xml(alert, render_alert_image(config, alert))
+        return build_image_xml(config, alert, render_alert_image(config, alert))
     except Exception as exc:
         logging.error("Unable to render alert image; falling back to text XML: %s", exc)
         return build_text_xml(alert)

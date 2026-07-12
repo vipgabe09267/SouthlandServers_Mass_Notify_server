@@ -42,8 +42,9 @@ if (($_REQUEST['slsmassnotifyserver_action'] ?? '') === 'cooldowns') {
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action'] ?? '') === 'save_setup_wizard') {
-	$_SESSION['slsmassnotifyserver_setup_result'] = $slsmassnotifyserver->saveSetupWizard($_POST);
-	header('Location: config.php?display=slsmassnotifyserver');
+	$setupSaveResult = $slsmassnotifyserver->saveSetupWizard($_POST);
+	$_SESSION['slsmassnotifyserver_setup_result'] = $setupSaveResult;
+	header('Location: ' . (!empty($setupSaveResult['success']) ? 'index.php' : 'config.php?display=slsmassnotifyserver'));
 	exit;
 }
 
@@ -58,6 +59,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action
 			'phones_all' => !empty($_POST['announcement_all_phones']),
 			'desktop_all' => !empty($_POST['announcement_all_desktops']),
 			'desktop_clients' => $_POST['announcement_desktop_clients'] ?? [],
+			'style' => !empty($_POST['announcement_colored']) ? 'colored' : 'standard',
+			'image' => !empty($_POST['announcement_colored']),
+			'title' => $_POST['announcement_title'] ?? 'Announcement',
+			'background_color' => $_POST['announcement_background_color'] ?? '#1f2937',
 		]
 	));
 }

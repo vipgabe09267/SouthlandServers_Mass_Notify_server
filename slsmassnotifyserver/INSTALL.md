@@ -19,7 +19,7 @@ cd /tmp
 curl -fsSL -o sls-install.sh \
   https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/main/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.0.5-beta/slsmassnotifyserver-0.0.5-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.0.6-beta/slsmassnotifyserver-0.0.6-beta.tgz' \
 ./sls-install.sh
 ```
 

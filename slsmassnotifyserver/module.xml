@@ -2,7 +2,7 @@
 	<rawname>slsmassnotifyserver</rawname>
 	<repo>custom</repo>
 	<name>Southland Servers Mass Notifications Server</name>
-	<version>0.0.5-beta</version>
+	<version>0.0.6-beta</version>
 	<publisher>Southland Servers</publisher>
 	<license>AGPLv3+</license>
 	<licenselink>http://www.gnu.org/licenses/agpl-3.0.txt</licenselink>

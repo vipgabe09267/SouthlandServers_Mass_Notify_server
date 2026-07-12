@@ -9,9 +9,10 @@ CONFIG_LOADER="${CONFIG_LOADER:-/usr/local/bin/sls_mass_notify/sls_config.py}"
 STATUS_FILE="${STATUS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/update-status.json}"
 LOG_FILE="${LOG_FILE:-/var/log/sls_mass_notify.log}"
 LOCK_FILE="${LOCK_FILE:-/run/lock/sls-mass-notify-update.lock}"
-CURRENT_VERSION="${SLS_MASS_NOTIFY_CURRENT_VERSION:-0.0.5-beta}"
+CURRENT_VERSION="${SLS_MASS_NOTIFY_CURRENT_VERSION:-0.0.6-beta}"
 
 GITHUB_UPDATES_ENABLED="0"
+MANUAL_UPDATE="${SLS_MASS_NOTIFY_MANUAL_UPDATE:-0}"
 readonly GITHUB_UPDATES_REPOSITORY="vipgabe09267/SouthlandServers_Mass_Notify_server"
 
 log() {
@@ -99,16 +100,6 @@ PY
   exit 0
 fi
 
-if [ "$GITHUB_UPDATES_ENABLED" != "1" ]; then
-  write_status "$(python3 - <<'PY'
-import json
-from datetime import datetime, timezone
-print(json.dumps({"checked_at": datetime.now(timezone.utc).astimezone().isoformat(), "update_available": False, "message": "Automatic GitHub updates are disabled."}, separators=(",", ":")))
-PY
-)"
-  exit 0
-fi
-
 release_json="$(CURRENT_VERSION="$CURRENT_VERSION" REPOSITORY="$GITHUB_UPDATES_REPOSITORY" python3 - <<'PY'
 import json
 import os
@@ -117,7 +108,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 repo = os.environ.get("REPOSITORY", "")
-current = os.environ.get("CURRENT_VERSION", "0.0.5-beta")
+current = os.environ.get("CURRENT_VERSION", "0.0.6-beta")
 now = datetime.now(timezone.utc).astimezone().isoformat()
 if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
     print(json.dumps({"ok": False, "checked_at": now, "update_available": False, "message": "Configured GitHub repository is invalid."}, separators=(",", ":")))
@@ -135,7 +126,7 @@ def version_key(value):
 try:
     request = urllib.request.Request(
         f"https://api.github.com/repos/{repo}/releases",
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "SouthlandServers-Mass-Notifications-Updater/0.0.5-beta"},
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "SouthlandServers-Mass-Notifications-Updater/0.0.6-beta"},
     )
     with urllib.request.urlopen(request, timeout=20) as response:
         releases = json.load(response)
@@ -185,6 +176,7 @@ PY
 write_status "$release_json"
 update_available="$(printf '%s' "$release_json" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("update_available") else "0")' 2>/dev/null || printf '0')"
 [ "$update_available" = "1" ] || exit 0
+[ "$GITHUB_UPDATES_ENABLED" = "1" ] || [ "$MANUAL_UPDATE" = "1" ] || exit 0
 
 readarray -t release_values < <(printf '%s' "$release_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("tgz_url", "")); print(d.get("sha256", "")); print(d.get("installer_url", "")); print(d.get("latest_version", ""))')
 tgz_url="${release_values[0]:-}"

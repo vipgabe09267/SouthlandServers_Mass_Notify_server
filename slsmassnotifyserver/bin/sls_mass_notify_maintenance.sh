@@ -5,6 +5,8 @@ set -euo pipefail
 umask 027
 
 REQUEST_FILE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/repair.request"
+UPDATE_REQUEST_FILE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/update.request"
+UNINSTALL_REQUEST_FILE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/uninstall.request"
 RUNTIME_DIR="/usr/local/bin/sls_mass_notify"
 SIGNER="/usr/local/sbin/sign_sls_mass_notify_local_sig.sh"
 LOG_FILE="/var/log/sls_mass_notify.log"
@@ -18,6 +20,40 @@ log() {
 exec 9>"$LOCK_FILE"
 chmod 0600 "$LOCK_FILE"
 flock -n 9 || exit 0
+
+safe_request() {
+  local path="$1"
+  local label="$2"
+  [ -e "$path" ] || return 1
+  if [ -L "$path" ] || [ ! -f "$path" ]; then
+    log "Rejected unsafe $label request marker"
+    rm -f "$path"
+    return 1
+  fi
+  local owner
+  owner="$(stat -c '%U' "$path" 2>/dev/null || true)"
+  if [ "$owner" != "asterisk" ] && [ "$owner" != "root" ]; then
+    log "Rejected $label request owned by $owner"
+    rm -f "$path"
+    return 1
+  fi
+  return 0
+}
+
+if safe_request "$UNINSTALL_REQUEST_FILE" "uninstall"; then
+  rm -f "$UNINSTALL_REQUEST_FILE"
+  log "Starting queued complete uninstall"
+  SLS_MASS_NOTIFY_PURGE_CONFIG=1 "$RUNTIME_DIR/sls_mass_notify_uninstall.sh" >> "$LOG_FILE" 2>&1 || log "Queued complete uninstall reported an error"
+  exit 0
+fi
+
+if safe_request "$UPDATE_REQUEST_FILE" "manual update"; then
+  rm -f "$UPDATE_REQUEST_FILE"
+  log "Starting queued manual update"
+  SLS_MASS_NOTIFY_MANUAL_UPDATE=1 /usr/bin/timeout 1800 "$RUNTIME_DIR/sls_mass_notify_update.sh" >> "$LOG_FILE" 2>&1 || true
+  log "Queued manual update finished"
+  exit 0
+fi
 
 [ -e "$REQUEST_FILE" ] || exit 0
 if [ -L "$REQUEST_FILE" ] || [ ! -f "$REQUEST_FILE" ]; then

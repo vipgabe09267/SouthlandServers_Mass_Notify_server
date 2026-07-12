@@ -28,7 +28,7 @@ Implemented format families
 ---------------------------
 
 - Desktop: JSON event records for the SLS Mass Notify desktop/client app.
-- Yealink: Yealink XML Browser `YealinkIPPhoneTextScreen` and generated `YealinkIPPhoneImageScreen` payloads. The `yealink_text` override avoids image retrieval on models that cannot load the generated HTTPS PNG.
+- Yealink: Yealink XML Browser `YealinkIPPhoneTextScreen` and generated `YealinkIPPhoneImageScreen` payloads. NWS color alerts and the Dashboard colored-announcement Labs feature use this image format. The `yealink_text` override avoids image retrieval on models that cannot load the hosted PNG.
 - Cisco Multiplatform/3PCC: an `XML-Service` SIP NOTIFY containing `CiscoIPPhoneExecute`, which directs the phone to a randomized hosted `CiscoIPPhoneText` document. Cisco documents a 401 digest challenge for this event; the endpoint/firmware must be provisioned so Asterisk can satisfy that authentication requirement.
 - Snom: Snom XML Minibrowser `SnomIPPhoneText` payloads.
 - Poly/Polycom: Polycom push content wrapped in `PolycomIPPhone` with `Data priority="critical"`.
