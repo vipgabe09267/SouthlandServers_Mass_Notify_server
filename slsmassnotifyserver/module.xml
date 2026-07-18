@@ -2,7 +2,7 @@
 	<rawname>slsmassnotifyserver</rawname>
 	<repo>custom</repo>
 	<name>Southland Servers Mass Notifications Server</name>
-	<version>0.0.6-beta</version>
+	<version>0.0.7-beta</version>
 	<publisher>Southland Servers</publisher>
 	<license>AGPLv3+</license>
 	<licenselink>http://www.gnu.org/licenses/agpl-3.0.txt</licenselink>
@@ -14,9 +14,10 @@
 	</description>
 	<menuitems>
 		<slsmassnotifyserver_help category="Mass Notify" sort="1">Help</slsmassnotifyserver_help>
-		<slsmassnotifyserver category="Mass Notify" sort="2">Logging</slsmassnotifyserver>
+		<slsmassnotifyserver category="Mass Notify" sort="2">Notification Logs</slsmassnotifyserver>
 		<slsmassnotifyserver_other category="Mass Notify" sort="3">General Settings</slsmassnotifyserver_other>
-		<slsmassnotifyserver_nws category="Mass Notify" sort="4">NWS Alerts</slsmassnotifyserver_nws>
+		<slsmassnotifyserver_nws category="Mass Notify" sort="4">Weather Alerts</slsmassnotifyserver_nws>
+		<slsmassnotifyserver_lightning category="Mass Notify" sort="5">Lightning Alerts</slsmassnotifyserver_lightning>
 	</menuitems>
 	<supported>
 		<version>17.0</version>

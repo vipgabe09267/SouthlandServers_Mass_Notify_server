@@ -7,9 +7,9 @@ class SlsMassNotifyAnnouncement {
 
 	public function getSections($order) {
 		return [[
-			'title' => _('SIP NOTIFY Announcements'),
+			'title' => _('Mass Notify Announcements'),
 			'group' => _('Announcements'),
-			'width' => '550px',
+			'width' => '680px',
 			'order' => $order['sls_mass_notify_announcement'] ?? '50',
 			'section' => 'sls_mass_notify_announcement',
 		]];
@@ -29,10 +29,11 @@ class SlsMassNotifyAnnouncement {
 				'announcement_groups' => $module->getAnnouncementGroups(),
 				'announcement_cooldown_remaining' => $module->getCooldownState()['announcement']['remaining'] ?? 0,
 				'announcement_state' => $module->getAnnouncementDashboardState(),
+				'announcement_tones' => $module->getAvailableTones(),
 				'csrf_token' => $module->getCsrfToken(),
 			]);
 		} catch (\Throwable $e) {
-			return '<div class="alert alert-warning">' . htmlspecialchars(_('Unable to load SIP NOTIFY announcement controls.')) . '</div>';
+			return '<div class="alert alert-warning">' . htmlspecialchars(_('Unable to load Mass Notify announcement controls.')) . '</div>';
 		}
 	}
 }

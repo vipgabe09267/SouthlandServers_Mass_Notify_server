@@ -5,12 +5,71 @@ $desktopClients = is_array($announcement_desktop_clients ?? null) ? $announcemen
 $announcementGroups = is_array($announcement_groups ?? null) ? $announcement_groups : [];
 $announcementCooldown = (int)($announcement_cooldown_remaining ?? 0);
 $announcementState = is_array($announcement_state ?? null) ? $announcement_state : [];
+$announcementTones = is_array($announcement_tones ?? null) ? $announcement_tones : [];
 $quietHoursActive = !empty($announcementState['quiet_hours_active']);
 $setupComplete = !empty($setup_complete);
 $setupModal = (string)($setup_modal ?? '');
 $csrfToken = (string)($csrf_token ?? '');
 ?>
 <style>
+#dashboard-sls-mass-notify-announcement {
+	padding: 4px 8px 12px;
+	color: #1f2937;
+	box-sizing: border-box;
+	max-width: 100%;
+	overflow: visible;
+}
+#dashboard-sls-mass-notify-announcement form,
+#dashboard-sls-mass-notify-announcement .sls-step-card,
+#dashboard-sls-mass-notify-announcement .sls-color-designer { max-width: 100%; box-sizing: border-box; }
+#dashboard-sls-mass-notify-announcement .sls-widget-intro {
+	margin: 0 0 14px;
+	color: #64748b;
+}
+#dashboard-sls-mass-notify-announcement .sls-step-card {
+	margin: 0 0 14px;
+	padding: 15px;
+	border: 1px solid #dfe5ec;
+	border-radius: 8px;
+	background: #fff;
+	box-shadow: 0 2px 7px rgba(15, 23, 42, .05);
+}
+#dashboard-sls-mass-notify-announcement .sls-step-heading {
+	display: flex;
+	align-items: center;
+	gap: 9px;
+	margin: 0 0 12px;
+	font-size: 16px;
+	font-weight: 700;
+}
+#dashboard-sls-mass-notify-announcement .sls-step-number {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 25px;
+	height: 25px;
+	border-radius: 50%;
+	color: #fff;
+	background: #6d28d9;
+	font-size: 13px;
+}
+#dashboard-sls-mass-notify-announcement .sls-target-card {
+	height: 100%;
+	padding: 12px;
+	border: 1px solid #e5e7eb;
+	border-radius: 6px;
+	background: #f8fafc;
+}
+#dashboard-sls-mass-notify-announcement .sls-action-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	padding: 13px 15px;
+	border-radius: 8px;
+	background: #f8fafc;
+	border: 1px solid #dfe5ec;
+}
 #dashboard-sls-mass-notify-announcement .sls-target-list {
 	max-height: 145px;
 	overflow-y: auto;
@@ -66,6 +125,11 @@ $csrfToken = (string)($csrf_token ?? '');
 	font-weight: 700;
 	margin-bottom: 8px;
 }
+@media (max-width: 767px) {
+	#dashboard-sls-mass-notify-announcement .sls-target-card { margin-bottom: 10px; }
+	#dashboard-sls-mass-notify-announcement .sls-action-row { display: block; }
+	#dashboard-sls-mass-notify-announcement .sls-action-row .btn { width: 100%; margin-bottom: 8px; }
+}
 </style>
 <div class="container-fluid" id="dashboard-sls-mass-notify-announcement" data-quiet-hours-active="<?php echo $quietHoursActive ? '1' : '0'; ?>">
 	<?php if (!$setupComplete) { ?>
@@ -99,10 +163,12 @@ $csrfToken = (string)($csrf_token ?? '');
 	<?php return; ?>
 	<?php } ?>
 	<div id="dashboard-sls-mass-notify-announcement-result" style="display: none;"></div>
+	<p class="sls-widget-intro"><?php echo _('Build an announcement from top to bottom: choose recipients, write the message, select delivery options, then send.'); ?></p>
 		<form id="dashboard-sls-mass-notify-announcement-form" method="post" action="config.php?display=slsmassnotifyserver">
 			<input type="hidden" name="slsmassnotifyserver_action" value="send_announcement">
 			<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
-		<div class="form-group">
+		<div class="form-group sls-step-card">
+			<div class="sls-step-heading"><span class="sls-step-number">1</span><?php echo _('Choose announcement groups'); ?></div>
 			<div class="clearfix">
 				<label class="pull-left"><?php echo _('Announcement Groups'); ?></label>
 				<button type="button" class="btn btn-xs btn-default pull-right" id="dashboard-announcement-new-group" <?php echo empty($announcementGroupTargets) && empty($desktopClients) ? 'disabled' : ''; ?>><?php echo _('Create New Announcement Group'); ?></button>
@@ -110,9 +176,11 @@ $csrfToken = (string)($csrf_token ?? '');
 			<div id="dashboard-announcement-groups" style="margin-top: 6px;"></div>
 			<p class="help-block"><?php echo _('Groups can include extensions and desktop app clients. Offline extensions are skipped when an announcement is sent.'); ?></p>
 		</div>
+		<div class="sls-step-card">
+			<div class="sls-step-heading"><span class="sls-step-number">2</span><?php echo _('Choose individual recipients'); ?></div>
 		<div class="row sls-dashboard-target-row">
 			<div class="col-sm-6">
-				<div class="form-group">
+				<div class="form-group sls-target-card">
 					<div class="clearfix">
 						<label class="pull-left"><?php echo _('Phone Targets'); ?></label>
 					</div>
@@ -147,7 +215,7 @@ $csrfToken = (string)($csrf_token ?? '');
 				</div>
 			</div>
 			<div class="col-sm-6">
-				<div class="form-group">
+				<div class="form-group sls-target-card">
 					<div class="clearfix">
 						<label class="pull-left"><?php echo _('Desktop App Targets'); ?></label>
 					</div>
@@ -174,19 +242,24 @@ $csrfToken = (string)($csrf_token ?? '');
 				</div>
 			</div>
 		</div>
-		<div class="form-group">
+		</div>
+		<div class="form-group sls-step-card">
+			<div class="sls-step-heading"><span class="sls-step-number">3</span><?php echo _('Write the announcement'); ?></div>
 			<label for="dashboard_announcement_body"><?php echo _('Message'); ?></label>
 			<textarea class="form-control" id="dashboard_announcement_body" name="announcement_body" rows="3" maxlength="500" placeholder="<?php echo htmlspecialchars(_('Announcement text')); ?>"></textarea>
 			<p class="help-block"><?php echo _('Phones display the title "Announcement" and this message body.'); ?></p>
 		</div>
-		<div class="form-group">
-			<label><?php echo _('Delivery Options'); ?></label>
+		<div class="form-group sls-step-card">
+			<div class="sls-step-heading"><span class="sls-step-number">4</span><?php echo _('Choose delivery options'); ?></div>
 			<div class="row">
 				<div class="col-sm-5">
-					<label class="checkbox-inline">
-						<input type="checkbox" name="announcement_tts_audio" value="1" checked>
-						<?php echo _('TTS Audio'); ?>
-					</label>
+					<label for="dashboard_announcement_audio_mode"><?php echo _('Audio Mode'); ?></label>
+					<select class="form-control" id="dashboard_announcement_audio_mode" name="announcement_audio_mode">
+						<option value="none"><?php echo _('None (visual/text only)'); ?></option>
+						<option value="tones"><?php echo _('Tones only (do not read text)'); ?></option>
+						<option value="tts"><?php echo _('TTS only'); ?></option>
+						<option value="tones_tts" selected><?php echo _('Tones and TTS'); ?></option>
+					</select>
 				</div>
 				<div class="col-sm-7">
 					<label class="checkbox-inline">
@@ -195,6 +268,22 @@ $csrfToken = (string)($csrf_token ?? '');
 						<span class="label label-success sls-labs-badge"><i class="fa fa-flask" aria-hidden="true"></i> <?php echo _('Labs'); ?></span>
 					</label>
 					<div class="help-block" style="margin: 3px 0 0 20px;"><small><em><?php echo _('*Yealink phones only*'); ?></em></small></div>
+				</div>
+			</div>
+			<div class="row" id="dashboard_announcement_tone_options">
+				<div class="col-sm-6">
+					<label for="dashboard_announcement_opening_tone"><?php echo _('Opening Sound'); ?></label>
+					<select class="form-control" id="dashboard_announcement_opening_tone" name="announcement_opening_tone">
+						<option value=""><?php echo _('None'); ?></option>
+						<?php foreach ($announcementTones as $tone) { ?><option value="<?php echo htmlspecialchars($tone); ?>" <?php echo ($announcementState['opening_tone'] ?? '') === $tone ? 'selected' : ''; ?>><?php echo htmlspecialchars(str_replace('_', ' ', $tone)); ?></option><?php } ?>
+					</select>
+				</div>
+				<div class="col-sm-6">
+					<label for="dashboard_announcement_closing_tone"><?php echo _('Closing Sound'); ?></label>
+					<select class="form-control" id="dashboard_announcement_closing_tone" name="announcement_closing_tone">
+						<option value=""><?php echo _('None'); ?></option>
+						<?php foreach ($announcementTones as $tone) { ?><option value="<?php echo htmlspecialchars($tone); ?>" <?php echo ($announcementState['closing_tone'] ?? '') === $tone ? 'selected' : ''; ?>><?php echo htmlspecialchars(str_replace('_', ' ', $tone)); ?></option><?php } ?>
+					</select>
 				</div>
 			</div>
 			<div class="sls-color-designer" id="dashboard_announcement_color_designer" aria-hidden="true">
@@ -218,14 +307,15 @@ $csrfToken = (string)($csrf_token ?? '');
 					</div>
 				</div>
 			</div>
-			<p class="help-block"><?php echo _('TTS Audio pages selected phone extensions with the configured opening tone, Piper voice, and closing tone. Desktop app delivery is controlled by the desktop target selections above.'); ?></p>
+			<p class="help-block"><?php echo _('Choose sounds for each announcement, use tones without TTS, use TTS without tones, or send only the visual/text notification.'); ?></p>
 		</div>
-		<button type="submit" id="dashboard-sls-mass-notify-announcement-submit" class="btn btn-warning" <?php echo $announcementCooldown > 0 ? 'disabled' : ''; ?>>
+		<div class="sls-action-row"><button type="submit" id="dashboard-sls-mass-notify-announcement-submit" class="btn btn-warning" <?php echo $announcementCooldown > 0 ? 'disabled' : ''; ?>>
 			<?php echo _('Send Announcement'); ?>
 		</button>
 		<span id="dashboard-sls-mass-notify-announcement-cooldown" class="text-muted" data-remaining="<?php echo $announcementCooldown; ?>" style="margin-left: 10px;">
 			<?php echo $announcementCooldown > 0 ? sprintf(_('Cooldown: %ss'), $announcementCooldown) : ''; ?>
 		</span>
+		</div>
 	</form>
 	<div class="modal fade" id="dashboard-announcement-group-modal" tabindex="-1" role="dialog" aria-hidden="true">
 		<div class="modal-dialog" role="document">
@@ -316,6 +406,8 @@ $csrfToken = (string)($csrf_token ?? '');
 	var groupId = document.getElementById('dashboard_group_id');
 	var groupName = document.getElementById('dashboard_group_name');
 	var coloredToggle = document.getElementById('dashboard_announcement_colored');
+	var audioMode = document.getElementById('dashboard_announcement_audio_mode');
+	var toneOptions = document.getElementById('dashboard_announcement_tone_options');
 	var colorDesigner = document.getElementById('dashboard_announcement_color_designer');
 	var colorInput = document.getElementById('dashboard_announcement_background_color');
 	var titleInput = document.getElementById('dashboard_announcement_title');
@@ -323,6 +415,24 @@ $csrfToken = (string)($csrf_token ?? '');
 	var colorPreview = document.getElementById('dashboard_announcement_color_preview');
 	var previewTitle = document.getElementById('dashboard_announcement_preview_title');
 	var previewBody = document.getElementById('dashboard_announcement_preview_body');
+	var dashboardItem = root.closest ? root.closest('.item') : null;
+	if (dashboardItem) {
+		dashboardItem.style.maxWidth = '100%';
+		dashboardItem.style.boxSizing = 'border-box';
+	}
+	var layoutTimer = null;
+	function scheduleDashboardLayout() {
+		if (layoutTimer) {
+			window.clearTimeout(layoutTimer);
+		}
+		layoutTimer = window.setTimeout(function() {
+			layoutTimer = null;
+			var page = $(root).closest('.page');
+			if (page.length && typeof page.packery === 'function') {
+				page.packery('layout');
+			}
+		}, 40);
+	}
 	if (!form || !submit || !cooldown || !result) {
 		return;
 	}
@@ -343,12 +453,26 @@ $csrfToken = (string)($csrf_token ?? '');
 		if (previewBody && messageInput) {
 			previewBody.textContent = messageInput.value.trim() || 'Announcement text';
 		}
+		scheduleDashboardLayout();
+	}
+	function renderAudioOptions() {
+		if (audioMode && toneOptions) {
+			var showTones = audioMode.value === 'tones' || audioMode.value === 'tones_tts';
+			toneOptions.style.display = showTones ? '' : 'none';
+		}
+	}
+	if (audioMode) {
+		audioMode.addEventListener('change', renderAudioOptions);
 	}
 	[coloredToggle, colorInput, titleInput, messageInput].forEach(function(control) {
 		if (control) {
 			control.addEventListener(control === coloredToggle ? 'change' : 'input', renderColorDesigner);
 		}
 	});
+	if (window.ResizeObserver) {
+		new ResizeObserver(scheduleDashboardLayout).observe(root);
+	}
+	window.addEventListener('resize', scheduleDashboardLayout);
 		var desktopLookup = {};
 		(Array.isArray(desktopClients) ? desktopClients : []).forEach(function(client) {
 			if (client && client.username) {
@@ -570,6 +694,7 @@ $csrfToken = (string)($csrf_token ?? '');
 	});
 	renderGroups();
 	renderColorDesigner();
+	renderAudioOptions();
 	renderCooldown();
 }());
 </script>

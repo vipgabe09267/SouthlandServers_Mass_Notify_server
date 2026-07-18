@@ -3,20 +3,54 @@
 set -euo pipefail
 
 umask 027
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
 
 CONFIG_JSON_FILE="${CONFIG_JSON_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config}"
 CONFIG_LOADER="${CONFIG_LOADER:-/usr/local/bin/sls_mass_notify/sls_config.py}"
 STATUS_FILE="${STATUS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/update-status.json}"
+UPDATE_PROGRESS_FILE="${UPDATE_PROGRESS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/update-progress.json}"
 LOG_FILE="${LOG_FILE:-/var/log/sls_mass_notify.log}"
 LOCK_FILE="${LOCK_FILE:-/run/lock/sls-mass-notify-update.lock}"
-CURRENT_VERSION="${SLS_MASS_NOTIFY_CURRENT_VERSION:-0.0.6-beta}"
+CURRENT_VERSION="${SLS_MASS_NOTIFY_CURRENT_VERSION:-0.0.7-beta}"
 
 GITHUB_UPDATES_ENABLED="0"
 MANUAL_UPDATE="${SLS_MASS_NOTIFY_MANUAL_UPDATE:-0}"
+CHECK_ONLY="${SLS_MASS_NOTIFY_CHECK_ONLY:-0}"
 readonly GITHUB_UPDATES_REPOSITORY="vipgabe09267/SouthlandServers_Mass_Notify_server"
 
 log() {
   printf '%s: %s\n' "$(date)" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+write_manual_progress() {
+  [ "$MANUAL_UPDATE" = "1" ] || return 0
+  local state="$1"
+  local message="$2"
+  UPDATE_PROGRESS_FILE="$UPDATE_PROGRESS_FILE" UPDATE_STATE="$state" UPDATE_MESSAGE="$message" /usr/bin/python3 - <<'PY'
+import json
+import os
+import pwd
+import tempfile
+from datetime import datetime, timezone
+
+path = os.environ["UPDATE_PROGRESS_FILE"]
+directory = os.path.dirname(path)
+os.makedirs(directory, mode=0o750, exist_ok=True)
+payload = {
+    "state": os.environ["UPDATE_STATE"],
+    "message": os.environ["UPDATE_MESSAGE"][:300],
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+}
+fd, temporary = tempfile.mkstemp(prefix=".update-progress.", dir=directory)
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, separators=(",", ":"))
+    handle.write("\n")
+os.chmod(temporary, 0o640)
+account = pwd.getpwnam("asterisk")
+os.chown(temporary, account.pw_uid, account.pw_gid)
+os.replace(temporary, path)
+PY
 }
 
 write_status() {
@@ -87,6 +121,7 @@ chmod 0600 "$LOCK_FILE" 2>/dev/null || true
 chown root:root "$LOCK_FILE" 2>/dev/null || true
 if ! flock -n 9; then
   log "Automatic update check skipped because another update process is running"
+  write_manual_progress "failed" "Another update process is already running. Try again after it finishes."
   exit 0
 fi
 
@@ -97,6 +132,7 @@ from datetime import datetime, timezone
 print(json.dumps({"checked_at": datetime.now(timezone.utc).astimezone().isoformat(), "update_available": False, "message": "Automatic update check failed: central config is invalid or unavailable."}, separators=(",", ":")))
 PY
 )"
+  write_manual_progress "failed" "The protected central configuration could not be read."
   exit 0
 fi
 
@@ -108,7 +144,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 repo = os.environ.get("REPOSITORY", "")
-current = os.environ.get("CURRENT_VERSION", "0.0.6-beta")
+current = os.environ.get("CURRENT_VERSION", "0.0.7-beta")
 now = datetime.now(timezone.utc).astimezone().isoformat()
 if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
     print(json.dumps({"ok": False, "checked_at": now, "update_available": False, "message": "Configured GitHub repository is invalid."}, separators=(",", ":")))
@@ -126,7 +162,7 @@ def version_key(value):
 try:
     request = urllib.request.Request(
         f"https://api.github.com/repos/{repo}/releases",
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "SouthlandServers-Mass-Notifications-Updater/0.0.6-beta"},
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "SouthlandServers-Mass-Notifications-Updater/0.0.7-beta"},
     )
     with urllib.request.urlopen(request, timeout=20) as response:
         releases = json.load(response)
@@ -174,8 +210,20 @@ PY
 )"
 
 write_status "$release_json"
+if [ "$CHECK_ONLY" = "1" ]; then
+  exit 0
+fi
 update_available="$(printf '%s' "$release_json" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("update_available") else "0")' 2>/dev/null || printf '0')"
-[ "$update_available" = "1" ] || exit 0
+release_ok="$(printf '%s' "$release_json" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("ok") else "0")' 2>/dev/null || printf '0')"
+release_message="$(printf '%s' "$release_json" | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("message") or ""))' 2>/dev/null || true)"
+if [ "$update_available" != "1" ]; then
+  if [ "$release_ok" = "1" ]; then
+    write_manual_progress "complete" "No newer release remains to be installed."
+  else
+    write_manual_progress "failed" "${release_message:-The verified beta release feed could not be checked.}"
+  fi
+  exit 0
+fi
 [ "$GITHUB_UPDATES_ENABLED" = "1" ] || [ "$MANUAL_UPDATE" = "1" ] || exit 0
 
 readarray -t release_values < <(printf '%s' "$release_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("tgz_url", "")); print(d.get("sha256", "")); print(d.get("installer_url", "")); print(d.get("latest_version", ""))')
@@ -185,19 +233,24 @@ installer_url="${release_values[2]:-}"
 latest="${release_values[3]:-}"
 if [ -z "$tgz_url" ] || ! [[ "$sha256" =~ ^[0-9a-f]{64}$ ]] || [ -z "$installer_url" ]; then
   log "Automatic update rejected incomplete release metadata"
+  write_manual_progress "failed" "The release metadata was incomplete or invalid."
   exit 0
 fi
 
 tmp_script="$(mktemp /tmp/slsmassnotifyserver-auto-install.XXXXXX)" || exit 0
 trap 'rm -f "$tmp_script"' EXIT
+write_manual_progress "installing" "Downloading and installing Mass Notify ${latest}."
 if ! curl -fsSL --proto '=https' --tlsv1.2 -o "$tmp_script" "$installer_url" >> "$LOG_FILE" 2>&1; then
   log "Automatic update could not download the tagged installer for $latest"
+  write_manual_progress "failed" "The tagged installer for ${latest} could not be downloaded."
   exit 0
 fi
 chmod 0700 "$tmp_script"
 log "Automatic update installing $latest"
 SLS_MASS_NOTIFY_TGZ_URL="$tgz_url" SLS_MASS_NOTIFY_SHA256="$sha256" "$tmp_script" >> "$LOG_FILE" 2>&1 || {
   log "Automatic update install failed for $latest"
+  write_manual_progress "failed" "Installation of Mass Notify ${latest} failed. Review Notification Logs for details."
   exit 0
 }
 log "Automatic update completed for $latest"
+write_manual_progress "complete" "Mass Notify ${latest} was installed successfully. Refreshing the page."

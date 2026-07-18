@@ -9,6 +9,8 @@ SIGN_HOME="/root/.gnupg-sls-mass-notify"
 PURGE_CONFIG="${SLS_MASS_NOTIFY_PURGE_CONFIG:-0}"
 CONFIG_TMP=""
 SIGNING_FINGERPRINT=""
+KEEP_SIGNING_TRUST=0
+STOCK_RESTORE_LOG="/tmp/slsmassnotifyserver-uninstall-stock-modules.log"
 
 log() {
   printf '%s\n' "$*"
@@ -118,7 +120,7 @@ with open(path, "r", encoding="utf-8", errors="ignore") as handle:
     data = handle.read()
 
 data = re.sub(
-    r"\t// SLS Mass Notifications menu placement:.*?(?=\telse if \(\$a == 'other'\)\n\t\treturn 1;\n)",
+    r"\t// SLS Mass Notifications menu placement:.*?(?=\telse if \(\$a == 'other'\)\n\t\treturn (?:1|true);\n)",
     "",
     data,
     flags=re.S,
@@ -267,17 +269,10 @@ PHP
 	  local stock_module
 	  for stock_module in dashboard framework; do
 	    [ -d "/var/www/html/admin/modules/$stock_module" ] || continue
-	    SLS_VERIFY_MODULE="$stock_module" php -d pcre.jit=0 -r '
-$bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
-require "/etc/freepbx.conf";
-$result = \FreePBX::GPG()->verifyModule((string)getenv("SLS_VERIFY_MODULE"));
-$status = (int)($result["status"] ?? 0);
-if (($status & 129) !== 129) {
-    fwrite(STDERR, json_encode($result, JSON_PRETTY_PRINT) . PHP_EOL);
-    exit(1);
-}
-exit(0);
-'
+	    if ! verify_stock_module "$stock_module"; then
+	      log "Uninstall verification failed; FreePBX did not trust the restored $stock_module module."
+	      return 1
+	    fi
 	  done
   local artifact
   for artifact in \
@@ -293,6 +288,132 @@ exit(0);
   done
 }
 
+verify_stock_module() {
+  local stock_module="$1"
+  SLS_VERIFY_MODULE="$stock_module" php -d pcre.jit=0 -r '
+$bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
+require "/etc/freepbx.conf";
+$result = \FreePBX::GPG()->verifyModule((string)getenv("SLS_VERIFY_MODULE"));
+$status = (int)($result["status"] ?? 0);
+exit(($status & 129) === 129 ? 0 : 1);
+'
+}
+
+redownload_stock_module() {
+  local stock_module="$1"
+  : > "$STOCK_RESTORE_LOG"
+  if run_fwconsole ma --no-interaction --ignorecache --stable -f downloadinstall "$stock_module" >>"$STOCK_RESTORE_LOG" 2>&1; then
+    return 0
+  fi
+  # Some FreePBX 17 builds reject --stable while still accepting the same
+  # forced fresh-cache download through the default configured repository.
+  run_fwconsole ma --no-interaction --ignorecache -f downloadinstall "$stock_module" >>"$STOCK_RESTORE_LOG" 2>&1
+}
+
+locally_sign_stock_module() {
+  local stock_module="$1"
+  local module_dir="/var/www/html/admin/modules/$stock_module"
+  local workdir
+  local keyid
+  local fingerprint
+  local freepbx_gpg_home
+  local signedby
+
+  [ -d "$module_dir" ] || return 1
+  command -v gpg >/dev/null || return 1
+  workdir="$(mktemp -d "/tmp/${stock_module}-sls-uninstall-sign.XXXXXX")"
+  chmod 0700 "$workdir"
+  signedby="Southland Servers Mass Notifications Uninstall Recovery <root@$(hostname -f 2>/dev/null || hostname)>"
+
+  install -d -m 0700 "$SIGN_HOME"
+  if ! GNUPGHOME="$SIGN_HOME" gpg --batch --list-secret-keys --with-colons 2>/dev/null | grep -q '^sec:'; then
+    {
+      printf '%s\n' 'Key-Type: RSA'
+      printf '%s\n' 'Key-Length: 3072'
+      printf '%s\n' 'Name-Real: Southland Servers Mass Notifications Uninstall Recovery'
+      printf 'Name-Email: root@%s\n' "$(hostname -f 2>/dev/null || hostname)"
+      printf '%s\n' 'Expire-Date: 0'
+      printf '%s\n' '%no-protection'
+      printf '%s\n' '%commit'
+    } > "$workdir/keyparams"
+    GNUPGHOME="$SIGN_HOME" gpg --batch --generate-key "$workdir/keyparams" >/dev/null 2>&1 || {
+      rm -rf "$workdir"
+      return 1
+    }
+  fi
+
+  keyid="$(GNUPGHOME="$SIGN_HOME" gpg --batch --list-secret-keys --with-colons 2>/dev/null | awk -F: '/^sec:/ {print $5; exit}')"
+  fingerprint="$(GNUPGHOME="$SIGN_HOME" gpg --batch --list-secret-keys --with-colons 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')"
+  if [ -z "$keyid" ] || [ -z "$fingerprint" ]; then
+    rm -rf "$workdir"
+    return 1
+  fi
+  SIGNING_FINGERPRINT="$fingerprint"
+
+  {
+    printf '%s\n' ';################################################'
+    printf '%s\n' ';#        FreePBX Module Signature File         #'
+    printf '%s\n' ';################################################'
+    printf '%s\n' ';# Do not alter the contents of this file!  If  #'
+    printf '%s\n' ';# this file is tampered with, the module will  #'
+    printf '%s\n' ';# fail validation and be marked as invalid!    #'
+    printf '%s\n' ';################################################'
+    printf '%s\n' '[config]'
+    printf '%s\n' 'version=1'
+    printf '%s\n' 'hash=sha256'
+    printf 'signedwith=%s\n' "$keyid"
+    printf "signedby='%s'\n" "$signedby"
+    printf '%s\n' 'repo=local'
+    php -r 'printf("timestamp=%.4f\n", microtime(true));'
+    printf '%s\n' '[hashes]'
+    cd "$module_dir"
+    find . -type f ! -name 'module.sig' ! -name '*.pyc' ! -path '*/__pycache__/*' -printf '%P\n' \
+      | LC_ALL=C sort \
+      | while IFS= read -r relative_file; do
+          printf '%s = %s\n' "$relative_file" "$(sha256sum "$relative_file" | awk '{print $1}')"
+        done
+  } > "$workdir/module.plain"
+
+  GNUPGHOME="$SIGN_HOME" gpg --batch --yes --pinentry-mode loopback --passphrase '' \
+    --local-user "$keyid" --clearsign --output "$workdir/module.sig" "$workdir/module.plain" >/dev/null 2>&1 || {
+      rm -rf "$workdir"
+      return 1
+    }
+  install -m 0644 -o asterisk -g asterisk "$workdir/module.sig" "$module_dir/module.sig"
+  GNUPGHOME="$SIGN_HOME" gpg --batch --armor --export "$keyid" > "$workdir/public.asc"
+
+  freepbx_gpg_home="$(php -d pcre.jit=0 -r '
+$bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
+require "/etc/freepbx.conf";
+$gpg = \FreePBX::GPG();
+$reflection = new ReflectionClass($gpg);
+if ($reflection->hasMethod("getGpgLocation")) {
+    $method = $reflection->getMethod("getGpgLocation");
+    $method->setAccessible(true);
+    echo (string)$method->invoke($gpg);
+} else {
+    echo "/var/lib/asterisk/.gnupg";
+}
+exit(0);
+')"
+  [ -n "$freepbx_gpg_home" ] || freepbx_gpg_home="/var/lib/asterisk/.gnupg"
+  install -d -m 0700 -o asterisk -g asterisk "$freepbx_gpg_home"
+  timeout 30 su -s /bin/bash asterisk -c "gpg --homedir '$freepbx_gpg_home' --batch --import" \
+    < "$workdir/public.asc" >/dev/null 2>&1 || {
+      rm -rf "$workdir"
+      return 1
+    }
+  printf '%s:6:\n' "$fingerprint" \
+    | timeout 30 su -s /bin/bash asterisk -c "gpg --homedir '$freepbx_gpg_home' --batch --import-ownertrust" >/dev/null 2>&1 || {
+      rm -rf "$workdir"
+      return 1
+    }
+  chown -R asterisk:asterisk "$freepbx_gpg_home" 2>/dev/null || true
+  chmod 0700 "$freepbx_gpg_home" 2>/dev/null || true
+  rm -rf "$workdir"
+  verify_stock_module "$stock_module"
+}
+
 remove_piper_wrapper() {
   local wrapper="/usr/local/bin/piper"
   local legacy_piper_bin="$DATA_DIR/piper/venv/bin/piper"
@@ -306,6 +427,10 @@ remove_piper_wrapper() {
 
 remove_runtime_files() {
   remove_piper_wrapper
+  if [ -L "$DATA_DIR/piper/venv/bin/piper" ] && [ "$(readlink "$DATA_DIR/piper/venv/bin/piper")" = "/usr/local/bin/piper" ]; then
+    rm -f "$DATA_DIR/piper/venv/bin/piper"
+    rmdir "$DATA_DIR/piper/venv/bin" "$DATA_DIR/piper/venv" 2>/dev/null || true
+  fi
   rm -rf /usr/local/bin/sls_mass_notify
   rm -f /usr/local/bin/nwsalerts_ensure_menu_patch.sh
   rm -f /usr/local/sbin/sign_sls_mass_notify_local_sig.sh
@@ -337,7 +462,7 @@ remove_cron() {
   for user in root asterisk; do
     tmp="$(mktemp /tmp/slsmassnotifyserver-cron.XXXXXX)"
     crontab -u "$user" -l 2>/dev/null \
-      | grep -vE 'sls_mass_notify_(nws_poll|update|maintenance)\.sh|nwsalerts_ensure_menu_patch\.sh' > "$tmp" || true
+      | grep -vE 'sls_mass_notify_(weather_poll|nws_poll|update|maintenance)\.sh|nwsalerts_ensure_menu_patch\.sh' > "$tmp" || true
     crontab -u "$user" "$tmp" 2>/dev/null || true
     rm -f "$tmp"
   done
@@ -347,25 +472,34 @@ restore_stock_modules() {
   rm -f /var/www/html/admin/modules/dashboard/sections/SlsMassNotifyAnnouncement.class.php
   rm -f /var/www/html/admin/modules/dashboard/views/sections/sls-mass-notify-announcement.php
 	  remove_legacy_dashboard_patch
-	  run_fwconsole ma refreshsignatures >/dev/null 2>&1 || true
   for stock_module in dashboard framework; do
 	    [ -d "/var/www/html/admin/modules/$stock_module" ] || continue
 	    if grep -q '^repo=local$' "/var/www/html/admin/modules/$stock_module/module.sig" 2>/dev/null || \
-	      ! SLS_VERIFY_MODULE="$stock_module" php -d pcre.jit=0 -r '
-$bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
-require "/etc/freepbx.conf";
-$result = \FreePBX::GPG()->verifyModule((string)getenv("SLS_VERIFY_MODULE"));
-$status = (int)($result["status"] ?? 0);
-exit(($status & 129) === 129 ? 0 : 1);
-'; then
-	      run_fwconsole ma -f downloadinstall "$stock_module" >/dev/null 2>&1 || \
-        log "Warning: unable to redownload the stock $stock_module module; run fwconsole ma -f downloadinstall $stock_module when repository access is available."
+	      ! verify_stock_module "$stock_module"; then
+	      log "Restoring the stock FreePBX $stock_module module."
+	      if redownload_stock_module "$stock_module" && verify_stock_module "$stock_module"; then
+	        log "Restored and verified the stock FreePBX $stock_module module."
+	      elif locally_sign_stock_module "$stock_module"; then
+	        KEEP_SIGNING_TRUST=1
+	        log "Warning: the FreePBX repository was unavailable for $stock_module. The cleaned module was locally signed and verified so the FreePBX UI remains usable."
+	        log "When repository access returns, run: fwconsole ma --ignorecache -f downloadinstall $stock_module"
+	      else
+	        log "Unable to restore or locally verify the FreePBX $stock_module module. Details: $STOCK_RESTORE_LOG"
+	        return 1
+	      fi
     fi
   done
-	  run_fwconsole ma refreshsignatures >/dev/null 2>&1 || true
 }
 
 remove_trusted_signing_key() {
+  if [ "$KEEP_SIGNING_TRUST" = "1" ]; then
+    # A repository outage forced a local signature fallback. Delete the private
+    # signing material, but retain the public key FreePBX needs to verify the
+    # cleaned stock modules until the administrator redownloads vendor copies.
+    rm -rf "$SIGN_HOME"
+    log "The temporary private signing key was removed; only its public verification key was retained."
+    return 0
+  fi
   [ -n "$SIGNING_FINGERPRINT" ] || {
     rm -rf "$SIGN_HOME"
     return 0
@@ -403,9 +537,9 @@ main() {
   remove_managed_block /etc/asterisk/extensions_custom.conf "SLS Mass Notifications Dialplan"
   remove_managed_block /etc/asterisk/manager_custom.conf "SLS Mass Notifications AMI"
   disable_apache_conf
+  restore_stock_modules
   remove_runtime_files
   restore_user_data
-  restore_stock_modules
   remove_trusted_signing_key
   asterisk -rx "dialplan reload" >/dev/null 2>&1 || true
   asterisk -rx "module reload res_pjsip_notify.so" >/dev/null 2>&1 || true

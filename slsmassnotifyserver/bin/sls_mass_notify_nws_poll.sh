@@ -16,12 +16,12 @@ SLS_TONE_SOUND_PREFIX="SLS_Mass_Notifications_Plugin/tones"
 SLS_TTS_SOUND_PREFIX="SLS_Mass_Notifications_Plugin/tts"
 SLS_TONES_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sounds/tones"
 SLS_TTS_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sounds/tts"
-SLS_OPENING_TONE="opening_Paging_Tone_Opening"
-SLS_CLOSING_TONE="closing_Paging_Tone_Closing"
+SLS_OPENING_TONE="opening_NWS_alert"
+SLS_CLOSING_TONE=""
 PIPER_BIN="/usr/local/bin/sls_mass_notify/piper/venv/bin/piper"
 PIPER_VOICE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices/en_US-lessac-low.onnx"
 PIPER_NWS_VOICE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices/en_US-lessac-low.onnx"
-PIPER_NWS_VOLUME="0.85"
+PIPER_NWS_VOLUME="0.25"
 PIPER_MAX_SECONDS="30"
 SEEN_ALERTS="${SEEN_ALERTS:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/seen_alerts.txt}"
 PROCESSED_ALERTS="${PROCESSED_ALERTS:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/processed_alert_keys.txt}"
@@ -33,6 +33,8 @@ EVENTS_LOG="${EVENTS_LOG:-/var/log/sls_mass_notify_events.jsonl}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-90}"
 CONFIG_JSON_FILE="${CONFIG_JSON_FILE:-${CONFIG_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config}}"
 CONFIG_LOADER="${CONFIG_LOADER:-/usr/local/bin/sls_mass_notify/sls_config.py}"
+BRANDED_EMAIL_SCRIPT="${BRANDED_EMAIL_SCRIPT:-/usr/local/bin/sls_mass_notify/sls_branded_email.py}"
+BRANDED_DISCORD_SCRIPT="${BRANDED_DISCORD_SCRIPT:-/usr/local/bin/sls_mass_notify/sls_branded_discord.py}"
 STATUS_FILE="${STATUS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/status.json}"
 FAULT_STATE_FILE="${FAULT_STATE_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/fault.state}"
 SPOOL="/var/spool/asterisk/outgoing"
@@ -41,10 +43,12 @@ FORCE_REPLAY="${FORCE_REPLAY:-0}"
 NWS_ALERTS_DRY_RUN="${NWS_ALERTS_DRY_RUN:-0}"
 API_FAULT_THRESHOLD="${API_FAULT_THRESHOLD:-3}"
 LOCK_FILE="${LOCK_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sls_mass_notify_nws_poll.lock}"
+LIGHTNING_GATE_FILE="${LIGHTNING_GATE_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/nws-lightning-gate-default.json}"
 MAIL_TO=""
 DISCORD_WEBHOOK_URL=""
 MAIL_FROM_NAME="SLS Mass Notification System"
 MAIL_FROM_ADDR="no-reply@localhost"
+EMAIL_HTML_ENABLED="1"
 SENDMAIL_BIN="/usr/sbin/sendmail"
 SOURCE_EXTENSION=""
 SOURCE_NAME="SLS Mass Notification System"
@@ -477,7 +481,7 @@ load_central_config() {
     case "$key" in
       NWS_ALERT_RECIPIENT) NWS_ALERT_RECIPIENTS+=("$value") ;;
       QUIET_HOURS_CRITICAL_EVENT) critical_events+=("$value") ;;
-      NWS_ALERTS_ENABLED|PUBLIC_PBX_HOST|NWS_API_BASE_URL|NWS_ZONE|SLS_OPENING_TONE|SLS_CLOSING_TONE|PIPER_BIN|PIPER_NWS_VOICE|PIPER_ANNOUNCEMENT_VOICE|PIPER_NWS_VOLUME|PIPER_ANNOUNCEMENT_VOLUME|PIPER_MAX_SECONDS|LOG_RETENTION_DAYS|MAIL_TO|DISCORD_WEBHOOK_URL|QUIET_HOURS_ENABLED|QUIET_HOURS_START|QUIET_HOURS_END|MAIL_FROM_NAME|MAIL_FROM_ADDR|ALERT_EMAIL_SUBJECT|ALERT_EMAIL_BODY|TEST_EMAIL_SUBJECT|TEST_EMAIL_BODY|AMI_USERNAME|AMI_PASSWORD|GITHUB_UPDATES_ENABLED|GITHUB_UPDATES_REPOSITORY|GITHUB_UPDATES_CHANNEL)
+      NWS_ALERTS_ENABLED|PUBLIC_PBX_HOST|NWS_API_BASE_URL|NWS_ZONE|SLS_OPENING_TONE|SLS_CLOSING_TONE|PIPER_BIN|PIPER_NWS_VOICE|PIPER_ANNOUNCEMENT_VOICE|PIPER_NWS_VOLUME|PIPER_ANNOUNCEMENT_VOLUME|PIPER_MAX_SECONDS|LOG_RETENTION_DAYS|MAIL_TO|DISCORD_WEBHOOK_URL|QUIET_HOURS_ENABLED|QUIET_HOURS_START|QUIET_HOURS_END|MAIL_FROM_NAME|MAIL_FROM_ADDR|ALERT_EMAIL_SUBJECT|ALERT_EMAIL_BODY|TEST_EMAIL_SUBJECT|TEST_EMAIL_BODY|EMAIL_HTML_ENABLED|AMI_USERNAME|AMI_PASSWORD|GITHUB_UPDATES_ENABLED|GITHUB_UPDATES_REPOSITORY|GITHUB_UPDATES_CHANNEL)
         printf -v "$key" '%s' "$value"
         ;;
     esac
@@ -492,6 +496,12 @@ if ! load_central_config; then
   update_status "$(printf '{"last_poll_at":%s,"last_poll_status":"fault","last_poll_message":"Central configuration is invalid or unavailable.","last_fault_at":%s,"last_fault_stage":"config","last_fault_message":"Central configuration is invalid or unavailable."}' \
     "$(json_string "$(timestamp_now)")" "$(json_string "$(timestamp_now)")")"
   exit 1
+fi
+if [ -n "${NWS_ZONE_OVERRIDE:-}" ]; then
+  NWS_ZONE="$NWS_ZONE_OVERRIDE"
+fi
+if [ -n "${NWS_RECIPIENTS_OVERRIDE:-}" ]; then
+  IFS=',' read -r -a NWS_ALERT_RECIPIENTS <<< "$NWS_RECIPIENTS_OVERRIDE"
 fi
 prune_event_log
 DELIVERY_TARGETS="$(delivery_targets)"
@@ -694,7 +704,7 @@ generate_tts_audio() {
   fi
 
   if command -v sox >/dev/null 2>&1; then
-    if ! sox -v "${PIPER_NWS_VOLUME:-0.85}" "$tmp_file" -r 8000 -c 1 -b 16 "$output_file" >> "$LOG" 2>&1; then
+    if ! sox -v "${PIPER_NWS_VOLUME:-0.25}" "$tmp_file" -r 8000 -c 1 -b 16 "$output_file" >> "$LOG" 2>&1; then
       rm -f "$tmp_file" "$output_file"
       echo "$(date): ERROR — Unable to convert Piper TTS WAV for $event" >> "$LOG"
       return 1
@@ -768,7 +778,7 @@ build_audio_sequence() {
 
 prune_tts_cache() {
   if [ -d "$SLS_TTS_DIR" ]; then
-    find "$SLS_TTS_DIR" -maxdepth 1 -type f -name '*.wav' -mtime +7 -delete 2>/dev/null || true
+    find "$SLS_TTS_DIR" -maxdepth 1 -type f -name '*.wav' -mmin +15 -delete 2>/dev/null || true
   fi
 }
 
@@ -888,28 +898,18 @@ send_notification_email() {
   local body="$2"
 
   subject="$(printf '%s' "$subject" | tr '\r\n' '  ')"
-  MAIL_FROM_NAME="$(printf '%s' "$MAIL_FROM_NAME" | tr '\r\n' '  ')"
-  MAIL_FROM_ADDR="$(printf '%s' "$MAIL_FROM_ADDR" | tr -d '\r\n')"
-
   if [ -z "$(printf '%s' "$MAIL_TO" | tr -d '[:space:]')" ]; then
     echo "$(date): Notification email skipped — no recipients configured" >> "$LOG"
     return 0
   fi
 
-  if [ ! -x "$SENDMAIL_BIN" ]; then
-    echo "$(date): ERROR — sendmail not found at $SENDMAIL_BIN" >> "$LOG"
+  if [ ! -x "$BRANDED_EMAIL_SCRIPT" ]; then
+    echo "$(date): ERROR — branded email sender is unavailable" >> "$LOG"
     return 1
   fi
 
-  {
-    printf 'From: "%s" <%s>\n' "$MAIL_FROM_NAME" "$MAIL_FROM_ADDR"
-    printf 'To: "Undisclosed Recipients" <%s>\n' "$MAIL_FROM_ADDR"
-    printf 'Bcc: %s\n' "$(printf '%s' "$MAIL_TO" | sed 's/ /, /g')"
-    printf 'Subject: %s\n' "$subject"
-    printf 'Content-Type: text/plain; charset=UTF-8\n'
-    printf '\n'
-    printf '%s\n' "$body"
-  } | "$SENDMAIL_BIN" -t -f "$MAIL_FROM_ADDR"
+  SLS_EMAIL_SUBJECT="$subject" SLS_EMAIL_BODY="$body" SLS_EMAIL_RECIPIENTS="$MAIL_TO" \
+    /usr/bin/python3 "$BRANDED_EMAIL_SCRIPT" "$CONFIG_JSON_FILE"
 }
 
 send_discord_alert() {
@@ -932,6 +932,24 @@ send_discord_alert() {
     echo "$(date): Discord notification skipped — no webhook configured" >> "$LOG"
     return 0
   fi
+
+  if [ ! -x "$BRANDED_DISCORD_SCRIPT" ]; then
+    echo "$(date): ERROR — branded Discord sender is unavailable" >> "$LOG"
+    return 1
+  fi
+
+  SLS_DISCORD_SUBJECT="$subject" \
+  SLS_DISCORD_BODY="$body" \
+  SLS_DISCORD_TYPE="$alert_type" \
+  SLS_DISCORD_EVENT="$event" \
+  SLS_DISCORD_SEVERITY="$severity" \
+  SLS_DISCORD_ZONE="$zone" \
+  SLS_DISCORD_RECIPIENTS="$DELIVERY_TARGETS" \
+  SLS_DISCORD_AUDIO="$audio" \
+  SLS_DISCORD_TRIGGER="${trigger_name:-$trigger_source}" \
+  SLS_DISCORD_TIME="$event_time" \
+    /usr/bin/python3 "$BRANDED_DISCORD_SCRIPT" "$CONFIG_JSON_FILE"
+  return $?
 
   DISCORD_WEBHOOK_URL="$DISCORD_WEBHOOK_URL" \
   DISCORD_SUBJECT="$subject" \
@@ -1049,13 +1067,13 @@ if [ -n "$TEST_PAYLOAD" ]; then
 else
 	ALERTS=$(curl -fsS --retry 3 --retry-all-errors --retry-connrefused --connect-timeout 10 --max-time 30 --max-filesize 10485760 \
     -H "Accept: application/geo+json" \
-    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.0.6-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
+    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.0.7-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
     "${NWS_API_BASE_URL%/}/alerts/active?zone=${NWS_ZONE}&status=actual" 2>>"$LOG") || ALERTS=""
   if [ -z "$ALERTS" ]; then
     echo "$(date): Initial NWS request failed; retrying over IPv4" >> "$LOG"
 	  ALERTS=$(curl -4 -fsS --retry 2 --retry-all-errors --retry-connrefused --connect-timeout 10 --max-time 30 --max-filesize 10485760 \
       -H "Accept: application/geo+json" \
-      -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.0.6-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
+	    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.0.7-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
       "${NWS_API_BASE_URL%/}/alerts/active?zone=${NWS_ZONE}&status=actual" 2>>"$LOG") || ALERTS=""
   fi
 fi
@@ -1192,6 +1210,55 @@ update_status "$(printf '{"last_poll_at":%s,"last_poll_status":"ok","last_poll_m
 if [ -n "$POLL_SUMMARY" ] && [ "$POLL_SUMMARY" != "{}" ]; then
   update_status "$POLL_SUMMARY"
 fi
+
+# Publish a credential-free, per-zone gate for Xweather's free-tier adaptive
+# mode. The lightning worker accepts only fresh files and event names that
+# explicitly identify thunderstorm activity.
+POLL_SUMMARY="$POLL_SUMMARY" LIGHTNING_GATE_FILE="$LIGHTNING_GATE_FILE" NWS_ZONE="$NWS_ZONE" NWS_ZONE_GROUP_NAME="${NWS_ZONE_GROUP_NAME_OVERRIDE:-$NWS_ZONE}" NWS_ZONE_GROUP_ID="${NWS_ZONE_GROUP_ID_OVERRIDE:-default}" python3 - <<'PY' 2>/dev/null || true
+import fcntl
+import json
+import os
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    summary = json.loads(os.environ.get("POLL_SUMMARY", "{}"))
+except Exception:
+    summary = {}
+events = summary.get("last_poll_candidate_events") if isinstance(summary, dict) else {}
+if not isinstance(events, dict):
+    events = {}
+matching = sorted(
+    str(name)[:120] for name, count in events.items()
+    if "thunderstorm" in str(name).lower() and int(count or 0) > 0
+)
+target = Path(os.environ["LIGHTNING_GATE_FILE"])
+target.parent.mkdir(parents=True, exist_ok=True)
+payload = {
+    "updated_at": datetime.now(timezone.utc).timestamp(),
+    "zone": str(os.environ.get("NWS_ZONE", ""))[:12],
+    "group": str(os.environ.get("NWS_ZONE_GROUP_NAME", ""))[:64],
+    "group_id": str(os.environ.get("NWS_ZONE_GROUP_ID", "default"))[:64],
+    "active": bool(matching),
+    "events": matching,
+}
+fd, temporary = tempfile.mkstemp(prefix=".nws-lightning-gate.", dir=str(target.parent))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        json.dump(payload, handle, separators=(",", ":"), ensure_ascii=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, 0o640)
+    os.replace(temporary, target)
+finally:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+PY
 clear_api_fault_state
 
 # Parse alerts

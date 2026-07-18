@@ -53,7 +53,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action
 		$_POST['announcement_extensions'] ?? [],
 		$_POST['announcement_body'] ?? '',
 		!empty($_POST['announcement_mass_notify']),
-		!empty($_POST['announcement_tts_audio']),
+		in_array(($_POST['announcement_audio_mode'] ?? 'none'), ['tts', 'tones_tts'], true),
 		$_POST['announcement_groups'] ?? [],
 		[
 			'phones_all' => !empty($_POST['announcement_all_phones']),
@@ -63,6 +63,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action
 			'image' => !empty($_POST['announcement_colored']),
 			'title' => $_POST['announcement_title'] ?? 'Announcement',
 			'background_color' => $_POST['announcement_background_color'] ?? '#1f2937',
+			'audio_mode' => $_POST['announcement_audio_mode'] ?? 'none',
+			'opening_tone' => $_POST['announcement_opening_tone'] ?? '',
+			'closing_tone' => $_POST['announcement_closing_tone'] ?? '',
 		]
 	));
 }

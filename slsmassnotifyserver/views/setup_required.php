@@ -4,9 +4,9 @@ $setupModal = (string)($setup_modal ?? '');
 $page = trim((string)($requested_page ?? ''));
 $titleMap = [
 	'main' => _('Notification Logs'),
-	'settings' => _('NWS Alerts'),
-	'testing' => _('NWS Alerts'),
-	'nws_alerts' => _('NWS Alerts'),
+	'settings' => _('Weather Alerts'),
+	'testing' => _('Weather Alerts'),
+	'nws_alerts' => _('Weather Alerts'),
 	'other_settings' => _('General Settings'),
 	'help' => _('Help'),
 ];

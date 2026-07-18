@@ -8,6 +8,13 @@ $tokenResult = $_SESSION['slsmassnotifyserver_other_token_result'] ?? null;
 $importResult = $_SESSION['slsmassnotifyserver_other_import_result'] ?? null;
 unset($_SESSION['slsmassnotifyserver_other_save_result'], $_SESSION['slsmassnotifyserver_other_apply_result'], $_SESSION['slsmassnotifyserver_other_token_result'], $_SESSION['slsmassnotifyserver_other_import_result']);
 
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['sls_update_status'] ?? '') === '1') {
+	header('Content-Type: application/json; charset=utf-8');
+	header('Cache-Control: no-store, max-age=0');
+	echo json_encode($slsmassnotifyserver->getManualUpdateProgress(), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+	exit;
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$slsmassnotifyserver->validateCsrfToken($_POST['slsmassnotifyserver_csrf'] ?? '')) {
 	$_SESSION['slsmassnotifyserver_other_save_result'] = [
 		'success' => false,
@@ -43,8 +50,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 		header('Location: config.php?display=slsmassnotifyserver_other');
 		exit;
 	} elseif ($action === 'manual_update') {
-		$_SESSION['slsmassnotifyserver_other_save_result'] = $slsmassnotifyserver->requestManualUpdate();
-		header('Location: config.php?display=slsmassnotifyserver_other');
+		$updateResult = $slsmassnotifyserver->requestManualUpdate();
+		$_SESSION['slsmassnotifyserver_other_save_result'] = $updateResult;
+		header('Location: config.php?display=slsmassnotifyserver_other' . (!empty($updateResult['success']) ? '&sls_update_queued=1' : ''));
 		exit;
 	} elseif ($action === 'complete_uninstall') {
 		$_SESSION['slsmassnotifyserver_other_save_result'] = $slsmassnotifyserver->requestCompleteUninstall();
@@ -62,4 +70,6 @@ echo $slsmassnotifyserver->showPage('other_settings', [
 	'apply_result' => $applyResult,
 	'token_result' => $tokenResult,
 	'import_result' => $importResult,
+	'update_monitor_active' => ($_GET['sls_update_queued'] ?? '') === '1',
+	'update_progress' => $slsmassnotifyserver->getManualUpdateProgress(),
 ]);

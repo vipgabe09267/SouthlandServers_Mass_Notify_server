@@ -45,7 +45,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 			$triggerName = (string)$_SESSION['AMP_user']->username;
 		}
 
-		$result = $slsmassnotifyserver->triggerTest('tts', '', $triggerName);
+		$selectedZoneScope = (($_POST['test_zone_scope'] ?? 'all') === 'selected');
+		$testZoneIds = $selectedZoneScope ? (array)($_POST['test_zone_ids'] ?? []) : [];
+		$result = ($selectedZoneScope && empty($testZoneIds))
+			? ['success' => false, 'message' => _('Select at least one NWS zone for the test.')]
+			: $slsmassnotifyserver->triggerTest('tts', '', $triggerName, $testZoneIds);
 		if (($_POST['ajax'] ?? '') === '1') {
 			header('Content-Type: application/json');
 			$result['cooldowns'] = $slsmassnotifyserver->getCooldownState();

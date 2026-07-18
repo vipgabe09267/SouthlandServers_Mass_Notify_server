@@ -4,11 +4,12 @@ Southland Servers Mass Notifications Server is a beta FreePBX module that can se
 
 ## Supported Versions
 
-Security fixes are currently targeted at the latest public beta release only.
+Security fixes are currently targeted at the latest beta release candidate only.
 
 | Version | Supported |
 | --- | --- |
-| `0.0.6-beta` | Yes |
+| `0.0.7-beta` | Yes |
+| `0.0.6-beta` | No |
 | `0.0.5-beta` | No |
 | `0.0.4-beta` | No |
 | `0.0.3-beta` | No |
@@ -32,7 +33,7 @@ Do not post live API keys, desktop client passwords, AMI credentials, bearer tok
 
 ## Secrets
 
-API keys, encrypted desktop client passwords, AMI credentials, notification groups, and deployment settings are stored in the central Mass Notifications config and should not be committed to Git.
+API keys, encrypted desktop client passwords, AMI credentials, Xweather client secrets, notification groups, and deployment settings are stored in the central Mass Notifications config and should not be committed to Git.
 
 Do not publish:
 
@@ -58,9 +59,15 @@ Credentials are generated on fresh installs and preserved during normal updates.
 
 ## Security Boundaries
 
-The desktop notification API and Control API are intended for authenticated clients only. Desktop app clients use per-client usernames and passwords over HTTPS, and event records are filtered by explicit desktop routing fields. Legacy untargeted records are denied. The Control API is disabled by default, uses constant-time key comparison, supports optional IPv4/IPv6 allowlisting and rate limiting, records a bounded audit trail, limits JSON request size, and never returns stored secrets in config responses.
+The desktop notification API and Control API are intended for authenticated clients only. Desktop app clients use per-client usernames and passwords over HTTPS. The primary transport is the live server-sent-event handshake; the JSON endpoint remains a fallback. Both filter event records by explicit desktop routing fields, and legacy untargeted records are denied. The Control API is disabled by default, uses constant-time key comparison, supports optional IPv4/IPv6 allowlisting and rate limiting, records a bounded audit trail, limits JSON request size, and never returns stored secrets in config responses.
 
-FreePBX UI mutations use a module CSRF token. Uploaded tones are size-limited and decoded/re-encoded by SoX; imported config files are size-limited and schema-validated before staging. NWS and announcement text is passed to subprocesses as argument arrays or shell-escaped values, and ImageMagick text metacharacters are neutralized before rendering.
+FreePBX UI mutations use a module CSRF token. Uploaded tones are size-limited and decoded/re-encoded by SoX; imported config files are size-limited and schema-validated before staging. Weather, Xweather, and announcement text is passed to subprocesses as argument arrays or shell-escaped values, and ImageMagick text metacharacters are neutralized before rendering. Xweather request fields are URL-encoded, TLS verification and bounded retries are enabled, and the client ID/secret are stored only in the protected `mass-notifications.config` file and are neither logged nor returned by the Control API.
+
+Default-on adaptive Lightning protection reads credential-free, short-lived Weather.gov gate files scoped to the administrator-selected zone group. Gate files older than three minutes are ignored. Its persisted quota bucket limits scheduled Xweather queries to the configured account-period allowance, while manual connection tests remain explicit extra queries. Disabling the toggle intentionally permits continuous Xweather polling regardless of NWS conditions. Adaptive mode reduces API use but can miss lightning outside a qualifying Weather.gov event and is not a substitute for a dedicated safety-grade lightning network.
+
+Public PBX Hostname is automatically detected and exposed read-only in administrator forms; it is not accepted as a Control API configuration mutation. Successful loopback `get_config` and `get_status` health probes are omitted from the API usage audit, while authentication failures, non-loopback requests, and meaningful local actions continue through the normal audit controls.
+
+Settings participate in FreePBX’s native Apply Config hook and remain staged in a protected Asterisk-owned file until reload. The root maintenance worker compares only the managed Dashboard widget and menu integration files after FreePBX updates; when drift is detected it restores those known files from the installed module and refreshes local signatures. It does not modify phone provisioning, PJSIP peers, or unrelated FreePBX module content.
 
 Executable runtime under `/usr/local/bin/sls_mass_notify`, including Piper, maintenance, and updater code, is owned by `root:root`. Mutable deployment data remains under the Asterisk data folder. The root updater only accepts the official beta repository, requires GitHub release SHA-256 metadata, and executes the installer from the matching immutable release tag. Automatic updates remain disabled by default.
 

@@ -27,7 +27,7 @@ download_file() {
   rm -f "$tmp"
   if command -v curl >/dev/null 2>&1; then
     curl -fL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 900 \
-      -A "SouthlandServers-Mass-Notifications-Server/0.0.6-beta" \
+      -A "SouthlandServers-Mass-Notifications-Server/0.0.7-beta" \
       -o "$tmp" "$url"
   elif command -v wget >/dev/null 2>&1; then
     wget --tries=5 --timeout=900 -O "$tmp" "$url"
@@ -167,6 +167,8 @@ install_piper_wrapper
 
 if [ -x "$PIPER_BIN" ]; then
   rm -rf /var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/venv
+  mkdir -p /var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/venv/bin
+  ln -s /usr/local/bin/piper /var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/venv/bin/piper
 fi
 
 if [ "${#failures[@]}" -gt 0 ]; then

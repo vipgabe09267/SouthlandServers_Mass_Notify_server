@@ -58,11 +58,25 @@ fi
 
 for required in \
   module.xml Slsmassnotifyserver.class.php install.php uninstall.php \
+  page.slsmassnotifyserver_lightning.php views/lightning.php \
+  api/sipnotify/index.php \
+  dashboard/sections/SlsMassNotifyAnnouncement.class.php \
+  dashboard/views/sections/sls-mass-notify-announcement.php \
   bin/sls_mass_notify/sls_notify.py bin/sls_mass_notify/sls_config.py \
+  bin/sls_mass_notify/sls_branded_email.py \
+  bin/sls_mass_notify/sls_branded_discord.py \
   bin/sls_mass_notify_nws_poll.sh bin/sls_mass_notify_test.sh \
+  bin/sls_mass_notify_weather_poll.sh \
+  bin/sls_mass_notify/sls_mass_notify_xweather_poll.py \
   bin/sls_mass_notify_update.sh bin/sls_mass_notify_maintenance.sh \
   bin/sls_mass_notify_uninstall.sh \
-  bin/sls_mass_notify_install_piper_voices.sh; do
+  bin/sls_mass_notify_install_piper_voices.sh \
+  assets/SLS_Mass_Notif_Email.png \
+  sounds/tones/opening_Paging_Tone_Opening.wav \
+  sounds/tones/closing_Paging_Tone_Closing.wav \
+  sounds/system-recordings/NWS_alert.wav \
+  sounds/system-recordings/Lightning_alert.wav \
+  sounds/system-recordings/Lightning_alert.mp3; do
   [ -f "${ROOT_DIR}/${MODULE}/${required}" ] || {
     printf 'Required module file is missing: %s\n' "$required" >&2
     exit 1

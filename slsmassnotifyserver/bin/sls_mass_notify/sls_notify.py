@@ -653,6 +653,22 @@ def aastra_text_xml(title, message):
     )
 
 
+def panasonic_text_xml(title, message):
+    lines = split_payload_lines(f"{title}\n{clean_payload_text(message)}", width=30, max_lines=6)
+    labels = []
+    for index, line in enumerate(lines, start=1):
+        labels.append(
+            f"<Label area='Line' name='Line{index}' line='{index}' text='{html.escape(line, quote=True)}' />"
+        )
+    return (
+        "<?xml version='1.0' encoding='UTF-8'?>"
+        "<ppxml xmlns='http://panasonic/sip_screen' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'>"
+        "<Screen version='3.0'><Components>"
+        + "".join(labels)
+        + "</Components></Screen></ppxml>"
+    )
+
+
 def generic_text_xml(title, message):
     return (
         "<?xml version='1.0' encoding='UTF-8'?>"
@@ -674,6 +690,8 @@ def text_xml_for_format(fmt, title, message):
         return grandstream_text_xml(title, message)
     if fmt in {"aastra", "mitel"}:
         return aastra_text_xml(title, message)
+    if fmt == "panasonic":
+        return panasonic_text_xml(title, message)
     if fmt in {"generic", "sangoma", "avaya", "vtech", "ale", "unknown"}:
         return generic_text_xml(title, message)
     return build_announcement_xml(message)
@@ -790,6 +808,7 @@ PHONE_FORMAT_ALIASES = {
     "generic_xml": "generic",
     "yealink_xml": "yealink",
     "cisco_xml": "cisco",
+    "panasonic_kx": "panasonic",
 }
 
 SUPPORTED_PHONE_FORMATS = {
@@ -805,6 +824,7 @@ SUPPORTED_PHONE_FORMATS = {
     "avaya",
     "vtech",
     "ale",
+    "panasonic",
     "generic",
     "unknown",
 }
@@ -850,6 +870,10 @@ def detect_phone_format(user_agent, endpoint=""):
         return "avaya"
     if "vtech" in ua:
         return "vtech"
+    if "alcatel-lucent" in ua or "alcatel lucent" in ua or "ale deskphone" in ua:
+        return "ale"
+    if "panasonic" in ua or re.search(r"kx-(?:hdv|ut|tgp|uds|udt)", ua):
+        return "panasonic"
     return "unknown"
 
 
@@ -966,6 +990,7 @@ def notify_events_for_format(phone_format):
         "avaya": ["xml"],
         "vtech": ["xml"],
         "ale": ["xml"],
+        "panasonic": ["xml"],
         "unknown": ["xml"],
         "generic": ["xml"],
     }.get(phone_format, ["xml"])
@@ -1083,6 +1108,7 @@ def alert_api_record(alert, xml_payload, extensions, phone_formats=None):
     event = props.get("event", "Unknown")
     alert_id = alert.get("id") or props.get("id") or "unknown"
     priority = alert_priority(props)
+    colors = ALERT_COLORS[priority]
     return {
         "kind": "alert",
         "id": alert_id,
@@ -1090,7 +1116,19 @@ def alert_api_record(alert, xml_payload, extensions, phone_formats=None):
         "event": event,
         "title": alert_title(event),
         "priority": priority,
-        "priority_label": ALERT_COLORS[priority]["label"],
+        "priority_label": colors["label"],
+        "announcement_style": "weather_alert",
+        "background_color": colors["background"],
+        "header_color": colors["header"],
+        "accent_color": colors["accent"],
+        "text_color": colors["text"],
+        "presentation": {
+            "style": "weather_alert",
+            "background_color": colors["background"],
+            "header_color": colors["header"],
+            "accent_color": colors["accent"],
+            "text_color": colors["text"],
+        },
         "beep": alert_beep(event),
         "severity": props.get("severity", ""),
         "message_type": props.get("messageType", ""),
@@ -1107,14 +1145,29 @@ def alert_api_record(alert, xml_payload, extensions, phone_formats=None):
     }
 
 
-def announcement_api_record(alert_id, message, xml_payload, extensions, desktop_targets=None, desktop_all=False, phone_formats=None):
+def announcement_api_record(alert_id, message, xml_payload, extensions, desktop_targets=None, desktop_all=False, phone_formats=None, title="Announcement", background_color="#1f2937", image=False):
+    normalized_title = clean_payload_text(title or "Announcement", 80) or "Announcement"
+    normalized_background = normalize_hex_color(background_color)
+    style = "colored" if image else "standard"
     return {
         "kind": "announcement",
         "id": alert_id,
         "event": "Announcement",
-        "title": "Announcement",
+        "title": normalized_title,
         "priority": "notice",
         "priority_label": ALERT_COLORS["notice"]["label"],
+        "announcement_style": style,
+        "background_color": normalized_background,
+        "header_color": normalized_background,
+        "accent_color": "#ffffff",
+        "text_color": "#ffffff",
+        "presentation": {
+            "style": style,
+            "background_color": normalized_background,
+            "header_color": normalized_background,
+            "accent_color": "#ffffff",
+            "text_color": "#ffffff",
+        },
         "beep": "yes",
         "body": message,
         "text": message,
@@ -1215,12 +1268,12 @@ def push_announcement(config, message, targets, print_results=True, api_publish=
         xml_payload = build_announcement_xml(message)
     alert_id = "announcement-" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     if api_only:
-        append_sipnotify_event(config, announcement_api_record(alert_id, message, xml_payload, [], desktop_targets, desktop_all))
+        append_sipnotify_event(config, announcement_api_record(alert_id, message, xml_payload, [], desktop_targets, desktop_all, title=title, background_color=background_color, image=image))
         return []
     if api_publish:
         append_sipnotify_event(
             config,
-            announcement_api_record(alert_id, message, xml_payload, sorted(targets or []), desktop_targets, desktop_all),
+            announcement_api_record(alert_id, message, xml_payload, sorted(targets or []), desktop_targets, desktop_all, title=title, background_color=background_color, image=image),
         )
     with AmiClient(
         config["ami"].get("host", "127.0.0.1"),
@@ -1233,7 +1286,7 @@ def push_announcement(config, message, targets, print_results=True, api_publish=
         phone_formats = endpoint_format_summary(endpoint_info)
         logging.info("Pushing SIP NOTIFY announcement %s to %d registered endpoints formats=%s", alert_id, len(extensions), phone_formats)
         if api_publish:
-            append_sipnotify_event(config, announcement_api_record(alert_id, message, xml_payload, extensions, desktop_targets, desktop_all, phone_formats))
+            append_sipnotify_event(config, announcement_api_record(alert_id, message, xml_payload, extensions, desktop_targets, desktop_all, phone_formats, title=title, background_color=background_color, image=image))
         if targets and not extensions:
             requested = ", ".join(sorted(targets))
             raise RuntimeError(f"No requested phone endpoints are registered/reachable for SIP NOTIFY: {requested}")
@@ -1309,12 +1362,33 @@ def main():
     parser.add_argument("--no-api", action="store_true", help="Do not publish this announcement/alert to the desktop API journal")
     parser.add_argument("--api-only", action="store_true", help="Publish announcement to the desktop API journal without sending SIP NOTIFY")
     parser.add_argument("--list-endpoints-json", action="store_true", help="Print registered endpoint vendor detection as JSON and exit")
+    parser.add_argument("--ami-health-json", action="store_true", help="Authenticate to AMI, issue Ping, and print a JSON health result")
     parser.add_argument("--no-retry", action="store_true", help="Do not send delayed visual retries")
     args = parser.parse_args()
 
     try:
         config = load_config()
         setup_logging(config["logging"].get("log_file", "/var/log/sls_mass_notify_push.log"))
+        if args.ami_health_json:
+            with AmiClient(
+                config["ami"].get("host", "127.0.0.1"),
+                config["ami"].getint("port", 5038),
+                config["ami"].get("username", "slsmassnotify"),
+                config["ami"].get("password", ""),
+            ) as ami:
+                response, _ = ami.action({"Action": "Ping"})
+                if response.get("Response", "").lower() != "success" or response.get("Ping", "").lower() != "pong":
+                    raise RuntimeError(response.get("Message", "AMI Ping failed"))
+                contact_response, _ = ami.action({"Action": "PJSIPShowContacts"})
+                if contact_response.get("Response", "").lower() != "success":
+                    raise RuntimeError(contact_response.get("Message", "AMI PJSIPShowContacts authorization failed"))
+                print(json.dumps({
+                    "status": "ok",
+                    "ami": "authenticated",
+                    "ping": "pong",
+                    "pjsip_show_contacts": "authorized",
+                }, sort_keys=True))
+            return 0
         if args.list_endpoints_json:
             with AmiClient(
                 config["ami"].get("host", "127.0.0.1"),

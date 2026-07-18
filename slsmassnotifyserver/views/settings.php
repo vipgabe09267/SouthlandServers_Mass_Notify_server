@@ -9,6 +9,9 @@ $testResult = $test_result ?? null;
 $cooldownRemaining = (int)($cooldown_remaining ?? 0);
 $csrfToken = (string)($csrf_token ?? '');
 $systemSounds = is_array($available_system_sounds ?? null) ? $available_system_sounds : [];
+$voices = is_array($available_voices ?? null) ? $available_voices : [];
+$zoneGroups = array_values((array)($settings['nws_zones'] ?? []));
+$xweather = is_array($settings['xweather'] ?? null) ? $settings['xweather'] : [];
 $placeholderHelp = "{{event}}, {{severity}}, {{message_type}}, {{audio}}, {{page_group}}, {{alert_id}}, {{zone}}, {{time}}, {{source_name}}, {{trigger_source}}, {{trigger_extension}}, {{trigger_name}}, {{audio_sequence}}";
 $hourOptions = [];
 for ($hour = 0; $hour < 24; $hour++) {
@@ -24,26 +27,32 @@ for ($hour = 0; $hour < 24; $hour++) {
 }
 .sls-nws-section-note { margin-bottom: 16px; }
 .sls-nws-scroll { max-height: 240px; overflow: auto; }
+.sls-nws-page { max-width: 1180px; margin: 0 auto; }
+.sls-settings-card { border: 1px solid #dfe5ec; border-radius: 8px; box-shadow: 0 2px 8px rgba(15,23,42,.05); margin-bottom: 18px; overflow: hidden; }
+.sls-settings-card > .panel-heading { padding: 14px 18px; background: #f8fafc; border-bottom: 1px solid #e8edf2; }
+.sls-settings-card > .panel-body { padding: 18px; }
+.sls-zone-empty { padding: 24px; text-align: center; color: #64748b; background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 6px; }
+.sls-zone-editor { border: 1px solid #dfe5ec; border-radius: 7px; padding: 14px; margin-bottom: 12px; background: #fff; }
+.sls-zone-editor-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
+.sls-zone-summary-table { margin-bottom: 0; }
+.sls-zone-summary-table td { vertical-align: middle !important; }
+.sls-zone-modal .modal-dialog { width: min(960px, calc(100% - 30px)); }
+.sls-zone-modal .modal-body { max-height: 70vh; overflow: auto; background: #f8fafc; }
+.sls-recipient-grid { border: 1px solid #e5e7eb; border-radius: 6px; padding: 9px 12px; background: #fbfcfe; }
+.sls-sticky-actions { position: sticky; bottom: 0; z-index: 4; background: rgba(255,255,255,.96); padding: 13px 16px; border: 1px solid #dfe5ec; border-radius: 8px; box-shadow: 0 -2px 10px rgba(15,23,42,.06); }
+.sls-weather-title { margin:0 0 7px; font-size:30px; line-height:1.2; font-weight:700; }
 </style>
-<div class="container-fluid">
+<div class="container-fluid sls-nws-page">
 	<div class="display full-border">
 		<div class="fpbx-container">
 			<?php echo load_view(__DIR__ . '/hero.php', ['hero_image' => $hero_image]); ?>
 			<div style="display: flex; justify-content: space-between; gap: 15px; align-items: flex-start;">
 				<div>
-					<h1><?php echo $showTestSection ? _('NWS Alerts') : _('NWS Settings'); ?></h1>
-					<p class="text-muted">
-						<?php echo _('Test and configure weather-alert delivery, then apply saved changes to push the updated configuration into the live scripts.'); ?>
-					</p>
+					<h1 class="sls-weather-title"><i class="fa fa-cloud text-primary" aria-hidden="true"></i> <?php echo $showTestSection ? _('Weather Alerts') : _('Weather Alert Settings'); ?></h1>
+					<p class="text-muted"><?php echo _('Test and configure weather-alert delivery.'); ?></p>
 				</div>
-				<?php if ($hasPendingChanges) { ?>
-						<form method="post" action="config.php?display=<?php echo htmlspecialchars($settingsDisplay); ?>">
-							<input type="hidden" name="slsmassnotifyserver_action" value="apply_settings">
-							<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
-						<button type="submit" class="btn btn-danger"><?php echo _('Apply Changes'); ?></button>
-					</form>
-				<?php } ?>
 			</div>
+			<div class="alert alert-info" style="margin-bottom:18px"><i class="fa fa-info-circle"></i> <?php echo _('Weather Alerts supports United States locations and zones through the U.S. National Weather Service weather.gov API only.'); ?></div>
 
 			<?php if (is_array($saveResult)) { ?>
 				<div class="alert alert-<?php echo !empty($saveResult['success']) ? 'success' : 'warning'; ?>">
@@ -71,16 +80,10 @@ for ($hour = 0; $hour < 24; $hour++) {
 				</div>
 			<?php } ?>
 
-			<?php if ($hasPendingChanges) { ?>
-				<div class="alert alert-info">
-					<?php echo _('Saved configuration changes are waiting to be applied.'); ?>
-				</div>
-			<?php } ?>
-
 			<?php if ($showTestSection) { ?>
-				<div class="panel panel-default">
+				<div class="panel panel-default sls-settings-card">
 					<div class="panel-heading">
-						<h3 class="panel-title"><?php echo _('Manual NWS Test'); ?></h3>
+						<h3 class="panel-title"><i class="fa fa-play-circle text-warning" aria-hidden="true"></i> <?php echo _('Manual Weather Alert Test'); ?></h3>
 					</div>
 					<div class="panel-body">
 						<p class="text-muted">
@@ -107,7 +110,12 @@ for ($hour = 0; $hour < 24; $hour++) {
 							<input type="hidden" name="ajax" value="1">
 
 							<div class="alert alert-danger">
-								<?php echo _('Warning: this test will trigger all configured NWS audio recipients.'); ?>
+								<?php echo _('Warning: this test sends audio and visuals to the selected weather-zone recipients.'); ?>
+							</div>
+							<div class="form-group"><label><?php echo _('Test Zones'); ?></label>
+								<div class="radio"><label><input type="radio" name="test_zone_scope" value="all" checked> <?php echo _('All configured zones'); ?></label></div>
+								<div class="radio"><label><input type="radio" name="test_zone_scope" value="selected"> <?php echo _('Only selected zones'); ?></label></div>
+								<div class="well sls-nws-scroll"><?php foreach ($zoneGroups as $zoneGroup) { ?><div class="checkbox"><label><input type="checkbox" name="test_zone_ids[]" value="<?php echo htmlspecialchars($zoneGroup['id'] ?? ''); ?>"> <?php echo htmlspecialchars(($zoneGroup['name'] ?? '') . ' (' . ($zoneGroup['zone'] ?? '') . ')'); ?></label></div><?php } ?></div>
 							</div>
 
 							<button type="submit" id="sls-test-submit" class="btn btn-danger" <?php echo !empty($cooldownRemaining) ? 'disabled' : ''; ?>><?php echo _('Trigger Piper TTS Test'); ?></button>
@@ -199,71 +207,50 @@ for ($hour = 0; $hour < 24; $hour++) {
 							<p class="help-block"><?php echo _('When disabled, both live NWS alerts and manual test paging are skipped.'); ?></p>
 						</div>
 					</div>
-					<div class="col-md-4">
-						<div class="form-group">
-							<label><?php echo _('NWS Audio Recipients'); ?></label>
-							<div class="well sls-nws-scroll">
-								<?php $selectedRecipients = array_fill_keys((array)($settings['alert_recipients'] ?? []), true); ?>
-								<?php foreach ((array)($available_extensions ?? []) as $extension) { ?>
-									<div class="checkbox">
-										<label>
-											<input type="checkbox" name="alert_recipients[]" value="<?php echo htmlspecialchars($extension['extension']); ?>" <?php echo isset($selectedRecipients[$extension['extension']]) ? 'checked' : ''; ?>>
-											<?php echo htmlspecialchars($extension['extension']); ?>
-											<?php if ($extension['name'] !== '') { ?>
-												<?php echo ' - ' . htmlspecialchars($extension['name']); ?>
-											<?php } ?>
-											<span class="text-muted">
-												<?php echo !empty($extension['registered']) ? _('registered') : _('not registered'); ?>
-											</span>
-										</label>
-									</div>
-								<?php } ?>
-							</div>
-							<p class="help-block"><?php echo _('Live NWS audio uses direct intercom calls to these extensions from SLS Mass Notification System.'); ?></p>
-						</div>
-					</div>
-				</div>
-
-				<div class="row">
-					<div class="col-md-4">
-						<div class="form-group">
-							<label for="nws_zone"><?php echo _('NWS Zone or County'); ?></label>
-							<input class="form-control" id="nws_zone" name="nws_zone" type="text" value="<?php echo htmlspecialchars($settings['nws_zone'] ?? ''); ?>" maxlength="6">
-							<p class="help-block"><?php echo _('Examples: TXC491 for Williamson County TX, or TXZ163 for a forecast zone. Find zones at weather.gov by opening your local forecast and checking the zone/county code in NWS alerts.'); ?></p>
-						</div>
-					</div>
 					<div class="col-md-6">
 						<div class="form-group">
 							<label for="nws_api_base_url"><?php echo _('NWS API Base URL'); ?></label>
 							<input class="form-control" id="nws_api_base_url" name="nws_api_base_url" type="url" value="<?php echo htmlspecialchars($settings['nws_api_base_url'] ?? 'https://api.weather.gov'); ?>">
-							<p class="help-block"><?php echo _('Default: https://api.weather.gov. The alert script appends /alerts/active with the selected zone.'); ?></p>
+							<p class="help-block"><?php echo _('Default: https://api.weather.gov. Each enabled group is polled once per minute.'); ?></p>
 						</div>
 					</div>
 				</div>
 
-				<div class="row">
-					<div class="col-md-7">
-						<div class="form-group">
-							<label for="mail_to"><?php echo _('Notification Emails'); ?></label>
-							<textarea class="form-control" id="mail_to" name="mail_to" rows="3"><?php echo htmlspecialchars($settings['mail_to']); ?></textarea>
-							<p class="help-block"><?php echo _('Use one recipient per line or separate them with commas. Leave blank to disable notification emails. Messages are sent through the PBX server mail transport/Postfix configuration.'); ?></p>
-						</div>
+				<div class="panel panel-default sls-settings-card">
+					<div class="panel-heading clearfix">
+						<div class="pull-left"><strong><i class="fa fa-map-marker text-danger" aria-hidden="true"></i> <?php echo _('NWS Zone Groups'); ?></strong><div class="text-muted"><small><?php echo _('Up to five zones, each with its own extension recipients.'); ?></small></div></div>
+						<button type="button" class="btn btn-primary btn-sm pull-right" data-toggle="modal" data-target="#sls-zone-manager"><i class="fa fa-map-marker"></i> <?php echo _('Manage Zone Groups'); ?></button>
 					</div>
-					<div class="col-md-4">
-						<div class="well">
-							<strong><?php echo _('Email From'); ?></strong>
-								<div style="margin-top: 8px;"><?php echo htmlspecialchars($settings['mail_from_name'] ?? 'SLS Mass Notification System'); ?></div>
-							<div class="text-muted"><?php echo htmlspecialchars($settings['mail_from_addr'] ?? ('no-reply@' . ($_SERVER['HTTP_HOST'] ?? 'localhost.localdomain'))); ?></div>
-						</div>
-						<div class="form-group">
-							<label for="discord_webhook_url"><?php echo _('Discord Webhook'); ?></label>
-							<input class="form-control" id="discord_webhook_url" name="discord_webhook_url" type="url" value="<?php echo htmlspecialchars($settings['discord_webhook_url'] ?? ''); ?>">
-							<p class="help-block"><?php echo _('Optional. Alerts are also sent to this Discord webhook when configured.'); ?></p>
-						</div>
+					<div class="panel-body">
+					<?php if (empty($zoneGroups)) { ?>
+						<div class="sls-zone-empty"><i class="fa fa-map-o fa-2x"></i><br><?php echo _('No NWS zone groups are configured. Use Manage Zone Groups to add one.'); ?></div>
+					<?php } else { ?>
+						<div class="table-responsive"><table class="table table-striped sls-zone-summary-table"><thead><tr><th><?php echo _('Group'); ?></th><th><?php echo _('NWS Zone'); ?></th><th><?php echo _('Recipients'); ?></th></tr></thead><tbody>
+						<?php foreach ($zoneGroups as $zoneGroup) { ?><tr><td><strong><?php echo htmlspecialchars($zoneGroup['name'] ?? ''); ?></strong></td><td><code><?php echo htmlspecialchars($zoneGroup['zone'] ?? ''); ?></code></td><td><?php echo htmlspecialchars(implode(', ', (array)($zoneGroup['extensions'] ?? []))); ?></td></tr><?php } ?>
+						</tbody></table></div>
+					<?php } ?>
 					</div>
 				</div>
 
-				<h3 class="sls-nws-heading"><?php echo _('Quiet Hours'); ?></h3>
+				<div class="modal fade sls-zone-modal" id="sls-zone-manager" tabindex="-1" role="dialog" aria-hidden="true">
+					<div class="modal-dialog"><div class="modal-content">
+						<div class="modal-header"><button type="button" class="close" data-dismiss="modal"><span>&times;</span></button><h4 class="modal-title"><?php echo _('Manage NWS Zone Groups'); ?></h4></div>
+						<div class="modal-body"><div id="sls-zone-editor-list">
+						<?php foreach ($zoneGroups as $zoneIndex => $zoneGroup) { $zoneRecipients = array_fill_keys((array)($zoneGroup['extensions'] ?? []), true); ?>
+							<div class="sls-zone-editor" data-zone-editor>
+								<div class="sls-zone-editor-header"><strong data-zone-title><?php echo htmlspecialchars($zoneGroup['name'] ?? sprintf(_('Weather Zone %d'), $zoneIndex + 1)); ?></strong><button type="button" class="btn btn-link btn-sm text-danger" data-zone-remove><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div>
+								<input type="hidden" data-zone-field="id" name="nws_zones[<?php echo $zoneIndex; ?>][id]" value="<?php echo htmlspecialchars($zoneGroup['id'] ?? ''); ?>">
+								<div class="row"><div class="col-md-7"><div class="form-group"><label><?php echo _('Group Name'); ?></label><input class="form-control" data-zone-field="name" name="nws_zones[<?php echo $zoneIndex; ?>][name]" maxlength="64" value="<?php echo htmlspecialchars($zoneGroup['name'] ?? ''); ?>" placeholder="<?php echo htmlspecialchars(_('Williamson County')); ?>"></div></div><div class="col-md-5"><div class="form-group"><label><?php echo _('NWS Zone'); ?></label><input class="form-control" data-zone-field="zone" name="nws_zones[<?php echo $zoneIndex; ?>][zone]" maxlength="6" value="<?php echo htmlspecialchars($zoneGroup['zone'] ?? ''); ?>" placeholder="TXC491"></div></div></div>
+								<label><?php echo _('Recipient Extensions'); ?></label><div class="sls-recipient-grid sls-nws-scroll"><div class="row"><?php foreach ((array)($available_extensions ?? []) as $extension) { ?><div class="col-md-4"><div class="checkbox"><label><input type="checkbox" data-zone-extension name="nws_zones[<?php echo $zoneIndex; ?>][extensions][]" value="<?php echo htmlspecialchars($extension['extension']); ?>" <?php echo isset($zoneRecipients[$extension['extension']]) ? 'checked' : ''; ?>> <?php echo htmlspecialchars($extension['extension'] . ($extension['name'] !== '' ? ' - ' . $extension['name'] : '')); ?> <span class="text-muted"><?php echo !empty($extension['registered']) ? _('online') : _('offline'); ?></span></label></div></div><?php } ?></div></div>
+							</div>
+						<?php } ?>
+						</div><button type="button" class="btn btn-default" id="sls-zone-add"><i class="fa fa-plus"></i> <?php echo _('Add Zone Group'); ?></button> <span class="text-muted" id="sls-zone-count"></span></div>
+						<div class="modal-footer"><button type="button" class="btn btn-primary" data-dismiss="modal"><?php echo _('Done'); ?></button></div>
+					</div></div>
+				</div>
+				<script type="text/template" id="sls-zone-template"><div class="sls-zone-editor" data-zone-editor><div class="sls-zone-editor-header"><strong data-zone-title><?php echo _('New Weather Zone'); ?></strong><button type="button" class="btn btn-link btn-sm text-danger" data-zone-remove><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div><input type="hidden" data-zone-field="id" value=""><div class="row"><div class="col-md-7"><div class="form-group"><label><?php echo _('Group Name'); ?></label><input class="form-control" data-zone-field="name" maxlength="64" placeholder="<?php echo htmlspecialchars(_('Williamson County')); ?>"></div></div><div class="col-md-5"><div class="form-group"><label><?php echo _('NWS Zone'); ?></label><input class="form-control" data-zone-field="zone" maxlength="6" placeholder="TXC491"></div></div></div><label><?php echo _('Recipient Extensions'); ?></label><div class="sls-recipient-grid sls-nws-scroll"><div class="row"><?php foreach ((array)($available_extensions ?? []) as $extension) { ?><div class="col-md-4"><div class="checkbox"><label><input type="checkbox" data-zone-extension value="<?php echo htmlspecialchars($extension['extension']); ?>"> <?php echo htmlspecialchars($extension['extension'] . ($extension['name'] !== '' ? ' - ' . $extension['name'] : '')); ?> <span class="text-muted"><?php echo !empty($extension['registered']) ? _('online') : _('offline'); ?></span></label></div></div><?php } ?></div></div></div></script>
+
+				<h3 class="sls-nws-heading"><i class="fa fa-moon-o text-muted" aria-hidden="true"></i> <?php echo _('Quiet Hours'); ?></h3>
 				<p class="help-block sls-nws-section-note"><?php echo _('During quiet hours, only selected critical live NWS alerts are delivered. Manual tests are not affected.'); ?></p>
 				<div class="row">
 					<div class="col-md-3">
@@ -319,50 +306,22 @@ for ($hour = 0; $hour < 24; $hour++) {
 					</div>
 				</div>
 
-				<h3 class="sls-nws-heading"><?php echo _('Email Templates'); ?></h3>
-				<p class="help-block"><?php echo sprintf(_('Placeholders supported: %s'), htmlspecialchars($placeholderHelp)); ?></p>
-				<div class="row">
-					<div class="col-md-6">
-						<div class="form-group">
-							<label for="alert_email_subject"><?php echo _('Live Alert Subject'); ?></label>
-							<input class="form-control" id="alert_email_subject" name="alert_email_subject" type="text" value="<?php echo htmlspecialchars($settings['alert_email_subject']); ?>">
-						</div>
-						<div class="form-group">
-							<label for="alert_email_body"><?php echo _('Live Alert Body'); ?></label>
-							<textarea class="form-control" id="alert_email_body" name="alert_email_body" rows="10"><?php echo htmlspecialchars($settings['alert_email_body']); ?></textarea>
-						</div>
-					</div>
-					<div class="col-md-6">
-						<div class="form-group">
-							<label for="test_email_subject"><?php echo _('Test Subject'); ?></label>
-							<input class="form-control" id="test_email_subject" name="test_email_subject" type="text" value="<?php echo htmlspecialchars($settings['test_email_subject']); ?>">
-						</div>
-						<div class="form-group">
-							<label for="test_email_body"><?php echo _('Test Body'); ?></label>
-							<textarea class="form-control" id="test_email_body" name="test_email_body" rows="10"><?php echo htmlspecialchars($settings['test_email_body']); ?></textarea>
-						</div>
-					</div>
-				</div>
-
-				<h3 class="sls-nws-heading"><?php echo _('NWS Audio and Piper TTS'); ?></h3>
-				<p class="help-block">
-					<?php echo _('Live weather audio now uses a short opening tone, a generated Piper TTS summary from the NWS alert payload, and a short closing tone. Generated speech defaults to 30 seconds and can be capped at up to 600 seconds.'); ?>
-					<code>/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sounds</code>
-				</p>
+				<div class="panel panel-default sls-settings-card"><div class="panel-heading"><strong><i class="fa fa-volume-up text-success" aria-hidden="true"></i> <?php echo _('Weather Alert Audio'); ?></strong><div class="text-muted"><small><?php echo _('Choose the opening and closing sounds around the concise weather summary.'); ?></small></div></div><div class="panel-body">
 				<div class="row">
 					<div class="col-md-5">
 						<div class="form-group">
-							<label for="opening_tone"><?php echo _('Opening Tone'); ?></label>
-							<select class="form-control" id="opening_tone" name="opening_tone">
+							<label for="nws_opening_tone"><?php echo _('Opening Tone'); ?></label>
+							<select class="form-control" id="nws_opening_tone" name="nws_opening_tone">
+								<option value="" <?php echo ($settings['nws_opening_tone'] ?? '') === '' ? 'selected' : ''; ?>><?php echo _('None'); ?></option>
 								<optgroup label="<?php echo htmlspecialchars(_('Mass Notify tones')); ?>">
 								<?php foreach ((array)($available_tones ?? []) as $toneName) {
 									if (strpos($toneName, 'opening_') !== 0) continue;
 									$displayName = str_replace('_', ' ', substr($toneName, strlen('opening_')));
-									if ($toneName === 'opening_Paging_Tone_Opening') {
-										$displayName .= ' *';
+									if ($toneName === 'opening_NWS_alert') {
+										$displayName = 'NWS alert (' . _('default; bundled as NWS_alert.wav') . ')';
 									}
 								?>
-									<option value="<?php echo htmlspecialchars($toneName); ?>" <?php echo ($settings['opening_tone'] ?? 'opening_Paging_Tone_Opening') === $toneName ? 'selected' : ''; ?>>
+									<option value="<?php echo htmlspecialchars($toneName); ?>" <?php echo ($settings['nws_opening_tone'] ?? 'opening_NWS_alert') === $toneName ? 'selected' : ''; ?>>
 										<?php echo htmlspecialchars($displayName); ?>
 									</option>
 								<?php } ?>
@@ -376,17 +335,15 @@ for ($hour = 0; $hour < 24; $hour++) {
 					</div>
 					<div class="col-md-5">
 						<div class="form-group">
-							<label for="closing_tone"><?php echo _('Closing Tone'); ?></label>
-							<select class="form-control" id="closing_tone" name="closing_tone">
+							<label for="nws_closing_tone"><?php echo _('Closing Tone'); ?></label>
+							<select class="form-control" id="nws_closing_tone" name="nws_closing_tone">
+								<option value="" <?php echo ($settings['nws_closing_tone'] ?? '') === '' ? 'selected' : ''; ?>><?php echo _('None'); ?></option>
 								<optgroup label="<?php echo htmlspecialchars(_('Mass Notify tones')); ?>">
 								<?php foreach ((array)($available_tones ?? []) as $toneName) {
 									if (strpos($toneName, 'closing_') !== 0) continue;
 									$displayName = str_replace('_', ' ', substr($toneName, strlen('closing_')));
-									if ($toneName === 'closing_Paging_Tone_Closing') {
-										$displayName .= ' *';
-									}
 								?>
-									<option value="<?php echo htmlspecialchars($toneName); ?>" <?php echo ($settings['closing_tone'] ?? 'closing_Paging_Tone_Closing') === $toneName ? 'selected' : ''; ?>>
+									<option value="<?php echo htmlspecialchars($toneName); ?>" <?php echo ($settings['nws_closing_tone'] ?? '') === $toneName ? 'selected' : ''; ?>>
 										<?php echo htmlspecialchars($displayName); ?>
 									</option>
 								<?php } ?>
@@ -399,46 +356,61 @@ for ($hour = 0; $hour < 24; $hour++) {
 						</div>
 					</div>
 				</div>
-				<div class="well">
-					<strong><?php echo _('Piper Voice'); ?></strong>
-					<div style="margin-top: 8px;"><code><?php echo htmlspecialchars($settings['piper_voice'] ?? '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices/en_US-lessac-low.onnx'); ?></code></div>
-					<div class="text-muted"><?php echo sprintf(_('Maximum spoken summary: %s seconds'), (int)($settings['tts_max_seconds'] ?? 30)); ?></div>
-				</div>
-
-				<h3 class="sls-nws-heading"><?php echo _('Preview'); ?></h3>
-				<p class="help-block"><?php echo _('Preview shows representative generated output only. It does not send SIP NOTIFY, desktop notifications, email, Discord, or audio.'); ?></p>
 				<div class="row">
-					<div class="col-md-6">
-						<label><?php echo _('Example TTS Summary'); ?></label>
-						<pre><?php echo htmlspecialchars(sprintf('Weather alert for %s. Tornado Watch. Conditions are favorable for tornadoes. Monitor official sources and be ready to shelter if warnings are issued.', $settings['nws_zone'] ?: 'your configured zone')); ?></pre>
-					</div>
-					<div class="col-md-6">
-						<label><?php echo _('Example Desktop Payload'); ?></label>
-						<pre><?php echo htmlspecialchars(json_encode([
-							'kind' => 'alert',
-							'event' => 'Tornado Watch',
-							'priority' => 'urgent',
-							'zone' => $settings['nws_zone'] ?? '',
-							'description' => 'Representative NWS alert summary.',
-						], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)); ?></pre>
-					</div>
+					<div class="col-md-6"><div class="form-group"><label for="nws_piper_voice"><?php echo _('Weather TTS Voice'); ?></label><select class="form-control" id="nws_piper_voice" name="nws_piper_voice"><?php foreach ($voices as $voice) { ?><option value="<?php echo htmlspecialchars($voice['path']); ?>" <?php echo (($settings['nws_piper_voice'] ?? '') === $voice['path']) ? 'selected' : ''; ?>><?php echo htmlspecialchars($voice['name'] . (basename($voice['path']) === 'en_US-amy-low.onnx' ? ' (' . _('default') . ')' : '')); ?></option><?php } ?></select><p class="help-block"><?php echo _('Amy is the default Weather Alert voice.'); ?></p></div></div>
+					<div class="col-md-3"><div class="form-group"><label for="nws_tts_volume"><?php echo _('Weather Volume'); ?></label><div class="input-group"><input class="form-control" id="nws_tts_volume" name="nws_tts_volume" type="number" min="1" max="200" value="<?php echo (int)($settings['nws_tts_volume'] ?? 25); ?>"><span class="input-group-addon">%</span></div><p class="help-block"><?php echo _('Default 25%.'); ?></p></div></div>
+					<div class="col-md-3"><div class="form-group"><label for="nws_tts_max_seconds"><?php echo _('Maximum Summary'); ?></label><div class="input-group"><input class="form-control" id="nws_tts_max_seconds" name="tts_max_seconds" type="number" min="1" max="600" value="<?php echo (int)($settings['tts_max_seconds'] ?? 30); ?>"><span class="input-group-addon"><?php echo _('sec'); ?></span></div></div></div>
 				</div>
-				<div class="row">
-					<div class="col-md-6">
-						<label><?php echo _('Example Phone XML'); ?></label>
-						<pre><?php echo htmlspecialchars("<YealinkIPPhoneTextScreen Beep='yes' Timeout='0'>\n  <Title>NWS ALERT</Title>\n  <Text>Tornado Watch for " . ($settings['nws_zone'] ?: 'configured zone') . "</Text>\n</YealinkIPPhoneTextScreen>"); ?></pre>
-					</div>
-					<div class="col-md-6">
-						<label><?php echo _('Example Email Subject'); ?></label>
-						<pre><?php echo htmlspecialchars(str_replace('{{event}}', 'Tornado Watch', (string)($settings['alert_email_subject'] ?? 'NWS alert triggered - {{event}}'))); ?></pre>
-						<p class="help-block"><?php echo _('Emails use the PBX server mail transport/Postfix configuration.'); ?></p>
-					</div>
-				</div>
+				</div></div>
 
-				<div style="margin-top: 20px;">
+				<div class="sls-sticky-actions">
 					<button type="submit" class="btn btn-primary"><?php echo _('Save Configuration'); ?></button>
 				</div>
 			</form>
 		</div>
 	</div>
 </div>
+<script>
+(function() {
+	var list = document.getElementById('sls-zone-editor-list');
+	var add = document.getElementById('sls-zone-add');
+	var template = document.getElementById('sls-zone-template');
+	var count = document.getElementById('sls-zone-count');
+	if (!list || !add || !template) return;
+	function editors() { return Array.prototype.slice.call(list.querySelectorAll('[data-zone-editor]')); }
+	function reindex() {
+		var rows = editors();
+		rows.forEach(function(row, index) {
+			['id','name','zone'].forEach(function(field) {
+				var input = row.querySelector('[data-zone-field="' + field + '"]');
+				if (input) input.name = 'nws_zones[' + index + '][' + field + ']';
+			});
+			Array.prototype.forEach.call(row.querySelectorAll('[data-zone-extension]'), function(input) { input.name = 'nws_zones[' + index + '][extensions][]'; });
+			var title = row.querySelector('[data-zone-title]');
+			var name = row.querySelector('[data-zone-field="name"]');
+			if (title) title.textContent = name && name.value.trim() ? name.value.trim() : 'Weather Zone ' + (index + 1);
+		});
+		add.disabled = rows.length >= 5;
+		if (count) count.textContent = rows.length + ' / 5 groups';
+	}
+	list.addEventListener('click', function(event) {
+		var remove = event.target.closest ? event.target.closest('[data-zone-remove]') : null;
+		if (!remove) return;
+		var row = remove.closest('[data-zone-editor]');
+		if (row) row.parentNode.removeChild(row);
+		reindex();
+	});
+	list.addEventListener('input', function(event) { if (event.target.matches('[data-zone-field="name"]')) reindex(); });
+	add.addEventListener('click', function() {
+		if (editors().length >= 5) return;
+		var shell = document.createElement('div');
+		shell.innerHTML = template.textContent || template.innerHTML;
+		var row = shell.firstElementChild;
+		if (row) list.appendChild(row);
+		reindex();
+		var first = row && row.querySelector('[data-zone-field="name"]');
+		if (first) first.focus();
+	});
+	reindex();
+}());
+</script>

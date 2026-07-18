@@ -14,10 +14,7 @@ If an endpoint is unknown or detected incorrectly, set a manual mapping in:
 
     Mass Notify > General Settings > Phone Format Overrides
 
-Use one mapping per line:
-
-    1190=cisco
-    1000=yealink
+Use the popup to enter a numeric extension and select a supported family. The Yealink choices are **Yealink - Color** (`yealink`) and **Yealink - Text Only** (`yealink_text`). Unknown/Safe Fallback is not a manual choice; unknown registered endpoints are flagged automatically in diagnostics.
 
 Multiple contacts on one extension
 ----------------------------------
@@ -35,11 +32,12 @@ Implemented format families
 - Fanvil: Cisco-compatible text XML. Fanvil documentation states X-series phones support Cisco, Yealink, and Voismart XML text/menu/directory/execute families.
 - Grandstream: GXP XML Application `xmlapp` payload with a mandatory `view` section.
 - Mitel/Aastra: `AastraIPPhoneTextScreen` payload.
+- Panasonic KX: Panasonic `ppxml` screen payload with `Event: xml` and `Content-Type: text/xml`. Detection covers Panasonic and KX-HDV/KX-UT/KX-TGP/KX-UDS/KX-UDT User-Agents. Panasonic’s documented push behavior remains model-, firmware-, and provisioning-dependent, so validate it on the actual handset.
 
 Provisioning-dependent and experimental families
 ------------------------------------------------
 
-Poly/Polycom push, Grandstream XML applications, Snom, Mitel/Aastra, Fanvil, Sangoma, Avaya, VTech, ALE, and Generic behavior depends heavily on model-specific provisioning. Sangoma, Avaya, VTech, ALE, Unknown, and Generic endpoints currently receive a conservative `MassNotification` XML body. Treat every family as experimental until it is verified on the actual phone model and firmware in use.
+Poly/Polycom push, Grandstream XML applications, Snom, Mitel/Aastra, Fanvil, Panasonic, Sangoma, Avaya, VTech, and ALE behavior depends heavily on model-specific provisioning. Sangoma, Avaya, VTech, ALE, and automatically detected Unknown endpoints currently receive a conservative `MassNotification` XML body. Treat every family as experimental until it is verified on the actual phone model and firmware in use.
 
 Hardware testing requirement
 ----------------------------

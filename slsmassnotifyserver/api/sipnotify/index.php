@@ -243,7 +243,7 @@ function retained_events(array $settings): array
 }
 
 $endpoint = endpoint_slug();
-if ($endpoint !== 'desktop') {
+if (!in_array($endpoint, ['desktop', 'desktop/stream'], true)) {
     respond(404, ['ok' => false, 'error' => 'unknown_endpoint']);
 }
 $remoteIp = (string)($_SERVER['REMOTE_ADDR'] ?? '');
@@ -268,6 +268,89 @@ if (empty($client)) {
 
 update_desktop_seen($client);
 $username = (string)$client['username'];
+$streamRequested = $endpoint === 'desktop/stream'
+    || (string)($_GET['stream'] ?? '') === '1'
+    || stripos(request_header_value('Accept'), 'text/event-stream') !== false;
+
+if ($streamRequested) {
+    @set_time_limit(0);
+	ignore_user_abort(false);
+	@ini_set('zlib.output_compression', '0');
+	@ini_set('output_buffering', '0');
+	if (function_exists('apache_setenv')) {
+		@apache_setenv('no-gzip', '1');
+	}
+	ob_implicit_flush(true);
+    header('Content-Type: text/event-stream; charset=utf-8');
+    header('Cache-Control: no-cache, no-store, must-revalidate');
+    header('Connection: keep-alive');
+    header('X-Accel-Buffering: no');
+    while (ob_get_level() > 0) {
+        @ob_end_flush();
+    }
+    $lastEventId = trim(request_header_value('Last-Event-ID'));
+    if ($lastEventId === '') {
+        $lastEventId = trim((string)($_GET['last_event_id'] ?? ''));
+    }
+	$sessionId = bin2hex(random_bytes(16));
+    echo "retry: 1000\n";
+    echo "event: authenticated\n";
+    echo 'data: ' . json_encode(['ok' => true, 'transport' => 'live_sse', 'session_id' => $sessionId, 'client_id' => (string)($client['client_id'] ?? ''), 'name' => (string)($client['name'] ?? ''), 'heartbeat_seconds' => 15, 'connected_at' => gmdate('c')], JSON_UNESCAPED_SLASHES) . "\n\n";
+	// A valid SSE comment fills Apache's initial output bucket so the
+	// authenticated handshake above reaches the desktop immediately.
+	echo ':' . str_repeat(' ', 8192) . "\n";
+    @flush();
+    $started = time();
+	$streamSeconds = min(300, max(1, (int)($_GET['stream_seconds'] ?? 300)));
+    $lastKeepalive = 0;
+    while (!connection_aborted() && time() - $started < $streamSeconds) {
+		$visibleEvents = [];
+        foreach (retained_events($settings) as $event) {
+            if (!array_key_exists('desktop_all', $event) && !array_key_exists('desktop_recipients', $event)) {
+                continue;
+            }
+            $recipients = is_array($event['desktop_recipients'] ?? null) ? $event['desktop_recipients'] : [];
+            if (empty($event['desktop_all']) && !in_array($username, $recipients, true)) {
+                continue;
+            }
+			$eventId = trim((string)($event['id'] ?? $event['event_id'] ?? ''));
+			if ($eventId !== '') {
+				$visibleEvents[] = [$eventId, $event];
+			}
+		}
+		if ($lastEventId === '' && !empty($visibleEvents)) {
+			$lastEventId = (string)$visibleEvents[count($visibleEvents) - 1][0];
+		} elseif ($lastEventId !== '') {
+			$lastIndex = -1;
+			foreach ($visibleEvents as $index => $visibleEvent) {
+				if (hash_equals($lastEventId, (string)$visibleEvent[0])) {
+					$lastIndex = (int)$index;
+				}
+			}
+			if ($lastIndex >= 0) {
+				foreach (array_slice($visibleEvents, $lastIndex + 1) as $visibleEvent) {
+					[$eventId, $event] = $visibleEvent;
+					echo 'id: ' . str_replace(["\r", "\n"], '', $eventId) . "\n";
+					echo "event: notification\n";
+					echo 'data: ' . json_encode($event, JSON_UNESCAPED_SLASHES) . "\n\n";
+					$lastEventId = (string)$eventId;
+				}
+			} elseif (!empty($visibleEvents)) {
+				$lastEventId = (string)$visibleEvents[count($visibleEvents) - 1][0];
+			}
+        }
+        if (time() - $lastKeepalive >= 15) {
+            echo ': keepalive ' . time() . "\n\n";
+            $lastKeepalive = time();
+        }
+        @flush();
+        usleep(500000);
+    }
+    echo 'event: reconnect' . "\n" . 'data: ' . json_encode(['ok' => true, 'session_id' => $sessionId], JSON_UNESCAPED_SLASHES) . "\n\n";
+    @flush();
+    exit;
+}
+
 $limit = min(MAX_LIMIT, max(1, (int)($_GET['limit'] ?? DEFAULT_LIMIT)));
 $events = [];
 foreach (retained_events($settings) as $event) {

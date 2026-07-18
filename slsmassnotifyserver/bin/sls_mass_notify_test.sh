@@ -9,18 +9,20 @@ SLS_TONE_SOUND_PREFIX="SLS_Mass_Notifications_Plugin/tones"
 SLS_TTS_SOUND_PREFIX="SLS_Mass_Notifications_Plugin/tts"
 SLS_TONES_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sounds/tones"
 SLS_TTS_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sounds/tts"
-SLS_OPENING_TONE="opening_Paging_Tone_Opening"
-SLS_CLOSING_TONE="closing_Paging_Tone_Closing"
+SLS_OPENING_TONE="opening_NWS_alert"
+SLS_CLOSING_TONE=""
 PIPER_BIN="/usr/local/bin/sls_mass_notify/piper/venv/bin/piper"
 PIPER_VOICE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices/en_US-lessac-low.onnx"
 PIPER_NWS_VOICE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices/en_US-lessac-low.onnx"
-PIPER_NWS_VOLUME="0.85"
+PIPER_NWS_VOLUME="0.25"
 PIPER_MAX_SECONDS="30"
 LOG="${LOG:-/var/log/sls_mass_notify.log}"
 EVENTS_LOG="${EVENTS_LOG:-/var/log/sls_mass_notify_events.jsonl}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-90}"
 CONFIG_JSON_FILE="${CONFIG_JSON_FILE:-${CONFIG_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config}}"
 CONFIG_LOADER="${CONFIG_LOADER:-/usr/local/bin/sls_mass_notify/sls_config.py}"
+BRANDED_EMAIL_SCRIPT="${BRANDED_EMAIL_SCRIPT:-/usr/local/bin/sls_mass_notify/sls_branded_email.py}"
+BRANDED_DISCORD_SCRIPT="${BRANDED_DISCORD_SCRIPT:-/usr/local/bin/sls_mass_notify/sls_branded_discord.py}"
 COOLDOWN_FILE="${COOLDOWN_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/test-cooldown.ts}"
 STATUS_FILE="${STATUS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/status.json}"
 FAULT_STATE_FILE="${FAULT_STATE_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/fault.state}"
@@ -30,6 +32,7 @@ MAIL_TO=""
 DISCORD_WEBHOOK_URL=""
 MAIL_FROM_NAME="SLS Mass Notification System"
 MAIL_FROM_ADDR="no-reply@localhost"
+EMAIL_HTML_ENABLED="1"
 SENDMAIL_BIN="/usr/sbin/sendmail"
 SOURCE_EXTENSION=""
 SOURCE_NAME="SLS Mass Notification System"
@@ -290,7 +293,7 @@ generate_test_tts_audio() {
   fi
 
   if command -v sox >/dev/null 2>&1; then
-    if ! sox -v "${PIPER_NWS_VOLUME:-0.85}" "$tmp_file" -r 8000 -c 1 -b 16 "$output_file" >> "$LOG" 2>&1; then
+    if ! sox -v "${PIPER_NWS_VOLUME:-0.25}" "$tmp_file" -r 8000 -c 1 -b 16 "$output_file" >> "$LOG" 2>&1; then
       rm -f "$tmp_file" "$output_file"
       echo "$(date): ERROR — Unable to convert manual test Piper TTS WAV" >> "$LOG"
       return 1
@@ -364,7 +367,7 @@ build_audio_sequence() {
 
 prune_tts_cache() {
   if [ -d "$SLS_TTS_DIR" ]; then
-    find "$SLS_TTS_DIR" -maxdepth 1 -type f -name '*.wav' -mtime +7 -delete 2>/dev/null || true
+    find "$SLS_TTS_DIR" -maxdepth 1 -type f -name '*.wav' -mmin +15 -delete 2>/dev/null || true
   fi
 }
 
@@ -477,7 +480,7 @@ load_central_config() {
   while IFS= read -r -d '' key && IFS= read -r -d '' value; do
     case "$key" in
       NWS_ALERT_RECIPIENT) NWS_ALERT_RECIPIENTS+=("$value") ;;
-      NWS_ALERTS_ENABLED|PUBLIC_PBX_HOST|NWS_API_BASE_URL|NWS_ZONE|SLS_OPENING_TONE|SLS_CLOSING_TONE|PIPER_BIN|PIPER_NWS_VOICE|PIPER_ANNOUNCEMENT_VOICE|PIPER_NWS_VOLUME|PIPER_ANNOUNCEMENT_VOLUME|PIPER_MAX_SECONDS|LOG_RETENTION_DAYS|MAIL_TO|DISCORD_WEBHOOK_URL|QUIET_HOURS_ENABLED|QUIET_HOURS_START|QUIET_HOURS_END|MAIL_FROM_NAME|MAIL_FROM_ADDR|ALERT_EMAIL_SUBJECT|ALERT_EMAIL_BODY|TEST_EMAIL_SUBJECT|TEST_EMAIL_BODY|AMI_USERNAME|AMI_PASSWORD|GITHUB_UPDATES_ENABLED|GITHUB_UPDATES_REPOSITORY|GITHUB_UPDATES_CHANNEL)
+      NWS_ALERTS_ENABLED|PUBLIC_PBX_HOST|NWS_API_BASE_URL|NWS_ZONE|SLS_OPENING_TONE|SLS_CLOSING_TONE|PIPER_BIN|PIPER_NWS_VOICE|PIPER_ANNOUNCEMENT_VOICE|PIPER_NWS_VOLUME|PIPER_ANNOUNCEMENT_VOLUME|PIPER_MAX_SECONDS|LOG_RETENTION_DAYS|MAIL_TO|DISCORD_WEBHOOK_URL|QUIET_HOURS_ENABLED|QUIET_HOURS_START|QUIET_HOURS_END|MAIL_FROM_NAME|MAIL_FROM_ADDR|ALERT_EMAIL_SUBJECT|ALERT_EMAIL_BODY|TEST_EMAIL_SUBJECT|TEST_EMAIL_BODY|EMAIL_HTML_ENABLED|AMI_USERNAME|AMI_PASSWORD|GITHUB_UPDATES_ENABLED|GITHUB_UPDATES_REPOSITORY|GITHUB_UPDATES_CHANNEL)
         printf -v "$key" '%s' "$value"
         ;;
     esac
@@ -490,7 +493,13 @@ load_central_config() {
 if ! load_central_config; then
   update_status "$(printf '{"last_test_at":%s,"last_test_status":"fault","last_test_message":"Central configuration is invalid or unavailable."}' \
     "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$(timestamp_now)")")"
-  exit 1
+	exit 1
+fi
+if [ -n "${NWS_ZONE_OVERRIDE:-}" ]; then
+  NWS_ZONE="$NWS_ZONE_OVERRIDE"
+fi
+if [ -n "${NWS_RECIPIENTS_OVERRIDE:-}" ]; then
+  IFS=',' read -r -a NWS_ALERT_RECIPIENTS <<< "$NWS_RECIPIENTS_OVERRIDE"
 fi
 prune_event_log
 DELIVERY_TARGETS="$(get_nws_recipient_targets)"
@@ -531,28 +540,18 @@ send_notification_email() {
   local body="$2"
 
   subject="$(printf '%s' "$subject" | tr '\r\n' '  ')"
-  MAIL_FROM_NAME="$(printf '%s' "$MAIL_FROM_NAME" | tr '\r\n' '  ')"
-  MAIL_FROM_ADDR="$(printf '%s' "$MAIL_FROM_ADDR" | tr -d '\r\n')"
-
   if [ -z "$(printf '%s' "$MAIL_TO" | tr -d '[:space:]')" ]; then
     echo "$(date): Notification email skipped — no recipients configured" >> "$LOG"
     return 0
   fi
 
-  if [ ! -x "$SENDMAIL_BIN" ]; then
-    echo "$(date): ERROR — sendmail not found at $SENDMAIL_BIN" >> "$LOG"
+  if [ ! -x "$BRANDED_EMAIL_SCRIPT" ]; then
+    echo "$(date): ERROR — branded email sender is unavailable" >> "$LOG"
     return 1
   fi
 
-  {
-    printf 'From: "%s" <%s>\n' "$MAIL_FROM_NAME" "$MAIL_FROM_ADDR"
-    printf 'To: "Undisclosed Recipients" <%s>\n' "$MAIL_FROM_ADDR"
-    printf 'Bcc: %s\n' "$(printf '%s' "$MAIL_TO" | sed 's/ /, /g')"
-    printf 'Subject: %s\n' "$subject"
-    printf 'Content-Type: text/plain; charset=UTF-8\n'
-    printf '\n'
-    printf '%s\n' "$body"
-  } | "$SENDMAIL_BIN" -t -f "$MAIL_FROM_ADDR"
+  SLS_EMAIL_SUBJECT="$subject" SLS_EMAIL_BODY="$body" SLS_EMAIL_RECIPIENTS="$MAIL_TO" \
+    /usr/bin/python3 "$BRANDED_EMAIL_SCRIPT" "$CONFIG_JSON_FILE"
 }
 
 send_discord_alert() {
@@ -575,6 +574,24 @@ send_discord_alert() {
     echo "$(date): Discord notification skipped — no webhook configured" >> "$LOG"
     return 0
   fi
+
+  if [ ! -x "$BRANDED_DISCORD_SCRIPT" ]; then
+    echo "$(date): ERROR — branded Discord sender is unavailable" >> "$LOG"
+    return 1
+  fi
+
+  SLS_DISCORD_SUBJECT="$subject" \
+  SLS_DISCORD_BODY="$body" \
+  SLS_DISCORD_TYPE="$alert_type" \
+  SLS_DISCORD_EVENT="$event" \
+  SLS_DISCORD_SEVERITY="$severity" \
+  SLS_DISCORD_ZONE="$zone" \
+  SLS_DISCORD_RECIPIENTS="$DELIVERY_TARGETS" \
+  SLS_DISCORD_AUDIO="$audio" \
+  SLS_DISCORD_TRIGGER="${trigger_name:-$trigger_source}" \
+  SLS_DISCORD_TIME="$event_time" \
+    /usr/bin/python3 "$BRANDED_DISCORD_SCRIPT" "$CONFIG_JSON_FILE"
+  return $?
 
   DISCORD_WEBHOOK_URL="$DISCORD_WEBHOOK_URL" \
   DISCORD_SUBJECT="$subject" \

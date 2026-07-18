@@ -160,11 +160,16 @@ function control_rate_allowed(array $control, string $ip): bool
 
 function audit_control_api(string $ip, string $action, int $status, bool $ok): void
 {
+    $normalizedAction = preg_replace('/[^a-z0-9_.-]+/i', '_', $action) ?: 'unknown';
+    if (in_array($ip, ['127.0.0.1', '::1'], true) && $ok && $status === 200 && in_array($normalizedAction, ['get_config', 'get_status'], true)) {
+        // Successful PBX self-checks are health probes, not administrator API use.
+        return;
+    }
     $record = [
         'created_at' => gmdate('c'),
         'ip' => $ip,
         'method' => (string)($_SERVER['REQUEST_METHOD'] ?? ''),
-        'action' => preg_replace('/[^a-z0-9_.-]+/i', '_', $action) ?: 'unknown',
+        'action' => $normalizedAction,
         'status' => $status,
         'ok' => $ok,
     ];
