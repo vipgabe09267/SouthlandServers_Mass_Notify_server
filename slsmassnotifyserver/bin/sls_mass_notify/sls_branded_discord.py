@@ -47,7 +47,7 @@ def public_logo_url(config):
     host = host.strip().strip("/")
     if not HOST_PATTERN.fullmatch(host) or host.lower() in {"localhost", "pbx"}:
         return ""
-    return f"https://{host}/sls_mass_notify/assets/SLS_Mass_Notif_Email.png?v=007b"
+    return f"https://{host}/sls_mass_notify/assets/SLS_Mass_Notif_Email.png?v=008b"
 
 
 def compact_description(body, subject):
@@ -67,6 +67,10 @@ def build_payload(config, subject, body, event="", severity="", fields=None, tim
             embed_fields.append({"name": str(name)[:256], "value": value[:320], "inline": len(value) <= 42})
         if len(embed_fields) >= 6:
             break
+    try:
+        normalized_timestamp = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00")).astimezone(timezone.utc).isoformat()
+    except (TypeError, ValueError):
+        normalized_timestamp = datetime.now(timezone.utc).isoformat()
     embed = {
         "author": {"name": "Southland Servers Group • SLS Mass Notification System"},
         "title": f"{icon} {str(subject).strip()}"[:256],
@@ -74,7 +78,7 @@ def build_payload(config, subject, body, event="", severity="", fields=None, tim
         "color": color,
         "fields": embed_fields,
         "footer": {"text": f"{urgency} • SLS Mass Notification System"[:2048]},
-        "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
+        "timestamp": normalized_timestamp,
     }
     if logo_url:
         embed["author"]["icon_url"] = logo_url
@@ -93,7 +97,7 @@ def send_branded_discord(config, subject, body, event="", severity="", fields=No
     request = urllib.request.Request(
         webhook,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json", "User-Agent": "SouthlandServers-Mass-Notifications-Server/0.0.7-beta"},
+        headers={"Content-Type": "application/json", "User-Agent": "SouthlandServers-Mass-Notifications-Server/0.0.8-beta"},
         method="POST",
     )
     try:

@@ -16,6 +16,9 @@ $packageStatus = is_array($package_update_status ?? null) ? $package_update_stat
 $hasPackageUpdate = (($packageStatus['state'] ?? '') === 'update');
 $updateProgress = is_array($update_progress ?? null) ? $update_progress : ['state' => 'idle', 'message' => ''];
 $updateMonitorActive = !empty($update_monitor_active) || in_array(($updateProgress['state'] ?? 'idle'), ['queued', 'checking', 'installing'], true);
+$maintenanceProgress = is_array($maintenance_progress ?? null) ? $maintenance_progress : ['action' => '', 'state' => 'idle', 'message' => ''];
+$maintenanceMonitorAction = in_array(($maintenance_monitor_action ?? ''), ['repair', 'uninstall', 'config'], true) ? (string)$maintenance_monitor_action : '';
+$maintenanceMonitorActive = $maintenanceMonitorAction !== '';
 $packageStatusClass = (($packageStatus['state'] ?? '') === 'update') ? 'label-warning' : 'label-success';
 $formatOverrides = [];
 $formatLabels = [
@@ -130,6 +133,9 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 .sls-danger-action form { margin-top:auto; }
 .sls-danger-action .form-group { margin-bottom:12px; }
 .sls-danger-action--critical { border-color:#f0a8a1; background:#fff5f5; }
+.sls-maintenance-progress { margin:0 0 16px; display:flex; align-items:center; gap:8px; }
+.sls-maintenance-progress[hidden] { display:none; }
+.sls-maintenance-form .btn[disabled] { cursor:wait; }
 @media (max-width:991px) { .sls-danger-grid { grid-template-columns:1fr; } }
 @media(max-width:767px){.sls-editor-row,#sls-format-editor-list .sls-editor-row{display:block}.sls-editor-row>*{margin-bottom:8px}.sls-manager-modal .modal-dialog{width:auto}#sls-format-editor-list .sls-editor-row [data-remove-format]{margin-top:4px !important}}
 </style>
@@ -443,30 +449,44 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 			<div class="panel panel-danger sls-danger-panel">
 				<div class="panel-heading"><i class="fa fa-exclamation-triangle" aria-hidden="true"></i> <?php echo _('Danger Zone'); ?></div>
 				<div class="panel-body">
+					<div id="sls-maintenance-progress"
+						class="alert alert-info sls-maintenance-progress"
+						role="status"
+						aria-live="polite"
+						data-active="<?php echo $maintenanceMonitorActive ? '1' : '0'; ?>"
+						data-action="<?php echo htmlspecialchars($maintenanceMonitorAction); ?>"
+						data-status-url="config.php?display=slsmassnotifyserver_other&amp;sls_maintenance_status=1"
+						<?php echo $maintenanceMonitorActive ? '' : 'hidden'; ?>>
+						<i class="fa <?php echo (($maintenanceProgress['state'] ?? '') === 'complete') ? 'fa-check-circle' : 'fa-spinner fa-spin'; ?>" aria-hidden="true"></i>
+						<span><?php echo htmlspecialchars((string)($maintenanceProgress['message'] ?? _('Preparing maintenance status...'))); ?></span>
+					</div>
 					<div class="sls-danger-grid">
 						<section class="sls-danger-action">
 							<h4><i class="fa fa-wrench text-warning" aria-hidden="true"></i> <?php echo _('Installer Health'); ?></h4>
 							<p><?php echo _('Repair Installation refreshes runtime files, permissions, Apache API routes, cron, dialplan, dashboard widget files, and local signatures. It does not replace your central .config, but it may reload FreePBX and Asterisk dialplan.'); ?></p>
-							<form method="post" onsubmit="return confirm(<?php echo htmlspecialchars(json_encode(_('Are you sure you want to repair/reinstall the Mass Notifications integration now? This may reload FreePBX and Asterisk dialplan. Your central .config will not be replaced.')), ENT_QUOTES, 'UTF-8'); ?>);">
+							<form method="post" class="sls-maintenance-form" data-maintenance-action="repair" data-confirm="<?php echo htmlspecialchars(_('Are you sure you want to repair/reinstall the Mass Notifications integration now? This may reload FreePBX and Asterisk dialplan. Your central .config will not be replaced.'), ENT_QUOTES, 'UTF-8'); ?>">
 								<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
-								<button type="submit" class="btn btn-warning" name="slsmassnotifyserver_action" value="repair_installation"><?php echo _('Repair Installation'); ?></button>
+								<input type="hidden" name="slsmassnotifyserver_action" value="repair_installation">
+								<button type="submit" class="btn btn-warning"><?php echo _('Repair Installation'); ?></button>
 							</form>
 						</section>
 						<section class="sls-danger-action sls-danger-action--critical">
 							<h4><i class="fa fa-trash text-danger" aria-hidden="true"></i> <?php echo _('Completely Uninstall'); ?></h4>
 							<p><strong><?php echo _('Warning:'); ?></strong> <?php echo _('This removes the module, runtime services, APIs, logs, desktop clients, credentials, tones, backups, and central configuration. This cannot be undone.'); ?></p>
-							<form method="post" onsubmit="return confirm(<?php echo htmlspecialchars(json_encode(_('Are you sure you want to completely uninstall this module? All Mass Notifications configuration and data will be permanently deleted.')), ENT_QUOTES, 'UTF-8'); ?>);">
+							<form method="post" class="sls-maintenance-form" data-maintenance-action="uninstall" data-confirm="<?php echo htmlspecialchars(_('Are you sure you want to completely uninstall this module? All Mass Notifications configuration and data will be permanently deleted.'), ENT_QUOTES, 'UTF-8'); ?>">
 								<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
-								<button type="submit" class="btn btn-danger" name="slsmassnotifyserver_action" value="complete_uninstall"><i class="fa fa-trash" aria-hidden="true"></i> <?php echo _('Completely Uninstall'); ?></button>
+								<input type="hidden" name="slsmassnotifyserver_action" value="complete_uninstall">
+								<button type="submit" class="btn btn-danger"><i class="fa fa-trash" aria-hidden="true"></i> <?php echo _('Completely Uninstall'); ?></button>
 							</form>
 						</section>
 						<section class="sls-danger-action sls-danger-action--critical">
 							<h4><i class="fa fa-upload text-danger" aria-hidden="true"></i> <?php echo _('Replace Configuration'); ?></h4>
 							<p><?php echo _('Replacing the config file wipes the current plugin data and overwrites API keys, desktop clients, voices, announcement groups, NWS settings, and retention settings.'); ?></p>
-							<form method="post" enctype="multipart/form-data" onsubmit="return confirm(<?php echo htmlspecialchars(json_encode(_('Replace the Mass Notifications config? This requires Apply Config to become live.')), ENT_QUOTES, 'UTF-8'); ?>);">
+							<form method="post" enctype="multipart/form-data" class="sls-maintenance-form" data-maintenance-action="config" data-confirm="<?php echo htmlspecialchars(_('Replace the Mass Notifications config? This requires Apply Config to become live.'), ENT_QUOTES, 'UTF-8'); ?>">
 								<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
-								<div class="form-group"><label><?php echo _('Upload .config'); ?></label><input type="file" name="config_upload" accept=".config,application/json"></div>
-								<button type="submit" class="btn btn-danger" name="slsmassnotifyserver_action" value="import_config"><?php echo _('Replace Config'); ?></button>
+								<input type="hidden" name="slsmassnotifyserver_action" value="import_config">
+								<div class="form-group"><label><?php echo _('Upload .config'); ?></label><input type="file" name="config_upload" accept=".config,application/json" required></div>
+								<button type="submit" class="btn btn-danger"><?php echo _('Replace Config'); ?></button>
 							</form>
 						</section>
 					</div>
@@ -522,6 +542,100 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 				});
 		}
 		window.setTimeout(pollUpdateStatus, 500);
+	}
+	var maintenanceProgress = document.getElementById('sls-maintenance-progress');
+	var maintenanceForms = document.querySelectorAll('.sls-maintenance-form');
+	Array.prototype.forEach.call(maintenanceForms, function(form) {
+		form.addEventListener('submit', function(event) {
+			if (form.getAttribute('data-submitting') === '1') {
+				return;
+			}
+			var promptText = form.getAttribute('data-confirm') || '';
+			if (promptText && !window.confirm(promptText)) {
+				event.preventDefault();
+				return;
+			}
+			form.setAttribute('data-submitting', '1');
+			Array.prototype.forEach.call(form.querySelectorAll('button'), function(control) {
+				control.disabled = true;
+			});
+			if (maintenanceProgress) {
+				var action = form.getAttribute('data-maintenance-action') || '';
+				var labels = {
+					repair: 'Submitting installation repair request...',
+					uninstall: 'Submitting complete uninstall request...',
+					config: 'Uploading and validating replacement configuration...'
+				};
+				maintenanceProgress.hidden = false;
+				maintenanceProgress.className = 'alert alert-info sls-maintenance-progress';
+				maintenanceProgress.setAttribute('data-action', action);
+				var icon = maintenanceProgress.querySelector('i');
+				var text = maintenanceProgress.querySelector('span');
+				if (icon) icon.className = 'fa fa-spinner fa-spin';
+				if (text) text.textContent = labels[action] || 'Submitting maintenance request...';
+			}
+		});
+	});
+	if (maintenanceProgress && maintenanceProgress.getAttribute('data-active') === '1') {
+		var maintenancePolls = 0;
+		var maintenanceFailures = 0;
+		var maintenanceStatusUrl = maintenanceProgress.getAttribute('data-status-url');
+		var expectedAction = maintenanceProgress.getAttribute('data-action');
+		var maintenanceIcon = maintenanceProgress.querySelector('i');
+		var maintenanceText = maintenanceProgress.querySelector('span');
+		function cleanMaintenanceUrl() {
+			var cleanUrl = new URL(window.location.href);
+			cleanUrl.searchParams.delete('sls_maintenance_action');
+			window.history.replaceState({}, document.title, cleanUrl.toString());
+		}
+		function finishMaintenanceDisplay(state, message) {
+			maintenanceProgress.hidden = false;
+			maintenanceProgress.className = state === 'complete' ? 'alert alert-success sls-maintenance-progress' : 'alert alert-danger sls-maintenance-progress';
+			maintenanceIcon.className = state === 'complete' ? 'fa fa-check-circle' : 'fa fa-times-circle';
+			maintenanceText.textContent = message || (state === 'complete' ? 'Maintenance completed.' : 'Maintenance failed.');
+			cleanMaintenanceUrl();
+			if (state === 'complete' && expectedAction === 'repair') {
+				window.setTimeout(function() { window.location.reload(); }, 1800);
+			}
+		}
+		function pollMaintenanceStatus() {
+			maintenancePolls += 1;
+			fetch(maintenanceStatusUrl, { credentials: 'same-origin', cache: 'no-store', headers: { 'Accept': 'application/json' } })
+				.then(function(response) { if (!response.ok) throw new Error('status request failed'); return response.json(); })
+				.then(function(data) {
+					maintenanceFailures = 0;
+					var action = String(data.action || expectedAction || '');
+					var state = String(data.state || 'running');
+					var message = String(data.message || 'Maintenance is running...');
+					if (expectedAction && action && expectedAction !== action) {
+						window.setTimeout(pollMaintenanceStatus, 1500);
+						return;
+					}
+					if (state === 'complete' || state === 'failed') {
+						finishMaintenanceDisplay(state, message);
+						return;
+					}
+					maintenanceProgress.hidden = false;
+					maintenanceProgress.className = 'alert alert-info sls-maintenance-progress';
+					maintenanceIcon.className = 'fa fa-spinner fa-spin';
+					maintenanceText.textContent = message;
+					window.setTimeout(pollMaintenanceStatus, 1500);
+				})
+				.catch(function() {
+					maintenanceFailures += 1;
+					if (expectedAction === 'uninstall' && maintenanceFailures >= 3) {
+						finishMaintenanceDisplay('complete', 'The module interface is no longer available. Complete uninstall has likely finished; verify in Module Admin.');
+						return;
+					}
+					if (maintenancePolls >= 400) {
+						finishMaintenanceDisplay('failed', 'Maintenance status could not be confirmed. Review Notification Logs before retrying.');
+						return;
+					}
+					maintenanceText.textContent = 'Maintenance is running; waiting for the PBX interface to respond...';
+					window.setTimeout(pollMaintenanceStatus, 2500);
+				});
+		}
+		window.setTimeout(pollMaintenanceStatus, expectedAction === 'config' ? 200 : 500);
 	}
 	document.addEventListener('click', function(event) {
 		var button = event.target.closest('[data-toggle-secret]');

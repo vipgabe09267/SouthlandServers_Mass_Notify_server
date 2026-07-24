@@ -28,6 +28,9 @@ STATUS_FILE="${STATUS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/stat
 FAULT_STATE_FILE="${FAULT_STATE_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/fault.state}"
 COOLDOWN_SECONDS=60
 SPOOL="${SPOOL:-/var/spool/asterisk/outgoing}"
+SPOOL_TMP="${SPOOL_TMP:-/var/spool/asterisk/tmp}"
+SPOOL_DONE="${SPOOL_DONE:-/var/spool/asterisk/outgoing_done}"
+TEST_CALL_RESULTS=()
 MAIL_TO=""
 DISCORD_WEBHOOK_URL=""
 MAIL_FROM_NAME="SLS Mass Notification System"
@@ -429,7 +432,7 @@ queue_test_audio_to_recipients() {
   for recipient in "${NWS_ALERT_RECIPIENTS[@]}"; do
     recipient="$(printf '%s' "$recipient" | tr -dc '0-9')"
     [ -n "$recipient" ] || continue
-    callfile=$(mktemp /tmp/sls_test_XXXXXX.call)
+    callfile=$(mktemp "$SPOOL_TMP/sls_test_XXXXXX.call")
     cat > "$callfile" << CALL
 Channel: Local/${recipient}@${SLS_AUDIO_CONTEXT}
 CallerID: "${SLS_CALLERID_NAME}" <${SLS_CALLERID_NUM}>
@@ -438,7 +441,8 @@ Setvar: SLS_CALLERID_NAME=${SLS_CALLERID_NAME}
 Setvar: SLS_CALLERID_NUM=${SLS_CALLERID_NUM}
 MaxRetries: 0
 RetryTime: 5
-WaitTime: 180
+WaitTime: 30
+Archive: yes
 Application: Wait
 Data: 1
 CALL
@@ -449,6 +453,7 @@ CALL
       rm -f "$callfile" 2>/dev/null || true
       continue
     fi
+    TEST_CALL_RESULTS+=("$SPOOL_DONE/$(basename "$callfile")")
     queued=$((queued + 1))
   done
 
@@ -459,6 +464,39 @@ CALL
 
   echo "$(date): Test call files queued to $queued recipient(s) — $sound_sequence" >> "$LOG"
   return 0
+}
+
+wait_for_test_call_results() {
+  local deadline=$((SECONDS + 45))
+  local result_file
+  local pending
+  local status
+  local failed=0
+
+  [ "${#TEST_CALL_RESULTS[@]}" -gt 0 ] || return 1
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    pending=0
+    for result_file in "${TEST_CALL_RESULTS[@]}"; do
+      [ -f "$result_file" ] || pending=$((pending + 1))
+    done
+    [ "$pending" -eq 0 ] && break
+    sleep 1
+  done
+
+  for result_file in "${TEST_CALL_RESULTS[@]}"; do
+    if [ ! -f "$result_file" ]; then
+      echo "$(date): ERROR — Timed out waiting for Asterisk test call result $(basename "$result_file")" >> "$LOG"
+      failed=1
+      continue
+    fi
+    status="$(awk -F: 'tolower($1) == "status" {sub(/^[[:space:]]+/, "", $2); print $2; exit}' "$result_file")"
+    if [ "$status" != "Completed" ]; then
+      echo "$(date): ERROR — Asterisk test call $(basename "$result_file") completed with status ${status:-Unknown}" >> "$LOG"
+      failed=1
+    fi
+    rm -f "$result_file" 2>/dev/null || true
+  done
+  [ "$failed" -eq 0 ]
 }
 
 load_central_config() {
@@ -695,6 +733,9 @@ fi
 if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
   echo "$(date): Dry run — would queue test call files using $AUDIO_SEQUENCE to recipients: ${NWS_ALERT_RECIPIENTS[*]}" >> "$LOG"
 else
+  mkdir -p "$SPOOL_DONE"
+  chown asterisk:asterisk "$SPOOL_DONE" 2>/dev/null || true
+  chmod 0750 "$SPOOL_DONE" 2>/dev/null || true
   if ! queue_test_audio_to_recipients "$AUDIO_SEQUENCE"; then
     exit 1
   fi
@@ -709,12 +750,17 @@ else
     report_fault "visual" "Manual NWS test SIP NOTIFY delivery failed"
     exit 1
   fi
+  if ! wait_for_test_call_results; then
+    report_fault "delivery" "One or more manual NWS test calls did not complete"
+    echo "ERROR: One or more Asterisk test calls did not complete. Confirm endpoint registration, DND, and phone auto-answer policy."
+    exit 1
+  fi
 fi
 
-echo "$(date): Test audio queued — $AUDIO_SEQUENCE" >> "$LOG"
+echo "$(date): Test audio and SIP NOTIFY delivery checks completed — $AUDIO_SEQUENCE" >> "$LOG"
 DELIVERY_TS="$(timestamp_now)"
-TEST_DELIVERY_STATUS="queued"
-TEST_DELIVERY_MESSAGE="Queued manual Piper TTS test"
+TEST_DELIVERY_STATUS="completed"
+TEST_DELIVERY_MESSAGE="Asterisk completed manual Piper TTS test calls and accepted SIP NOTIFY delivery"
 if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
   TEST_DELIVERY_STATUS="dry_run"
   TEST_DELIVERY_MESSAGE="Dry run completed for manual Piper TTS test"
@@ -765,20 +811,6 @@ if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
   append_event_log "$MAIL_SUBJECT" "$MAIL_BODY" "$AUDIO_SEQUENCE"
   echo "Dry run complete. No phones were notified."
 else
-  AUX_DELIVERY_OK=1
-  if ! send_notification_email "$MAIL_SUBJECT" "$MAIL_BODY"; then
-    echo "$(date): ERROR - Test email failed" >> "$LOG"
-    report_fault "email" "Manual test email failed"
-    AUX_DELIVERY_OK=0
-  fi
-  if ! send_discord_alert "$MAIL_SUBJECT" "$MAIL_BODY" "Manual Test" "Manual NWS Test" "Test" "Test" "Piper TTS" "" "" "$CURRENT_TIME" "FreePBX Dashboard" "$TRIGGER_EXTENSION" "$TRIGGER_NAME" "$AUDIO_SEQUENCE"; then
-    echo "$(date): ERROR - Test Discord webhook failed" >> "$LOG"
-    report_fault "discord" "Manual test Discord webhook failed"
-    AUX_DELIVERY_OK=0
-  fi
   append_event_log "$MAIL_SUBJECT" "$MAIL_BODY" "$AUDIO_SEQUENCE"
-  if [ "$AUX_DELIVERY_OK" = "1" ]; then
-    clear_fault_state
-  fi
-  echo "Done! Check your phones."
+  echo "Weather test delivered to ${#NWS_ALERT_RECIPIENTS[@]} configured recipient(s). Email and Discord were not sent."
 fi

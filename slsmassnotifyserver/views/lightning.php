@@ -70,10 +70,12 @@ for ($hour = 0; $hour < 24; $hour++) { $hourOptions[] = sprintf('%02d:00', $hour
 				<strong><?php echo _('Spoken message preview'); ?></strong><br>
 				<span id="sls-lightning-preview-text"><?php echo htmlspecialchars(sprintf(_('TEST ONLY. This is a simulated alert. Lightning has been detected within %d miles of %s. No actual lightning event is being reported.'), $radius, $location)); ?></span>
 			</div>
-			<p class="help-block"><?php echo _('The test is clearly labeled as simulated in phone, audio, desktop, email, and Discord delivery. A 60-second cooldown prevents repeated test sends.'); ?></p>
-			<form method="post" action="config.php?display=slsmassnotifyserver_lightning" onsubmit="return confirm('<?php echo htmlspecialchars(_('Send a live lightning test to the configured recipients?'), ENT_QUOTES); ?>');">
+			<p class="help-block"><?php echo _('The test is clearly labeled as simulated in phone, audio, and desktop delivery. It does not send email or Discord. A 60-second cooldown prevents repeated test sends.'); ?></p>
+			<div id="sls-lightning-test-result" style="display:none" role="status" aria-live="polite"></div>
+			<form id="sls-lightning-test-form" method="post" action="config.php?display=slsmassnotifyserver_lightning">
 				<input type="hidden" name="slsmassnotifyserver_action" value="test_lightning">
 				<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
+				<input type="hidden" name="ajax" value="1">
 				<button class="btn btn-warning" id="sls-lightning-test-submit" type="submit" <?php echo $cooldownRemaining > 0 ? 'disabled' : ''; ?>><i class="fa fa-bolt"></i> <?php echo _('Send Lightning Test'); ?></button>
 				<span class="text-muted" id="sls-lightning-test-cooldown" data-remaining="<?php echo $cooldownRemaining; ?>" style="margin-left:10px"><?php echo $cooldownRemaining > 0 ? sprintf(_('Available again in %d seconds'), $cooldownRemaining) : ''; ?></span>
 			</form>
@@ -164,8 +166,9 @@ for ($hour = 0; $hour < 24; $hour++) { $hourOptions[] = sprintf('%02d:00', $hour
 	if(adaptive)adaptive.addEventListener('change',updatePollWarning);
 	var secret=document.getElementById('sls-xweather-client-secret'); var secretToggle=document.getElementById('sls-xweather-secret-toggle');
 	if(secret&&secretToggle){secretToggle.addEventListener('click',function(){var reveal=secret.type==='password';secret.type=reveal?'text':'password';var icon=secretToggle.querySelector('i');if(icon)icon.className=reveal?'fa fa-eye-slash':'fa fa-eye';});}
-	var testButton=document.getElementById('sls-lightning-test-submit'); var cooldown=document.getElementById('sls-lightning-test-cooldown'); var remaining=cooldown?parseInt(cooldown.getAttribute('data-remaining')||'0',10)||0:0;
+	var testForm=document.getElementById('sls-lightning-test-form'); var testButton=document.getElementById('sls-lightning-test-submit'); var testResult=document.getElementById('sls-lightning-test-result'); var cooldown=document.getElementById('sls-lightning-test-cooldown'); var remaining=cooldown?parseInt(cooldown.getAttribute('data-remaining')||'0',10)||0:0;
 	function renderCooldown(){if(!testButton||!cooldown)return;if(remaining>0){testButton.disabled=true;cooldown.textContent='Available again in '+remaining+' seconds';}else{testButton.disabled=false;cooldown.textContent='';}}
 	renderCooldown(); setInterval(function(){if(remaining>0){remaining-=1;renderCooldown();}},1000);
+	if(testForm&&testButton&&testResult){testForm.addEventListener('submit',function(event){event.preventDefault();if(remaining>0||!window.confirm(<?php echo json_encode(_('Send a live lightning test to the configured recipients?')); ?>))return;testButton.disabled=true;testResult.style.display='block';testResult.className='alert alert-info';testResult.innerHTML='<i class="fa fa-spinner fa-spin" aria-hidden="true"></i> Running phone and audio delivery checks...';fetch(testForm.action,{method:'POST',credentials:'same-origin',body:new FormData(testForm)}).then(function(response){return response.json();}).then(function(data){var ok=!!(data&&data.success);var message=data&&data.message?String(data.message):'Lightning test request finished.';var errors=data&&Array.isArray(data.errors)?data.errors.filter(Boolean):[];testResult.className='alert alert-'+(ok?'success':'danger');testResult.textContent=message+(errors.length?' '+errors.join(' '):'');if(data&&data.cooldown)remaining=parseInt(data.cooldown.remaining||'0',10)||0;if(!ok)window.alert('Lightning test error\n\n'+message+(errors.length?'\n\n'+errors.join('\n'):''));renderCooldown();}).catch(function(){testResult.className='alert alert-danger';testResult.textContent='Lightning test request failed before delivery could be confirmed.';window.alert('Lightning test error\n\nThe PBX did not return a confirmed delivery result. Review Notification Logs.');renderCooldown();});});}
 }());
 </script>

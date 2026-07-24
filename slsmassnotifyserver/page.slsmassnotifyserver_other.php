@@ -15,6 +15,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['sls_update_status'] ?? '') =
 	exit;
 }
 
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['sls_maintenance_status'] ?? '') === '1') {
+	header('Content-Type: application/json; charset=utf-8');
+	header('Cache-Control: no-store, max-age=0');
+	echo json_encode($slsmassnotifyserver->getMaintenanceProgress(), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+	exit;
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$slsmassnotifyserver->validateCsrfToken($_POST['slsmassnotifyserver_csrf'] ?? '')) {
 	$_SESSION['slsmassnotifyserver_other_save_result'] = [
 		'success' => false,
@@ -42,12 +49,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 		echo $slsmassnotifyserver->exportConfig();
 		exit;
 	} elseif ($action === 'import_config') {
-		$_SESSION['slsmassnotifyserver_other_import_result'] = $slsmassnotifyserver->importConfigUpload($_FILES['config_upload'] ?? []);
-		header('Location: config.php?display=slsmassnotifyserver_other');
+		$importResult = $slsmassnotifyserver->importConfigUpload($_FILES['config_upload'] ?? []);
+		$_SESSION['slsmassnotifyserver_other_import_result'] = $importResult;
+		header('Location: config.php?display=slsmassnotifyserver_other' . (!empty($importResult['success']) ? '&sls_maintenance_action=config' : ''));
 		exit;
 	} elseif ($action === 'repair_installation') {
-		$_SESSION['slsmassnotifyserver_other_save_result'] = $slsmassnotifyserver->repairInstallation();
-		header('Location: config.php?display=slsmassnotifyserver_other');
+		$repairResult = $slsmassnotifyserver->repairInstallation();
+		$_SESSION['slsmassnotifyserver_other_save_result'] = $repairResult;
+		header('Location: config.php?display=slsmassnotifyserver_other' . (!empty($repairResult['success']) ? '&sls_maintenance_action=repair' : ''));
 		exit;
 	} elseif ($action === 'manual_update') {
 		$updateResult = $slsmassnotifyserver->requestManualUpdate();
@@ -55,8 +64,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 		header('Location: config.php?display=slsmassnotifyserver_other' . (!empty($updateResult['success']) ? '&sls_update_queued=1' : ''));
 		exit;
 	} elseif ($action === 'complete_uninstall') {
-		$_SESSION['slsmassnotifyserver_other_save_result'] = $slsmassnotifyserver->requestCompleteUninstall();
-		header('Location: config.php?display=slsmassnotifyserver_other');
+		$uninstallResult = $slsmassnotifyserver->requestCompleteUninstall();
+		$_SESSION['slsmassnotifyserver_other_save_result'] = $uninstallResult;
+		header('Location: config.php?display=slsmassnotifyserver_other' . (!empty($uninstallResult['success']) ? '&sls_maintenance_action=uninstall' : ''));
 		exit;
 	} elseif ($action === 'apply_settings') {
 		$_SESSION['slsmassnotifyserver_other_apply_result'] = $slsmassnotifyserver->applySettings();
@@ -72,4 +82,6 @@ echo $slsmassnotifyserver->showPage('other_settings', [
 	'import_result' => $importResult,
 	'update_monitor_active' => ($_GET['sls_update_queued'] ?? '') === '1',
 	'update_progress' => $slsmassnotifyserver->getManualUpdateProgress(),
+	'maintenance_monitor_action' => in_array(($_GET['sls_maintenance_action'] ?? ''), ['repair', 'uninstall', 'config'], true) ? (string)$_GET['sls_maintenance_action'] : '',
+	'maintenance_progress' => $slsmassnotifyserver->getMaintenanceProgress(),
 ]);

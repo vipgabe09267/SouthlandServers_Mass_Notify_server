@@ -4,7 +4,9 @@
 
 - FreePBX 17
 - Asterisk with PJSIP endpoints
-- Apache/PHP as provided by FreePBX
+- FreePBX Framework, Dashboard, and System Recordings modules. The release installer installs a missing dependency or enables an installed disabled dependency; it does not silently upgrade an already installed core module.
+- Active Apache and cron services, with Apache rewrite and authorization-header support
+- PHP OpenSSL support for encrypted desktop-client credentials
 - Python 3
 - Piper TTS runtime. The installer creates the root-owned `/usr/local/bin/sls_mass_notify/piper/venv`, exposes it at the compatibility path `/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/venv`, installs pinned packaging tools plus `piper-tts`, and downloads checksum-verified voices to the plugin data folder.
 - `sox` for audio conversion and normalization
@@ -19,7 +21,7 @@ cd /tmp
 curl -fsSL -o sls-install.sh \
   https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/main/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.0.7-beta/slsmassnotifyserver-0.0.7-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.0.8-beta/slsmassnotifyserver-0.0.8-beta.tgz' \
 ./sls-install.sh
 ```
 
@@ -39,8 +41,19 @@ The module install hook prepares the local PBX integration by applying managed c
 - enforces `0640 asterisk:asterisk` on the protected central configuration after FreePBX ownership operations without changing its contents
 - creates the Asterisk-owned one-minute weather scheduler for U.S. weather.gov zone groups; free-tier adaptive Lightning polling uses one selected zone as its storm gate and queries Xweather every five minutes only while that gate or its grace period is active
 - installs bundled regular paging opening/closing tones, `NWS_alert.wav`, and `Lightning_alert.mp3` into FreePBX System Recordings and managed Asterisk audio
-- verifies the real AMI contact-discovery action, Asterisk spool access, sound links, default audio formats, and exact paging dialplan before reporting success
-- calls the local signing helper if one exists on the deployment
+- verifies the real AMI contact-discovery and `PJSIPNotify` actions, matches registered numeric phones between the Asterisk CLI and AMI, checks spool access, sound links, WAV support, default audio formats, and the exact paging dialplan before reporting success
+- verifies all Asterisk functions and applications used by the paging dialplan before module activation. An installed but unloaded provider is loaded and rechecked, including `res_pjsip_header_funcs.so` for `PJSIP_HEADER`; a genuinely absent provider stops with its exact module path before any module replacement
+- stages and syntax-checks the complete module before activation, retains a recoverable copy of the previous module during upgrades, removes partial integration before rollback, restores the prior module and protected configuration after a failed install, and retries a repaired loopback AMI integration before returning an error
+- compares every managed runtime, API, public asset, signer, and Dashboard file with its packaged source; stale managed files are removed without touching the central configuration or Piper models
+- verifies all six Piper model/metadata hashes and performs a real synthesis with Amy, Lessac, and Ryan
+- renders a phone image as the `asterisk` account in the real public media directory and retrieves the exact file through Apache
+- completes an authenticated desktop live-SSE handshake without printing or storing the client password outside protected memory
+- verifies an authenticated Control API status request when the Control API is enabled and loopback is allowed; disabled or deliberately loopback-blocked APIs remain valid configurations
+- uses portable endpoint fan-out for same-format phone registrations. Mixed formats on one extension require a complete contact URI for every phone and a usable Asterisk default outbound endpoint; unsafe cross-vendor endpoint fallback is rejected
+- accepts an authenticated Asterisk 22 `No Contacts found` AMI response as an authorized empty inventory on PBXs where no phones are currently registered, without accepting authentication or permission failures
+- restores the packaged local signer as an exact root-owned executable, discovers the FreePBX web account, module root, and GPG home from that PBX, repairs ownership on the selected keyring before importing trust, and requires exact trusted status 129 for every touched module
+- serializes install, update, repair, and uninstall work with the root maintenance lock. A child installer launched by the maintenance worker reuses the inherited lock instead of deadlocking, while direct CLI operations wait for an active maintenance transaction to finish
+- performs one final signing pass after reload. A candidate `module.sig` is published only after FreePBX verifies it; a failed verification restores the previous signature
 
 ## First-Run Setup
 
@@ -124,7 +137,7 @@ Fresh installation generates random Control API, desktop encryption, desktop cli
 
 ## Uninstall
 
-The default uninstall preserves the central config, config backups, and uploaded tones. It removes the plugin-owned FreePBX Manager record and verifies that Apache/Asterisk artifacts are not regenerated and that Dashboard and Framework remain trusted. When FreePBX repository access is unavailable, it locally signs the cleaned stock modules, deletes the private key, retains only the public verification key, and prints the command that can later replace the fallback with vendor copies. Set `SLS_MASS_NOTIFY_PURGE_CONFIG=1` only when those deployment files should also be removed.
+The default uninstall preserves the central config, config backups, and uploaded tones. It removes the plugin-owned FreePBX Manager record and verifies that Apache/Asterisk artifacts are not regenerated and that Dashboard and Framework remain trusted. Before the module hook removes the normal signer copies, the current uninstaller saves a protected temporary copy for the stock-module cleanup transaction. When FreePBX repository access is unavailable, that copy signs and verifies the cleaned modules and is deleted before exit; older releases use the compatibility fallback. Set `SLS_MASS_NOTIFY_PURGE_CONFIG=1` only when those deployment files should also be removed.
 
 ```bash
 cd /tmp

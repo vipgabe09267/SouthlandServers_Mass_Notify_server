@@ -36,6 +36,42 @@ for path in pathlib.Path(sys.argv[1]).rglob("*.py"):
     ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 PY
 
+python3 "${ROOT_DIR}/tools/test_release_portability.py"
+bash "${ROOT_DIR}/tools/test_installer_asterisk_capabilities.sh"
+bash "${ROOT_DIR}/tools/test_local_signer.sh"
+bash "${ROOT_DIR}/tools/test_uninstaller_signer_snapshot.sh"
+
+cmp -s "${ROOT_DIR}/tools/uninstall_release.sh" "${ROOT_DIR}/${MODULE}/bin/sls_mass_notify_uninstall.sh" || {
+  printf 'Standalone and packaged uninstallers differ.\n' >&2
+  exit 1
+}
+
+python3 - "${ROOT_DIR}/tools/uninstall_release.sh" "${ROOT_DIR}/${MODULE}/bin/sls_mass_notify_uninstall.sh" <<'PY'
+import pathlib
+import re
+import subprocess
+import sys
+
+for filename in sys.argv[1:]:
+    source = pathlib.Path(filename).read_text(encoding="utf-8")
+    blocks = re.findall(r"<<'PHP'\n(.*?)\nPHP\n", source, flags=re.DOTALL)
+    if not blocks:
+        raise SystemExit(f"no embedded PHP blocks found in {filename}")
+    for index, block in enumerate(blocks, start=1):
+        result = subprocess.run(
+            ["php", "-l"],
+            input=block,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise SystemExit(
+                f"invalid embedded PHP block {index} in {filename}: "
+                + (result.stderr or result.stdout).strip()
+            )
+PY
+
 php -r '$xml = simplexml_load_file($argv[1]); if (!$xml || trim((string)$xml->rawname) !== $argv[2] || trim((string)$xml->version) !== $argv[3]) exit(1);' \
   "${ROOT_DIR}/${MODULE}/module.xml" "$MODULE" "$VERSION"
 

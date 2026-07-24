@@ -9,6 +9,7 @@ export PATH
 REQUEST_FILE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/repair.request"
 UPDATE_REQUEST_FILE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/update.request"
 UPDATE_PROGRESS_FILE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/update-progress.json"
+MAINTENANCE_PROGRESS_FILE="/run/asterisk/sls-mass-notify-maintenance-progress.json"
 CONFIG_FILE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config"
 UNINSTALL_REQUEST_FILE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/uninstall.request"
 RUNTIME_DIR="/usr/local/bin/sls_mass_notify"
@@ -52,6 +53,37 @@ os.replace(temporary, path)
 PY
 }
 
+write_maintenance_progress() {
+  local action="$1"
+  local state="$2"
+  local message="$3"
+  MAINTENANCE_PROGRESS_FILE="$MAINTENANCE_PROGRESS_FILE" MAINTENANCE_ACTION="$action" MAINTENANCE_STATE="$state" MAINTENANCE_MESSAGE="$message" /usr/bin/python3 - <<'PY'
+import json
+import os
+import pwd
+import tempfile
+from datetime import datetime, timezone
+
+path = os.environ["MAINTENANCE_PROGRESS_FILE"]
+directory = os.path.dirname(path)
+os.makedirs(directory, mode=0o755, exist_ok=True)
+payload = {
+    "action": os.environ["MAINTENANCE_ACTION"],
+    "state": os.environ["MAINTENANCE_STATE"],
+    "message": os.environ["MAINTENANCE_MESSAGE"][:300],
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+}
+fd, temporary = tempfile.mkstemp(prefix=".maintenance-progress.", dir=directory)
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, separators=(",", ":"))
+    handle.write("\n")
+os.chmod(temporary, 0o640)
+account = pwd.getpwnam("asterisk")
+os.chown(temporary, account.pw_uid, account.pw_gid)
+os.replace(temporary, path)
+PY
+}
+
 secure_central_config() {
   [ -e "$CONFIG_FILE" ] || return 0
   if [ -L "$CONFIG_FILE" ] || [ ! -f "$CONFIG_FILE" ]; then
@@ -63,9 +95,10 @@ secure_central_config() {
 }
 
 [ "${EUID:-$(id -u)}" -eq 0 ] || exit 1
-exec 9>"$LOCK_FILE"
+MAINTENANCE_LOCK_FD=""
+exec {MAINTENANCE_LOCK_FD}>"$LOCK_FILE"
 chmod 0600 "$LOCK_FILE"
-flock -n 9 || exit 0
+flock -n "$MAINTENANCE_LOCK_FD" || exit 0
 secure_central_config
 
 # Generated speech and composite audio are short-lived delivery artifacts.
@@ -87,7 +120,7 @@ if [ -r "$MENU_FILE" ] && ! grep -Fq 'SLS Mass Notifications menu placement:' "$
 fi
 if [ "$integration_drift" -eq 1 ]; then
   log "FreePBX update drift detected; restoring Mass Notify dashboard/menu integration"
-  if php -r 'require "/etc/freepbx.conf"; \FreePBX::Create()->Slsmassnotifyserver->repairUpdateSensitiveIntegration(); exit(0);' >> "$LOG_FILE" 2>&1; then
+  if SLS_MASS_NOTIFY_DEFER_SIGNING=1 php -r 'require "/etc/freepbx.conf"; \FreePBX::Create()->Slsmassnotifyserver->repairUpdateSensitiveIntegration(); exit(0);' >> "$LOG_FILE" 2>&1; then
     /usr/sbin/fwconsole chown >> "$LOG_FILE" 2>&1 || true
     secure_central_config
     for module in dashboard framework; do
@@ -122,7 +155,13 @@ safe_request() {
 if safe_request "$UNINSTALL_REQUEST_FILE" "uninstall"; then
   rm -f "$UNINSTALL_REQUEST_FILE"
   log "Starting queued complete uninstall"
-  SLS_MASS_NOTIFY_PURGE_CONFIG=1 "$RUNTIME_DIR/sls_mass_notify_uninstall.sh" >> "$LOG_FILE" 2>&1 || log "Queued complete uninstall reported an error"
+  write_maintenance_progress "uninstall" "running" "Removing Mass Notify runtime, FreePBX integration, APIs, logs, and protected configuration."
+  if SLS_MASS_NOTIFY_PURGE_CONFIG=1 "$RUNTIME_DIR/sls_mass_notify_uninstall.sh" >> "$LOG_FILE" 2>&1; then
+    rm -f "$MAINTENANCE_PROGRESS_FILE"
+  else
+    log "Queued complete uninstall reported an error"
+    write_maintenance_progress "uninstall" "failed" "Complete uninstall reported an error. Review the PBX console and uninstall log before retrying."
+  fi
   exit 0
 fi
 
@@ -152,21 +191,38 @@ fi
 rm -f "$REQUEST_FILE"
 
 log "Starting queued installation repair"
-php -r 'require "/etc/freepbx.conf"; require_once "/var/www/html/admin/modules/slsmassnotifyserver/Slsmassnotifyserver.class.php"; $class = "\\FreePBX\\modules\\Slsmassnotifyserver"; $obj = new $class(\FreePBX::Create()); $obj->install(); exit(0);' >> "$LOG_FILE" 2>&1
-fwconsole chown >> "$LOG_FILE" 2>&1
-secure_central_config
-
-chown -R root:root "$RUNTIME_DIR"
-find "$RUNTIME_DIR" -type d -exec chmod 0755 {} +
-find "$RUNTIME_DIR" -type f -exec chmod 0644 {} +
-find "$RUNTIME_DIR/piper/venv/bin" -type f -exec chmod 0755 {} + 2>/dev/null || true
-chmod 0755 "$RUNTIME_DIR"/*.sh "$RUNTIME_DIR"/*.py 2>/dev/null || true
-chmod 0755 /usr/local/bin/piper 2>/dev/null || true
-
-for module in slsmassnotifyserver dashboard framework; do
-  [ -d "/var/www/html/admin/modules/$module" ] || continue
-  "$SIGNER" "$module" >> "$LOG_FILE" 2>&1
-done
-fwconsole reload >> "$LOG_FILE" 2>&1
-asterisk -rx "dialplan reload" >> "$LOG_FILE" 2>&1 || true
-log "Queued installation repair completed"
+write_maintenance_progress "repair" "running" "Refreshing runtime files, permissions, dialplan, dashboard integration, and local signatures."
+repair_ok=1
+SLS_MASS_NOTIFY_DEFER_SIGNING=1 php -r 'require "/etc/freepbx.conf"; require_once "/var/www/html/admin/modules/slsmassnotifyserver/Slsmassnotifyserver.class.php"; $class = "\\FreePBX\\modules\\Slsmassnotifyserver"; $obj = new $class(\FreePBX::Create()); $obj->install(); exit(0);' >> "$LOG_FILE" 2>&1 || repair_ok=0
+if [ "$repair_ok" -eq 1 ]; then
+  fwconsole chown >> "$LOG_FILE" 2>&1 || repair_ok=0
+fi
+if [ "$repair_ok" -eq 1 ]; then
+  secure_central_config || repair_ok=0
+fi
+if [ "$repair_ok" -eq 1 ]; then
+  chown -R root:root "$RUNTIME_DIR" || repair_ok=0
+  find "$RUNTIME_DIR" -type d -exec chmod 0755 {} + || repair_ok=0
+  find "$RUNTIME_DIR" -type f -exec chmod 0644 {} + || repair_ok=0
+  find "$RUNTIME_DIR/piper/venv/bin" -type f -exec chmod 0755 {} + 2>/dev/null || true
+  chmod 0755 "$RUNTIME_DIR"/*.sh "$RUNTIME_DIR"/*.py 2>/dev/null || true
+  chmod 0755 /usr/local/bin/piper 2>/dev/null || true
+fi
+if [ "$repair_ok" -eq 1 ]; then
+  fwconsole reload >> "$LOG_FILE" 2>&1 || repair_ok=0
+  asterisk -rx "dialplan reload" >> "$LOG_FILE" 2>&1 || repair_ok=0
+fi
+if [ "$repair_ok" -eq 1 ]; then
+  for module in slsmassnotifyserver dashboard framework; do
+    [ -d "/var/www/html/admin/modules/$module" ] || continue
+    "$SIGNER" "$module" >> "$LOG_FILE" 2>&1 || repair_ok=0
+  done
+fi
+if [ "$repair_ok" -eq 1 ]; then
+  log "Queued installation repair completed"
+  write_maintenance_progress "repair" "complete" "Installation repair completed successfully."
+else
+  log "Queued installation repair failed"
+  write_maintenance_progress "repair" "failed" "Installation repair failed. Review Notification Logs before retrying."
+  exit 1
+fi

@@ -6,7 +6,7 @@ namespace FreePBX\modules;
 #[\AllowDynamicProperties]
 class Slsmassnotifyserver implements \BMO
 {
-	const MODULE_VERSION = '0.0.7-beta';
+	const MODULE_VERSION = '0.0.8-beta';
 	const EVENTS_LOG = '/var/log/sls_mass_notify_events.jsonl';
 	const LEGACY_EVENTS_LOG = '/var/log/nws_weather_alert_events.jsonl';
 	const PLUGIN_DATA_DIR = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin';
@@ -50,6 +50,7 @@ class Slsmassnotifyserver implements \BMO
 	const UPDATE_REQUEST_FILE = self::PLUGIN_DATA_DIR . '/update.request';
 	const UPDATE_PROGRESS_FILE = self::PLUGIN_DATA_DIR . '/update-progress.json';
 	const UNINSTALL_REQUEST_FILE = self::PLUGIN_DATA_DIR . '/uninstall.request';
+	const MAINTENANCE_PROGRESS_FILE = '/run/asterisk/sls-mass-notify-maintenance-progress.json';
 	const TEST_COOLDOWN_SECONDS = 60;
 	const ANNOUNCEMENT_COOLDOWN_SECONDS = 60;
 	const MIN_ANNOUNCEMENT_COOLDOWN_SECONDS = 5;
@@ -93,7 +94,9 @@ class Slsmassnotifyserver implements \BMO
 		$this->ensureDashboardWidget();
 		$this->ensureCronJob();
 		$this->cleanupLegacyRuntimeArtifacts();
-		$this->signLocalModulesIfAvailable();
+		if (getenv('SLS_MASS_NOTIFY_DEFER_SIGNING') !== '1') {
+			$this->signLocalModulesIfAvailable(true);
+		}
 	}
 
 	public function uninstall()
@@ -107,10 +110,12 @@ class Slsmassnotifyserver implements \BMO
 		$this->removeManagedBlock('/etc/asterisk/sip_notify_custom.conf', 'SLS Mass Notifications SIP NOTIFY Templates');
 		$this->removeManagedBlock('/etc/asterisk/extensions_custom.conf', 'SLS Mass Notifications Dialplan');
 		$this->removeManagedBlock('/etc/asterisk/manager_custom.conf', 'SLS Mass Notifications AMI');
+		$this->removeBundledSystemRecordings();
 		$this->runCommand('/usr/sbin/asterisk -rx ' . escapeshellarg('dialplan reload'));
 		$this->runCommand('/usr/sbin/asterisk -rx ' . escapeshellarg('module reload res_pjsip_notify.so'));
 		$this->runCommand('/usr/sbin/asterisk -rx ' . escapeshellarg('manager reload'));
 		$this->repairPostUninstallSignatures();
+		$this->removeRuntimeIntegrationFiles();
 	}
 	public function backup()
 	{
@@ -267,6 +272,8 @@ class Slsmassnotifyserver implements \BMO
 						'package_update_status' => $this->getPackageUpdateStatus(),
 						'update_progress' => $params['update_progress'] ?? $this->getManualUpdateProgress(),
 						'update_monitor_active' => !empty($params['update_monitor_active']),
+						'maintenance_progress' => $params['maintenance_progress'] ?? $this->getMaintenanceProgress(),
+						'maintenance_monitor_action' => (string)($params['maintenance_monitor_action'] ?? ''),
 						'hero_image' => self::HERO_IMAGE,
 						'csrf_token' => $csrfToken,
 				]);
@@ -366,8 +373,20 @@ class Slsmassnotifyserver implements \BMO
 
 		$settings = $this->getActiveSettings();
 		$settings['enabled'] = empty($input['enabled']) ? '0' : '1';
-		// The PBX host is detected during installation/first load and is display-only.
-		$settings['public_pbx_host'] = $this->normalizePbxHost((string)($settings['public_pbx_host'] ?? '')) ?: $this->detectPbxHost();
+		// CLI installation can only see the machine's local hostname. During
+		// first-run setup, prefer the authenticated browser host so generated
+		// Yealink image URLs are reachable from the same network as the admin.
+		$currentPbxHost = $this->normalizePbxHost((string)($settings['public_pbx_host'] ?? ''));
+		$browserPbxHost = $this->normalizePbxHost((string)($_SERVER['HTTP_HOST'] ?? ''));
+		if (!$this->isSetupComplete($settings) && $browserPbxHost !== '' && !in_array($browserPbxHost, ['localhost', '127.0.0.1'], true)) {
+			$currentMailFrom = strtolower(trim((string)($settings['mail_from_addr'] ?? '')));
+			$installerMailFrom = 'no-reply@' . ($currentPbxHost ?: 'localhost');
+			if ($currentMailFrom === '' || in_array($currentMailFrom, ['no-reply@localhost', strtolower($installerMailFrom)], true)) {
+				$settings['mail_from_addr'] = 'no-reply@' . $browserPbxHost;
+			}
+			$currentPbxHost = $browserPbxHost;
+		}
+		$settings['public_pbx_host'] = $currentPbxHost ?: $this->detectPbxHost();
 		if ($settings['enabled'] === '1') {
 			$settings['nws_api_base_url'] = $this->normalizeNwsApiBaseUrl((string)($input['nws_api_base_url'] ?? $settings['nws_api_base_url'] ?? 'https://api.weather.gov')) ?: 'https://api.weather.gov';
 			$settings['nws_zone'] = $this->normalizeNwsZone((string)($input['nws_zone'] ?? ''));
@@ -911,7 +930,9 @@ class Slsmassnotifyserver implements \BMO
 
 	public function importConfigUpload(array $upload)
 	{
+		$this->writeMaintenanceProgress('config', 'running', _('Validating the replacement configuration.'));
 		if (($upload['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+			$this->writeMaintenanceProgress('config', 'failed', _('No valid configuration upload was received.'));
 			return [
 				'success' => false,
 				'message' => _('Upload a Mass Notifications .config file first.'),
@@ -919,6 +940,7 @@ class Slsmassnotifyserver implements \BMO
 			];
 		}
 		if ((int)($upload['size'] ?? 0) <= 0 || (int)($upload['size'] ?? 0) > 1024 * 1024) {
+			$this->writeMaintenanceProgress('config', 'failed', _('The replacement configuration did not pass the size limit.'));
 			return [
 				'success' => false,
 				'message' => _('Config import must be smaller than 1 MB.'),
@@ -927,6 +949,7 @@ class Slsmassnotifyserver implements \BMO
 		}
 		$tmpName = (string)($upload['tmp_name'] ?? '');
 		if ($tmpName === '' || !is_uploaded_file($tmpName)) {
+			$this->writeMaintenanceProgress('config', 'failed', _('The uploaded configuration could not be read safely.'));
 			return [
 				'success' => false,
 				'message' => _('Unable to read uploaded config file.'),
@@ -935,6 +958,7 @@ class Slsmassnotifyserver implements \BMO
 		}
 		$decoded = json_decode((string)file_get_contents($tmpName), true);
 		if (!is_array($decoded)) {
+			$this->writeMaintenanceProgress('config', 'failed', _('The uploaded configuration is not valid JSON.'));
 			return [
 				'success' => false,
 				'message' => _('Uploaded config is not valid JSON.'),
@@ -944,6 +968,7 @@ class Slsmassnotifyserver implements \BMO
 		$settings = is_array($decoded['settings'] ?? null) ? $decoded['settings'] : $decoded;
 		$schemaErrors = $this->validateConfigSchema($settings);
 		if (!empty($schemaErrors)) {
+			$this->writeMaintenanceProgress('config', 'failed', _('The uploaded configuration failed validation.'));
 			return [
 				'success' => false,
 				'message' => _('Uploaded config failed validation.'),
@@ -953,12 +978,14 @@ class Slsmassnotifyserver implements \BMO
 		try {
 			$this->persistPendingSettings($this->normalizeSettings(array_replace($this->getDefaultSettings(), $settings)));
 		} catch (\Throwable $e) {
+			$this->writeMaintenanceProgress('config', 'failed', _('The replacement configuration could not be staged.'));
 			return [
 				'success' => false,
 				'message' => _('Unable to import Mass Notifications config.'),
 				'errors' => [$e->getMessage()],
 			];
 		}
+		$this->writeMaintenanceProgress('config', 'complete', _('Replacement configuration validated and staged. Apply Config to make it live.'));
 		return [
 			'success' => true,
 			'message' => _('Mass Notifications config imported. Apply Config to make it live.'),
@@ -1085,6 +1112,9 @@ class Slsmassnotifyserver implements \BMO
 		}
 
 		$settings = $this->getActiveSettings();
+		if (($settings['enabled'] ?? '0') !== '1') {
+			return ['success' => false, 'message' => _('Enable Weather Alerts before running a delivery test.'), 'errors' => []];
+		}
 		$groups = $this->normalizeNwsZoneGroups($settings['nws_zones'] ?? [], $settings['nws_zone'] ?? '', $settings['alert_recipients'] ?? []);
 		$selectedIds = array_fill_keys(array_filter(array_map(static function ($value) {
 			return preg_replace('/[^A-Za-z0-9_-]/', '', (string)$value);
@@ -1104,27 +1134,33 @@ class Slsmassnotifyserver implements \BMO
 			return ['success' => false, 'message' => _('The selected NWS zones do not have any recipient extensions.')];
 		}
 
-		$cmd = 'NWS_ZONE_OVERRIDE=' . escapeshellarg(implode(',', $zones))
+		$cmd = '/usr/bin/timeout 120 /usr/bin/env NWS_ZONE_OVERRIDE=' . escapeshellarg(implode(',', $zones))
 			. ' NWS_RECIPIENTS_OVERRIDE=' . escapeshellarg(implode(',', array_values($recipients)))
-			. ' ' . escapeshellcmd(self::TEST_SCRIPT)
+			. ' ' . escapeshellarg(self::TEST_SCRIPT)
 			. ' '
 			. escapeshellarg('GUI')
 			. ' '
 			. escapeshellarg($triggerName)
-			. ' > /dev/null 2>&1 &';
+			. ' 2>&1';
 
 		exec($cmd, $output, $exitCode);
 
 		if ($exitCode !== 0) {
+			$detail = $this->sanitizeTestCommandOutput($output);
 			return [
 				'success' => false,
-				'message' => _('The test command could not be started.'),
+				'message' => _('Weather test failed. No success is reported unless audio and SIP NOTIFY delivery both complete.'),
+				'errors' => $detail !== '' ? [$detail] : [_('Review Notification Logs for the delivery stage that failed.')],
 			];
 		}
 
 		return [
 			'success' => true,
-			'message' => _('Piper TTS test started.'),
+			'message' => sprintf(
+				_('Weather test passed Asterisk call completion and SIP NOTIFY submission for %d configured recipient(s). Test email and Discord delivery were skipped.'),
+				count($recipients)
+			),
+			'errors' => [],
 		];
 	}
 
@@ -1196,12 +1232,32 @@ class Slsmassnotifyserver implements \BMO
 			return ['success' => false, 'message' => _('The lightning alert worker is unavailable.')];
 		}
 		$this->setLightningTestCooldown();
-		$command = 'XWEATHER_TEST_EVENT=entry XWEATHER_TEST_TRIGGER_NAME=' . escapeshellarg(substr(trim((string)$triggerName), 0, 80))
-			. ' /usr/bin/python3 /usr/local/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py >/dev/null 2>&1 &';
+		$command = '/usr/bin/timeout 120 /usr/bin/env XWEATHER_TEST_EVENT=entry XWEATHER_TEST_TRIGGER_NAME=' . escapeshellarg(substr(trim((string)$triggerName), 0, 80))
+			. ' /usr/bin/python3 /usr/local/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py 2>&1';
 		exec($command, $output, $exitCode);
 		return $exitCode === 0
-			? ['success' => true, 'message' => _('Lightning system test started using the configured radius, location, tones, TTS, and recipients.')]
-			: ['success' => false, 'message' => _('The lightning system test could not be started.')];
+			? [
+				'success' => true,
+				'message' => sprintf(
+					_('Lightning test passed Asterisk call completion and SIP NOTIFY submission for %d configured recipient(s). Test email and Discord delivery were skipped.'),
+					count($xweather['recipients'])
+				),
+				'errors' => [],
+			]
+			: [
+				'success' => false,
+				'message' => _('Lightning test failed. No success is reported unless audio and SIP NOTIFY delivery both complete.'),
+				'errors' => ($detail = $this->sanitizeTestCommandOutput($output)) !== '' ? [$detail] : [_('Review Notification Logs for the delivery stage that failed.')],
+			];
+	}
+
+	private function sanitizeTestCommandOutput(array $lines)
+	{
+		$text = trim(implode(' ', array_slice($lines, -8)));
+		$text = preg_replace('/\s+/', ' ', $text);
+		$text = preg_replace('#https://discord(?:app)?\.com/api/webhooks/[^\s]+#i', '[redacted Discord webhook]', $text);
+		$text = preg_replace('/(?:password|secret|token|api[_ -]?key)\s*[=:]\s*\S+/i', '$1=[redacted]', $text);
+		return mb_substr(trim((string)$text), 0, 500);
 	}
 
 	public function sendSipNotifyAnnouncement($extensions, $message, $massNotify = true, $ttsAudio = false, $groups = [], array $options = [])
@@ -1969,6 +2025,7 @@ class Slsmassnotifyserver implements \BMO
 				];
 			}
 			$this->setPrivateOwnership(self::REPAIR_REQUEST_FILE);
+			$this->writeMaintenanceProgress('repair', 'queued', _('Repair queued. Waiting for the protected maintenance worker.'));
 			return [
 				'success' => true,
 				'message' => _('Installation repair was queued. The protected maintenance worker will run it within one minute.'),
@@ -1976,16 +2033,18 @@ class Slsmassnotifyserver implements \BMO
 			];
 		}
 		try {
+			$this->writeMaintenanceProgress('repair', 'running', _('Repairing runtime files and FreePBX integration.'));
 			$this->install();
 			$this->runCommand('/usr/sbin/fwconsole reload');
 			$this->runCommand('/usr/sbin/asterisk -rx ' . escapeshellarg('dialplan reload'));
-			$this->signLocalModulesIfAvailable();
+			$this->writeMaintenanceProgress('repair', 'complete', _('Installation repair completed successfully.'));
 			return [
 				'success' => true,
 				'message' => _('Installation repair completed. Runtime files, permissions, dialplan, dashboard widget, cron, and signatures were refreshed.'),
 				'errors' => [],
 			];
 		} catch (\Throwable $e) {
+			$this->writeMaintenanceProgress('repair', 'failed', _('Installation repair failed. Review Notification Logs for details.'));
 			return [
 				'success' => false,
 				'message' => _('Installation repair failed.'),
@@ -2077,10 +2136,85 @@ class Slsmassnotifyserver implements \BMO
 
 	public function requestCompleteUninstall()
 	{
-		return $this->queueMaintenanceAction(
+		$result = $this->queueMaintenanceAction(
 			self::UNINSTALL_REQUEST_FILE,
 			_('Complete uninstall was queued. The module, runtime files, APIs, logs, and central configuration will be removed within one minute.')
 		);
+		if (!empty($result['success'])) {
+			$this->writeMaintenanceProgress('uninstall', 'queued', _('Complete uninstall queued. Waiting for the protected maintenance worker.'));
+		}
+		return $result;
+	}
+
+	public function getMaintenanceProgress()
+	{
+		$progress = [
+			'action' => '',
+			'state' => 'idle',
+			'message' => '',
+			'updated_at' => '',
+		];
+		if (is_readable(self::MAINTENANCE_PROGRESS_FILE)) {
+			$decoded = json_decode((string)file_get_contents(self::MAINTENANCE_PROGRESS_FILE), true);
+			if (is_array($decoded)) {
+				$action = strtolower(trim((string)($decoded['action'] ?? '')));
+				$state = strtolower(trim((string)($decoded['state'] ?? 'idle')));
+				if (in_array($action, ['repair', 'uninstall', 'config'], true)) {
+					$progress['action'] = $action;
+				}
+				if (in_array($state, ['idle', 'queued', 'running', 'complete', 'failed'], true)) {
+					$progress['state'] = $state;
+				}
+				$progress['message'] = mb_substr(trim((string)($decoded['message'] ?? '')), 0, 300);
+				$progress['updated_at'] = trim((string)($decoded['updated_at'] ?? ''));
+			}
+		}
+		if (is_file(self::REPAIR_REQUEST_FILE)) {
+			$progress = array_replace($progress, [
+				'action' => 'repair',
+				'state' => 'queued',
+				'message' => _('Repair queued. Waiting for the protected maintenance worker.'),
+			]);
+		} elseif (is_file(self::UNINSTALL_REQUEST_FILE)) {
+			$progress = array_replace($progress, [
+				'action' => 'uninstall',
+				'state' => 'queued',
+				'message' => _('Complete uninstall queued. Waiting for the protected maintenance worker.'),
+			]);
+		}
+		return $progress;
+	}
+
+	private function writeMaintenanceProgress($action, $state, $message)
+	{
+		if (!in_array($action, ['repair', 'uninstall', 'config'], true)
+			|| !in_array($state, ['idle', 'queued', 'running', 'complete', 'failed'], true)) {
+			return false;
+		}
+		$directory = dirname(self::MAINTENANCE_PROGRESS_FILE);
+		if (!is_dir($directory) || !is_writable($directory)) {
+			return false;
+		}
+		$payload = json_encode([
+			'action' => $action,
+			'state' => $state,
+			'message' => mb_substr(trim((string)$message), 0, 300),
+			'updated_at' => gmdate('c'),
+		], JSON_UNESCAPED_SLASHES);
+		if ($payload === false) {
+			return false;
+		}
+		$temporary = self::MAINTENANCE_PROGRESS_FILE . '.tmp.' . bin2hex(random_bytes(4));
+		if (@file_put_contents($temporary, $payload . "\n", LOCK_EX) === false) {
+			return false;
+		}
+		$this->setPrivateOwnership($temporary);
+		if (!@rename($temporary, self::MAINTENANCE_PROGRESS_FILE)) {
+			@unlink($temporary);
+			return false;
+		}
+		$this->setPrivateOwnership(self::MAINTENANCE_PROGRESS_FILE);
+		return true;
 	}
 
 	private function queueMaintenanceAction($path, $successMessage)
@@ -3573,7 +3707,7 @@ class Slsmassnotifyserver implements \BMO
 		];
 	}
 
-	private function getLightningTestCooldownState()
+	public function getLightningTestCooldownState()
 	{
 		$lastRun = 0;
 		if (is_readable(self::LIGHTNING_TEST_COOLDOWN_FILE)) {
@@ -3623,17 +3757,35 @@ class Slsmassnotifyserver implements \BMO
 
 	private function getRegisteredPjsipExtensions()
 	{
+		if (is_executable(self::VISUAL_PUSH_SCRIPT)) {
+			$output = [];
+			$exitCode = 0;
+			exec('/usr/bin/timeout 15 /usr/bin/python3 ' . escapeshellarg(self::VISUAL_PUSH_SCRIPT) . ' --list-endpoints-json 2>/dev/null', $output, $exitCode);
+			if ($exitCode === 0) {
+				$inventory = json_decode(implode("\n", $output), true);
+				if (is_array($inventory)) {
+					$registered = [];
+					foreach (array_keys($inventory) as $extension) {
+						$extension = preg_replace('/[^0-9]/', '', (string)$extension);
+						if ($extension !== '') {
+							$registered[$extension] = $extension;
+						}
+					}
+					if (!empty($registered)) {
+						return array_values($registered);
+					}
+				}
+			}
+		}
+
 		$output = [];
 		exec("asterisk -rx 'pjsip show contacts' 2>/dev/null", $output);
 		$registered = [];
 		foreach ($output as $line) {
-			if (!preg_match('/Contact:\s+([0-9]+)\/.*\s([A-Za-z]+)\s+[-0-9na.]+$/', $line, $matches)) {
+			if (!preg_match('/Contact:\s+([0-9]+)\/.*\s(Avail|Available|NonQual|Reachable|Unknown)\s+[-0-9na.]+$/i', $line, $matches)) {
 				continue;
 			}
-			$status = $matches[2];
-			if (in_array($status, ['Avail', 'NonQual'], true)) {
-				$registered[$matches[1]] = $matches[1];
-			}
+			$registered[$matches[1]] = $matches[1];
 		}
 		return array_values($registered);
 	}
@@ -4302,9 +4454,22 @@ class Slsmassnotifyserver implements \BMO
 		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_uninstall.sh', $runtimeDir . '/sls_mass_notify_uninstall.sh', 0755);
 		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_install_piper_voices.sh', $runtimeDir . '/sls_mass_notify_install_piper_voices.sh', 0755);
 		$this->copyRuntimeFile(__DIR__ . '/bin/sign_sls_mass_notify_local_sig.sh', '/usr/local/sbin/sign_sls_mass_notify_local_sig.sh', 0755);
+		$this->pruneRuntimeDirectory(__DIR__ . '/bin/sls_mass_notify', $runtimeDir, [
+			'piper',
+			'sls_mass_notify_nws_poll.sh',
+			'sls_mass_notify_weather_poll.sh',
+			'sls_mass_notify_test.sh',
+			'sls_mass_notify_update.sh',
+			'sls_mass_notify_maintenance.sh',
+			'sls_mass_notify_uninstall.sh',
+			'sls_mass_notify_install_piper_voices.sh',
+		]);
 		$this->copyRuntimeDirectory(__DIR__ . '/bin/sls_mass_notify', $runtimeDir, 0755);
+		$this->pruneRuntimeDirectory(__DIR__ . '/api/sipnotify', '/var/www/html/api/sipnotify');
 		$this->copyRuntimeDirectory(__DIR__ . '/api/sipnotify', '/var/www/html/api/sipnotify', 0644);
+		$this->pruneRuntimeDirectory(__DIR__ . '/api/sls-mass-notify', '/var/www/html/api/sls-mass-notify');
 		$this->copyRuntimeDirectory(__DIR__ . '/api/sls-mass-notify', '/var/www/html/api/sls-mass-notify', 0644);
+		$this->pruneRuntimeDirectory(__DIR__ . '/assets', '/var/www/html/sls_mass_notify/assets');
 		$this->copyRuntimeDirectory(__DIR__ . '/assets', '/var/www/html/sls_mass_notify/assets', 0644);
 		$this->copyRuntimeDirectory(__DIR__ . '/sounds', self::SOUNDS_DIR, 0644, false);
 		@unlink($runtimeDir . '/config.ini');
@@ -4383,6 +4548,34 @@ class Slsmassnotifyserver implements \BMO
 			}
 		} catch (\Throwable $exception) {
 			// The audio remains installed and selectable if the optional Recordings module is unavailable.
+		}
+	}
+
+	private function removeBundledSystemRecordings()
+	{
+		$filenames = [
+			'custom/Paging_Tone_Opening',
+			'custom/Paging_Tone_Closing',
+			'custom/NWS_alert',
+			'custom/Lightning_alert',
+		];
+		try {
+			$statement = $this->FreePBX->Database()->prepare('DELETE FROM recordings WHERE filename = ?');
+			foreach ($filenames as $filename) {
+				$statement->execute([$filename]);
+			}
+		} catch (\Throwable $exception) {
+			// The standalone uninstaller repeats this bounded cleanup.
+		}
+		foreach ([
+			'/var/lib/asterisk/sounds/en/custom/Paging_Tone_Opening.wav',
+			'/var/lib/asterisk/sounds/en/custom/Paging_Tone_Closing.wav',
+			'/var/lib/asterisk/sounds/en/custom/NWS_alert.wav',
+			'/var/lib/asterisk/sounds/en/custom/Lightning_alert.wav',
+		] as $path) {
+			if (is_file($path) && !is_link($path)) {
+				@unlink($path);
+			}
 		}
 	}
 
@@ -4625,6 +4818,42 @@ class Slsmassnotifyserver implements \BMO
 		}
 	}
 
+	private function removeRuntimeIntegrationFiles()
+	{
+		$preservePiperRuntime = getenv('SLS_MASS_NOTIFY_PRESERVE_PIPER_RUNTIME') === '1';
+		foreach ([
+			self::RUNTIME_DIR,
+			'/var/www/html/api/sipnotify',
+			'/var/www/html/api/sls-mass-notify',
+			'/var/www/html/sls_mass_notify',
+		] as $path) {
+			if (is_dir($path) && !is_link($path)) {
+				if ($path === self::RUNTIME_DIR && $preservePiperRuntime) {
+					foreach (scandir($path) ?: [] as $entry) {
+						if ($entry === '.' || $entry === '..' || $entry === 'piper') {
+							continue;
+						}
+						$this->runCommand('/bin/rm -rf ' . escapeshellarg($path . '/' . $entry));
+					}
+				} else {
+					$this->runCommand('/bin/rm -rf ' . escapeshellarg($path));
+				}
+			}
+		}
+		foreach ([
+			'/var/lib/asterisk/sounds/' . self::ASTERISK_SOUND_PREFIX,
+			'/var/lib/asterisk/sounds/en/' . self::ASTERISK_SOUND_PREFIX,
+		] as $link) {
+			if (is_link($link) && readlink($link) === self::SOUNDS_DIR) {
+				@unlink($link);
+			}
+		}
+		$signer = '/usr/local/sbin/sign_sls_mass_notify_local_sig.sh';
+		if (is_file($signer)) {
+			@unlink($signer);
+		}
+	}
+
 	private function ensurePiperVoices()
 	{
 		if (is_executable(self::PIPER_VOICE_INSTALL_SCRIPT)) {
@@ -4652,6 +4881,10 @@ class Slsmassnotifyserver implements \BMO
 				'last_fault_stage' => 'piper_voice_download',
 				'last_fault_message' => 'Unable to download Piper voice file(s): ' . implode(', ', $failures),
 			]);
+			throw new \RuntimeException(sprintf(
+				_('Required Piper voice files could not be installed: %s'),
+				implode(', ', $failures)
+			));
 		} else {
 			$this->updateStatusData([
 				'last_fault_at' => '',
@@ -4824,8 +5057,8 @@ class Slsmassnotifyserver implements \BMO
 				. " same => n,ExecIf($[\"\${SLS_AUTOANSWER_UA:0:5}\"=\"mitel\"]?Set(SLS_CALL_INFO=<sip:broadworks.net>\\;answer-after=0))\n"
 				. " same => n,ExecIf($[\"\${SLS_AUTOANSWER_UA:0:9}\"=\"openstage\"]?Set(SLS_ALERT_INFO=<http://example.com>\\;info=alert-autoanswer))\n"
 				. " same => n,ExecIf($[\"\${SLS_AUTOANSWER_UA:0:6}\"=\"digium\"]?Set(SLS_ALERT_INFO=ring-answer))\n"
-				. " same => n,ExecIf($[\"\${SLS_AUTOANSWER_UA:0:9}\"=\"sangoma p\"]?Set(SLS_ALERT_INFO=ring-answer))\n"
-				. " same => n,ExecIf($[\"\${SLS_AUTOANSWER_UA:0:9}\"=\"sangoma s\"]?Set(SLS_ALERT_INFO=<http://www.sangoma.com>\\;info=external))\n"
+				. " same => n,ExecIf($[\"\${SLS_AUTOANSWER_UA:0:9}\"=\"sangoma p\"]?Set(SLS_ALERT_INFO=intercom))\n"
+				. " same => n,ExecIf($[\"\${SLS_AUTOANSWER_UA:0:9}\"=\"sangoma s\"]?Set(SLS_ALERT_INFO=intercom))\n"
 				. " same => n,ExecIf($[\"\${SLS_AUTOANSWER_UA:0:23}\"=\"sangoma macos softphone\"]?Set(SLS_ALERT_INFO=Direct-Intercom))\n"
 				. " same => n,ExecIf($[\"\${SLS_AUTOANSWER_UA:0:25}\"=\"sangoma windows softphone\"]?Set(SLS_ALERT_INFO=Direct-Intercom))\n"
 				. " same => n,NoOp(SLS Mass Notification auto-answer user-agent \${SLS_AUTOANSWER_UA} alert-info \${SLS_ALERT_INFO})\n"
@@ -4990,6 +5223,30 @@ class Slsmassnotifyserver implements \BMO
 		@unlink('/var/www/html/admin/modules/dashboard/views/sections/sls-mass-notify-announcement.php');
 		@unlink('/var/lib/asterisk/bin/sls_mass_notify');
 		@unlink('/var/lib/asterisk/bin/sls_mass_notify_test.sh');
+		$this->refreshDashboardHookIndexAfterRemoval();
+	}
+
+	private function refreshDashboardHookIndexAfterRemoval()
+	{
+		$hooksFile = '/var/www/html/admin/modules/dashboard/classes/DashboardHooks.class.php';
+		if (!is_readable($hooksFile)) {
+			throw new \RuntimeException(_('FreePBX Dashboard hook loader is missing after Mass Notify removal.'));
+		}
+		require_once $hooksFile;
+		if (!class_exists('DashboardHooks')) {
+			throw new \RuntimeException(_('FreePBX Dashboard hook loader could not be initialized after Mass Notify removal.'));
+		}
+		$dashboard = \FreePBX::Dashboard();
+		$visualOrder = $dashboard->getConfig('visualorder');
+		$hooks = \DashboardHooks::genHooks(is_array($visualOrder) ? $visualOrder : []);
+		foreach ((array)$hooks as $page) {
+			foreach ((array)($page['entries'] ?? []) as $entry) {
+				if (($entry['rawname'] ?? '') === 'SlsMassNotifyAnnouncement') {
+					throw new \RuntimeException(_('FreePBX Dashboard still discovers the removed Mass Notify announcement panel.'));
+				}
+			}
+		}
+		$dashboard->setConfig('allhooks', $hooks);
 	}
 
 	private function removeAmiUsers()
@@ -5168,32 +5425,58 @@ class Slsmassnotifyserver implements \BMO
 		}
 	}
 
-	private function signLocalModulesIfAvailable()
+	private function signLocalModulesIfAvailable($required = true)
 	{
-		$candidates = [
-			'/usr/local/sbin/sign_sls_mass_notify_local_sig.sh',
-			'/home/localadmin/sign_sls_mass_notify_local_sig.sh',
-		];
-		$signer = '';
-		foreach ($candidates as $candidate) {
-			if (is_executable($candidate)) {
-				$signer = $candidate;
-				break;
-			}
+		if (getenv('SLS_MASS_NOTIFY_DEFER_SIGNING') === '1') {
+			return;
 		}
-		if ($signer === '') {
+		$signer = '/usr/local/sbin/sign_sls_mass_notify_local_sig.sh';
+		clearstatcache(true, $signer);
+		$signerMode = @fileperms($signer);
+		$signerOwner = @fileowner($signer);
+		$signerGroup = @filegroup($signer);
+		$signerIsSafe = is_file($signer)
+			&& !is_link($signer)
+			&& is_executable($signer)
+			&& $signerOwner === 0
+			&& $signerGroup === 0
+			&& $signerMode !== false
+			&& ($signerMode & 0777) === 0755;
+		if (!$signerIsSafe) {
+			if ($required) {
+				throw new \RuntimeException(_('The protected PBX-local module signer is missing or unsafe.'));
+			}
 			return;
 		}
 		$moduleRawName = basename(__DIR__);
-		$this->runCommand(escapeshellarg($signer) . ' ' . escapeshellarg($moduleRawName));
-			if (is_dir('/var/www/html/admin/modules/dashboard')) {
-				$this->runCommand(escapeshellarg($signer) . ' dashboard');
+		$modules = [$moduleRawName];
+		if (is_dir('/var/www/html/admin/modules/dashboard')) {
+			$modules[] = 'dashboard';
+		}
+		// Menu placement modifies a framework-owned view, so cover that managed
+		// integration with the same trusted local signature.
+		if (is_dir('/var/www/html/admin/modules/framework')) {
+			$modules[] = 'framework';
+		}
+		foreach ($modules as $module) {
+			$output = [];
+			$exitCode = 0;
+			@exec(
+				'/usr/bin/timeout --signal=TERM 360 '
+					. escapeshellarg($signer) . ' ' . escapeshellarg($module) . ' 2>&1',
+				$output,
+				$exitCode
+			);
+			if ($exitCode !== 0 && $required) {
+				$detail = trim(implode(' ', array_slice($output, -3)));
+				$detail = preg_replace('/\s+/', ' ', $detail);
+				throw new \RuntimeException(sprintf(
+					_('Unable to create a trusted local signature for %s.%s'),
+					$module,
+					$detail !== '' ? ' ' . substr($detail, 0, 500) : ''
+				));
 			}
-			// Menu placement modifies a framework-owned view, so cover that managed
-			// integration with the same trusted local signature.
-			if (is_dir('/var/www/html/admin/modules/framework')) {
-				$this->runCommand(escapeshellarg($signer) . ' framework');
-			}
+		}
 	}
 
 	private function repairPostUninstallSignatures()
@@ -5202,7 +5485,7 @@ class Slsmassnotifyserver implements \BMO
 		// hook. The standalone uninstaller restores stock modules after this
 		// transaction; native Module Admin removal can safely retain local trusted
 		// signatures for the two integration-owned files it just restored.
-		$this->signLocalModulesIfAvailable();
+		$this->signLocalModulesIfAvailable(false);
 	}
 
 	private function runCommand($command)
@@ -5215,30 +5498,44 @@ class Slsmassnotifyserver implements \BMO
 
 	private function copyRuntimeFile($source, $target, $mode = 0644, $overwrite = true)
 	{
-		if (!is_readable($source)) {
-			return;
+		if (!is_file($source) || !is_readable($source) || is_link($source)) {
+			throw new \RuntimeException(sprintf(_('Required packaged file is missing or unsafe: %s'), $source));
+		}
+		if (is_link($target)) {
+			throw new \RuntimeException(sprintf(_('Refusing to replace a symbolic-link runtime target: %s'), $target));
 		}
 		if (!$overwrite && file_exists($target)) {
 			return;
 		}
 		$dir = dirname($target);
-		if (!is_dir($dir)) {
-			@mkdir($dir, 0755, true);
+		if (!is_dir($dir) && !@mkdir($dir, 0755, true) && !is_dir($dir)) {
+			throw new \RuntimeException(sprintf(_('Unable to create runtime directory: %s'), $dir));
 		}
-		@copy($source, $target);
-		@chmod($target, $mode);
+		if (!@copy($source, $target) || !is_file($target)) {
+			throw new \RuntimeException(sprintf(_('Unable to install runtime file: %s'), $target));
+		}
+		if (!@chmod($target, $mode)) {
+			throw new \RuntimeException(sprintf(_('Unable to secure runtime file permissions: %s'), $target));
+		}
 	}
 
 	private function copyRuntimeDirectory($source, $target, $mode = 0644, $overwrite = true)
 	{
-		if (!is_dir($source)) {
-			return;
+		if (!is_dir($source) || is_link($source)) {
+			throw new \RuntimeException(sprintf(_('Required packaged directory is missing or unsafe: %s'), $source));
 		}
-		if (!is_dir($target)) {
-			@mkdir($target, 0755, true);
+		if (is_link($target)) {
+			throw new \RuntimeException(sprintf(_('Refusing to use a symbolic-link runtime directory: %s'), $target));
 		}
-		foreach (scandir($source) ?: [] as $entry) {
-			if ($entry === '.' || $entry === '..') {
+		if (!is_dir($target) && !@mkdir($target, 0755, true) && !is_dir($target)) {
+			throw new \RuntimeException(sprintf(_('Unable to create runtime directory: %s'), $target));
+		}
+		$entries = scandir($source);
+		if ($entries === false) {
+			throw new \RuntimeException(sprintf(_('Unable to read packaged runtime directory: %s'), $source));
+		}
+		foreach ($entries as $entry) {
+			if ($entry === '.' || $entry === '..' || $entry === '__pycache__' || substr($entry, -4) === '.pyc') {
 				continue;
 			}
 			$src = $source . '/' . $entry;
@@ -5247,6 +5544,38 @@ class Slsmassnotifyserver implements \BMO
 				$this->copyRuntimeDirectory($src, $dst, $mode, $overwrite);
 			} else {
 				$this->copyRuntimeFile($src, $dst, $mode, $overwrite);
+			}
+		}
+	}
+
+	private function pruneRuntimeDirectory($source, $target, array $preserve = [])
+	{
+		if (!is_dir($target)) {
+			return;
+		}
+		if (!is_dir($source) || is_link($source) || is_link($target)) {
+			throw new \RuntimeException(sprintf(_('Unable to safely reconcile runtime directory: %s'), $target));
+		}
+		$sourceEntries = array_fill_keys(array_values(array_filter(scandir($source) ?: [], static function ($entry) {
+			return $entry !== '.' && $entry !== '..' && $entry !== '__pycache__' && substr($entry, -4) !== '.pyc';
+		})), true);
+		$preserveEntries = array_fill_keys($preserve, true);
+		foreach (scandir($target) ?: [] as $entry) {
+			if ($entry === '.' || $entry === '..' || isset($preserveEntries[$entry])) {
+				continue;
+			}
+			$targetPath = $target . '/' . $entry;
+			if (!isset($sourceEntries[$entry])) {
+				if (is_dir($targetPath) && !is_link($targetPath)) {
+					$this->runCommand('/bin/rm -rf ' . escapeshellarg($targetPath));
+				} else {
+					@unlink($targetPath);
+				}
+				continue;
+			}
+			$sourcePath = $source . '/' . $entry;
+			if (is_dir($sourcePath) && is_dir($targetPath) && !is_link($targetPath)) {
+				$this->pruneRuntimeDirectory($sourcePath, $targetPath);
 			}
 		}
 	}

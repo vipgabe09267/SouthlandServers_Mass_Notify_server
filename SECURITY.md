@@ -8,7 +8,8 @@ Security fixes are currently targeted at the latest beta release candidate only.
 
 | Version | Supported |
 | --- | --- |
-| `0.0.7-beta` | Yes |
+| `0.0.8-beta` | Yes |
+| `0.0.7-beta` | Security fixes only |
 | `0.0.6-beta` | No |
 | `0.0.5-beta` | No |
 | `0.0.4-beta` | No |
@@ -67,7 +68,7 @@ Default-on adaptive Lightning protection reads credential-free, short-lived Weat
 
 Public PBX Hostname is automatically detected and exposed read-only in administrator forms; it is not accepted as a Control API configuration mutation. Successful loopback `get_config` and `get_status` health probes are omitted from the API usage audit, while authentication failures, non-loopback requests, and meaningful local actions continue through the normal audit controls.
 
-Settings participate in FreePBX’s native Apply Config hook and remain staged in a protected Asterisk-owned file until reload. The root maintenance worker compares only the managed Dashboard widget and menu integration files after FreePBX updates; when drift is detected it restores those known files from the installed module and refreshes local signatures. It does not modify phone provisioning, PJSIP peers, or unrelated FreePBX module content.
+Settings participate in FreePBX’s native Apply Config hook and remain staged in a protected Asterisk-owned file until reload. The root maintenance worker compares only the managed Dashboard widget and menu integration files after FreePBX updates; when drift is detected it restores those known files from the installed module and refreshes local signatures. Install, update, repair, and uninstall operations use the same root-owned maintenance lock, preventing the minute worker from changing managed files during a deployment transaction. A maintenance-launched child reuses the inherited lock rather than opening a second transaction. These paths do not modify phone provisioning, PJSIP peers, or unrelated FreePBX module content.
 
 Executable runtime under `/usr/local/bin/sls_mass_notify`, including Piper, maintenance, and updater code, is owned by `root:root`. Mutable deployment data remains under the Asterisk data folder. The root updater only accepts the official beta repository, requires GitHub release SHA-256 metadata, and executes the installer from the matching immutable release tag. Automatic updates remain disabled by default.
 
@@ -79,7 +80,7 @@ The module does not replace FreePBX system hardening. Firewall rules, TLS certif
 
 The installer uses Debian packages, creates a dedicated Piper virtual environment with pinned packaging tools and `piper-tts`, and downloads Piper voice models from a pinned repository revision with exact SHA-256 verification. Release TGZ paths and metadata are validated before extraction. Use a trusted network for installation, verify release checksums, and run installers only from the official project source.
 
-The project locally signs its custom module and the FreePBX modules containing managed integration files. The signing key is generated on each PBX and trusted only in that PBX's FreePBX GPG home. This detects later local file alteration but is not a publisher-distributed release signature or a substitute for verifying the release download.
+The project locally signs its custom module and the FreePBX modules containing managed integration files. The signer resolves the configured FreePBX web user, web root, spool path, and actual GPG home through FreePBX and the operating-system account database. It rejects unsafe paths, repairs ownership and restrictive modes in the selected keyring before importing trust, and serializes key and signature work with a root-owned lock. A new `module.sig` replaces the existing file only after exact FreePBX verification succeeds; otherwise the previous signature is restored. The signing key is generated on each PBX and trusted only in that PBX's FreePBX GPG home. This detects later local file alteration but is not a publisher-distributed release signature or a substitute for verifying the release download.
 
 ## Disclosure Target
 

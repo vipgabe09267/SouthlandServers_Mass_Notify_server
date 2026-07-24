@@ -48,6 +48,8 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 		<li><?php echo _('The module is designed to keep deployment settings outside module code in a centralized .config file so updates do not overwrite local configuration.'); ?></li>
 		<li><?php echo _('Custom/local FreePBX module signatures normally show as Unknown. Altered means the module should be signed again on that PBX.'); ?></li>
 		<li><?php echo _('General Settings shows the installed package version and whether the known release status is LATEST or an update is available.'); ?></li>
+		<li><?php echo _('Version 0.0.8 adds first-seen Weather.gov chain delivery fixes, portable endpoint-fan-out SIP NOTIFY, guarded mixed-contact routing, Asterisk-completed system tests, live Danger Zone progress, and recoverable release installation. The installer loads and verifies an inactive Asterisk paging provider such as res_pjsip_header_funcs before module activation. If a packaged provider is missing or damaged, it can reinstall only the exact installed owning package version and retry without upgrading Asterisk.'); ?></li>
+		<li><?php echo _('Local signing now uses the web account, module root, and GPG home reported by FreePBX. Install, update, repair, and uninstall share a maintenance lock; each candidate signature must return trusted status 129 before it replaces the previous module.sig.'); ?></li>
 		<li><?php echo _('After a Dashboard or Framework upgrade, Repair Installation restores the managed announcement widget and menu placement, rebuilds the stored Dashboard hook index, and verifies that the announcement controls render. Framework 17.0.30 and earlier Framework 17 menu comparator forms are supported.'); ?></li>
 	</ul>
 	<p><?php echo _('Generated phone images use the automatically detected, read-only Public PBX Hostname shown in General Settings. Phone Image Transport remains configurable: HTTP is the compatibility default for legacy Yealink models such as the T48G, while HTTPS should be selected only when target phones trust the PBX certificate and support its TLS configuration. Authenticated APIs remain HTTPS.'); ?></p>
@@ -163,7 +165,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 	<ul>
 		<li><?php echo _('The one-minute weather scheduler reads the centralized config, polls up to five independent NWS zone groups, deduplicates alert chains, applies quiet hours, and can also check the optional Xweather lightning API.'); ?></li>
 		<li><?php echo _('Dashboard announcements can send phone SIP NOTIFY text, publish to the SLS Mass Notify desktop API, and independently use opening/closing tones, Piper TTS, both, or neither.'); ?></li>
-		<li><?php echo _('Manual NWS tests use the same direct audio context and SIP NOTIFY sender as live alerts and can target all or selected weather-zone groups.'); ?></li>
+		<li><?php echo _('Manual NWS tests use the same direct audio context and SIP NOTIFY sender as live alerts and can target all or selected weather-zone groups. A test succeeds only after Asterisk archives every targeted call as completed and the SIP NOTIFY sender accepts every requested contact. Tests do not send email or Discord notifications.'); ?></li>
 		<li><?php echo _('Desktop clients can receive authenticated live server-sent events or use the backward-compatible JSON endpoint with their assigned username and password.'); ?></li>
 	</ul>
 
@@ -196,7 +198,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_test.sh</code> <?php echo _('manual test sender.'); ?></li>
 		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh</code> <?php echo _('root-owned manual and automatic beta updater.'); ?></li>
 		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_maintenance.sh</code> <?php echo _('root-owned worker for queued repairs, manual updates, and complete uninstall requests.'); ?></li>
-		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_uninstall.sh</code> <?php echo _('standalone cleanup path used by the confirmed Danger Zone uninstall action; if the FreePBX repository is unavailable, cleaned Dashboard and Framework copies receive a locally verified fallback signature and the private key is removed.'); ?></li>
+		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_uninstall.sh</code> <?php echo _('standalone cleanup path used by the confirmed Danger Zone uninstall action; it snapshots the current transactional signer before the module hook removes the installed copies, then deletes that protected snapshot before exit. If the FreePBX repository is unavailable, cleaned Dashboard and Framework copies receive a locally verified fallback signature.'); ?></li>
 		<li><code>/usr/local/bin/sls_mass_notify/piper/venv</code> <?php echo _('root-owned Piper executable environment, also exposed through the compatibility path /var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/venv.'); ?></li>
 		<li><code>/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices</code> <?php echo _('checksum-verified Piper voice models.'); ?></li>
 		<li><code>/usr/local/bin/sls_mass_notify/sls_notify.py</code> <?php echo _('SIP NOTIFY and desktop journal publisher.'); ?></li>
@@ -211,7 +213,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 		<li><?php echo _('Download the current .config from General Settings before major updates.'); ?></li>
 		<li><?php echo _('Upload a replacement .config only when intentionally restoring or transplanting a deployment. Replacing it overwrites credentials, desktop clients, phone overrides, voices, announcement groups, NWS settings, quiet hours, and retention settings.'); ?></li>
 		<li><?php echo _('FreePBX backup support exports the module settings payload where the module backup hook is available. Keep an external .config backup anyway.'); ?></li>
-		<li><?php echo _('Danger Zone separates repair, complete uninstall, and configuration replacement into distinct confirmed actions. Repair preserves the central .config; complete uninstall and configuration replacement are destructive.'); ?></li>
+		<li><?php echo _('Danger Zone separates repair, complete uninstall, and configuration replacement into distinct confirmed actions. Repair and uninstall display protected queued/running/completed/failed status; config replacement displays upload and validation progress. Repair preserves the central .config; complete uninstall and configuration replacement are destructive.'); ?></li>
 	</ul>
 
 	<h3><?php echo _('Weather Alerts'); ?></h3>
@@ -219,6 +221,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 		<li><?php echo _('The setup wizard defaults Weather Alerts to No and keeps weather-specific fields hidden and excluded from validation until Yes is selected.'); ?></li>
 		<li><?php echo _('Weather polling is optional and can be disabled during setup or from Weather Alerts. It supports U.S. weather.gov zones only. Up to five named weather-zone groups can each have their own phone recipients.'); ?></li>
 		<li><?php echo _('Supported event names are mapped internally to priorities, SIP NOTIFY colors, quiet-hour behavior, and TTS summaries.'); ?></li>
+		<li><?php echo _('Heat Advisory is supported. First-seen alerts remain eligible when Weather.gov labels them Update; reference-based chain keys suppress later timestamp-only reissues only after that chain has actually been processed.'); ?></li>
 		<li><?php echo _('Quiet hours suppress non-critical configured alerts. Critical bypass events can still notify during quiet hours.'); ?></li>
 		<li><?php echo _('TTS is limited to short important alert summaries rather than reading the full NWS alert text.'); ?></li>
 	</ul>
@@ -232,7 +235,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 		<li><?php echo _('The 5-minute default is the longest gap-free period for standard Xweather access. Periods from 6–10 minutes can miss strikes unless the subscription includes extended lightning history.'); ?></li>
 		<li><?php echo _('A storm creates one entry alert using the nearest strike distance reported by Xweather, rounded to one decimal mile. Repeated strikes do not alert again until two clear queries reset the state; an optional all-clear can be sent. Lightning uses its own quiet-hours toggle and opening/closing tones.'); ?></li>
 		<li><?php echo _('Regular announcements, Weather Alerts, and Lightning Alerts default to 25% audio volume and retain independent 1–200% controls. Coordinate locations are announced as “this area,” while named locations use the configured city. Every Lightning audio sequence retains one second of leading silence before the pre-tone and speech.'); ?></li>
-		<li><?php echo _('The Lightning system test has a dedicated 60-second anti-spam cooldown. Its phone message, speech, email subject, and branded email card are explicitly marked TEST ONLY and do not represent an actual strike.'); ?></li>
+		<li><?php echo _('The Lightning system test has a dedicated 60-second anti-spam cooldown. It sends only the simulated phone, audio, and authorized desktop test, waits for Asterisk call completion and SIP NOTIFY submission, and does not send email or Discord notifications.'); ?></li>
 		<li><?php echo _('The saved Xweather Client Secret is masked on the page and can be revealed with the eye button by an authenticated FreePBX administrator. Diagnostics and API responses continue to redact it.'); ?></li>
 	</ul>
 
@@ -246,7 +249,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 	</ul>
 
 	<h3><?php echo _('SIP NOTIFY and Desktop API'); ?></h3>
-	<p><?php echo _('Phones receive SIP NOTIFY pushes directly from Asterisk/PJSIP using their registered endpoints. Desktop clients authenticate with their assigned username and password and can use either the live event stream or the JSON endpoint.'); ?></p>
+	<p><?php echo _('Phones receive SIP NOTIFY pushes directly from Asterisk/PJSIP. Same-format registrations use endpoint fan-out so Asterisk retains the endpoint transport and contact behavior. Mixed formats on one extension use per-contact URI delivery only when every URI is available and Asterisk has a usable default outbound endpoint; otherwise the send stops with a clear error. Desktop clients authenticate with their assigned username and password and can use either the live event stream or the JSON endpoint.'); ?></p>
 	<ul>
 		<li><code>/api/sipnotify/desktop</code> <?php echo _('returns JSON for the SLS Mass Notify desktop app. Use HTTP Basic authentication with the desktop client username and password configured in General Settings.'); ?></li>
 		<li><code>/api/sipnotify/desktop/stream</code> <?php echo _('returns a live server-sent-event stream using the same Basic authentication and per-client target filtering. The authenticated handshake is flushed through Apache immediately; clients should reconnect after the server reconnect event and may send Last-Event-ID when resuming.'); ?></li>
@@ -272,7 +275,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 
 	<h3><?php echo _('Email and Discord'); ?></h3>
 	<p><?php echo _('Shared Weather and Lightning destinations are managed from the Notification Destinations popup in General Settings. Add or remove validated recipient email addresses there and optionally store one Discord webhook.'); ?></p>
-	<p><?php echo _('Alert email is sent through the local sendmail path as an always-branded Southland Servers HTML card with an embedded logo and a plain-text alternative. Test alerts are visibly identified as tests. Discord uses a compact branded embed with the SLS identity, public logo image/avatar, event-aware emoji/color, concise delivery fields, timestamp, and urgency/test footer. The public logo URL is built from the automatically detected PBX hostname. Destination values and the webhook are stored only in the protected central config.'); ?></p>
+	<p><?php echo _('Live alert email is sent through the local sendmail path as an always-branded Southland Servers HTML card with an embedded logo and a plain-text alternative. Live Discord delivery uses a compact branded embed with the SLS identity, public logo image/avatar, event-aware emoji/color, concise delivery fields, a normalized ISO timestamp, and an urgency footer. Manual Weather and Lightning tests do not send either destination. The public logo URL is built from the automatically detected PBX hostname. Destination values and the webhook are stored only in the protected central config.'); ?></p>
 
 	<h3><?php echo _('TTS and Audio'); ?></h3>
 	<ul>
@@ -313,7 +316,8 @@ python3 -m py_compile /usr/local/bin/sls_mass_notify/sls_notify.py</pre>
 		<li><?php echo _('Desktop app unauthorized: confirm the desktop client is enabled in General Settings and test /api/sipnotify/desktop with that client username and password.'); ?></li>
 		<li><?php echo _('Phone SIP NOTIFY missing: confirm the target extension is registered, AMI user slsmassnotify exists, and /var/log/sls_mass_notify_push.log has no AMI errors.'); ?></li>
 		<li><?php echo _('Audio missing or the phone rings normally: confirm both SLS dialplan contexts exist, the asterisk account can write to /var/spool/asterisk/tmp and outgoing, the two SLS sound links resolve to the protected sounds folder, Piper generated a WAV under the TTS folder, and Asterisk can read that sound path.'); ?></li>
-		<li><?php echo _('Module says Altered: remove generated caches such as __pycache__ if present, run the local signing helper, then fwconsole reload.'); ?></li>
+		<li><?php echo _('Asterisk provider repair stops before installation: wait for active calls to finish and rerun the installer. If it reports an unowned module path or an unavailable exact package version, restore the matching provider from that Asterisk build or repository; the installer intentionally will not mix modules from a different ABI.'); ?></li>
+		<li><?php echo _('Module says Altered: remove generated caches such as __pycache__ if present, run the PBX-local signing helper, confirm verifyModule returns status 129 with no details, then run fwconsole reload.'); ?></li>
 		<li><?php echo _('Setup wizard appears after update: verify setup.completed remains 1 in the central .config and no pending config reset it.'); ?></li>
 	</ul>
 

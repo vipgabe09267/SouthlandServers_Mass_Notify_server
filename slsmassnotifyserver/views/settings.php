@@ -87,7 +87,7 @@ for ($hour = 0; $hour < 24; $hour++) {
 					</div>
 					<div class="panel-body">
 						<p class="text-muted">
-							<?php echo _('Trigger a manual Piper TTS alert using the configured opening and closing tones.'); ?>
+							<?php echo _('Trigger a manual Piper TTS alert using the configured opening and closing tones. The test sends only phone and desktop delivery; email and Discord are intentionally skipped.'); ?>
 						</p>
 
 						<div id="sls-test-cooldown-alert" class="alert alert-warning" <?php echo empty($cooldownRemaining) ? 'style="display: none;"' : ''; ?>>
@@ -173,8 +173,13 @@ for ($hour = 0; $hour < 24; $hour++) {
 							.then(function(response) { return response.json(); })
 							.then(function(data) {
 								result.style.display = 'block';
-								result.className = 'alert alert-' + (data && data.success ? 'success' : 'warning');
-								result.textContent = data && data.message ? data.message : 'Test request finished.';
+								result.className = 'alert alert-' + (data && data.success ? 'success' : 'danger');
+								var message = data && data.message ? data.message : 'Test request finished.';
+								var errors = data && Array.isArray(data.errors) ? data.errors.filter(Boolean) : [];
+								result.textContent = message + (errors.length ? ' ' + errors.join(' ') : '');
+								if (!data || !data.success) {
+									window.alert('Weather test error\n\n' + message + (errors.length ? '\n\n' + errors.join('\n') : ''));
+								}
 								if (data && data.cooldowns && data.cooldowns.test) {
 									remaining = parseInt(data.cooldowns.test.remaining || '0', 10) || 0;
 								}

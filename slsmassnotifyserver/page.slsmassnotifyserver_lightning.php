@@ -13,11 +13,19 @@ unset(
 );
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$slsmassnotifyserver->validateCsrfToken($_POST['slsmassnotifyserver_csrf'] ?? '')) {
-	$_SESSION['slsmassnotifyserver_lightning_save_result'] = [
+	$result = [
 		'success' => false,
 		'message' => _('The request security token is invalid or expired. Reload the page and try again.'),
 		'errors' => [],
 	];
+	if (($_POST['ajax'] ?? '') === '1') {
+		http_response_code(403);
+		header('Content-Type: application/json');
+		header('Cache-Control: no-store');
+		echo json_encode($result, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+		exit;
+	}
+	$_SESSION['slsmassnotifyserver_lightning_save_result'] = $result;
 	header('Location: config.php?display=slsmassnotifyserver_lightning');
 	exit;
 }
@@ -32,7 +40,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 		$triggerName = isset($_SESSION['AMP_user']->username) && $_SESSION['AMP_user']->username !== ''
 			? (string)$_SESSION['AMP_user']->username
 			: 'FreePBX Dashboard';
-		$_SESSION['slsmassnotifyserver_lightning_test_result'] = $slsmassnotifyserver->triggerLightningTest($triggerName);
+		try {
+			$result = $slsmassnotifyserver->triggerLightningTest($triggerName);
+		} catch (\Throwable $e) {
+			error_log('SLS Mass Notify Lightning test response failed: ' . $e->getMessage());
+			$result = [
+				'success' => false,
+				'message' => _('Lightning test could not return a confirmed delivery result.'),
+				'errors' => [_('Review Notification Logs and Dashboard health for the failed delivery stage.')],
+			];
+		}
+		if (($_POST['ajax'] ?? '') === '1') {
+			header('Content-Type: application/json');
+			header('Cache-Control: no-store');
+			$result['cooldown'] = $slsmassnotifyserver->getLightningTestCooldownState();
+			echo json_encode($result, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+			exit;
+		}
+		$_SESSION['slsmassnotifyserver_lightning_test_result'] = $result;
 	} elseif ($action === 'verify_lightning_connection') {
 		$_SESSION['slsmassnotifyserver_lightning_connection_result'] = $slsmassnotifyserver->verifyLightningConnection();
 	}

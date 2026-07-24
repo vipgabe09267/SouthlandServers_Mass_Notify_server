@@ -41,6 +41,7 @@ ALERT_MAP = {
     "Ice Storm Warning": ("⚠ ICE STORM WARNING", "yes"),
     "High Wind Warning": ("⚠ HIGH WIND WARNING", "yes"),
     "High Wind Watch": ("⚠ HIGH WIND WATCH", "no"),
+    "Heat Advisory": ("⚠ HEAT ADVISORY", "no"),
     "Excessive Heat Warning": ("⚠ EXCESS HEAT WARNING", "yes"),
     "Extreme Heat Warning": ("⚠ EXTREME HEAT WARNING", "yes"),
     "Extreme Heat Watch": ("⚠ EXTREME HEAT WATCH", "no"),
@@ -116,6 +117,36 @@ ALERT_COLORS = {
         "text": "#111827",
     },
 }
+
+
+def ami_response_is_empty_contact_inventory(response):
+    if str(response.get("Response") or "").strip().lower() != "error":
+        return False
+    message = str(response.get("Message") or "").strip().lower()
+    return re.fullmatch(r"no\s+(?:contacts?|objects?)\s+found[.!]?", message) is not None
+
+
+def ami_response_is_missing_probe_endpoint(response, probe="__sls_capability_probe__"):
+    if str(response.get("Response") or "").strip().lower() != "error":
+        return False
+    message = str(response.get("Message") or "").strip().lower()
+    if probe.lower() not in message:
+        return False
+    return any(phrase in message for phrase in (
+        "unable to retrieve endpoint",
+        "unable to find endpoint",
+        "endpoint not found",
+        "endpoint does not exist",
+    ))
+
+
+def ami_field(message, *names):
+    for name in names:
+        wanted = str(name).lower()
+        for key, value in (message or {}).items():
+            if str(key).lower() == wanted:
+                return value
+    return ""
 
 
 class AmiClient:
@@ -216,7 +247,7 @@ class AmiClient:
             message = self.read_message()
             if not response and "Response" in message:
                 response = message
-                if complete_event is None:
+                if complete_event is None or response.get("Response", "").lower() == "error":
                     return response, events
             elif "Event" in message:
                 events.append(message)
@@ -877,26 +908,81 @@ def detect_phone_format(user_agent, endpoint=""):
     return "unknown"
 
 
-def get_registered_endpoint_info(ami, allowed_targets=None, format_overrides=None):
+def asterisk_contact_uri_inventory(endpoints):
+    inventory = {}
+    for endpoint in sorted(set(endpoints or [])):
+        if not re.fullmatch(r"[0-9]+", endpoint):
+            continue
+        try:
+            result = subprocess.run(
+                ["/usr/sbin/asterisk", "-rx", f"pjsip show aor {endpoint}"],
+                cwd="/",
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+        except Exception as exc:
+            logging.warning("Unable to query Asterisk contact URIs for endpoint %s: %s", endpoint, exc)
+            continue
+        if result.returncode != 0:
+            logging.warning(
+                "Asterisk contact URI query failed for endpoint %s; SIP NOTIFY will use endpoint fallback: %s",
+                endpoint,
+                (result.stderr or result.stdout or "unknown error").strip()[:300],
+            )
+            continue
+        uris = []
+        for line in result.stdout.splitlines():
+            match = re.match(r"^\s*contact\s*:\s*((?:sips?):\S+)\s*$", line, re.IGNORECASE)
+            if match and match.group(1) not in uris:
+                uris.append(match.group(1))
+        if uris:
+            inventory[endpoint] = uris
+    return inventory
+
+
+def contact_uri_for_event(event, endpoint, inventory, contact_index=0):
+    direct = registered_contact_uri(ami_field(event, "Contact", "Uri"))
+    if direct:
+        return direct
+    candidates = inventory.get(endpoint) or []
+    if 0 <= contact_index < len(candidates):
+        return candidates[contact_index]
+    return candidates[0] if len(candidates) == 1 else ""
+
+
+def get_registered_endpoint_info(ami, allowed_targets=None, format_overrides=None, resolve_contact_uris=False):
     response, events = ami.action({"Action": "PJSIPShowContacts"}, "ContactListComplete")
     if response.get("Response", "").lower() == "error":
+        if ami_response_is_empty_contact_inventory(response):
+            return {}
         raise RuntimeError(response.get("Message", "PJSIPShowContacts failed"))
     allowed_targets = set(allowed_targets or [])
     format_overrides = format_overrides or {}
+    candidate_endpoints = set()
+    for event in events:
+        if ami_field(event, "Event") != "ContactList":
+            continue
+        endpoint = str(ami_field(event, "Endpoint", "AOR", "ObjectName")).split("/", 1)[0].strip()
+        if endpoint and (not allowed_targets or endpoint in allowed_targets):
+            candidate_endpoints.add(endpoint)
+    contact_uri_inventory = asterisk_contact_uri_inventory(candidate_endpoints) if resolve_contact_uris else {}
+    contact_uri_offsets = {}
     endpoints = {}
     skipped = []
     registered_statuses = {"reachable", "nonqualified", "avail", "available", "ok", "unknown"}
     blocked_statuses = {"unreachable", "unavailable", "unavail", "removed", "rejected", "failed"}
     for event in events:
-        if event.get("Event") != "ContactList":
+        if ami_field(event, "Event") != "ContactList":
             continue
-        endpoint = (event.get("Endpoint") or event.get("AOR") or event.get("ObjectName") or "").strip()
+        endpoint = str(ami_field(event, "Endpoint", "AOR", "ObjectName")).strip()
         if not endpoint:
-            contact = (event.get("Contact") or "").strip()
+            contact = str(ami_field(event, "Contact", "Uri")).strip()
             endpoint = contact.split("/", 1)[0] if "/" in contact else contact
         endpoint = endpoint.split("/", 1)[0].strip()
-        status = (event.get("Status") or "").strip()
-        user_agent = (event.get("UserAgent") or "").strip()
+        status = str(ami_field(event, "Status")).strip()
+        user_agent = str(ami_field(event, "UserAgent")).strip()
         if not endpoint:
             continue
         if not endpoint.isdigit() and not allowed_targets:
@@ -927,12 +1013,14 @@ def get_registered_endpoint_info(ami, allowed_targets=None, format_overrides=Non
             info["status"] = status or info.get("status", "")
             info["format"] = info["formats"][0] if info["formats"] else fmt
             info["override"] = info.get("override", False) or bool(override_format)
+            contact_index = contact_uri_offsets.get(endpoint, 0)
+            contact_uri_offsets[endpoint] = contact_index + 1
             info["contacts"].append({
                 "status": status,
                 "user_agent": user_agent,
                 "detected_format": detected_format,
                 "format": fmt,
-                "contact": (event.get("Contact") or "").strip(),
+                "contact": contact_uri_for_event(event, endpoint, contact_uri_inventory, contact_index),
             })
         else:
             skipped.append((endpoint, status or "Unknown", user_agent))
@@ -1010,28 +1098,105 @@ def notify_content_type_for_format(phone_format):
     return "text/xml"
 
 
-def send_notify(ami, endpoint, xml_payload, phone_format="yealink"):
+def registered_contact_uri(contact):
+    raw = str(contact or "").strip()
+    if not raw or "\r" in raw or "\n" in raw:
+        return ""
+    match = re.search(r"(?:sips?):[^\s>]+", raw, re.IGNORECASE)
+    if not match:
+        return ""
+    return match.group(0).rstrip(",;")
+
+
+def parse_pjsip_notify_capabilities(manager_help, pjsip_settings, default_endpoint_details=""):
+    manager_help = str(manager_help or "")
+    pjsip_settings = str(pjsip_settings or "")
+    endpoint_target = re.search(r"(?im)^\s*\[?Endpoint:?\]?\s*(?:<value>)?", manager_help) is not None
+    uri_target = re.search(r"(?im)^\s*\[?URI:?\]?\s*(?:<value>)?", manager_help) is not None
+    match = re.search(r"(?im)^\s*default_outbound_endpoint\s*:\s*(\S*)\s*$", pjsip_settings)
+    default_endpoint = match.group(1).strip() if match else ""
+    if default_endpoint.lower() in {"", "none", "<none>"}:
+        default_endpoint = ""
+    endpoint_details = str(default_endpoint_details or "")
+    default_endpoint_available = bool(
+        default_endpoint
+        and "unable to find object" not in endpoint_details.lower()
+        and re.search(rf"(?im)^\s*Endpoint:\s+{re.escape(default_endpoint)}(?:/|\s)", endpoint_details)
+    )
+    return {
+        "endpoint_target": endpoint_target,
+        "uri_target": uri_target,
+        "default_outbound_endpoint": default_endpoint,
+        "default_outbound_endpoint_available": default_endpoint_available,
+        "contact_uri_usable": bool(uri_target and default_endpoint_available),
+        "routing_mode": "contact_uri" if uri_target and default_endpoint_available else "endpoint_fanout",
+    }
+
+
+def pjsip_notify_capabilities():
+    def run_cli(command):
+        try:
+            return subprocess.run(
+                ["/usr/sbin/asterisk", "-rx", command],
+                cwd="/",
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+        except Exception as exc:
+            logging.warning("Unable to inspect Asterisk SIP NOTIFY capability %s: %s", command, exc)
+            return None
+
+    manager = run_cli("manager show command PJSIPNotify")
+    settings = run_cli("pjsip show settings")
+    manager_text = (manager.stdout + manager.stderr) if manager else ""
+    settings_text = (settings.stdout + settings.stderr) if settings else ""
+    initial = parse_pjsip_notify_capabilities(manager_text, settings_text)
+    details_text = ""
+    if initial["default_outbound_endpoint"]:
+        details = run_cli(f"pjsip show endpoint {initial['default_outbound_endpoint']}")
+        details_text = (details.stdout + details.stderr) if details else ""
+    capabilities = parse_pjsip_notify_capabilities(manager_text, settings_text, details_text)
+    # Endpoint targeting is the portable Asterisk route. If introspection is
+    # unavailable at runtime, attempt it and let AMI return a concrete error.
+    if not manager_text:
+        capabilities["endpoint_target"] = True
+    return capabilities
+
+
+def send_notify(ami, target, xml_payload, phone_format="yealink", target_field="Endpoint"):
+    if target_field not in {"Endpoint", "URI"}:
+        raise ValueError("Invalid PJSIPNotify target field")
     content_type = notify_content_type_for_format(phone_format)
     errors = []
     successes = []
     for event_name in notify_events_for_format(phone_format):
         response, _ = ami.action({
             "Action": "PJSIPNotify",
-            "Endpoint": endpoint,
+            target_field: target,
             "Variable": [
                 f"Event={event_name}",
                 f"Content-Type={content_type}",
                 f"Content={xml_payload}",
             ],
         })
-        if response.get("Response", "").lower() != "error":
+        if response.get("Response", "").lower() == "success":
             successes.append(f"{event_name}: {response.get('Message', 'sent')}")
             break
-        message = response.get("Message", "PJSIPNotify failed")
+        message = response.get("Message", "PJSIPNotify returned no explicit success response")
         errors.append(f"{event_name}: {message}")
-        logging.warning("PJSIPNotify event=%s content_type=%s failed for %s format=%s: %s", event_name, content_type, endpoint, phone_format, message)
+        logging.warning(
+            "PJSIPNotify event=%s content_type=%s failed for %s=%s format=%s: %s",
+            event_name,
+            content_type,
+            target_field,
+            target,
+            phone_format,
+            message,
+        )
     if successes:
-        return f"{'; '.join(successes)} content_type={content_type}"
+        return f"{'; '.join(successes)} target={target_field} content_type={content_type}"
     raise RuntimeError("; ".join(errors) if errors else "PJSIPNotify failed")
 
 
@@ -1185,19 +1350,130 @@ def announcement_api_record(alert_id, message, xml_payload, extensions, desktop_
 def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_results=False, attempt_label="initial"):
     successes = 0
     failures = []
+    capabilities = pjsip_notify_capabilities()
     for extension, info in sorted(endpoint_info.items()):
-        formats = info.get("formats") or [info.get("format", "yealink")]
+        contacts = info.get("contacts") or []
         user_agent = info.get("user_agent", "")
-        if len(formats) > 1:
-            logging.warning(
-                "Endpoint %s has mixed phone vendors on one extension (%s). Each vendor event will be sent to every registered contact for that endpoint.",
-                extension,
-                ", ".join(formats),
+        contact_targets = []
+        seen_contact_targets = set()
+        for contact in contacts:
+            contact_uri = registered_contact_uri(contact.get("contact", ""))
+            phone_format = contact.get("format") or info.get("format", "yealink")
+            contact_key = (contact_uri, phone_format)
+            if contact_uri and contact_key not in seen_contact_targets:
+                seen_contact_targets.add(contact_key)
+                contact_targets.append((contact_uri, phone_format, contact.get("user_agent", "")))
+
+        contact_formats = sorted({
+            contact.get("format") or info.get("format", "yealink")
+            for contact in contacts
+        } or set(info.get("formats") or [info.get("format", "yealink")]))
+        mixed_formats = len(contact_formats) > 1
+        use_contact_uri = bool(
+            contact_targets
+            and mixed_formats
+            and len(contact_targets) == len(contacts)
+            and capabilities.get("contact_uri_usable")
+        )
+
+        if mixed_formats and not use_contact_uri:
+            error = (
+                f"mixed phone formats {contact_formats} require a distinct contact URI for every registration "
+                "and a usable default outbound endpoint; use one phone family per extension or apply a manual format override"
             )
+            failures.append(f"{extension}: {error}")
+            logging.error("Unable to route SIP NOTIFY for extension %s: %s", extension, error)
+            if print_results:
+                print(f"{extension}: failed ({attempt_label}) - {error}")
+            continue
+
+        if contact_targets and not use_contact_uri:
+            formats = contact_formats or [info.get("format", "yealink")]
+            for phone_format in formats:
+                try:
+                    xml_payload = payload_builder(phone_format)
+                    result = send_notify(ami, extension, xml_payload, phone_format, "Endpoint")
+                    successes += max(1, len(contact_targets))
+                    logging.info(
+                        "Pushed SIP NOTIFY %s by endpoint fan-out to extension=%s contacts=%s format=%s "
+                        "user_agent=%s attempt=%s route=%s: %s",
+                        alert_id,
+                        extension,
+                        len(contact_targets),
+                        phone_format,
+                        user_agent or "unknown",
+                        attempt_label,
+                        capabilities.get("routing_mode", "endpoint_fanout"),
+                        result,
+                    )
+                    if print_results:
+                        print(
+                            f"{extension}: success endpoint fan-out contacts={len(contact_targets)} "
+                            f"format={phone_format} ({attempt_label})"
+                        )
+                except Exception as exc:
+                    failures.append(f"{extension}/{phone_format}: endpoint fan-out: {exc}")
+                    logging.error(
+                        "Failed endpoint-fan-out SIP NOTIFY %s extension=%s format=%s attempt=%s: %s",
+                        alert_id,
+                        extension,
+                        phone_format,
+                        attempt_label,
+                        exc,
+                    )
+                    if print_results:
+                        print(f"{extension}: failed endpoint fan-out format={phone_format} ({attempt_label}) - {exc}")
+            continue
+
+        if contact_targets:
+            format_results = {}
+            for contact_uri, phone_format, contact_user_agent in contact_targets:
+                result_state = format_results.setdefault(phone_format, {"successes": 0, "failures": []})
+                try:
+                    xml_payload = payload_builder(phone_format)
+                    result = send_notify(ami, contact_uri, xml_payload, phone_format, "URI")
+                    result_state["successes"] += 1
+                    successes += 1
+                    logging.info(
+                        "Pushed SIP NOTIFY %s to contact %s extension=%s format=%s user_agent=%s attempt=%s: %s",
+                        alert_id,
+                        contact_uri,
+                        extension,
+                        phone_format,
+                        contact_user_agent or user_agent or "unknown",
+                        attempt_label,
+                        result,
+                    )
+                    if print_results:
+                        print(f"{extension}: success contact={contact_uri} format={phone_format} ({attempt_label})")
+                except Exception as exc:
+                    result_state["failures"].append((contact_uri, str(exc)))
+
+            for phone_format, result_state in format_results.items():
+                contact_failures = result_state["failures"]
+                if not contact_failures:
+                    continue
+                for contact_uri, error in contact_failures:
+                    failures.append(f"{extension}/{phone_format}/{contact_uri}: {error}")
+                    logging.error(
+                        "Failed SIP NOTIFY %s to contact %s extension=%s format=%s user_agent=%s attempt=%s: %s",
+                        alert_id,
+                        contact_uri,
+                        extension,
+                        phone_format,
+                        user_agent or "unknown",
+                        attempt_label,
+                        error,
+                    )
+                    if print_results:
+                        print(f"{extension}: failed contact={contact_uri} format={phone_format} ({attempt_label}) - {error}")
+            continue
+
+        formats = info.get("formats") or [info.get("format", "yealink")]
         for phone_format in formats:
             try:
                 xml_payload = payload_builder(phone_format)
-                result = send_notify(ami, extension, xml_payload, phone_format)
+                result = send_notify(ami, extension, xml_payload, phone_format, "Endpoint")
                 successes += 1
                 logging.info("Pushed SIP NOTIFY %s to %s format=%s user_agent=%s attempt=%s: %s", alert_id, extension, phone_format, user_agent or "unknown", attempt_label, result)
                 if print_results:
@@ -1242,7 +1518,7 @@ def push_alert(config, alert, print_results=False, retries=True, targets=None, a
         config["ami"].get("username", "slsmassnotify"),
         config["ami"].get("password", ""),
     ) as ami:
-        endpoint_info = get_registered_endpoint_info(ami, targets, endpoint_format_overrides(config))
+        endpoint_info = get_registered_endpoint_info(ami, targets, endpoint_format_overrides(config), resolve_contact_uris=True)
         extensions = sorted(endpoint_info.keys())
         phone_formats = endpoint_format_summary(endpoint_info)
         logging.info("Pushing %s alert %s priority=%s to %d registered endpoints formats=%s", event, alert_id, priority, len(extensions), phone_formats)
@@ -1281,7 +1557,7 @@ def push_announcement(config, message, targets, print_results=True, api_publish=
         config["ami"].get("username", "slsmassnotify"),
         config["ami"].get("password", ""),
     ) as ami:
-        endpoint_info = get_registered_endpoint_info(ami, targets, endpoint_format_overrides(config))
+        endpoint_info = get_registered_endpoint_info(ami, targets, endpoint_format_overrides(config), resolve_contact_uris=True)
         extensions = sorted(endpoint_info.keys())
         phone_formats = endpoint_format_summary(endpoint_info)
         logging.info("Pushing SIP NOTIFY announcement %s to %d registered endpoints formats=%s", alert_id, len(extensions), phone_formats)
@@ -1363,12 +1639,16 @@ def main():
     parser.add_argument("--api-only", action="store_true", help="Publish announcement to the desktop API journal without sending SIP NOTIFY")
     parser.add_argument("--list-endpoints-json", action="store_true", help="Print registered endpoint vendor detection as JSON and exit")
     parser.add_argument("--ami-health-json", action="store_true", help="Authenticate to AMI, issue Ping, and print a JSON health result")
+    parser.add_argument("--notify-capabilities-json", action="store_true", help="Print adaptive Asterisk SIP NOTIFY routing capabilities and exit")
     parser.add_argument("--no-retry", action="store_true", help="Do not send delayed visual retries")
     args = parser.parse_args()
 
     try:
         config = load_config()
         setup_logging(config["logging"].get("log_file", "/var/log/sls_mass_notify_push.log"))
+        if args.notify_capabilities_json:
+            print(json.dumps(pjsip_notify_capabilities(), sort_keys=True))
+            return 0
         if args.ami_health_json:
             with AmiClient(
                 config["ami"].get("host", "127.0.0.1"),
@@ -1380,13 +1660,30 @@ def main():
                 if response.get("Response", "").lower() != "success" or response.get("Ping", "").lower() != "pong":
                     raise RuntimeError(response.get("Message", "AMI Ping failed"))
                 contact_response, _ = ami.action({"Action": "PJSIPShowContacts"})
-                if contact_response.get("Response", "").lower() != "success":
+                contact_status = "authorized"
+                if ami_response_is_empty_contact_inventory(contact_response):
+                    contact_status = "authorized_empty"
+                elif contact_response.get("Response", "").lower() != "success":
                     raise RuntimeError(contact_response.get("Message", "AMI PJSIPShowContacts authorization failed"))
+                notify_probe = "__sls_capability_probe__"
+                notify_response, _ = ami.action({
+                    "Action": "PJSIPNotify",
+                    "Endpoint": notify_probe,
+                    "Variable": ["Event=sls-capability-probe"],
+                })
+                if (
+                    notify_response.get("Response", "").lower() != "success"
+                    and not ami_response_is_missing_probe_endpoint(notify_response, notify_probe)
+                ):
+                    raise RuntimeError(
+                        notify_response.get("Message", "AMI PJSIPNotify authorization probe returned an unexpected result")
+                    )
                 print(json.dumps({
                     "status": "ok",
                     "ami": "authenticated",
                     "ping": "pong",
-                    "pjsip_show_contacts": "authorized",
+                    "pjsip_show_contacts": contact_status,
+                    "pjsip_notify": "authorized",
                 }, sort_keys=True))
             return 0
         if args.list_endpoints_json:

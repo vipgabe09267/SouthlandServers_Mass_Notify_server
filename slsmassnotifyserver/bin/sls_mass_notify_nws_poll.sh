@@ -26,8 +26,6 @@ PIPER_MAX_SECONDS="30"
 SEEN_ALERTS="${SEEN_ALERTS:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/seen_alerts.txt}"
 PROCESSED_ALERTS="${PROCESSED_ALERTS:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/processed_alert_keys.txt}"
 AUDIO_DELIVERED_ALERTS="${AUDIO_DELIVERED_ALERTS:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/audio_delivered_alert_keys.txt}"
-EVENT_COOLDOWN_FILE="${EVENT_COOLDOWN_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/event_cooldowns.txt}"
-COOLDOWN_HOURS=6
 LOG="${LOG:-/var/log/sls_mass_notify.log}"
 EVENTS_LOG="${EVENTS_LOG:-/var/log/sls_mass_notify_events.jsonl}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-90}"
@@ -38,6 +36,7 @@ BRANDED_DISCORD_SCRIPT="${BRANDED_DISCORD_SCRIPT:-/usr/local/bin/sls_mass_notify
 STATUS_FILE="${STATUS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/status.json}"
 FAULT_STATE_FILE="${FAULT_STATE_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/fault.state}"
 SPOOL="/var/spool/asterisk/outgoing"
+SPOOL_TMP="/var/spool/asterisk/tmp"
 TEST_PAYLOAD="${TEST_PAYLOAD:-}"
 FORCE_REPLAY="${FORCE_REPLAY:-0}"
 NWS_ALERTS_DRY_RUN="${NWS_ALERTS_DRY_RUN:-0}"
@@ -248,6 +247,11 @@ report_fault() {
     "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$event")" \
     "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$alert_id")")"
 
+  if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
+    echo "$(date): Dry run fault recorded locally; external fault email was skipped — ${stage}: ${message}" >> "$LOG"
+    return 1
+  fi
+
   fault_key="${stage}|${message}|${event}|${alert_id}"
   if [ -r "$FAULT_STATE_FILE" ] && [ "$(cat "$FAULT_STATE_FILE" 2>/dev/null)" = "$fault_key" ]; then
     return 1
@@ -426,6 +430,7 @@ SUPPORTED_NWS_EVENTS_DEFAULT=(
   "Ice Storm Warning"
   "High Wind Warning"
   "High Wind Watch"
+  "Heat Advisory"
   "Excessive Heat Warning"
   "Extreme Heat Warning"
   "Extreme Heat Watch"
@@ -833,7 +838,7 @@ queue_audio_to_recipients() {
   for recipient in "${NWS_ALERT_RECIPIENTS[@]}"; do
     recipient="$(printf '%s' "$recipient" | tr -dc '0-9')"
     [ -n "$recipient" ] || continue
-    callfile=$(mktemp /tmp/sls_alert_XXXXXX.call)
+    callfile=$(mktemp "$SPOOL_TMP/sls_alert_XXXXXX.call")
     cat > "$callfile" << CALL
 Channel: Local/${recipient}@${SLS_AUDIO_CONTEXT}
 CallerID: "${SLS_CALLERID_NAME}" <${SLS_CALLERID_NUM}>
@@ -863,25 +868,6 @@ CALL
 
   echo "$(date): Alert call files queued for $event to $queued recipient(s) — ${sound_sequence}" >> "$LOG"
   return 0
-}
-
-get_event_cooldown_ts() {
-  local event_key="$1"
-
-  awk -F: -v event_key="$event_key" '$1 == event_key { ts = $2 } END { print ts }' "$EVENT_COOLDOWN_FILE" 2>/dev/null
-}
-
-set_event_cooldown_ts() {
-  local event_key="$1"
-  local timestamp="$2"
-  local tmp_file
-
-  tmp_file="$(mktemp /var/tmp/sls_event_cooldowns.XXXXXX)"
-  awk -F: -v event_key="$event_key" '$1 != event_key { print }' "$EVENT_COOLDOWN_FILE" 2>/dev/null > "$tmp_file" || true
-  printf '%s:%s\n' "$event_key" "$timestamp" >> "$tmp_file"
-  mv "$tmp_file" "$EVENT_COOLDOWN_FILE"
-  chmod 0640 "$EVENT_COOLDOWN_FILE" 2>/dev/null || true
-  chown asterisk:asterisk "$EVENT_COOLDOWN_FILE" 2>/dev/null || true
 }
 
 if [ "${NWS_ALERTS_ENABLED:-1}" != "1" ]; then
@@ -1037,6 +1023,23 @@ touch "$SEEN_ALERTS" "$PROCESSED_ALERTS" "$AUDIO_DELIVERED_ALERTS"
 chmod 0640 "$SEEN_ALERTS" "$PROCESSED_ALERTS" "$AUDIO_DELIVERED_ALERTS" 2>/dev/null || true
 chown asterisk:asterisk "$SEEN_ALERTS" "$PROCESSED_ALERTS" "$AUDIO_DELIVERED_ALERTS" 2>/dev/null || true
 
+# v0.0.7 recorded unsupported Heat Advisory chains as fully processed. Remove
+# those stale records once when upgrading so an active advisory can be
+# delivered now that it is a supported event.
+DEDUP_MIGRATION_FILE="${PROCESSED_ALERTS}.v008-migrated"
+if [ ! -f "$DEDUP_MIGRATION_FILE" ]; then
+  for dedup_file in "$SEEN_ALERTS" "$PROCESSED_ALERTS"; do
+    migration_tmp="${dedup_file}.migration.$$"
+    grep -v '^Heat Advisory|' "$dedup_file" > "$migration_tmp" 2>/dev/null || true
+    chown asterisk:asterisk "$migration_tmp" 2>/dev/null || true
+    chmod 0640 "$migration_tmp" 2>/dev/null || true
+    mv -f "$migration_tmp" "$dedup_file"
+  done
+  printf '%s\n' "Heat Advisory support migration completed $(timestamp_now)" > "$DEDUP_MIGRATION_FILE"
+  chown asterisk:asterisk "$DEDUP_MIGRATION_FILE" 2>/dev/null || true
+  chmod 0640 "$DEDUP_MIGRATION_FILE" 2>/dev/null || true
+fi
+
 # Keep dedup state bounded without erasing active alert-chain history.
 for dedup_file in "$SEEN_ALERTS" "$PROCESSED_ALERTS" "$AUDIO_DELIVERED_ALERTS"; do
   if [ "$(wc -l < "$dedup_file" 2>/dev/null || echo 0)" -gt 5000 ]; then
@@ -1067,13 +1070,13 @@ if [ -n "$TEST_PAYLOAD" ]; then
 else
 	ALERTS=$(curl -fsS --retry 3 --retry-all-errors --retry-connrefused --connect-timeout 10 --max-time 30 --max-filesize 10485760 \
     -H "Accept: application/geo+json" \
-    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.0.7-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
+    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.0.8-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
     "${NWS_API_BASE_URL%/}/alerts/active?zone=${NWS_ZONE}&status=actual" 2>>"$LOG") || ALERTS=""
   if [ -z "$ALERTS" ]; then
     echo "$(date): Initial NWS request failed; retrying over IPv4" >> "$LOG"
 	  ALERTS=$(curl -4 -fsS --retry 2 --retry-all-errors --retry-connrefused --connect-timeout 10 --max-time 30 --max-filesize 10485760 \
       -H "Accept: application/geo+json" \
-	    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.0.7-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
+	    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.0.8-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
       "${NWS_API_BASE_URL%/}/alerts/active?zone=${NWS_ZONE}&status=actual" 2>>"$LOG") || ALERTS=""
   fi
 fi
@@ -1285,17 +1288,6 @@ printf '%s\n' "$PARSED_ALERTS" | while IFS=$'\t' read -r ALERT_ID EVENT SEVERITY
     echo "$(date): Quiet hours active — paging suppressed for '$EVENT' (not configured as critical)" >> "$LOG"
   fi
 
-	NOW_TS_VAL="$(date +%s)"
-	EVENT_SAFE_VAL="$(printf '%s' "$EVENT" | sha256sum | awk '{print $1}')"
-	LAST_EVENT_TS="$(get_event_cooldown_ts "$EVENT_SAFE_VAL")"
-	if [ "$MSG_TYPE" = "Update" ] && [[ "$LAST_EVENT_TS" =~ ^[0-9]+$ ]]; then
-	  DIFF_VAL=$((NOW_TS_VAL - LAST_EVENT_TS))
-	  if [ "$DIFF_VAL" -lt $((COOLDOWN_HOURS * 3600)) ]; then
-	    echo "$(date): Skipping $EVENT - already paged recently" >> "$LOG"
-      [ "$FORCE_REPLAY" = "1" ] || mark_processed_alert "$ALERT_KEY"
-      continue
-    fi
-  fi
   echo "$(date): New alert — Event: $EVENT | Severity: $SEVERITY | Type: $MSG_TYPE" >> "$LOG"
 
   AUDIO_LABEL="Piper TTS"
@@ -1318,7 +1310,6 @@ printf '%s\n' "$PARSED_ALERTS" | while IFS=$'\t' read -r ALERT_ID EVENT SEVERITY
       "$(json_string "$EVENT")" \
       "$(json_string "Skipped ${EVENT}; event is not enabled in supported NWS event list.")" \
       "$(json_string "$ALERT_ID")")"
-    [ "$FORCE_REPLAY" = "1" ] || mark_processed_alert "$ALERT_KEY"
     continue
   fi
 
@@ -1449,7 +1440,6 @@ ${QUIET_NOTE}"
     continue
   fi
   if [ "$NWS_ALERTS_DRY_RUN" != "1" ]; then
-    set_event_cooldown_ts "$EVENT_SAFE_VAL" "$NOW_TS_VAL"
     [ "$FORCE_REPLAY" = "1" ] || mark_processed_alert "$ALERT_KEY"
     clear_audio_delivered "$ALERT_KEY"
   fi

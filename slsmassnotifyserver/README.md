@@ -10,7 +10,21 @@ An AGPL-3.0 FreePBX 17 module for phone, desktop, weather, lightning, and audio-
 
 Configuration lives in one protected, portable `.config` file outside the module tree. Weather.gov routing, optional Xweather lightning detection, announcement groups, API access, email and Discord delivery, tones, voices, and retention settings are managed from FreePBX.
 
-Current release: `0.0.7-beta`. This is beta software; test it on a non-critical FreePBX system before depending on it for emergency notifications.
+Current release: `0.0.8-beta`. This is beta software; test it on a non-critical FreePBX system before depending on it for emergency notifications.
+
+## 0.0.8 Highlights
+
+- Heat Advisories and first-seen NWS update chains are no longer discarded by the deduplication safeguards.
+- Weather and Lightning tests wait for Asterisk call completion and SIP NOTIFY submission, show actionable failures in FreePBX, and do not send test email or Discord messages.
+- SIP NOTIFY uses portable endpoint fan-out for normal same-vendor registrations. Mixed-vendor contacts use per-contact URI routing only when Asterisk has a usable default outbound endpoint.
+- Sangoma P- and S-series paging uses the documented `intercom` auto-answer header.
+- Repair, uninstall, and protected config replacement show live progress in the Danger Zone.
+- The release installer stages and validates the module before activation, repairs AMI integration when possible, removes partial integration before rollback, and restores the previous module and protected configuration after a failed upgrade.
+- The installer detects Asterisk paging functions that are present but not loaded, loads their matching providers before activation, and rechecks them after FreePBX reload. If a provider such as `res_pjsip_header_funcs.so` is missing or cannot register, the installer can resolve the Debian package that owns the active Asterisk module path, reinstall that exact installed package version without upgrading Asterisk, and retry the capability. It defers package repair while calls are active and will not mix packaged modules into an unowned/custom Asterisk build.
+- Local module signing uses the web account, web root, and GPG home reported by the installed FreePBX system instead of assuming a fixed service account or keyring path. Install, update, repair, and uninstall operations share a maintenance lock, and each signature is published only after FreePBX verifies it successfully.
+- Fresh installation verifies or enables the required Framework, Dashboard, and System Recordings modules, tests both local HTTP and HTTPS paths, and validates the installed Apache, AMI, audio, TTS, API, cron, and Dashboard integration before reporting success.
+- Empty PBXs are accepted: an authenticated Asterisk 22 `No Contacts found` result is treated as an authorized empty inventory, while real AMI authentication and permission errors still stop installation.
+- Normal uninstall now restores its preserved central configuration, backups, and uploaded tones if cleanup exits early.
 
 ## What It Installs
 
@@ -62,7 +76,7 @@ From the repository root:
 The package is written to:
 
 ```text
-dist/slsmassnotifyserver-0.0.7-beta.tgz
+dist/slsmassnotifyserver-0.0.8-beta.tgz
 ```
 
 ## Install
@@ -76,7 +90,7 @@ cd /tmp
 curl -fsSL -o sls-install.sh \
   https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/main/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.0.7-beta/slsmassnotifyserver-0.0.7-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.0.8-beta/slsmassnotifyserver-0.0.8-beta.tgz' \
 ./sls-install.sh
 ```
 
@@ -88,24 +102,24 @@ Expected module state:
 slsmassnotifyserver Enabled
 ```
 
-Custom/local FreePBX module signatures normally show as `Unknown`. That is acceptable for this beta package. `Altered` means the module should be signed again on that PBX.
+Custom/local FreePBX module signatures normally show as `Unknown`. That is acceptable for this beta package when `FreePBX::GPG()->verifyModule()` returns trusted status 129 with no details. `Altered`, `Unsigned`, or a failed verification means the local signature needs attention.
 
 ## Install From A Local `.tgz`
 
-Use this only if you already downloaded or built the release package and uploaded it to `/tmp/slsmassnotifyserver-0.0.7-beta.tgz` on the PBX.
+Use this only if you already downloaded or built the release package and uploaded it to `/tmp/slsmassnotifyserver-0.0.8-beta.tgz` on the PBX.
 
 ```bash
 cd /tmp
-tar -tzf /tmp/slsmassnotifyserver-0.0.7-beta.tgz >/dev/null
+tar -tzf /tmp/slsmassnotifyserver-0.0.8-beta.tgz >/dev/null
 curl -fsSL -o sls-install.sh \
   https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/main/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ=/tmp/slsmassnotifyserver-0.0.7-beta.tgz ./sls-install.sh
+SLS_MASS_NOTIFY_TGZ=/tmp/slsmassnotifyserver-0.0.8-beta.tgz ./sls-install.sh
 ```
 
 ## Uninstall
 
-This removes the FreePBX module, its Manager/AMI database user, runtime scripts, API folders, Apache state, sound symlinks, local signing artifacts, and temporary installer files. It then verifies that managed records and generated files are gone and that Dashboard and Framework remain trusted. If the FreePBX module repository is unavailable, the cleaned stock modules receive a temporary local signature so the UI remains usable; private signing material is deleted, and the uninstaller prints the later vendor-redownload command. Central config files under `/var/lib/asterisk/SLS_Mass_Notifications_Plugin` are preserved when present so the deployment can be restored later.
+This removes the FreePBX module, its Manager/AMI database user, runtime scripts, API folders, Apache state, bundled System Recordings, sound symlinks, Dashboard hook, local signing artifacts, and temporary installer files. It then verifies that managed records and generated files are gone and that Dashboard and Framework remain trusted. The uninstaller takes a protected temporary copy of the installed transactional signer before the module hook removes its normal copies. If the FreePBX module repository is unavailable, that copy signs the cleaned stock modules and is deleted before exit; older installations retain a compatibility fallback. Central config files under `/var/lib/asterisk/SLS_Mass_Notifications_Plugin` are preserved when present so the deployment can be restored later.
 
 ```bash
 cd /tmp
@@ -118,7 +132,7 @@ chmod +x sls-uninstall.sh
 ## Post-Install Check
 
 ```bash
-fwconsole ma list | egrep -i 'slsmassnotifyserver|dashboard|Module'
+fwconsole ma list | grep -Ei 'slsmassnotifyserver|dashboard|Module'
 asterisk -rx "dialplan show 1000@sls-alert-audio"
 asterisk -rx "dialplan show s@sls-alert-autoanswer"
 timeout 15 python3 /usr/local/bin/sls_mass_notify/sls_notify.py --ami-health-json
@@ -193,7 +207,7 @@ Control API:
 https://pbx.example.com/api/sls-mass-notify
 ```
 
-Desktop clients use their configured username and password. The live endpoint uses server-sent events with the same per-client targeting as the JSON endpoint, flushes its authenticated handshake through Apache immediately, supports `Last-Event-ID`, and asks clients to reconnect before the bounded PHP request ends. A desktop app should make a streaming HTTP request that can set the Basic `Authorization` header; the browser-only `EventSource` constructor cannot set that header. A legacy desktop that keeps requesting `/api/sipnotify/desktop` remains on the polling JSON fallback until that application is updated to use `/stream`. Notification records include flat presentation fields and a structured `presentation` object: Weather Alerts carry priority-derived background/header/accent/text colors, colored announcements retain the selected title and background, and Lightning publishes its branded warning color to the live desktop stream. Phone SIP NOTIFY payloads are pushed by Asterisk/PJSIP to registered endpoints, and the sender chooses the payload style from the detected endpoint vendor. The Control API is disabled by default and uses its own API key.
+Desktop clients use their configured username and password. The live endpoint uses server-sent events with the same per-client targeting as the JSON endpoint, flushes its authenticated handshake through Apache immediately, supports `Last-Event-ID`, and asks clients to reconnect before the bounded PHP request ends. A desktop app should make a streaming HTTP request that can set the Basic `Authorization` header; the browser-only `EventSource` constructor cannot set that header. A legacy desktop that keeps requesting `/api/sipnotify/desktop` remains on the polling JSON fallback until that application is updated to use `/stream`. Notification records include flat presentation fields and a structured `presentation` object: Weather Alerts carry priority-derived background/header/accent/text colors, colored announcements retain the selected title and background, and Lightning publishes its branded warning color to the live desktop stream. For one phone family on an extension, Asterisk sends the vendor payload by endpoint and fans it out using that endpoint's own transports and contacts. Mixed-vendor contacts on one extension require complete contact URIs plus a configured Asterisk default outbound endpoint; otherwise delivery stops with a clear error instead of sending the wrong XML to every phone. The Control API is disabled by default and uses its own API key.
 
 `Mass Notify > General Settings > Public PBX Hostname` is automatically detected and displayed read-only; it is not accepted from settings forms or Control API configuration patches. Phone Image Transport defaults to HTTP for legacy Yealink compatibility and can be changed to HTTPS when every target phone trusts the PBX certificate and supports its TLS configuration. Authenticated APIs remain HTTPS.
 
@@ -218,7 +232,7 @@ Log retention is configured in `Mass Notify > General Settings`; default retenti
 Useful checks after install are also listed above. The most common quick check is:
 
 ```bash
-fwconsole ma list | egrep -i 'slsmassnotifyserver|dashboard|Module'
+fwconsole ma list | grep -Ei 'slsmassnotifyserver|dashboard|Module'
 ```
 
 ## FAQ
@@ -273,7 +287,7 @@ Update availability is checked even when automatic installation is disabled. Gen
 
 ### Are all phone models guaranteed to display SIP NOTIFY payloads?
 
-No. The module implements documented XML families and detects registered-contact User-Agents, but actual behavior depends on model, firmware, XML push provisioning, SIP NOTIFY authentication, and HTTPS certificate trust. Use a manual format override when detection is wrong, choose **Yealink - Text Only** when a Yealink cannot retrieve an image, and test every target model before emergency use. The override manager also includes **Yealink - Color** and Panasonic KX. Unknown endpoints are flagged automatically but are not offered as a manual format. Mixed-vendor phones sharing one extension receive endpoint-level pushes and should be tested especially carefully.
+No. The module implements documented XML families and detects registered-contact User-Agents, but actual behavior depends on model, firmware, XML push provisioning, SIP NOTIFY authentication, and HTTPS certificate trust. Yealink XML push must be enabled on the handset or through provisioning; the PBX installer does not change phone firmware or provisioning. Use a manual format override when detection is wrong, choose **Yealink - Text Only** when a Yealink cannot retrieve an image, and test every target model before emergency use. The override manager also includes **Yealink - Color** and Panasonic KX. Unknown endpoints are flagged automatically but are not offered as a manual format. Use separate extensions for mixed vendors unless the PBX has a working default outbound endpoint for per-contact URI delivery.
 
 ### What happens during quiet hours?
 
@@ -299,9 +313,9 @@ The Lightning page presents that enabled/disabled state once beside the toggle. 
 
 One warning is sent when a storm first enters the radius. The warning uses Xweather's nearest-strike distance and reports it to one decimal mile (for example, 4.1 miles) rather than reading the configured radius as the strike distance. Additional strikes from that active cluster do not create repeat alerts. Two consecutive clear queries reset the state; an optional all-clear can be sent, and a later storm can then generate a new warning. Credentials remain only in the protected central config and are redacted from diagnostics and Control API responses. The UI links to the official Xweather key setup guide; see the [Xweather Lightning API documentation](https://www.xweather.com/docs/weather-api/endpoints/lightning).
 
-The Lightning system test has its own 60-second anti-spam cooldown. Test phone, audio, and email content is explicitly labeled **TEST ONLY** so a validation cannot be mistaken for a real lightning event. The saved Client Secret is masked in Lightning Alerts and can be revealed by an authenticated FreePBX administrator with the eye button; diagnostics and APIs never return it.
+The Lightning system test has its own 60-second anti-spam cooldown. Test phone, audio, and desktop content is explicitly labeled **TEST ONLY** so a validation cannot be mistaken for a real lightning event. Tests do not send email or Discord notifications. The saved Client Secret is masked in Lightning Alerts and can be revealed by an authenticated FreePBX administrator with the eye button; diagnostics and APIs never return it.
 
-Settings use FreePBX’s standard top-right **Apply Config** control. Saving a module form stages the protected central configuration and marks FreePBX for reload; the native config hook atomically applies it. Install and repair rebuild FreePBX Dashboard's stored hook index and verify that the announcement panel renders. A root maintenance check restores the managed Dashboard widget and menu placement after Dashboard or Framework replacement and corrects the central config to `0640 asterisk:asterisk` without rewriting its contents. The menu repair supports both the numeric comparator used by earlier Framework 17 builds and the boolean comparator introduced by Framework 17.0.30.
+Settings use FreePBX’s standard top-right **Apply Config** control. Saving a module form stages the protected central configuration and marks FreePBX for reload; the native config hook atomically applies it. Install and repair rebuild FreePBX Dashboard's stored hook index and verify that the announcement panel renders. A root maintenance check restores the managed Dashboard widget and menu placement after Dashboard or Framework replacement and corrects the central config to `0640 asterisk:asterisk` without rewriting its contents. Install, update, repair, and uninstall share the same root-owned maintenance lock so the minute worker cannot rewrite integration files during a deployment transaction. The menu repair supports both the numeric comparator used by earlier Framework 17 builds and the boolean comparator introduced by Framework 17.0.30.
 
 ### What do alert emails look like?
 
