@@ -97,7 +97,7 @@ def send_branded_discord(config, subject, body, event="", severity="", fields=No
     request = urllib.request.Request(
         webhook,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json", "User-Agent": "SouthlandServers-Mass-Notifications-Server/0.0.8-beta"},
+        headers={"Content-Type": "application/json", "User-Agent": "SouthlandServers-Mass-Notifications-Server/0.0.9-beta"},
         method="POST",
     )
     try:

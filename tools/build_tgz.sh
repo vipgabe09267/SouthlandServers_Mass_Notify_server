@@ -2,6 +2,7 @@
 set -euo pipefail
 
 umask 027
+export PYTHONDONTWRITEBYTECODE=1
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODULE="slsmassnotifyserver"
@@ -40,6 +41,14 @@ python3 "${ROOT_DIR}/tools/test_release_portability.py"
 bash "${ROOT_DIR}/tools/test_installer_asterisk_capabilities.sh"
 bash "${ROOT_DIR}/tools/test_local_signer.sh"
 bash "${ROOT_DIR}/tools/test_uninstaller_signer_snapshot.sh"
+php "${ROOT_DIR}/tools/test_scheduling_contract.php"
+python3 "${ROOT_DIR}/tools/test_announcement_display_timeout.py"
+php "${ROOT_DIR}/tools/test_desktop_announcement_expiry.php"
+php "${ROOT_DIR}/tools/test_email_sender_domain.php"
+python3 "${ROOT_DIR}/tools/test_email_sender_domain.py"
+python3 "${ROOT_DIR}/tools/test_xweather_manual_test_status.py"
+python3 "${ROOT_DIR}/tools/test_nws_alert_dedup.py"
+python3 "${ROOT_DIR}/tools/test_alert_worker_cli_safety.py"
 
 cmp -s "${ROOT_DIR}/tools/uninstall_release.sh" "${ROOT_DIR}/${MODULE}/bin/sls_mass_notify_uninstall.sh" || {
   printf 'Standalone and packaged uninstallers differ.\n' >&2
@@ -76,24 +85,34 @@ php -r '$xml = simplexml_load_file($argv[1]); if (!$xml || trim((string)$xml->ra
   "${ROOT_DIR}/${MODULE}/module.xml" "$MODULE" "$VERSION"
 
 if find "${ROOT_DIR}/${MODULE}" -type f \( \
-  -name 'module.sig' -o -name '*.pyc' -o -name '*.pyo' -o -name '*.bak*' \
-  -o -name '*.orig' -o -name '*.rej' -o -name '*~' -o -name '.DS_Store' \
-  -o -name '*.config' -o -name '*.pending.json' -o -name '*.onnx' -o -name '*.onnx.json' \
+  -name 'module.sig*' -o -name '*.pyc' -o -name '*.pyo' -o -name '*.bak*' \
+  -o -name '*.backup*' -o -name '*.old' -o -name '*.orig' -o -name '*.rej' \
+  -o -name '*.tmp' -o -name '*.swp' -o -name '*.swo' -o -name '*~' \
+  -o -name '.DS_Store' -o -name '.env' -o -name '.env.*' -o -name '.htpasswd' \
+  -o -name '*.log' -o -name '*.key' -o -name '*.pem' -o -name '*.p12' \
+  -o -name '*.pfx' -o -name '*.config' -o -name '*.pending.json' \
+  -o -name '*.onnx' -o -name '*.onnx.json' -o -name '*.ckpt' -o -name '*.model' \
+  -o -name '*.tgz' -o -name '*.tar' -o -name '*.tar.gz' -o -name '*.zip' \
 \) -print -quit | grep -q .; then
   printf 'Module tree contains a generated, private, cache, or backup artifact.\n' >&2
   exit 1
 fi
-if find "${ROOT_DIR}/${MODULE}" -type d -name '__pycache__' -print -quit | grep -q .; then
-  printf 'Module tree contains a Python cache directory.\n' >&2
+if find "${ROOT_DIR}/${MODULE}" -type d \( \
+  -name '__pycache__' -o -name '.cache' -o -name cache -o -name caches \
+  -o -name log -o -name logs -o -name backup -o -name backups \
+  -o -name generated -o -name rendered -o -name tmp \
+\) -print -quit | grep -q .; then
+  printf 'Module tree contains a generated, cache, log, or backup directory.\n' >&2
   exit 1
 fi
-if grep -RIlE 'ghp_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+' "${ROOT_DIR}/${MODULE}" "${ROOT_DIR}/tools" | grep -q .; then
-  printf 'A GitHub credential pattern was found in release source.\n' >&2
+if grep -RIlE 'ghp_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|-----BEGIN ([A-Z0-9 ]+ )?PRIVATE KEY-----' "${ROOT_DIR}/${MODULE}" "${ROOT_DIR}/tools" | grep -q .; then
+  printf 'A credential or private-key pattern was found in release source.\n' >&2
   exit 1
 fi
 
 for required in \
   module.xml Slsmassnotifyserver.class.php install.php uninstall.php \
+  page.slsmassnotifyserver_scheduling.php views/scheduling.php \
   page.slsmassnotifyserver_lightning.php views/lightning.php \
   api/sipnotify/index.php \
   dashboard/sections/SlsMassNotifyAnnouncement.class.php \
@@ -103,6 +122,7 @@ for required in \
   bin/sls_mass_notify/sls_branded_discord.py \
   bin/sls_mass_notify_nws_poll.sh bin/sls_mass_notify_test.sh \
   bin/sls_mass_notify_weather_poll.sh \
+  bin/sls_mass_notify_schedule_worker.php \
   bin/sls_mass_notify/sls_mass_notify_xweather_poll.py \
   bin/sls_mass_notify_update.sh bin/sls_mass_notify_maintenance.sh \
   bin/sls_mass_notify_uninstall.sh \

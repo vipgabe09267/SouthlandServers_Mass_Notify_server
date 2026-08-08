@@ -8,8 +8,9 @@ Security fixes are currently targeted at the latest beta release candidate only.
 
 | Version | Supported |
 | --- | --- |
-| `0.0.8-beta` | Yes |
-| `0.0.7-beta` | Security fixes only |
+| `0.0.9-beta` | Yes |
+| `0.0.8-beta` | No |
+| `0.0.7-beta` | No |
 | `0.0.6-beta` | No |
 | `0.0.5-beta` | No |
 | `0.0.4-beta` | No |
@@ -57,10 +58,11 @@ Credentials are generated on fresh installs and preserved during normal updates.
 - Review notification logs regularly and configure retention according to local policy.
 - Validate uploaded tones and images through the module UI instead of placing arbitrary files in runtime directories.
 - Back up the central `.config` file securely; it contains operational settings and credentials.
+- Authorize the configured alert sender domain in the site's mail relay and DNS policy, and monitor delivery failures rather than assuming a locally accepted message reached its recipient.
 
 ## Security Boundaries
 
-The desktop notification API and Control API are intended for authenticated clients only. Desktop app clients use per-client usernames and passwords over HTTPS. The primary transport is the live server-sent-event handshake; the JSON endpoint remains a fallback. Both filter event records by explicit desktop routing fields, and legacy untargeted records are denied. The Control API is disabled by default, uses constant-time key comparison, supports optional IPv4/IPv6 allowlisting and rate limiting, records a bounded audit trail, limits JSON request size, and never returns stored secrets in config responses.
+The desktop notification API and Control API are intended for authenticated clients only. Desktop app clients use per-client usernames and passwords over HTTPS. The primary transport is the live server-sent-event handshake; the JSON endpoint remains a fallback. Both filter event records by explicit desktop routing fields, and legacy untargeted records are denied. An expired authorized event advances the SSE cursor without being emitted, preventing it from hiding the next valid targeted record. The Control API is disabled by default, uses constant-time key comparison, supports optional IPv4/IPv6 allowlisting and rate limiting, records a bounded audit trail, limits JSON request size, and never returns stored secrets in config responses.
 
 FreePBX UI mutations use a module CSRF token. Uploaded tones are size-limited and decoded/re-encoded by SoX; imported config files are size-limited and schema-validated before staging. Weather, Xweather, and announcement text is passed to subprocesses as argument arrays or shell-escaped values, and ImageMagick text metacharacters are neutralized before rendering. Xweather request fields are URL-encoded, TLS verification and bounded retries are enabled, and the client ID/secret are stored only in the protected `mass-notifications.config` file and are neither logged nor returned by the Control API.
 
@@ -68,7 +70,11 @@ Default-on adaptive Lightning protection reads credential-free, short-lived Weat
 
 Public PBX Hostname is automatically detected and exposed read-only in administrator forms; it is not accepted as a Control API configuration mutation. Successful loopback `get_config` and `get_status` health probes are omitted from the API usage audit, while authentication failures, non-loopback requests, and meaningful local actions continue through the normal audit controls.
 
+Alert email uses the canonical `mail_from_domain` stored in the protected central config and fixes the complete sender to `no-reply@<domain>`. The UI, config import, and Control API accept DNS hostnames only; schemes, mailbox addresses, IP literals, malformed labels, and control characters are rejected. An older valid `mail_from_addr` supplies the migration domain when the canonical setting is absent. This setting does not configure or secure Postfix, an SMTP relay, SPF, DKIM, DMARC, PTR/reverse DNS, or any other DNS/mail infrastructure.
+
 Settings participate in FreePBX’s native Apply Config hook and remain staged in a protected Asterisk-owned file until reload. The root maintenance worker compares only the managed Dashboard widget and menu integration files after FreePBX updates; when drift is detected it restores those known files from the installed module and refreshes local signatures. Install, update, repair, and uninstall operations use the same root-owned maintenance lock, preventing the minute worker from changing managed files during a deployment transaction. A maintenance-launched child reuses the inherited lock rather than opening a second transaction. These paths do not modify phone provisioning, PJSIP peers, or unrelated FreePBX module content.
+
+Scheduled-announcement definitions live in the protected central config, while the execution ledger is a separate Asterisk-owned `0640` state file. The worker claims an occurrence before submitting delivery and fails closed if its worker lock or ledger cannot be opened safely, favoring a missed page over an accidental duplicate. It revalidates the live schedule immediately before claiming delivery. Configuration imports and FreePBX restores disable imported schedules because the destination PBX does not inherit that execution history. A normal uninstall preserves the local ledger so reinstalling cannot replay a completed occurrence; an explicit purge removes it. Scheduling shares the normal announcement lock and cooldown and does not bypass recipient, audio, or SIP NOTIFY validation.
 
 Executable runtime under `/usr/local/bin/sls_mass_notify`, including Piper, maintenance, and updater code, is owned by `root:root`. Mutable deployment data remains under the Asterisk data folder. The root updater only accepts the official beta repository, requires GitHub release SHA-256 metadata, and executes the installer from the matching immutable release tag. Automatic updates remain disabled by default.
 
@@ -78,7 +84,7 @@ The module does not replace FreePBX system hardening. Firewall rules, TLS certif
 
 ## Dependency Security
 
-The installer uses Debian packages, creates a dedicated Piper virtual environment with pinned packaging tools and `piper-tts`, and downloads Piper voice models from a pinned repository revision with exact SHA-256 verification. Release TGZ paths and metadata are validated before extraction. Use a trusted network for installation, verify release checksums, and run installers only from the official project source.
+The installer detects native prerequisites and installs only missing Debian packages, creates a dedicated Piper virtual environment with pinned packaging tools and `piper-tts`, and downloads Piper voice models from a pinned repository revision with exact SHA-256 verification. It validates a loopback-only FreePBX AMI host/port, verifies required Asterisk modules will remain available after restart, refuses an unrelated `/usr/local/bin/piper` wrapper, and refuses conflicting reserved SLS System Recording ownership. Release TGZ paths and metadata are validated before extraction, while the build gate rejects credentials, private keys, models, logs, caches, backups, signatures, nested archives, and generated artifacts. Use a trusted network for installation, verify release checksums, and run installers only from the official project source.
 
 The project locally signs its custom module and the FreePBX modules containing managed integration files. The signer resolves the configured FreePBX web user, web root, spool path, and actual GPG home through FreePBX and the operating-system account database. It rejects unsafe paths, repairs ownership and restrictive modes in the selected keyring before importing trust, and serializes key and signature work with a root-owned lock. A new `module.sig` replaces the existing file only after exact FreePBX verification succeeds; otherwise the previous signature is restored. The signing key is generated on each PBX and trusted only in that PBX's FreePBX GPG home. This detects later local file alteration but is not a publisher-distributed release signature or a substitute for verifying the release download.
 

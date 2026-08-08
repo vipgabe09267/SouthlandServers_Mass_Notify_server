@@ -20,14 +20,17 @@ log() {
 }
 
 require_freepbx() {
-  [ "${EUID:-$(id -u)}" -eq 0 ] || {
+	local required_command
+	  [ "${EUID:-$(id -u)}" -eq 0 ] || {
     log "Run the uninstaller as root."
     exit 1
   }
-  command -v fwconsole >/dev/null || {
-    log "fwconsole not found. Run this inside the FreePBX machine."
-    exit 1
-  }
+	  for required_command in /usr/sbin/fwconsole /usr/sbin/asterisk /usr/bin/php /usr/bin/python3 /usr/bin/gpg /usr/bin/crontab /usr/bin/flock /usr/bin/readlink /usr/bin/timeout /usr/bin/base64 /usr/bin/sha256sum /usr/bin/systemctl /usr/bin/su; do
+	    [ -x "$required_command" ] || {
+	      log "Required uninstall prerequisite is unavailable: $required_command. No uninstall changes were made."
+	      exit 1
+	    }
+	  done
   [ -d /var/www/html/admin/modules ] || {
     log "/var/www/html/admin/modules not found. This does not look like a FreePBX server."
     exit 1
@@ -186,7 +189,7 @@ preserve_user_data() {
   [ "$PURGE_CONFIG" != "1" ] || return 0
   [ -d "$DATA_DIR" ] || return 0
   CONFIG_TMP="$(mktemp -d /tmp/slsmassnotifyserver-config.XXXXXX)"
-  for name in mass-notifications.config mass-notifications.pending.config; do
+  for name in mass-notifications.config mass-notifications.pending.config schedule-executions.json; do
     [ -f "$DATA_DIR/$name" ] && cp -p "$DATA_DIR/$name" "$CONFIG_TMP/$name"
   done
   [ -d "$DATA_DIR/config-backups" ] && cp -a "$DATA_DIR/config-backups" "$CONFIG_TMP/config-backups"
@@ -207,7 +210,7 @@ restore_user_data() {
     [ -d "$DATA_DIR/config-backups" ] && chmod 0750 "$DATA_DIR/config-backups" 2>/dev/null || true
     [ -d "$DATA_DIR/sounds" ] && chmod 0755 "$DATA_DIR/sounds" 2>/dev/null || true
     [ -d "$DATA_DIR/sounds/tones" ] && chmod 0755 "$DATA_DIR/sounds/tones" 2>/dev/null || true
-    find "$DATA_DIR" -maxdepth 1 -type f -name '*.config' -exec chmod 0640 {} + 2>/dev/null || true
+    find "$DATA_DIR" -maxdepth 1 -type f \( -name '*.config' -o -name 'schedule-executions.json' \) -exec chmod 0640 {} + 2>/dev/null || true
     find "$DATA_DIR/config-backups" -type f -exec chmod 0640 {} + 2>/dev/null || true
     find "$DATA_DIR/sounds/tones" -type f -name '*.wav' -exec chmod 0644 {} + 2>/dev/null || true
   fi
@@ -271,7 +274,7 @@ with open(path, "r", encoding="utf-8", errors="ignore") as handle:
     data = handle.read()
 data = re.sub(
     r"\n\s*\$final\[\$i\]\s*=\s*\$this->checkSlsMassNotify\(\);\s*"
-    r"\$final\[\$i\]\['title'\]\s*=\s*_\(\"Mass Notifications Plugin\"\);\s*\$i\+\+;\s*",
+    r"\$final\[\$i\]\['title'\]\s*=\s*_\(\"Mass Notifications (?:Plugin|Module)\"\);\s*\$i\+\+;\s*",
     "\n",
     data,
     flags=re.S,
@@ -355,28 +358,39 @@ PHP
 }
 
 remove_bundled_system_recordings() {
-  php -d pcre.jit=0 <<'PHP'
+  SLS_DATA_DIR="$DATA_DIR" php -d pcre.jit=0 <<'PHP'
 <?php
 $bootstrap_settings = ['freepbx_auth' => false, 'skip_astman' => true];
 require '/etc/freepbx.conf';
-$filenames = [
-    'custom/Paging_Tone_Opening',
-    'custom/Paging_Tone_Closing',
-    'custom/NWS_alert',
-    'custom/Lightning_alert',
+$dataDir = rtrim((string)getenv('SLS_DATA_DIR'), '/');
+$recordings = [
+    ['custom/SLS_Mass_Notify_Paging_Tone_Opening', '/var/lib/asterisk/sounds/en/custom/SLS_Mass_Notify_Paging_Tone_Opening.wav', $dataDir . '/sounds/tones/opening_Paging_Tone_Opening.wav', 'SLS Mass Notify - Paging Tone Opening', 'Default Southland Servers regular announcement opening tone.'],
+    ['custom/SLS_Mass_Notify_Paging_Tone_Closing', '/var/lib/asterisk/sounds/en/custom/SLS_Mass_Notify_Paging_Tone_Closing.wav', $dataDir . '/sounds/tones/closing_Paging_Tone_Closing.wav', 'SLS Mass Notify - Paging Tone Closing', 'Default Southland Servers regular announcement closing tone.'],
+    ['custom/SLS_Mass_Notify_NWS_Alert', '/var/lib/asterisk/sounds/en/custom/SLS_Mass_Notify_NWS_Alert.wav', $dataDir . '/sounds/tones/opening_NWS_alert.wav', 'SLS Mass Notify - NWS Alert', 'Default Southland Servers NWS alert opening tone.'],
+    ['custom/SLS_Mass_Notify_Lightning_Alert', '/var/lib/asterisk/sounds/en/custom/SLS_Mass_Notify_Lightning_Alert.wav', $dataDir . '/sounds/tones/opening_Lightning_alert.wav', 'SLS Mass Notify - Lightning Alert', 'Default Southland Servers cloud-to-ground lightning warning opening tone.'],
 ];
 $database = \FreePBX::Database();
-$statement = $database->prepare('DELETE FROM recordings WHERE filename = ?');
-foreach ($filenames as $filename) {
-    $statement->execute([$filename]);
+$lookup = $database->prepare('SELECT displayname, description FROM recordings WHERE filename = ? LIMIT 1');
+$delete = $database->prepare('DELETE FROM recordings WHERE filename = ?');
+foreach ($recordings as [$filename, $path, $tone, $name, $description]) {
+    $fileExists = is_file($path) && !is_link($path);
+    $toneHash = is_file($tone) ? @hash_file('sha256', $tone) : false;
+    $fileHash = $fileExists ? @hash_file('sha256', $path) : false;
+    $fileOwned = is_string($toneHash) && $toneHash !== '' && is_string($fileHash) && hash_equals($toneHash, $fileHash);
+    $lookup->execute([$filename]);
+    $row = $lookup->fetch(PDO::FETCH_ASSOC);
+    $rowOwned = is_array($row)
+        && hash_equals($name, (string)($row['displayname'] ?? ''))
+        && hash_equals($description, (string)($row['description'] ?? ''));
+    if ($rowOwned && (!$fileExists || $fileOwned)) {
+        $delete->execute([$filename]);
+    }
+    if ($fileOwned && (!is_array($row) || $rowOwned)) {
+        @unlink($path);
+    }
 }
 exit(0);
 PHP
-  rm -f \
-    /var/lib/asterisk/sounds/en/custom/Paging_Tone_Opening.wav \
-    /var/lib/asterisk/sounds/en/custom/Paging_Tone_Closing.wav \
-    /var/lib/asterisk/sounds/en/custom/NWS_alert.wav \
-    /var/lib/asterisk/sounds/en/custom/Lightning_alert.wav
 }
 
 verify_freepbx_cleanup() {
@@ -409,27 +423,6 @@ foreach ($candidates as $username) {
 }
 exit(0);
 PHP
-  php -d pcre.jit=0 <<'PHP'
-<?php
-$bootstrap_settings = ['freepbx_auth' => false, 'skip_astman' => true];
-require '/etc/freepbx.conf';
-$filenames = [
-    'custom/Paging_Tone_Opening',
-    'custom/Paging_Tone_Closing',
-    'custom/NWS_alert',
-    'custom/Lightning_alert',
-];
-$database = \FreePBX::Database();
-$statement = $database->prepare('SELECT COUNT(*) FROM recordings WHERE filename = ?');
-foreach ($filenames as $filename) {
-    $statement->execute([$filename]);
-    if ((int)$statement->fetchColumn() > 0) {
-        fwrite(STDERR, "Bundled System Recording remains after uninstall: {$filename}\n");
-        exit(1);
-    }
-}
-exit(0);
-PHP
 	  local stock_module
 	  for stock_module in dashboard framework; do
 	    [ -d "/var/www/html/admin/modules/$stock_module" ] || continue
@@ -453,11 +446,7 @@ PHP
     /var/lib/asterisk/sounds/SLS_Mass_Notifications_Plugin \
     /var/lib/asterisk/sounds/en/SLS_Mass_Notifications_Plugin \
     /var/www/html/admin/modules/dashboard/sections/SlsMassNotifyAnnouncement.class.php \
-    /var/www/html/admin/modules/dashboard/views/sections/sls-mass-notify-announcement.php \
-    /var/lib/asterisk/sounds/en/custom/Paging_Tone_Opening.wav \
-    /var/lib/asterisk/sounds/en/custom/Paging_Tone_Closing.wav \
-    /var/lib/asterisk/sounds/en/custom/NWS_alert.wav \
-    /var/lib/asterisk/sounds/en/custom/Lightning_alert.wav; do
+    /var/www/html/admin/modules/dashboard/views/sections/sls-mass-notify-announcement.php; do
     if [ -e "$artifact" ] || [ -L "$artifact" ]; then
       log "Uninstall verification failed; managed artifact remains: $artifact"
       return 1
@@ -473,7 +462,7 @@ PHP
     fi
   done
   if crontab -l 2>/dev/null | grep -Eq 'sls_mass_notify_(update|maintenance)\.sh' \
-    || crontab -u asterisk -l 2>/dev/null | grep -Eq 'sls_mass_notify_(weather_poll|nws_poll)\.sh'; then
+    || crontab -u asterisk -l 2>/dev/null | grep -Eq 'sls_mass_notify_(weather_poll|nws_poll)\.sh|sls_mass_notify_schedule_worker\.php'; then
     log "Uninstall verification failed; an SLS scheduled job remains."
     return 1
   fi
@@ -683,7 +672,7 @@ remove_cron() {
   for user in root asterisk; do
     tmp="$(mktemp /tmp/slsmassnotifyserver-cron.XXXXXX)"
     crontab -u "$user" -l 2>/dev/null \
-      | grep -vE 'sls_mass_notify_(weather_poll|nws_poll|update|maintenance)\.sh|nwsalerts_ensure_menu_patch\.sh' > "$tmp" || true
+      | grep -vE 'sls_mass_notify_(weather_poll|nws_poll|update|maintenance)\.sh|sls_mass_notify_schedule_worker\.php|nwsalerts_ensure_menu_patch\.sh' > "$tmp" || true
     crontab -u "$user" "$tmp" 2>/dev/null || true
     rm -f "$tmp"
   done

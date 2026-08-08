@@ -1,7 +1,11 @@
 Southland Servers Mass Notifications Server - SIP NOTIFY Phone Formats
 ====================================================================
 
-This beta exposes one authenticated desktop JSON endpoint under:
+This beta exposes a primary authenticated live desktop stream under:
+
+    https://<pbx-host>/api/sipnotify/desktop/stream
+
+The stream is a server-sent-event login handshake with per-client targeting. The authenticated JSON endpoint remains available as a compatibility fallback:
 
     https://<pbx-host>/api/sipnotify/desktop
 
@@ -26,7 +30,7 @@ Mixed phone formats on one extension require a distinct full contact URI for eve
 Implemented format families
 ---------------------------
 
-- Desktop: JSON event records for the SLS Mass Notify desktop/client app.
+- Desktop: authenticated live SSE event records for the SLS Mass Notify desktop/client app, with the JSON route retained as a fallback. Expired authorized events advance the stream cursor without being emitted so the next valid targeted event is not skipped.
 - Yealink: Yealink XML Browser `YealinkIPPhoneTextScreen` and generated `YealinkIPPhoneImageScreen` payloads. NWS color alerts and the Dashboard colored-announcement Labs feature use this image format. The `yealink_text` override avoids image retrieval on models that cannot load the hosted PNG. Yealink's SIP-NOTIFY XML push control is disabled by default on some firmware and must be enabled on the handset or through provisioning; this PBX module does not change phone provisioning.
 - Cisco Multiplatform/3PCC: an `XML-Service` SIP NOTIFY containing `CiscoIPPhoneExecute`, which directs the phone to a randomized hosted `CiscoIPPhoneText` document. Cisco documents a 401 digest challenge for this event; the endpoint/firmware must be provisioned so Asterisk can satisfy that authentication requirement.
 - Snom: Snom XML Minibrowser `SnomIPPhoneText` payloads.
@@ -47,4 +51,4 @@ Hardware testing requirement
 
 Vendor XML documentation describes object shapes, but it does not guarantee that every firmware accepts those objects through an unsolicited SIP NOTIFY. Actual behavior depends on phone model, firmware, XML browser/push configuration, authentication settings, HTTPS trust, and whether the phone accepts a push while idle or in-call. An AMI `PJSIPNotify` success means Asterisk queued the request; it does not prove that the handset displayed it.
 
-For mixed-vendor contacts sharing one extension, 0.0.8 uses contact-specific URI delivery only after proving that every contact is addressable and Asterisk has a usable default outbound endpoint. Separate extensions remain the recommended and easiest-to-diagnose arrangement.
+For mixed-vendor contacts sharing one extension, the module uses contact-specific URI delivery only after proving that every contact is addressable and Asterisk has a usable default outbound endpoint. Separate extensions remain the recommended and easiest-to-diagnose arrangement.

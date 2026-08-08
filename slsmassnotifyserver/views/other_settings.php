@@ -29,6 +29,15 @@ $formatLabels = [
 	'ale' => _('Alcatel-Lucent Enterprise'), 'panasonic' => _('Panasonic KX Series'),
 ];
 $notificationEmails = preg_split('/[\s,;]+/', trim((string)($settings['mail_to'] ?? '')), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+$mailFromDomain = strtolower(trim((string)($settings['mail_from_domain'] ?? '')));
+$mailFromAddress = strtolower(trim((string)($settings['mail_from_addr'] ?? '')));
+if ($mailFromDomain === '' && strpos($mailFromAddress, '@') !== false) {
+	$mailFromDomain = substr($mailFromAddress, strrpos($mailFromAddress, '@') + 1);
+}
+if ($mailFromDomain === '') {
+	$mailFromDomain = 'localhost.localdomain';
+}
+$mailFromAddress = 'no-reply@' . $mailFromDomain;
 $csrfToken = (string)($csrf_token ?? '');
 foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension => $format) {
 	$extension = preg_replace('/[^0-9]/', '', (string)$extension);
@@ -205,7 +214,30 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 				</div>
 				<div class="modal fade sls-manager-modal" id="sls-notification-manager" tabindex="-1" role="dialog" aria-hidden="true"><div class="modal-dialog"><div class="modal-content">
 					<div class="modal-header"><button type="button" class="close" data-dismiss="modal"><span>&times;</span></button><h4 class="modal-title"><?php echo _('Notification Destinations'); ?></h4></div>
-					<div class="modal-body"><input type="hidden" name="mail_recipients_present" value="1"><h4><?php echo _('Email Recipients'); ?></h4><p class="text-muted"><?php echo _('Each address receives the branded Southland Servers alert card with its plain-text alternative.'); ?></p><div id="sls-email-editor-list"><?php foreach ($notificationEmails as $emailIndex => $email) { ?><div class="sls-editor-row" data-email-row><div class="sls-editor-grow"><input class="form-control" type="email" name="mail_recipients[]" value="<?php echo htmlspecialchars($email); ?>" placeholder="alerts@example.com"></div><button type="button" class="btn btn-link text-danger" data-remove-email><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div><?php } ?></div><button type="button" class="btn btn-default btn-sm" id="sls-add-email"><i class="fa fa-plus"></i> <?php echo _('Add Email'); ?></button><hr><div class="form-group"><label for="sls-discord-webhook"><?php echo _('Discord Webhook'); ?></label><div class="input-group"><input class="form-control" id="sls-discord-webhook" name="discord_webhook_url" type="password" value="<?php echo htmlspecialchars($settings['discord_webhook_url'] ?? ''); ?>" autocomplete="off" placeholder="https://discord.com/api/webhooks/..."><span class="input-group-btn"><button type="button" class="btn btn-default" data-toggle-secret title="<?php echo htmlspecialchars(_('Show or hide webhook')); ?>"><i class="fa fa-eye"></i></button></span></div><p class="help-block"><?php echo _('Optional. Leave blank to disable Discord delivery.'); ?></p></div><div class="well" style="margin-bottom:0"><strong><?php echo _('Email From'); ?>:</strong> <?php echo htmlspecialchars($settings['mail_from_name'] ?? 'SLS Mass Notification System'); ?> &lt;<?php echo htmlspecialchars($settings['mail_from_addr'] ?? ('no-reply@' . ($_SERVER['HTTP_HOST'] ?? 'localhost.localdomain'))); ?>&gt;</div></div>
+					<div class="modal-body">
+						<input type="hidden" name="mail_recipients_present" value="1">
+						<h4><?php echo _('Email Recipients'); ?></h4>
+						<p class="text-muted"><?php echo _('Each address receives the branded Southland Servers alert card with its plain-text alternative.'); ?></p>
+						<div id="sls-email-editor-list">
+							<?php foreach ($notificationEmails as $emailIndex => $email) { ?><div class="sls-editor-row" data-email-row><div class="sls-editor-grow"><input class="form-control" type="email" name="mail_recipients[]" value="<?php echo htmlspecialchars($email); ?>" placeholder="alerts@example.com"></div><button type="button" class="btn btn-link text-danger" data-remove-email><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div><?php } ?>
+						</div>
+						<button type="button" class="btn btn-default btn-sm" id="sls-add-email"><i class="fa fa-plus"></i> <?php echo _('Add Email'); ?></button>
+						<hr>
+						<div class="form-group">
+							<label for="sls-mail-from-domain"><?php echo _('Email Sender Domain'); ?></label>
+							<div class="input-group">
+								<span class="input-group-addon">no-reply@</span>
+								<input class="form-control" id="sls-mail-from-domain" name="mail_from_domain" type="text" value="<?php echo htmlspecialchars($mailFromDomain); ?>" maxlength="253" autocomplete="off" spellcheck="false" placeholder="example.com">
+							</div>
+							<p class="help-block"><?php echo _('Changes the sender identity used by module alert email. Enter a DNS domain only; this does not configure Postfix, a relay, SPF, DKIM, DMARC, or reverse DNS.'); ?></p>
+						</div>
+						<div class="form-group">
+							<label for="sls-discord-webhook"><?php echo _('Discord Webhook'); ?></label>
+							<div class="input-group"><input class="form-control" id="sls-discord-webhook" name="discord_webhook_url" type="password" value="<?php echo htmlspecialchars($settings['discord_webhook_url'] ?? ''); ?>" autocomplete="off" placeholder="https://discord.com/api/webhooks/..."><span class="input-group-btn"><button type="button" class="btn btn-default" data-toggle-secret title="<?php echo htmlspecialchars(_('Show or hide webhook')); ?>"><i class="fa fa-eye"></i></button></span></div>
+							<p class="help-block"><?php echo _('Optional. Leave blank to disable Discord delivery.'); ?></p>
+						</div>
+						<div class="well" style="margin-bottom:0"><strong><?php echo _('Email From'); ?>:</strong> <?php echo htmlspecialchars($settings['mail_from_name'] ?? 'SLS Mass Notification System'); ?> &lt;<span id="sls-mail-from-preview"><?php echo htmlspecialchars($mailFromAddress); ?></span>&gt;</div>
+					</div>
 					<div class="modal-footer"><button type="button" class="btn btn-primary" data-dismiss="modal"><?php echo _('Done'); ?></button></div>
 				</div></div></div>
 				<script type="text/template" id="sls-email-row-template"><div class="sls-editor-row" data-email-row><div class="sls-editor-grow"><input class="form-control" type="email" placeholder="alerts@example.com"></div><button type="button" class="btn btn-link text-danger" data-remove-email><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div></script>
@@ -280,6 +312,26 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 							<label><?php echo _('Maximum Spoken Length'); ?></label>
 							<div class="input-group"><input class="form-control" name="tts_max_seconds" type="number" min="1" max="600" value="<?php echo (int)($settings['tts_max_seconds'] ?? 30); ?>"><span class="input-group-addon"><?php echo _('sec'); ?></span></div>
 							<p class="help-block"><?php echo _('Default 30; maximum 600 seconds.'); ?></p>
+						</div>
+					</div>
+				</div>
+				<div class="row">
+					<div class="col-md-6">
+						<div class="form-group">
+							<label for="sls-announcement-timeout-mode"><i class="fa fa-hourglass-half text-primary" aria-hidden="true"></i> <?php echo _('Announcement Timeout'); ?></label>
+							<select class="form-control" id="sls-announcement-timeout-mode" name="announcement_timeout_mode">
+								<option value="none" <?php echo ($settings['announcement_timeout_mode'] ?? 'none') === 'none' ? 'selected' : ''; ?>><?php echo _('No expiry (default)'); ?></option>
+								<option value="audio" <?php echo ($settings['announcement_timeout_mode'] ?? 'none') === 'audio' ? 'selected' : ''; ?>><?php echo _('Duration of Alert'); ?></option>
+								<option value="custom" <?php echo ($settings['announcement_timeout_mode'] ?? 'none') === 'custom' ? 'selected' : ''; ?>><?php echo _('Specified timeout'); ?></option>
+							</select>
+							<p class="help-block"><?php echo _('Controls how long regular dashboard, API, and scheduled announcement screens remain visible. Duration of Alert follows the generated page audio; visual-only announcements remain until dismissed. Support outside Yealink and the desktop app depends on the receiving device.'); ?></p>
+						</div>
+					</div>
+					<div class="col-md-3" id="sls-announcement-timeout-custom">
+						<div class="form-group">
+							<label for="sls-announcement-timeout-seconds"><?php echo _('Timeout Length'); ?></label>
+							<div class="input-group"><input class="form-control" id="sls-announcement-timeout-seconds" name="announcement_timeout_seconds" type="number" min="1" max="86400" value="<?php echo (int)($settings['announcement_timeout_seconds'] ?? 300); ?>"><span class="input-group-addon"><?php echo _('sec'); ?></span></div>
+							<p class="help-block"><?php echo _('Used only for a specified timeout. Allowed range: 1 second to 24 hours.'); ?></p>
 						</div>
 					</div>
 				</div>
@@ -481,7 +533,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						</section>
 						<section class="sls-danger-action sls-danger-action--critical">
 							<h4><i class="fa fa-upload text-danger" aria-hidden="true"></i> <?php echo _('Replace Configuration'); ?></h4>
-							<p><?php echo _('Replacing the config file wipes the current plugin data and overwrites API keys, desktop clients, voices, announcement groups, NWS settings, and retention settings.'); ?></p>
+							<p><?php echo _('Replacing the config file wipes the current module data and overwrites API keys, desktop clients, voices, announcement groups, NWS settings, schedules, and retention settings.'); ?></p>
 							<form method="post" enctype="multipart/form-data" class="sls-maintenance-form" data-maintenance-action="config" data-confirm="<?php echo htmlspecialchars(_('Replace the Mass Notifications config? This requires Apply Config to become live.'), ENT_QUOTES, 'UTF-8'); ?>">
 								<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
 								<input type="hidden" name="slsmassnotifyserver_action" value="import_config">
@@ -683,6 +735,17 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 		addEmail.addEventListener('click', function(){var shell=document.createElement('div');shell.innerHTML=emailTemplate.innerHTML.trim();emailList.appendChild(shell.firstElementChild);nameEmails();});
 	}
 	nameEmails();
+	var mailFromDomain = document.getElementById('sls-mail-from-domain');
+	var mailFromPreview = document.getElementById('sls-mail-from-preview');
+	function renderMailFromPreview() {
+		if (!mailFromDomain || !mailFromPreview) return;
+		var domain = String(mailFromDomain.value || '').trim().replace(/^@/, '').replace(/\.$/, '').toLowerCase();
+		mailFromPreview.textContent = 'no-reply@' + (domain || 'example.com');
+	}
+	if (mailFromDomain) {
+		mailFromDomain.addEventListener('input', renderMailFromPreview);
+	}
+	renderMailFromPreview();
 	var copyButton = document.getElementById('copy_control_api_key');
 	var controlKey = document.getElementById('control_api_key');
 	if (copyButton && controlKey) {
@@ -692,6 +755,22 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 			document.execCommand('copy');
 		});
 	}
+	var timeoutMode = document.getElementById('sls-announcement-timeout-mode');
+	var timeoutCustom = document.getElementById('sls-announcement-timeout-custom');
+	var timeoutSeconds = document.getElementById('sls-announcement-timeout-seconds');
+	function renderAnnouncementTimeout() {
+		var custom = timeoutMode && timeoutMode.value === 'custom';
+		if (timeoutCustom) {
+			timeoutCustom.style.display = custom ? '' : 'none';
+		}
+		if (timeoutSeconds) {
+			timeoutSeconds.disabled = !custom;
+		}
+	}
+	if (timeoutMode) {
+		timeoutMode.addEventListener('change', renderAnnouncementTimeout);
+	}
+	renderAnnouncementTimeout();
 	var table = document.querySelector('#desktop-client-table tbody');
 	var desktopScroller = document.getElementById('desktop-client-scroll');
 	var add = document.getElementById('add-desktop-client');

@@ -27,7 +27,7 @@ download_file() {
   rm -f "$tmp"
   if command -v curl >/dev/null 2>&1; then
     curl -fL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 900 \
-      -A "SouthlandServers-Mass-Notifications-Server/0.0.8-beta" \
+      -A "SouthlandServers-Mass-Notifications-Server/0.0.9-beta" \
       -o "$tmp" "$url"
   elif command -v wget >/dev/null 2>&1; then
     wget --tries=5 --timeout=900 -O "$tmp" "$url"
@@ -93,6 +93,17 @@ ensure_piper_runtime() {
 }
 
 install_piper_wrapper() {
+  if [ -e /usr/local/bin/piper ] || [ -L /usr/local/bin/piper ]; then
+    if [ -L /usr/local/bin/piper ]; then
+      case "$(readlink /usr/local/bin/piper 2>/dev/null || true)" in
+        /usr/local/bin/sls_mass_notify/piper/venv/bin/piper|/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/venv/bin/piper) ;;
+        *) printf '%s\n' '/usr/local/bin/piper belongs to another application; refusing to overwrite it.' >&2; return 1 ;;
+      esac
+    elif ! grep -Eq 'sls_mass_notify/piper|SLS_Mass_Notifications_Plugin/piper' /usr/local/bin/piper 2>/dev/null; then
+      printf '%s\n' '/usr/local/bin/piper belongs to another application; refusing to overwrite it.' >&2
+      return 1
+    fi
+  fi
   rm -f /usr/local/bin/piper
   cat > /usr/local/bin/piper <<'EOF'
 #!/bin/sh

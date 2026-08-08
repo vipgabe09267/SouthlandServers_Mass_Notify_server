@@ -255,6 +255,33 @@ class AmiClient:
                     return response, events
 
 
+def resolve_local_ami_endpoint(ami):
+    values = {}
+    amportal = Path("/etc/amportal.conf")
+    if amportal.is_file():
+        try:
+            for raw_line in amportal.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith(("#", ";")) or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                values[key.strip().upper()] = value.strip().strip('"\'')
+        except OSError:
+            values = {}
+
+    host = str(ami.get("host") or values.get("ASTMANAGERHOST") or "localhost").strip().lower()
+    if host not in {"localhost", "127.0.0.1", "::1"}:
+        raise RuntimeError("FreePBX AMI must use a loopback host for SLS Mass Notify")
+    configured_port = ami.get("port") if "port" in ami and str(ami.get("port")).strip() != "" else values.get("ASTMANAGERPORT") or 5038
+    try:
+        port = int(configured_port)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("FreePBX AMI port is invalid") from exc
+    if not 1 <= port <= 65535:
+        raise RuntimeError("FreePBX AMI port is outside the supported range")
+    return "127.0.0.1", port
+
+
 def load_config():
     config = configparser.ConfigParser(interpolation=None)
     if CENTRAL_SETTINGS_FILE.is_file():
@@ -275,6 +302,7 @@ def load_config():
         if media_scheme not in {"http", "https"}:
             media_scheme = "http"
 
+        ami_host, ami_port = resolve_local_ami_endpoint(ami)
         config.read_dict({
             "nws": {
                 "zone": str(settings.get("nws_zone") or ""),
@@ -282,8 +310,8 @@ def load_config():
                 "poll_interval": "60",
             },
             "ami": {
-                "host": "127.0.0.1",
-                "port": "5038",
+                "host": ami_host,
+                "port": str(ami_port),
                 "username": str(ami.get("username") or "slsmassnotify"),
                 "password": str(ami.get("password") or ""),
             },
@@ -417,22 +445,30 @@ def alert_chain_key(alert):
     props = alert.get("properties", {})
     alert_id = compact_identifier(alert.get("id") or props.get("id"))
     event = (props.get("event") or "").strip()
+    message_type = (props.get("messageType") or "").strip().lower()
     references = props.get("references") or []
     reference_id = ""
 
-    for ref in references:
-        if not isinstance(ref, dict):
-            continue
-        if (ref.get("event") or "").strip() == event:
-            reference_id = compact_identifier(ref.get("identifier"))
-            if reference_id:
-                break
-    if not reference_id:
-        for ref in references:
-            if isinstance(ref, dict):
-                reference_id = compact_identifier(ref.get("identifier"))
-                if reference_id:
-                    break
+    # CAP references identify an Update/Cancel/Error chain. A first-issued
+    # Alert must retain its own identifier even if a downstream NWS feed
+    # unexpectedly includes historical references; otherwise a genuinely new
+    # alert can collide with an older processed chain and be suppressed.
+    if message_type == "update":
+        candidates = []
+        for position, ref in enumerate(references):
+            if not isinstance(ref, dict):
+                continue
+            identifier = compact_identifier(ref.get("identifier") or ref.get("@id"))
+            if not identifier:
+                continue
+            sent = str(ref.get("sent") or "").strip()
+            try:
+                sent_key = datetime.fromisoformat(sent.replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError):
+                sent_key = float("inf")
+            candidates.append((sent_key, position, identifier))
+        if candidates:
+            reference_id = min(candidates)[2]
 
     return f"{event}|{reference_id or alert_id}"
 
@@ -514,12 +550,21 @@ def validate_rendered_png(path, expected_width, expected_height):
         raise RuntimeError(f"Generated phone image failed validation: {details or result.stderr.strip()}")
 
 
-def yealink_image_xml(image_url, beep="yes", width=480, height=272):
+def normalize_announcement_timeout_seconds(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = 0
+    return min(86400, max(0, parsed))
+
+
+def yealink_image_xml(image_url, beep="yes", width=480, height=272, timeout_seconds=0):
     width = max(1, min(2000, int(width)))
     height = max(1, min(2000, int(height)))
+    timeout_seconds = normalize_announcement_timeout_seconds(timeout_seconds)
     return (
         "<?xml version='1.0' encoding='UTF-8'?>"
-        f"<YealinkIPPhoneImageScreen Beep='{html.escape(beep)}' Timeout='0' LockIn='no' mode='fullscreen'>"
+        f"<YealinkIPPhoneImageScreen Beep='{html.escape(beep)}' Timeout='{timeout_seconds}' LockIn='no' mode='fullscreen'>"
         f"<Image horizontalAlign='middle' verticalAlign='middle' width='{width}' height='{height}'>{html.escape(image_url)}</Image>"
         "</YealinkIPPhoneImageScreen>"
     )
@@ -563,7 +608,7 @@ def build_text_xml(alert):
     )
 
 
-def build_announcement_xml(message):
+def build_announcement_xml(message, timeout_seconds=0):
     cleaned = "\n".join(line.strip() for line in (message or "").splitlines()).strip()
     if not cleaned:
         cleaned = "Announcement"
@@ -571,9 +616,10 @@ def build_announcement_xml(message):
     for paragraph in cleaned.splitlines():
         wrapped.extend(textwrap.wrap(paragraph, width=32, break_long_words=False, break_on_hyphens=False) or [""])
     escaped_text = "&#10;".join(html.escape(line) for line in wrapped[:10])
+    timeout_seconds = normalize_announcement_timeout_seconds(timeout_seconds)
     return (
         "<?xml version='1.0' encoding='UTF-8'?>"
-        "<YealinkIPPhoneTextScreen Beep='yes' Timeout='0'>"
+        f"<YealinkIPPhoneTextScreen Beep='yes' Timeout='{timeout_seconds}'>"
         "<Title>Announcement</Title>"
         f"<Text>{escaped_text}</Text>"
         "<SoftKey index='1'>"
@@ -795,13 +841,14 @@ def render_announcement_image(config, title, message, background_color="#1f2937"
     return f"{public_base_url}/{output.name}"
 
 
-def build_announcement_image_xml(config, message, title="Announcement", background_color="#1f2937", background_image=""):
+def build_announcement_image_xml(config, message, title="Announcement", background_color="#1f2937", background_image="", timeout_seconds=0):
     image_url = render_announcement_image(config, title, message, background_color, background_image)
     return yealink_image_xml(
         image_url,
         "yes",
         config.getint("visual", "image_width", fallback=480),
         config.getint("visual", "image_height", fallback=272),
+        timeout_seconds,
     )
 
 
@@ -1041,7 +1088,7 @@ def phone_title_and_message_from_alert(alert):
     return title, message
 
 
-def build_phone_xml_for_format(config, fmt, payload_type, alert=None, message="", image=False, title="Announcement", background_color="#1f2937", background_image=""):
+def build_phone_xml_for_format(config, fmt, payload_type, alert=None, message="", image=False, title="Announcement", background_color="#1f2937", background_image="", timeout_seconds=0):
     fmt = fmt or "yealink"
     if payload_type == "alert":
         if fmt == "yealink":
@@ -1054,7 +1101,9 @@ def build_phone_xml_for_format(config, fmt, payload_type, alert=None, message=""
             return cisco_execute_xml(hosted_phone_payload(config, payload))
         return payload
     if image and fmt == "yealink":
-        return build_announcement_image_xml(config, message, title, background_color, background_image)
+        return build_announcement_image_xml(config, message, title, background_color, background_image, timeout_seconds)
+    if fmt in {"yealink", "yealink_text"}:
+        return build_announcement_xml(message, timeout_seconds)
     payload = text_xml_for_format(fmt, title or "Announcement", message)
     if fmt == "cisco":
         return cisco_execute_xml(hosted_phone_payload(config, payload))
@@ -1310,9 +1359,15 @@ def alert_api_record(alert, xml_payload, extensions, phone_formats=None):
     }
 
 
-def announcement_api_record(alert_id, message, xml_payload, extensions, desktop_targets=None, desktop_all=False, phone_formats=None, title="Announcement", background_color="#1f2937", image=False):
+def announcement_api_record(alert_id, message, xml_payload, extensions, desktop_targets=None, desktop_all=False, phone_formats=None, title="Announcement", background_color="#1f2937", image=False, timeout_seconds=0):
     normalized_title = clean_payload_text(title or "Announcement", 80) or "Announcement"
     normalized_background = normalize_hex_color(background_color)
+    timeout_seconds = normalize_announcement_timeout_seconds(timeout_seconds)
+    display_expires_at = None
+    if timeout_seconds > 0:
+        display_expires_at = (
+            datetime.now(timezone.utc) + timedelta(seconds=timeout_seconds)
+        ).isoformat().replace("+00:00", "Z")
     style = "colored" if image else "standard"
     return {
         "kind": "announcement",
@@ -1338,6 +1393,8 @@ def announcement_api_record(alert_id, message, xml_payload, extensions, desktop_
         "text": message,
         "description": message,
         "message": message,
+        "display_timeout_seconds": timeout_seconds,
+        "display_expires_at": display_expires_at,
         "image_url": image_url_from_xml(xml_payload),
         "xml": xml_payload,
         "recipients": extensions,
@@ -1537,19 +1594,20 @@ def push_alert(config, alert, print_results=False, retries=True, targets=None, a
             send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_results, f"retry+{delay}s")
 
 
-def push_announcement(config, message, targets, print_results=True, api_publish=True, api_only=False, image=False, title="Announcement", background_color="#1f2937", background_image="", desktop_targets=None, desktop_all=False):
+def push_announcement(config, message, targets, print_results=True, api_publish=True, api_only=False, image=False, title="Announcement", background_color="#1f2937", background_image="", desktop_targets=None, desktop_all=False, timeout_seconds=0):
+    timeout_seconds = normalize_announcement_timeout_seconds(timeout_seconds)
     if image:
-        xml_payload = build_announcement_image_xml(config, message, title, background_color, background_image)
+        xml_payload = build_announcement_image_xml(config, message, title, background_color, background_image, timeout_seconds)
     else:
-        xml_payload = build_announcement_xml(message)
+        xml_payload = build_announcement_xml(message, timeout_seconds)
     alert_id = "announcement-" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     if api_only:
-        append_sipnotify_event(config, announcement_api_record(alert_id, message, xml_payload, [], desktop_targets, desktop_all, title=title, background_color=background_color, image=image))
+        append_sipnotify_event(config, announcement_api_record(alert_id, message, xml_payload, [], desktop_targets, desktop_all, title=title, background_color=background_color, image=image, timeout_seconds=timeout_seconds))
         return []
     if api_publish:
         append_sipnotify_event(
             config,
-            announcement_api_record(alert_id, message, xml_payload, sorted(targets or []), desktop_targets, desktop_all, title=title, background_color=background_color, image=image),
+            announcement_api_record(alert_id, message, xml_payload, sorted(targets or []), desktop_targets, desktop_all, title=title, background_color=background_color, image=image, timeout_seconds=timeout_seconds),
         )
     with AmiClient(
         config["ami"].get("host", "127.0.0.1"),
@@ -1562,11 +1620,11 @@ def push_announcement(config, message, targets, print_results=True, api_publish=
         phone_formats = endpoint_format_summary(endpoint_info)
         logging.info("Pushing SIP NOTIFY announcement %s to %d registered endpoints formats=%s", alert_id, len(extensions), phone_formats)
         if api_publish:
-            append_sipnotify_event(config, announcement_api_record(alert_id, message, xml_payload, extensions, desktop_targets, desktop_all, phone_formats, title=title, background_color=background_color, image=image))
+            append_sipnotify_event(config, announcement_api_record(alert_id, message, xml_payload, extensions, desktop_targets, desktop_all, phone_formats, title=title, background_color=background_color, image=image, timeout_seconds=timeout_seconds))
         if targets and not extensions:
             requested = ", ".join(sorted(targets))
             raise RuntimeError(f"No requested phone endpoints are registered/reachable for SIP NOTIFY: {requested}")
-        payload_builder = lambda fmt: xml_payload if fmt == "yealink" else build_phone_xml_for_format(config, fmt, "announcement", message=message, image=image, title=title, background_color=background_color, background_image=background_image)
+        payload_builder = lambda fmt: xml_payload if fmt == "yealink" else build_phone_xml_for_format(config, fmt, "announcement", message=message, image=image, title=title, background_color=background_color, background_image=background_image, timeout_seconds=timeout_seconds)
         send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_results, "initial")
         return extensions
 
@@ -1633,6 +1691,7 @@ def main():
     parser.add_argument("--announcement-title", default="Announcement", help="Announcement image title")
     parser.add_argument("--announcement-bg-color", default="#1f2937", help="Announcement image background color")
     parser.add_argument("--announcement-bg-image", default="", help="Announcement image background file")
+    parser.add_argument("--announcement-timeout-seconds", type=int, default=0, help="Regular announcement display timeout in seconds (0 means no expiry)")
     parser.add_argument("--desktop-targets", default="", help="Comma-separated desktop app usernames allowed to receive this API event")
     parser.add_argument("--desktop-all", action="store_true", help="Allow all enabled desktop app clients to receive this API event")
     parser.add_argument("--no-api", action="store_true", help="Do not publish this announcement/alert to the desktop API journal")
@@ -1710,6 +1769,7 @@ def main():
                 background_image=args.announcement_bg_image,
                 desktop_targets=normalize_desktop_target_list(args.desktop_targets),
                 desktop_all=args.desktop_all,
+                timeout_seconds=normalize_announcement_timeout_seconds(args.announcement_timeout_seconds),
             )
         elif args.alert_json_b64:
             alert = alert_from_json_b64(args.alert_json_b64)

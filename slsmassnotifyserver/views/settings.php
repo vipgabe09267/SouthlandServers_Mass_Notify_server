@@ -1,5 +1,5 @@
 <?php
-// Southland Servers Mass Notification Plugin
+// Southland Servers Mass Notification Module
 $saveResult = $save_result ?? null;
 $applyResult = $apply_result ?? null;
 $hasPendingChanges = !empty($has_pending_changes);

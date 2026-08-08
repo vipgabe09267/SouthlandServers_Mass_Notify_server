@@ -13,9 +13,41 @@ sys.dont_write_bytecode = True
 logging.disable(logging.CRITICAL)
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "slsmassnotifyserver/bin/sls_mass_notify/sls_notify.py"
+CLASS_SOURCE = (ROOT / "slsmassnotifyserver/Slsmassnotifyserver.class.php").read_text(encoding="utf-8")
+UNINSTALL_SOURCE = (ROOT / "tools/uninstall_release.sh").read_text(encoding="utf-8")
 SPEC = importlib.util.spec_from_file_location("sls_notify_portability_test", SOURCE)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+
+
+recording_unlink_guard = "if ($fileOwned && (!is_array($row) || $rowOwned))"
+assert CLASS_SOURCE.count(recording_unlink_guard) >= 2
+assert recording_unlink_guard in UNINSTALL_SOURCE
+wrapper_method = CLASS_SOURCE.split("private function ensurePiperWrapper()", 1)[1].split(
+    "private function isSlsOwnedPiperWrapper", 1
+)[0]
+assert wrapper_method.index("!$this->isSlsOwnedPiperWrapper($wrapper)") < wrapper_method.index(
+    "$this->repairPiperRuntimePermissions()"
+)
+permissions_method = CLASS_SOURCE.split("private function repairPiperRuntimePermissions()", 1)[1].split(
+    "private function secureExecutableRuntimeTree", 1
+)[0]
+assert "$this->isSlsOwnedPiperWrapper('/usr/local/bin/piper')" in permissions_method
+
+
+assert MODULE.resolve_local_ami_endpoint({"host": "localhost", "port": 5040}) == ("127.0.0.1", 5040)
+assert MODULE.resolve_local_ami_endpoint({"host": "::1", "port": "5038"}) == ("127.0.0.1", 5038)
+for invalid_ami in (
+    {"host": "192.0.2.20", "port": 5038},
+    {"host": "localhost", "port": 0},
+    {"host": "localhost", "port": "not-a-port"},
+):
+    try:
+        MODULE.resolve_local_ami_endpoint(invalid_ami)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError(f"unsafe AMI endpoint was accepted: {invalid_ami!r}")
 
 
 MANAGER_HELP = """

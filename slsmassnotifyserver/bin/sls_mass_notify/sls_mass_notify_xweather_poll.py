@@ -34,6 +34,7 @@ SPOOL_DONE_DIR = Path("/var/spool/asterisk/outgoing_done")
 PIPER_BIN = Path("/usr/local/bin/sls_mass_notify/piper/venv/bin/piper")
 VISUAL_SCRIPT = Path("/usr/local/bin/sls_mass_notify/sls_notify.py")
 SOUND_PREFIX = "SLS_Mass_Notifications_Plugin/tts"
+TEST_CALL_WAIT_SECONDS = 30
 LAST_RATE_LIMIT = {}
 
 
@@ -105,7 +106,7 @@ def fetch_payload(xweather):
         "client_secret": xweather["client_secret"],
     }
     url = "https://data.api.xweather.com/lightning/closest?" + urllib.parse.urlencode(params)
-    request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "SouthlandServers-Mass-Notifications-Server/0.0.8-beta"})
+    request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "SouthlandServers-Mass-Notifications-Server/0.0.9-beta"})
     last_error = None
     for attempt in range(3):
         try:
@@ -353,7 +354,7 @@ def queue_audio(recipients, sound, archive=False):
             os.chown(SPOOL_DONE_DIR, asterisk_account.pw_uid, asterisk_account.pw_gid)
         os.chmod(SPOOL_DONE_DIR, 0o750)
     for extension in recipients:
-        wait_time = 30 if archive else 180
+        wait_time = TEST_CALL_WAIT_SECONDS if archive else 180
         body = (
             f"Channel: Local/{extension}@sls-alert-audio\n"
             "CallerID: \"SLS Lightning Alert\" <SLS>\n"
@@ -376,19 +377,19 @@ def queue_audio(recipients, sound, archive=False):
         target = SPOOL_DIR / Path(name).name
         os.replace(name, target)
         if archive:
-            archived_results.append(SPOOL_DONE_DIR / target.name)
+            archived_results.append((SPOOL_DONE_DIR / target.name, extension))
         queued += 1
     return queued, archived_results
 
 
-def wait_for_archived_calls(paths, timeout=45):
+def wait_for_archived_calls(results, timeout=45):
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline and any(not path.is_file() for path in paths):
+    while time.monotonic() < deadline and any(not path.is_file() for path, _extension in results):
         time.sleep(1)
     failures = []
-    for path in paths:
+    for path, extension in results:
         if not path.is_file():
-            failures.append(f"{path.name}: timed out")
+            failures.append(f"Extension {extension}: timed out waiting for the Asterisk test call result")
             continue
         status = ""
         try:
@@ -399,10 +400,28 @@ def wait_for_archived_calls(paths, timeout=45):
                     break
         finally:
             path.unlink(missing_ok=True)
-        if status != "Completed":
-            failures.append(f"{path.name}: {status or 'unknown'}")
+        if status.lower() == "completed":
+            continue
+        if status.lower() == "expired":
+            failures.append(
+                f"Extension {extension}: page did not answer within {TEST_CALL_WAIT_SECONDS} seconds "
+                "(Asterisk status: Expired)"
+            )
+        elif status:
+            failures.append(f"Extension {extension}: Asterisk test call ended with status {status}")
+        else:
+            failures.append(f"Extension {extension}: Asterisk did not record a test call status")
     if failures:
-        raise RuntimeError("Asterisk test call did not complete: " + "; ".join(failures))
+        raise RuntimeError("Asterisk test audio did not complete: " + "; ".join(failures))
+
+
+def record_xweather_outcome(is_test, status, message):
+    prefix = "last_xweather_test" if is_test else "last_xweather_delivery"
+    atomic_json_update(STATUS_FILE, {
+        f"{prefix}_at": datetime.now().astimezone().isoformat(),
+        f"{prefix}_status": status,
+        f"{prefix}_message": message[:240],
+    })
 
 
 def send_visual(recipients, message, is_test=False):
@@ -636,7 +655,7 @@ def main():
         append_event({"event_id": f"xweather-{alert_id}", "logged_at": datetime.now(timezone.utc).astimezone().isoformat(), "type": "xweather", "status": "dry_run" if dry_run else "queued", "system_name": "SLS Mass Notify System", "source_name": "Xweather Lightning API", "trigger_source": "Manual Lightning Test" if test_event else "Xweather API", "trigger_name": os.environ.get("XWEATHER_TEST_TRIGGER_NAME", "")[:80], "page_group": ",".join(recipients), "event": event_name, "severity": severity, "message_type": "Lightning", "audio": "Piper TTS" if sound else "None", "audio_sequence": [sound] if sound else [], "body": message, "radius_miles": settings["radius_miles"], "nearest_strike_miles": round(nearest_miles, 1) if nearest_miles is not None else None, "storm_state": state_label})
     except Exception as exc:
         log(f"delivery failed: {exc}")
-        atomic_json_update(STATUS_FILE, {"last_xweather_delivery_at": datetime.now().astimezone().isoformat(), "last_xweather_delivery_status": "fault", "last_xweather_delivery_message": str(exc)[:240]})
+        record_xweather_outcome(is_test, "fault", str(exc))
         if test_event == "":
             atomic_json_update(STATE_FILE, state)
         return 1
@@ -652,11 +671,24 @@ def main():
     delivery_state = "dry_run" if dry_run else ("completed" if is_test else "queued")
     call_label = "completed" if is_test else "queued"
     delivery_message = f"Delivered {event_name.lower()} to {len(recipients)} extension(s); {queued} audio call(s) {call_label}."
-    atomic_json_update(STATUS_FILE, {"last_xweather_delivery_at": datetime.now().astimezone().isoformat(), "last_xweather_delivery_status": delivery_state, "last_xweather_delivery_message": delivery_message})
+    record_xweather_outcome(is_test, delivery_state, delivery_message)
     log(delivery_message)
     print(delivery_message + (" Email and Discord were not sent." if is_test else ""))
     return 0
 
 
+def cli(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args in (["-h"], ["--help"]):
+        print("Usage: sls_mass_notify_xweather_poll.py")
+        print("Run one configured Xweather lightning polling cycle.")
+        return 0
+    if args:
+        print(f"Unknown argument: {args[0]}", file=sys.stderr)
+        print("Usage: sls_mass_notify_xweather_poll.py", file=sys.stderr)
+        return 2
+    return main()
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli())

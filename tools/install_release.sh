@@ -4,12 +4,12 @@ set -euo pipefail
 umask 027
 
 MODULE="${SLS_MASS_NOTIFY_MODULE:-slsmassnotifyserver}"
-TGZ="${SLS_MASS_NOTIFY_TGZ:-/tmp/slsmassnotifyserver-0.0.8-beta.tgz}"
+TGZ="${SLS_MASS_NOTIFY_TGZ:-/tmp/slsmassnotifyserver-0.0.9-beta.tgz}"
 URL="${SLS_MASS_NOTIFY_TGZ_URL:-${1:-}}"
 SHA256="${SLS_MASS_NOTIFY_SHA256:-}"
 TOKEN="${SLS_MASS_NOTIFY_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
 LOG_FILE="${SLS_MASS_NOTIFY_INSTALL_LOG:-/tmp/slsmassnotifyserver-install.log}"
-EXPECTED_TGZ_SHA256="ec60a908c8ecdb8210082cff19346e41314214c597b33d335df31e420d3b6aee"
+EXPECTED_TGZ_SHA256="4c81256bb92af4b3b06a4434fe5b78d514f8abd16d581bbb2c0be3a4b99b8e0b"
 DATA_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin"
 CONFIG_FILE="$DATA_DIR/mass-notifications.config"
 CONFIG_SNAPSHOT=""
@@ -137,6 +137,7 @@ exit(0);
 }
 
 require_freepbx() {
+  local bootstrap_utility
   [ "${EUID:-$(id -u)}" -eq 0 ] || {
     log "Run the installer as root."
     exit 1
@@ -148,26 +149,50 @@ require_freepbx() {
       exit 1
       ;;
   esac
-  command -v fwconsole >/dev/null || {
-    log "fwconsole not found. Run this inside the FreePBX machine."
+  [ -x /usr/sbin/fwconsole ] || {
+    log "The required FreePBX CLI is unavailable at /usr/sbin/fwconsole. This runtime cannot activate safely on a nonstandard FreePBX path."
     exit 1
   }
   [ -d /var/www/html/admin/modules ] || {
     log "/var/www/html/admin/modules not found. This does not look like a FreePBX server."
     exit 1
   }
-  command -v asterisk >/dev/null || {
-    log "Asterisk CLI was not found."
+  [ -x /usr/sbin/asterisk ] || {
+    log "The required Asterisk CLI is unavailable at /usr/sbin/asterisk. This runtime cannot activate safely on a nonstandard Asterisk path."
     exit 1
   }
   [ -r /etc/freepbx.conf ] || {
     log "/etc/freepbx.conf is missing or unreadable."
     exit 1
   }
-  php -r '
+  # A minimal FreePBX image may not yet have the locking/process utilities or
+  # PHP features needed by the coordination and bootstrap checks below. Repair
+  # those only after the target has been identified as a FreePBX host, but
+  # before trying to use them.
+  install_bootstrap_dependencies
+  for bootstrap_utility in /usr/bin/flock /usr/bin/readlink /usr/bin/timeout /usr/sbin/runuser; do
+    [ -x "$bootstrap_utility" ] || {
+      log "Required installation coordination utility is unavailable: $bootstrap_utility"
+      exit 1
+    }
+  done
+  /usr/bin/php -r '
 $bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
 require "/etc/freepbx.conf";
 \FreePBX::Database()->query("SELECT 1");
+$managerHost = strtolower(trim((string)\FreePBX::Config()->get("ASTMANAGERHOST")));
+$managerPort = (int)\FreePBX::Config()->get("ASTMANAGERPORT");
+if ($managerHost === "") {
+    $managerHost = "localhost";
+}
+if (!in_array($managerHost, ["localhost", "127.0.0.1", "::1"], true)) {
+    fwrite(STDERR, "SLS Mass Notify requires FreePBX AMI to use a loopback host; configured ASTMANAGERHOST is unsupported.\n");
+    exit(1);
+}
+if ($managerPort < 1 || $managerPort > 65535) {
+    fwrite(STDERR, "FreePBX ASTMANAGERPORT is invalid.\n");
+    exit(1);
+}
 exit(0);
 ' >>"$LOG_FILE" 2>&1 || {
     log "FreePBX bootstrap or database access failed. See $LOG_FILE."
@@ -177,7 +202,7 @@ exit(0);
     log "This release requires FreePBX 17."
     exit 1
   }
-  php -r 'exit(function_exists("openssl_encrypt") && function_exists("openssl_decrypt") ? 0 : 1);' || {
+  /usr/bin/php -r 'exit(function_exists("openssl_encrypt") && function_exists("openssl_decrypt") ? 0 : 1);' || {
     log "The PHP OpenSSL extension is required for protected desktop credentials."
     exit 1
   }
@@ -244,6 +269,44 @@ ensure_freepbx_prerequisites() {
   done
 }
 
+strip_asterisk_ansi() {
+  # Asterisk can emit terminal color/control sequences even when invoked from
+  # a noninteractive installer. Remove CSI sequences before parsing headings.
+  LC_ALL=C sed -E $'s/\033\\[[0-?]*[ -\\/]*[@-~]//g'
+}
+
+asterisk_cli_output() {
+  local command="$1"
+  local output
+
+  output="$(asterisk -rx "$command" 2>&1 || true)"
+  strip_asterisk_ansi <<<"$output"
+}
+
+asterisk_setting_value() {
+  local setting_name="$1"
+  local settings
+
+  settings="$(asterisk_cli_output "core show settings")"
+  printf '%s\n' "$settings" | awk -v wanted="$setting_name" '
+function trim(value) {
+  sub(/^[[:space:]]+/, "", value)
+  sub(/[[:space:]]+$/, "", value)
+  return value
+}
+{
+  separator = index($0, ":")
+  if (separator == 0) {
+    next
+  }
+  key = trim(substr($0, 1, separator - 1))
+  if (tolower(key) == tolower(wanted)) {
+    print trim(substr($0, separator + 1))
+    exit
+  }
+}'
+}
+
 asterisk_capability_available() {
   local capability_type="$1"
   local capability_name="$2"
@@ -251,11 +314,11 @@ asterisk_capability_available() {
 
   case "$capability_type" in
     function)
-      capability_info="$(asterisk -rx "core show function $capability_name" 2>&1 || true)"
+      capability_info="$(asterisk_cli_output "core show function $capability_name")"
       marker="Info about Function '$capability_name'"
       ;;
     application)
-      capability_info="$(asterisk -rx "core show application $capability_name" 2>&1 || true)"
+      capability_info="$(asterisk_cli_output "core show application $capability_name")"
       marker="Info about Application '$capability_name'"
       ;;
     *)
@@ -275,9 +338,7 @@ asterisk_module_file() {
   local module_name="$1"
   local module_directory
 
-  module_directory="$(asterisk -rx "core show settings" 2>/dev/null \
-    | sed -n 's/^[[:space:]]*Module directory:[[:space:]]*//p' \
-    | head -n 1)"
+  module_directory="$(asterisk_setting_value "Module directory")"
   if [ -n "$module_directory" ] && [[ "$module_directory" = /* ]]; then
     printf '%s/%s\n' "${module_directory%/}" "$module_name"
   fi
@@ -421,13 +482,31 @@ repair_asterisk_provider_package() {
 
 asterisk_module_loaded() {
   local module_name="$1"
-  local module_info line
-  module_info="$(asterisk -rx "module show like $module_name" 2>&1 || true)"
+  local module_info line normalized_module_name field_count
+  local -a fields
+  module_info="$(asterisk_cli_output "module show like $module_name")"
+  normalized_module_name="${module_name,,}"
   while IFS= read -r line; do
-    if [[ "$line" == "$module_name"* ]] && [[ "$line" == *"Running"* ]]; then
+    read -r -a fields <<<"$line"
+    field_count="${#fields[@]}"
+    if [ "$field_count" -ge 3 ] \
+      && [ "${fields[0],,}" = "$normalized_module_name" ] \
+      && [ "${fields[field_count - 2],,}" = "running" ] \
+      && { [ "$field_count" -lt 4 ] || [ "${fields[field_count - 3],,}" != "not" ]; }; then
       return 0
     fi
   done <<<"$module_info"
+  return 1
+}
+
+require_asterisk_capability() {
+  local capability_type="$1"
+  local capability_name="$2"
+
+  if asterisk_capability_available "$capability_type" "$capability_name"; then
+    return 0
+  fi
+  log "Required built-in Asterisk $capability_type is unavailable: $capability_name. The installer cannot safely repair a built-in capability."
   return 1
 }
 
@@ -487,25 +566,275 @@ ensure_asterisk_capability() {
 ensure_required_asterisk_capabilities() {
   ensure_asterisk_capability function PJSIP_HEADER res_pjsip_header_funcs.so || return 1
   ensure_asterisk_capability function PJSIP_CONTACT func_pjsip_contact.so || return 1
+  ensure_asterisk_capability function PJSIP_AOR func_pjsip_aor.so || return 1
   ensure_asterisk_capability function PJSIP_DIAL_CONTACTS chan_pjsip.so || return 1
   ensure_asterisk_capability function TOLOWER func_strings.so || return 1
+  ensure_asterisk_capability function CUT func_strings.so || return 1
   ensure_asterisk_capability function FILTER func_strings.so || return 1
   ensure_asterisk_capability function CHANNEL func_channel.so || return 1
   ensure_asterisk_capability function IF func_logic.so || return 1
   ensure_asterisk_capability function DB func_db.so || return 1
+  ensure_asterisk_capability function CALLERID func_callerid.so || return 1
   ensure_asterisk_capability application Dial app_dial.so || return 1
   ensure_asterisk_capability application ExecIf app_exec.so || return 1
+  ensure_asterisk_capability application Gosub app_stack.so || return 1
   ensure_asterisk_capability application Return app_stack.so || return 1
   ensure_asterisk_capability application Log app_verbose.so || return 1
   ensure_asterisk_capability application Verbose app_verbose.so || return 1
+  require_asterisk_capability application Wait || return 1
+}
+
+asterisk_module_starts_persistently() {
+  local module_name="$1"
+  local modules_config="${2:-/etc/asterisk/modules.conf}"
+  [ -r "$modules_config" ] || return 1
+  /usr/bin/awk -v wanted="${module_name,,}" '
+    BEGIN { autoload = 0; explicit = 0; blocked = 0 }
+    {
+      line = $0
+      sub(/[;#].*$/, "", line)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+      split(line, fields, /[[:space:]]*=>?[[:space:]]*/)
+      key = tolower(fields[1])
+      value = tolower(fields[2])
+      if (key == "autoload" && value == "yes") autoload = 1
+      if ((key == "load" || key == "preload") && value == wanted) explicit = 1
+      if (key == "noload" && value == wanted) blocked = 1
+    }
+    END { exit(blocked || (!autoload && !explicit) ? 1 : 0) }
+  ' "$modules_config"
+}
+
+verify_asterisk_module_startup_persistence() {
+  local module_name
+  for module_name in \
+    res_pjsip.so res_pjsip_session.so chan_pjsip.so res_pjsip_notify.so \
+    pbx_spool.so format_wav.so res_pjsip_header_funcs.so \
+    func_pjsip_contact.so func_pjsip_aor.so func_strings.so func_channel.so \
+    func_logic.so func_db.so func_callerid.so app_dial.so app_exec.so \
+    app_stack.so app_verbose.so; do
+    asterisk_module_starts_persistently "$module_name" || {
+      log "Required Asterisk module is available now but is blocked after restart by /etc/asterisk/modules.conf: $module_name"
+      log "Enable Asterisk module autoloading or explicitly load that module through the PBX-managed module configuration, then rerun the installer."
+      return 1
+    }
+  done
 }
 
 asterisk_channel_type_available() {
   local channel_type="$1"
   local channel_info
 
-  channel_info="$(asterisk -rx "core show channeltype $channel_type" 2>&1 || true)"
-  [[ "$channel_info" == *"Info about channel driver: $channel_type"* ]]
+  channel_info="$(asterisk_cli_output "core show channeltype $channel_type")"
+  LC_ALL=C grep -Fqi -- "Info about channel driver: $channel_type" <<<"$channel_info"
+}
+
+verify_supported_asterisk_directories() {
+  local spool_directory varlib_directory data_directory
+  local canonical_spool canonical_varlib canonical_data
+
+  spool_directory="$(asterisk_setting_value "Spool directory")"
+  varlib_directory="$(asterisk_setting_value "VarLib directory")"
+  data_directory="$(asterisk_setting_value "Data directory")"
+
+  if [[ "$spool_directory" != /* ]]; then
+    log "Unable to determine Asterisk's active Spool directory from 'core show settings'."
+    return 1
+  fi
+  if [[ "$varlib_directory" != /* ]]; then
+    log "Unable to determine Asterisk's active VarLib directory from 'core show settings'."
+    return 1
+  fi
+
+  canonical_spool="$(readlink -m -- "$spool_directory" 2>/dev/null || true)"
+  canonical_varlib="$(readlink -m -- "$varlib_directory" 2>/dev/null || true)"
+  if [ "$canonical_spool" != "/var/spool/asterisk" ]; then
+    log "Unsupported Asterisk Spool directory: $spool_directory. This release writes call files only to /var/spool/asterisk and will not activate against a different live spool path."
+    return 1
+  fi
+  if [ "$canonical_varlib" != "/var/lib/asterisk" ]; then
+    log "Unsupported Asterisk VarLib directory: $varlib_directory. This release stores sounds and state only under /var/lib/asterisk and will not activate against a different live data path."
+    return 1
+  fi
+
+  # Some builds omit Data directory from the CLI. When it is reported, ensure
+  # that the module's fixed sound path points at the active Asterisk data root.
+  if [ -n "$data_directory" ]; then
+    if [[ "$data_directory" != /* ]]; then
+      log "Asterisk reported a non-absolute Data directory: $data_directory."
+      return 1
+    fi
+    canonical_data="$(readlink -m -- "$data_directory" 2>/dev/null || true)"
+    if [ "$canonical_data" != "/var/lib/asterisk" ]; then
+      log "Unsupported Asterisk Data directory: $data_directory. This release expects /var/lib/asterisk for sounds."
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
+asterisk_labeled_value() {
+  local command="$1"
+  local label="$2"
+  local output
+
+  output="$(asterisk_cli_output "$command")"
+  printf '%s\n' "$output" | awk -v wanted="$label" '
+function trim(value) {
+  sub(/^[[:space:]]+/, "", value)
+  sub(/[[:space:]]+$/, "", value)
+  return value
+}
+{
+  separator = index($0, ":")
+  if (separator == 0) {
+    next
+  }
+  key = trim(substr($0, 1, separator - 1))
+  if (tolower(key) == tolower(wanted)) {
+    print trim(substr($0, separator + 1))
+    exit
+  }
+}'
+}
+
+pjsip_dial_string_supported() {
+  local dial_string="$1"
+  local channel
+  local -a channels
+
+  [ -n "$dial_string" ] || return 1
+  IFS='&' read -r -a channels <<<"$dial_string"
+  [ "${#channels[@]}" -gt 0 ] || return 1
+  for channel in "${channels[@]}"; do
+    channel="$(printf '%s' "$channel" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    [ -n "$channel" ] || return 1
+    [[ "${channel,,}" == pjsip/* ]] || return 1
+  done
+}
+
+pjsip_endpoint_available() {
+  local endpoint="$1"
+  local endpoint_info
+
+  [[ "$endpoint" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+  endpoint_info="$(asterisk_cli_output "pjsip show endpoint $endpoint")"
+  printf '%s\n' "$endpoint_info" | awk -v wanted="$endpoint" '
+function trim(value) {
+  sub(/^[[:space:]]+/, "", value)
+  sub(/[[:space:]]+$/, "", value)
+  return value
+}
+{
+  separator = index($0, ":")
+  if (separator == 0 || tolower(trim(substr($0, 1, separator - 1))) != "endpoint") {
+    next
+  }
+  value = trim(substr($0, separator + 1))
+  split(value, columns, /[[:space:]]+/)
+  split(columns[1], endpoint_parts, "/")
+  if (endpoint_parts[1] == wanted) {
+    found = 1
+  }
+}
+END {
+  exit(found ? 0 : 1)
+}'
+}
+
+pjsip_dial_string_endpoints_available() {
+  local dial_string="$1"
+  local channel endpoint
+  local -a channels
+
+  pjsip_dial_string_supported "$dial_string" || return 1
+  IFS='&' read -r -a channels <<<"$dial_string"
+  for channel in "${channels[@]}"; do
+    channel="$(printf '%s' "$channel" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    endpoint="${channel#*/}"
+    endpoint="${endpoint%%/*}"
+    if ! pjsip_endpoint_available "$endpoint"; then
+      log "PJSIP paging route component does not resolve to an active endpoint object: $channel"
+      return 1
+    fi
+  done
+}
+
+verify_registered_endpoint_route() {
+  local extension="$1"
+  local dial_string route_source
+
+  [[ "$extension" =~ ^[0-9]+$ ]] || {
+    log "Refusing to validate a nonnumeric paging extension: $extension"
+    return 1
+  }
+
+  dial_string="$(asterisk_labeled_value "database get DEVICE ${extension}/dial" "Value")"
+  route_source="AstDB DEVICE/${extension}/dial"
+  if [ -z "$dial_string" ]; then
+    dial_string="$(asterisk_labeled_value "dialplan eval function PJSIP_DIAL_CONTACTS(${extension})" "Result")"
+    route_source="PJSIP_DIAL_CONTACTS(${extension})"
+  fi
+  if [ -z "$dial_string" ]; then
+    dial_string="PJSIP/${extension}"
+    route_source="PJSIP endpoint fallback"
+  fi
+
+  if ! pjsip_dial_string_supported "$dial_string"; then
+    log "Registered endpoint $extension resolves through $route_source to a non-PJSIP paging route: $dial_string"
+    log "The module will not rewrite DEVICE routes or SIP peers. Configure extension $extension as a PJSIP endpoint before installing."
+    return 1
+  fi
+  if ! pjsip_dial_string_endpoints_available "$dial_string"; then
+    log "Registered endpoint $extension resolves through $route_source, but one or more referenced PJSIP endpoint objects are unavailable."
+    log "The module will not rewrite DEVICE routes or SIP peers. Repair the FreePBX endpoint route, then rerun the installer."
+    return 1
+  fi
+  log "Registered endpoint $extension has a PJSIP-capable paging route with verified endpoint objects via $route_source."
+}
+
+endpoint_inventory_records() {
+  local inventory_file="$1"
+  python3 - "$inventory_file" <<'PY'
+import json
+import sys
+
+supported_formats = {
+    "yealink", "yealink_text", "cisco", "poly", "grandstream",
+    "fanvil", "snom", "aastra", "sangoma", "avaya", "vtech",
+    "ale", "panasonic", "generic", "unknown",
+}
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    inventory = json.load(handle)
+if not isinstance(inventory, dict):
+    raise SystemExit("endpoint inventory is not a JSON object")
+
+for extension, details in sorted(inventory.items()):
+    if not isinstance(extension, str) or not isinstance(details, dict):
+        raise SystemExit("endpoint inventory contains an invalid entry")
+    if not extension.isdigit():
+        # The notification module intentionally targets numeric FreePBX
+        # extensions, not trunks or arbitrary alphanumeric PJSIP objects.
+        continue
+    try:
+        contacts = int(details.get("contacts") or 0)
+    except (TypeError, ValueError):
+        raise SystemExit(f"endpoint {extension} has an invalid contact count")
+    phone_format = str(details.get("format") or "").strip().lower()
+    formats = details.get("formats") or [phone_format]
+    if not isinstance(formats, list):
+        raise SystemExit(f"endpoint {extension} has an invalid format list")
+    normalized_formats = [str(value or "").strip().lower() for value in formats]
+    if contacts < 1:
+        raise SystemExit(f"endpoint {extension} has no registered contacts")
+    if phone_format not in supported_formats or any(value not in supported_formats for value in normalized_formats):
+        raise SystemExit(f"endpoint {extension} has an unsupported phone format")
+    user_agent = " ".join(str(details.get("user_agent") or "").replace("\t", " ").split())[:300]
+    unknown = "1" if phone_format == "unknown" or "unknown" in normalized_formats else "0"
+    print("\t".join((extension, phone_format, str(contacts), unknown, user_agent)))
+PY
 }
 
 preflight_platform() {
@@ -521,7 +850,7 @@ preflight_platform() {
       exit 1
     fi
   done
-  for utility in timeout runuser flock; do
+  for utility in timeout runuser flock readlink; do
     command -v "$utility" >/dev/null || {
       log "Required system utility is unavailable: $utility"
       exit 1
@@ -550,6 +879,11 @@ preflight_platform() {
     log "The Asterisk control socket is unavailable. Start Asterisk before installing."
     exit 1
   }
+  verify_supported_asterisk_directories || {
+    log "Asterisk uses paths this release does not support; no module files were activated."
+    exit 1
+  }
+  validate_piper_wrapper_ownership || exit 1
   local module_name
   for module_name in \
     res_pjsip.so res_pjsip_session.so chan_pjsip.so res_pjsip_notify.so \
@@ -564,19 +898,123 @@ preflight_platform() {
     log "Required Asterisk paging capabilities are unavailable before module activation."
     exit 1
   }
+  verify_asterisk_module_startup_persistence || exit 1
   mkdir -p /var/spool/asterisk/tmp /var/spool/asterisk/outgoing /var/spool/asterisk/outgoing_done
   chown asterisk:asterisk /var/spool/asterisk/tmp /var/spool/asterisk/outgoing /var/spool/asterisk/outgoing_done
   chmod 0775 /var/spool/asterisk/tmp /var/spool/asterisk/outgoing
   chmod 0750 /var/spool/asterisk/outgoing_done
 }
 
-install_dependencies() {
-  if command -v apt-get >/dev/null; then
-    refresh_apt_metadata || {
-      log "Unable to refresh Debian package metadata. See $LOG_FILE."
+validate_piper_wrapper_ownership() {
+  local wrapper="${1:-/usr/local/bin/piper}"
+  local target
+  if [ ! -e "$wrapper" ] && [ ! -L "$wrapper" ]; then
+    return 0
+  fi
+  if [ -L "$wrapper" ]; then
+    target="$(readlink "$wrapper" 2>/dev/null || true)"
+    case "$target" in
+      /usr/local/bin/sls_mass_notify/piper/venv/bin/piper|/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/venv/bin/piper)
+        return 0
+        ;;
+    esac
+  elif [ -f "$wrapper" ] && grep -Eq 'sls_mass_notify/piper|SLS_Mass_Notifications_Plugin/piper' "$wrapper" 2>/dev/null; then
+    return 0
+  fi
+  log "$wrapper already belongs to another application. SLS Mass Notify did not overwrite it."
+  log "Move or rename that wrapper explicitly, then rerun the installer if SLS should own the compatibility path."
+  return 1
+}
+
+install_bootstrap_dependencies() {
+  local -a missing_packages=()
+
+  [ -x /usr/bin/php ] || missing_packages+=(php-cli)
+  if [ -x /usr/bin/php ]; then
+    /usr/bin/php -r 'exit(function_exists("openssl_encrypt") && function_exists("openssl_decrypt") ? 0 : 1);' >/dev/null 2>&1 \
+      || missing_packages+=(php-common)
+  else
+    missing_packages+=(php-common)
+  fi
+  { [ -x /usr/bin/flock ] && [ -x /usr/sbin/runuser ]; } || missing_packages+=(util-linux)
+  { [ -x /usr/bin/timeout ] && [ -x /usr/bin/readlink ]; } || missing_packages+=(coreutils)
+
+  if [ "${#missing_packages[@]}" -gt 0 ]; then
+    command -v apt-get >/dev/null 2>&1 || {
+      log "Missing installation bootstrap prerequisites and no supported Debian package manager is available: ${missing_packages[*]}"
       exit 1
     }
-    DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget ca-certificates gnupg python3 python3-venv python3-pip sox imagemagick fonts-dejavu-core tar
+    log "Installing missing installation bootstrap prerequisites: ${missing_packages[*]}"
+    refresh_apt_metadata || {
+      log "Unable to refresh Debian package metadata for bootstrap prerequisites. See $LOG_FILE."
+      exit 1
+    }
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --no-remove "${missing_packages[@]}"
+  fi
+
+  for bootstrap_utility in /usr/bin/php /usr/bin/flock /usr/bin/readlink /usr/bin/timeout /usr/sbin/runuser; do
+    [ -x "$bootstrap_utility" ] || {
+      log "A required installation bootstrap prerequisite is unavailable after dependency installation: $bootstrap_utility"
+      exit 1
+    }
+  done
+  /usr/bin/php -r 'exit(function_exists("openssl_encrypt") && function_exists("openssl_decrypt") ? 0 : 1);' || {
+    log "The PHP OpenSSL extension is required for protected desktop credentials. Install php-common, then rerun the installer."
+    exit 1
+  }
+}
+
+install_dependencies() {
+  local package
+  local -a missing_packages=()
+  add_missing_package() {
+    local candidate="$1"
+    local existing
+    for existing in "${missing_packages[@]:-}"; do
+      [ "$existing" = "$candidate" ] && return 0
+    done
+    missing_packages+=("$candidate")
+  }
+
+  if command -v apt-get >/dev/null; then
+    [ -x /usr/bin/curl ] || add_missing_package curl
+    [ -x /usr/bin/wget ] || add_missing_package wget
+    [ -r /etc/ssl/certs/ca-certificates.crt ] || add_missing_package ca-certificates
+    [ -x /usr/bin/gpg ] || add_missing_package gnupg
+    [ -x /usr/bin/python3 ] || add_missing_package python3
+    if [ -x /usr/bin/python3 ]; then
+      /usr/bin/python3 -c 'import venv' >/dev/null 2>&1 || add_missing_package python3-venv
+      /usr/bin/python3 -m pip --version >/dev/null 2>&1 || add_missing_package python3-pip
+    else
+      add_missing_package python3-venv
+      add_missing_package python3-pip
+    fi
+    { [ -x /usr/bin/sox ] && [ -x /usr/bin/soxi ]; } || add_missing_package sox
+    { [ -x /usr/bin/convert ] && [ -x /usr/bin/identify ]; } || add_missing_package imagemagick
+    [ -r /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf ] || add_missing_package fonts-dejavu-core
+    [ -x /usr/bin/tar ] || add_missing_package tar
+    [ -x /usr/bin/php ] || add_missing_package php-cli
+    if [ -x /usr/bin/php ]; then
+      /usr/bin/php -r 'exit(extension_loaded("mbstring") && function_exists("mb_strlen") && function_exists("mb_substr") ? 0 : 1);' >/dev/null 2>&1 || add_missing_package php-mbstring
+      /usr/bin/php -r 'exit(function_exists("posix_getpwnam") ? 0 : 1);' >/dev/null 2>&1 || add_missing_package php-common
+      /usr/bin/php -r 'exit(function_exists("openssl_encrypt") && function_exists("openssl_decrypt") ? 0 : 1);' >/dev/null 2>&1 || add_missing_package php-common
+    else
+      add_missing_package php-mbstring
+    fi
+    { [ -x /usr/bin/crontab ] && [ -x /usr/sbin/cron ]; } || add_missing_package cron
+    { [ -x /usr/bin/flock ] && [ -x /usr/sbin/runuser ]; } || add_missing_package util-linux
+    { [ -x /usr/bin/timeout ] && [ -x /usr/bin/readlink ]; } || add_missing_package coreutils
+
+    if [ "${#missing_packages[@]}" -gt 0 ]; then
+      log "Installing missing runtime prerequisites: ${missing_packages[*]}"
+      refresh_apt_metadata || {
+        log "Unable to refresh Debian package metadata for missing prerequisites. See $LOG_FILE."
+        exit 1
+      }
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --no-remove "${missing_packages[@]}"
+    else
+      log "Runtime package prerequisites are already available; skipping apt metadata refresh."
+    fi
   else
     command -v curl >/dev/null || command -v wget >/dev/null || {
       log "curl or wget is required to download the module."
@@ -590,11 +1028,37 @@ install_dependencies() {
       log "sox is required."
       exit 1
     }
-    command -v convert >/dev/null || {
+    { command -v convert >/dev/null && command -v identify >/dev/null; } || {
       log "ImageMagick is required for phone alert images."
       exit 1
     }
   fi
+  [ -x /usr/bin/php ] || {
+    log "The scheduling worker requires the canonical /usr/bin/php CLI executable. Install php-cli, then rerun the installer."
+    exit 1
+  }
+  /usr/bin/php -r 'exit(extension_loaded("mbstring") && function_exists("mb_strlen") && function_exists("mb_substr") ? 0 : 1);' || {
+    log "The PHP mbstring extension is required for safe alert text validation. Install php-mbstring, then rerun the installer."
+    exit 1
+  }
+  /usr/bin/php -r 'exit(function_exists("posix_getpwnam") ? 0 : 1);' || {
+    log "PHP POSIX support is required to resolve the configured FreePBX service account safely. Install php-common, then rerun the installer."
+    exit 1
+  }
+  /usr/bin/php -r 'exit(function_exists("openssl_encrypt") && function_exists("openssl_decrypt") ? 0 : 1);' || {
+    log "The PHP OpenSSL extension is required for protected desktop credentials. Install php-common, then rerun the installer."
+    exit 1
+  }
+  [ -r /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf ] || {
+    log "The DejaVu Sans Bold font required for phone alert images is unavailable after dependency installation."
+    exit 1
+  }
+  for package in /usr/bin/curl /usr/bin/wget /usr/bin/gpg /usr/bin/python3 /usr/bin/sox /usr/bin/soxi /usr/bin/convert /usr/bin/identify /usr/bin/tar /usr/bin/crontab /usr/bin/flock /usr/bin/readlink /usr/bin/timeout /usr/sbin/runuser; do
+    [ -x "$package" ] || {
+      log "A required runtime prerequisite is still unavailable after dependency installation: $package"
+      exit 1
+    }
+  done
 }
 
 preflight_python() {
@@ -638,8 +1102,8 @@ verify_tgz() {
   actual_sha="$(sha256sum "$TGZ" | awk '{print $1}')"
   if [ -n "$SHA256" ]; then
     echo "$SHA256  $TGZ" | sha256sum -c -
-  elif [ "$EXPECTED_TGZ_SHA256" != "__SLS_MASS_NOTIFY_008_SHA256__" ] && [ "$(basename "$TGZ")" = "slsmassnotifyserver-0.0.8-beta.tgz" ] && [ "$actual_sha" != "$EXPECTED_TGZ_SHA256" ]; then
-    log "$TGZ does not match the current slsmassnotifyserver-0.0.8-beta package."
+  elif [ "$(basename "$TGZ")" = "slsmassnotifyserver-0.0.9-beta.tgz" ] && [ "$actual_sha" != "$EXPECTED_TGZ_SHA256" ]; then
+		log "$TGZ does not match the current slsmassnotifyserver-0.0.9-beta package."
     log "Expected SHA256: $EXPECTED_TGZ_SHA256"
     log "Actual SHA256:   $actual_sha"
     log "Remove the stale local TGZ or install with SLS_MASS_NOTIFY_TGZ_URL so the current release is downloaded."
@@ -683,8 +1147,8 @@ with tarfile.open(archive, "r:gz") as handle:
     root = ET.fromstring(module_xml.read())
     if (root.findtext("rawname") or "").strip() != module:
         raise SystemExit("module.xml rawname does not match the requested module")
-    if (root.findtext("version") or "").strip() != "0.0.8-beta":
-        raise SystemExit("module.xml does not contain the expected 0.0.8-beta version")
+    if (root.findtext("version") or "").strip() != "0.0.9-beta":
+        raise SystemExit("module.xml does not contain the expected 0.0.9-beta version")
 PY
 }
 
@@ -697,6 +1161,33 @@ snapshot_config() {
   CONFIG_SNAPSHOT="$(mktemp /tmp/slsmassnotifyserver-config.XXXXXX)"
   cp -p "$CONFIG_FILE" "$CONFIG_SNAPSHOT"
   CONFIG_HASH_BEFORE="$(sha256sum "$CONFIG_FILE" | awk '{print $1}')"
+}
+
+validate_preserved_config_prerequisites() {
+  [ -n "$CONFIG_HASH_BEFORE" ] || return 0
+  if ! CONFIG_PATH="$CONFIG_FILE" /usr/bin/php -r '
+$path = getenv("CONFIG_PATH");
+$settings = json_decode((string)@file_get_contents($path), true);
+if (!is_array($settings)) {
+    exit(1);
+}
+$ami = $settings["ami"] ?? null;
+if (!is_array($ami)) {
+    exit(2);
+}
+$username = trim((string)($ami["username"] ?? ""));
+$password = trim((string)($ami["password"] ?? ""));
+if (!preg_match("/^[a-z0-9_.-]{1,64}$/", $username)) {
+    exit(3);
+}
+if (!preg_match("/^[\\x21-\\x7e]{1,128}$/", $password)) {
+    exit(4);
+}
+exit(0);
+'; then
+    log "The preserved central config has invalid JSON or AMI credentials. Restore a valid mass-notifications.config before upgrading; the installer did not alter it."
+    exit 1
+  fi
 }
 
 describe_config_drift() {
@@ -842,7 +1333,7 @@ $module = getenv("SLS_MASS_NOTIFY_MODULE") ?: "slsmassnotifyserver";
 $stmt = \FreePBX::Database()->prepare("SELECT version FROM modules WHERE modulename = ? LIMIT 1");
 $stmt->execute([$module]);
 $version = $stmt->fetchColumn();
-exit(is_string($version) && trim($version) === "0.0.8-beta" ? 0 : 1);
+exit(is_string($version) && trim($version) === "0.0.9-beta" ? 0 : 1);
 ' >>"$LOG_FILE" 2>&1
 }
 
@@ -979,6 +1470,7 @@ EOF
     chmod 0755 \
 	  /usr/local/bin/sls_mass_notify/sls_mass_notify_weather_poll.sh \
       /usr/local/bin/sls_mass_notify/sls_mass_notify_nws_poll.sh \
+      /usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php \
       /usr/local/bin/sls_mass_notify/sls_mass_notify_test.sh \
 	  /usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh \
 	  /usr/local/bin/sls_mass_notify/sls_mass_notify_maintenance.sh \
@@ -1128,6 +1620,7 @@ expected_runtime = {}
 for name in (
     "sls_mass_notify_nws_poll.sh",
     "sls_mass_notify_weather_poll.sh",
+    "sls_mass_notify_schedule_worker.php",
     "sls_mass_notify_test.sh",
     "sls_mass_notify_update.sh",
     "sls_mass_notify_maintenance.sh",
@@ -1380,6 +1873,9 @@ $checks = [
     (int)($lightning["tts_volume"] ?? 0) === 25,
     (int)($settings["nws_tts_volume"] ?? 0) === 25,
     (int)($settings["announcement_tts_volume"] ?? 0) === 25,
+    (string)($settings["announcement_timeout_mode"] ?? "") === "none",
+    (int)($settings["announcement_timeout_seconds"] ?? 0) === 300,
+    is_array($settings["scheduled_announcements"] ?? null) && count($settings["scheduled_announcements"]) === 0,
     basename((string)($settings["nws_piper_voice"] ?? "")) === "en_US-amy-low.onnx",
     basename((string)($settings["announcement_piper_voice"] ?? "")) === "en_US-lessac-low.onnx",
     (string)($settings["opening_tone"] ?? "") === "opening_Paging_Tone_Opening",
@@ -1532,9 +2028,13 @@ verify_install() {
     log "Required Asterisk paging capabilities disappeared after FreePBX reload."
     exit 1
   }
+  verify_asterisk_module_startup_persistence || {
+    log "Required Asterisk modules are not configured to survive an Asterisk restart."
+    exit 1
+  }
   audio_dialplan="$(asterisk -rx "dialplan show 1000@sls-alert-audio" 2>&1)"
   printf '%s\n' "$audio_dialplan"
-  printf '%s\n' "$audio_dialplan" | grep -Fq 'b(sls-alert-autoanswer^s^1)A(${SLS_SAFE_SOUND})' || {
+  printf '%s\n' "$audio_dialplan" | grep -Fq 'b(sls-alert-autoanswer^s^1(${EXTEN}))A(${SLS_SAFE_SOUND})' || {
     log "The SLS audio paging context is missing its portable auto-answer and audio playback handler."
     exit 1
   }
@@ -1549,6 +2049,14 @@ verify_install() {
   }
   printf '%s\n' "$autoanswer_dialplan" | grep -Fq 'PJSIP_HEADER(add,Call-Info)' || {
     log "The SLS PJSIP Call-Info auto-answer header is missing."
+    exit 1
+  }
+  printf '%s\n' "$autoanswer_dialplan" | grep -Fq 'Set(SLS_AUTOANSWER_CONTACT=${CHANNEL(contact)})' || {
+    log "The SLS PJSIP auto-answer context is missing per-contact user-agent discovery."
+    exit 1
+  }
+  printf '%s\n' "$autoanswer_dialplan" | grep -Fq 'PJSIP_AOR(${SLS_AUTOANSWER_AOR},contact)' || {
+    log "The SLS PJSIP auto-answer context is missing its extension/AOR contact fallback."
     exit 1
   }
   command -v runuser >/dev/null 2>&1 || {
@@ -1605,10 +2113,10 @@ verify_install() {
     fi
   done
   for recording_file in \
-    /var/lib/asterisk/sounds/en/custom/Paging_Tone_Opening.wav \
-    /var/lib/asterisk/sounds/en/custom/Paging_Tone_Closing.wav \
-    /var/lib/asterisk/sounds/en/custom/NWS_alert.wav \
-    /var/lib/asterisk/sounds/en/custom/Lightning_alert.wav; do
+    /var/lib/asterisk/sounds/en/custom/SLS_Mass_Notify_Paging_Tone_Opening.wav \
+    /var/lib/asterisk/sounds/en/custom/SLS_Mass_Notify_Paging_Tone_Closing.wav \
+    /var/lib/asterisk/sounds/en/custom/SLS_Mass_Notify_NWS_Alert.wav \
+    /var/lib/asterisk/sounds/en/custom/SLS_Mass_Notify_Lightning_Alert.wav; do
     [ -r "$recording_file" ] || {
       log "Bundled System Recording is missing: $recording_file"
       exit 1
@@ -1623,10 +2131,10 @@ verify_install() {
   php -r '
 require "/etc/freepbx.conf";
 $required = [
-    "custom/Paging_Tone_Opening",
-    "custom/Paging_Tone_Closing",
-    "custom/NWS_alert",
-    "custom/Lightning_alert",
+    "custom/SLS_Mass_Notify_Paging_Tone_Opening",
+    "custom/SLS_Mass_Notify_Paging_Tone_Closing",
+    "custom/SLS_Mass_Notify_NWS_Alert",
+    "custom/SLS_Mass_Notify_Lightning_Alert",
 ];
 $stmt = \FreePBX::Database()->prepare("SELECT COUNT(*) FROM recordings WHERE filename = ?");
 foreach ($required as $filename) {
@@ -1656,7 +2164,7 @@ exit(0);
     }
   notify_module_ready=0
   for _attempt in $(seq 1 20); do
-    if asterisk -rx "module show like res_pjsip_notify.so" 2>/dev/null | grep -q "res_pjsip_notify.so"; then
+    if asterisk_module_loaded res_pjsip_notify.so; then
       notify_module_ready=1
       break
     fi
@@ -1769,65 +2277,49 @@ PY
     log "SIP NOTIFY routing verified: portable endpoint fan-out will be used because no usable default outbound endpoint is configured."
   fi
   rm -f "$notify_capabilities"
-  if grep -Eq 'Objects found:[[:space:]]*[1-9][0-9]*' /tmp/sls-mass-notify-pjsip-contacts.out; then
-    endpoint_inventory="$(mktemp /tmp/sls-mass-notify-endpoints.XXXXXX)"
-    endpoint_inventory_err="$(mktemp /tmp/sls-mass-notify-endpoints-error.XXXXXX)"
-    if ! /usr/bin/timeout 15 python3 /usr/local/bin/sls_mass_notify/sls_notify.py --list-endpoints-json \
-      >"$endpoint_inventory" 2>"$endpoint_inventory_err"; then
-      cat "$endpoint_inventory_err" >>"$LOG_FILE" 2>/dev/null || true
-      rm -f "$endpoint_inventory" "$endpoint_inventory_err"
-      log "SLS AMI PJSIP contact discovery failed. Confirm the loopback manager user has system-event read permission; see $LOG_FILE."
-      exit 1
-    fi
-    if ! python3 - "$endpoint_inventory" /tmp/sls-mass-notify-pjsip-contacts.out <<'PY'
-import json
-import re
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as handle:
-    inventory = json.load(handle)
-if not isinstance(inventory, dict):
-    raise SystemExit("endpoint inventory is not a JSON object")
-for extension, details in inventory.items():
-    if not isinstance(extension, str) or not isinstance(details, dict):
-        raise SystemExit("endpoint inventory contains an invalid entry")
-with open(sys.argv[2], encoding="utf-8", errors="replace") as handle:
-    cli_contacts = handle.read()
-registered_cli = {
-    match.group(1)
-    for match in re.finditer(
-        r"(?im)^\s*Contact:\s+([0-9]+)/.*\s(?:Avail|Available|NonQual|Reachable|Unknown)\s+[-0-9na.]+\s*$",
-        cli_contacts,
-    )
-}
-for extension in sorted(registered_cli):
-    details = inventory.get(extension)
-    if not isinstance(details, dict):
-        raise SystemExit(f"AMI inventory omitted registered numeric endpoint {extension}")
-    if int(details.get("contacts") or 0) < 1 or not str(details.get("format") or "").strip():
-        raise SystemExit(f"AMI inventory returned an incomplete registered endpoint {extension}")
-PY
-    then
-      cat "$endpoint_inventory" >>"$LOG_FILE" 2>/dev/null || true
-      rm -f "$endpoint_inventory" "$endpoint_inventory_err"
-      log "SLS AMI PJSIP contact discovery returned invalid data; see $LOG_FILE."
-      exit 1
-    fi
-    first_numeric_endpoint="$(python3 - "$endpoint_inventory" <<'PY'
-import json
-import sys
-with open(sys.argv[1], encoding="utf-8") as handle:
-    inventory = json.load(handle)
-print(next((key for key in sorted(inventory) if str(key).isdigit()), ""))
-PY
-)"
-    if [ -n "$first_numeric_endpoint" ]; then
-      log "Registered endpoint discovery verified through AMI for extension $first_numeric_endpoint."
-    fi
+  # Always exercise the same AMI discovery path used by the Dashboard. Do not
+  # infer whether it should run from the presentation-dependent summary line of
+  # `pjsip show contacts`; community Asterisk builds format that output
+  # differently, and an empty PBX is a valid installation state.
+  endpoint_inventory="$(mktemp /tmp/sls-mass-notify-endpoints.XXXXXX)"
+  endpoint_inventory_err="$(mktemp /tmp/sls-mass-notify-endpoints-error.XXXXXX)"
+  if ! /usr/bin/timeout 15 python3 /usr/local/bin/sls_mass_notify/sls_notify.py --list-endpoints-json \
+    >"$endpoint_inventory" 2>"$endpoint_inventory_err"; then
+    cat "$endpoint_inventory_err" >>"$LOG_FILE" 2>/dev/null || true
     rm -f "$endpoint_inventory" "$endpoint_inventory_err"
-  else
-    log "No registered PJSIP contacts are present; AMI PJSIPShowContacts authorization was verified without waiting for an empty asynchronous inventory."
+    log "SLS AMI PJSIP contact discovery failed. Confirm the loopback manager user has system-event read permission; see $LOG_FILE."
+    exit 1
   fi
+  endpoint_records=""
+  if ! endpoint_records="$(endpoint_inventory_records "$endpoint_inventory" 2>>"$LOG_FILE")"; then
+    cat "$endpoint_inventory" >>"$LOG_FILE" 2>/dev/null || true
+    rm -f "$endpoint_inventory" "$endpoint_inventory_err"
+    log "SLS AMI PJSIP contact discovery returned invalid data; see $LOG_FILE."
+    exit 1
+  fi
+
+  registered_endpoint_count=0
+  while IFS=$'\t' read -r extension phone_format contact_count unknown_format user_agent; do
+    [ -n "$extension" ] || continue
+    registered_endpoint_count=$((registered_endpoint_count + 1))
+    if [ "$unknown_format" = "1" ]; then
+      log "Warning: registered endpoint $extension has an unknown phone format (user agent: ${user_agent:-not reported})."
+      log "A safe generic SIP NOTIFY fallback will be used; add a Phone Format Override after confirming the device family."
+    fi
+    if ! verify_registered_endpoint_route "$extension"; then
+      rm -f "$endpoint_inventory" "$endpoint_inventory_err"
+      log "Registered endpoint route validation failed before the installation was committed."
+      exit 1
+    fi
+    log "Registered endpoint $extension discovery verified through AMI: format=$phone_format contacts=$contact_count."
+  done <<<"$endpoint_records"
+
+  if [ "$registered_endpoint_count" -eq 0 ]; then
+    log "No registered numeric PJSIP contacts are present; AMI discovery and empty-PBX handling were verified."
+  else
+    log "AMI discovery and PJSIP paging routes verified for $registered_endpoint_count registered endpoint(s)."
+  fi
+  rm -f "$endpoint_inventory" "$endpoint_inventory_err"
   php -l /var/www/html/admin/modules/slsmassnotifyserver/Slsmassnotifyserver.class.php >/dev/null
   code="$(local_web_probe /api/sipnotify/desktop /tmp/sls-sipnotify-api.out '^(401|429)$' || true)"
   case "$code" in
@@ -1874,6 +2366,8 @@ PY
   update_count="$(printf '%s\n' "$root_cron" | grep -Fc '/usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh' || true)"
   maintenance_count="$(printf '%s\n' "$root_cron" | grep -Fc '/usr/local/bin/sls_mass_notify/sls_mass_notify_maintenance.sh' || true)"
   weather_count="$(printf '%s\n' "$asterisk_cron" | grep -Fc '/usr/local/bin/sls_mass_notify/sls_mass_notify_weather_poll.sh' || true)"
+  schedule_count="$(printf '%s\n' "$asterisk_cron" | grep -Fc '/usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php' || true)"
+  schedule_canonical_count="$(printf '%s\n' "$asterisk_cron" | grep -Fxc '* * * * * /usr/bin/timeout 1200 /usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php' || true)"
   if [ "$update_count" -ne 1 ]; then
     log "Expected exactly one root automatic-update cron entry; found $update_count."
     exit 1
@@ -1884,6 +2378,14 @@ PY
   fi
   if [ "$weather_count" -ne 1 ]; then
     log "Expected exactly one Asterisk weather scheduler cron entry; found $weather_count."
+    exit 1
+  fi
+  if [ "$schedule_count" -ne 1 ] || [ "$schedule_canonical_count" -ne 1 ]; then
+    log "Expected exactly one canonical Asterisk announcement scheduler cron entry; found $schedule_count total and $schedule_canonical_count canonical."
+    exit 1
+  fi
+  if ! runuser -u asterisk -- /usr/bin/timeout 20 /usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php --self-test >>"$LOG_FILE" 2>&1; then
+    log "Scheduled-announcement worker failed its Asterisk-account self-test."
     exit 1
   fi
   scheduler_probe="$(mktemp -d /tmp/sls-mass-notify-scheduler-check.XXXXXX)"
@@ -1910,27 +2412,28 @@ PY
 }
 
 main() {
-  require_freepbx
-  acquire_maintenance_coordination
   cd /tmp
   : >"$LOG_FILE"
-  preflight_platform
+  require_freepbx
+  acquire_maintenance_coordination
   install_dependencies
+  preflight_platform
   preflight_python
   ensure_freepbx_prerequisites
   download_tgz
   verify_tgz
   snapshot_config
+  validate_preserved_config_prerequisites
   trap guard_config_on_exit EXIT
   stage_module_directory
   activate_staged_module
   ensure_local_signer
   if ! SLS_MASS_NOTIFY_DEFER_SIGNING=1 fwconsole ma install "$MODULE" >>"$LOG_FILE" 2>&1; then
     if ! module_registered_at_expected_version; then
-      log "FreePBX rejected the module installation before registering version 0.0.8-beta. See $LOG_FILE."
+		log "FreePBX rejected the module installation before registering version 0.0.9-beta. See $LOG_FILE."
       exit 1
     fi
-    log "FreePBX registered version 0.0.8-beta but reported a nonfatal install status; runtime verification will continue."
+	log "FreePBX registered version 0.0.9-beta but reported a nonfatal install status; runtime verification will continue."
   fi
   fwconsole ma enable "$MODULE" >>"$LOG_FILE" 2>&1 || true
   SLS_MASS_NOTIFY_MODULE="$MODULE" sync_module_version

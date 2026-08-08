@@ -21,6 +21,68 @@ log() {
   :
 }
 
+# Bootstrap dependencies must be repaired before require_freepbx tries to use
+# PHP OpenSSL or the maintenance-lock utilities. A complete PBX must still skip
+# apt entirely.
+(
+  mock_apt_calls=0
+  apt-get() {
+    mock_apt_calls=$((mock_apt_calls + 1))
+    return 1
+  }
+  install_bootstrap_dependencies
+  [ "$mock_apt_calls" -eq 0 ]
+)
+
+# Fully provisioned PBXs must not be blocked by an unrelated broken apt source.
+# When every concrete capability exists, dependency setup skips apt entirely.
+(
+  mock_apt_calls=0
+  apt-get() {
+    mock_apt_calls=$((mock_apt_calls + 1))
+    return 1
+  }
+  install_dependencies
+  [ "$mock_apt_calls" -eq 0 ]
+)
+
+# Module startup validation accepts autoload or an explicit load, but rejects a
+# provider that is merely loaded in the current Asterisk process and noloaded.
+(
+  mock_modules="$(mktemp /tmp/sls-modules-conf.XXXXXX)"
+  trap 'rm -f "$mock_modules"' EXIT
+  printf '%s\n' '[modules]' 'autoload=yes' >"$mock_modules"
+  asterisk_module_starts_persistently res_pjsip_header_funcs.so "$mock_modules"
+  printf '%s\n' '[modules]' 'autoload=yes' 'noload = res_pjsip_header_funcs.so' >"$mock_modules"
+  if asterisk_module_starts_persistently res_pjsip_header_funcs.so "$mock_modules"; then
+    printf 'A noloaded Asterisk provider was accepted as restart-persistent.\n' >&2
+    exit 1
+  fi
+  printf '%s\n' '[modules]' 'autoload=no' 'load = res_pjsip_header_funcs.so' >"$mock_modules"
+  asterisk_module_starts_persistently res_pjsip_header_funcs.so "$mock_modules"
+  printf '%s\n' '[modules]' 'autoload=no' 'load => res_pjsip_header_funcs.so' >"$mock_modules"
+  asterisk_module_starts_persistently res_pjsip_header_funcs.so "$mock_modules"
+  printf '%s\n' '[modules]' 'autoload=yes' 'noload => res_pjsip_header_funcs.so' >"$mock_modules"
+  if asterisk_module_starts_persistently res_pjsip_header_funcs.so "$mock_modules"; then
+    printf 'An Asterisk-style noload => provider was accepted as restart-persistent.\n' >&2
+    exit 1
+  fi
+)
+
+# The compatibility Piper path is managed only when absent or already SLS-owned.
+(
+  mock_wrapper_dir="$(mktemp -d /tmp/sls-piper-wrapper.XXXXXX)"
+  trap 'find "$mock_wrapper_dir" -depth -delete' EXIT
+  mock_wrapper="$mock_wrapper_dir/piper"
+  printf '%s\n' '#!/bin/sh' 'exec /opt/other-piper "$@"' >"$mock_wrapper"
+  if validate_piper_wrapper_ownership "$mock_wrapper"; then
+    printf 'An unrelated Piper wrapper was accepted for overwrite.\n' >&2
+    exit 1
+  fi
+  printf '%s\n' '#!/bin/sh' 'exec /usr/local/bin/sls_mass_notify/piper/venv/bin/piper "$@"' >"$mock_wrapper"
+  validate_piper_wrapper_ownership "$mock_wrapper"
+)
+
 # Direct installers must exclude the minute maintenance job, while an updater
 # child launched by that job must reuse its inherited lock without deadlocking.
 (
@@ -421,7 +483,7 @@ mock_package_repair_success=0
 (
   asterisk() {
     if [ "${2:-}" = "core show channeltype Local" ]; then
-      printf '%s\n' "-- Info about channel driver: Local --"
+      printf '\033[1;35m%s\033[0m\n' "-- info about CHANNEL DRIVER: local --"
       return 0
     fi
     printf '%s\n' "No such channel type."
@@ -447,10 +509,227 @@ ensure_asterisk_capability application Dial app_dial.so
 [ "$mock_load_calls" -eq 1 ]
 mock_heading_case="title"
 
-expected_mapping=$'function|PJSIP_HEADER|res_pjsip_header_funcs.so\nfunction|PJSIP_CONTACT|func_pjsip_contact.so\nfunction|PJSIP_DIAL_CONTACTS|chan_pjsip.so\nfunction|TOLOWER|func_strings.so\nfunction|FILTER|func_strings.so\nfunction|CHANNEL|func_channel.so\nfunction|IF|func_logic.so\nfunction|DB|func_db.so\napplication|Dial|app_dial.so\napplication|ExecIf|app_exec.so\napplication|Return|app_stack.so\napplication|Log|app_verbose.so\napplication|Verbose|app_verbose.so'
+# Settings and module parsing must tolerate case and ANSI differences while
+# still requiring the active Asterisk directories supported by this release.
+(
+  mock_spool="/var/spool/asterisk"
+  mock_varlib="/var/lib/asterisk"
+  mock_data="/var/lib/asterisk"
+  asterisk() {
+    if [ "${2:-}" = "core show settings" ]; then
+      printf '\033[1;35m  module DIRECTORY:\033[0m /lib/asterisk/modules\n'
+      printf '  spool DIRECTORY: %s\n' "$mock_spool"
+      printf '  VARLIB directory: %s\n' "$mock_varlib"
+      printf '  data directory: %s\n' "$mock_data"
+      return 0
+    fi
+    return 1
+  }
+  [ "$(asterisk_setting_value "Module directory")" = "/lib/asterisk/modules" ]
+  [ "$(asterisk_module_file "test-provider.so")" = "/lib/asterisk/modules/test-provider.so" ]
+  verify_supported_asterisk_directories
+  mock_spool="/srv/asterisk/spool"
+  if verify_supported_asterisk_directories; then
+    printf 'An unsupported live Asterisk spool path was incorrectly accepted.\n' >&2
+    exit 1
+  fi
+  mock_spool="/var/spool/asterisk"
+  mock_varlib="/srv/asterisk/lib"
+  if verify_supported_asterisk_directories; then
+    printf 'An unsupported live Asterisk VarLib path was incorrectly accepted.\n' >&2
+    exit 1
+  fi
+  mock_varlib="/var/lib/asterisk"
+  mock_data="/srv/asterisk/data"
+  if verify_supported_asterisk_directories; then
+    printf 'An unsupported live Asterisk data path was incorrectly accepted.\n' >&2
+    exit 1
+  fi
+  mock_data=""
+  verify_supported_asterisk_directories
+  mock_varlib=""
+  if verify_supported_asterisk_directories; then
+    printf 'A missing live Asterisk VarLib path was incorrectly accepted.\n' >&2
+    exit 1
+  fi
+)
+
+# Module status parsing must accept colored/lowercase community output but not
+# a matching module that is explicitly Not Running.
+(
+  mock_status="running"
+  asterisk() {
+    if [ "${2:-}" = "module show like res_pjsip_notify.so" ]; then
+      printf '\033[1;32mres_pjsip_notify.so\033[0m notify 0 %s core\n' "$mock_status"
+      return 0
+    fi
+    return 1
+  }
+  asterisk_module_loaded res_pjsip_notify.so
+  mock_status="Not Running"
+  if asterisk_module_loaded res_pjsip_notify.so; then
+    printf 'A Not Running Asterisk module was incorrectly accepted.\n' >&2
+    exit 1
+  fi
+)
+
+# Wait is built into supported Asterisk builds. A missing built-in capability
+# must fail without attempting a provider load or package repair.
+(
+  mock_provider_activity=0
+  asterisk() {
+    if [ "${2:-}" = "core show application Wait" ]; then
+      printf '%s\n' "Your application(s) is (are) not registered."
+      return 0
+    fi
+    mock_provider_activity=$((mock_provider_activity + 1))
+    return 1
+  }
+  repair_asterisk_provider_package() {
+    mock_provider_activity=$((mock_provider_activity + 1))
+    return 1
+  }
+  if require_asterisk_capability application Wait; then
+    printf 'A missing built-in Wait application was incorrectly accepted.\n' >&2
+    exit 1
+  fi
+  [ "$mock_provider_activity" -eq 0 ]
+)
+
+# Effective paging routes must remain entirely PJSIP. The installer reports a
+# legacy AstDB route instead of rewriting it, and only accepts endpoint fallback
+# when the corresponding PJSIP endpoint object actually exists.
+pjsip_dial_string_supported 'PJSIP/1000'
+pjsip_dial_string_supported 'PJSIP/1000/sip:1000@192.0.2.10&PJSIP/1000/sip:1000@192.0.2.11'
+if pjsip_dial_string_supported 'Local/1000@from-internal'; then
+  printf 'A Local paging route was incorrectly accepted as PJSIP.\n' >&2
+  exit 1
+fi
+if pjsip_dial_string_supported 'PJSIP/1000&SIP/1000'; then
+  printf 'A mixed PJSIP/legacy route was incorrectly accepted.\n' >&2
+  exit 1
+fi
+(
+  mock_db_route="PJSIP/1000"
+  mock_dynamic_route="PJSIP/1000/sip:1000@192.0.2.10"
+  asterisk() {
+    case "${2:-}" in
+      "database get DEVICE 1000/dial")
+        if [ -n "$mock_db_route" ]; then
+          printf '\033[1;32mVALUE:\033[0m %s\n' "$mock_db_route"
+        else
+          printf '%s\n' "Database entry not found."
+        fi
+        ;;
+      "dialplan eval function PJSIP_DIAL_CONTACTS(1000)")
+        printf '%s\n' "Return Value: Success (0)"
+        [ -z "$mock_dynamic_route" ] || printf 'RESULT: %s\n' "$mock_dynamic_route"
+        ;;
+      "pjsip show endpoint 1000")
+        if [ "${mock_endpoint_available:-1}" -eq 1 ]; then
+          printf '%s\n' ' Endpoint:  1000/1000                         Not in use    0 of inf'
+        else
+          printf '%s\n' 'Unable to find object 1000.'
+        fi
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  verify_registered_endpoint_route 1000
+  mock_db_route="Local/1000@from-internal"
+  if verify_registered_endpoint_route 1000; then
+    printf 'A non-PJSIP effective AstDB route was incorrectly accepted.\n' >&2
+    exit 1
+  fi
+  mock_db_route=""
+  verify_registered_endpoint_route 1000
+  mock_dynamic_route="PJSIP/9999/sip:9999@192.0.2.20"
+  if verify_registered_endpoint_route 1000; then
+    printf 'A paging route referencing a missing PJSIP endpoint was incorrectly accepted.\n' >&2
+    exit 1
+  fi
+  mock_dynamic_route=""
+  verify_registered_endpoint_route 1000
+  mock_endpoint_available=0
+  if verify_registered_endpoint_route 1000; then
+    printf 'A fabricated PJSIP endpoint fallback was incorrectly accepted.\n' >&2
+    exit 1
+  fi
+)
+
+# AMI endpoint records are validated independently of `pjsip show contacts`
+# summary wording. Empty inventories remain valid and unknown formats are
+# surfaced explicitly to the caller.
+(
+  inventory_dir="$(mktemp -d /tmp/sls-installer-inventory.XXXXXX)"
+  trap 'find "$inventory_dir" -depth -delete' EXIT
+  printf '%s\n' '{}' >"$inventory_dir/empty.json"
+  [ -z "$(endpoint_inventory_records "$inventory_dir/empty.json")" ]
+  printf '%s\n' '{"1000":{"contacts":2,"format":"unknown","formats":["unknown"],"user_agent":"Community Phone"}}' >"$inventory_dir/unknown.json"
+  [ "$(endpoint_inventory_records "$inventory_dir/unknown.json")" = $'1000\tunknown\t2\t1\tCommunity Phone' ]
+  printf '%s\n' '{"1000":{"contacts":1,"format":"unsupported","formats":["unsupported"]}}' >"$inventory_dir/invalid.json"
+  if endpoint_inventory_records "$inventory_dir/invalid.json" >/dev/null 2>&1; then
+    printf 'An unsupported endpoint inventory format was incorrectly accepted.\n' >&2
+    exit 1
+  fi
+)
+
+# Regression guard: AMI discovery is unconditional and no longer branches on
+# the display-only "Objects found" footer emitted by selected Asterisk builds.
+if grep -Fq "if grep -Eq 'Objects found" "${ROOT_DIR}/tools/install_release.sh"; then
+  printf 'Installer still branches AMI discovery on Asterisk summary text.\n' >&2
+  exit 1
+fi
+[ "$(grep -Fc -- '--list-endpoints-json' "${ROOT_DIR}/tools/install_release.sh")" -ge 1 ]
+
+# Regression guards for dependency-bootstrap ordering and the exact image
+# validation tools used by sls_notify.py and verify_install().
+installer_source="${ROOT_DIR}/tools/install_release.sh"
+require_body="$(declare -f require_freepbx)"
+bootstrap_call_line="$(grep -nFm1 'install_bootstrap_dependencies' <<<"$require_body" | cut -d: -f1)"
+bootstrap_utility_line="$(grep -nFm1 'for bootstrap_utility in /usr/bin/flock' <<<"$require_body" | cut -d: -f1)"
+[ -n "$bootstrap_call_line" ]
+[ -n "$bootstrap_utility_line" ]
+[ "$bootstrap_call_line" -lt "$bootstrap_utility_line" ]
+
+main_body="$(declare -f main)"
+log_reset_line="$(grep -nFm1 ': > "$LOG_FILE"' <<<"$main_body" | cut -d: -f1)"
+require_line="$(grep -nFm1 'require_freepbx' <<<"$main_body" | cut -d: -f1)"
+lock_line="$(grep -nFm1 'acquire_maintenance_coordination' <<<"$main_body" | cut -d: -f1)"
+dependency_line="$(grep -nFm1 'install_dependencies' <<<"$main_body" | cut -d: -f1)"
+[ "$log_reset_line" -lt "$require_line" ]
+[ "$require_line" -lt "$lock_line" ]
+[ "$lock_line" -lt "$dependency_line" ]
+
+grep -Fq '{ [ -x /usr/bin/convert ] && [ -x /usr/bin/identify ]; } || add_missing_package imagemagick' "$installer_source"
+grep -Fq 'for package in /usr/bin/curl /usr/bin/wget /usr/bin/gpg /usr/bin/python3 /usr/bin/sox /usr/bin/soxi /usr/bin/convert /usr/bin/identify ' "$installer_source"
+grep -Fq '[ -r /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf ] || {' "$installer_source"
+grep -Fq 'function_exists("openssl_encrypt") && function_exists("openssl_decrypt")' "$installer_source"
+class_dependency_source="${ROOT_DIR}/slsmassnotifyserver/Slsmassnotifyserver.class.php"
+grep -Fq "'/usr/bin/identify'" "$class_dependency_source"
+grep -Fq "!is_readable('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf')" "$class_dependency_source"
+grep -Fq "!function_exists('openssl_encrypt') || !function_exists('openssl_decrypt')" "$class_dependency_source"
+
+# The outbound called channel's contact remains the preferred Asterisk 22
+# user-agent source. The explicit extension/AOR fallback protects compatible
+# community builds where CHANNEL(contact) is empty in the pre-dial handler.
+class_source="${ROOT_DIR}/slsmassnotifyserver/Slsmassnotifyserver.class.php"
+channel_contact_line="$(grep -nFm1 'Set(SLS_AUTOANSWER_CONTACT=\${CHANNEL(contact)})' "$class_source" | cut -d: -f1)"
+aor_fallback_line="$(grep -nFm1 'PJSIP_AOR(\${SLS_AUTOANSWER_AOR},contact)' "$class_source" | cut -d: -f1)"
+[ -n "$channel_contact_line" ]
+[ -n "$aor_fallback_line" ]
+[ "$channel_contact_line" -lt "$aor_fallback_line" ]
+grep -Fq 'PJSIP_CONTACT(\${SLS_AUTOANSWER_CONTACT},user_agent)' "$class_source"
+grep -Fq 'b(sls-alert-autoanswer^s^1(\${EXTEN}))' "$class_source"
+grep -Fq 'b(sls-alert-autoanswer^s^1(${EXTEN}))A(${SLS_SAFE_SOUND})' "${ROOT_DIR}/tools/install_release.sh"
+
+expected_mapping=$'function|PJSIP_HEADER|res_pjsip_header_funcs.so\nfunction|PJSIP_CONTACT|func_pjsip_contact.so\nfunction|PJSIP_AOR|func_pjsip_aor.so\nfunction|PJSIP_DIAL_CONTACTS|chan_pjsip.so\nfunction|TOLOWER|func_strings.so\nfunction|CUT|func_strings.so\nfunction|FILTER|func_strings.so\nfunction|CHANNEL|func_channel.so\nfunction|IF|func_logic.so\nfunction|DB|func_db.so\nfunction|CALLERID|func_callerid.so\napplication|Dial|app_dial.so\napplication|ExecIf|app_exec.so\napplication|Gosub|app_stack.so\napplication|Return|app_stack.so\napplication|Log|app_verbose.so\napplication|Verbose|app_verbose.so\nrequired|application|Wait'
 actual_mapping="$(
   ensure_asterisk_capability() {
     printf '%s|%s|%s\n' "$1" "$2" "$3"
+  }
+  require_asterisk_capability() {
+    printf 'required|%s|%s\n' "$1" "$2"
   }
   ensure_required_asterisk_capabilities
 )"

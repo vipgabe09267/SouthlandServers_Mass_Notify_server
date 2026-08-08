@@ -6,6 +6,33 @@
 # Configure the NWS section in the central .config file before enabling alerts.
 # ============================================================
 
+usage() {
+  printf '%s\n' 'Usage: sls_mass_notify_nws_poll.sh'
+  printf '%s\n' 'Poll one configured Weather.gov zone. Configuration is supplied through the protected central config and worker environment.'
+}
+
+case "$#" in
+  0) ;;
+  1)
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        printf 'Unknown argument: %s\n' "$1" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  *)
+    printf 'This worker does not accept positional arguments.\n' >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
 NWS_ZONE=""
 NWS_API_BASE_URL="https://api.weather.gov"
 SLS_CALLERID_NAME="SLS Mass Notification System"
@@ -46,7 +73,7 @@ LIGHTNING_GATE_FILE="${LIGHTNING_GATE_FILE:-/var/lib/asterisk/SLS_Mass_Notificat
 MAIL_TO=""
 DISCORD_WEBHOOK_URL=""
 MAIL_FROM_NAME="SLS Mass Notification System"
-MAIL_FROM_ADDR="no-reply@localhost"
+MAIL_FROM_ADDR="no-reply@localhost.localdomain"
 EMAIL_HTML_ENABLED="1"
 SENDMAIL_BIN="/usr/sbin/sendmail"
 SOURCE_EXTENSION=""
@@ -486,7 +513,7 @@ load_central_config() {
     case "$key" in
       NWS_ALERT_RECIPIENT) NWS_ALERT_RECIPIENTS+=("$value") ;;
       QUIET_HOURS_CRITICAL_EVENT) critical_events+=("$value") ;;
-      NWS_ALERTS_ENABLED|PUBLIC_PBX_HOST|NWS_API_BASE_URL|NWS_ZONE|SLS_OPENING_TONE|SLS_CLOSING_TONE|PIPER_BIN|PIPER_NWS_VOICE|PIPER_ANNOUNCEMENT_VOICE|PIPER_NWS_VOLUME|PIPER_ANNOUNCEMENT_VOLUME|PIPER_MAX_SECONDS|LOG_RETENTION_DAYS|MAIL_TO|DISCORD_WEBHOOK_URL|QUIET_HOURS_ENABLED|QUIET_HOURS_START|QUIET_HOURS_END|MAIL_FROM_NAME|MAIL_FROM_ADDR|ALERT_EMAIL_SUBJECT|ALERT_EMAIL_BODY|TEST_EMAIL_SUBJECT|TEST_EMAIL_BODY|EMAIL_HTML_ENABLED|AMI_USERNAME|AMI_PASSWORD|GITHUB_UPDATES_ENABLED|GITHUB_UPDATES_REPOSITORY|GITHUB_UPDATES_CHANNEL)
+      NWS_ALERTS_ENABLED|PUBLIC_PBX_HOST|NWS_API_BASE_URL|NWS_ZONE|SLS_OPENING_TONE|SLS_CLOSING_TONE|PIPER_BIN|PIPER_NWS_VOICE|PIPER_ANNOUNCEMENT_VOICE|PIPER_NWS_VOLUME|PIPER_ANNOUNCEMENT_VOLUME|PIPER_MAX_SECONDS|LOG_RETENTION_DAYS|MAIL_TO|DISCORD_WEBHOOK_URL|QUIET_HOURS_ENABLED|QUIET_HOURS_START|QUIET_HOURS_END|MAIL_FROM_NAME|MAIL_FROM_ADDR|ALERT_EMAIL_SUBJECT|ALERT_EMAIL_BODY|TEST_EMAIL_SUBJECT|TEST_EMAIL_BODY|EMAIL_HTML_ENABLED|AMI_USERNAME|AMI_PASSWORD|AMI_HOST|AMI_PORT|GITHUB_UPDATES_ENABLED|GITHUB_UPDATES_REPOSITORY|GITHUB_UPDATES_CHANNEL)
         printf -v "$key" '%s' "$value"
         ;;
     esac
@@ -1070,13 +1097,13 @@ if [ -n "$TEST_PAYLOAD" ]; then
 else
 	ALERTS=$(curl -fsS --retry 3 --retry-all-errors --retry-connrefused --connect-timeout 10 --max-time 30 --max-filesize 10485760 \
     -H "Accept: application/geo+json" \
-    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.0.8-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
+    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.0.9-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
     "${NWS_API_BASE_URL%/}/alerts/active?zone=${NWS_ZONE}&status=actual" 2>>"$LOG") || ALERTS=""
   if [ -z "$ALERTS" ]; then
     echo "$(date): Initial NWS request failed; retrying over IPv4" >> "$LOG"
 	  ALERTS=$(curl -4 -fsS --retry 2 --retry-all-errors --retry-connrefused --connect-timeout 10 --max-time 30 --max-filesize 10485760 \
       -H "Accept: application/geo+json" \
-	    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.0.8-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
+	    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.0.9-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
       "${NWS_API_BASE_URL%/}/alerts/active?zone=${NWS_ZONE}&status=actual" 2>>"$LOG") || ALERTS=""
   fi
 fi
@@ -1124,6 +1151,7 @@ print(json.dumps(payload, separators=(',', ':')))
 PARSED_ALERTS="$(echo "$ALERTS" | python3 -c "
 import base64
 import sys, json
+from datetime import datetime
 
 try:
     data = json.load(sys.stdin)
@@ -1151,19 +1179,25 @@ for feature in features:
     references = props.get('references') or []
     reference_id = ''
 
-    for ref in references:
-        if not isinstance(ref, dict):
-            continue
-        if (ref.get('event') or '').strip() == event:
-            reference_id = (ref.get('identifier') or '').strip().split('/')[-1]
-            if reference_id:
-                break
-    if not reference_id:
-        for ref in references:
-            if isinstance(ref, dict):
-                reference_id = (ref.get('identifier') or '').strip().split('/')[-1]
-                if reference_id:
-                    break
+    # Only Update messages inherit a prior chain identity. A first-issued
+    # Alert keeps its own ID even if a provider unexpectedly includes an old
+    # reference, preventing a new alert from colliding with processed state.
+    if msg_type.lower() == 'update':
+        candidates = []
+        for position, ref in enumerate(references):
+            if not isinstance(ref, dict):
+                continue
+            identifier = str(ref.get('identifier') or ref.get('@id') or '').strip().split('/')[-1]
+            if not identifier:
+                continue
+            sent = str(ref.get('sent') or '').strip()
+            try:
+                sent_key = datetime.fromisoformat(sent.replace('Z', '+00:00')).timestamp()
+            except (TypeError, ValueError):
+                sent_key = float('inf')
+            candidates.append((sent_key, position, identifier))
+        if candidates:
+            reference_id = min(candidates)[2]
 
     if status != 'Actual':
         continue

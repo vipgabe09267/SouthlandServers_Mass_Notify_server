@@ -2,6 +2,33 @@
 # Southland Servers Mass Notifications Server by the Southland Servers Group
 set -uo pipefail
 
+usage() {
+  printf '%s\n' 'Usage: sls_mass_notify_weather_poll.sh'
+  printf '%s\n' 'Run one scheduled Weather.gov and Lightning polling cycle.'
+}
+
+case "$#" in
+  0) ;;
+  1)
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        printf 'Unknown argument: %s\n' "$1" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  *)
+    printf 'This worker does not accept positional arguments.\n' >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
 CONFIG_FILE="${CONFIG_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config}"
 RUNTIME_DIR="${RUNTIME_DIR:-/usr/local/bin/sls_mass_notify}"
 DATA_DIR="${DATA_DIR:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin}"

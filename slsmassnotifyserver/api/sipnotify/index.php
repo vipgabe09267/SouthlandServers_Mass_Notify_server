@@ -242,6 +242,90 @@ function retained_events(array $settings): array
     return $events;
 }
 
+function announcement_display_expired(array $event, ?int $now = null): bool
+{
+    if (strtolower(trim((string)($event['kind'] ?? ''))) !== 'announcement') {
+        return false;
+    }
+    $timeoutSeconds = min(86400, max(0, (int)($event['display_timeout_seconds'] ?? 0)));
+    if ($timeoutSeconds === 0) {
+        return false;
+    }
+    $expiresAt = trim((string)($event['display_expires_at'] ?? ''));
+    if ($expiresAt === '') {
+        return false;
+    }
+    $expiresTimestamp = strtotime($expiresAt);
+    if ($expiresTimestamp === false) {
+        return false;
+    }
+    return $expiresTimestamp <= ($now ?? time());
+}
+
+function desktop_event_routed_to_client(array $event, string $username): bool
+{
+    // Legacy records without explicit desktop routing remain denied so one
+    // desktop cannot read another client's history.
+    if (!array_key_exists('desktop_all', $event) && !array_key_exists('desktop_recipients', $event)) {
+        return false;
+    }
+    $recipients = is_array($event['desktop_recipients'] ?? null) ? $event['desktop_recipients'] : [];
+    return !empty($event['desktop_all']) || in_array($username, $recipients, true);
+}
+
+function desktop_stream_events_after_cursor(
+    array $events,
+    string $username,
+    string $lastEventId,
+    ?int $now = null
+): array {
+    $routedEvents = [];
+    foreach ($events as $event) {
+        if (!is_array($event) || !desktop_event_routed_to_client($event, $username)) {
+            continue;
+        }
+        $eventId = trim((string)($event['id'] ?? $event['event_id'] ?? ''));
+        if ($eventId !== '') {
+            $routedEvents[] = [$eventId, $event];
+        }
+    }
+
+    $nextEvents = [];
+    if ($lastEventId === '') {
+        if (!empty($routedEvents)) {
+            $lastEventId = (string)$routedEvents[count($routedEvents) - 1][0];
+        }
+        return ['last_event_id' => $lastEventId, 'events' => $nextEvents];
+    }
+
+    $lastIndex = -1;
+    foreach ($routedEvents as $index => $routedEvent) {
+        if (hash_equals($lastEventId, (string)$routedEvent[0])) {
+            $lastIndex = (int)$index;
+        }
+    }
+    if ($lastIndex < 0) {
+        if (!empty($routedEvents)) {
+            $lastEventId = (string)$routedEvents[count($routedEvents) - 1][0];
+        }
+        return ['last_event_id' => $lastEventId, 'events' => $nextEvents];
+    }
+
+    foreach (array_slice($routedEvents, $lastIndex + 1) as $routedEvent) {
+        [$eventId, $event] = $routedEvent;
+        // Advance across every routed journal record, including an expired
+        // announcement. Otherwise an expired cursor can disappear from the
+        // visible set and cause the following live event to be skipped.
+        $lastEventId = (string)$eventId;
+        if (announcement_display_expired($event, $now)) {
+            continue;
+        }
+        $nextEvents[] = [$eventId, $event];
+    }
+
+    return ['last_event_id' => $lastEventId, 'events' => $nextEvents];
+}
+
 $endpoint = endpoint_slug();
 if (!in_array($endpoint, ['desktop', 'desktop/stream'], true)) {
     respond(404, ['ok' => false, 'error' => 'unknown_endpoint']);
@@ -304,41 +388,18 @@ if ($streamRequested) {
 	$streamSeconds = min(300, max(1, (int)($_GET['stream_seconds'] ?? 300)));
     $lastKeepalive = 0;
     while (!connection_aborted() && time() - $started < $streamSeconds) {
-		$visibleEvents = [];
-        foreach (retained_events($settings) as $event) {
-            if (!array_key_exists('desktop_all', $event) && !array_key_exists('desktop_recipients', $event)) {
-                continue;
-            }
-            $recipients = is_array($event['desktop_recipients'] ?? null) ? $event['desktop_recipients'] : [];
-            if (empty($event['desktop_all']) && !in_array($username, $recipients, true)) {
-                continue;
-            }
-			$eventId = trim((string)($event['id'] ?? $event['event_id'] ?? ''));
-			if ($eventId !== '') {
-				$visibleEvents[] = [$eventId, $event];
-			}
+		$streamBatch = desktop_stream_events_after_cursor(
+			retained_events($settings),
+			$username,
+			$lastEventId
+		);
+		foreach ($streamBatch['events'] as $streamEvent) {
+			[$eventId, $event] = $streamEvent;
+			echo 'id: ' . str_replace(["\r", "\n"], '', (string)$eventId) . "\n";
+			echo "event: notification\n";
+			echo 'data: ' . json_encode($event, JSON_UNESCAPED_SLASHES) . "\n\n";
 		}
-		if ($lastEventId === '' && !empty($visibleEvents)) {
-			$lastEventId = (string)$visibleEvents[count($visibleEvents) - 1][0];
-		} elseif ($lastEventId !== '') {
-			$lastIndex = -1;
-			foreach ($visibleEvents as $index => $visibleEvent) {
-				if (hash_equals($lastEventId, (string)$visibleEvent[0])) {
-					$lastIndex = (int)$index;
-				}
-			}
-			if ($lastIndex >= 0) {
-				foreach (array_slice($visibleEvents, $lastIndex + 1) as $visibleEvent) {
-					[$eventId, $event] = $visibleEvent;
-					echo 'id: ' . str_replace(["\r", "\n"], '', $eventId) . "\n";
-					echo "event: notification\n";
-					echo 'data: ' . json_encode($event, JSON_UNESCAPED_SLASHES) . "\n\n";
-					$lastEventId = (string)$eventId;
-				}
-			} elseif (!empty($visibleEvents)) {
-				$lastEventId = (string)$visibleEvents[count($visibleEvents) - 1][0];
-			}
-        }
+		$lastEventId = (string)$streamBatch['last_event_id'];
         if (time() - $lastKeepalive >= 15) {
             echo ': keepalive ' . time() . "\n\n";
             $lastKeepalive = time();
@@ -354,14 +415,10 @@ if ($streamRequested) {
 $limit = min(MAX_LIMIT, max(1, (int)($_GET['limit'] ?? DEFAULT_LIMIT)));
 $events = [];
 foreach (retained_events($settings) as $event) {
-    // New records always contain explicit desktop routing. Legacy records are
-    // denied by default so one desktop cannot read another client's history.
-    if (!array_key_exists('desktop_all', $event) && !array_key_exists('desktop_recipients', $event)) {
-        continue;
-    }
-    $desktopAll = !empty($event['desktop_all']);
-    $recipients = is_array($event['desktop_recipients'] ?? null) ? $event['desktop_recipients'] : [];
-    if (!$desktopAll && !in_array($username, $recipients, true)) {
+	if (announcement_display_expired($event)) {
+		continue;
+	}
+    if (!desktop_event_routed_to_client($event, $username)) {
         continue;
     }
     $events[] = $event;

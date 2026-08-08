@@ -2,6 +2,7 @@
 """Build and send branded multipart alert email without exposing config secrets."""
 
 import html
+import ipaddress
 import json
 import os
 import re
@@ -19,6 +20,37 @@ LOGO_PATHS = (
     Path("/var/www/html/sls_mass_notify/assets/SLS_Mass_Notif_Plugin.png"),
 )
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}")
+DOMAIN_LABEL_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def normalized_sender_domain(value):
+    domain = str(value or "").strip().lower()
+    if domain.startswith("@"):
+        domain = domain[1:]
+    domain = domain.rstrip(".")
+    if not domain or len(domain) > 253 or "." not in domain:
+        return ""
+    try:
+        ipaddress.ip_address(domain)
+        return ""
+    except ValueError:
+        pass
+    labels = domain.split(".")
+    if not all(DOMAIN_LABEL_PATTERN.fullmatch(label) for label in labels):
+        return ""
+    return domain
+
+
+def sender_address(config):
+    domain = normalized_sender_domain(config.get("mail_from_domain"))
+    if domain:
+        return "no-reply@" + domain
+    legacy = str(config.get("mail_from_addr") or "").replace("\r", "").replace("\n", "").strip()
+    if EMAIL_PATTERN.fullmatch(legacy):
+        legacy_domain = normalized_sender_domain(legacy.rsplit("@", 1)[1])
+        if legacy_domain:
+            return legacy
+    return "no-reply@localhost.localdomain"
 
 
 def alert_profile(subject, body, event="", severity=""):
@@ -105,9 +137,7 @@ def send_branded_email(config, subject, body, event="", severity="", recipients_
     if not sendmail.is_file():
         raise RuntimeError("sendmail is unavailable")
     from_name = re.sub(r"[\r\n]+", " ", str(config.get("mail_from_name") or "SLS Mass Notification System"))[:80]
-    from_addr = str(config.get("mail_from_addr") or "no-reply@localhost").replace("\r", "").replace("\n", "")
-    if not EMAIL_PATTERN.fullmatch(from_addr):
-        from_addr = "no-reply@localhost"
+    from_addr = sender_address(config)
     _, _, subject_icon, _ = alert_profile(subject, body, event, severity)
     message = EmailMessage()
     message["Subject"] = f"{subject_icon} {str(subject).replace(chr(13), ' ').replace(chr(10), ' ')[:230]}"

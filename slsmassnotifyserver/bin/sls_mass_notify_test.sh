@@ -1,6 +1,35 @@
 #!/bin/bash
 # Southland Servers Mass Notifications Server by the Southland Servers Group
 
+usage() {
+  printf '%s\n' 'Usage: sls_mass_notify_test.sh [trigger-id [trigger-name]]'
+  printf '%s\n' 'Run a manual Weather Alert delivery test. Invoke this through the authenticated FreePBX interface.'
+}
+
+if [ "$#" -eq 1 ] && { [ "$1" = "-h" ] || [ "$1" = "--help" ]; }; then
+  usage
+  exit 0
+fi
+if [ "$#" -gt 2 ]; then
+  printf 'Too many arguments.\n' >&2
+  usage >&2
+  exit 2
+fi
+case "${1:-}" in
+  -*)
+    printf 'Unknown option: %s\n' "$1" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+case "${2:-}" in
+  -*)
+    printf 'Unknown option: %s\n' "$2" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
 SLS_CALLERID_NAME="SLS Mass Notification System"
 SLS_CALLERID_NUM="SLS"
 SLS_AUDIO_CONTEXT="sls-alert-audio"
@@ -34,7 +63,7 @@ TEST_CALL_RESULTS=()
 MAIL_TO=""
 DISCORD_WEBHOOK_URL=""
 MAIL_FROM_NAME="SLS Mass Notification System"
-MAIL_FROM_ADDR="no-reply@localhost"
+MAIL_FROM_ADDR="no-reply@localhost.localdomain"
 EMAIL_HTML_ENABLED="1"
 SENDMAIL_BIN="/usr/sbin/sendmail"
 SOURCE_EXTENSION=""
@@ -150,42 +179,13 @@ report_fault() {
   local stage="$1"
   local message="$2"
   local now
-  local fault_key
-  local subject
-  local body
 
   now="$(timestamp_now)"
-  update_status "$(printf '{"last_fault_at":%s,"last_fault_stage":%s,"last_fault_message":%s}' \
+  update_status "$(printf '{"last_test_at":%s,"last_test_status":"fault","last_test_stage":%s,"last_test_message":%s}' \
     "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$now")" \
     "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$stage")" \
     "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$message")")"
-
-  fault_key="${stage}|${message}"
-  if [ -r "$FAULT_STATE_FILE" ] && [ "$(cat "$FAULT_STATE_FILE" 2>/dev/null)" = "$fault_key" ]; then
-    return 1
-  fi
-
-  subject="Southland Servers Group PBX: EAS fault detected - ${stage}"
-  body="A fault was detected in the EAS alert system.
-
-Stage: ${stage}
-Message: ${message}
-NWS Recipients: ${DELIVERY_TARGETS}
-Time: ${now}"
-
-  if send_notification_email "$subject" "$body"; then
-    printf '%s\n' "$fault_key" > "$FAULT_STATE_FILE"
-    chmod 0640 "$FAULT_STATE_FILE" 2>/dev/null || true
-    chown asterisk:asterisk "$FAULT_STATE_FILE" 2>/dev/null || true
-    update_status "$(printf '{"fault_email_sent_at":%s}' "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$now")")"
-  fi
-
   return 0
-}
-
-clear_fault_state() {
-  rm -f "$FAULT_STATE_FILE" 2>/dev/null || true
-  update_status '{"last_fault_at":"","last_fault_stage":"","last_fault_message":"","fault_email_sent_at":""}'
 }
 
 append_event_log() {
@@ -518,7 +518,7 @@ load_central_config() {
   while IFS= read -r -d '' key && IFS= read -r -d '' value; do
     case "$key" in
       NWS_ALERT_RECIPIENT) NWS_ALERT_RECIPIENTS+=("$value") ;;
-      NWS_ALERTS_ENABLED|PUBLIC_PBX_HOST|NWS_API_BASE_URL|NWS_ZONE|SLS_OPENING_TONE|SLS_CLOSING_TONE|PIPER_BIN|PIPER_NWS_VOICE|PIPER_ANNOUNCEMENT_VOICE|PIPER_NWS_VOLUME|PIPER_ANNOUNCEMENT_VOLUME|PIPER_MAX_SECONDS|LOG_RETENTION_DAYS|MAIL_TO|DISCORD_WEBHOOK_URL|QUIET_HOURS_ENABLED|QUIET_HOURS_START|QUIET_HOURS_END|MAIL_FROM_NAME|MAIL_FROM_ADDR|ALERT_EMAIL_SUBJECT|ALERT_EMAIL_BODY|TEST_EMAIL_SUBJECT|TEST_EMAIL_BODY|EMAIL_HTML_ENABLED|AMI_USERNAME|AMI_PASSWORD|GITHUB_UPDATES_ENABLED|GITHUB_UPDATES_REPOSITORY|GITHUB_UPDATES_CHANNEL)
+      NWS_ALERTS_ENABLED|PUBLIC_PBX_HOST|NWS_API_BASE_URL|NWS_ZONE|SLS_OPENING_TONE|SLS_CLOSING_TONE|PIPER_BIN|PIPER_NWS_VOICE|PIPER_ANNOUNCEMENT_VOICE|PIPER_NWS_VOLUME|PIPER_ANNOUNCEMENT_VOLUME|PIPER_MAX_SECONDS|LOG_RETENTION_DAYS|MAIL_TO|DISCORD_WEBHOOK_URL|QUIET_HOURS_ENABLED|QUIET_HOURS_START|QUIET_HOURS_END|MAIL_FROM_NAME|MAIL_FROM_ADDR|ALERT_EMAIL_SUBJECT|ALERT_EMAIL_BODY|TEST_EMAIL_SUBJECT|TEST_EMAIL_BODY|EMAIL_HTML_ENABLED|AMI_USERNAME|AMI_PASSWORD|AMI_HOST|AMI_PORT|GITHUB_UPDATES_ENABLED|GITHUB_UPDATES_REPOSITORY|GITHUB_UPDATES_CHANNEL)
         printf -v "$key" '%s' "$value"
         ;;
     esac
@@ -572,146 +572,6 @@ fi
 printf '%s\n' "$NOW_TS" > "$COOLDOWN_FILE"
 chmod 0640 "$COOLDOWN_FILE" 2>/dev/null || true
 chown asterisk:asterisk "$COOLDOWN_FILE" 2>/dev/null || true
-
-send_notification_email() {
-  local subject="$1"
-  local body="$2"
-
-  subject="$(printf '%s' "$subject" | tr '\r\n' '  ')"
-  if [ -z "$(printf '%s' "$MAIL_TO" | tr -d '[:space:]')" ]; then
-    echo "$(date): Notification email skipped — no recipients configured" >> "$LOG"
-    return 0
-  fi
-
-  if [ ! -x "$BRANDED_EMAIL_SCRIPT" ]; then
-    echo "$(date): ERROR — branded email sender is unavailable" >> "$LOG"
-    return 1
-  fi
-
-  SLS_EMAIL_SUBJECT="$subject" SLS_EMAIL_BODY="$body" SLS_EMAIL_RECIPIENTS="$MAIL_TO" \
-    /usr/bin/python3 "$BRANDED_EMAIL_SCRIPT" "$CONFIG_JSON_FILE"
-}
-
-send_discord_alert() {
-  local subject="$1"
-  local body="$2"
-  local alert_type="$3"
-  local event="$4"
-  local severity="$5"
-  local msg_type="$6"
-  local audio="$7"
-  local alert_id="$8"
-  local zone="$9"
-  local event_time="${10}"
-  local trigger_source="${11}"
-  local trigger_extension="${12}"
-  local trigger_name="${13}"
-  local audio_sequence="${14}"
-
-  if [ -z "$(printf '%s' "$DISCORD_WEBHOOK_URL" | tr -d '[:space:]')" ]; then
-    echo "$(date): Discord notification skipped — no webhook configured" >> "$LOG"
-    return 0
-  fi
-
-  if [ ! -x "$BRANDED_DISCORD_SCRIPT" ]; then
-    echo "$(date): ERROR — branded Discord sender is unavailable" >> "$LOG"
-    return 1
-  fi
-
-  SLS_DISCORD_SUBJECT="$subject" \
-  SLS_DISCORD_BODY="$body" \
-  SLS_DISCORD_TYPE="$alert_type" \
-  SLS_DISCORD_EVENT="$event" \
-  SLS_DISCORD_SEVERITY="$severity" \
-  SLS_DISCORD_ZONE="$zone" \
-  SLS_DISCORD_RECIPIENTS="$DELIVERY_TARGETS" \
-  SLS_DISCORD_AUDIO="$audio" \
-  SLS_DISCORD_TRIGGER="${trigger_name:-$trigger_source}" \
-  SLS_DISCORD_TIME="$event_time" \
-    /usr/bin/python3 "$BRANDED_DISCORD_SCRIPT" "$CONFIG_JSON_FILE"
-  return $?
-
-  DISCORD_WEBHOOK_URL="$DISCORD_WEBHOOK_URL" \
-  DISCORD_SUBJECT="$subject" \
-  DISCORD_BODY="$body" \
-  DISCORD_TYPE="$alert_type" \
-  DISCORD_EVENT="$event" \
-  DISCORD_SEVERITY="$severity" \
-  DISCORD_MESSAGE_TYPE="$msg_type" \
-  DISCORD_AUDIO="$audio" \
-  DISCORD_ALERT_ID="$alert_id" \
-  DISCORD_ZONE="$zone" \
-  DISCORD_PAGE_GROUP="$DELIVERY_TARGETS" \
-  DISCORD_TIME="$event_time" \
-  DISCORD_TRIGGER_SOURCE="$trigger_source" \
-  DISCORD_TRIGGER_EXTENSION="$trigger_extension" \
-  DISCORD_TRIGGER_NAME="$trigger_name" \
-  DISCORD_AUDIO_SEQUENCE="$audio_sequence" \
-  python3 - <<'PY'
-import json
-import os
-import sys
-import urllib.error
-import urllib.request
-
-webhook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-if not webhook:
-    raise SystemExit(0)
-
-fields = [
-    ("Type", os.environ.get("DISCORD_TYPE", "")),
-    ("Event", os.environ.get("DISCORD_EVENT", "")),
-    ("Severity", os.environ.get("DISCORD_SEVERITY", "")),
-    ("Message Type", os.environ.get("DISCORD_MESSAGE_TYPE", "")),
-    ("Audio", os.environ.get("DISCORD_AUDIO", "")),
-    ("NWS Recipients", os.environ.get("DISCORD_PAGE_GROUP", "")),
-    ("Alert ID", os.environ.get("DISCORD_ALERT_ID", "")),
-    ("Zone", os.environ.get("DISCORD_ZONE", "")),
-    ("Trigger Source", os.environ.get("DISCORD_TRIGGER_SOURCE", "")),
-    ("Trigger Extension", os.environ.get("DISCORD_TRIGGER_EXTENSION", "")),
-    ("Trigger Name", os.environ.get("DISCORD_TRIGGER_NAME", "")),
-    ("Audio Sequence", os.environ.get("DISCORD_AUDIO_SEQUENCE", "")),
-    ("Time", os.environ.get("DISCORD_TIME", "")),
-]
-embed_fields = [
-    {"name": name, "value": value[:1024], "inline": len(value) <= 32}
-    for name, value in fields
-    if value
-]
-
-body = os.environ.get("DISCORD_BODY", "")
-description = body[:4096] if body else os.environ.get("DISCORD_SUBJECT", "")
-payload = {
-    "embeds": [
-        {
-            "title": "NWS Weather Alert",
-            "description": description,
-            "color": 0x7B2CBF,
-            "fields": embed_fields[:25],
-            "footer": {"text": "Southland Servers PBX • Purple and Gold Alert Routing"},
-        }
-    ],
-}
-
-request = urllib.request.Request(
-    webhook,
-    data=json.dumps(payload).encode("utf-8"),
-    headers={"Content-Type": "application/json", "User-Agent": "SouthlandServersPBX-NWSAlerts/1.0"},
-    method="POST",
-)
-try:
-    with urllib.request.urlopen(request, timeout=12) as response:
-        if response.status not in (200, 204):
-            print(f"Discord webhook returned HTTP {response.status}", file=sys.stderr)
-            raise SystemExit(1)
-except urllib.error.HTTPError as exc:
-    print(f"Discord webhook HTTP error {exc.code}: {exc.read().decode('utf-8', 'replace')}", file=sys.stderr)
-    raise SystemExit(1)
-except Exception as exc:
-    print(f"Discord webhook error: {exc}", file=sys.stderr)
-    raise SystemExit(1)
-PY
-}
 
 echo "$(date): Manual Piper TTS test alert triggered" >> "$LOG"
 

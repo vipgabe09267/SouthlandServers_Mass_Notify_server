@@ -6,25 +6,26 @@
 
 # Southland Servers Mass Notifications Server
 
-An AGPL-3.0 FreePBX 17 module for phone, desktop, weather, lightning, and audio-page notifications. It sends SIP NOTIFY messages directly through Asterisk/PJSIP, supports live authenticated desktop events, and can page tones or Piper TTS without a paging-group dependency.
+An AGPL-3.0-or-later FreePBX 17 module for phone, desktop, weather, lightning, and audio-page notifications. It sends SIP NOTIFY messages directly through Asterisk/PJSIP, supports live authenticated desktop events, and can page tones or Piper TTS without a paging-group dependency.
 
-Configuration lives in one protected, portable `.config` file outside the module tree. Weather.gov routing, optional Xweather lightning detection, announcement groups, API access, email and Discord delivery, tones, voices, and retention settings are managed from FreePBX.
+Configuration lives in one protected, portable `.config` file outside the module tree. Weather.gov routing, optional Xweather lightning detection, announcement groups, schedules, display timeouts, API access, email and Discord delivery, tones, voices, and retention settings are managed from FreePBX.
 
-Current release: `0.0.8-beta`. This is beta software; test it on a non-critical FreePBX system before depending on it for emergency notifications.
+Current release candidate: `0.0.9-beta`. This is beta software; test it on a non-critical FreePBX system before depending on it for emergency notifications.
 
-## 0.0.8 Highlights
+## Install or update
 
-- Heat Advisories and first-seen NWS update chains are no longer discarded by the deduplication safeguards.
-- Weather and Lightning tests wait for Asterisk call completion and SIP NOTIFY submission, show actionable failures in FreePBX, and do not send test email or Discord messages.
-- SIP NOTIFY uses portable endpoint fan-out for normal same-vendor registrations. Mixed-vendor contacts use per-contact URI routing only when Asterisk has a usable default outbound endpoint.
-- Sangoma P- and S-series paging uses the documented `intercom` auto-answer header.
-- Repair, uninstall, and protected config replacement show live progress in the Danger Zone.
-- The release installer stages and validates the module before activation, repairs AMI integration when possible, removes partial integration before rollback, and restores the previous module and protected configuration after a failed upgrade.
-- The installer detects Asterisk paging functions that are present but not loaded, loads their matching providers before activation, and rechecks them after FreePBX reload. If a provider such as `res_pjsip_header_funcs.so` is missing or cannot register, the installer can resolve the Debian package that owns the active Asterisk module path, reinstall that exact installed package version without upgrading Asterisk, and retry the capability. It defers package repair while calls are active and will not mix packaged modules into an unowned/custom Asterisk build.
-- Local module signing uses the web account, web root, and GPG home reported by the installed FreePBX system instead of assuming a fixed service account or keyring path. Install, update, repair, and uninstall operations share a maintenance lock, and each signature is published only after FreePBX verifies it successfully.
-- Fresh installation verifies or enables the required Framework, Dashboard, and System Recordings modules, tests both local HTTP and HTTPS paths, and validates the installed Apache, AMI, audio, TTS, API, cron, and Dashboard integration before reporting success.
-- Empty PBXs are accepted: an authenticated Asterisk 22 `No Contacts found` result is treated as an authorized empty inventory, while real AMI authentication and permission errors still stop installation.
-- Normal uninstall now restores its preserved central configuration, backups, and uploaded tones if cleanup exits early.
+Run as `root` on Debian 12 / FreePBX 17:
+
+```bash
+cd /tmp
+curl -fsSL -o sls-install.sh \
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.0.9-beta/tools/install_release.sh
+chmod +x sls-install.sh
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.0.9-beta/slsmassnotifyserver-0.0.9-beta.tgz' \
+./sls-install.sh
+```
+
+Existing settings and credentials are preserved. Fresh installations open the required setup wizard. After installation, open **Mass Notify** in FreePBX.
 
 ## What It Installs
 
@@ -32,6 +33,7 @@ Current release: `0.0.8-beta`. This is beta software; test it on a non-critical 
 - FreePBX menu: `Mass Notify`
 - Dashboard widget: `Mass Notify Announcements`
 - Runtime scripts: `/usr/local/bin/sls_mass_notify`
+- Scheduled-announcement worker: `/usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php`
 - Central data/config folder: `/var/lib/asterisk/SLS_Mass_Notifications_Plugin`
 - Public media folder: `/var/www/html/sls_mass_notify`
 - SIP Notify API: `/var/www/html/api/sipnotify`
@@ -43,11 +45,14 @@ Current release: `0.0.8-beta`. This is beta software; test it on a non-critical 
 ## Requirements
 
 - FreePBX 17
+- Debian 12
 - Asterisk using PJSIP endpoints
-- Apache/PHP as provided by FreePBX
-- Python 3
-- `curl`
-- `sox`
+- FreePBX Framework, Dashboard, and System Recordings modules
+- Apache/PHP as provided by FreePBX, including the `/usr/bin/php` CLI and PHP OpenSSL, mbstring, and POSIX support
+- Python 3 with `venv` and `pip`
+- `curl`, `wget`, CA certificates, GnuPG, and `tar`
+- SoX/soxi, ImageMagick, and DejaVu fonts
+- cron, `flock`, `timeout`, `readlink`, and `runuser`
 - Piper TTS. The installer creates a root-owned virtual environment under `/usr/local/bin/sls_mass_notify/piper`, exposes the compatibility path `/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/venv`, installs pinned Piper packaging dependencies and `piper-tts`, and downloads checksum-verified voice models.
 
 Piper voices downloaded during install:
@@ -76,55 +81,30 @@ From the repository root:
 The package is written to:
 
 ```text
-dist/slsmassnotifyserver-0.0.8-beta.tgz
+dist/slsmassnotifyserver-0.0.9-beta.tgz
 ```
-
-## Install
-
-### **Recommended** Release Installer
-
-Run this on the FreePBX server as `root` or a sudo-capable administrator.
-
-```bash
-cd /tmp
-curl -fsSL -o sls-install.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/main/tools/install_release.sh
-chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.0.8-beta/slsmassnotifyserver-0.0.8-beta.tgz' \
-./sls-install.sh
-```
-
-After install, open FreePBX and go to `Mass Notify`. New installs show the required first-run setup wizard before the module controls can be used.
-
-Expected module state:
-
-```text
-slsmassnotifyserver Enabled
-```
-
-Custom/local FreePBX module signatures normally show as `Unknown`. That is acceptable for this beta package when `FreePBX::GPG()->verifyModule()` returns trusted status 129 with no details. `Altered`, `Unsigned`, or a failed verification means the local signature needs attention.
 
 ## Install From A Local `.tgz`
 
-Use this only if you already downloaded or built the release package and uploaded it to `/tmp/slsmassnotifyserver-0.0.8-beta.tgz` on the PBX.
+Use this only if you already downloaded or built the release package and uploaded it to `/tmp/slsmassnotifyserver-0.0.9-beta.tgz` on the PBX.
 
 ```bash
 cd /tmp
-tar -tzf /tmp/slsmassnotifyserver-0.0.8-beta.tgz >/dev/null
+tar -tzf /tmp/slsmassnotifyserver-0.0.9-beta.tgz >/dev/null
 curl -fsSL -o sls-install.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/main/tools/install_release.sh
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.0.9-beta/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ=/tmp/slsmassnotifyserver-0.0.8-beta.tgz ./sls-install.sh
+SLS_MASS_NOTIFY_TGZ=/tmp/slsmassnotifyserver-0.0.9-beta.tgz ./sls-install.sh
 ```
 
 ## Uninstall
 
-This removes the FreePBX module, its Manager/AMI database user, runtime scripts, API folders, Apache state, bundled System Recordings, sound symlinks, Dashboard hook, local signing artifacts, and temporary installer files. It then verifies that managed records and generated files are gone and that Dashboard and Framework remain trusted. The uninstaller takes a protected temporary copy of the installed transactional signer before the module hook removes its normal copies. If the FreePBX module repository is unavailable, that copy signs the cleaned stock modules and is deleted before exit; older installations retain a compatibility fallback. Central config files under `/var/lib/asterisk/SLS_Mass_Notifications_Plugin` are preserved when present so the deployment can be restored later.
+This removes the FreePBX module, its Manager/AMI database user, runtime scripts, API folders, Apache state, module-owned System Recordings, sound symlinks, Dashboard hook, local signing artifacts, and temporary installer files. A bundled recording is removed only while its database metadata and audio hash still prove module ownership. The uninstaller then verifies that managed records and generated files are gone and that Dashboard and Framework remain trusted. It takes a protected temporary copy of the installed transactional signer before the module hook removes its normal copies. If the FreePBX module repository is unavailable, that copy signs the cleaned stock modules and is deleted before exit; older installations retain a compatibility fallback. Central config, backups, uploaded tones, and `schedule-executions.json` under `/var/lib/asterisk/SLS_Mass_Notifications_Plugin` are preserved during a normal uninstall so a reinstall cannot replay previously executed schedules. An explicit purge removes them.
 
 ```bash
 cd /tmp
 curl -fsSL -o sls-uninstall.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/main/tools/uninstall_release.sh
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.0.9-beta/tools/uninstall_release.sh
 chmod +x sls-uninstall.sh
 ./sls-uninstall.sh
 ```
@@ -148,7 +128,7 @@ FreePBX module installs are not a safe place for interactive questions, so the m
 
 1. Open any page under `Mass Notifications`.
 2. Read the beta warning and accept the at-your-own-risk acknowledgement.
-3. Review and accept the AGPL-3.0 license notice.
+3. Review and accept the AGPL-3.0-or-later license notice.
 4. Read and accept the EULA.
 5. Choose whether to configure Weather Alerts. The default is No; weather fields remain hidden unless Yes is selected.
 6. If enabled, enter the first Weather.gov zone and its recipient extensions. Additional named zone groups can be added later from Weather Alerts.
@@ -175,7 +155,7 @@ Live configuration is stored outside the module so updates do not overwrite it:
 /var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config
 ```
 
-That JSON `.config` file is the only settings source of truth. Shell, Python, PHP, API, desktop-client, announcement-group, NWS zone-group, Xweather, email, tone, TTS, and phone-format settings are normalized into it and runtime services read it directly. Use the FreePBX UI or transplant the central `.config` file; obsolete generated `mass-notifications.conf` and `config.ini` copies are removed during install.
+That JSON `.config` file is the only settings source of truth. Shell, Python, PHP, API, desktop-client, announcement-group, NWS zone-group, Xweather, email, tone, TTS, and phone-format settings are normalized into it and runtime services read it directly. The canonical `mail_from_domain` value travels with this protected config; the runtime derives the alert sender as `no-reply@<mail_from_domain>`. Use the FreePBX UI or transplant the central `.config` file; obsolete generated `mass-notifications.conf` and `config.ini` copies are removed during install.
 
 ## Backup And Restore
 
@@ -185,7 +165,7 @@ Before major updates, download the central `.config` from:
 Mass Notify > General Settings > Danger Zone
 ```
 
-To restore a deployment, upload the saved `.config` from the same page and apply changes. Replacing the config overwrites plugin settings such as endpoints, groups, tokens, voices, NWS settings, quiet hours, and log retention.
+To restore a deployment, upload the saved `.config` from the same page and apply changes. Replacing the config overwrites module settings such as endpoints, groups, tokens, voices, NWS settings, quiet hours, schedules, and log retention.
 
 ## APIs
 
@@ -257,11 +237,25 @@ Module updates should not overwrite the central `.config` file. Back it up befor
 
 ### Why does NWS still appear in some places?
 
-NWS appears only for the **Weather Alerts** portion of the plugin: API details, U.S. weather.gov zone groups, recipients, weather TTS voice, and technical logs. Weather Alerts supports United States weather.gov zones only. The overall product remains Southland Servers Mass Notifications Server.
+NWS appears only for the **Weather Alerts** portion of the module: API details, U.S. weather.gov zone groups, recipients, weather TTS voice, and technical logs. Weather Alerts supports United States weather.gov zones only. The overall product remains Southland Servers Mass Notifications Server.
 
 ### How are announcements delivered?
 
 The dashboard announcement widget can send SIP NOTIFY text/image payloads, publish to desktop clients, and independently use no audio, tones only, TTS only, or tones plus TTS. Opening and closing System Recordings can be selected per send.
+
+### How does Scheduling work?
+
+Open **Mass Notify > Scheduling** and create a schedule with one or more future PBX-local dates and times. Each schedule stores its phone, announcement-group, desktop, audio, voice, volume, tone, and optional Labs color choices in the protected central config. The Asterisk-owned worker checks once per minute. Pre-delivery cooldown, busy, or temporarily offline target conditions can retry inside a 15-minute grace window; a delivery already claimed by an interrupted worker is marked for review instead of being replayed.
+
+Scheduled pages use the PBX operating-system timezone. Nonexistent or ambiguous daylight-saving times are rejected, and Dashboard health warns when FreePBX's PHP timezone differs. Scheduling is serialized with ordinary announcements, so items placed closer together than the configured cooldown can run late and remain eligible only inside the protected grace window. To re-arm a failed or missed occurrence, remove that date and add a new future date; an uncertain occurrence must be reviewed and is never replayed automatically.
+
+Configuration exports contain schedule definitions but not the PBX-local execution ledger. Imports and FreePBX restores therefore disable imported schedules automatically; review dates, targets, and delivery settings before enabling them on the destination PBX.
+
+Times that do not exist during a daylight-saving transition, or that occur twice during the fall transition, are rejected so the delivery instant is never ambiguous.
+
+### Can regular announcement screens expire?
+
+Yes. **General Settings > Announcement Timeout** defaults to **No expiry**. It can instead follow the generated page-audio duration or use a fixed 1–86,400 second timeout. Regular Yealink text/image payloads receive the XML timeout, and live desktop events receive timeout and UTC expiry metadata. Other phone families depend on their own firmware behavior; Weather Alert expiry fields are not changed by this setting.
 
 ### Is the setup wizard mandatory?
 
@@ -274,6 +268,12 @@ No. Phones receive SIP NOTIFY directly from Asterisk/PJSIP. Desktop clients use 
 ### Can I regenerate credentials?
 
 Yes. The Control API key can be regenerated, and desktop clients can be given new per-client usernames/passwords from the FreePBX UI. Fresh installs generate random Control API, desktop encryption, desktop client, and AMI credentials. Updates preserve credentials in the central `.config` unless an administrator intentionally changes them.
+
+### Can I change the alert email domain?
+
+Yes. Open **Mass Notify > General Settings > Notification Destinations** and set **Email Sender Domain**. The module keeps the local part fixed as `no-reply`; for example, changing `pbx.example.com` to `example.com` changes the sender from `no-reply@pbx.example.com` to `no-reply@example.com`. Fresh installs default to the detected PBX hostname. Upgrades without `mail_from_domain` retain their existing valid sender domain by deriving it from the legacy `mail_from_addr` value. The canonical value follows protected config backups and is available to validated, allowlisted Control API configuration updates.
+
+This setting changes only the sender address used by Mass Notify alert messages. It does not configure Postfix, an SMTP relay, DNS, SPF, DKIM, DMARC, or PTR/reverse DNS. Configure those separately so the selected domain is authorized to send mail from this PBX.
 
 ### Does the Control API allow remote control?
 
@@ -295,7 +295,7 @@ Live Weather Alerts can be suppressed unless the event is configured as critical
 
 ### Can I use my own tones?
 
-Yes. Upload audio through **Admin > System Recordings**, then select it as an opening or closing tone in General Settings, Weather Alerts, Lightning Alerts, or a dashboard announcement. Either tone can be **None** without changing or breaking `extensions_custom.conf`. The installer includes and registers regular paging opening/closing tones, `NWS_alert.wav`, and `Lightning_alert.mp3`. Fresh regular announcements use both paging tones, Weather Alerts use the NWS tone with no closing tone, and Lightning uses the Lightning tone with no closing tone; all three profiles default to 25% volume. Tone-only dashboard mode pages sounds without speaking the typed text.
+Yes. Upload audio through **Admin > System Recordings**, then select it as an opening or closing tone in General Settings, Weather Alerts, Lightning Alerts, Scheduling, or a dashboard announcement. Either tone can be **None** without changing or breaking `extensions_custom.conf`. The installer registers four ownership-safe recordings: **SLS Mass Notify - Paging Tone Opening**, **SLS Mass Notify - Paging Tone Closing**, **SLS Mass Notify - NWS Alert**, and **SLS Mass Notify - Lightning Alert**. It refuses a conflicting user-owned recording instead of overwriting it. Fresh regular announcements use both paging tones, Weather Alerts use the NWS tone with no closing tone, and Lightning uses the Lightning tone with no closing tone; all three profiles default to 25% volume. Tone-only mode pages sounds without speaking the typed text.
 
 Generated TTS and combined announcement WAV files are automatically removed after 15 minutes.
 
@@ -319,7 +319,7 @@ Settings use FreePBX’s standard top-right **Apply Config** control. Saving a m
 
 ### What do alert emails look like?
 
-Shared email recipients and the optional Discord webhook are managed from the **Notification Destinations** popup in General Settings. When recipients are configured, Weather and Lightning alerts always use a branded multipart message. The HTML card embeds a compact Southland Servers logo inside the email, identifies Southland Servers Group and the SLS Mass Notification System, highlights the primary action, and renders structured alert details. Tornado, severe-storm, flood, winter, fire, lightning, test, and general alerts receive distinct urgency colors and icons. A plain-text alternative is included for non-HTML clients. Discord uses the same event-aware visual language in a smaller embed with the SLS identity, a public logo image/avatar, concise delivery fields, timestamp, and urgency/test footer; its logo URL is built from the automatically detected PBX hostname.
+Shared email recipients, the sender domain, and the optional Discord webhook are managed from the **Notification Destinations** popup in General Settings. When recipients are configured, Weather and Lightning alerts always use a branded multipart message. The HTML card embeds a compact Southland Servers logo inside the email, identifies Southland Servers Group and the SLS Mass Notification System, highlights the primary action, and renders structured alert details. Tornado, severe-storm, flood, winter, fire, lightning, test, and general alerts receive distinct urgency colors and icons. A plain-text alternative is included for non-HTML clients. Discord uses the same event-aware visual language in a smaller embed with the SLS identity, a public logo image/avatar, concise delivery fields, timestamp, and urgency/test footer; its logo URL is built from the automatically detected PBX hostname.
 
 ### Where do I report bugs?
 

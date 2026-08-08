@@ -2,6 +2,7 @@
 """Read and validate the SLS Mass Notify central JSON configuration."""
 
 import json
+import ipaddress
 import re
 import sys
 from pathlib import Path
@@ -64,6 +65,32 @@ def emails(value):
             if candidate not in output:
                 output.append(candidate)
     return " ".join(output)
+
+
+def normalized_sender_domain(value):
+    domain = text(value).lower()
+    if domain.startswith("@"):
+        domain = domain[1:]
+    domain = domain.rstrip(".")
+    if not domain or len(domain) > 253 or "." not in domain:
+        return ""
+    try:
+        ipaddress.ip_address(domain)
+        return ""
+    except ValueError:
+        pass
+    label_pattern = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+    return domain if all(label_pattern.fullmatch(label) for label in domain.split(".")) else ""
+
+
+def sender_address(data):
+    domain = normalized_sender_domain(data.get("mail_from_domain"))
+    if domain:
+        return "no-reply@" + domain
+    legacy = (emails(data.get("mail_from_addr")).split() or [""])[0]
+    if legacy and normalized_sender_domain(legacy.rsplit("@", 1)[1]):
+        return legacy
+    return "no-reply@localhost.localdomain"
 
 
 def clock_time(value, default):
@@ -131,7 +158,7 @@ def main():
         "QUIET_HOURS_START": clock_time(data.get("quiet_hours_start"), "21:00"),
         "QUIET_HOURS_END": clock_time(data.get("quiet_hours_end"), "06:00"),
         "MAIL_FROM_NAME": re.sub(r"[\r\n]+", " ", text(data.get("mail_from_name"), "SLS Mass Notification System"))[:80],
-        "MAIL_FROM_ADDR": (emails(data.get("mail_from_addr")).split() or ["no-reply@localhost"])[0],
+        "MAIL_FROM_ADDR": sender_address(data),
         "ALERT_EMAIL_SUBJECT": text(data.get("alert_email_subject")),
         "ALERT_EMAIL_BODY": text(data.get("alert_email_body")),
         "TEST_EMAIL_SUBJECT": text(data.get("test_email_subject")),
@@ -139,6 +166,8 @@ def main():
         "EMAIL_HTML_ENABLED": enabled(data.get("email_html_enabled"), True),
         "AMI_USERNAME": re.sub(r"[^A-Za-z0-9_.-]", "", text(ami.get("username"), "slsmassnotify")),
         "AMI_PASSWORD": text(ami.get("password")),
+        "AMI_HOST": "127.0.0.1",
+        "AMI_PORT": bounded_int(ami.get("port"), 1, 65535, 5038),
         "GITHUB_UPDATES_ENABLED": enabled(updates.get("github_enabled")),
         "GITHUB_UPDATES_REPOSITORY": text(updates.get("repository"), "vipgabe09267/SouthlandServers_Mass_Notify_server"),
         "GITHUB_UPDATES_CHANNEL": "beta",

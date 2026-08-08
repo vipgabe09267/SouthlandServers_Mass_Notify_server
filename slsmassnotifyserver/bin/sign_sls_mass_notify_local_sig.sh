@@ -74,9 +74,9 @@ require "/etc/freepbx.conf";
 $webUser = trim((string)\FreePBX::Config()->get("AMPASTERISKWEBUSER"));
 $webRoot = rtrim(trim((string)\FreePBX::Config()->get("AMPWEBROOT")), "/");
 $astSpool = rtrim(trim((string)\FreePBX::Config()->get("ASTSPOOLDIR")), "/");
-$account = $webUser !== "" ? posix_getpwnam($webUser) : false;
+$account = $webUser !== "" && function_exists("posix_getpwnam") ? posix_getpwnam($webUser) : false;
 if (!is_array($account) || $webRoot === "") {
-	fwrite(STDERR, "Unable to resolve the configured FreePBX web account or web root.\n");
+	fwrite(STDERR, "Unable to resolve the configured FreePBX web account or web root; PHP POSIX support is required.\n");
 	exit(1);
 }
 $gpg = \FreePBX::GPG();
