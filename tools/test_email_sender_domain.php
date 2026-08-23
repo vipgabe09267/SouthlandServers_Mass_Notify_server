@@ -25,6 +25,8 @@ $reflection = new ReflectionClass(\FreePBX\modules\Slsmassnotifyserver::class);
 $module = $reflection->newInstanceWithoutConstructor();
 $normalize = $reflection->getMethod('normalizeEmailSenderDomain');
 $normalize->setAccessible(true);
+$normalizeLocalPart = $reflection->getMethod('normalizeEmailSenderLocalPart');
+$normalizeLocalPart->setAccessible(true);
 
 foreach ([
 	'PBX.Example.com' => 'pbx.example.com',
@@ -35,6 +37,20 @@ foreach ([
 	$actual = $normalize->invoke($module, $input);
 	if ($actual !== $expected) {
 		sender_domain_fail("Valid sender domain was not normalized: {$input}");
+	}
+}
+
+foreach ([
+	'no-reply' => 'no-reply',
+	'Alerts.Team+PBX' => 'alerts.team+pbx',
+] as $input => $expected) {
+	if ($normalizeLocalPart->invoke($module, $input) !== $expected) {
+		sender_domain_fail("Valid sender local part was not normalized: {$input}");
+	}
+}
+foreach (['', '.alerts', 'alerts.', 'alerts..pbx', 'bad space', str_repeat('a', 65)] as $input) {
+	if ($normalizeLocalPart->invoke($module, $input) !== '') {
+		sender_domain_fail("Invalid sender local part was accepted: {$input}");
 	}
 }
 
@@ -54,14 +70,15 @@ $classSource = (string)file_get_contents(dirname(__DIR__) . '/slsmassnotifyserve
 $viewSource = (string)file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/views/other_settings.php');
 foreach ([
 	"'mail_from_domain' => \$defaultMailFromDomain",
-	"\$settings['mail_from_addr'] = 'no-reply@' . \$mailFromDomain",
-	"'mail_to', 'mail_from_domain', 'discord_webhook_url'",
+	"'mail_from_local_part' => \$defaultMailFromLocalPart",
+	"\$settings['mail_from_addr'] = \$settings['mail_from_local_part'] . '@' . \$mailFromDomain",
+	"'mail_to', 'mail_from_local_part', 'mail_from_domain'",
 ] as $marker) {
 	if (strpos($classSource, $marker) === false) {
 		sender_domain_fail("Missing sender-domain class contract: {$marker}");
 	}
 }
-foreach (['name="mail_from_domain"', 'id="sls-mail-from-preview"', 'does not configure Postfix'] as $marker) {
+foreach (['name="mail_from_local_part"', 'name="mail_from_domain"', 'id="sls-mail-from-preview"', 'does not configure a relay'] as $marker) {
 	if (strpos($viewSource, $marker) === false) {
 		sender_domain_fail("Missing sender-domain UI contract: {$marker}");
 	}

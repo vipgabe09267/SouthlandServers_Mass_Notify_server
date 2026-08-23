@@ -3,12 +3,16 @@
 $settings = is_array($settings ?? null) ? $settings : [];
 $saveResult = $save_result ?? null;
 $extensions = is_array($available_extensions ?? null) ? $available_extensions : [];
+$desktopClients = array_values(array_filter((array)($available_desktop_clients ?? []), 'is_array'));
 $voices = is_array($available_voices ?? null) ? $available_voices : [];
 $setup = is_array($settings['setup'] ?? null) ? $settings['setup'] : [];
 $criticalEvents = is_array($settings['quiet_critical_events'] ?? null) ? $settings['quiet_critical_events'] : [];
 $selectedRecipients = array_fill_keys((array)($settings['alert_recipients'] ?? []), true);
 $xweather = is_array($settings['xweather'] ?? null) ? $settings['xweather'] : [];
 $setupWeatherZones = is_array($settings['nws_zones'] ?? null) ? $settings['nws_zones'] : [];
+$setupPrimaryWeatherZone = is_array($setupWeatherZones[0] ?? null) ? $setupWeatherZones[0] : [];
+$selectedWeatherDesktops = array_fill_keys((array)($setupPrimaryWeatherZone['desktop_clients'] ?? []), true);
+$selectedWeatherEmails = implode("\n", (array)($setupPrimaryWeatherZone['email_recipients'] ?? []));
 $setupAdaptiveZone = (string)($xweather['adaptive_nws_zone_id'] ?? ($setupWeatherZones[0]['id'] ?? ''));
 $lightningRecipients = array_fill_keys((array)($xweather['recipients'] ?? []), true);
 $setupTones = is_array($available_tones ?? null) ? $available_tones : [];
@@ -176,14 +180,15 @@ $lightningSetupEnabled = (($xweather['enabled'] ?? '0') === '1');
 					<div class="col-md-3">
 						<div class="form-group">
 							<label><?php echo _('NWS Zone/County'); ?></label>
-							<input class="form-control" name="nws_zone" value="<?php echo htmlspecialchars($settings['nws_zone'] ?? ''); ?>" placeholder="TXC491">
-							<p class="help-block"><a href="https://www.weather.gov/gis/ZoneCounty" target="_blank" rel="noopener"><?php echo _('Find your NWS zone'); ?></a></p>
+							<input class="form-control" name="nws_zone" value="<?php echo htmlspecialchars($settings['nws_zone'] ?? ''); ?>" placeholder="TXZ163">
+							<p class="help-block"><?php echo _('Open the official zone maps, choose your state, and find the three-digit number covering your location. Enter your state abbreviation, Z, and that number; for example, Texas zone 163 is TXZ163.'); ?> <a href="https://www.weather.gov/pimar/PubZone" target="_blank" rel="noopener noreferrer"><?php echo _('Open official NWS zone maps'); ?> <i class="fa fa-external-link" aria-hidden="true"></i></a></p>
 						</div>
 					</div>
 					<div class="col-md-6">
 						<div class="form-group">
 							<label><?php echo _('NWS API Base URL'); ?></label>
-							<input class="form-control" name="nws_api_base_url" value="<?php echo htmlspecialchars($settings['nws_api_base_url'] ?? 'https://api.weather.gov'); ?>">
+							<input class="form-control" name="nws_api_base_url" value="https://api.weather.gov" readonly aria-readonly="true">
+							<p class="help-block"><?php echo _('Weather Alerts uses only the official U.S. weather.gov API endpoint.'); ?></p>
 						</div>
 					</div>
 				</div>
@@ -200,6 +205,21 @@ $lightningSetupEnabled = (($xweather['enabled'] ?? '0') === '1');
 							</div>
 						<?php } ?>
 					</div>
+				</div>
+				<div class="form-group">
+					<label><?php echo _('NWS Desktop Clients'); ?></label>
+					<div class="row">
+							<?php foreach ($desktopClients as $desktopClient) { $desktopUsername = (string)($desktopClient['username'] ?? ''); $desktopEnabled = !empty($desktopClient['enabled']); $desktopClientId = trim((string)($desktopClient['client_id'] ?? '')); $desktopName = trim((string)($desktopClient['name'] ?? '')); $desktopIdentity = $desktopName !== '' && $desktopName !== $desktopUsername ? $desktopName . ' — ' . $desktopUsername : $desktopUsername; if ($desktopClientId !== '') { $desktopIdentity .= ' · ' . _('client ID') . ' ' . $desktopClientId; } ?>
+								<div class="col-sm-4"><label class="checkbox-inline"><input type="checkbox" name="nws_desktop_clients[]" value="<?php echo htmlspecialchars($desktopUsername); ?>" <?php echo isset($selectedWeatherDesktops[$desktopUsername]) ? 'checked' : ''; ?> <?php echo !$desktopEnabled ? 'disabled data-sls-permanent-disabled="1"' : ''; ?>> <?php echo htmlspecialchars($desktopIdentity); ?> <span class="text-muted"><?php echo $desktopEnabled ? _('enabled') : _('disabled'); ?></span></label></div>
+						<?php } ?>
+						<?php if (empty($desktopClients)) { ?><div class="col-xs-12 text-muted"><?php echo _('Desktop clients can be added later from General Settings.'); ?></div><?php } ?>
+					</div>
+					<p class="help-block"><?php echo _('Select at least one phone extension or desktop client for the first weather zone.'); ?></p>
+				</div>
+				<div class="form-group">
+					<label for="sls-setup-weather-email"><?php echo _('Zone Email Recipients'); ?></label>
+					<textarea class="form-control" id="sls-setup-weather-email" name="nws_email_recipients" rows="2" maxlength="4096" placeholder="weather-team@example.com"><?php echo htmlspecialchars($selectedWeatherEmails); ?></textarea>
+					<p class="help-block"><?php echo _('Optional. Only live alerts from this zone use these addresses. Up to 50 unique addresses are allowed. Manual tests do not send email.'); ?></p>
 				</div>
 				<div class="row">
 					<div class="col-md-3">
@@ -357,7 +377,7 @@ $lightningSetupEnabled = (($xweather['enabled'] ?? '0') === '1');
 	function setFieldsEnabled(root, enabled) {
 		if (!root) { return; }
 		Array.prototype.forEach.call(root.querySelectorAll('input, select, textarea, button'), function(field) {
-			field.disabled = !enabled;
+			field.disabled = !enabled || field.getAttribute('data-sls-permanent-disabled') === '1';
 		});
 	}
 	function renderOptionalSection(select, details) {

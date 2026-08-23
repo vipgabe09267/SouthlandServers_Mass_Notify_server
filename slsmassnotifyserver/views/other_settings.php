@@ -28,7 +28,32 @@ $formatLabels = [
 	'sangoma' => _('Sangoma'), 'avaya' => _('Avaya'), 'vtech' => _('VTech'),
 	'ale' => _('Alcatel-Lucent Enterprise'), 'panasonic' => _('Panasonic KX Series'),
 ];
-$notificationEmails = preg_split('/[\s,;]+/', trim((string)($settings['mail_to'] ?? '')), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+$systemNotificationEmails = preg_split(
+	'/[\s,;]+/',
+	trim((string)($settings['system_notification_emails'] ?? $settings['mail_to'] ?? '')),
+	-1,
+	PREG_SPLIT_NO_EMPTY
+) ?: [];
+$discordWebhooks = is_array($settings['discord_webhooks'] ?? null) ? $settings['discord_webhooks'] : [];
+if (empty($discordWebhooks) && !empty($settings['discord_webhook_url'])) {
+	$discordWebhooks[] = [
+		'id' => 'discord_' . substr(hash('sha256', (string)$settings['discord_webhook_url']), 0, 16),
+		'name' => _('Primary Discord'),
+		'url' => (string)$settings['discord_webhook_url'],
+		'enabled' => '1',
+	];
+}
+$genericWebhooks = is_array($settings['generic_webhooks'] ?? null) ? $settings['generic_webhooks'] : [];
+$enabledDiscordWebhooks = array_filter($discordWebhooks, static function ($destination) {
+	return is_array($destination) && !empty($destination['enabled']);
+});
+$enabledGenericWebhooks = array_filter($genericWebhooks, static function ($destination) {
+	return is_array($destination) && !empty($destination['enabled']);
+});
+$mailFromLocalPart = strtolower(trim((string)($settings['mail_from_local_part'] ?? 'no-reply')));
+if ($mailFromLocalPart === '') {
+	$mailFromLocalPart = 'no-reply';
+}
 $mailFromDomain = strtolower(trim((string)($settings['mail_from_domain'] ?? '')));
 $mailFromAddress = strtolower(trim((string)($settings['mail_from_addr'] ?? '')));
 if ($mailFromDomain === '' && strpos($mailFromAddress, '@') !== false) {
@@ -37,7 +62,7 @@ if ($mailFromDomain === '' && strpos($mailFromAddress, '@') !== false) {
 if ($mailFromDomain === '') {
 	$mailFromDomain = 'localhost.localdomain';
 }
-$mailFromAddress = 'no-reply@' . $mailFromDomain;
+$mailFromAddress = $mailFromLocalPart . '@' . $mailFromDomain;
 $csrfToken = (string)($csrf_token ?? '');
 foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension => $format) {
 	$extension = preg_replace('/[^0-9]/', '', (string)$extension);
@@ -128,6 +153,15 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 #sls-format-editor-list .sls-editor-row { display:grid; grid-template-columns:minmax(150px,1fr) minmax(220px,330px) auto; align-items:end; }
 #sls-format-editor-list .sls-editor-row [data-remove-format] { margin:0 0 1px !important; padding-left:10px; padding-right:10px; white-space:nowrap; }
 .sls-summary-table { margin-bottom:8px; background:#fff; }
+.sls-destination-tabs { margin-bottom:16px; }
+.sls-destination-pane { padding:16px; border:1px solid #dfe5ec; border-top:0; background:#fff; }
+.sls-destination-list { max-height:320px; overflow:auto; margin-bottom:12px; }
+.sls-webhook-row { display:grid; grid-template-columns:auto minmax(150px,1fr) minmax(260px,2fr) auto; gap:10px; align-items:end; }
+.sls-webhook-enabled { align-self:center; padding-top:18px; }
+.sls-destination-limit { display:inline-block; margin-left:8px; vertical-align:middle; }
+.sls-stored-secret { color:#4b5563; font-size:12px; margin-top:5px; }
+.sls-empty-state { padding:22px 16px; border:1px dashed #cbd5e1; border-radius:6px; color:#64748b; text-align:center; background:#f8fafc; }
+.sls-destination-note { margin:12px 0 0; }
 .sls-save-actions { margin:26px 0 34px; padding:16px; border:1px solid #dfe5ec; border-radius:8px; background:#f8fafc; }
 .sls-update-controls { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
 .sls-update-controls .alert { display:inline-flex; align-items:center; gap:6px; margin:0; padding:7px 10px; }
@@ -146,7 +180,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 .sls-maintenance-progress[hidden] { display:none; }
 .sls-maintenance-form .btn[disabled] { cursor:wait; }
 @media (max-width:991px) { .sls-danger-grid { grid-template-columns:1fr; } }
-@media(max-width:767px){.sls-editor-row,#sls-format-editor-list .sls-editor-row{display:block}.sls-editor-row>*{margin-bottom:8px}.sls-manager-modal .modal-dialog{width:auto}#sls-format-editor-list .sls-editor-row [data-remove-format]{margin-top:4px !important}}
+@media(max-width:767px){.sls-editor-row,#sls-format-editor-list .sls-editor-row,.sls-webhook-row{display:block}.sls-editor-row>*,.sls-webhook-row>*{margin-bottom:8px}.sls-manager-modal .modal-dialog{width:auto}.sls-manager-card .text-right{text-align:left;margin-top:10px}#sls-format-editor-list .sls-editor-row [data-remove-format]{margin-top:4px !important}}
 </style>
 <div class="container-fluid">
 	<?php echo load_view(__DIR__ . '/hero.php', ['hero_image' => $hero_image ?? '']); ?>
@@ -208,39 +242,58 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 				</div></div></div>
 				<script type="text/template" id="sls-format-row-template"><div class="sls-editor-row" data-format-row><div class="sls-editor-grow"><label><?php echo _('Extension'); ?></label><input class="form-control" inputmode="numeric" pattern="[0-9]+"></div><div class="sls-editor-format"><label><?php echo _('Phone family'); ?></label><select class="form-control"><?php foreach ($formatLabels as $formatValue => $formatLabel) { ?><option value="<?php echo htmlspecialchars($formatValue); ?>"><?php echo htmlspecialchars($formatLabel); ?></option><?php } ?></select></div><button type="button" class="btn btn-link text-danger" data-remove-format style="margin-top:20px"><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div></script>
 
-				<h3 class="sls-settings-heading"><i class="fa fa-envelope text-warning" aria-hidden="true"></i> <?php echo _('Notification Destinations'); ?></h3>
+				<h3 class="sls-settings-heading"><i class="fa fa-envelope text-warning" aria-hidden="true"></i> <?php echo _('Email and Webhook Delivery'); ?></h3>
 				<div class="sls-manager-card">
-					<div class="row"><div class="col-md-8"><h4><i class="fa fa-envelope"></i> <?php echo _('Shared Email and Discord Delivery'); ?></h4><div class="sls-manager-summary"><?php echo sprintf(_('%d notification email(s); Discord webhook %s.'), count($notificationEmails), !empty($settings['discord_webhook_url']) ? _('configured') : _('not configured')); ?> <?php echo _('These destinations receive both Weather and Lightning alerts.'); ?></div></div><div class="col-md-4 text-right"><button type="button" class="btn btn-default" data-toggle="modal" data-target="#sls-notification-manager"><i class="fa fa-pencil"></i> <?php echo _('Manage Destinations'); ?></button></div></div>
+					<div class="row"><div class="col-md-8"><h4><i class="fa fa-paper-plane"></i> <?php echo _('Outbound Delivery'); ?></h4><div class="sls-manager-summary"><?php echo sprintf(_('Email sender %s; %d system/error recipient(s); %d enabled Discord destination(s); %d enabled generic webhook(s).'), htmlspecialchars($mailFromAddress), count($systemNotificationEmails), count($enabledDiscordWebhooks), count($enabledGenericWebhooks)); ?> <?php echo _('Weather and Lightning email recipients are selected within each zone or trigger area.'); ?></div></div><div class="col-md-4 text-right"><button type="button" class="btn btn-default" data-toggle="modal" data-target="#sls-notification-manager"><i class="fa fa-pencil"></i> <?php echo _('Manage Delivery'); ?></button></div></div>
 				</div>
 				<div class="modal fade sls-manager-modal" id="sls-notification-manager" tabindex="-1" role="dialog" aria-hidden="true"><div class="modal-dialog"><div class="modal-content">
-					<div class="modal-header"><button type="button" class="close" data-dismiss="modal"><span>&times;</span></button><h4 class="modal-title"><?php echo _('Notification Destinations'); ?></h4></div>
+					<div class="modal-header"><button type="button" class="close" data-dismiss="modal" aria-label="<?php echo htmlspecialchars(_('Close')); ?>"><span aria-hidden="true">&times;</span></button><h4 class="modal-title"><?php echo _('Email and Webhook Delivery'); ?></h4></div>
 					<div class="modal-body">
-						<input type="hidden" name="mail_recipients_present" value="1">
-						<h4><?php echo _('Email Recipients'); ?></h4>
-						<p class="text-muted"><?php echo _('Each address receives the branded Southland Servers alert card with its plain-text alternative.'); ?></p>
-						<div id="sls-email-editor-list">
-							<?php foreach ($notificationEmails as $emailIndex => $email) { ?><div class="sls-editor-row" data-email-row><div class="sls-editor-grow"><input class="form-control" type="email" name="mail_recipients[]" value="<?php echo htmlspecialchars($email); ?>" placeholder="alerts@example.com"></div><button type="button" class="btn btn-link text-danger" data-remove-email><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div><?php } ?>
+						<input type="hidden" name="system_notification_recipients_present" value="1">
+						<input type="hidden" name="discord_webhooks_present" value="1">
+						<input type="hidden" name="generic_webhooks_present" value="1">
+						<ul class="nav nav-tabs sls-destination-tabs" role="tablist">
+							<li class="active" role="presentation"><a href="#sls-destination-email" data-toggle="tab" role="tab"><i class="fa fa-envelope"></i> <?php echo _('Email Setup'); ?> <span class="badge"><?php echo count($systemNotificationEmails); ?></span></a></li>
+							<li role="presentation"><a href="#sls-destination-discord" data-toggle="tab" role="tab"><i class="fa fa-comments"></i> <?php echo _('Discord'); ?> <span class="badge"><?php echo count($discordWebhooks); ?></span></a></li>
+							<li role="presentation"><a href="#sls-destination-generic" data-toggle="tab" role="tab"><i class="fa fa-exchange"></i> <?php echo _('Generic Webhooks'); ?> <span class="badge"><?php echo count($genericWebhooks); ?></span></a></li>
+						</ul>
+						<div class="tab-content">
+							<section class="tab-pane active sls-destination-pane" id="sls-destination-email" role="tabpanel">
+								<h4><?php echo _('Postfix Email Configuration'); ?></h4>
+								<p class="text-muted"><?php echo _('The module hands branded HTML email with a plain-text fallback to the PBX local mail service. Final delivery depends on Postfix, DNS, and any relay configured outside this module.'); ?></p>
+							<div class="row"><div class="col-sm-5"><div class="form-group"><label for="sls-mail-from-local-part"><?php echo _('Sender Local Part'); ?></label><input class="form-control" id="sls-mail-from-local-part" name="mail_from_local_part" type="text" value="<?php echo htmlspecialchars($mailFromLocalPart); ?>" maxlength="64" pattern="[A-Za-z0-9](?:[A-Za-z0-9._+\-]{0,62}[A-Za-z0-9])?" autocomplete="off" spellcheck="false" placeholder="no-reply"><p class="help-block"><?php echo _('The part before the @ sign.'); ?></p></div></div><div class="col-sm-7"><div class="form-group"><label for="sls-mail-from-domain"><?php echo _('Sender Domain'); ?></label><div class="input-group"><span class="input-group-addon">@</span><input class="form-control" id="sls-mail-from-domain" name="mail_from_domain" type="text" value="<?php echo htmlspecialchars($mailFromDomain); ?>" maxlength="253" autocomplete="off" spellcheck="false" placeholder="pbx.example.com"></div></div></div></div>
+								<p class="help-block"><?php echo _('Fresh installations use the local Postfix identity when it is valid. Editing this address does not configure a relay, SPF, DKIM, DMARC, or reverse DNS.'); ?></p>
+								<div class="well"><div><strong><?php echo _('Email From'); ?>:</strong> <?php echo htmlspecialchars($settings['mail_from_name'] ?? 'SLS Mass Notification System'); ?> &lt;<span id="sls-mail-from-preview"><?php echo htmlspecialchars($mailFromAddress); ?></span>&gt;</div><div><strong><?php echo _('Delivery Method'); ?>:</strong> <?php echo _('Local Postfix sendmail'); ?> <code>/usr/sbin/sendmail</code></div></div>
+								<h4><?php echo _('System and Error Notifications'); ?></h4>
+								<p class="text-muted"><?php echo _('These addresses receive module health, configuration, maintenance, and delivery-fault notices. Weather and Lightning alert recipients are configured separately on their zone or trigger area.'); ?></p>
+							<div class="sls-destination-list" id="sls-email-editor-list">
+								<?php if (empty($systemNotificationEmails)) { ?><div class="sls-empty-state" data-destination-empty><?php echo _('No system or error notification recipients are configured.'); ?></div><?php } ?>
+								<?php foreach ($systemNotificationEmails as $email) { ?><div class="sls-editor-row" data-email-row><div class="sls-editor-grow"><input class="form-control" type="email" name="system_notification_recipients[]" value="<?php echo htmlspecialchars($email); ?>" maxlength="254" placeholder="pbx-operations@example.com"></div><button type="button" class="btn btn-link text-danger" data-remove-email><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div><?php } ?>
+								</div>
+								<button type="button" class="btn btn-default btn-sm" id="sls-add-email"><i class="fa fa-plus"></i> <?php echo _('Add Recipient'); ?></button>
+							</section>
+							<section class="tab-pane sls-destination-pane" id="sls-destination-discord" role="tabpanel">
+								<h4><?php echo _('Discord Webhooks'); ?></h4><p class="text-muted"><?php echo _('Add up to 10 branded Discord destinations. Stored webhook tokens are never placed back into this page; leave the URL blank to keep the stored value.'); ?></p>
+							<div class="sls-destination-list" id="sls-discord-editor-list">
+							<?php if (empty($discordWebhooks)) { ?><div class="sls-empty-state" data-destination-empty><?php echo _('No Discord destinations are configured.'); ?></div><?php } ?>
+								<?php foreach ($discordWebhooks as $index => $destination) { ?><div class="sls-editor-row sls-webhook-row" data-webhook-row data-webhook-type="discord"><div class="sls-webhook-enabled"><input type="hidden" name="discord_webhooks[<?php echo (int)$index; ?>][enabled]" value="0"><label><input type="checkbox" name="discord_webhooks[<?php echo (int)$index; ?>][enabled]" value="1" <?php echo !empty($destination['enabled']) ? 'checked' : ''; ?>> <?php echo _('Enabled'); ?></label><input type="hidden" name="discord_webhooks[<?php echo (int)$index; ?>][id]" value="<?php echo htmlspecialchars($destination['id'] ?? ''); ?>"></div><div><label><?php echo _('Name'); ?></label><input class="form-control" name="discord_webhooks[<?php echo (int)$index; ?>][name]" value="<?php echo htmlspecialchars($destination['name'] ?? ''); ?>" maxlength="80"></div><div><label><?php echo _('Webhook URL'); ?></label><input class="form-control" type="password" name="discord_webhooks[<?php echo (int)$index; ?>][url]" value="" autocomplete="new-password" placeholder="<?php echo htmlspecialchars(_('Stored; enter a new URL to replace')); ?>"><div class="sls-stored-secret"><i class="fa fa-lock"></i> <?php echo _('Stored in the protected central configuration'); ?></div></div><button type="button" class="btn btn-link text-danger" data-remove-webhook><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div><?php } ?>
+									</div><button type="button" class="btn btn-default btn-sm" data-add-webhook="discord"><i class="fa fa-plus"></i> <?php echo _('Add Discord Destination'); ?></button><span class="text-muted sls-destination-limit" data-webhook-limit="discord" aria-live="polite" hidden><?php echo _('10-destination limit reached.'); ?></span>
+							</section>
+							<section class="tab-pane sls-destination-pane" id="sls-destination-generic" role="tabpanel">
+								<h4><?php echo _('Generic HTTPS Webhooks'); ?></h4><p class="text-muted"><?php echo _('Add up to 10 HTTPS hostname endpoints. When an alert is sent, the module resolves the hostname and rejects private or non-public addresses, redirects, embedded credentials, and insecure TLS.'); ?></p>
+							<div class="sls-destination-list" id="sls-generic-editor-list">
+							<?php if (empty($genericWebhooks)) { ?><div class="sls-empty-state" data-destination-empty><?php echo _('No generic webhooks are configured.'); ?></div><?php } ?>
+								<?php foreach ($genericWebhooks as $index => $destination) { ?><div class="sls-editor-row sls-webhook-row" data-webhook-row data-webhook-type="generic"><div class="sls-webhook-enabled"><input type="hidden" name="generic_webhooks[<?php echo (int)$index; ?>][enabled]" value="0"><label><input type="checkbox" name="generic_webhooks[<?php echo (int)$index; ?>][enabled]" value="1" <?php echo !empty($destination['enabled']) ? 'checked' : ''; ?>> <?php echo _('Enabled'); ?></label><input type="hidden" name="generic_webhooks[<?php echo (int)$index; ?>][id]" value="<?php echo htmlspecialchars($destination['id'] ?? ''); ?>"></div><div><label><?php echo _('Name'); ?></label><input class="form-control" name="generic_webhooks[<?php echo (int)$index; ?>][name]" value="<?php echo htmlspecialchars($destination['name'] ?? ''); ?>" maxlength="80"></div><div><label><?php echo _('HTTPS URL'); ?></label><input class="form-control" type="password" name="generic_webhooks[<?php echo (int)$index; ?>][url]" value="" autocomplete="new-password" placeholder="<?php echo htmlspecialchars(_('Stored; enter a new URL to replace')); ?>"><div class="sls-stored-secret"><i class="fa fa-lock"></i> <?php echo _('Stored in the protected central configuration'); ?></div></div><button type="button" class="btn btn-link text-danger" data-remove-webhook><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div><?php } ?>
+									</div><button type="button" class="btn btn-default btn-sm" data-add-webhook="generic"><i class="fa fa-plus"></i> <?php echo _('Add Generic Webhook'); ?></button><span class="text-muted sls-destination-limit" data-webhook-limit="generic" aria-live="polite" hidden><?php echo _('10-destination limit reached.'); ?></span>
+							</section>
 						</div>
-						<button type="button" class="btn btn-default btn-sm" id="sls-add-email"><i class="fa fa-plus"></i> <?php echo _('Add Email'); ?></button>
-						<hr>
-						<div class="form-group">
-							<label for="sls-mail-from-domain"><?php echo _('Email Sender Domain'); ?></label>
-							<div class="input-group">
-								<span class="input-group-addon">no-reply@</span>
-								<input class="form-control" id="sls-mail-from-domain" name="mail_from_domain" type="text" value="<?php echo htmlspecialchars($mailFromDomain); ?>" maxlength="253" autocomplete="off" spellcheck="false" placeholder="example.com">
-							</div>
-							<p class="help-block"><?php echo _('Changes the sender identity used by module alert email. Enter a DNS domain only; this does not configure Postfix, a relay, SPF, DKIM, DMARC, or reverse DNS.'); ?></p>
-						</div>
-						<div class="form-group">
-							<label for="sls-discord-webhook"><?php echo _('Discord Webhook'); ?></label>
-							<div class="input-group"><input class="form-control" id="sls-discord-webhook" name="discord_webhook_url" type="password" value="<?php echo htmlspecialchars($settings['discord_webhook_url'] ?? ''); ?>" autocomplete="off" placeholder="https://discord.com/api/webhooks/..."><span class="input-group-btn"><button type="button" class="btn btn-default" data-toggle-secret title="<?php echo htmlspecialchars(_('Show or hide webhook')); ?>"><i class="fa fa-eye"></i></button></span></div>
-							<p class="help-block"><?php echo _('Optional. Leave blank to disable Discord delivery.'); ?></p>
-						</div>
-						<div class="well" style="margin-bottom:0"><strong><?php echo _('Email From'); ?>:</strong> <?php echo htmlspecialchars($settings['mail_from_name'] ?? 'SLS Mass Notification System'); ?> &lt;<span id="sls-mail-from-preview"><?php echo htmlspecialchars($mailFromAddress); ?></span>&gt;</div>
+						<p class="text-muted sls-destination-note"><i class="fa fa-info-circle"></i> <?php echo _('Close this window, then use Save General Settings to stage the changes.'); ?></p>
 					</div>
-					<div class="modal-footer"><button type="button" class="btn btn-primary" data-dismiss="modal"><?php echo _('Done'); ?></button></div>
+					<div class="modal-footer"><button type="button" class="btn btn-primary" data-dismiss="modal"><?php echo _('Done Editing'); ?></button></div>
 				</div></div></div>
-				<script type="text/template" id="sls-email-row-template"><div class="sls-editor-row" data-email-row><div class="sls-editor-grow"><input class="form-control" type="email" placeholder="alerts@example.com"></div><button type="button" class="btn btn-link text-danger" data-remove-email><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div></script>
+				<script type="text/template" id="sls-email-row-template"><div class="sls-editor-row" data-email-row><div class="sls-editor-grow"><input class="form-control" type="email" placeholder="pbx-operations@example.com"></div><button type="button" class="btn btn-link text-danger" data-remove-email><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div></script>
+				<script type="text/template" id="sls-discord-row-template"><div class="sls-editor-row sls-webhook-row" data-webhook-row data-webhook-type="discord"><div class="sls-webhook-enabled"><input type="hidden" data-field="enabled-hidden" value="0"><label><input type="checkbox" data-field="enabled" value="1" checked> <?php echo _('Enabled'); ?></label><input type="hidden" data-field="id" value=""></div><div><label><?php echo _('Name'); ?></label><input class="form-control" data-field="name" maxlength="80" placeholder="Operations"></div><div><label><?php echo _('Webhook URL'); ?></label><input class="form-control" type="password" data-field="url" autocomplete="new-password" placeholder="https://discord.com/api/webhooks/..."></div><button type="button" class="btn btn-link text-danger" data-remove-webhook><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div></script>
+				<script type="text/template" id="sls-generic-row-template"><div class="sls-editor-row sls-webhook-row" data-webhook-row data-webhook-type="generic"><div class="sls-webhook-enabled"><input type="hidden" data-field="enabled-hidden" value="0"><label><input type="checkbox" data-field="enabled" value="1" checked> <?php echo _('Enabled'); ?></label><input type="hidden" data-field="id" value=""></div><div><label><?php echo _('Name'); ?></label><input class="form-control" data-field="name" maxlength="80" placeholder="Incident Platform"></div><div><label><?php echo _('HTTPS URL'); ?></label><input class="form-control" type="password" data-field="url" autocomplete="new-password" placeholder="https://alerts.example.com/hooks/sls"></div><button type="button" class="btn btn-link text-danger" data-remove-webhook><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div></script>
 
 				<h3 class="sls-settings-heading"><i class="fa fa-volume-up text-success" aria-hidden="true"></i> <?php echo _('Regular Paging Audio'); ?></h3>
 				<div class="alert alert-info"><i class="fa fa-info-circle" aria-hidden="true"></i> <?php echo _('These defaults apply only to dashboard and API announcements. Weather Alerts and Lightning Alerts keep their own independent sounds and volume settings.'); ?></div>
@@ -470,7 +523,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 					<div class="col-md-3">
 						<label><?php echo _('Update Channel'); ?></label>
 						<input type="hidden" name="updates[channel]" value="beta">
-						<p class="form-control-static"><span class="label label-warning"><?php echo _('Beta'); ?></span></p>
+						<p class="form-control-static"><span class="label label-info"><?php echo _('Verified releases'); ?></span></p>
 						<p class="help-block"><?php echo _('Public beta updates are the only available channel right now.'); ?></p>
 					</div>
 					<div class="col-md-3">
@@ -727,7 +780,12 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 	var emailList = document.getElementById('sls-email-editor-list');
 	var addEmail = document.getElementById('sls-add-email');
 	var emailTemplate = document.getElementById('sls-email-row-template');
-	function nameEmails() { if (!emailList) return; Array.prototype.forEach.call(emailList.querySelectorAll('[data-email-row] input'), function(input) { input.name='mail_recipients[]'; }); }
+	function updateDestinationEmptyState(list, rowSelector) {
+		if (!list) return;
+		var empty = list.querySelector('[data-destination-empty]');
+		if (empty) empty.hidden = list.querySelectorAll(rowSelector).length !== 0;
+	}
+	function nameEmails() { if (!emailList) return; Array.prototype.forEach.call(emailList.querySelectorAll('[data-email-row] input'), function(input) { input.name='system_notification_recipients[]'; }); updateDestinationEmptyState(emailList, '[data-email-row]'); }
 	if (emailList) {
 		emailList.addEventListener('click', function(event) { var remove=event.target.closest('[data-remove-email]'); if(remove){remove.closest('[data-email-row]').remove();nameEmails();} });
 	}
@@ -735,12 +793,68 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 		addEmail.addEventListener('click', function(){var shell=document.createElement('div');shell.innerHTML=emailTemplate.innerHTML.trim();emailList.appendChild(shell.firstElementChild);nameEmails();});
 	}
 	nameEmails();
+	function reindexWebhooks(type) {
+		var list = document.getElementById('sls-' + type + '-editor-list');
+		if (!list) return;
+		Array.prototype.forEach.call(list.querySelectorAll('[data-webhook-row]'), function(row, index) {
+			var prefix = type + '_webhooks[' + index + ']';
+			var enabledHidden = row.querySelector('[data-field="enabled-hidden"]') || row.querySelector('input[type="hidden"][name$="[enabled]"]');
+			var enabled = row.querySelector('[data-field="enabled"]') || row.querySelector('input[type="checkbox"]');
+			var id = row.querySelector('[data-field="id"]') || row.querySelector('input[type="hidden"][name$="[id]"]');
+			var name = row.querySelector('[data-field="name"]') || row.querySelector('input[name$="[name]"]');
+			var url = row.querySelector('[data-field="url"]') || row.querySelector('input[name$="[url]"]');
+			if (enabledHidden) enabledHidden.name = prefix + '[enabled]';
+			if (enabled) enabled.name = prefix + '[enabled]';
+			if (id) id.name = prefix + '[id]';
+			if (name) name.name = prefix + '[name]';
+			if (url) url.name = prefix + '[url]';
+		});
+		updateDestinationEmptyState(list, '[data-webhook-row]');
+		var addButton = document.querySelector('[data-add-webhook="' + type + '"]');
+		var limitMessage = document.querySelector('[data-webhook-limit="' + type + '"]');
+		var limitReached = list.querySelectorAll('[data-webhook-row]').length >= 10;
+		if (addButton) {
+			addButton.disabled = limitReached;
+			addButton.setAttribute('aria-disabled', limitReached ? 'true' : 'false');
+		}
+		if (limitMessage) limitMessage.hidden = !limitReached;
+	}
+	['discord', 'generic'].forEach(function(type) {
+		var list = document.getElementById('sls-' + type + '-editor-list');
+		var template = document.getElementById('sls-' + type + '-row-template');
+		var addButton = document.querySelector('[data-add-webhook="' + type + '"]');
+		if (list) {
+			list.addEventListener('click', function(event) {
+				var remove = event.target.closest('[data-remove-webhook]');
+				if (remove) {
+					remove.closest('[data-webhook-row]').remove();
+					reindexWebhooks(type);
+				}
+			});
+		}
+		if (addButton && list && template) {
+			addButton.addEventListener('click', function() {
+				if (list.querySelectorAll('[data-webhook-row]').length >= 10) return;
+				var shell = document.createElement('div');
+				shell.innerHTML = template.innerHTML.trim();
+				list.appendChild(shell.firstElementChild);
+				reindexWebhooks(type);
+				list.scrollTop = list.scrollHeight;
+			});
+		}
+		reindexWebhooks(type);
+	});
+	var mailFromLocalPart = document.getElementById('sls-mail-from-local-part');
 	var mailFromDomain = document.getElementById('sls-mail-from-domain');
 	var mailFromPreview = document.getElementById('sls-mail-from-preview');
 	function renderMailFromPreview() {
 		if (!mailFromDomain || !mailFromPreview) return;
+		var localPart = String(mailFromLocalPart ? mailFromLocalPart.value : 'no-reply').trim().toLowerCase();
 		var domain = String(mailFromDomain.value || '').trim().replace(/^@/, '').replace(/\.$/, '').toLowerCase();
-		mailFromPreview.textContent = 'no-reply@' + (domain || 'example.com');
+		mailFromPreview.textContent = (localPart || 'no-reply') + '@' + (domain || 'example.com');
+	}
+	if (mailFromLocalPart) {
+		mailFromLocalPart.addEventListener('input', renderMailFromPreview);
 	}
 	if (mailFromDomain) {
 		mailFromDomain.addEventListener('input', renderMailFromPreview);

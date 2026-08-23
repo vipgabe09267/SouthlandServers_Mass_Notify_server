@@ -3,7 +3,13 @@ set -euo pipefail
 
 umask 027
 
-MODULE="${SLS_MASS_NOTIFY_MODULE:-slsmassnotifyserver}"
+MODULE="slsmassnotifyserver"
+if [ -n "${SLS_MASS_NOTIFY_MODULE:-}" ] \
+  && [ "${SLS_MASS_NOTIFY_MODULE}" != "$MODULE" ]; then
+  printf '%s\n' \
+    "SLS_MASS_NOTIFY_MODULE is fixed to the FreePBX raw module name '$MODULE'; refusing an alternate value." >&2
+  exit 2
+fi
 DATA_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin"
 SIGN_HOME="/root/.gnupg-sls-mass-notify"
 PURGE_CONFIG="${SLS_MASS_NOTIFY_PURGE_CONFIG:-0}"
@@ -187,32 +193,263 @@ capture_signing_fingerprint() {
 
 preserve_user_data() {
   [ "$PURGE_CONFIG" != "1" ] || return 0
-  [ -d "$DATA_DIR" ] || return 0
   CONFIG_TMP="$(mktemp -d /tmp/slsmassnotifyserver-config.XXXXXX)"
-  for name in mass-notifications.config mass-notifications.pending.config schedule-executions.json; do
-    [ -f "$DATA_DIR/$name" ] && cp -p "$DATA_DIR/$name" "$CONFIG_TMP/$name"
-  done
-  [ -d "$DATA_DIR/config-backups" ] && cp -a "$DATA_DIR/config-backups" "$CONFIG_TMP/config-backups"
-  # Uploaded tones are binary user data referenced by the central config.
-  [ -d "$DATA_DIR/sounds/tones" ] && {
-    mkdir -p "$CONFIG_TMP/sounds"
-    cp -a "$DATA_DIR/sounds/tones" "$CONFIG_TMP/sounds/tones"
-  }
+  chmod 0700 "$CONFIG_TMP"
+
+  # DATA_DIR is service-writable while this script runs as root. Anchor every
+  # read to no-follow directory descriptors and reject links/special files so
+  # preservation cannot disclose a root-only file or restore an unsafe object.
+  if ! /usr/bin/python3 - "$DATA_DIR" "$CONFIG_TMP" <<'PY'
+import errno
+import os
+import stat
+import sys
+
+source_root, target_root = sys.argv[1:3]
+no_follow = getattr(os, "O_NOFOLLOW", 0)
+read_flags = os.O_RDONLY | os.O_CLOEXEC | no_follow
+directory_flags = read_flags | os.O_DIRECTORY
+
+try:
+    source_fd = os.open(source_root, directory_flags)
+except FileNotFoundError:
+    raise SystemExit(0)
+except OSError as exc:
+    raise SystemExit(f"refusing unsafe preserved-data directory: {exc}")
+
+target_fd = os.open(target_root, directory_flags)
+
+
+def open_optional(parent_fd, name, flags):
+    try:
+        return os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None
+
+
+def copy_regular(source_parent_fd, target_parent_fd, name):
+    source_file_fd = open_optional(source_parent_fd, name, read_flags)
+    if source_file_fd is None:
+        return
+    try:
+        if not stat.S_ISREG(os.fstat(source_file_fd).st_mode):
+            raise RuntimeError(f"refusing non-regular preserved file: {name}")
+        target_file_fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | no_follow,
+            0o600,
+            dir_fd=target_parent_fd,
+        )
+        try:
+            while True:
+                chunk = os.read(source_file_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(target_file_fd, view)
+                    if written <= 0:
+                        raise OSError(errno.EIO, "short write while preserving user data")
+                    view = view[written:]
+            os.fsync(target_file_fd)
+        finally:
+            os.close(target_file_fd)
+    finally:
+        os.close(source_file_fd)
+
+
+def copy_tree(source_parent_fd, target_parent_fd, name):
+    source_directory_fd = open_optional(source_parent_fd, name, directory_flags)
+    if source_directory_fd is None:
+        return
+    try:
+        os.mkdir(name, 0o700, dir_fd=target_parent_fd)
+        target_directory_fd = os.open(name, directory_flags, dir_fd=target_parent_fd)
+        try:
+            for entry in sorted(os.listdir(source_directory_fd)):
+                if entry in {"", ".", ".."} or "/" in entry or "\x00" in entry:
+                    raise RuntimeError("refusing invalid preserved-data entry")
+                entry_stat = os.stat(entry, dir_fd=source_directory_fd, follow_symlinks=False)
+                if stat.S_ISLNK(entry_stat.st_mode):
+                    raise RuntimeError(f"refusing symbolic link in preserved data: {entry}")
+                if stat.S_ISDIR(entry_stat.st_mode):
+                    copy_tree(source_directory_fd, target_directory_fd, entry)
+                elif stat.S_ISREG(entry_stat.st_mode):
+                    copy_regular(source_directory_fd, target_directory_fd, entry)
+                else:
+                    raise RuntimeError(f"refusing special file in preserved data: {entry}")
+        finally:
+            os.close(target_directory_fd)
+    finally:
+        os.close(source_directory_fd)
+
+
+try:
+    for filename in (
+        "mass-notifications.config",
+        "mass-notifications.pending.config",
+        "schedule-executions.json",
+    ):
+        copy_regular(source_fd, target_fd, filename)
+    copy_tree(source_fd, target_fd, "config-backups")
+    sounds_fd = open_optional(source_fd, "sounds", directory_flags)
+    if sounds_fd is not None:
+        try:
+            os.mkdir("sounds", 0o700, dir_fd=target_fd)
+            target_sounds_fd = os.open("sounds", directory_flags, dir_fd=target_fd)
+            try:
+                copy_tree(sounds_fd, target_sounds_fd, "tones")
+            finally:
+                os.close(target_sounds_fd)
+        finally:
+            os.close(sounds_fd)
+finally:
+    os.close(target_fd)
+    os.close(source_fd)
+PY
+  then
+    log "Refusing to preserve unsafe configuration or uploaded-tone data. No uninstall changes were made."
+    return 1
+  fi
 }
 
 restore_user_data() {
   [ -n "$CONFIG_TMP" ] && [ -d "$CONFIG_TMP" ] || return 0
   if find "$CONFIG_TMP" -type f -print -quit | grep -q .; then
-    mkdir -p "$DATA_DIR"
-    cp -a "$CONFIG_TMP"/. "$DATA_DIR/"
-    chown -R asterisk:asterisk "$DATA_DIR" 2>/dev/null || true
-    chmod 0750 "$DATA_DIR" 2>/dev/null || true
-    [ -d "$DATA_DIR/config-backups" ] && chmod 0750 "$DATA_DIR/config-backups" 2>/dev/null || true
-    [ -d "$DATA_DIR/sounds" ] && chmod 0755 "$DATA_DIR/sounds" 2>/dev/null || true
-    [ -d "$DATA_DIR/sounds/tones" ] && chmod 0755 "$DATA_DIR/sounds/tones" 2>/dev/null || true
-    find "$DATA_DIR" -maxdepth 1 -type f \( -name '*.config' -o -name 'schedule-executions.json' \) -exec chmod 0640 {} + 2>/dev/null || true
-    find "$DATA_DIR/config-backups" -type f -exec chmod 0640 {} + 2>/dev/null || true
-    find "$DATA_DIR/sounds/tones" -type f -name '*.wav' -exec chmod 0644 {} + 2>/dev/null || true
+    if ! /usr/bin/python3 - "$CONFIG_TMP" "$DATA_DIR" <<'PY'
+import errno
+import os
+import pwd
+import secrets
+import stat
+import sys
+
+source_root, destination_root = sys.argv[1:3]
+no_follow = getattr(os, "O_NOFOLLOW", 0)
+directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | no_follow
+read_flags = os.O_RDONLY | os.O_CLOEXEC | no_follow
+write_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | no_follow
+account = pwd.getpwnam("asterisk")
+file_count = 0
+byte_count = 0
+
+
+def open_parent(path):
+    parts = [part for part in path.split("/") if part]
+    if not path.startswith("/") or not parts or "\x00" in path:
+        raise RuntimeError("invalid restore path")
+    parent_fd = os.open("/", directory_flags)
+    for component in parts[:-1]:
+        next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+        os.close(parent_fd)
+        parent_fd = next_fd
+    return parent_fd, parts[-1]
+
+
+def open_or_create_directory(parent_fd, name):
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    directory_fd = os.open(name, directory_flags, dir_fd=parent_fd)
+    if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
+        os.close(directory_fd)
+        raise RuntimeError("restore destination is not a directory")
+    return directory_fd
+
+
+def restore_regular(source_parent_fd, destination_parent_fd, name, relative_path):
+    global file_count, byte_count
+    source_fd = os.open(name, read_flags, dir_fd=source_parent_fd)
+    if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+        os.close(source_fd)
+        raise RuntimeError(f"refusing non-regular restore source: {relative_path}")
+    temporary_name = ".sls-restore-" + secrets.token_hex(8)
+    temporary_fd = os.open(temporary_name, write_flags, 0o600, dir_fd=destination_parent_fd)
+    try:
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            byte_count += len(chunk)
+            if byte_count > 256 * 1024 * 1024:
+                raise RuntimeError("preserved data exceeds the restore size limit")
+            view = memoryview(chunk)
+            while view:
+                written = os.write(temporary_fd, view)
+                if written <= 0:
+                    raise OSError(errno.EIO, "short write while restoring user data")
+                view = view[written:]
+        file_count += 1
+        if file_count > 2000:
+            raise RuntimeError("preserved data exceeds the restore file limit")
+        mode = 0o644 if relative_path.startswith("sounds/tones/") else 0o640
+        os.fchmod(temporary_fd, mode)
+        os.fchown(temporary_fd, account.pw_uid, account.pw_gid)
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = -1
+        os.replace(temporary_name, name, src_dir_fd=destination_parent_fd, dst_dir_fd=destination_parent_fd)
+    finally:
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        os.close(source_fd)
+        try:
+            os.unlink(temporary_name, dir_fd=destination_parent_fd)
+        except FileNotFoundError:
+            pass
+
+
+def restore_tree(source_fd, destination_fd, prefix=""):
+    for name in sorted(os.listdir(source_fd)):
+        if name in {"", ".", ".."} or "/" in name or "\x00" in name:
+            raise RuntimeError("invalid preserved-data name")
+        relative_path = f"{prefix}/{name}" if prefix else name
+        metadata = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RuntimeError(f"refusing symbolic link in preserved data: {relative_path}")
+        if stat.S_ISDIR(metadata.st_mode):
+            source_child_fd = os.open(name, directory_flags, dir_fd=source_fd)
+            destination_child_fd = open_or_create_directory(destination_fd, name)
+            try:
+                os.fchmod(destination_child_fd, 0o700)
+                os.fchown(destination_child_fd, 0, 0)
+                restore_tree(source_child_fd, destination_child_fd, relative_path)
+                mode = 0o755 if relative_path in {"sounds", "sounds/tones"} else 0o750
+                os.fchown(destination_child_fd, account.pw_uid, account.pw_gid)
+                os.fchmod(destination_child_fd, mode)
+                os.fsync(destination_child_fd)
+            finally:
+                os.close(destination_child_fd)
+                os.close(source_child_fd)
+        elif stat.S_ISREG(metadata.st_mode):
+            restore_regular(source_fd, destination_fd, name, relative_path)
+        else:
+            raise RuntimeError(f"refusing special file in preserved data: {relative_path}")
+
+
+source_fd = os.open(source_root, directory_flags)
+destination_parent_fd, destination_name = open_parent(destination_root)
+try:
+    destination_fd = open_or_create_directory(destination_parent_fd, destination_name)
+    try:
+        os.fchmod(destination_fd, 0o700)
+        os.fchown(destination_fd, 0, 0)
+        restore_tree(source_fd, destination_fd)
+        os.fchown(destination_fd, account.pw_uid, account.pw_gid)
+        os.fchmod(destination_fd, 0o750)
+        os.fsync(destination_fd)
+        os.fsync(destination_parent_fd)
+    finally:
+        os.close(destination_fd)
+finally:
+    os.close(destination_parent_fd)
+    os.close(source_fd)
+PY
+    then
+      log "Unable to restore preserved user data without following symbolic links. The root-owned recovery copy remains at $CONFIG_TMP."
+      return 1
+    fi
   fi
   rm -rf "$CONFIG_TMP"
   CONFIG_TMP=""
@@ -635,6 +872,25 @@ remove_piper_wrapper() {
   fi
 }
 
+remove_managed_sound_link() {
+  local link_path="$1"
+  local expected_target="$DATA_DIR/sounds"
+  local actual_target=""
+
+  if [ -L "$link_path" ]; then
+    actual_target="$(readlink -- "$link_path" 2>/dev/null || true)"
+    if [ "$actual_target" = "$expected_target" ]; then
+      rm -f -- "$link_path"
+    else
+      log "Leaving non-module sound link unchanged: $link_path"
+    fi
+  elif [ -e "$link_path" ]; then
+    # A managed install creates a symbolic link here. Never recursively delete
+    # a real directory or file that may contain user-owned recordings.
+    log "Leaving non-link sound path unchanged: $link_path"
+  fi
+}
+
 remove_runtime_files() {
   remove_piper_wrapper
   if [ -L "$DATA_DIR/piper/venv/bin/piper" ] && [ "$(readlink "$DATA_DIR/piper/venv/bin/piper")" = "/usr/local/bin/piper" ]; then
@@ -646,8 +902,8 @@ remove_runtime_files() {
   rm -f /usr/local/sbin/sign_sls_mass_notify_local_sig.sh
   rm -f /usr/local/sbin/sign_sls_mass_notify_local_sig.sh.bak-*
   rm -f /etc/freepbx.secure/slsmassnotifyserver.sig
-  rm -rf /var/lib/asterisk/sounds/SLS_Mass_Notifications_Plugin
-  rm -rf /var/lib/asterisk/sounds/en/SLS_Mass_Notifications_Plugin
+  remove_managed_sound_link /var/lib/asterisk/sounds/SLS_Mass_Notifications_Plugin
+  remove_managed_sound_link /var/lib/asterisk/sounds/en/SLS_Mass_Notifications_Plugin
   rm -f /var/lib/asterisk/bin/sls_mass_notify
   rm -f /var/lib/asterisk/bin/sls_mass_notify_test.sh
   rm -rf /var/www/html/api/sls-mass-notify

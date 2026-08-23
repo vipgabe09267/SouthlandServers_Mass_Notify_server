@@ -34,10 +34,12 @@ SLS_CALLERID_NAME="SLS Mass Notification System"
 SLS_CALLERID_NUM="SLS"
 SLS_AUDIO_CONTEXT="sls-alert-audio"
 NWS_ALERT_RECIPIENTS=()
+NWS_DESKTOP_CLIENTS=()
 SLS_TONE_SOUND_PREFIX="SLS_Mass_Notifications_Plugin/tones"
 SLS_TTS_SOUND_PREFIX="SLS_Mass_Notifications_Plugin/tts"
-SLS_TONES_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sounds/tones"
-SLS_TTS_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sounds/tts"
+SLS_TONES_DIR="${SLS_TONES_DIR:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sounds/tones}"
+SLS_TTS_DIR="${SLS_TTS_DIR:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sounds/tts}"
+ASTERISK_SOUNDS_DIR="${ASTERISK_SOUNDS_DIR:-/var/lib/asterisk/sounds}"
 SLS_OPENING_TONE="opening_NWS_alert"
 SLS_CLOSING_TONE=""
 PIPER_BIN="/usr/local/bin/sls_mass_notify/piper/venv/bin/piper"
@@ -50,6 +52,7 @@ EVENTS_LOG="${EVENTS_LOG:-/var/log/sls_mass_notify_events.jsonl}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-90}"
 CONFIG_JSON_FILE="${CONFIG_JSON_FILE:-${CONFIG_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config}}"
 CONFIG_LOADER="${CONFIG_LOADER:-/usr/local/bin/sls_mass_notify/sls_config.py}"
+VISUAL_PUSH_SCRIPT="${VISUAL_PUSH_SCRIPT:-/usr/local/bin/sls_mass_notify/sls_notify.py}"
 BRANDED_EMAIL_SCRIPT="${BRANDED_EMAIL_SCRIPT:-/usr/local/bin/sls_mass_notify/sls_branded_email.py}"
 BRANDED_DISCORD_SCRIPT="${BRANDED_DISCORD_SCRIPT:-/usr/local/bin/sls_mass_notify/sls_branded_discord.py}"
 COOLDOWN_FILE="${COOLDOWN_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/test-cooldown.ts}"
@@ -58,8 +61,9 @@ FAULT_STATE_FILE="${FAULT_STATE_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_P
 COOLDOWN_SECONDS=60
 SPOOL="${SPOOL:-/var/spool/asterisk/outgoing}"
 SPOOL_TMP="${SPOOL_TMP:-/var/spool/asterisk/tmp}"
-SPOOL_DONE="${SPOOL_DONE:-/var/spool/asterisk/outgoing_done}"
-TEST_CALL_RESULTS=()
+TEST_CALL_QUEUE_PATHS=()
+declare -A TEST_CALL_RECIPIENTS=()
+TEST_SPOOL_PICKUP_TIMEOUT_SECONDS="${TEST_SPOOL_PICKUP_TIMEOUT_SECONDS:-10}"
 MAIL_TO=""
 DISCORD_WEBHOOK_URL=""
 MAIL_FROM_NAME="SLS Mass Notification System"
@@ -69,6 +73,8 @@ SENDMAIL_BIN="/usr/sbin/sendmail"
 SOURCE_EXTENSION=""
 SOURCE_NAME="SLS Mass Notification System"
 DELIVERY_TARGETS=""
+DESKTOP_DELIVERY_TARGETS=""
+TEST_AUDIO_LABEL="None"
 TRIGGER_EXTENSION="${1:-unknown}"
 TRIGGER_NAME="${2:-Unknown Caller}"
 NWS_ALERTS_DRY_RUN="${NWS_ALERTS_DRY_RUN:-0}"
@@ -85,6 +91,62 @@ Time: {{time}}"
 
 timestamp_now() {
   date --iso-8601=seconds
+}
+
+claim_test_cooldown() {
+  COOLDOWN_FILE_PATH="$COOLDOWN_FILE" \
+  COOLDOWN_SECONDS_VALUE="$COOLDOWN_SECONDS" \
+  python3 - <<'PY'
+import fcntl
+import os
+import stat
+import sys
+import time
+
+path = os.environ["COOLDOWN_FILE_PATH"]
+try:
+    cooldown = max(1, min(3600, int(os.environ.get("COOLDOWN_SECONDS_VALUE", "60"))))
+except ValueError:
+    cooldown = 60
+
+parent = os.path.dirname(path)
+if not parent or not os.path.isdir(parent) or os.path.islink(parent):
+    print("ERROR invalid cooldown directory")
+    raise SystemExit(2)
+
+lock_path = path + ".lock"
+common_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+lock_fd = os.open(lock_path, common_flags | getattr(os, "O_NONBLOCK", 0), 0o640)
+try:
+    if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+        print("ERROR invalid cooldown lock")
+        raise SystemExit(2)
+    os.fchmod(lock_fd, 0o640)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+    cooldown_fd = os.open(path, common_flags | getattr(os, "O_NONBLOCK", 0), 0o640)
+    try:
+        if not stat.S_ISREG(os.fstat(cooldown_fd).st_mode):
+            print("ERROR invalid cooldown state")
+            raise SystemExit(2)
+        os.fchmod(cooldown_fd, 0o640)
+        raw = os.read(cooldown_fd, 64).decode("ascii", "ignore").strip()
+        last_run = int(raw) if raw.isdigit() else 0
+        now = int(time.time())
+        remaining = min(cooldown, cooldown - (now - last_run))
+        if last_run > 0 and remaining > 0:
+            print(f"COOLDOWN {remaining}")
+            raise SystemExit(3)
+        os.lseek(cooldown_fd, 0, os.SEEK_SET)
+        os.ftruncate(cooldown_fd, 0)
+        os.write(cooldown_fd, f"{now}\n".encode("ascii"))
+        os.fsync(cooldown_fd)
+        print("CLAIMED")
+    finally:
+        os.close(cooldown_fd)
+finally:
+    os.close(lock_fd)
+PY
 }
 
 prune_event_log() {
@@ -201,6 +263,8 @@ append_event_log() {
   SUBJECT="$subject" \
   BODY="$body" \
   NWS_RECIPIENTS="$DELIVERY_TARGETS" \
+  DESKTOP_RECIPIENTS="$DESKTOP_DELIVERY_TARGETS" \
+  TEST_AUDIO_LABEL="$TEST_AUDIO_LABEL" \
   SOURCE_EXTENSION="$SOURCE_EXTENSION" \
   SOURCE_NAME="$SOURCE_NAME" \
   TRIGGER_EXTENSION="$TRIGGER_EXTENSION" \
@@ -225,10 +289,12 @@ payload = {
     "trigger_extension": os.environ.get("TRIGGER_EXTENSION", ""),
     "trigger_name": os.environ.get("TRIGGER_NAME", ""),
     "page_group": os.environ.get("NWS_RECIPIENTS", ""),
+    "desktop_all": False,
+    "desktop_clients": [item for item in os.environ.get("DESKTOP_RECIPIENTS", "").split(",") if item],
     "event": "Manual NWS Paging Test",
     "severity": "Test",
     "message_type": "Test",
-    "audio": "Piper TTS",
+    "audio": os.environ.get("TEST_AUDIO_LABEL", "None"),
     "audio_sequence": [part for part in os.environ.get("AUDIO_SEQUENCE", "").split("&") if part],
     "mail_subject": os.environ.get("SUBJECT", ""),
     "mail_body": os.environ.get("BODY", ""),
@@ -380,9 +446,11 @@ trigger_visual_test() {
 	local description
 	local test_id
 	local targets
+	local desktop_targets
+	local -a command
 
-  if [ ! -x /usr/local/bin/sls_mass_notify/sls_notify.py ]; then
-    echo "$(date): Visual test skipped — /usr/local/bin/sls_mass_notify/sls_notify.py is not executable" >> "$LOG"
+  if [ ! -x "$VISUAL_PUSH_SCRIPT" ]; then
+    echo "$(date): Visual test skipped — visual notification worker is not executable" >> "$LOG"
     return 1
   fi
 
@@ -391,22 +459,35 @@ trigger_visual_test() {
   test_id="pbx-gui-test-$(date +%Y%m%d%H%M%S)-$$"
   description="PBX TEST - Simulated ${event}. This visual alert was triggered from the FreePBX Mass Notifications testing page."
   targets="$(get_nws_recipient_targets)"
-  if [ -z "$targets" ]; then
-    echo "$(date): Visual test skipped — no NWS recipient extensions configured" >> "$LOG"
+  desktop_targets="$(get_nws_desktop_targets)"
+  if [ -z "$targets" ] && [ -z "$desktop_targets" ]; then
+    echo "$(date): Visual test skipped — no phone or desktop recipients configured" >> "$LOG"
     return 1
   fi
 
-  echo "$(date): Sending visual test image — Event: $event" >> "$LOG"
-  if ! /usr/bin/timeout 45 /usr/bin/python3 /usr/local/bin/sls_mass_notify/sls_notify.py \
+  command=(
+    /usr/bin/timeout 45 /usr/bin/python3 "$VISUAL_PUSH_SCRIPT"
     --event "$event" \
     --severity "$severity" \
     --area "${NWS_ZONE:-Configured NWS zone}" \
     --description "$description" \
     --test-id "$test_id" \
-    --targets "$targets" \
-    --no-retry \
-    >> "$LOG" 2>&1; then
-    echo "$(date): ERROR — Visual test delivery failed" >> "$LOG"
+    --no-retry
+  )
+  if [ -n "$targets" ]; then
+    command+=(--targets "$targets" --require-all-targets)
+  else
+    command+=(--api-only)
+  fi
+  if [ -n "$desktop_targets" ]; then
+    command+=(--desktop-targets "$desktop_targets")
+  else
+    command+=(--no-api)
+  fi
+
+  echo "$(date): Submitting manual Weather visual to requested phone/desktop channels — Event: $event" >> "$LOG"
+  if ! "${command[@]}" >> "$LOG" 2>&1; then
+    echo "$(date): ERROR — Manual Weather visual channel submission failed" >> "$LOG"
     return 1
   fi
   return 0
@@ -417,17 +498,50 @@ get_nws_recipient_targets() {
   printf '%s\n' "${NWS_ALERT_RECIPIENTS[*]}"
 }
 
+get_nws_desktop_targets() {
+  local IFS=,
+  printf '%s\n' "${NWS_DESKTOP_CLIENTS[*]}"
+}
+
+audio_page_hold_seconds() {
+  local sound_sequence="$1"
+  local sound_file
+  local duration
+
+  [[ "$sound_sequence" =~ ^[A-Za-z0-9_/-]+$ ]] || return 1
+  sound_file="${ASTERISK_SOUNDS_DIR}/${sound_sequence}.wav"
+  [ -r "$sound_file" ] || return 1
+  duration="$(LC_ALL=C /usr/bin/soxi -D "$sound_file" 2>/dev/null)" || return 1
+  # Keep Page's originating Local channel through the complete WAV and a
+  # bounded teardown margin without adding its separate participant timeout.
+  LC_ALL=C awk -v duration="$duration" 'BEGIN {
+    if (duration <= 0 || duration > 1767) exit 1
+    rounded = int(duration)
+    if (duration > rounded) rounded++
+    print rounded + 2
+  }'
+}
+
 queue_test_audio_to_recipients() {
   local sound_sequence="$1"
   local recipient
   local callfile
   local queued=0
+  local page_hold_seconds
+  local call_wait_seconds
 
   if [ "${#NWS_ALERT_RECIPIENTS[@]}" -eq 0 ]; then
     echo "$(date): ERROR — No NWS alert recipient extensions configured" >> "$LOG"
     report_fault "delivery" "No NWS alert recipient extensions configured"
     return 1
   fi
+
+  if ! page_hold_seconds="$(audio_page_hold_seconds "$sound_sequence")"; then
+    echo "$(date): ERROR — Unable to measure the complete test audio sequence" >> "$LOG"
+    report_fault "delivery" "Unable to measure the complete manual test audio sequence"
+    return 1
+  fi
+  call_wait_seconds=$((page_hold_seconds + 30))
 
   for recipient in "${NWS_ALERT_RECIPIENTS[@]}"; do
     recipient="$(printf '%s' "$recipient" | tr -dc '0-9')"
@@ -441,10 +555,9 @@ Setvar: SLS_CALLERID_NAME=${SLS_CALLERID_NAME}
 Setvar: SLS_CALLERID_NUM=${SLS_CALLERID_NUM}
 MaxRetries: 0
 RetryTime: 5
-WaitTime: 30
-Archive: yes
+WaitTime: ${call_wait_seconds}
 Application: Wait
-Data: 1
+Data: ${page_hold_seconds}
 CALL
     chown asterisk:asterisk "$callfile" 2>/dev/null || true
     chmod 0640 "$callfile"
@@ -453,7 +566,9 @@ CALL
       rm -f "$callfile" 2>/dev/null || true
       continue
     fi
-    TEST_CALL_RESULTS+=("$SPOOL_DONE/$(basename "$callfile")")
+    callfile="$SPOOL/$(basename "$callfile")"
+    TEST_CALL_QUEUE_PATHS+=("$callfile")
+    TEST_CALL_RECIPIENTS["$callfile"]="$recipient"
     queued=$((queued + 1))
   done
 
@@ -466,35 +581,33 @@ CALL
   return 0
 }
 
-wait_for_test_call_results() {
-  local deadline=$((SECONDS + 45))
-  local result_file
+wait_for_test_call_pickup() {
+  local timeout_seconds="$TEST_SPOOL_PICKUP_TIMEOUT_SECONDS"
+  local deadline
+  local queue_file
   local pending
-  local status
   local failed=0
 
-  [ "${#TEST_CALL_RESULTS[@]}" -gt 0 ] || return 1
+  [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || timeout_seconds=10
+  [ "$timeout_seconds" -ge 1 ] 2>/dev/null || timeout_seconds=10
+  [ "$timeout_seconds" -le 30 ] 2>/dev/null || timeout_seconds=30
+  deadline=$((SECONDS + timeout_seconds))
+  [ "${#TEST_CALL_QUEUE_PATHS[@]}" -gt 0 ] || return 1
   while [ "$SECONDS" -lt "$deadline" ]; do
     pending=0
-    for result_file in "${TEST_CALL_RESULTS[@]}"; do
-      [ -f "$result_file" ] || pending=$((pending + 1))
+    for queue_file in "${TEST_CALL_QUEUE_PATHS[@]}"; do
+      [ ! -e "$queue_file" ] || pending=$((pending + 1))
     done
     [ "$pending" -eq 0 ] && break
     sleep 1
   done
 
-  for result_file in "${TEST_CALL_RESULTS[@]}"; do
-    if [ ! -f "$result_file" ]; then
-      echo "$(date): ERROR — Timed out waiting for Asterisk test call result $(basename "$result_file")" >> "$LOG"
-      failed=1
-      continue
-    fi
-    status="$(awk -F: 'tolower($1) == "status" {sub(/^[[:space:]]+/, "", $2); print $2; exit}' "$result_file")"
-    if [ "$status" != "Completed" ]; then
-      echo "$(date): ERROR — Asterisk test call $(basename "$result_file") completed with status ${status:-Unknown}" >> "$LOG"
+  for queue_file in "${TEST_CALL_QUEUE_PATHS[@]}"; do
+    if [ -e "$queue_file" ]; then
+      echo "$(date): ERROR — Asterisk did not pick up the manual Weather audio job for extension ${TEST_CALL_RECIPIENTS[$queue_file]:-unknown} within ${timeout_seconds} seconds" >> "$LOG"
+      rm -f "$queue_file" 2>/dev/null || true
       failed=1
     fi
-    rm -f "$result_file" 2>/dev/null || true
   done
   [ "$failed" -eq 0 ]
 }
@@ -515,9 +628,11 @@ load_central_config() {
   fi
 
   NWS_ALERT_RECIPIENTS=()
+  NWS_DESKTOP_CLIENTS=()
   while IFS= read -r -d '' key && IFS= read -r -d '' value; do
     case "$key" in
       NWS_ALERT_RECIPIENT) NWS_ALERT_RECIPIENTS+=("$value") ;;
+      NWS_DESKTOP_CLIENT) NWS_DESKTOP_CLIENTS+=("$value") ;;
       NWS_ALERTS_ENABLED|PUBLIC_PBX_HOST|NWS_API_BASE_URL|NWS_ZONE|SLS_OPENING_TONE|SLS_CLOSING_TONE|PIPER_BIN|PIPER_NWS_VOICE|PIPER_ANNOUNCEMENT_VOICE|PIPER_NWS_VOLUME|PIPER_ANNOUNCEMENT_VOLUME|PIPER_MAX_SECONDS|LOG_RETENTION_DAYS|MAIL_TO|DISCORD_WEBHOOK_URL|QUIET_HOURS_ENABLED|QUIET_HOURS_START|QUIET_HOURS_END|MAIL_FROM_NAME|MAIL_FROM_ADDR|ALERT_EMAIL_SUBJECT|ALERT_EMAIL_BODY|TEST_EMAIL_SUBJECT|TEST_EMAIL_BODY|EMAIL_HTML_ENABLED|AMI_USERNAME|AMI_PASSWORD|AMI_HOST|AMI_PORT|GITHUB_UPDATES_ENABLED|GITHUB_UPDATES_REPOSITORY|GITHUB_UPDATES_CHANNEL)
         printf -v "$key" '%s' "$value"
         ;;
@@ -536,11 +651,27 @@ fi
 if [ -n "${NWS_ZONE_OVERRIDE:-}" ]; then
   NWS_ZONE="$NWS_ZONE_OVERRIDE"
 fi
-if [ -n "${NWS_RECIPIENTS_OVERRIDE:-}" ]; then
-  IFS=',' read -r -a NWS_ALERT_RECIPIENTS <<< "$NWS_RECIPIENTS_OVERRIDE"
+if [ "${NWS_RECIPIENTS_OVERRIDE+x}" = "x" ]; then
+  NWS_ALERT_RECIPIENTS=()
+  if [ -n "$NWS_RECIPIENTS_OVERRIDE" ]; then
+    IFS=',' read -r -a NWS_ALERT_RECIPIENTS <<< "$NWS_RECIPIENTS_OVERRIDE"
+  fi
+fi
+if [ "${NWS_DESKTOP_CLIENTS_OVERRIDE+x}" = "x" ]; then
+  NWS_DESKTOP_CLIENTS=()
+  if [ -n "$NWS_DESKTOP_CLIENTS_OVERRIDE" ]; then
+    IFS=',' read -r -a NWS_DESKTOP_CLIENTS <<< "$NWS_DESKTOP_CLIENTS_OVERRIDE"
+  fi
 fi
 prune_event_log
 DELIVERY_TARGETS="$(get_nws_recipient_targets)"
+DESKTOP_DELIVERY_TARGETS="$(get_nws_desktop_targets)"
+
+if [ "${#NWS_ALERT_RECIPIENTS[@]}" -eq 0 ] && [ "${#NWS_DESKTOP_CLIENTS[@]}" -eq 0 ]; then
+  echo "ERROR: The selected Weather zones do not have a phone or desktop channel that can be tested. Email destinations are intentionally skipped during manual tests."
+  report_fault "configuration" "Selected Weather zones have no testable phone or desktop recipients"
+  exit 1
+fi
 
 if [ "${NWS_ALERTS_ENABLED:-1}" != "1" ]; then
   echo "$(date): NWS alerts are disabled in settings; manual test skipped" >> "$LOG"
@@ -551,97 +682,112 @@ fi
 
 prune_tts_cache
 
-LAST_RUN=0
-if [ -r "$COOLDOWN_FILE" ]; then
-  LAST_RUN="$(tr -dc '0-9' < "$COOLDOWN_FILE")"
-fi
-if [ -z "$LAST_RUN" ]; then
-  LAST_RUN=0
-fi
-
-NOW_TS="$(date +%s)"
-if [ "$LAST_RUN" -gt 0 ] && [ $((NOW_TS - LAST_RUN)) -lt "$COOLDOWN_SECONDS" ]; then
-  REMAINING=$((COOLDOWN_SECONDS - (NOW_TS - LAST_RUN)))
+COOLDOWN_RESULT=""
+COOLDOWN_EXIT=0
+COOLDOWN_RESULT="$(claim_test_cooldown)" || COOLDOWN_EXIT=$?
+if [ "$COOLDOWN_EXIT" -eq 3 ]; then
+  REMAINING="${COOLDOWN_RESULT#COOLDOWN }"
+  case "$REMAINING" in
+    ''|*[!0-9]*) REMAINING="$COOLDOWN_SECONDS" ;;
+  esac
   echo "$(date): Manual test blocked by cooldown — ${REMAINING}s remaining" >> "$LOG"
   update_status "$(printf '{"last_test_at":%s,"last_test_status":"cooldown","last_test_message":%s}' \
     "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$(timestamp_now)")" \
     "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "Manual test blocked by cooldown (${REMAINING}s remaining).")")"
-  exit 0
+  echo "ERROR: Manual testing is on cooldown (${REMAINING}s remaining)."
+  exit 75
 fi
-
-printf '%s\n' "$NOW_TS" > "$COOLDOWN_FILE"
-chmod 0640 "$COOLDOWN_FILE" 2>/dev/null || true
-chown asterisk:asterisk "$COOLDOWN_FILE" 2>/dev/null || true
-
-echo "$(date): Manual Piper TTS test alert triggered" >> "$LOG"
-
-TTS_FILE="$(generate_test_tts_audio)"
-if [ -z "$TTS_FILE" ]; then
-  echo "ERROR: Piper TTS test audio was not generated"
-  report_fault "audio" "Piper TTS test audio was not generated"
+if [ "$COOLDOWN_EXIT" -ne 0 ] || [ "$COOLDOWN_RESULT" != "CLAIMED" ]; then
+  echo "$(date): ERROR - Manual test cooldown state could not be secured" >> "$LOG"
+  report_fault "cooldown" "Manual test cooldown state could not be secured"
+  echo "ERROR: Manual test cooldown state could not be secured."
   exit 1
 fi
 
-AUDIO_SEQUENCE="$(build_audio_sequence "$TTS_FILE")"
-if [ -z "$AUDIO_SEQUENCE" ]; then
-  echo "ERROR: Piper TTS test audio sequence was not generated"
-  report_fault "audio" "Piper TTS test audio sequence was not generated"
-  exit 1
+echo "$(date): Manual Weather channel test triggered" >> "$LOG"
+
+AUDIO_SEQUENCE=""
+if [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ]; then
+  TTS_FILE="$(generate_test_tts_audio)"
+  if [ -z "$TTS_FILE" ]; then
+    echo "ERROR: Piper TTS test audio was not generated"
+    report_fault "audio" "Piper TTS test audio was not generated"
+    exit 1
+  fi
+
+  AUDIO_SEQUENCE="$(build_audio_sequence "$TTS_FILE")"
+  if [ -z "$AUDIO_SEQUENCE" ]; then
+    echo "ERROR: Piper TTS test audio sequence was not generated"
+    report_fault "audio" "Piper TTS test audio sequence was not generated"
+    exit 1
+  fi
+  TEST_AUDIO_LABEL="Piper TTS"
 fi
 
 # Build call files using the same direct audio path as live NWS alerts.
 if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
-  echo "$(date): Dry run — would queue test call files using $AUDIO_SEQUENCE to recipients: ${NWS_ALERT_RECIPIENTS[*]}" >> "$LOG"
-else
-  mkdir -p "$SPOOL_DONE"
-  chown asterisk:asterisk "$SPOOL_DONE" 2>/dev/null || true
-  chmod 0750 "$SPOOL_DONE" 2>/dev/null || true
+  if [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ]; then
+    echo "$(date): Dry run — would queue test call files using $AUDIO_SEQUENCE to recipients: ${NWS_ALERT_RECIPIENTS[*]}" >> "$LOG"
+  fi
+elif [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ]; then
   if ! queue_test_audio_to_recipients "$AUDIO_SEQUENCE"; then
+    exit 1
+  fi
+  if ! wait_for_test_call_pickup; then
+    report_fault "audio" "Asterisk did not pick up one or more manual Weather audio page jobs"
+    echo "ERROR: Asterisk did not pick up one or more requested audio page jobs. Review Asterisk service and outgoing-spool permissions."
     exit 1
   fi
 fi
 
 # Let the auto-answer call enter media before placing the visual screen on top.
 if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
-  echo "$(date): Dry run — would send visual test image after audio starts" >> "$LOG"
+  echo "$(date): Dry run — would publish the manual Weather visual to the requested phone/desktop channels" >> "$LOG"
 else
-  sleep 2
-  if ! trigger_visual_test; then
-    report_fault "visual" "Manual NWS test SIP NOTIFY delivery failed"
-    exit 1
+  if [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ]; then
+    sleep 2
   fi
-  if ! wait_for_test_call_results; then
-    report_fault "delivery" "One or more manual NWS test calls did not complete"
-    echo "ERROR: One or more Asterisk test calls did not complete. Confirm endpoint registration, DND, and phone auto-answer policy."
+  if ! trigger_visual_test; then
+    report_fault "visual" "Manual Weather visual submission to a requested phone or desktop channel failed"
+    echo "ERROR: Manual Weather visual submission failed for at least one requested phone or desktop channel."
     exit 1
   fi
 fi
 
-echo "$(date): Test audio and SIP NOTIFY delivery checks completed — $AUDIO_SEQUENCE" >> "$LOG"
+echo "$(date): Requested manual Weather channels accepted the local submission — phones=${#NWS_ALERT_RECIPIENTS[@]} desktops=${#NWS_DESKTOP_CLIENTS[@]}" >> "$LOG"
 DELIVERY_TS="$(timestamp_now)"
-TEST_DELIVERY_STATUS="completed"
-TEST_DELIVERY_MESSAGE="Asterisk completed manual Piper TTS test calls and accepted SIP NOTIFY delivery"
+TEST_DELIVERY_STATUS="submitted"
+if [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ] && [ "${#NWS_DESKTOP_CLIENTS[@]}" -gt 0 ]; then
+  TEST_DELIVERY_MESSAGE="Asterisk picked up the manual audio page jobs and accepted SIP NOTIFY submission; targeted desktop publication completed; endpoint display and handset acceptance are not confirmed"
+elif [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ]; then
+  TEST_DELIVERY_MESSAGE="Asterisk picked up the manual audio page jobs and accepted SIP NOTIFY submission; handset acceptance is not confirmed"
+else
+  TEST_DELIVERY_MESSAGE="Targeted desktop publication completed; desktop application display is not confirmed"
+fi
 if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
   TEST_DELIVERY_STATUS="dry_run"
   TEST_DELIVERY_MESSAGE="Dry run completed for manual Piper TTS test"
 fi
-update_status "$(printf '{"last_delivery_at":%s,"last_delivery_status":%s,"last_delivery_source":"test","last_delivery_event":"Manual NWS Test","last_delivery_audio":%s,"last_delivery_message":%s,"last_delivery_page_group":%s}' \
+update_status "$(printf '{"last_delivery_at":%s,"last_delivery_status":%s,"last_delivery_source":"test","last_delivery_event":"Manual NWS Test","last_delivery_audio":%s,"last_delivery_message":%s,"last_delivery_page_group":%s,"last_delivery_desktop_clients":%s}' \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DELIVERY_TS")" \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_DELIVERY_STATUS")" \
-  "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "Piper TTS")" \
+  "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_AUDIO_LABEL")" \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_DELIVERY_MESSAGE")" \
-  "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DELIVERY_TARGETS")")"
-update_status "$(printf '{"last_test_at":%s,"last_test_status":%s,"last_test_message":%s,"last_test_audio":%s}' \
+  "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DELIVERY_TARGETS")" \
+  "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DESKTOP_DELIVERY_TARGETS")")"
+update_status "$(printf '{"last_test_at":%s,"last_test_status":%s,"last_test_message":%s,"last_test_audio":%s,"last_test_phone_count":%d,"last_test_desktop_count":%d}' \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DELIVERY_TS")" \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_DELIVERY_STATUS")" \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_DELIVERY_MESSAGE")" \
-  "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "Piper TTS")")"
+  "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_AUDIO_LABEL")" \
+  "${#NWS_ALERT_RECIPIENTS[@]}" \
+  "${#NWS_DESKTOP_CLIENTS[@]}")"
 CURRENT_TIME="$(date)"
 MAIL_SUBJECT="$(render_template "$TEST_EMAIL_SUBJECT" \
   "event=Manual NWS Test" \
   "severity=Test" \
   "message_type=Test" \
-  "audio=Piper TTS" \
+  "audio=$TEST_AUDIO_LABEL" \
   "page_group=$DELIVERY_TARGETS" \
   "alert_id=" \
   "zone=" \
@@ -656,7 +802,7 @@ MAIL_BODY="$(render_template "$TEST_EMAIL_BODY" \
   "event=Manual NWS Test" \
   "severity=Test" \
   "message_type=Test" \
-  "audio=Piper TTS" \
+  "audio=$TEST_AUDIO_LABEL" \
   "page_group=$DELIVERY_TARGETS" \
   "alert_id=" \
   "zone=" \
@@ -672,5 +818,5 @@ if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
   echo "Dry run complete. No phones were notified."
 else
   append_event_log "$MAIL_SUBJECT" "$MAIL_BODY" "$AUDIO_SEQUENCE"
-  echo "Weather test delivered to ${#NWS_ALERT_RECIPIENTS[@]} configured recipient(s). Email and Discord were not sent."
+  echo "Weather test local submission completed for ${#NWS_ALERT_RECIPIENTS[@]} phone recipient(s) and ${#NWS_DESKTOP_CLIENTS[@]} desktop recipient(s). Endpoint display and handset acceptance are not confirmed. Email and webhooks were not sent."
 fi

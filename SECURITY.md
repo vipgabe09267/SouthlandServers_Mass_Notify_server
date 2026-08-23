@@ -1,14 +1,15 @@
 # Security Policy
 
-Southland Servers Mass Notifications Server is a beta FreePBX module that can send PBX alerts, desktop notifications, SIP NOTIFY messages, and optional TTS audio pages. Treat it like infrastructure software: test changes on a non-critical PBX first, restrict administrative access, and keep FreePBX, Asterisk, Debian packages, and this module updated.
+Southland Servers Mass Notifications Server is beta-stage FreePBX software that can send PBX alerts, desktop notifications, SIP NOTIFY messages, webhooks, and optional TTS audio pages. Treat it like infrastructure software: test changes on a non-critical PBX first, restrict administrative access, and keep FreePBX, Asterisk, Debian packages, and this module updated.
 
 ## Supported Versions
 
-Security fixes are currently targeted at the latest beta release candidate only.
+Security fixes are currently targeted at the latest release only.
 
 | Version | Supported |
 | --- | --- |
-| `0.0.9-beta` | Yes |
+| `0.1.0` | Yes |
+| `0.0.9-beta` | No |
 | `0.0.8-beta` | No |
 | `0.0.7-beta` | No |
 | `0.0.6-beta` | No |
@@ -35,7 +36,7 @@ Do not post live API keys, desktop client passwords, AMI credentials, bearer tok
 
 ## Secrets
 
-API keys, encrypted desktop client passwords, AMI credentials, Xweather client secrets, notification groups, and deployment settings are stored in the central Mass Notifications config and should not be committed to Git.
+API keys, encrypted desktop client passwords, AMI credentials, Xweather client secrets, webhook URLs, notification groups, and deployment settings are stored in the central Mass Notifications config and should not be committed to Git.
 
 Do not publish:
 
@@ -59,6 +60,7 @@ Credentials are generated on fresh installs and preserved during normal updates.
 - Validate uploaded tones and images through the module UI instead of placing arbitrary files in runtime directories.
 - Back up the central `.config` file securely; it contains operational settings and credentials.
 - Authorize the configured alert sender domain in the site's mail relay and DNS policy, and monitor delivery failures rather than assuming a locally accepted message reached its recipient.
+- Use only trusted HTTPS webhook services. Generic webhook hosts must resolve exclusively to public addresses; private, loopback, link-local, and redirect targets are rejected.
 
 ## Security Boundaries
 
@@ -70,17 +72,21 @@ Default-on adaptive Lightning protection reads credential-free, short-lived Weat
 
 Public PBX Hostname is automatically detected and exposed read-only in administrator forms; it is not accepted as a Control API configuration mutation. Successful loopback `get_config` and `get_status` health probes are omitted from the API usage audit, while authentication failures, non-loopback requests, and meaningful local actions continue through the normal audit controls.
 
-Alert email uses the canonical `mail_from_domain` stored in the protected central config and fixes the complete sender to `no-reply@<domain>`. The UI, config import, and Control API accept DNS hostnames only; schemes, mailbox addresses, IP literals, malformed labels, and control characters are rejected. An older valid `mail_from_addr` supplies the migration domain when the canonical setting is absent. This setting does not configure or secure Postfix, an SMTP relay, SPF, DKIM, DMARC, PTR/reverse DNS, or any other DNS/mail infrastructure.
+Alert email uses canonical sender-local-part and domain values stored in protected central config. The local part defaults to `no-reply`; the UI, config import, and Control API validate both fields and reject header controls, schemes, mailbox-in-domain input, IP literals, and malformed DNS labels. Older valid sender settings supply migration values when canonical keys are absent. This setting does not configure or secure Postfix, an SMTP relay, SPF, DKIM, DMARC, PTR/reverse DNS, or any other DNS/mail infrastructure.
+
+Live Weather and Lightning destinations share a bounded dispatcher. Discord URLs must match Discord's HTTPS webhook shape. Generic webhook URLs require a DNS hostname whose resolved addresses are all globally routable; requests use certificate verification, validated-address pinning, no redirects, limited retries, bounded payloads, and an idempotency key. Destination secrets are omitted from API/config responses and safe result records. Manual tests, previews, dry runs, and direct CLI use cannot send external webhook traffic without the internal live-alert gate.
 
 Settings participate in FreePBX’s native Apply Config hook and remain staged in a protected Asterisk-owned file until reload. The root maintenance worker compares only the managed Dashboard widget and menu integration files after FreePBX updates; when drift is detected it restores those known files from the installed module and refreshes local signatures. Install, update, repair, and uninstall operations use the same root-owned maintenance lock, preventing the minute worker from changing managed files during a deployment transaction. A maintenance-launched child reuses the inherited lock rather than opening a second transaction. These paths do not modify phone provisioning, PJSIP peers, or unrelated FreePBX module content.
 
-Scheduled-announcement definitions live in the protected central config, while the execution ledger is a separate Asterisk-owned `0640` state file. The worker claims an occurrence before submitting delivery and fails closed if its worker lock or ledger cannot be opened safely, favoring a missed page over an accidental duplicate. It revalidates the live schedule immediately before claiming delivery. Configuration imports and FreePBX restores disable imported schedules because the destination PBX does not inherit that execution history. A normal uninstall preserves the local ledger so reinstalling cannot replay a completed occurrence; an explicit purge removes it. Scheduling shares the normal announcement lock and cooldown and does not bypass recipient, audio, or SIP NOTIFY validation.
+Scheduled-announcement definitions live in the protected central config, while the execution ledger is a separate Asterisk-owned `0640` state file. The worker claims an occurrence before submitting delivery and fails closed if its worker lock or ledger cannot be opened safely, favoring a missed page over an accidental duplicate. It revalidates the live schedule immediately before claiming delivery. Portable `.config` imports lack execution history and disable imported schedules for review; native FreePBX backup includes the journal and restores it through replay-safe validation. A normal uninstall preserves the local ledger so reinstalling cannot replay a completed occurrence; an explicit purge removes it. Scheduling shares the normal announcement lock and cooldown and does not bypass recipient, audio, or SIP NOTIFY validation.
 
-Executable runtime under `/usr/local/bin/sls_mass_notify`, including Piper, maintenance, and updater code, is owned by `root:root`. Mutable deployment data remains under the Asterisk data folder. The root updater only accepts the official beta repository, requires GitHub release SHA-256 metadata, and executes the installer from the matching immutable release tag. Automatic updates remain disabled by default.
+Executable runtime under `/usr/local/bin/sls_mass_notify`, including Piper, maintenance, and updater code, is owned by `root:root`. Mutable deployment data remains under the Asterisk data folder. The root updater accepts only the official repository, requires GitHub release SHA-256 metadata, accepts normal three-part tags with an optional `-beta` suffix, and executes the installer from the matching immutable tag. Automatic updates remain disabled by default.
 
-Phone SIP NOTIFY delivery is sent directly by Asterisk/PJSIP to registered endpoints. Vendor XML support is model-, firmware-, provisioning-, authentication-, and certificate-dependent; do not interpret a successful AMI send as proof that a phone displayed the payload.
+Phone SIP NOTIFY requests are submitted directly through Asterisk/PJSIP to registered endpoints. Vendor XML support is model-, firmware-, provisioning-, authentication-, and certificate-dependent; do not interpret a successful AMI action as proof that a phone displayed the payload.
 
-The module does not replace FreePBX system hardening. Firewall rules, TLS certificates, fail2ban policies, OS patching, mail transport security, and SIP trunk security remain the responsibility of the PBX administrator.
+Native FreePBX backup records use a manifest with type, restore name, byte count, and SHA-256 for every protected file. Restore is size-bounded, rejects symbolic-link/path escapes, validates config structure and encrypted credentials, checks custom WAV content, stages changes privately, and rolls back on activation failure. Due or completed schedule occurrences are not replayed. A stock FreePBX restore cannot fetch an unknown custom module, so install this module before restoring its module data and protect archives as secrets.
+
+The module does not replace FreePBX system hardening. Firewall rules, TLS certificates, fail2ban policies, OS patching, mail transport security, backup encryption, and SIP trunk security remain the responsibility of the PBX administrator.
 
 ## Dependency Security
 
@@ -90,4 +96,4 @@ The project locally signs its custom module and the FreePBX modules containing m
 
 ## Disclosure Target
 
-For beta releases, the goal is to acknowledge valid security reports quickly and publish fixes in the next beta package when practical. Severe issues affecting authentication, arbitrary file writes, command execution, or unauthenticated alert sending should be treated as urgent.
+The goal is to acknowledge valid security reports quickly and publish fixes in the next package when practical. Severe issues affecting authentication, arbitrary file writes, command execution, restore integrity, or unauthenticated alert sending should be treated as urgent.

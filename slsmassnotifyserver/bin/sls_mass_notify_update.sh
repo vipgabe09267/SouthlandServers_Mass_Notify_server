@@ -12,7 +12,7 @@ STATUS_FILE="${STATUS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/upda
 UPDATE_PROGRESS_FILE="${UPDATE_PROGRESS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/update-progress.json}"
 LOG_FILE="${LOG_FILE:-/var/log/sls_mass_notify.log}"
 LOCK_FILE="${LOCK_FILE:-/run/lock/sls-mass-notify-update.lock}"
-CURRENT_VERSION="${SLS_MASS_NOTIFY_CURRENT_VERSION:-0.0.9-beta}"
+CURRENT_VERSION="${SLS_MASS_NOTIFY_CURRENT_VERSION:-0.1.0}"
 
 GITHUB_UPDATES_ENABLED="0"
 MANUAL_UPDATE="${SLS_MASS_NOTIFY_MANUAL_UPDATE:-0}"
@@ -144,7 +144,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 repo = os.environ.get("REPOSITORY", "")
-current = os.environ.get("CURRENT_VERSION", "0.0.9-beta")
+current = os.environ.get("CURRENT_VERSION", "0.1.0")
 now = datetime.now(timezone.utc).astimezone().isoformat()
 if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
     print(json.dumps({"ok": False, "checked_at": now, "update_available": False, "message": "Configured GitHub repository is invalid."}, separators=(",", ":")))
@@ -156,13 +156,16 @@ def norm(value):
 
 def version_key(value):
     normalized = norm(value)
-    numbers = [int(part) for part in re.findall(r"\d+", normalized)[:4]]
-    return tuple((numbers + [0, 0, 0, 0])[:4])
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(-beta)?", normalized)
+    if not match:
+        return (0, 0, 0, -1)
+    major, minor, patch = (int(match.group(index)) for index in (1, 2, 3))
+    return (major, minor, patch, 0 if match.group(4) else 1)
 
 try:
     request = urllib.request.Request(
         f"https://api.github.com/repos/{repo}/releases",
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "SouthlandServers-Mass-Notifications-Updater/0.0.9-beta"},
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "SouthlandServers-Mass-Notifications-Updater/0.1.0"},
     )
     with urllib.request.urlopen(request, timeout=20) as response:
         releases = json.load(response)
@@ -175,7 +178,7 @@ for release in releases if isinstance(releases, list) else []:
     if not isinstance(release, dict) or release.get("draft"):
         continue
     tag = str(release.get("tag_name") or "")
-    if not re.fullmatch(r"slsmassnotifyserver-\d+\.\d+\.\d+-beta", tag):
+    if not re.fullmatch(r"slsmassnotifyserver-\d+\.\d+\.\d+(?:-beta)?", tag):
         continue
     for asset in release.get("assets") or []:
         if not isinstance(asset, dict):
@@ -190,7 +193,7 @@ for release in releases if isinstance(releases, list) else []:
 
 candidates.sort(reverse=True)
 if not candidates:
-    print(json.dumps({"ok": False, "checked_at": now, "update_available": False, "latest_version": current, "message": "No signed-digest beta release asset was found."}, separators=(",", ":")))
+    print(json.dumps({"ok": False, "checked_at": now, "update_available": False, "latest_version": current, "message": "No release asset with verified SHA-256 metadata was found."}, separators=(",", ":")))
     raise SystemExit(0)
 
 _, tag, tgz_url, sha256 = candidates[0]
@@ -220,7 +223,7 @@ if [ "$update_available" != "1" ]; then
   if [ "$release_ok" = "1" ]; then
     write_manual_progress "complete" "No newer release remains to be installed."
   else
-    write_manual_progress "failed" "${release_message:-The verified beta release feed could not be checked.}"
+    write_manual_progress "failed" "${release_message:-The verified release feed could not be checked.}"
   fi
   exit 0
 fi

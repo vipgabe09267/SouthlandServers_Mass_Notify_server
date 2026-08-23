@@ -11,6 +11,18 @@ $csrfToken = (string)($csrf_token ?? '');
 $systemSounds = is_array($available_system_sounds ?? null) ? $available_system_sounds : [];
 $voices = is_array($available_voices ?? null) ? $available_voices : [];
 $zoneGroups = array_values((array)($settings['nws_zones'] ?? []));
+$desktopClients = array_values(array_filter((array)($available_desktop_clients ?? []), 'is_array'));
+$desktopNames = [];
+foreach ($desktopClients as $desktopClient) {
+	$username = (string)($desktopClient['username'] ?? '');
+	$name = trim((string)($desktopClient['name'] ?? ''));
+	$clientId = trim((string)($desktopClient['client_id'] ?? ''));
+	$identity = $name !== '' && $name !== $username ? $name . ' — ' . $username : $username;
+	if ($clientId !== '') {
+		$identity .= ' · ' . _('client ID') . ' ' . $clientId;
+	}
+	$desktopNames[$username] = $identity;
+}
 $xweather = is_array($settings['xweather'] ?? null) ? $settings['xweather'] : [];
 $placeholderHelp = "{{event}}, {{severity}}, {{message_type}}, {{audio}}, {{page_group}}, {{alert_id}}, {{zone}}, {{time}}, {{source_name}}, {{trigger_source}}, {{trigger_extension}}, {{trigger_name}}, {{audio_sequence}}";
 $hourOptions = [];
@@ -87,7 +99,7 @@ for ($hour = 0; $hour < 24; $hour++) {
 					</div>
 					<div class="panel-body">
 						<p class="text-muted">
-							<?php echo _('Trigger a manual Piper TTS alert using the configured opening and closing tones. The test sends only phone and desktop delivery; email and Discord are intentionally skipped.'); ?>
+							<?php echo _('Exercise the channels assigned to the selected zone groups. Phone targets receive the configured tones, Piper TTS page, and SIP NOTIFY; desktop-only groups receive a targeted live event without creating a phone page.'); ?>
 						</p>
 
 						<div id="sls-test-cooldown-alert" class="alert alert-warning" <?php echo empty($cooldownRemaining) ? 'style="display: none;"' : ''; ?>>
@@ -110,7 +122,7 @@ for ($hour = 0; $hour < 24; $hour++) {
 							<input type="hidden" name="ajax" value="1">
 
 							<div class="alert alert-danger">
-								<?php echo _('Warning: this test sends audio and visuals to the selected weather-zone recipients.'); ?>
+								<?php echo _('Warning: this submits phone audio/SIP NOTIFY and targeted desktop events wherever those channels are configured. Zone email, Discord, and generic webhooks are intentionally skipped.'); ?>
 							</div>
 							<div class="form-group"><label><?php echo _('Test Zones'); ?></label>
 								<div class="radio"><label><input type="radio" name="test_zone_scope" value="all" checked> <?php echo _('All configured zones'); ?></label></div>
@@ -118,7 +130,7 @@ for ($hour = 0; $hour < 24; $hour++) {
 								<div class="well sls-nws-scroll"><?php foreach ($zoneGroups as $zoneGroup) { ?><div class="checkbox"><label><input type="checkbox" name="test_zone_ids[]" value="<?php echo htmlspecialchars($zoneGroup['id'] ?? ''); ?>"> <?php echo htmlspecialchars(($zoneGroup['name'] ?? '') . ' (' . ($zoneGroup['zone'] ?? '') . ')'); ?></label></div><?php } ?></div>
 							</div>
 
-							<button type="submit" id="sls-test-submit" class="btn btn-danger" <?php echo !empty($cooldownRemaining) ? 'disabled' : ''; ?>><?php echo _('Trigger Piper TTS Test'); ?></button>
+							<button type="submit" id="sls-test-submit" class="btn btn-danger" <?php echo !empty($cooldownRemaining) ? 'disabled' : ''; ?>><?php echo _('Run Weather Delivery Test'); ?></button>
 						</form>
 					</div>
 				</div>
@@ -164,7 +176,7 @@ for ($hour = 0; $hour < 24; $hour++) {
 					}, 10000);
 					form.addEventListener('submit', function(event) {
 						event.preventDefault();
-						if (remaining > 0 || !confirm('Are you sure you wish to trigger a test? This will trigger all configured NWS recipients.')) {
+						if (remaining > 0 || !confirm('Run a test through the phone and desktop channels assigned to the selected Weather zone scope?')) {
 							return;
 						}
 						submit.disabled = true;
@@ -215,7 +227,8 @@ for ($hour = 0; $hour < 24; $hour++) {
 					<div class="col-md-6">
 						<div class="form-group">
 							<label for="nws_api_base_url"><?php echo _('NWS API Base URL'); ?></label>
-							<input class="form-control" id="nws_api_base_url" name="nws_api_base_url" type="url" value="<?php echo htmlspecialchars($settings['nws_api_base_url'] ?? 'https://api.weather.gov'); ?>">
+							<input class="form-control" id="nws_api_base_url" name="nws_api_base_url" type="url" value="https://api.weather.gov" readonly aria-readonly="true">
+							<p class="help-block"><?php echo _('Weather Alerts uses only the official U.S. weather.gov API endpoint.'); ?></p>
 							<p class="help-block"><?php echo _('Default: https://api.weather.gov. Each enabled group is polled once per minute.'); ?></p>
 						</div>
 					</div>
@@ -223,15 +236,15 @@ for ($hour = 0; $hour < 24; $hour++) {
 
 				<div class="panel panel-default sls-settings-card">
 					<div class="panel-heading clearfix">
-						<div class="pull-left"><strong><i class="fa fa-map-marker text-danger" aria-hidden="true"></i> <?php echo _('NWS Zone Groups'); ?></strong><div class="text-muted"><small><?php echo _('Up to five zones, each with its own extension recipients.'); ?></small></div></div>
+						<div class="pull-left"><strong><i class="fa fa-map-marker text-danger" aria-hidden="true"></i> <?php echo _('NWS Zone Groups'); ?></strong><div class="text-muted"><small><?php echo _('Up to five zones, each with its own phone, desktop, and email recipients.'); ?></small></div></div>
 						<button type="button" class="btn btn-primary btn-sm pull-right" data-toggle="modal" data-target="#sls-zone-manager"><i class="fa fa-map-marker"></i> <?php echo _('Manage Zone Groups'); ?></button>
 					</div>
 					<div class="panel-body">
 					<?php if (empty($zoneGroups)) { ?>
 						<div class="sls-zone-empty"><i class="fa fa-map-o fa-2x"></i><br><?php echo _('No NWS zone groups are configured. Use Manage Zone Groups to add one.'); ?></div>
 					<?php } else { ?>
-						<div class="table-responsive"><table class="table table-striped sls-zone-summary-table"><thead><tr><th><?php echo _('Group'); ?></th><th><?php echo _('NWS Zone'); ?></th><th><?php echo _('Recipients'); ?></th></tr></thead><tbody>
-						<?php foreach ($zoneGroups as $zoneGroup) { ?><tr><td><strong><?php echo htmlspecialchars($zoneGroup['name'] ?? ''); ?></strong></td><td><code><?php echo htmlspecialchars($zoneGroup['zone'] ?? ''); ?></code></td><td><?php echo htmlspecialchars(implode(', ', (array)($zoneGroup['extensions'] ?? []))); ?></td></tr><?php } ?>
+						<div class="table-responsive"><table class="table table-striped sls-zone-summary-table"><thead><tr><th><?php echo _('Group'); ?></th><th><?php echo _('NWS Zone'); ?></th><th><?php echo _('Phones'); ?></th><th><?php echo _('Desktops'); ?></th><th><?php echo _('Zone Email'); ?></th></tr></thead><tbody>
+						<?php foreach ($zoneGroups as $zoneGroup) { $zoneDesktopLabels = []; foreach ((array)($zoneGroup['desktop_clients'] ?? []) as $username) { $zoneDesktopLabels[] = $desktopNames[$username] ?? $username; } ?><tr><td><strong><?php echo htmlspecialchars($zoneGroup['name'] ?? ''); ?></strong></td><td><code><?php echo htmlspecialchars($zoneGroup['zone'] ?? ''); ?></code></td><td><?php echo htmlspecialchars(implode(', ', (array)($zoneGroup['extensions'] ?? [])) ?: _('None')); ?></td><td><?php echo htmlspecialchars(implode(', ', $zoneDesktopLabels) ?: _('None')); ?></td><td><?php echo htmlspecialchars(implode(', ', (array)($zoneGroup['email_recipients'] ?? [])) ?: _('None')); ?></td></tr><?php } ?>
 						</tbody></table></div>
 					<?php } ?>
 					</div>
@@ -240,20 +253,24 @@ for ($hour = 0; $hour < 24; $hour++) {
 				<div class="modal fade sls-zone-modal" id="sls-zone-manager" tabindex="-1" role="dialog" aria-hidden="true">
 					<div class="modal-dialog"><div class="modal-content">
 						<div class="modal-header"><button type="button" class="close" data-dismiss="modal"><span>&times;</span></button><h4 class="modal-title"><?php echo _('Manage NWS Zone Groups'); ?></h4></div>
-						<div class="modal-body"><div id="sls-zone-editor-list">
-						<?php foreach ($zoneGroups as $zoneIndex => $zoneGroup) { $zoneRecipients = array_fill_keys((array)($zoneGroup['extensions'] ?? []), true); ?>
+						<div class="modal-body">
+							<div class="alert alert-info"><i class="fa fa-map-signs" aria-hidden="true"></i> <strong><?php echo _('Find your Weather.gov zone'); ?></strong><p style="margin:7px 0"><?php echo _('Open the official zone maps, choose your state, and find the three-digit number covering your location. Enter your two-letter state abbreviation, the letter Z, and that number. Example: Texas zone 163 is TXZ163.'); ?></p><a class="alert-link" href="https://www.weather.gov/pimar/PubZone" target="_blank" rel="noopener noreferrer"><?php echo _('Open official NWS zone maps'); ?> <i class="fa fa-external-link" aria-hidden="true"></i></a></div>
+							<div id="sls-zone-editor-list">
+						<?php foreach ($zoneGroups as $zoneIndex => $zoneGroup) { $zoneRecipients = array_fill_keys((array)($zoneGroup['extensions'] ?? []), true); $zoneDesktopRecipients = array_fill_keys((array)($zoneGroup['desktop_clients'] ?? []), true); $zoneUnknownDesktopRecipients = array_diff_key($zoneDesktopRecipients, $desktopNames); ?>
 							<div class="sls-zone-editor" data-zone-editor>
 								<div class="sls-zone-editor-header"><strong data-zone-title><?php echo htmlspecialchars($zoneGroup['name'] ?? sprintf(_('Weather Zone %d'), $zoneIndex + 1)); ?></strong><button type="button" class="btn btn-link btn-sm text-danger" data-zone-remove><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div>
 								<input type="hidden" data-zone-field="id" name="nws_zones[<?php echo $zoneIndex; ?>][id]" value="<?php echo htmlspecialchars($zoneGroup['id'] ?? ''); ?>">
-								<div class="row"><div class="col-md-7"><div class="form-group"><label><?php echo _('Group Name'); ?></label><input class="form-control" data-zone-field="name" name="nws_zones[<?php echo $zoneIndex; ?>][name]" maxlength="64" value="<?php echo htmlspecialchars($zoneGroup['name'] ?? ''); ?>" placeholder="<?php echo htmlspecialchars(_('Williamson County')); ?>"></div></div><div class="col-md-5"><div class="form-group"><label><?php echo _('NWS Zone'); ?></label><input class="form-control" data-zone-field="zone" name="nws_zones[<?php echo $zoneIndex; ?>][zone]" maxlength="6" value="<?php echo htmlspecialchars($zoneGroup['zone'] ?? ''); ?>" placeholder="TXC491"></div></div></div>
-								<label><?php echo _('Recipient Extensions'); ?></label><div class="sls-recipient-grid sls-nws-scroll"><div class="row"><?php foreach ((array)($available_extensions ?? []) as $extension) { ?><div class="col-md-4"><div class="checkbox"><label><input type="checkbox" data-zone-extension name="nws_zones[<?php echo $zoneIndex; ?>][extensions][]" value="<?php echo htmlspecialchars($extension['extension']); ?>" <?php echo isset($zoneRecipients[$extension['extension']]) ? 'checked' : ''; ?>> <?php echo htmlspecialchars($extension['extension'] . ($extension['name'] !== '' ? ' - ' . $extension['name'] : '')); ?> <span class="text-muted"><?php echo !empty($extension['registered']) ? _('online') : _('offline'); ?></span></label></div></div><?php } ?></div></div>
+								<div class="row"><div class="col-md-7"><div class="form-group"><label><?php echo _('Group Name'); ?></label><input class="form-control" data-zone-field="name" name="nws_zones[<?php echo $zoneIndex; ?>][name]" maxlength="64" value="<?php echo htmlspecialchars($zoneGroup['name'] ?? ''); ?>" placeholder="<?php echo htmlspecialchars(_('Williamson County')); ?>"></div></div><div class="col-md-5"><div class="form-group"><label><?php echo _('NWS Zone'); ?></label><input class="form-control" data-zone-field="zone" name="nws_zones[<?php echo $zoneIndex; ?>][zone]" maxlength="6" value="<?php echo htmlspecialchars($zoneGroup['zone'] ?? ''); ?>" placeholder="TXZ163"></div></div></div>
+								<div class="row"><div class="col-md-6"><label><?php echo _('Recipient Extensions'); ?></label><div class="sls-recipient-grid sls-nws-scroll"><div class="row"><?php foreach ((array)($available_extensions ?? []) as $extension) { ?><div class="col-md-6"><div class="checkbox"><label><input type="checkbox" data-zone-extension name="nws_zones[<?php echo $zoneIndex; ?>][extensions][]" value="<?php echo htmlspecialchars($extension['extension']); ?>" <?php echo isset($zoneRecipients[$extension['extension']]) ? 'checked' : ''; ?>> <?php echo htmlspecialchars($extension['extension'] . ($extension['name'] !== '' ? ' - ' . $extension['name'] : '')); ?> <span class="text-muted"><?php echo !empty($extension['registered']) ? _('online') : _('offline'); ?></span></label></div></div><?php } ?></div></div></div><div class="col-md-6"><label><?php echo _('Desktop Clients'); ?></label><div class="sls-recipient-grid sls-nws-scroll"><div class="row"><?php foreach ($desktopClients as $desktopClient) { $username = (string)($desktopClient['username'] ?? ''); $desktopEnabled = !empty($desktopClient['enabled']); $desktopSelected = isset($zoneDesktopRecipients[$username]); ?><div class="col-md-6"><div class="checkbox"><label><input type="checkbox" data-zone-desktop name="nws_zones[<?php echo $zoneIndex; ?>][desktop_clients][]" value="<?php echo htmlspecialchars($username); ?>" <?php echo $desktopSelected ? 'checked' : ''; ?> <?php echo (!$desktopEnabled && !$desktopSelected) ? 'disabled' : ''; ?>> <?php echo htmlspecialchars($desktopNames[$username] ?? $username); ?> <span class="text-muted"><?php echo $desktopEnabled ? _('enabled') : ($desktopSelected ? _('disabled — uncheck to remove this assignment') : _('disabled')); ?></span></label></div></div><?php } ?><?php if (empty($desktopClients)) { ?><div class="col-xs-12 text-muted"><?php echo _('No desktop clients are configured in General Settings.'); ?></div><?php } ?></div></div></div></div>
+								<?php if (!empty($zoneUnknownDesktopRecipients)) { ?><div class="alert alert-warning" style="margin-top:12px"><strong><?php echo _('Unavailable desktop assignments:'); ?></strong> <?php echo _('Uncheck each missing client to remove its assignment before saving.'); ?><?php foreach (array_keys($zoneUnknownDesktopRecipients) as $unknownUsername) { ?><div class="checkbox"><label><input type="checkbox" data-zone-desktop name="nws_zones[<?php echo $zoneIndex; ?>][desktop_clients][]" value="<?php echo htmlspecialchars($unknownUsername); ?>" checked> <?php echo htmlspecialchars($unknownUsername); ?> <span class="text-muted"><?php echo _('missing — uncheck to remove'); ?></span></label></div><?php } ?></div><?php } ?>
+								<div class="form-group" style="margin-top:12px"><label><?php echo _('Email Recipients for This Zone'); ?></label><textarea class="form-control" data-zone-email name="nws_zones[<?php echo $zoneIndex; ?>][email_recipients]" rows="2" maxlength="4096" placeholder="weather-team@example.com"><?php echo htmlspecialchars(implode("\n", (array)($zoneGroup['email_recipients'] ?? []))); ?></textarea><p class="help-block"><?php echo _('Optional. Only live alerts from this zone use these addresses. Up to 50 unique addresses are allowed per zone. Manual tests never send email.'); ?></p></div>
 							</div>
 						<?php } ?>
 						</div><button type="button" class="btn btn-default" id="sls-zone-add"><i class="fa fa-plus"></i> <?php echo _('Add Zone Group'); ?></button> <span class="text-muted" id="sls-zone-count"></span></div>
 						<div class="modal-footer"><button type="button" class="btn btn-primary" data-dismiss="modal"><?php echo _('Done'); ?></button></div>
 					</div></div>
 				</div>
-				<script type="text/template" id="sls-zone-template"><div class="sls-zone-editor" data-zone-editor><div class="sls-zone-editor-header"><strong data-zone-title><?php echo _('New Weather Zone'); ?></strong><button type="button" class="btn btn-link btn-sm text-danger" data-zone-remove><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div><input type="hidden" data-zone-field="id" value=""><div class="row"><div class="col-md-7"><div class="form-group"><label><?php echo _('Group Name'); ?></label><input class="form-control" data-zone-field="name" maxlength="64" placeholder="<?php echo htmlspecialchars(_('Williamson County')); ?>"></div></div><div class="col-md-5"><div class="form-group"><label><?php echo _('NWS Zone'); ?></label><input class="form-control" data-zone-field="zone" maxlength="6" placeholder="TXC491"></div></div></div><label><?php echo _('Recipient Extensions'); ?></label><div class="sls-recipient-grid sls-nws-scroll"><div class="row"><?php foreach ((array)($available_extensions ?? []) as $extension) { ?><div class="col-md-4"><div class="checkbox"><label><input type="checkbox" data-zone-extension value="<?php echo htmlspecialchars($extension['extension']); ?>"> <?php echo htmlspecialchars($extension['extension'] . ($extension['name'] !== '' ? ' - ' . $extension['name'] : '')); ?> <span class="text-muted"><?php echo !empty($extension['registered']) ? _('online') : _('offline'); ?></span></label></div></div><?php } ?></div></div></div></script>
+				<script type="text/template" id="sls-zone-template"><div class="sls-zone-editor" data-zone-editor><div class="sls-zone-editor-header"><strong data-zone-title><?php echo _('New Weather Zone'); ?></strong><button type="button" class="btn btn-link btn-sm text-danger" data-zone-remove><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div><input type="hidden" data-zone-field="id" value=""><div class="row"><div class="col-md-7"><div class="form-group"><label><?php echo _('Group Name'); ?></label><input class="form-control" data-zone-field="name" maxlength="64" placeholder="<?php echo htmlspecialchars(_('Williamson County')); ?>"></div></div><div class="col-md-5"><div class="form-group"><label><?php echo _('NWS Zone'); ?></label><input class="form-control" data-zone-field="zone" maxlength="6" placeholder="TXZ163"></div></div></div><div class="row"><div class="col-md-6"><label><?php echo _('Recipient Extensions'); ?></label><div class="sls-recipient-grid sls-nws-scroll"><div class="row"><?php foreach ((array)($available_extensions ?? []) as $extension) { ?><div class="col-md-6"><div class="checkbox"><label><input type="checkbox" data-zone-extension value="<?php echo htmlspecialchars($extension['extension']); ?>"> <?php echo htmlspecialchars($extension['extension'] . ($extension['name'] !== '' ? ' - ' . $extension['name'] : '')); ?> <span class="text-muted"><?php echo !empty($extension['registered']) ? _('online') : _('offline'); ?></span></label></div></div><?php } ?></div></div></div><div class="col-md-6"><label><?php echo _('Desktop Clients'); ?></label><div class="sls-recipient-grid sls-nws-scroll"><div class="row"><?php foreach ($desktopClients as $desktopClient) { $username = (string)($desktopClient['username'] ?? ''); $desktopEnabled = !empty($desktopClient['enabled']); ?><div class="col-md-6"><div class="checkbox"><label><input type="checkbox" data-zone-desktop value="<?php echo htmlspecialchars($username); ?>" <?php echo !$desktopEnabled ? 'disabled' : ''; ?>> <?php echo htmlspecialchars($desktopNames[$username] ?? $username); ?> <span class="text-muted"><?php echo $desktopEnabled ? _('enabled') : _('disabled'); ?></span></label></div></div><?php } ?><?php if (empty($desktopClients)) { ?><div class="col-xs-12 text-muted"><?php echo _('No desktop clients are configured in General Settings.'); ?></div><?php } ?></div></div></div></div><div class="form-group" style="margin-top:12px"><label><?php echo _('Email Recipients for This Zone'); ?></label><textarea class="form-control" data-zone-email rows="2" maxlength="4096" placeholder="weather-team@example.com"></textarea><p class="help-block"><?php echo _('Optional. Only live alerts from this zone use these addresses. Up to 50 unique addresses are allowed per zone. Manual tests never send email.'); ?></p></div></div></script>
 
 				<h3 class="sls-nws-heading"><i class="fa fa-moon-o text-muted" aria-hidden="true"></i> <?php echo _('Quiet Hours'); ?></h3>
 				<p class="help-block sls-nws-section-note"><?php echo _('During quiet hours, only selected critical live NWS alerts are delivered. Manual tests are not affected.'); ?></p>
@@ -391,6 +408,9 @@ for ($hour = 0; $hour < 24; $hour++) {
 				if (input) input.name = 'nws_zones[' + index + '][' + field + ']';
 			});
 			Array.prototype.forEach.call(row.querySelectorAll('[data-zone-extension]'), function(input) { input.name = 'nws_zones[' + index + '][extensions][]'; });
+			Array.prototype.forEach.call(row.querySelectorAll('[data-zone-desktop]'), function(input) { input.name = 'nws_zones[' + index + '][desktop_clients][]'; });
+			var emailInput = row.querySelector('[data-zone-email]');
+			if (emailInput) emailInput.name = 'nws_zones[' + index + '][email_recipients]';
 			var title = row.querySelector('[data-zone-title]');
 			var name = row.querySelector('[data-zone-field="name"]');
 			if (title) title.textContent = name && name.value.trim() ? name.value.trim() : 'Weather Zone ' + (index + 1);

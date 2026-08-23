@@ -39,10 +39,13 @@ SLS_CALLERID_NAME="SLS Mass Notification System"
 SLS_CALLERID_NUM="SLS"
 SLS_AUDIO_CONTEXT="sls-alert-audio"
 NWS_ALERT_RECIPIENTS=()
+NWS_DESKTOP_RECIPIENTS=()
+NWS_ZONE_EMAIL_RECIPIENTS=()
 SLS_TONE_SOUND_PREFIX="SLS_Mass_Notifications_Plugin/tones"
 SLS_TTS_SOUND_PREFIX="SLS_Mass_Notifications_Plugin/tts"
-SLS_TONES_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sounds/tones"
-SLS_TTS_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sounds/tts"
+SLS_TONES_DIR="${SLS_TONES_DIR:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sounds/tones}"
+SLS_TTS_DIR="${SLS_TTS_DIR:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sounds/tts}"
+ASTERISK_SOUNDS_DIR="${ASTERISK_SOUNDS_DIR:-/var/lib/asterisk/sounds}"
 SLS_OPENING_TONE="opening_NWS_alert"
 SLS_CLOSING_TONE=""
 PIPER_BIN="/usr/local/bin/sls_mass_notify/piper/venv/bin/piper"
@@ -53,17 +56,24 @@ PIPER_MAX_SECONDS="30"
 SEEN_ALERTS="${SEEN_ALERTS:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/seen_alerts.txt}"
 PROCESSED_ALERTS="${PROCESSED_ALERTS:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/processed_alert_keys.txt}"
 AUDIO_DELIVERED_ALERTS="${AUDIO_DELIVERED_ALERTS:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/audio_delivered_alert_keys.txt}"
+LOCAL_DISPATCH_STATE="${LOCAL_DISPATCH_STATE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/nws-local-dispatch-intents.json}"
 LOG="${LOG:-/var/log/sls_mass_notify.log}"
 EVENTS_LOG="${EVENTS_LOG:-/var/log/sls_mass_notify_events.jsonl}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-90}"
 CONFIG_JSON_FILE="${CONFIG_JSON_FILE:-${CONFIG_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config}}"
 CONFIG_LOADER="${CONFIG_LOADER:-/usr/local/bin/sls_mass_notify/sls_config.py}"
 BRANDED_EMAIL_SCRIPT="${BRANDED_EMAIL_SCRIPT:-/usr/local/bin/sls_mass_notify/sls_branded_email.py}"
-BRANDED_DISCORD_SCRIPT="${BRANDED_DISCORD_SCRIPT:-/usr/local/bin/sls_mass_notify/sls_branded_discord.py}"
+NOTIFICATION_DESTINATION_SCRIPT="${NOTIFICATION_DESTINATION_SCRIPT:-/usr/local/bin/sls_mass_notify/sls_notification_destinations.py}"
 STATUS_FILE="${STATUS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/status.json}"
-FAULT_STATE_FILE="${FAULT_STATE_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/fault.state}"
-SPOOL="/var/spool/asterisk/outgoing"
-SPOOL_TMP="/var/spool/asterisk/tmp"
+EXTERNAL_DELIVERY_STATE="${EXTERNAL_DELIVERY_STATE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/nws-external-deliveries.json}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+NWS_STATUS_HELPER="${NWS_STATUS_HELPER:-$SCRIPT_DIR/sls_nws_status.py}"
+if [ ! -r "$NWS_STATUS_HELPER" ] && [ -r "$SCRIPT_DIR/sls_mass_notify/sls_nws_status.py" ]; then
+  NWS_STATUS_HELPER="$SCRIPT_DIR/sls_mass_notify/sls_nws_status.py"
+fi
+SPOOL="${SPOOL:-/var/spool/asterisk/outgoing}"
+SPOOL_TMP="${SPOOL_TMP:-/var/spool/asterisk/tmp}"
+VISUAL_SCRIPT="${VISUAL_SCRIPT:-/usr/local/bin/sls_mass_notify/sls_notify.py}"
 TEST_PAYLOAD="${TEST_PAYLOAD:-}"
 FORCE_REPLAY="${FORCE_REPLAY:-0}"
 NWS_ALERTS_DRY_RUN="${NWS_ALERTS_DRY_RUN:-0}"
@@ -71,6 +81,7 @@ API_FAULT_THRESHOLD="${API_FAULT_THRESHOLD:-3}"
 LOCK_FILE="${LOCK_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sls_mass_notify_nws_poll.lock}"
 LIGHTNING_GATE_FILE="${LIGHTNING_GATE_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/nws-lightning-gate-default.json}"
 MAIL_TO=""
+LIVE_EMAIL_TO=""
 DISCORD_WEBHOOK_URL=""
 MAIL_FROM_NAME="SLS Mass Notification System"
 MAIL_FROM_ADDR="no-reply@localhost.localdomain"
@@ -92,41 +103,55 @@ Alert ID: {{alert_id}}
 Zone: {{zone}}
 Time: {{time}}"
 
+run_status_mutation() {
+  local mutation_json="$1"
+  local group_id="${NWS_ZONE_GROUP_ID_OVERRIDE:-default}"
+  local group_name="${NWS_ZONE_GROUP_NAME_OVERRIDE:-${NWS_ZONE:-Primary Weather Zone}}"
+  local zone="${NWS_ZONE_OVERRIDE:-${NWS_ZONE:-}}"
+
+  if [ ! -r "$NWS_STATUS_HELPER" ]; then
+    printf '%s: NWS status helper is unavailable: %s\n' "$(date)" "$NWS_STATUS_HELPER" >> "$LOG"
+    return 1
+  fi
+  STATUS_FILE_PATH="$STATUS_FILE" \
+  NWS_STATUS_GROUP_ID="$group_id" \
+  NWS_STATUS_GROUP_NAME="$group_name" \
+  NWS_STATUS_ZONE="$zone" \
+  NWS_STATUS_MUTATION_JSON="$mutation_json" \
+    /usr/bin/python3 "$NWS_STATUS_HELPER" mutate
+  local result=$?
+  if [ "$result" -eq 0 ]; then
+    chmod 0640 "$STATUS_FILE" 2>/dev/null || true
+    chown asterisk:asterisk "$STATUS_FILE" 2>/dev/null || true
+  fi
+  return "$result"
+}
+
+update_status() {
+  local patch_json="$1"
+  local mutation_json
+
+  mutation_json="$(STATUS_PATCH_JSON="$patch_json" /usr/bin/python3 - <<'PY'
+import json
+import os
+
+patch = json.loads(os.environ["STATUS_PATCH_JSON"])
+if not isinstance(patch, dict):
+    raise SystemExit(2)
+print(json.dumps({"patch": patch}, separators=(",", ":")))
+PY
+)" || return 1
+  run_status_mutation "$mutation_json"
+}
+
 exec 9>"$LOCK_FILE"
 chmod 0640 "$LOCK_FILE" 2>/dev/null || true
 chown asterisk:asterisk "$LOCK_FILE" 2>/dev/null || true
 if ! flock -n 9; then
   echo "$(date): Another NWS alert poll is already running; skipping this cycle" >> "$LOG"
-  STATUS_FILE="$STATUS_FILE" python3 - <<'PY' 2>/dev/null || true
-import fcntl
-import json
-import os
-from datetime import datetime, timezone
-
-path = os.environ.get("STATUS_FILE", "")
-try:
-    with open(path, "a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        handle.seek(0)
-        try:
-            data = json.load(handle)
-        except Exception:
-            data = {}
-        data.update({
-            "last_poll_at": datetime.now(timezone.utc).astimezone().isoformat(),
-            "last_poll_status": "already_running",
-            "last_poll_message": "Previous NWS poll is still running; this cycle was skipped.",
-        })
-        handle.seek(0)
-        handle.truncate(0)
-        json.dump(data, handle, indent=2)
-        handle.write("\n")
-        handle.flush()
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    os.chmod(path, 0o640)
-except Exception:
-    pass
-PY
+  update_status "$(printf '{"last_poll_at":%s,"last_poll_status":"already_running","last_poll_message":"Previous NWS poll is still running; this cycle was skipped."}' \
+    "$(python3 -c 'import json; from datetime import datetime,timezone; print(json.dumps(datetime.now(timezone.utc).astimezone().isoformat()))')")" \
+    >/dev/null 2>&1 || true
   exit 0
 fi
 
@@ -188,172 +213,61 @@ json_string() {
   python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"
 }
 
-get_status_value() {
-  local key="$1"
-
-  STATUS_FILE_PATH="$STATUS_FILE" \
-  STATUS_KEY="$key" \
-  python3 - <<'PY'
-import json
-import os
-
-path = os.environ["STATUS_FILE_PATH"]
-key = os.environ["STATUS_KEY"]
-
-if not os.path.exists(path):
-    print("")
-    raise SystemExit(0)
-
-try:
-    with open(path, "r", encoding="utf-8") as handle:
-        data = json.load(handle)
-except Exception:
-    print("")
-    raise SystemExit(0)
-
-value = data.get(key, "")
-if value is None:
-    value = ""
-print(value)
-PY
-}
-
-update_status() {
-  local patch_json="$1"
-
-  STATUS_FILE_PATH="$STATUS_FILE" \
-  STATUS_PATCH_JSON="$patch_json" \
-  python3 - <<'PY'
-import fcntl
-import json
-import os
-
-path = os.environ["STATUS_FILE_PATH"]
-patch = json.loads(os.environ["STATUS_PATCH_JSON"])
-
-os.makedirs(os.path.dirname(path), mode=0o750, exist_ok=True)
-with open(path, "a+", encoding="utf-8") as handle:
-    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-    handle.seek(0)
-    try:
-        loaded = json.load(handle)
-        data = loaded if isinstance(loaded, dict) else {}
-    except Exception:
-        data = {}
-    data.update(patch)
-    handle.seek(0)
-    handle.truncate(0)
-    json.dump(data, handle, indent=2, sort_keys=True)
-    handle.write("\n")
-    handle.flush()
-    os.fsync(handle.fileno())
-    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-os.chmod(path, 0o640)
-PY
-
-  chmod 0640 "$STATUS_FILE" 2>/dev/null || true
-  chown asterisk:asterisk "$STATUS_FILE" 2>/dev/null || true
-}
-
 report_fault() {
   local stage="$1"
   local message="$2"
   local event="${3:-}"
   local alert_id="${4:-}"
   local now
-  local fault_key
-  local subject
-  local body
 
   now="$(timestamp_now)"
-  update_status "$(printf '{"last_poll_status":"fault","last_poll_message":%s,"last_fault_at":%s,"last_fault_stage":%s,"last_fault_message":%s,"last_fault_event":%s,"last_fault_alert_id":%s}' \
-    "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$message")" \
-    "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$now")" \
-    "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$stage")" \
-    "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$message")" \
-    "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$event")" \
-    "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$alert_id")")"
+  run_status_mutation "$(printf '{"patch":{"last_poll_at":%s,"last_poll_status":"fault","last_poll_message":%s},"fault":{"at":%s,"stage":%s,"message":%s,"event":%s,"alert_id":%s}}' \
+    "$(json_string "$now")" \
+    "$(json_string "$message")" \
+    "$(json_string "$now")" \
+    "$(json_string "$stage")" \
+    "$(json_string "$message")" \
+    "$(json_string "$event")" \
+    "$(json_string "$alert_id")")"
 
-  if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
-    echo "$(date): Dry run fault recorded locally; external fault email was skipped — ${stage}: ${message}" >> "$LOG"
-    return 1
-  fi
-
-  fault_key="${stage}|${message}|${event}|${alert_id}"
-  if [ -r "$FAULT_STATE_FILE" ] && [ "$(cat "$FAULT_STATE_FILE" 2>/dev/null)" = "$fault_key" ]; then
-    return 1
-  fi
-
-  subject="Southland Servers Group PBX: EAS fault detected - ${stage}"
-  body="A fault was detected in the NWS alert system.
-
-Stage: ${stage}
-Message: ${message}
-Event: ${event}
-Alert ID: ${alert_id}
-Zone: ${NWS_ZONE}
-NWS Recipients: ${DELIVERY_TARGETS}
-Time: ${now}"
-
-  if send_notification_email "$subject" "$body"; then
-    printf '%s\n' "$fault_key" > "$FAULT_STATE_FILE"
-    chmod 0640 "$FAULT_STATE_FILE" 2>/dev/null || true
-    chown asterisk:asterisk "$FAULT_STATE_FILE" 2>/dev/null || true
-    update_status "$(printf '{"fault_email_sent_at":%s}' "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$now")")"
-  fi
-
+  echo "$(date): NWS fault recorded locally — ${stage}: ${message}" >> "$LOG"
   return 0
 }
 
 clear_fault_state() {
-  rm -f "$FAULT_STATE_FILE" 2>/dev/null || true
-  update_status '{"last_fault_at":"","last_fault_stage":"","last_fault_message":"","last_fault_event":"","last_fault_alert_id":"","fault_email_sent_at":"","last_poll_fail_count":0,"last_poll_fail_started_at":""}'
+  run_status_mutation '{"clear_faults":true,"reset_api":true}'
 }
 
 clear_api_fault_state() {
-  if [ "$(get_status_value last_fault_stage)" = "api" ]; then
-    clear_fault_state
-  else
-    update_status '{"last_poll_fail_count":0,"last_poll_fail_started_at":""}'
-  fi
+  run_status_mutation '{"clear_fault_stage":"api","reset_api":true}'
 }
 
 delivery_targets() {
-  local IFS=,
-  printf '%s' "${NWS_ALERT_RECIPIENTS[*]}"
+  local phone_targets desktop_targets IFS=,
+  phone_targets="${NWS_ALERT_RECIPIENTS[*]}"
+  desktop_targets="${NWS_DESKTOP_RECIPIENTS[*]}"
+  if [ -n "$phone_targets" ] && [ -n "$desktop_targets" ]; then
+    printf '%s; desktop:%s' "$phone_targets" "$desktop_targets"
+  elif [ -n "$desktop_targets" ]; then
+    printf 'desktop:%s' "$desktop_targets"
+  else
+    printf '%s' "$phone_targets"
+  fi
 }
 
 record_api_failure() {
   local message="$1"
   local now
-  local fail_count
-  local fail_started_at
-  local status_message
+  local threshold="${API_FAULT_THRESHOLD:-3}"
 
   now="$(timestamp_now)"
-  fail_count="$(get_status_value last_poll_fail_count)"
-  fail_count="${fail_count:-0}"
-  if ! [[ "$fail_count" =~ ^[0-9]+$ ]]; then
-    fail_count=0
+  if ! [[ "$threshold" =~ ^[0-9]+$ ]] || [ "$threshold" -lt 1 ] || [ "$threshold" -gt 100 ]; then
+    threshold=3
   fi
-  fail_count=$((fail_count + 1))
-
-  fail_started_at="$(get_status_value last_poll_fail_started_at)"
-  if [ -z "$fail_started_at" ]; then
-    fail_started_at="$now"
-  fi
-
-  status_message="NWS API poll failure ${fail_count}/${API_FAULT_THRESHOLD}: ${message}"
-  update_status "$(printf '{"last_poll_at":%s,"last_poll_status":%s,"last_poll_message":%s,"last_poll_fail_count":%s,"last_poll_fail_started_at":%s}' \
+  run_status_mutation "$(printf '{"api_failure":{"at":%s,"message":%s,"threshold":%s}}' \
     "$(json_string "$now")" \
-    "$(json_string "$([ "$fail_count" -ge "$API_FAULT_THRESHOLD" ] && printf 'fault' || printf 'warning')")" \
-    "$(json_string "$status_message")" \
-    "$(json_string "$fail_count")" \
-    "$(json_string "$fail_started_at")")"
-
-  if [ "$fail_count" -ge "$API_FAULT_THRESHOLD" ]; then
-    report_fault "api" "$message"
-  fi
+    "$(json_string "$message")" \
+    "$threshold")"
 }
 
 append_event_log() {
@@ -509,9 +423,13 @@ load_central_config() {
   fi
 
   NWS_ALERT_RECIPIENTS=()
+	NWS_DESKTOP_RECIPIENTS=()
+	NWS_ZONE_EMAIL_RECIPIENTS=()
   while IFS= read -r -d '' key && IFS= read -r -d '' value; do
     case "$key" in
       NWS_ALERT_RECIPIENT) NWS_ALERT_RECIPIENTS+=("$value") ;;
+		NWS_DESKTOP_CLIENT) NWS_DESKTOP_RECIPIENTS+=("$value") ;;
+		NWS_ZONE_EMAIL_RECIPIENT) NWS_ZONE_EMAIL_RECIPIENTS+=("$value") ;;
       QUIET_HOURS_CRITICAL_EVENT) critical_events+=("$value") ;;
       NWS_ALERTS_ENABLED|PUBLIC_PBX_HOST|NWS_API_BASE_URL|NWS_ZONE|SLS_OPENING_TONE|SLS_CLOSING_TONE|PIPER_BIN|PIPER_NWS_VOICE|PIPER_ANNOUNCEMENT_VOICE|PIPER_NWS_VOLUME|PIPER_ANNOUNCEMENT_VOLUME|PIPER_MAX_SECONDS|LOG_RETENTION_DAYS|MAIL_TO|DISCORD_WEBHOOK_URL|QUIET_HOURS_ENABLED|QUIET_HOURS_START|QUIET_HOURS_END|MAIL_FROM_NAME|MAIL_FROM_ADDR|ALERT_EMAIL_SUBJECT|ALERT_EMAIL_BODY|TEST_EMAIL_SUBJECT|TEST_EMAIL_BODY|EMAIL_HTML_ENABLED|AMI_USERNAME|AMI_PASSWORD|AMI_HOST|AMI_PORT|GITHUB_UPDATES_ENABLED|GITHUB_UPDATES_REPOSITORY|GITHUB_UPDATES_CHANNEL)
         printf -v "$key" '%s' "$value"
@@ -525,15 +443,37 @@ load_central_config() {
 }
 
 if ! load_central_config; then
-  update_status "$(printf '{"last_poll_at":%s,"last_poll_status":"fault","last_poll_message":"Central configuration is invalid or unavailable.","last_fault_at":%s,"last_fault_stage":"config","last_fault_message":"Central configuration is invalid or unavailable."}' \
-    "$(json_string "$(timestamp_now)")" "$(json_string "$(timestamp_now)")")"
+  report_fault "config" "Central configuration is invalid or unavailable."
+  exit 1
+fi
+if [ "$NWS_API_BASE_URL" != "https://api.weather.gov" ]; then
+  echo "$(date): ERROR - Refusing non-weather.gov NWS API base URL" >> "$LOG"
+  report_fault "config" "Weather Alerts API must use https://api.weather.gov."
   exit 1
 fi
 if [ -n "${NWS_ZONE_OVERRIDE:-}" ]; then
   NWS_ZONE="$NWS_ZONE_OVERRIDE"
 fi
-if [ -n "${NWS_RECIPIENTS_OVERRIDE:-}" ]; then
-  IFS=',' read -r -a NWS_ALERT_RECIPIENTS <<< "$NWS_RECIPIENTS_OVERRIDE"
+if [ "${NWS_RECIPIENTS_OVERRIDE+x}" = "x" ]; then
+	NWS_ALERT_RECIPIENTS=()
+	if [ -n "$NWS_RECIPIENTS_OVERRIDE" ]; then
+		IFS=',' read -r -a NWS_ALERT_RECIPIENTS <<< "$NWS_RECIPIENTS_OVERRIDE"
+	fi
+fi
+if [ "${NWS_DESKTOP_CLIENTS_OVERRIDE+x}" = "x" ]; then
+	NWS_DESKTOP_RECIPIENTS=()
+	if [ -n "$NWS_DESKTOP_CLIENTS_OVERRIDE" ]; then
+		IFS=',' read -r -a NWS_DESKTOP_RECIPIENTS <<< "$NWS_DESKTOP_CLIENTS_OVERRIDE"
+	fi
+fi
+if [ "${NWS_EMAIL_RECIPIENTS_OVERRIDE+x}" = "x" ]; then
+	NWS_ZONE_EMAIL_RECIPIENTS=()
+	if [ -n "$NWS_EMAIL_RECIPIENTS_OVERRIDE" ]; then
+		read -r -a NWS_ZONE_EMAIL_RECIPIENTS <<< "$NWS_EMAIL_RECIPIENTS_OVERRIDE"
+	fi
+fi
+if [ "${#NWS_ZONE_EMAIL_RECIPIENTS[@]}" -gt 0 ]; then
+	LIVE_EMAIL_TO="${NWS_ZONE_EMAIL_RECIPIENTS[*]}"
 fi
 prune_event_log
 DELIVERY_TARGETS="$(delivery_targets)"
@@ -620,6 +560,39 @@ clear_audio_delivered() {
   chown asterisk:asterisk "$tmp_file" 2>/dev/null || true
   chmod 0640 "$tmp_file" 2>/dev/null || true
   mv -f "$tmp_file" "$AUDIO_DELIVERED_ALERTS"
+}
+
+local_dispatch_intent_recorded() {
+  local alert_key="$1"
+
+  NWS_LOCAL_DISPATCH_STATE_PATH="$LOCAL_DISPATCH_STATE" \
+  NWS_LOCAL_DISPATCH_KEY="$alert_key" \
+    /usr/bin/timeout --signal=TERM --kill-after=1 10 \
+      /usr/bin/python3 "$NWS_STATUS_HELPER" local-recorded >/dev/null 2>&1
+}
+
+queue_local_dispatch_intent() {
+  local alert_key="$1"
+  local alert_id="$2"
+  local event="$3"
+  local phone_requested="$4"
+  local visual_requested="$5"
+  local result
+
+  NWS_LOCAL_DISPATCH_STATE_PATH="$LOCAL_DISPATCH_STATE" \
+  NWS_LOCAL_DISPATCH_KEY="$alert_key" \
+  NWS_LOCAL_DISPATCH_ALERT_ID="$alert_id" \
+  NWS_LOCAL_DISPATCH_EVENT="$event" \
+  NWS_LOCAL_DISPATCH_PHONE="$phone_requested" \
+  NWS_LOCAL_DISPATCH_VISUAL="$visual_requested" \
+    /usr/bin/timeout --signal=TERM --kill-after=1 10 \
+      /usr/bin/python3 "$NWS_STATUS_HELPER" local-intent >> "$LOG" 2>&1
+  result=$?
+  if [ "$result" -eq 0 ] || [ "$result" -eq 10 ]; then
+    chmod 0640 "$LOCAL_DISPATCH_STATE" "${LOCAL_DISPATCH_STATE}.lock" 2>/dev/null || true
+    chown asterisk:asterisk "$LOCAL_DISPATCH_STATE" "${LOCAL_DISPATCH_STATE}.lock" 2>/dev/null || true
+  fi
+  return "$result"
 }
 
 build_tts_text() {
@@ -818,8 +791,10 @@ trigger_visual_alert() {
   local alert_b64="$1"
   local event="$2"
   local alert_id="$3"
-  local visual_script="/usr/local/bin/sls_mass_notify/sls_notify.py"
+  local visual_script="$VISUAL_SCRIPT"
   local targets
+	local desktop_targets
+	local -a notify_args=()
 
   if [ -z "$alert_b64" ]; then
     echo "$(date): Visual live alert skipped for $event — missing alert payload" >> "$LOG"
@@ -831,13 +806,28 @@ trigger_visual_alert() {
   fi
 
   targets="$(get_nws_recipient_targets)"
-  if [ -z "$targets" ]; then
-    echo "$(date): Visual live alert skipped for $event — no NWS recipient extensions configured" >> "$LOG"
+	desktop_targets="$(get_nws_desktop_recipient_targets)"
+  if [ -z "$targets" ] && [ -z "$desktop_targets" ]; then
+		echo "$(date): Visual live alert skipped for $event — no NWS phone or desktop recipients configured" >> "$LOG"
     return 1
   fi
-  echo "$(date): Sending visual live alert for $event — Alert ID: $alert_id" >> "$LOG"
-  if ! /usr/bin/timeout 45 /usr/bin/python3 "$visual_script" --alert-json-b64 "$alert_b64" --targets "$targets" --no-retry >> "$LOG" 2>&1; then
-    echo "$(date): ERROR — Visual live alert delivery failed for $event" >> "$LOG"
+	if [ -n "$targets" ]; then
+		notify_args+=(--targets "$targets")
+	else
+		notify_args+=(--api-only)
+	fi
+	if [ -n "$desktop_targets" ]; then
+		notify_args+=(--desktop-targets "$desktop_targets")
+	fi
+	if [ -n "$targets" ] && [ -n "$desktop_targets" ]; then
+		echo "$(date): Submitting visual live alert to Asterisk and the targeted desktop journal for $event — Alert ID: $alert_id" >> "$LOG"
+	elif [ -n "$targets" ]; then
+		echo "$(date): Submitting visual live alert to Asterisk for $event — Alert ID: $alert_id" >> "$LOG"
+	else
+		echo "$(date): Publishing visual live alert to the targeted desktop journal for $event — Alert ID: $alert_id" >> "$LOG"
+	fi
+	if ! /usr/bin/timeout 45 /usr/bin/python3 "$visual_script" --alert-json-b64 "$alert_b64" "${notify_args[@]}" --no-retry >> "$LOG" 2>&1; then
+    echo "$(date): ERROR — Visual live alert submission to Asterisk failed for $event" >> "$LOG"
     return 1
   fi
   return 0
@@ -848,6 +838,30 @@ get_nws_recipient_targets() {
   printf '%s\n' "${NWS_ALERT_RECIPIENTS[*]}"
 }
 
+get_nws_desktop_recipient_targets() {
+	local IFS=,
+	printf '%s\n' "${NWS_DESKTOP_RECIPIENTS[*]}"
+}
+
+audio_page_hold_seconds() {
+  local sound_sequence="$1"
+  local sound_file
+  local duration
+
+  [[ "$sound_sequence" =~ ^[A-Za-z0-9_/-]+$ ]] || return 1
+  sound_file="${ASTERISK_SOUNDS_DIR}/${sound_sequence}.wav"
+  [ -r "$sound_file" ] || return 1
+  duration="$(LC_ALL=C /usr/bin/soxi -D "$sound_file" 2>/dev/null)" || return 1
+  # Keep Page's originating Local channel through the complete WAV and a
+  # bounded teardown margin without adding its separate participant timeout.
+  LC_ALL=C awk -v duration="$duration" 'BEGIN {
+    if (duration <= 0 || duration > 1767) exit 1
+    rounded = int(duration)
+    if (duration > rounded) rounded++
+    print rounded + 2
+  }'
+}
+
 queue_audio_to_recipients() {
   local sound_sequence="$1"
   local event="$2"
@@ -855,12 +869,21 @@ queue_audio_to_recipients() {
   local recipient
   local callfile
   local queued=0
+  local page_hold_seconds
+  local call_wait_seconds
 
   if [ "${#NWS_ALERT_RECIPIENTS[@]}" -eq 0 ]; then
     echo "$(date): ERROR — No NWS alert recipient extensions configured" >> "$LOG"
     report_fault "delivery" "No NWS alert recipient extensions configured" "$event" "$alert_id"
     return 1
   fi
+
+  if ! page_hold_seconds="$(audio_page_hold_seconds "$sound_sequence")"; then
+    echo "$(date): ERROR — Unable to measure the complete alert audio sequence" >> "$LOG"
+    report_fault "delivery" "Unable to measure the complete alert audio sequence" "$event" "$alert_id"
+    return 1
+  fi
+  call_wait_seconds=$((page_hold_seconds + 30))
 
   for recipient in "${NWS_ALERT_RECIPIENTS[@]}"; do
     recipient="$(printf '%s' "$recipient" | tr -dc '0-9')"
@@ -874,9 +897,9 @@ Setvar: SLS_CALLERID_NAME=${SLS_CALLERID_NAME}
 Setvar: SLS_CALLERID_NUM=${SLS_CALLERID_NUM}
 MaxRetries: 6
 RetryTime: 10
-WaitTime: 180
+WaitTime: ${call_wait_seconds}
 Application: Wait
-Data: 1
+Data: ${page_hold_seconds}
 CALL
     chown asterisk:asterisk "$callfile" 2>/dev/null || true
     chmod 0640 "$callfile"
@@ -906,26 +929,46 @@ fi
 
 prune_tts_cache
 
-send_notification_email() {
-  local subject="$1"
-  local body="$2"
-
-  subject="$(printf '%s' "$subject" | tr '\r\n' '  ')"
-  if [ -z "$(printf '%s' "$MAIL_TO" | tr -d '[:space:]')" ]; then
-    echo "$(date): Notification email skipped — no recipients configured" >> "$LOG"
-    return 0
-  fi
-
-  if [ ! -x "$BRANDED_EMAIL_SCRIPT" ]; then
-    echo "$(date): ERROR — branded email sender is unavailable" >> "$LOG"
-    return 1
-  fi
-
-  SLS_EMAIL_SUBJECT="$subject" SLS_EMAIL_BODY="$body" SLS_EMAIL_RECIPIENTS="$MAIL_TO" \
-    /usr/bin/python3 "$BRANDED_EMAIL_SCRIPT" "$CONFIG_JSON_FILE"
+external_destinations_allowed() {
+  [ "$NWS_ALERTS_DRY_RUN" != "1" ] && [ -z "$TEST_PAYLOAD" ] && [ "$FORCE_REPLAY" != "1" ]
 }
 
-send_discord_alert() {
+external_command_timeout() {
+  local maximum="$1"
+  local now remaining
+  remaining="$maximum"
+  if [[ "${SLS_WORKER_DEADLINE_EPOCH:-}" =~ ^[0-9]+$ ]]; then
+    now="$(date +%s)"
+    # Leave two seconds for status/event writes before the scheduler's own
+    # four-second shutdown margin.
+    remaining=$((SLS_WORKER_DEADLINE_EPOCH - now - 2))
+    [ "$remaining" -lt "$maximum" ] || remaining="$maximum"
+  fi
+  [ "$remaining" -ge 2 ] || return 1
+  printf '%s\n' "$remaining"
+}
+
+retry_pending_external_destinations() {
+  local command_timeout result
+  external_destinations_allowed || return 0
+  [ -x "$NOTIFICATION_DESTINATION_SCRIPT" ] || return 75
+  command_timeout="$(external_command_timeout 40)" || return 75
+  SLS_NOTIFICATION_LIVE="1" \
+  SLS_NOTIFICATION_TEST="0" \
+  SLS_NOTIFICATION_DRY_RUN="0" \
+  SLS_DESTINATION_SOURCE="nws" \
+  SLS_EXTERNAL_RETRY_ONLY="1" \
+    /usr/bin/timeout --signal=TERM --kill-after=1 "$command_timeout" \
+      /usr/bin/python3 "$NOTIFICATION_DESTINATION_SCRIPT" "$CONFIG_JSON_FILE" \
+      --retry-state "$EXTERNAL_DELIVERY_STATE" >> "$LOG" 2>&1
+  result=$?
+  case "$result" in
+    0|1) return "$result" ;;
+    *) return 75 ;;
+  esac
+}
+
+queue_external_destinations() {
   local subject="$1"
   local body="$2"
   local alert_type="$3"
@@ -934,116 +977,92 @@ send_discord_alert() {
   local msg_type="$6"
   local audio="$7"
   local alert_id="$8"
-  local zone="$9"
-  local event_time="${10}"
-  local trigger_source="${11}"
-  local trigger_extension="${12}"
-  local trigger_name="${13}"
-  local audio_sequence="${14}"
+  local correlation_key="$9"
+  local zone="${10}"
+  local event_time="${11}"
+  local trigger_source="${12}"
+  local trigger_extension="${13}"
+  local trigger_name="${14}"
+  local audio_sequence="${15}"
+  local command_timeout result
 
-  if [ -z "$(printf '%s' "$DISCORD_WEBHOOK_URL" | tr -d '[:space:]')" ]; then
-    echo "$(date): Discord notification skipped — no webhook configured" >> "$LOG"
-    return 0
-  fi
+  external_destinations_allowed || return 0
+  [ -r "$NOTIFICATION_DESTINATION_SCRIPT" ] || return 75
+  command_timeout="$(external_command_timeout 12)" || return 75
 
-  if [ ! -x "$BRANDED_DISCORD_SCRIPT" ]; then
-    echo "$(date): ERROR — branded Discord sender is unavailable" >> "$LOG"
-    return 1
-  fi
-
-  SLS_DISCORD_SUBJECT="$subject" \
-  SLS_DISCORD_BODY="$body" \
-  SLS_DISCORD_TYPE="$alert_type" \
-  SLS_DISCORD_EVENT="$event" \
-  SLS_DISCORD_SEVERITY="$severity" \
-  SLS_DISCORD_ZONE="$zone" \
-  SLS_DISCORD_RECIPIENTS="$DELIVERY_TARGETS" \
-  SLS_DISCORD_AUDIO="$audio" \
-  SLS_DISCORD_TRIGGER="${trigger_name:-$trigger_source}" \
-  SLS_DISCORD_TIME="$event_time" \
-    /usr/bin/python3 "$BRANDED_DISCORD_SCRIPT" "$CONFIG_JSON_FILE"
-  return $?
-
-  DISCORD_WEBHOOK_URL="$DISCORD_WEBHOOK_URL" \
-  DISCORD_SUBJECT="$subject" \
-  DISCORD_BODY="$body" \
-  DISCORD_TYPE="$alert_type" \
-  DISCORD_EVENT="$event" \
-  DISCORD_SEVERITY="$severity" \
-  DISCORD_MESSAGE_TYPE="$msg_type" \
-  DISCORD_AUDIO="$audio" \
-  DISCORD_ALERT_ID="$alert_id" \
-  DISCORD_ZONE="$zone" \
-  DISCORD_PAGE_GROUP="$DELIVERY_TARGETS" \
-  DISCORD_TIME="$event_time" \
-  DISCORD_TRIGGER_SOURCE="$trigger_source" \
-  DISCORD_TRIGGER_EXTENSION="$trigger_extension" \
-  DISCORD_TRIGGER_NAME="$trigger_name" \
-  DISCORD_AUDIO_SEQUENCE="$audio_sequence" \
-  python3 - <<'PY'
+  SLS_NOTIFICATION_LIVE="1" \
+  SLS_NOTIFICATION_TEST="0" \
+  SLS_NOTIFICATION_DRY_RUN="0" \
+  SLS_DESTINATION_SOURCE="nws" \
+  SLS_DESTINATION_SUBJECT="$subject" \
+  SLS_DESTINATION_BODY="$body" \
+  SLS_DESTINATION_TYPE="$alert_type" \
+  SLS_DESTINATION_EVENT="$event" \
+  SLS_DESTINATION_SEVERITY="$severity" \
+  SLS_DESTINATION_MESSAGE_TYPE="$msg_type" \
+  SLS_DESTINATION_AUDIO="$audio" \
+  SLS_DESTINATION_EVENT_ID="$alert_id" \
+  SLS_EXTERNAL_CORRELATION_KEY="$correlation_key" \
+  SLS_DESTINATION_ZONE="$zone" \
+  SLS_DESTINATION_RECIPIENTS="$DELIVERY_TARGETS" \
+  SLS_DESTINATION_TIME="$event_time" \
+  SLS_DESTINATION_TRIGGER="${trigger_name:-$trigger_source}" \
+  SLS_DESTINATION_TRIGGER_EXTENSION="$trigger_extension" \
+  SLS_DESTINATION_AUDIO_SEQUENCE="$audio_sequence" \
+  SLS_EMAIL_RECIPIENTS="$LIVE_EMAIL_TO" \
+    /usr/bin/timeout --signal=TERM --kill-after=1 "$command_timeout" \
+      /usr/bin/python3 - "$NOTIFICATION_DESTINATION_SCRIPT" "$CONFIG_JSON_FILE" "$EXTERNAL_DELIVERY_STATE" >> "$LOG" 2>&1 <<'PY'
+import importlib.util
 import json
 import os
 import sys
-import urllib.error
-import urllib.request
+from pathlib import Path
 
-webhook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-if not webhook:
-    raise SystemExit(0)
-
-fields = [
-    ("Type", os.environ.get("DISCORD_TYPE", "")),
-    ("Event", os.environ.get("DISCORD_EVENT", "")),
-    ("Severity", os.environ.get("DISCORD_SEVERITY", "")),
-    ("Message Type", os.environ.get("DISCORD_MESSAGE_TYPE", "")),
-    ("Audio", os.environ.get("DISCORD_AUDIO", "")),
-    ("NWS Recipients", os.environ.get("DISCORD_PAGE_GROUP", "")),
-    ("Alert ID", os.environ.get("DISCORD_ALERT_ID", "")),
-    ("Zone", os.environ.get("DISCORD_ZONE", "")),
-    ("Trigger Source", os.environ.get("DISCORD_TRIGGER_SOURCE", "")),
-    ("Trigger Extension", os.environ.get("DISCORD_TRIGGER_EXTENSION", "")),
-    ("Trigger Name", os.environ.get("DISCORD_TRIGGER_NAME", "")),
-    ("Audio Sequence", os.environ.get("DISCORD_AUDIO_SEQUENCE", "")),
-    ("Time", os.environ.get("DISCORD_TIME", "")),
-]
-embed_fields = [
-    {"name": name, "value": value[:1024], "inline": len(value) <= 32}
-    for name, value in fields
-    if value
-]
-
-body = os.environ.get("DISCORD_BODY", "")
-description = body[:4096] if body else os.environ.get("DISCORD_SUBJECT", "")
-payload = {
-    "embeds": [
-        {
-            "title": "NWS Weather Alert",
-            "description": description,
-            "color": 0x7B2CBF,
-            "fields": embed_fields[:25],
-            "footer": {"text": "Southland Servers PBX - Purple and Gold Alert Routing"},
-        }
-    ],
-}
-
-request = urllib.request.Request(
-    webhook,
-    data=json.dumps(payload).encode("utf-8"),
-    headers={"Content-Type": "application/json", "User-Agent": "SouthlandServersPBX-NWSAlerts/1.0"},
-    method="POST",
-)
+sys.dont_write_bytecode = True
+script_path, config_path, state_path = map(Path, sys.argv[1:4])
+spec = importlib.util.spec_from_file_location("sls_nws_external_queue", script_path)
+if spec is None or spec.loader is None:
+    raise SystemExit(75)
+module = importlib.util.module_from_spec(spec)
 try:
-    with urllib.request.urlopen(request, timeout=12) as response:
-        if response.status not in (200, 204):
-            print(f"Discord webhook returned HTTP {response.status}", file=sys.stderr)
-            raise SystemExit(1)
-except urllib.error.HTTPError as exc:
-    print(f"Discord webhook HTTP error {exc.code}: {exc.read().decode('utf-8', 'replace')}", file=sys.stderr)
-    raise SystemExit(1)
+    spec.loader.exec_module(module)
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
+    fields = [
+        (name, os.environ.get("SLS_DESTINATION_" + name.upper(), ""))
+        for name in ("Type", "Event", "Severity", "Zone", "Recipients", "Audio", "Trigger")
+    ]
+    details = {
+        "zone": os.environ.get("SLS_DESTINATION_ZONE", ""),
+        "recipients": os.environ.get("SLS_DESTINATION_RECIPIENTS", ""),
+        "audio": os.environ.get("SLS_DESTINATION_AUDIO", ""),
+        "audio_sequence": os.environ.get("SLS_DESTINATION_AUDIO_SEQUENCE", ""),
+        "message_type": os.environ.get("SLS_DESTINATION_MESSAGE_TYPE", ""),
+        "trigger": os.environ.get("SLS_DESTINATION_TRIGGER", ""),
+        "trigger_extension": os.environ.get("SLS_DESTINATION_TRIGGER_EXTENSION", ""),
+    }
+    module.queue_external_delivery(
+        state_path,
+        config,
+        os.environ.get("SLS_EXTERNAL_CORRELATION_KEY", ""),
+        os.environ.get("SLS_DESTINATION_SUBJECT", "Southland Servers Mass Notification"),
+        os.environ.get("SLS_DESTINATION_BODY", "A notification was issued."),
+        os.environ.get("SLS_DESTINATION_EVENT", ""),
+        os.environ.get("SLS_DESTINATION_SEVERITY", ""),
+        fields,
+        os.environ.get("SLS_DESTINATION_TIME", ""),
+        os.environ.get("SLS_DESTINATION_SOURCE", "nws"),
+        os.environ.get("SLS_DESTINATION_EVENT_ID", ""),
+        details,
+        os.environ.get("SLS_EMAIL_RECIPIENTS", ""),
+    )
 except Exception as exc:
-    print(f"Discord webhook error: {exc}", file=sys.stderr)
-    raise SystemExit(1)
+    print(f"external_queue_failed:{type(exc).__name__}", file=sys.stderr)
+    raise SystemExit(75)
 PY
+  result=$?
+  [ "$result" -eq 0 ] || return 75
+  return 0
 }
 
 touch "$SEEN_ALERTS" "$PROCESSED_ALERTS" "$AUDIO_DELIVERED_ALERTS"
@@ -1097,13 +1116,13 @@ if [ -n "$TEST_PAYLOAD" ]; then
 else
 	ALERTS=$(curl -fsS --retry 3 --retry-all-errors --retry-connrefused --connect-timeout 10 --max-time 30 --max-filesize 10485760 \
     -H "Accept: application/geo+json" \
-    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.0.9-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
+    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.0 (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
     "${NWS_API_BASE_URL%/}/alerts/active?zone=${NWS_ZONE}&status=actual" 2>>"$LOG") || ALERTS=""
   if [ -z "$ALERTS" ]; then
     echo "$(date): Initial NWS request failed; retrying over IPv4" >> "$LOG"
 	  ALERTS=$(curl -4 -fsS --retry 2 --retry-all-errors --retry-connrefused --connect-timeout 10 --max-time 30 --max-filesize 10485760 \
       -H "Accept: application/geo+json" \
-	    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.0.9-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
+	    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.0 (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
       "${NWS_API_BASE_URL%/}/alerts/active?zone=${NWS_ZONE}&status=actual" 2>>"$LOG") || ALERTS=""
   fi
 fi
@@ -1251,7 +1270,9 @@ fi
 # Publish a credential-free, per-zone gate for Xweather's free-tier adaptive
 # mode. The lightning worker accepts only fresh files and event names that
 # explicitly identify thunderstorm activity.
-POLL_SUMMARY="$POLL_SUMMARY" LIGHTNING_GATE_FILE="$LIGHTNING_GATE_FILE" NWS_ZONE="$NWS_ZONE" NWS_ZONE_GROUP_NAME="${NWS_ZONE_GROUP_NAME_OVERRIDE:-$NWS_ZONE}" NWS_ZONE_GROUP_ID="${NWS_ZONE_GROUP_ID_OVERRIDE:-default}" python3 - <<'PY' 2>/dev/null || true
+lightning_gate_group_name="${NWS_ZONE_GROUP_NAME_OVERRIDE:-$NWS_ZONE}"
+lightning_gate_group_id="${NWS_ZONE_GROUP_ID_OVERRIDE:-default}"
+POLL_SUMMARY="$POLL_SUMMARY" LIGHTNING_GATE_FILE="$LIGHTNING_GATE_FILE" NWS_ZONE="$NWS_ZONE" NWS_ZONE_GROUP_NAME="$lightning_gate_group_name" NWS_ZONE_GROUP_ID="$lightning_gate_group_id" python3 - <<'PY' 2>/dev/null || true
 import fcntl
 import json
 import os
@@ -1327,13 +1348,6 @@ printf '%s\n' "$PARSED_ALERTS" | while IFS=$'\t' read -r ALERT_ID EVENT SEVERITY
   AUDIO_LABEL="Piper TTS"
   AUDIO_SEQUENCE=""
   TTS_FILE=""
-  AUDIO_ALREADY_DELIVERED=0
-  if grep -qFx "$ALERT_KEY" "$AUDIO_DELIVERED_ALERTS" 2>/dev/null; then
-    AUDIO_ALREADY_DELIVERED=1
-    AUDIO_LABEL="Piper TTS already queued; retrying visual delivery only"
-    AUDIO_SEQUENCE="previously_queued"
-    echo "$(date): Audio was already queued for $EVENT; retrying visual delivery without replaying audio" >> "$LOG"
-  fi
 
   if [ -n "${ALERT_SOUNDS[$EVENT]+_}" ]; then
     echo "$(date): Matched supported NWS event — using Piper TTS" >> "$LOG"
@@ -1348,7 +1362,6 @@ printf '%s\n' "$PARSED_ALERTS" | while IFS=$'\t' read -r ALERT_ID EVENT SEVERITY
   fi
 
   if [ "$QUIET_SUPPRESS_PAGING" = "1" ]; then
-    QUIET_TS="$(timestamp_now)"
     CURRENT_TIME="$(date)"
     QUIET_AUDIO="Piper TTS suppressed by quiet hours"
     QUIET_NOTE="Quiet Hours: The paging system did not go off because this alert is not configured as critical during quiet hours (${QUIET_HOURS_START}-${QUIET_HOURS_END})."
@@ -1386,96 +1399,127 @@ printf '%s\n' "$PARSED_ALERTS" | while IFS=$'\t' read -r ALERT_ID EVENT SEVERITY
 
 ${QUIET_NOTE}"
 
-    update_status "$(printf '{"last_delivery_at":%s,"last_delivery_status":"skipped_quiet_hours","last_delivery_source":"nws","last_delivery_event":%s,"last_delivery_audio":%s,"last_delivery_message":%s,"last_delivery_page_group":%s,"last_delivery_alert_id":%s}' \
-      "$(json_string "$QUIET_TS")" \
-      "$(json_string "$EVENT")" \
-      "$(json_string "$QUIET_AUDIO")" \
-      "$(json_string "Sent email/webhook for ${EVENT}; paging suppressed by quiet hours.")" \
-      "$(json_string "$DELIVERY_TARGETS")" \
-      "$(json_string "$ALERT_ID")")"
     if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
+      QUIET_TS="$(timestamp_now)"
+      update_status "$(printf '{"last_delivery_at":%s,"last_delivery_status":"dry_run","last_delivery_source":"nws","last_delivery_event":%s,"last_delivery_audio":%s,"last_delivery_message":%s,"last_delivery_page_group":%s,"last_delivery_alert_id":%s}' \
+        "$(json_string "$QUIET_TS")" \
+        "$(json_string "$EVENT")" \
+        "$(json_string "$QUIET_AUDIO")" \
+        "$(json_string "Dry run: paging and external destinations would be suppressed or evaluated under quiet hours for ${EVENT}.")" \
+        "$(json_string "$DELIVERY_TARGETS")" \
+        "$(json_string "$ALERT_ID")")"
       append_event_log "$EVENT" "$SEVERITY" "$MSG_TYPE" "$QUIET_AUDIO" "$ALERT_ID" "$MAIL_SUBJECT" "$MAIL_BODY" "dry_run_quiet_hours"
-    else
-      if ! send_notification_email "$MAIL_SUBJECT" "$MAIL_BODY"; then
-        echo "$(date): ERROR - Quiet-hours alert email failed for $EVENT" >> "$LOG"
-        report_fault "email" "Quiet-hours alert email failed" "$EVENT" "$ALERT_ID"
+	    else
+	      QUIET_AUX_OK=1
+	      QUIET_STATE_PERSISTED=1
+	      queue_external_destinations "$MAIL_SUBJECT" "$MAIL_BODY" "Live NWS Alert (Quiet Hours)" \
+	        "$EVENT" "$SEVERITY" "$MSG_TYPE" "$QUIET_AUDIO" "$ALERT_ID" "$ALERT_KEY" \
+	        "$NWS_ZONE" "$CURRENT_TIME" "NWS API" "" "" "$QUIET_AUDIO"
+	      QUIET_EXTERNAL_STATUS=$?
+	      if [ "$QUIET_EXTERNAL_STATUS" -eq 75 ]; then
+	        echo "$(date): ERROR - Quiet-hours external delivery could not be persisted for $EVENT" >> "$LOG"
+	        report_fault "external_state" "Quiet-hours external delivery could not be persisted" "$EVENT" "$ALERT_ID"
+	        QUIET_AUX_OK=0
+	        QUIET_STATE_PERSISTED=0
+		      fi
+      QUIET_TS="$(timestamp_now)"
+      if [ "$QUIET_AUX_OK" = "1" ]; then
+	        QUIET_DELIVERY_STATUS="queued"
+	        QUIET_DELIVERY_MESSAGE="Paging suppressed by quiet hours; external destination work was durably queued for post-local retry for ${EVENT}."
+        QUIET_EVENT_STATUS="suppressed_quiet_hours"
+        clear_fault_state
+      else
+        QUIET_DELIVERY_STATUS="partial_failure"
+	        QUIET_DELIVERY_MESSAGE="Paging suppressed by quiet hours, but external destination work could not be made durable for ${EVENT}."
+        QUIET_EVENT_STATUS="partial_failure"
       fi
-      if ! send_discord_alert "$MAIL_SUBJECT" "$MAIL_BODY" "Live NWS Alert (Quiet Hours)" "$EVENT" "$SEVERITY" "$MSG_TYPE" "$QUIET_AUDIO" "$ALERT_ID" "$NWS_ZONE" "$CURRENT_TIME" "NWS API" "" "" "$QUIET_AUDIO"; then
-        echo "$(date): ERROR - Quiet-hours alert Discord webhook failed for $EVENT" >> "$LOG"
-        report_fault "discord" "Quiet-hours alert Discord webhook failed" "$EVENT" "$ALERT_ID"
-      fi
-      append_event_log "$EVENT" "$SEVERITY" "$MSG_TYPE" "$QUIET_AUDIO" "$ALERT_ID" "$MAIL_SUBJECT" "$MAIL_BODY" "suppressed_quiet_hours"
-      [ "$FORCE_REPLAY" = "1" ] || mark_processed_alert "$ALERT_KEY"
+      update_status "$(printf '{"last_delivery_at":%s,"last_delivery_status":%s,"last_delivery_source":"nws","last_delivery_event":%s,"last_delivery_audio":%s,"last_delivery_message":%s,"last_delivery_page_group":%s,"last_delivery_alert_id":%s}' \
+        "$(json_string "$QUIET_TS")" \
+        "$(json_string "$QUIET_DELIVERY_STATUS")" \
+        "$(json_string "$EVENT")" \
+        "$(json_string "$QUIET_AUDIO")" \
+        "$(json_string "$QUIET_DELIVERY_MESSAGE")" \
+        "$(json_string "$DELIVERY_TARGETS")" \
+        "$(json_string "$ALERT_ID")")"
+      append_event_log "$EVENT" "$SEVERITY" "$MSG_TYPE" "$QUIET_AUDIO" "$ALERT_ID" "$MAIL_SUBJECT" "$MAIL_BODY" "$QUIET_EVENT_STATUS"
+	      if [ "$QUIET_STATE_PERSISTED" = "1" ]; then
+	        [ "$FORCE_REPLAY" = "1" ] || mark_processed_alert "$ALERT_KEY"
+	      fi
     fi
     continue
   fi
 
-  if [ "$AUDIO_ALREADY_DELIVERED" = "0" ]; then
+  LOCAL_PHONE_REQUESTED=0
+  LOCAL_VISUAL_REQUESTED=0
+  LOCAL_RECOVERY=0
+  LOCAL_STATE_OK=1
+  LOCAL_PREP_OK=1
+  LOCAL_INTENT_COMMITTED=0
+  LOCAL_SUBMISSION_OK=1
+  LOCAL_AUDIO_QUEUE_FAILED=0
+  VISUAL_DELIVERY_OK=1
+  [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ] && LOCAL_PHONE_REQUESTED=1
+  if [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ] || [ "${#NWS_DESKTOP_RECIPIENTS[@]}" -gt 0 ]; then
+    LOCAL_VISUAL_REQUESTED=1
+  fi
+
+  # FORCE_REPLAY is an explicit operator override. Automatic recovery never
+  # bypasses this at-most-once local intent check.
+  if [ "$FORCE_REPLAY" != "1" ]; then
+    local_dispatch_intent_recorded "$ALERT_KEY"
+    LOCAL_RECORDED_STATUS=$?
+    case "$LOCAL_RECORDED_STATUS" in
+      0)
+        LOCAL_RECOVERY=1
+        ;;
+      1)
+        ;;
+      *)
+        LOCAL_STATE_OK=0
+        ;;
+    esac
+
+    # Migrate the prior post-audio marker into the stronger all-local-channel
+    # intent contract. Audio may already have been submitted, so visual must
+    # not be replayed while the outcome is uncertain.
+    if [ "$LOCAL_RECOVERY" = "0" ] && grep -qFx "$ALERT_KEY" "$AUDIO_DELIVERED_ALERTS" 2>/dev/null; then
+      queue_local_dispatch_intent "$ALERT_KEY" "$ALERT_ID" "$EVENT" "$LOCAL_PHONE_REQUESTED" "$LOCAL_VISUAL_REQUESTED"
+      LOCAL_MIGRATION_STATUS=$?
+      if [ "$LOCAL_MIGRATION_STATUS" -eq 0 ] || [ "$LOCAL_MIGRATION_STATUS" -eq 10 ]; then
+        LOCAL_RECOVERY=1
+      else
+        LOCAL_STATE_OK=0
+      fi
+    fi
+  fi
+
+  if [ "$LOCAL_RECOVERY" = "1" ]; then
+    AUDIO_LABEL="Local dispatch outcome indeterminate after restart"
+    AUDIO_SEQUENCE="indeterminate"
+    echo "$(date): Durable local dispatch intent found for $EVENT; phone and visual submission will not be replayed" >> "$LOG"
+  elif [ "$LOCAL_STATE_OK" = "0" ]; then
+    AUDIO_LABEL="Local dispatch state unavailable"
+    AUDIO_SEQUENCE=""
+  elif [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ]; then
     TTS_FILE="$(generate_tts_audio "$ALERT_B64" "$EVENT" "$ALERT_ID")"
     if [ -z "$TTS_FILE" ]; then
+      LOCAL_PREP_OK=0
+      AUDIO_LABEL="Piper TTS preparation failed"
       echo "$(date): ERROR - Piper TTS audio was not generated for $EVENT" >> "$LOG"
       report_fault "audio" "Piper TTS audio was not generated" "$EVENT" "$ALERT_ID"
-      continue
-    fi
-
-    AUDIO_SEQUENCE="$(build_audio_sequence "$TTS_FILE")"
-    if [ -z "$AUDIO_SEQUENCE" ]; then
-      echo "$(date): ERROR - Unable to build audio sequence for $EVENT" >> "$LOG"
-      report_fault "audio" "Unable to build Piper TTS audio sequence" "$EVENT" "$ALERT_ID"
-      continue
-    fi
-
-    echo "$(date): Queueing call file for $EVENT - audio sequence: $AUDIO_SEQUENCE" >> "$LOG"
-    if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
-      echo "$(date): Dry run - would queue call files for $EVENT using $AUDIO_SEQUENCE to recipients: ${NWS_ALERT_RECIPIENTS[*]}" >> "$LOG"
     else
-      if ! queue_audio_to_recipients "$AUDIO_SEQUENCE" "$EVENT" "$ALERT_ID"; then
-        continue
+      AUDIO_SEQUENCE="$(build_audio_sequence "$TTS_FILE")"
+      if [ -z "$AUDIO_SEQUENCE" ]; then
+        LOCAL_PREP_OK=0
+        AUDIO_LABEL="Piper TTS sequence preparation failed"
+        echo "$(date): ERROR - Unable to build audio sequence for $EVENT" >> "$LOG"
+        report_fault "audio" "Unable to build Piper TTS audio sequence" "$EVENT" "$ALERT_ID"
       fi
-      mark_audio_delivered "$ALERT_KEY"
     fi
-  fi
-
-  echo "$(date): Alert audio queued for $EVENT" >> "$LOG"
-  VISUAL_DELIVERY_OK=1
-  if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
-    echo "$(date): Dry run — would queue visual live alert for $EVENT" >> "$LOG"
   else
-    sleep 2
-    if ! trigger_visual_alert "$ALERT_B64" "$EVENT" "$ALERT_ID"; then
-      VISUAL_DELIVERY_OK=0
-      report_fault "visual" "SIP NOTIFY visual delivery failed" "$EVENT" "$ALERT_ID"
-    fi
-  fi
-  DELIVERY_TS="$(timestamp_now)"
-  if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
-    DELIVERY_STATUS="dry_run"
-    DELIVERY_MESSAGE="Dry run would queue live NWS alert for ${EVENT} using Piper TTS"
-  elif [ "$VISUAL_DELIVERY_OK" = "0" ]; then
-    DELIVERY_STATUS="partial_failure"
-    DELIVERY_MESSAGE="Queued audio for ${EVENT}, but SIP NOTIFY visual delivery failed"
-  else
-    DELIVERY_STATUS="queued"
-    DELIVERY_MESSAGE="Queued live NWS alert for ${EVENT} using Piper TTS"
-  fi
-  update_status "$(printf '{"last_delivery_at":%s,"last_delivery_status":%s,"last_delivery_source":"nws","last_delivery_event":%s,"last_delivery_audio":%s,"last_delivery_message":%s,"last_delivery_page_group":%s,"last_delivery_alert_id":%s}' \
-    "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DELIVERY_TS")" \
-    "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DELIVERY_STATUS")" \
-    "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$EVENT")" \
-    "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$AUDIO_LABEL")" \
-    "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DELIVERY_MESSAGE")" \
-    "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DELIVERY_TARGETS")" \
-    "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$ALERT_ID")")"
-  if [ "$VISUAL_DELIVERY_OK" = "0" ]; then
-    append_event_log "$EVENT" "$SEVERITY" "$MSG_TYPE" "$AUDIO_LABEL" "$ALERT_ID" \
-      "SIP NOTIFY visual delivery failed - $EVENT" \
-      "Audio was queued, but visual delivery failed. The next poll will retry visual delivery without replaying audio." \
-      "partial_failure" "$AUDIO_SEQUENCE"
-    continue
-  fi
-  if [ "$NWS_ALERTS_DRY_RUN" != "1" ]; then
-    [ "$FORCE_REPLAY" = "1" ] || mark_processed_alert "$ALERT_KEY"
-    clear_audio_delivered "$ALERT_KEY"
+    AUDIO_LABEL="No phone audio requested"
+    AUDIO_SEQUENCE=""
+    echo "$(date): No phone recipients configured for $EVENT; preparing targeted desktop submission" >> "$LOG"
   fi
 
   CURRENT_TIME="$(date)"
@@ -1510,25 +1554,147 @@ ${QUIET_NOTE}"
     "trigger_name=" \
     "audio_sequence=$AUDIO_SEQUENCE")"
   AUX_DELIVERY_OK=1
-  if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
-    append_event_log "$EVENT" "$SEVERITY" "$MSG_TYPE" "$AUDIO_LABEL" "$ALERT_ID" "$MAIL_SUBJECT" "$MAIL_BODY" "dry_run" "$AUDIO_SEQUENCE"
-  else
-    if ! send_notification_email "$MAIL_SUBJECT" "$MAIL_BODY"; then
-      echo "$(date): ERROR - Live alert email failed for $EVENT" >> "$LOG"
-      report_fault "email" "Live alert email failed" "$EVENT" "$ALERT_ID"
+  EXTERNAL_STATE_PERSISTED=1
+
+  if [ "$NWS_ALERTS_DRY_RUN" != "1" ]; then
+    # Stage 1: durable external work must exist before either irreversible
+    # local submission. A state error therefore produces zero local calls.
+    queue_external_destinations "$MAIL_SUBJECT" "$MAIL_BODY" "Live NWS Alert" \
+      "$EVENT" "$SEVERITY" "$MSG_TYPE" "$AUDIO_LABEL" "$ALERT_ID" "$ALERT_KEY" \
+      "$NWS_ZONE" "$CURRENT_TIME" "NWS API" "" "" "$AUDIO_SEQUENCE"
+    EXTERNAL_STATUS=$?
+    if [ "$EXTERNAL_STATUS" -eq 75 ]; then
+      EXTERNAL_STATE_PERSISTED=0
       AUX_DELIVERY_OK=0
-    fi
-    if ! send_discord_alert "$MAIL_SUBJECT" "$MAIL_BODY" "Live NWS Alert" "$EVENT" "$SEVERITY" "$MSG_TYPE" "$AUDIO_LABEL" "$ALERT_ID" "$NWS_ZONE" "$CURRENT_TIME" "NWS API" "" "" "$AUDIO_SEQUENCE"; then
-      echo "$(date): ERROR - Live alert Discord webhook failed for $EVENT" >> "$LOG"
-      report_fault "discord" "Live alert Discord webhook failed" "$EVENT" "$ALERT_ID"
+      echo "$(date): ERROR - Live external delivery could not be persisted for $EVENT; local submission was not attempted" >> "$LOG"
+      report_fault "external_state" "Live external delivery could not be persisted; no local submission was attempted" "$EVENT" "$ALERT_ID"
+    elif [ "$EXTERNAL_STATUS" -eq 1 ]; then
       AUX_DELIVERY_OK=0
-    fi
-    append_event_log "$EVENT" "$SEVERITY" "$MSG_TYPE" "$AUDIO_LABEL" "$ALERT_ID" "$MAIL_SUBJECT" "$MAIL_BODY" "$([ "$AUX_DELIVERY_OK" = "1" ] && printf triggered || printf partial_failure)" "$AUDIO_SEQUENCE"
-    if [ "$AUX_DELIVERY_OK" = "1" ]; then
-      clear_fault_state
+      echo "$(date): One or more live external destinations remain durably pending for $EVENT" >> "$LOG"
+      report_fault "external" "One or more live external destinations remain pending" "$EVENT" "$ALERT_ID"
     fi
   fi
 
+  if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
+    [ "$LOCAL_PHONE_REQUESTED" = "0" ] || echo "$(date): Dry run - would queue call files for $EVENT using $AUDIO_SEQUENCE to recipients: ${NWS_ALERT_RECIPIENTS[*]}" >> "$LOG"
+    echo "$(date): Dry run - would queue visual live alert for $EVENT" >> "$LOG"
+    DELIVERY_STATUS="dry_run"
+    DELIVERY_MESSAGE="Dry run would submit live NWS alert for ${EVENT}; no local intent or external work was created"
+  elif [ "$EXTERNAL_STATE_PERSISTED" = "0" ]; then
+    LOCAL_SUBMISSION_OK=0
+    DELIVERY_STATUS="failed"
+    DELIVERY_MESSAGE="External retry work could not be made durable for ${EVENT}; zero local phone or visual submissions were attempted"
+  elif [ "$LOCAL_RECOVERY" = "1" ]; then
+    LOCAL_INTENT_COMMITTED=1
+    LOCAL_SUBMISSION_OK=0
+    DELIVERY_STATUS="indeterminate"
+    DELIVERY_MESSAGE="A durable local dispatch intent survived a restart; phone and visual submission were not replayed, so their outcome is indeterminate while external retries continue"
+    report_fault "delivery" "Local dispatch outcome is indeterminate after restart; automatic local replay was suppressed" "$EVENT" "$ALERT_ID"
+  elif [ "$LOCAL_STATE_OK" = "0" ]; then
+    LOCAL_SUBMISSION_OK=0
+    DELIVERY_STATUS="failed"
+    DELIVERY_MESSAGE="The durable local dispatch journal was unavailable for ${EVENT}; zero local phone or visual submissions were attempted while external retry work remained durable"
+    report_fault "delivery" "Durable local dispatch journal unavailable; no local submission was attempted" "$EVENT" "$ALERT_ID"
+  elif [ "$LOCAL_PREP_OK" = "0" ]; then
+    LOCAL_SUBMISSION_OK=0
+    DELIVERY_STATUS="failed"
+    DELIVERY_MESSAGE="Local audio preparation failed for ${EVENT}; no local dispatch intent or local submission was made, while external retry work remained durable"
+  else
+    if [ "$FORCE_REPLAY" = "1" ]; then
+      # An administrator explicitly requested a local replay. It is neither an
+      # automatic recovery path nor an exactly-once delivery guarantee.
+      LOCAL_INTENT_COMMITTED=1
+    else
+      # Stage 2: persist intent before invoking either local channel.
+      queue_local_dispatch_intent "$ALERT_KEY" "$ALERT_ID" "$EVENT" "$LOCAL_PHONE_REQUESTED" "$LOCAL_VISUAL_REQUESTED"
+      LOCAL_INTENT_STATUS=$?
+      if [ "$LOCAL_INTENT_STATUS" -eq 0 ]; then
+        LOCAL_INTENT_COMMITTED=1
+      elif [ "$LOCAL_INTENT_STATUS" -eq 10 ]; then
+        LOCAL_INTENT_COMMITTED=1
+        LOCAL_RECOVERY=1
+        LOCAL_SUBMISSION_OK=0
+        DELIVERY_STATUS="indeterminate"
+        DELIVERY_MESSAGE="A concurrent durable local dispatch intent was found; phone and visual submission were not replayed, so their outcome is indeterminate while external retries continue"
+        report_fault "delivery" "Local dispatch outcome is indeterminate; automatic local replay was suppressed" "$EVENT" "$ALERT_ID"
+      else
+        LOCAL_SUBMISSION_OK=0
+        DELIVERY_STATUS="failed"
+        DELIVERY_MESSAGE="The durable local dispatch intent could not be queued for ${EVENT}; zero local phone or visual submissions were attempted while external retry work remained durable"
+        report_fault "delivery" "Durable local dispatch intent could not be queued; no local submission was attempted" "$EVENT" "$ALERT_ID"
+      fi
+    fi
+
+    if [ "$LOCAL_INTENT_COMMITTED" = "1" ] && [ "$LOCAL_RECOVERY" = "0" ]; then
+      if [ "$LOCAL_PHONE_REQUESTED" = "1" ]; then
+        echo "$(date): Queueing call files for $EVENT - audio sequence: $AUDIO_SEQUENCE" >> "$LOG"
+        if ! queue_audio_to_recipients "$AUDIO_SEQUENCE" "$EVENT" "$ALERT_ID"; then
+          LOCAL_SUBMISSION_OK=0
+          LOCAL_AUDIO_QUEUE_FAILED=1
+          DELIVERY_STATUS="failed"
+          DELIVERY_MESSAGE="Phone audio queueing failed before any call file was accepted for ${EVENT}; visual submission was not invoked and automatic local replay is suppressed"
+        fi
+      fi
+      if [ "$LOCAL_AUDIO_QUEUE_FAILED" = "0" ]; then
+        sleep 2
+        if ! trigger_visual_alert "$ALERT_B64" "$EVENT" "$ALERT_ID"; then
+          VISUAL_DELIVERY_OK=0
+          LOCAL_SUBMISSION_OK=0
+          DELIVERY_STATUS="partial_failure"
+          DELIVERY_MESSAGE="Phone or desktop visual submission returned a failure for ${EVENT}; its outcome may be partial and automatic local replay is suppressed"
+          report_fault "visual" "Phone or desktop visual alert submission failed; automatic replay suppressed" "$EVENT" "$ALERT_ID"
+        fi
+      fi
+      if [ "$LOCAL_SUBMISSION_OK" = "1" ]; then
+        DELIVERY_STATUS="queued"
+        DELIVERY_MESSAGE="Local phone and visual submission commands accepted ${EVENT}; endpoint receipt is not confirmed"
+      fi
+    fi
+  fi
+
+  if [ "$AUX_DELIVERY_OK" = "0" ] && [ "$DELIVERY_STATUS" = "queued" ]; then
+    DELIVERY_STATUS="partial_failure"
+    DELIVERY_MESSAGE="Local submission commands accepted ${EVENT}, while one or more durable external destinations remain pending"
+  fi
+
+  DELIVERY_TS="$(timestamp_now)"
+  update_status "$(printf '{"last_delivery_at":%s,"last_delivery_status":%s,"last_delivery_source":"nws","last_delivery_event":%s,"last_delivery_audio":%s,"last_delivery_message":%s,"last_delivery_page_group":%s,"last_delivery_alert_id":%s}' \
+    "$(json_string "$DELIVERY_TS")" \
+    "$(json_string "$DELIVERY_STATUS")" \
+    "$(json_string "$EVENT")" \
+    "$(json_string "$AUDIO_LABEL")" \
+    "$(json_string "$DELIVERY_MESSAGE")" \
+    "$(json_string "$DELIVERY_TARGETS")" \
+    "$(json_string "$ALERT_ID")")"
+  append_event_log "$EVENT" "$SEVERITY" "$MSG_TYPE" "$AUDIO_LABEL" "$ALERT_ID" "$MAIL_SUBJECT" "$MAIL_BODY" "$DELIVERY_STATUS" "$AUDIO_SEQUENCE"
+
+  if [ "$NWS_ALERTS_DRY_RUN" != "1" ] \
+    && [ "$EXTERNAL_STATE_PERSISTED" = "1" ] \
+    && [ "$LOCAL_INTENT_COMMITTED" = "1" ]; then
+    [ "$FORCE_REPLAY" = "1" ] || mark_processed_alert "$ALERT_KEY"
+    clear_audio_delivered "$ALERT_KEY"
+  fi
+  if [ "$LOCAL_SUBMISSION_OK" = "1" ] \
+    && [ "$AUX_DELIVERY_OK" = "1" ] \
+    && [ "$EXTERNAL_STATE_PERSISTED" = "1" ]; then
+    clear_fault_state
+  fi
+
 done
+
+# Stage 3 runs only after every actionable alert has crossed its local intent
+# and local submission path. External network latency can never hold up an
+# urgent phone/Desktop attempt, while pending destinations remain durable.
+if external_destinations_allowed; then
+  retry_pending_external_destinations
+  RETRY_STATUS=$?
+  if [ "$RETRY_STATUS" -eq 75 ]; then
+    echo "$(date): ERROR - Durable external delivery retry could not run after local handling" >> "$LOG"
+    report_fault "external_state" "Durable external delivery retry could not run after local handling" "" ""
+  elif [ "$RETRY_STATUS" -eq 1 ]; then
+    echo "$(date): One or more durable external deliveries remain pending after post-local retry" >> "$LOG"
+    report_fault "external" "One or more external destinations remain durably pending after local handling" "" ""
+  fi
+fi
 
 echo "$(date): Alert check complete" >> "$LOG"

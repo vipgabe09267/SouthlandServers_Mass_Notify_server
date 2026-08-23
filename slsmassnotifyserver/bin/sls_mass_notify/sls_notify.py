@@ -13,6 +13,7 @@ import secrets
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import textwrap
 from datetime import datetime, timedelta, timezone
@@ -1231,7 +1232,8 @@ def send_notify(ami, target, xml_payload, phone_format="yealink", target_field="
             ],
         })
         if response.get("Response", "").lower() == "success":
-            successes.append(f"{event_name}: {response.get('Message', 'sent')}")
+            manager_message = response.get("Message", "request accepted")
+            successes.append(f"{event_name}: Asterisk accepted the submission ({manager_message})")
             break
         message = response.get("Message", "PJSIPNotify returned no explicit success response")
         errors.append(f"{event_name}: {message}")
@@ -1277,47 +1279,114 @@ def image_url_from_xml(xml_payload):
     return html.unescape(match.group(1)).strip()
 
 
-def append_sipnotify_event(config, record):
-    path = api_events_file(config)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    record = dict(record)
-    record["created_at"] = datetime.now(timezone.utc).astimezone().isoformat()
-    with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        handle.seek(0)
-        lines = [line.rstrip("\n") for line in handle if line.strip()]
-        record_id = str(record.get("id") or "")
-        encoded = json.dumps(record, ensure_ascii=True, separators=(",", ":"))
-        replaced = False
-        if record_id:
-            for index, line in enumerate(lines):
-                try:
-                    existing = json.loads(line)
-                except Exception:
-                    continue
-                if str(existing.get("id") or "") == record_id:
-                    lines[index] = encoded
-                    replaced = True
-        if not replaced:
-            lines.append(encoded)
-        lines = lines[-1000:]
-        handle.seek(0)
-        handle.truncate(0)
-        if lines:
-            handle.write("\n".join(lines) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+def set_journal_file_metadata(file_descriptor):
+    os.fchmod(file_descriptor, 0o640)
     try:
         import grp
         import pwd
-        os.chown(path, pwd.getpwnam("asterisk").pw_uid, grp.getgrnam("asterisk").gr_gid)
+        os.fchown(
+            file_descriptor,
+            pwd.getpwnam("asterisk").pw_uid,
+            grp.getgrnam("asterisk").gr_gid,
+        )
     except Exception:
         pass
-    os.chmod(path, 0o640)
 
 
-def alert_api_record(alert, xml_payload, extensions, phone_formats=None):
+def atomic_write_journal(path, lines):
+    temporary_fd = None
+    temporary_path = None
+    try:
+        temporary_fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.tmp.",
+            dir=str(path.parent),
+            text=True,
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(temporary_fd, "w", encoding="utf-8", newline="\n") as handle:
+            temporary_fd = None
+            set_journal_file_metadata(handle.fileno())
+            if lines:
+                handle.write("\n".join(lines) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+
+        directory_flags = os.O_RDONLY
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(path.parent, directory_flags)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def append_sipnotify_event(config, record):
+    path = api_events_file(config)
+    record = dict(record)
+    record["created_at"] = datetime.now(timezone.utc).astimezone().isoformat()
+    encoded = json.dumps(record, ensure_ascii=True, separators=(",", ":"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    open_flags = os.O_RDWR | os.O_CREAT
+    open_flags |= getattr(os, "O_CLOEXEC", 0)
+    open_flags |= getattr(os, "O_NOFOLLOW", 0)
+    lock_path = path.with_name(path.name + ".lock")
+    lock_fd = os.open(lock_path, open_flags, 0o640)
+    with os.fdopen(lock_fd, "r+", encoding="utf-8") as lock_handle:
+        set_journal_file_metadata(lock_handle.fileno())
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+
+        journal_fd = os.open(path, open_flags, 0o640)
+        with os.fdopen(journal_fd, "r+", encoding="utf-8") as journal_handle:
+            set_journal_file_metadata(journal_handle.fileno())
+            fcntl.flock(journal_handle.fileno(), fcntl.LOCK_EX)
+            journal_handle.seek(0)
+            lines = [line.rstrip("\n") for line in journal_handle if line.strip()]
+            record_id = str(record.get("id") or "")
+            replaced = False
+            if record_id:
+                for index, line in enumerate(lines):
+                    try:
+                        existing = json.loads(line)
+                    except Exception:
+                        continue
+                    if str(existing.get("id") or "") == record_id:
+                        if existing.get("kind") == "alert" and record.get("kind") == "alert":
+                            record["recipients"] = sorted(set(existing.get("recipients") or []) | set(record.get("recipients") or []))
+                            record["desktop_recipients"] = sorted(set(existing.get("desktop_recipients") or []) | set(record.get("desktop_recipients") or []))
+                            record["desktop_all"] = bool(record.get("desktop_all"))
+                            merged_formats = dict(existing.get("phone_formats") or {})
+                            merged_formats.update(record.get("phone_formats") or {})
+                            record["phone_formats"] = merged_formats
+                            encoded = json.dumps(record, ensure_ascii=True, separators=(",", ":"))
+                        lines[index] = encoded
+                        replaced = True
+            if not replaced:
+                lines.append(encoded)
+            atomic_write_journal(path, lines[-1000:])
+
+
+def new_announcement_id(now=None):
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    else:
+        current = current.astimezone(timezone.utc)
+    return f"announcement-{current.strftime('%Y%m%d%H%M%S%f')}-{secrets.token_hex(16)}"
+
+
+def alert_api_record(alert, xml_payload, extensions, desktop_targets=None, desktop_all=False, phone_formats=None):
     props = alert.get("properties", {})
     event = props.get("event", "Unknown")
     alert_id = alert.get("id") or props.get("id") or "unknown"
@@ -1353,8 +1422,8 @@ def alert_api_record(alert, xml_payload, extensions, phone_formats=None):
         "image_url": image_url_from_xml(xml_payload),
         "xml": xml_payload,
         "recipients": extensions,
-        "desktop_all": True,
-        "desktop_recipients": [],
+        "desktop_all": bool(desktop_all),
+        "desktop_recipients": sorted(set(desktop_targets or [])),
         "phone_formats": phone_formats or {},
     }
 
@@ -1452,7 +1521,7 @@ def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_resul
                     result = send_notify(ami, extension, xml_payload, phone_format, "Endpoint")
                     successes += max(1, len(contact_targets))
                     logging.info(
-                        "Pushed SIP NOTIFY %s by endpoint fan-out to extension=%s contacts=%s format=%s "
+                        "Submitted SIP NOTIFY %s to Asterisk by endpoint fan-out extension=%s contacts=%s format=%s "
                         "user_agent=%s attempt=%s route=%s: %s",
                         alert_id,
                         extension,
@@ -1465,7 +1534,7 @@ def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_resul
                     )
                     if print_results:
                         print(
-                            f"{extension}: success endpoint fan-out contacts={len(contact_targets)} "
+                            f"{extension}: submitted to Asterisk by endpoint fan-out contacts={len(contact_targets)} "
                             f"format={phone_format} ({attempt_label})"
                         )
                 except Exception as exc:
@@ -1492,7 +1561,7 @@ def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_resul
                     result_state["successes"] += 1
                     successes += 1
                     logging.info(
-                        "Pushed SIP NOTIFY %s to contact %s extension=%s format=%s user_agent=%s attempt=%s: %s",
+                        "Submitted SIP NOTIFY %s to Asterisk contact %s extension=%s format=%s user_agent=%s attempt=%s: %s",
                         alert_id,
                         contact_uri,
                         extension,
@@ -1502,7 +1571,7 @@ def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_resul
                         result,
                     )
                     if print_results:
-                        print(f"{extension}: success contact={contact_uri} format={phone_format} ({attempt_label})")
+                        print(f"{extension}: submitted to Asterisk contact={contact_uri} format={phone_format} ({attempt_label})")
                 except Exception as exc:
                     result_state["failures"].append((contact_uri, str(exc)))
 
@@ -1532,18 +1601,18 @@ def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_resul
                 xml_payload = payload_builder(phone_format)
                 result = send_notify(ami, extension, xml_payload, phone_format, "Endpoint")
                 successes += 1
-                logging.info("Pushed SIP NOTIFY %s to %s format=%s user_agent=%s attempt=%s: %s", alert_id, extension, phone_format, user_agent or "unknown", attempt_label, result)
+                logging.info("Submitted SIP NOTIFY %s to Asterisk target %s format=%s user_agent=%s attempt=%s: %s", alert_id, extension, phone_format, user_agent or "unknown", attempt_label, result)
                 if print_results:
-                    print(f"{extension}: success format={phone_format} ({attempt_label})")
+                    print(f"{extension}: submitted to Asterisk format={phone_format} ({attempt_label})")
             except Exception as exc:
                 failures.append(f"{extension}/{phone_format}: {exc}")
                 logging.error("Failed SIP NOTIFY %s to %s format=%s user_agent=%s attempt=%s: %s", alert_id, extension, phone_format, user_agent or "unknown", attempt_label, exc)
                 if print_results:
                     print(f"{extension}: failed format={phone_format} ({attempt_label}) - {exc}")
     if failures:
-        raise RuntimeError(f"SIP NOTIFY delivery failed for {len(failures)} target format(s): " + "; ".join(failures))
+        raise RuntimeError(f"SIP NOTIFY submission failed for {len(failures)} target format(s): " + "; ".join(failures))
     if endpoint_info and successes == 0:
-        raise RuntimeError("SIP NOTIFY did not succeed for any requested endpoint")
+        raise RuntimeError("SIP NOTIFY was not submitted to Asterisk for any requested endpoint")
     return successes
 
 
@@ -1560,15 +1629,43 @@ def endpoint_format_summary(endpoint_info):
     }
 
 
-def push_alert(config, alert, print_results=False, retries=True, targets=None, api_publish=True):
+def push_alert(
+    config,
+    alert,
+    print_results=False,
+    retries=True,
+    targets=None,
+    api_publish=True,
+    api_only=False,
+    desktop_targets=None,
+    desktop_all=False,
+    require_all_targets=False,
+):
     primary_xml_payload = build_xml(config, alert)
     props = alert.get("properties", {})
     event = props.get("event", "Unknown")
     priority = alert_priority(props)
     alert_id = alert.get("id") or props.get("id") or "unknown"
     requested_extensions = sorted(targets or [])
-    if api_publish:
-        append_sipnotify_event(config, alert_api_record(alert, primary_xml_payload, requested_extensions, {}))
+    desktop_targets = sorted(set(desktop_targets or []))
+    if api_only:
+        if not desktop_targets and not desktop_all:
+            raise RuntimeError("API-only alert publication requires at least one desktop target")
+        append_sipnotify_event(config, alert_api_record(alert, primary_xml_payload, [], desktop_targets, desktop_all, {}))
+        return []
+    # Live alert channels remain independent: a targeted desktop alert must
+    # still be available if AMI or a handset-side SIP submission fails. Manual
+    # delivery tests opt into require_all_targets and intentionally defer the
+    # desktop record until every requested phone has passed validation and the
+    # initial SIP NOTIFY batch has been accepted by Asterisk.
+    desktop_pre_published = bool(
+        api_publish and not require_all_targets and (desktop_targets or desktop_all)
+    )
+    if desktop_pre_published:
+        append_sipnotify_event(
+            config,
+            alert_api_record(alert, primary_xml_payload, [], desktop_targets, desktop_all, {}),
+        )
     with AmiClient(
         config["ami"].get("host", "127.0.0.1"),
         config["ami"].getint("port", 5038),
@@ -1579,13 +1676,21 @@ def push_alert(config, alert, print_results=False, retries=True, targets=None, a
         extensions = sorted(endpoint_info.keys())
         phone_formats = endpoint_format_summary(endpoint_info)
         logging.info("Pushing %s alert %s priority=%s to %d registered endpoints formats=%s", event, alert_id, priority, len(extensions), phone_formats)
-        if api_publish:
-            append_sipnotify_event(config, alert_api_record(alert, primary_xml_payload, extensions, phone_formats))
-        if targets and not extensions:
-            requested = ", ".join(sorted(targets))
+        missing_extensions = sorted(set(requested_extensions) - set(extensions))
+        if requested_extensions and not extensions:
+            requested = ", ".join(missing_extensions)
             raise RuntimeError(f"No requested phone endpoints are registered/reachable for SIP NOTIFY: {requested}")
+        if require_all_targets and missing_extensions:
+            requested = ", ".join(missing_extensions)
+            raise RuntimeError(f"Requested phone endpoints are not registered/reachable for SIP NOTIFY: {requested}")
         payload_builder = lambda fmt: primary_xml_payload if fmt == "yealink" else build_phone_xml_for_format(config, fmt, "alert", alert=alert)
         send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_results, "initial")
+        # Manual mixed-channel tests defer publication until every requested
+        # phone endpoint resolves and Asterisk accepts the initial batch.
+        # Live targeted desktop delivery was already published above and must
+        # not be written a second time after phone discovery.
+        if api_publish and not desktop_pre_published:
+            append_sipnotify_event(config, alert_api_record(alert, primary_xml_payload, extensions, desktop_targets, desktop_all, phone_formats))
         if not retries:
             return
         for delay in visual_retry_delays(config):
@@ -1600,11 +1705,15 @@ def push_announcement(config, message, targets, print_results=True, api_publish=
         xml_payload = build_announcement_image_xml(config, message, title, background_color, background_image, timeout_seconds)
     else:
         xml_payload = build_announcement_xml(message, timeout_seconds)
-    alert_id = "announcement-" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    alert_id = new_announcement_id()
+    desktop_targets = sorted(set(desktop_targets or []))
     if api_only:
+        if not desktop_targets and not desktop_all:
+            raise RuntimeError("API-only announcement publication requires at least one desktop target")
         append_sipnotify_event(config, announcement_api_record(alert_id, message, xml_payload, [], desktop_targets, desktop_all, title=title, background_color=background_color, image=image, timeout_seconds=timeout_seconds))
         return []
-    if api_publish:
+    desktop_pre_published = bool(api_publish and (desktop_targets or desktop_all))
+    if desktop_pre_published:
         append_sipnotify_event(
             config,
             announcement_api_record(alert_id, message, xml_payload, sorted(targets or []), desktop_targets, desktop_all, title=title, background_color=background_color, image=image, timeout_seconds=timeout_seconds),
@@ -1619,13 +1728,13 @@ def push_announcement(config, message, targets, print_results=True, api_publish=
         extensions = sorted(endpoint_info.keys())
         phone_formats = endpoint_format_summary(endpoint_info)
         logging.info("Pushing SIP NOTIFY announcement %s to %d registered endpoints formats=%s", alert_id, len(extensions), phone_formats)
-        if api_publish:
-            append_sipnotify_event(config, announcement_api_record(alert_id, message, xml_payload, extensions, desktop_targets, desktop_all, phone_formats, title=title, background_color=background_color, image=image, timeout_seconds=timeout_seconds))
         if targets and not extensions:
             requested = ", ".join(sorted(targets))
             raise RuntimeError(f"No requested phone endpoints are registered/reachable for SIP NOTIFY: {requested}")
         payload_builder = lambda fmt: xml_payload if fmt == "yealink" else build_phone_xml_for_format(config, fmt, "announcement", message=message, image=image, title=title, background_color=background_color, background_image=background_image, timeout_seconds=timeout_seconds)
         send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_results, "initial")
+        if api_publish and not desktop_pre_published:
+            append_sipnotify_event(config, announcement_api_record(alert_id, message, xml_payload, extensions, desktop_targets, desktop_all, phone_formats, title=title, background_color=background_color, image=image, timeout_seconds=timeout_seconds))
         return extensions
 
 
@@ -1696,6 +1805,7 @@ def main():
     parser.add_argument("--desktop-all", action="store_true", help="Allow all enabled desktop app clients to receive this API event")
     parser.add_argument("--no-api", action="store_true", help="Do not publish this announcement/alert to the desktop API journal")
     parser.add_argument("--api-only", action="store_true", help="Publish announcement to the desktop API journal without sending SIP NOTIFY")
+    parser.add_argument("--require-all-targets", action="store_true", help="Fail unless every requested phone endpoint is registered and reachable (manual delivery tests)")
     parser.add_argument("--list-endpoints-json", action="store_true", help="Print registered endpoint vendor detection as JSON and exit")
     parser.add_argument("--ami-health-json", action="store_true", help="Authenticate to AMI, issue Ping, and print a JSON health result")
     parser.add_argument("--notify-capabilities-json", action="store_true", help="Print adaptive Asterisk SIP NOTIFY routing capabilities and exit")
@@ -1755,6 +1865,7 @@ def main():
                 print(json.dumps(endpoint_format_summary(get_registered_endpoint_info(ami, format_overrides=endpoint_format_overrides(config))), sort_keys=True))
             return 0
         targets = normalize_target_list(args.targets)
+        desktop_targets = normalize_desktop_target_list(args.desktop_targets)
         if args.announcement:
             push_announcement(
                 config,
@@ -1767,17 +1878,27 @@ def main():
                 title=args.announcement_title,
                 background_color=args.announcement_bg_color,
                 background_image=args.announcement_bg_image,
-                desktop_targets=normalize_desktop_target_list(args.desktop_targets),
+                desktop_targets=desktop_targets,
                 desktop_all=args.desktop_all,
                 timeout_seconds=normalize_announcement_timeout_seconds(args.announcement_timeout_seconds),
             )
         elif args.alert_json_b64:
             alert = alert_from_json_b64(args.alert_json_b64)
-            push_alert(config, alert, print_results=True, retries=not args.no_retry, targets=targets, api_publish=not args.no_api)
+            push_alert(
+                config, alert, print_results=True, retries=not args.no_retry,
+                targets=targets, api_publish=not args.no_api, api_only=args.api_only,
+                desktop_targets=desktop_targets, desktop_all=args.desktop_all,
+                require_all_targets=args.require_all_targets,
+            )
         elif args.event:
             description = args.description or "PBX test visual alert. This image was generated by the FreePBX Mass Notifications testing page."
             alert = synthetic_alert(args.event, args.severity, args.area, description, args.expires_minutes, args.test_id)
-            push_alert(config, alert, print_results=True, retries=not args.no_retry, targets=targets, api_publish=not args.no_api)
+            push_alert(
+                config, alert, print_results=True, retries=not args.no_retry,
+                targets=targets, api_publish=not args.no_api, api_only=args.api_only,
+                desktop_targets=desktop_targets, desktop_all=args.desktop_all,
+                require_all_targets=args.require_all_targets,
+            )
         elif args.test:
             run_test(config, retries=not args.no_retry)
         else:

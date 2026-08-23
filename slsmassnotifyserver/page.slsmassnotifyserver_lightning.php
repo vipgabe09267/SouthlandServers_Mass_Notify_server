@@ -41,7 +41,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 			? (string)$_SESSION['AMP_user']->username
 			: 'FreePBX Dashboard';
 		try {
-			$result = $slsmassnotifyserver->triggerLightningTest($triggerName);
+			$selectedGroupIds = is_array($_POST['lightning_group_ids'] ?? null)
+				? $_POST['lightning_group_ids']
+				: [];
+			$result = $slsmassnotifyserver->triggerLightningTest($triggerName, $selectedGroupIds);
 		} catch (\Throwable $e) {
 			error_log('SLS Mass Notify Lightning test response failed: ' . $e->getMessage());
 			$result = [

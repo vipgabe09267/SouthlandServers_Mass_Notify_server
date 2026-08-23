@@ -44,7 +44,13 @@ def validated_https_url(value, default):
         raise ValueError(f"invalid HTTPS URL: {value}")
     if parsed.query or parsed.fragment:
         raise ValueError(f"URL must not contain a query or fragment: {value}")
-    return value.rstrip("/")
+    if (
+        parsed.hostname.lower().rstrip(".") != "api.weather.gov"
+        or parsed.port is not None
+        or parsed.path not in {"", "/"}
+    ):
+        raise ValueError("Weather Alerts API must use https://api.weather.gov")
+    return "https://api.weather.gov"
 
 
 def validated_voice(value, default_name="en_US-lessac-low.onnx"):
@@ -62,8 +68,22 @@ def emails(value):
     for candidate in re.split(r"[\s,;]+", text(value)):
         candidate = candidate.strip()
         if re.fullmatch(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}", candidate):
+            local_part, domain = candidate.rsplit("@", 1)
+            valid = (
+                len(candidate) <= 254
+                and len(local_part) <= 64
+                and not local_part.startswith(".")
+                and not local_part.endswith(".")
+                and ".." not in local_part
+                and normalized_sender_domain(domain) != ""
+            )
+        else:
+            valid = False
+        if valid:
             if candidate not in output:
                 output.append(candidate)
+        if len(output) >= 50:
+            break
     return " ".join(output)
 
 
@@ -83,14 +103,36 @@ def normalized_sender_domain(value):
     return domain if all(label_pattern.fullmatch(label) for label in domain.split(".")) else ""
 
 
+def normalized_sender_local_part(value):
+    local_part = text(value).lower()
+    if not local_part or len(local_part) > 64 or ".." in local_part:
+        return ""
+    pattern = re.compile(r"[a-z0-9](?:[a-z0-9._+-]{0,62}[a-z0-9])?")
+    return local_part if pattern.fullmatch(local_part) else ""
+
+
 def sender_address(data):
     domain = normalized_sender_domain(data.get("mail_from_domain"))
     if domain:
-        return "no-reply@" + domain
+        return (normalized_sender_local_part(data.get("mail_from_local_part")) or "no-reply") + "@" + domain
     legacy = (emails(data.get("mail_from_addr")).split() or [""])[0]
     if legacy and normalized_sender_domain(legacy.rsplit("@", 1)[1]):
         return legacy
     return "no-reply@localhost.localdomain"
+
+
+def legacy_discord_url(data):
+    destinations = data.get("discord_webhooks")
+    if isinstance(destinations, list) and destinations:
+        for destination in destinations[:10]:
+            if not isinstance(destination, dict) or enabled(destination.get("enabled", "1")) != "1":
+                continue
+            candidate = text(destination.get("url") or destination.get("webhook_url"))
+            if re.fullmatch(r"https://(?:discord|discordapp|canary\.discord|ptb\.discord)\.com/api/webhooks/[0-9]+/[A-Za-z0-9._~-]+", candidate):
+                return candidate
+        return ""
+    candidate = text(data.get("discord_webhook_url"))
+    return candidate if re.fullmatch(r"https://(?:discord|discordapp|canary\.discord|ptb\.discord)\.com/api/webhooks/[0-9]+/[A-Za-z0-9._~-]+", candidate) else ""
 
 
 def clock_time(value, default):
@@ -132,8 +174,38 @@ def main():
         value = re.sub(r"[^0-9]", "", text(value))
         if value and value not in recipients:
             recipients.append(value)
-    if enabled(data.get("enabled")) == "1" and (not zone or not recipients):
-        print("NWS is enabled but its zone or recipient list is empty", file=sys.stderr)
+    configured_desktop_recipients = {
+        text(client.get("username")).lower()
+        for client in (data.get("desktop_clients") or [])
+        if isinstance(client, dict) and enabled(client.get("enabled")) == "1"
+    }
+    zone_desktop_recipients = []
+    zone_email_recipients = []
+    for group in data.get("nws_zones") or []:
+        if not isinstance(group, dict) or text(group.get("zone")).upper() != zone:
+            continue
+        for username in group.get("desktop_clients") or []:
+            username = text(username).lower()
+            if (
+                re.fullmatch(r"[a-z0-9_.-]{1,48}", username)
+                and username in configured_desktop_recipients
+                and username not in zone_desktop_recipients
+            ):
+                zone_desktop_recipients.append(username)
+        for recipient in emails(" ".join(map(str, group.get("email_recipients") or []))).split():
+            if recipient.lower() not in {value.lower() for value in zone_email_recipients}:
+                zone_email_recipients.append(recipient)
+    # Pre-0.1.0 configurations used mail_to for both live alerts and faults.
+    # Preserve that live route only until the canonical system-recipient key is
+    # written; new configurations use the selected zone list exclusively.
+    if "system_notification_emails" not in data:
+        for recipient in emails(data.get("mail_to")).split():
+            if recipient.lower() not in {value.lower() for value in zone_email_recipients}:
+                zone_email_recipients.append(recipient)
+            if len(zone_email_recipients) >= 50:
+                break
+    if enabled(data.get("enabled")) == "1" and (not zone or (not recipients and not zone_desktop_recipients)):
+        print("NWS is enabled but its zone has no phone or desktop recipients", file=sys.stderr)
         return 1
 
     ami = data.get("ami") if isinstance(data.get("ami"), dict) else {}
@@ -152,12 +224,13 @@ def main():
         "PIPER_ANNOUNCEMENT_VOLUME": scalar(data.get("announcement_tts_volume"), 25),
         "PIPER_MAX_SECONDS": bounded_int(data.get("tts_max_seconds"), 1, 600, 30),
         "LOG_RETENTION_DAYS": bounded_int(data.get("log_retention_days"), 1, 365, 90),
-        "MAIL_TO": emails(data.get("mail_to")),
-        "DISCORD_WEBHOOK_URL": text(data.get("discord_webhook_url")) if re.fullmatch(r"https://discord(?:app)?\.com/api/webhooks/[0-9]+/[A-Za-z0-9._~-]+", text(data.get("discord_webhook_url"))) else "",
+        "MAIL_TO": emails(data.get("system_notification_emails")),
+        "DISCORD_WEBHOOK_URL": legacy_discord_url(data),
         "QUIET_HOURS_ENABLED": enabled(data.get("quiet_hours_enabled")),
         "QUIET_HOURS_START": clock_time(data.get("quiet_hours_start"), "21:00"),
         "QUIET_HOURS_END": clock_time(data.get("quiet_hours_end"), "06:00"),
         "MAIL_FROM_NAME": re.sub(r"[\r\n]+", " ", text(data.get("mail_from_name"), "SLS Mass Notification System"))[:80],
+        "MAIL_FROM_LOCAL_PART": normalized_sender_local_part(data.get("mail_from_local_part")) or "no-reply",
         "MAIL_FROM_ADDR": sender_address(data),
         "ALERT_EMAIL_SUBJECT": text(data.get("alert_email_subject")),
         "ALERT_EMAIL_BODY": text(data.get("alert_email_body")),
@@ -176,6 +249,10 @@ def main():
         emit(key, value)
     for recipient in recipients:
         emit("NWS_ALERT_RECIPIENT", recipient)
+    for username in zone_desktop_recipients:
+        emit("NWS_DESKTOP_CLIENT", username)
+    for recipient in zone_email_recipients:
+        emit("NWS_ZONE_EMAIL_RECIPIENT", recipient)
     for event in data.get("quiet_critical_events") or []:
         event = text(event)
         if event:

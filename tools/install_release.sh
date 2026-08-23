@@ -3,17 +3,25 @@ set -euo pipefail
 
 umask 027
 
-MODULE="${SLS_MASS_NOTIFY_MODULE:-slsmassnotifyserver}"
-TGZ="${SLS_MASS_NOTIFY_TGZ:-/tmp/slsmassnotifyserver-0.0.9-beta.tgz}"
+MODULE="slsmassnotifyserver"
+if [ -n "${SLS_MASS_NOTIFY_MODULE:-}" ] \
+  && [ "${SLS_MASS_NOTIFY_MODULE}" != "$MODULE" ]; then
+  printf '%s\n' \
+    "SLS_MASS_NOTIFY_MODULE is fixed to the FreePBX raw module name '$MODULE'; refusing an alternate value." >&2
+  exit 2
+fi
+TGZ="${SLS_MASS_NOTIFY_TGZ:-/tmp/slsmassnotifyserver-0.1.0.tgz}"
 URL="${SLS_MASS_NOTIFY_TGZ_URL:-${1:-}}"
 SHA256="${SLS_MASS_NOTIFY_SHA256:-}"
 TOKEN="${SLS_MASS_NOTIFY_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
 LOG_FILE="${SLS_MASS_NOTIFY_INSTALL_LOG:-/tmp/slsmassnotifyserver-install.log}"
-EXPECTED_TGZ_SHA256="4c81256bb92af4b3b06a4434fe5b78d514f8abd16d581bbb2c0be3a4b99b8e0b"
+EXPECTED_TGZ_SHA256="90ae525738d117a8141722590b33dbd4f4b23c32f31cb6e761f329e98504d704"
 DATA_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin"
 CONFIG_FILE="$DATA_DIR/mass-notifications.config"
 CONFIG_SNAPSHOT=""
 CONFIG_HASH_BEFORE=""
+CONFIG_LOCK_FD=""
+SETTINGS_LOCK="$DATA_DIR/mass-notifications.config.lock"
 STAGING_DIR=""
 MODULE_BACKUP_DIR=""
 MODULE_ACTIVATED=0
@@ -24,9 +32,114 @@ APT_METADATA_REFRESHED=0
 ASTERISK_PACKAGE_REPAIR_ATTEMPTS=""
 REPAIR_ASTERISK_PACKAGES="${SLS_MASS_NOTIFY_REPAIR_ASTERISK_PACKAGES:-1}"
 INSTALL_MAINTENANCE_LOCK_FD=""
+FREEPBX_CONFIRMED=0
+# Regression tests source this installer so they can exercise its protected
+# filesystem helpers.  Keep their fixture failure markers from creating or
+# deleting real FreePBX Dashboard notifications on the host running the test.
+INSTALL_NOTIFICATION_SIDE_EFFECTS=1
+INSTALL_STAGE="initialization"
+INSTALL_SOLUTION="Review /tmp/slsmassnotifyserver-install.log, correct the reported prerequisite, then run the same installer again."
+INSTALL_FAILURE_FILE="$DATA_DIR/install-failure.json"
 
 log() {
   printf '%s\n' "$*"
+}
+
+set_install_stage() {
+  INSTALL_STAGE="$1"
+  INSTALL_SOLUTION="$2"
+}
+
+ensure_data_directory() {
+  DATA_DIRECTORY_PATH="$DATA_DIR" /usr/bin/python3 - <<'PY'
+import os
+import pwd
+import stat
+
+path = os.environ["DATA_DIRECTORY_PATH"]
+parts = [part for part in path.split("/") if part]
+if not path.startswith("/") or not parts or "\x00" in path:
+    raise SystemExit(2)
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+parent_fd = os.open("/", flags)
+try:
+    for component in parts[:-1]:
+        next_fd = os.open(component, flags, dir_fd=parent_fd)
+        os.close(parent_fd)
+        parent_fd = next_fd
+    try:
+        directory_fd = os.open(parts[-1], flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        os.mkdir(parts[-1], 0o750, dir_fd=parent_fd)
+        directory_fd = os.open(parts[-1], flags, dir_fd=parent_fd)
+    try:
+        if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
+            raise SystemExit(3)
+        account = pwd.getpwnam("asterisk")
+        os.fchmod(directory_fd, 0o750)
+        os.fchown(directory_fd, account.pw_uid, account.pw_gid)
+    finally:
+        os.close(directory_fd)
+finally:
+    os.close(parent_fd)
+PY
+}
+
+record_install_failure() {
+  local marker_tmp
+  [ "$FREEPBX_CONFIRMED" -eq 1 ] || return 0
+  ensure_data_directory 2>/dev/null || return 0
+  marker_tmp="$(mktemp /tmp/slsmassnotifyserver-install-failure.XXXXXX 2>/dev/null || true)"
+  [ -n "$marker_tmp" ] || return 0
+  if ! /usr/bin/php -r '
+$payload = [
+    "version" => 1,
+    "failed_at" => gmdate("c"),
+    "stage" => substr(preg_replace("/[^A-Za-z0-9 ._\/-]/", "", (string)$argv[1]), 0, 80),
+    "message" => "SLS Mass Notify installation did not complete.",
+    "solution" => substr(preg_replace("/[[:cntrl:]]/", " ", (string)$argv[2]), 0, 400),
+    "log" => "/tmp/slsmassnotifyserver-install.log",
+];
+$json = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+if (!is_string($json) || file_put_contents($argv[3], $json . PHP_EOL, LOCK_EX) === false) {
+    exit(1);
+}
+' "$INSTALL_STAGE" "$INSTALL_SOLUTION" "$marker_tmp" 2>/dev/null; then
+    rm -f "$marker_tmp"
+    return 0
+  fi
+  safe_config_restore "$marker_tmp" "$INSTALL_FAILURE_FILE" 2>/dev/null || {
+    rm -f "$marker_tmp"
+    return 0
+  }
+  rm -f "$marker_tmp"
+  [ "${INSTALL_NOTIFICATION_SIDE_EFFECTS:-1}" -eq 1 ] || return 0
+  /usr/bin/php -r '
+require "/etc/freepbx.conf";
+$detail = "Stage: " . $argv[1] . ". " . $argv[2] . " Installer log: /tmp/slsmassnotifyserver-install.log";
+\FreePBX::Notifications()->add_error(
+    "slsmassnotifyserver",
+    "INSTALLFAILED",
+    "SLS Mass Notify installation failed",
+    $detail,
+    "",
+    true,
+    true
+);
+exit(0);
+' "$INSTALL_STAGE" "$INSTALL_SOLUTION" >/dev/null 2>&1 || true
+}
+
+clear_install_failure() {
+  if [ ! -L "$INSTALL_FAILURE_FILE" ]; then
+    rm -f "$INSTALL_FAILURE_FILE" 2>/dev/null || true
+  fi
+  [ "${INSTALL_NOTIFICATION_SIDE_EFFECTS:-1}" -eq 1 ] || return 0
+  /usr/bin/php -r '
+require "/etc/freepbx.conf";
+\FreePBX::Notifications()->delete("slsmassnotifyserver", "INSTALLFAILED");
+exit(0);
+' >/dev/null 2>&1 || true
 }
 
 local_web_probe() {
@@ -113,17 +226,22 @@ exit(0);
   fi
 
   if [ -n "$CONFIG_SNAPSHOT" ] && [ -f "$CONFIG_SNAPSHOT" ]; then
-    current_hash="$(sha256sum "$CONFIG_FILE" 2>/dev/null | awk '{print $1}')"
+    current_hash="$(safe_config_hash "$CONFIG_FILE" 2>/dev/null || true)"
     if [ "$current_hash" != "$CONFIG_HASH_BEFORE" ]; then
-      cp -p "$CONFIG_SNAPSHOT" "$CONFIG_FILE"
-      chown asterisk:asterisk "$CONFIG_FILE" 2>/dev/null || true
-      chmod 0640 "$CONFIG_FILE" 2>/dev/null || true
-      refresh_module_install >/dev/null 2>&1 || true
-      log "The installer restored the original central config after an interrupted or failed install."
-      status=1
+      if ensure_data_directory 2>/dev/null && safe_config_restore "$CONFIG_SNAPSHOT" "$CONFIG_FILE" 2>/dev/null; then
+        refresh_module_install >/dev/null 2>&1 || true
+        log "The installer restored the original central config after an interrupted or failed install."
+        status=1
+      else
+        log "CRITICAL: the installer could not safely restore the protected central config. The root-owned snapshot remains at $CONFIG_SNAPSHOT."
+        CONFIG_SNAPSHOT=""
+        status=1
+      fi
     fi
-    rm -f "$CONFIG_SNAPSHOT"
-    CONFIG_SNAPSHOT=""
+    if [ -n "$CONFIG_SNAPSHOT" ]; then
+      rm -f "$CONFIG_SNAPSHOT"
+      CONFIG_SNAPSHOT=""
+    fi
   fi
 
   if [ -n "$STAGING_DIR" ] && [ -d "$STAGING_DIR" ]; then
@@ -131,6 +249,10 @@ exit(0);
   fi
   if [ -n "$MODULE_BACKUP_DIR" ] && [ -d "$MODULE_BACKUP_DIR" ]; then
     rm -rf "$MODULE_BACKUP_DIR"
+  fi
+
+  if [ "$status" -ne 0 ]; then
+    record_install_failure
   fi
 
   exit "$status"
@@ -165,6 +287,7 @@ require_freepbx() {
     log "/etc/freepbx.conf is missing or unreadable."
     exit 1
   }
+  FREEPBX_CONFIRMED=1
   # A minimal FreePBX image may not yet have the locking/process utilities or
   # PHP features needed by the coordination and bootstrap checks below. Repair
   # those only after the target has been identified as a FreePBX host, but
@@ -250,7 +373,7 @@ acquire_maintenance_coordination() {
 ensure_freepbx_prerequisites() {
   local prerequisite module_list
   module_list="$(fwconsole ma list 2>/dev/null)"
-  for prerequisite in framework dashboard recordings; do
+  for prerequisite in framework dashboard backup recordings; do
     if ! printf '%s\n' "$module_list" | grep -Eq "\\|[[:space:]]*${prerequisite}[[:space:]]*\\|"; then
       log "Installing required FreePBX module: $prerequisite"
       fwconsole ma --no-interaction --ignorecache downloadinstall "$prerequisite" >>"$LOG_FILE" 2>&1 || {
@@ -575,7 +698,8 @@ ensure_required_asterisk_capabilities() {
   ensure_asterisk_capability function IF func_logic.so || return 1
   ensure_asterisk_capability function DB func_db.so || return 1
   ensure_asterisk_capability function CALLERID func_callerid.so || return 1
-  ensure_asterisk_capability application Dial app_dial.so || return 1
+  ensure_asterisk_capability application ConfBridge app_confbridge.so || return 1
+  ensure_asterisk_capability application Page app_page.so || return 1
   ensure_asterisk_capability application ExecIf app_exec.so || return 1
   ensure_asterisk_capability application Gosub app_stack.so || return 1
   ensure_asterisk_capability application Return app_stack.so || return 1
@@ -611,8 +735,8 @@ verify_asterisk_module_startup_persistence() {
     res_pjsip.so res_pjsip_session.so chan_pjsip.so res_pjsip_notify.so \
     pbx_spool.so format_wav.so res_pjsip_header_funcs.so \
     func_pjsip_contact.so func_pjsip_aor.so func_strings.so func_channel.so \
-    func_logic.so func_db.so func_callerid.so app_dial.so app_exec.so \
-    app_stack.so app_verbose.so; do
+    func_logic.so func_db.so func_callerid.so app_exec.so \
+    app_page.so app_confbridge.so app_stack.so app_verbose.so; do
     asterisk_module_starts_persistently "$module_name" || {
       log "Required Asterisk module is available now but is blocked after restart by /etc/asterisk/modules.conf: $module_name"
       log "Enable Asterisk module autoloading or explicitly load that module through the PBX-managed module configuration, then rerun the installer."
@@ -763,18 +887,33 @@ pjsip_dial_string_endpoints_available() {
 
 verify_registered_endpoint_route() {
   local extension="$1"
-  local dial_string route_source
+  local device_route device_aor dial_string route_source
 
   [[ "$extension" =~ ^[0-9]+$ ]] || {
     log "Refusing to validate a nonnumeric paging extension: $extension"
     return 1
   }
 
-  dial_string="$(asterisk_labeled_value "database get DEVICE ${extension}/dial" "Value")"
-  route_source="AstDB DEVICE/${extension}/dial"
+  # Match the managed dialplan: explicit registered contacts are preferred so
+  # Page creates one conference participant per contact instead of allowing a
+  # single endpoint Dial operation to cancel sibling registrations.
+  dial_string="$(asterisk_labeled_value "dialplan eval function PJSIP_DIAL_CONTACTS(${extension})" "Result")"
+  route_source="PJSIP_DIAL_CONTACTS(${extension})"
+  device_route=""
+  device_aor=""
   if [ -z "$dial_string" ]; then
-    dial_string="$(asterisk_labeled_value "dialplan eval function PJSIP_DIAL_CONTACTS(${extension})" "Result")"
-    route_source="PJSIP_DIAL_CONTACTS(${extension})"
+    device_route="$(asterisk_labeled_value "database get DEVICE ${extension}/dial" "Value")"
+    if [[ "$device_route" =~ ^PJSIP/([A-Za-z0-9_.-]+)(/.*)?$ ]]; then
+      device_aor="${BASH_REMATCH[1]}"
+    fi
+    if [ -n "$device_aor" ] && [ "$device_aor" != "$extension" ]; then
+      dial_string="$(asterisk_labeled_value "dialplan eval function PJSIP_DIAL_CONTACTS(${device_aor})" "Result")"
+      route_source="PJSIP_DIAL_CONTACTS(${device_aor}) from AstDB DEVICE/${extension}/dial"
+    fi
+  fi
+  if [ -z "$dial_string" ]; then
+    dial_string="$device_route"
+    route_source="AstDB DEVICE/${extension}/dial fallback"
   fi
   if [ -z "$dial_string" ]; then
     dial_string="PJSIP/${extension}"
@@ -832,9 +971,25 @@ for extension, details in sorted(inventory.items()):
     if phone_format not in supported_formats or any(value not in supported_formats for value in normalized_formats):
         raise SystemExit(f"endpoint {extension} has an unsupported phone format")
     user_agent = " ".join(str(details.get("user_agent") or "").replace("\t", " ").split())[:300]
-    unknown = "1" if phone_format == "unknown" or "unknown" in normalized_formats else "0"
-    print("\t".join((extension, phone_format, str(contacts), unknown, user_agent)))
+    unique_formats = sorted(set(normalized_formats))
+    unknown = "1" if phone_format == "unknown" or "unknown" in unique_formats else "0"
+    mixed = "1" if len(unique_formats) > 1 else "0"
+    print("\t".join((
+        extension,
+        phone_format,
+        str(contacts),
+        unknown,
+        mixed,
+        ",".join(unique_formats),
+        user_agent,
+    )))
 PY
+}
+
+mixed_endpoint_visual_route_supported() {
+  local mixed_format="$1"
+  local routing_mode="$2"
+  [ "$mixed_format" != "1" ] || [ "$routing_mode" = "contact_uri" ]
 }
 
 preflight_platform() {
@@ -883,7 +1038,7 @@ preflight_platform() {
     log "Asterisk uses paths this release does not support; no module files were activated."
     exit 1
   }
-  validate_piper_wrapper_ownership || exit 1
+  validate_piper_wrapper_ownership /usr/local/bin/piper || exit 1
   local module_name
   for module_name in \
     res_pjsip.so res_pjsip_session.so chan_pjsip.so res_pjsip_notify.so \
@@ -1102,8 +1257,8 @@ verify_tgz() {
   actual_sha="$(sha256sum "$TGZ" | awk '{print $1}')"
   if [ -n "$SHA256" ]; then
     echo "$SHA256  $TGZ" | sha256sum -c -
-  elif [ "$(basename "$TGZ")" = "slsmassnotifyserver-0.0.9-beta.tgz" ] && [ "$actual_sha" != "$EXPECTED_TGZ_SHA256" ]; then
-		log "$TGZ does not match the current slsmassnotifyserver-0.0.9-beta package."
+  elif [ "$(basename "$TGZ")" = "slsmassnotifyserver-0.1.0.tgz" ] && [ "$actual_sha" != "$EXPECTED_TGZ_SHA256" ]; then
+		log "$TGZ does not match the current slsmassnotifyserver-0.1.0 package."
     log "Expected SHA256: $EXPECTED_TGZ_SHA256"
     log "Actual SHA256:   $actual_sha"
     log "Remove the stale local TGZ or install with SLS_MASS_NOTIFY_TGZ_URL so the current release is downloaded."
@@ -1147,8 +1302,259 @@ with tarfile.open(archive, "r:gz") as handle:
     root = ET.fromstring(module_xml.read())
     if (root.findtext("rawname") or "").strip() != module:
         raise SystemExit("module.xml rawname does not match the requested module")
-    if (root.findtext("version") or "").strip() != "0.0.9-beta":
-        raise SystemExit("module.xml does not contain the expected 0.0.9-beta version")
+    if (root.findtext("version") or "").strip() != "0.1.0":
+        raise SystemExit("module.xml does not contain the expected 0.1.0 version")
+PY
+}
+
+prepare_settings_lock() {
+  [ ! -L "$CONFIG_FILE" ] || {
+    log "Refusing to install while the protected central configuration is a symbolic link."
+    exit 1
+  }
+  [ -e "$CONFIG_FILE" ] || return 0
+  SETTINGS_LOCK_PATH="$SETTINGS_LOCK" /usr/bin/python3 - <<'PY'
+import os
+import pwd
+import stat
+
+path = os.environ["SETTINGS_LOCK_PATH"]
+parts = [part for part in path.split("/") if part]
+if not path.startswith("/") or not parts or "\x00" in path:
+    raise SystemExit("invalid settings-lock path")
+directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+file_flags = os.O_RDWR | os.O_CLOEXEC | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+parent_fd = os.open("/", directory_flags)
+try:
+    for component in parts[:-1]:
+        next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+        os.close(parent_fd)
+        parent_fd = next_fd
+    file_fd = os.open(parts[-1], file_flags, 0o640, dir_fd=parent_fd)
+    try:
+        metadata = os.fstat(file_fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise SystemExit("settings lock is not a regular file")
+        account = pwd.getpwnam("asterisk")
+        os.fchmod(file_fd, 0o640)
+        os.fchown(file_fd, account.pw_uid, account.pw_gid)
+    finally:
+        os.close(file_fd)
+finally:
+    os.close(parent_fd)
+PY
+}
+
+acquire_settings_coordination() {
+  [ ! -L "$CONFIG_FILE" ] || {
+    log "Refusing to install while the protected central configuration is a symbolic link."
+    exit 1
+  }
+  [ -e "$CONFIG_FILE" ] || return 0
+  prepare_settings_lock
+  [ ! -L "$SETTINGS_LOCK" ] && [ -f "$SETTINGS_LOCK" ] || {
+    log "Refusing to use an unsafe central-configuration lock file."
+    exit 1
+  }
+  exec {CONFIG_LOCK_FD}<>"$SETTINGS_LOCK"
+  flock -x "$CONFIG_LOCK_FD"
+  lock_fd_identity="$(stat -Lc '%d:%i' "/proc/$$/fd/$CONFIG_LOCK_FD" 2>/dev/null || true)"
+  lock_path_identity="$(stat -Lc '%d:%i' "$SETTINGS_LOCK" 2>/dev/null || true)"
+  if [ -z "$lock_fd_identity" ] || [ "$lock_fd_identity" != "$lock_path_identity" ] || [ -L "$SETTINGS_LOCK" ]; then
+    log "The central-configuration lock path changed while the installer acquired it."
+    exit 1
+  fi
+}
+
+safe_config_snapshot() {
+  source_path="$1"
+  snapshot_path="$2"
+  CONFIG_SOURCE_PATH="$source_path" CONFIG_SNAPSHOT_PATH="$snapshot_path" /usr/bin/python3 - <<'PY'
+import hashlib
+import os
+import stat
+
+source_path = os.environ["CONFIG_SOURCE_PATH"]
+snapshot_path = os.environ["CONFIG_SNAPSHOT_PATH"]
+limit = 16 * 1024 * 1024
+
+def open_regular(path, flags):
+    parts = [part for part in path.split("/") if part]
+    if not path.startswith("/") or not parts or "\x00" in path:
+        raise RuntimeError("invalid path")
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    parent_fd = os.open("/", directory_flags)
+    try:
+        for component in parts[:-1]:
+            next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = next_fd
+        file_fd = os.open(parts[-1], flags | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+    if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+        os.close(file_fd)
+        raise RuntimeError("protected config is not a regular file")
+    return file_fd
+
+source_fd = open_regular(source_path, os.O_RDONLY)
+snapshot_fd = open_regular(snapshot_path, os.O_WRONLY | os.O_TRUNC)
+digest = hashlib.sha256()
+total = 0
+try:
+    while True:
+        chunk = os.read(source_fd, 1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise RuntimeError("protected config exceeds the size limit")
+        digest.update(chunk)
+        view = memoryview(chunk)
+        while view:
+            written = os.write(snapshot_fd, view)
+            view = view[written:]
+    os.fsync(snapshot_fd)
+finally:
+    os.close(snapshot_fd)
+    os.close(source_fd)
+print(digest.hexdigest())
+PY
+}
+
+safe_config_hash() {
+  CONFIG_SOURCE_PATH="$1" /usr/bin/python3 - <<'PY'
+import hashlib
+import os
+import stat
+
+path = os.environ["CONFIG_SOURCE_PATH"]
+parts = [part for part in path.split("/") if part]
+if not path.startswith("/") or not parts or "\x00" in path:
+    raise SystemExit(2)
+directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+parent_fd = os.open("/", directory_flags)
+try:
+    for component in parts[:-1]:
+        next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+        os.close(parent_fd)
+        parent_fd = next_fd
+    file_fd = os.open(parts[-1], os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+finally:
+    os.close(parent_fd)
+try:
+    metadata = os.fstat(file_fd)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 16 * 1024 * 1024:
+        raise SystemExit(3)
+    digest = hashlib.sha256()
+    while True:
+        chunk = os.read(file_fd, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+finally:
+    os.close(file_fd)
+print(digest.hexdigest())
+PY
+}
+
+safe_config_restore() {
+  snapshot_path="$1"
+  destination_path="$2"
+  CONFIG_SNAPSHOT_PATH="$snapshot_path" CONFIG_DESTINATION_PATH="$destination_path" /usr/bin/python3 - <<'PY'
+import hashlib
+import os
+import pwd
+import secrets
+import stat
+
+source_path = os.environ["CONFIG_SNAPSHOT_PATH"]
+destination_path = os.environ["CONFIG_DESTINATION_PATH"]
+limit = 16 * 1024 * 1024
+directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+file_nofollow = os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+
+def open_parent(path):
+    parts = [part for part in path.split("/") if part]
+    if not path.startswith("/") or not parts or "\x00" in path:
+        raise RuntimeError("invalid path")
+    parent_fd = os.open("/", directory_flags)
+    for component in parts[:-1]:
+        next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+        os.close(parent_fd)
+        parent_fd = next_fd
+    return parent_fd, parts[-1]
+
+source_parent_fd, source_name = open_parent(source_path)
+try:
+    source_fd = os.open(source_name, os.O_RDONLY | os.O_NONBLOCK | file_nofollow, dir_fd=source_parent_fd)
+finally:
+    os.close(source_parent_fd)
+if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+    os.close(source_fd)
+    raise SystemExit("config snapshot is not a regular file")
+
+destination_parent_fd, destination_name = open_parent(destination_path)
+temporary_name = ".mass-notifications.config.restore." + secrets.token_hex(8)
+temporary_fd = -1
+try:
+    temporary_fd = os.open(
+        temporary_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | file_nofollow,
+        0o600,
+        dir_fd=destination_parent_fd,
+    )
+    total = 0
+    digest = hashlib.sha256()
+    while True:
+        chunk = os.read(source_fd, 1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise RuntimeError("config snapshot exceeds the size limit")
+        digest.update(chunk)
+        view = memoryview(chunk)
+        while view:
+            written = os.write(temporary_fd, view)
+            view = view[written:]
+    account = pwd.getpwnam("asterisk")
+    os.fchmod(temporary_fd, 0o640)
+    os.fchown(temporary_fd, account.pw_uid, account.pw_gid)
+    os.fsync(temporary_fd)
+    os.close(temporary_fd)
+    temporary_fd = -1
+    os.replace(temporary_name, destination_name, src_dir_fd=destination_parent_fd, dst_dir_fd=destination_parent_fd)
+    os.fsync(destination_parent_fd)
+    restored_fd = os.open(destination_name, os.O_RDONLY | os.O_NONBLOCK | file_nofollow, dir_fd=destination_parent_fd)
+    try:
+        metadata = os.fstat(restored_fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o640
+            or metadata.st_uid != account.pw_uid
+            or metadata.st_gid != account.pw_gid
+        ):
+            raise RuntimeError("restored config metadata is invalid")
+        restored = hashlib.sha256()
+        while True:
+            chunk = os.read(restored_fd, 1024 * 1024)
+            if not chunk:
+                break
+            restored.update(chunk)
+        if restored.digest() != digest.digest():
+            raise RuntimeError("restored config digest mismatch")
+    finally:
+        os.close(restored_fd)
+finally:
+    if temporary_fd >= 0:
+        os.close(temporary_fd)
+    try:
+        os.unlink(temporary_name, dir_fd=destination_parent_fd)
+    except FileNotFoundError:
+        pass
+    os.close(destination_parent_fd)
+    os.close(source_fd)
 PY
 }
 
@@ -1159,13 +1565,17 @@ snapshot_config() {
   fi
   [ -r "$CONFIG_FILE" ] || return 0
   CONFIG_SNAPSHOT="$(mktemp /tmp/slsmassnotifyserver-config.XXXXXX)"
-  cp -p "$CONFIG_FILE" "$CONFIG_SNAPSHOT"
-  CONFIG_HASH_BEFORE="$(sha256sum "$CONFIG_FILE" | awk '{print $1}')"
+  if ! CONFIG_HASH_BEFORE="$(safe_config_snapshot "$CONFIG_FILE" "$CONFIG_SNAPSHOT")"; then
+    rm -f "$CONFIG_SNAPSHOT"
+    CONFIG_SNAPSHOT=""
+    log "Refusing to install because the protected central configuration could not be opened safely without following symbolic links."
+    exit 1
+  fi
 }
 
 validate_preserved_config_prerequisites() {
   [ -n "$CONFIG_HASH_BEFORE" ] || return 0
-  if ! CONFIG_PATH="$CONFIG_FILE" /usr/bin/php -r '
+  if ! CONFIG_PATH="$CONFIG_SNAPSHOT" /usr/bin/php -r '
 $path = getenv("CONFIG_PATH");
 $settings = json_decode((string)@file_get_contents($path), true);
 if (!is_array($settings)) {
@@ -1236,16 +1646,24 @@ PY
 
 verify_config_unchanged() {
   [ -n "$CONFIG_HASH_BEFORE" ] || return 0
-  current_hash="$(sha256sum "$CONFIG_FILE" 2>/dev/null | awk '{print $1}')"
+  current_hash="$(safe_config_hash "$CONFIG_FILE" 2>/dev/null || true)"
   if [ "$current_hash" = "$CONFIG_HASH_BEFORE" ]; then
     rm -f "$CONFIG_SNAPSHOT"
     CONFIG_SNAPSHOT=""
     return 0
   fi
-  describe_config_drift "$CONFIG_SNAPSHOT" "$CONFIG_FILE"
-  cp -p "$CONFIG_SNAPSHOT" "$CONFIG_FILE"
-  chown asterisk:asterisk "$CONFIG_FILE" 2>/dev/null || true
-  chmod 0640 "$CONFIG_FILE" 2>/dev/null || true
+  current_snapshot="$(mktemp /tmp/slsmassnotifyserver-config-current.XXXXXX)"
+  if safe_config_snapshot "$CONFIG_FILE" "$current_snapshot" >/dev/null 2>&1; then
+    describe_config_drift "$CONFIG_SNAPSHOT" "$current_snapshot"
+  else
+    log "Config drift: the live protected path became missing, non-regular, or unsafe."
+  fi
+  rm -f "$current_snapshot"
+  if ! ensure_data_directory || ! safe_config_restore "$CONFIG_SNAPSHOT" "$CONFIG_FILE"; then
+    log "CRITICAL: unable to safely restore the protected central config. The original root-owned snapshot remains at $CONFIG_SNAPSHOT."
+    CONFIG_SNAPSHOT=""
+    exit 1
+  fi
   rm -f "$CONFIG_SNAPSHOT"
   CONFIG_SNAPSHOT=""
   refresh_module_install || true
@@ -1333,7 +1751,7 @@ $module = getenv("SLS_MASS_NOTIFY_MODULE") ?: "slsmassnotifyserver";
 $stmt = \FreePBX::Database()->prepare("SELECT version FROM modules WHERE modulename = ? LIMIT 1");
 $stmt->execute([$module]);
 $version = $stmt->fetchColumn();
-exit(is_string($version) && trim($version) === "0.0.9-beta" ? 0 : 1);
+exit(is_string($version) && trim($version) === "0.1.0" ? 0 : 1);
 ' >>"$LOG_FILE" 2>&1
 }
 
@@ -1479,6 +1897,9 @@ EOF
 	  /usr/local/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py \
 	  /usr/local/bin/sls_mass_notify/sls_branded_email.py \
 	  /usr/local/bin/sls_mass_notify/sls_branded_discord.py \
+	  /usr/local/bin/sls_mass_notify/sls_notification_destinations.py \
+	  /usr/local/bin/sls_mass_notify/sls_system_notifications.py \
+	  /usr/local/bin/sls_mass_notify/sls_nws_status.py \
       /usr/local/bin/sls_mass_notify/sls_notify.py \
       /usr/local/bin/sls_mass_notify/sls_config.py 2>/dev/null || true
   fi
@@ -1511,16 +1932,42 @@ EOF
 }
 
 secure_central_config() {
-  if [ -L "$CONFIG_FILE" ] || [ ! -f "$CONFIG_FILE" ]; then
-    log "Protected central configuration is missing or is not a safe regular file after installation."
-    exit 1
-  fi
-  chown asterisk:asterisk "$CONFIG_FILE"
-  chmod 0640 "$CONFIG_FILE"
-  [ "$(stat -c '%a %U:%G' "$CONFIG_FILE")" = "640 asterisk:asterisk" ] || {
+  if ! CONFIG_PATH="$CONFIG_FILE" /usr/bin/python3 - <<'PY'
+import os
+import pwd
+import stat
+
+path = os.environ["CONFIG_PATH"]
+parts = [part for part in path.split("/") if part]
+if not path.startswith("/") or not parts or "\x00" in path:
+    raise SystemExit(2)
+directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+parent_fd = os.open("/", directory_flags)
+try:
+    for component in parts[:-1]:
+        next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+        os.close(parent_fd)
+        parent_fd = next_fd
+    file_fd = os.open(parts[-1], os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+finally:
+    os.close(parent_fd)
+try:
+    metadata = os.fstat(file_fd)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit(3)
+    account = pwd.getpwnam("asterisk")
+    os.fchmod(file_fd, 0o640)
+    os.fchown(file_fd, account.pw_uid, account.pw_gid)
+    verified = os.fstat(file_fd)
+    if stat.S_IMODE(verified.st_mode) != 0o640 or verified.st_uid != account.pw_uid or verified.st_gid != account.pw_gid:
+        raise SystemExit(4)
+finally:
+    os.close(file_fd)
+PY
+  then
     log "Protected central configuration permissions or ownership could not be secured."
     exit 1
-  }
+  fi
 }
 
 validate_ami_health_file() {
@@ -2017,13 +2464,43 @@ verify_install() {
     log "The SLS Mass Notify module is not enabled after installation."
     exit 1
   }
-  for required_module in framework dashboard recordings; do
+  for required_module in framework dashboard backup recordings; do
     printf '%s\n' "$module_list" \
       | grep -Eq "\\|[[:space:]]*${required_module}[[:space:]]*\\|[^|]*\\|[[:space:]]*Enabled[[:space:]]*\\|" || {
         log "Required FreePBX module is not enabled after installation: $required_module"
         exit 1
       }
   done
+  if ! php -r '
+require "/etc/freepbx.conf";
+$freepbx = \FreePBX::Create();
+if (!$freepbx->Modules->checkStatus("backup")) {
+    fwrite(STDERR, "FreePBX Backup is not enabled.\n");
+    exit(1);
+}
+$available = $freepbx->Backup->getModules();
+if (!is_array($available) || !isset($available["slsmassnotifyserver"])) {
+    fwrite(STDERR, "FreePBX did not discover the Mass Notify native backup adapter.\n");
+    exit(2);
+}
+$enrollment = $freepbx->Slsmassnotifyserver->ensureFreePbxBackupEnrollment();
+$health = $freepbx->Slsmassnotifyserver->getFreePbxBackupHealth();
+$jobs = (int)($enrollment["jobs"] ?? 0);
+$enrolled = (int)($enrollment["enrolled"] ?? 0);
+if (empty($enrollment["success"]) || $jobs !== $enrolled || ($health["state"] ?? "") !== "ok") {
+    fwrite(STDERR, "Mass Notify backup enrollment verification failed.\n");
+    exit(3);
+}
+if ($jobs === 0) {
+    echo "Native FreePBX backup adapter verified; this PBX has no administrator-defined module backup jobs yet.\n";
+} else {
+    echo "Native FreePBX backup adapter verified and enrolled in {$enrolled} module backup job(s).\n";
+}
+exit(0);
+' >>"$LOG_FILE" 2>&1; then
+    log "Native FreePBX backup integration verification failed. See $LOG_FILE."
+    exit 1
+  fi
   ensure_required_asterisk_capabilities || {
     log "Required Asterisk paging capabilities disappeared after FreePBX reload."
     exit 1
@@ -2034,10 +2511,21 @@ verify_install() {
   }
   audio_dialplan="$(asterisk -rx "dialplan show 1000@sls-alert-audio" 2>&1)"
   printf '%s\n' "$audio_dialplan"
-  printf '%s\n' "$audio_dialplan" | grep -Fq 'b(sls-alert-autoanswer^s^1(${EXTEN}))A(${SLS_SAFE_SOUND})' || {
-    log "The SLS audio paging context is missing its portable auto-answer and audio playback handler."
+  printf '%s\n' "$audio_dialplan" | grep -Fq 'Page(${SLS_DIAL},b(sls-alert-autoanswer^s^1(${EXTEN}))A(${SLS_SAFE_SOUND})inq,5)' || {
+    log "The SLS audio paging context is missing its multi-contact Page/ConfBridge auto-answer and audio handler."
     exit 1
   }
+  if printf '%s\n' "$audio_dialplan" | grep -Fq 'Dial(${SLS_DIAL}'; then
+    log "The SLS audio paging context still uses first-answer Dial semantics instead of multi-contact Page semantics."
+    exit 1
+  fi
+  dynamic_contacts_line="$(printf '%s\n' "$audio_dialplan" | grep -nFm1 'Set(SLS_DIAL=${PJSIP_DIAL_CONTACTS(${EXTEN})})' | cut -d: -f1)"
+  device_fallback_line="$(printf '%s\n' "$audio_dialplan" | grep -nFm1 'Set(SLS_DIAL=${SLS_DEVICE_DIAL})' | cut -d: -f1)"
+  if ! [[ "$dynamic_contacts_line" =~ ^[0-9]+$ && "$device_fallback_line" =~ ^[0-9]+$ ]] \
+    || [ "$dynamic_contacts_line" -ge "$device_fallback_line" ]; then
+    log "The SLS audio paging context does not prefer explicit PJSIP contacts before its AstDB endpoint fallback."
+    exit 1
+  fi
   if printf '%s\n' "$audio_dialplan" | grep -Eq 'macro-autoanswer|b\(autoanswer\^'; then
     log "The SLS audio paging context still depends on a FreePBX internal auto-answer context."
     exit 1
@@ -2057,6 +2545,10 @@ verify_install() {
   }
   printf '%s\n' "$autoanswer_dialplan" | grep -Fq 'PJSIP_AOR(${SLS_AUTOANSWER_AOR},contact)' || {
     log "The SLS PJSIP auto-answer context is missing its extension/AOR contact fallback."
+    exit 1
+  }
+  printf '%s\n' "$autoanswer_dialplan" | grep -Fq '${SLS_AUTOANSWER_UA:0:7}"="yealink"]?Set(SLS_ALERT_INFO=Intercom)' || {
+    log "The SLS PJSIP auto-answer context is missing the Yealink Intercom Alert-Info policy."
     exit 1
   }
   command -v runuser >/dev/null 2>&1 || {
@@ -2196,7 +2688,30 @@ exit(0);
     log "Piper compatibility executable is missing at $DATA_DIR/piper/venv/bin/piper."
     exit 1
   }
-  python3 -c 'compile(open("/usr/local/bin/sls_mass_notify/sls_notify.py", encoding="utf-8").read(), "/usr/local/bin/sls_mass_notify/sls_notify.py", "exec"); compile(open("/usr/local/bin/sls_mass_notify/sls_config.py", encoding="utf-8").read(), "/usr/local/bin/sls_mass_notify/sls_config.py", "exec")'
+  runtime_python_files=(
+    /usr/local/bin/sls_mass_notify/sls_notify.py
+    /usr/local/bin/sls_mass_notify/sls_config.py
+    /usr/local/bin/sls_mass_notify/sls_branded_email.py
+    /usr/local/bin/sls_mass_notify/sls_branded_discord.py
+    /usr/local/bin/sls_mass_notify/sls_notification_destinations.py
+    /usr/local/bin/sls_mass_notify/sls_system_notifications.py
+    /usr/local/bin/sls_mass_notify/sls_nws_status.py
+    /usr/local/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py
+  )
+  for runtime_python in "${runtime_python_files[@]}"; do
+    [ -x "$runtime_python" ] || {
+      log "Required Python runtime is missing or not executable: $runtime_python"
+      exit 1
+    }
+  done
+  python3 - "${runtime_python_files[@]}" <<'PY'
+import pathlib
+import sys
+
+for value in sys.argv[1:]:
+    path = pathlib.Path(value)
+    compile(path.read_text(encoding="utf-8"), str(path), "exec")
+PY
   config_dump="$(mktemp /tmp/sls-mass-notify-config-check.XXXXXX)"
   /usr/local/bin/sls_mass_notify/sls_config.py "$CONFIG_FILE" >"$config_dump"
   rm -f "$config_dump"
@@ -2299,12 +2814,27 @@ PY
   fi
 
   registered_endpoint_count=0
-  while IFS=$'\t' read -r extension phone_format contact_count unknown_format user_agent; do
+  yealink_endpoint_list=""
+  while IFS=$'\t' read -r extension phone_format contact_count unknown_format mixed_format formats_csv user_agent; do
     [ -n "$extension" ] || continue
     registered_endpoint_count=$((registered_endpoint_count + 1))
     if [ "$unknown_format" = "1" ]; then
       log "Warning: registered endpoint $extension has an unknown phone format (user agent: ${user_agent:-not reported})."
       log "A safe generic SIP NOTIFY fallback will be used; add a Phone Format Override after confirming the device family."
+    fi
+    case ",${formats_csv}," in
+      *,yealink,*|*,yealink_text,*)
+        yealink_endpoint_list="${yealink_endpoint_list}${yealink_endpoint_list:+,}${extension}"
+        ;;
+    esac
+    if ! mixed_endpoint_visual_route_supported "$mixed_format" "$notify_routing_mode"; then
+      rm -f "$endpoint_inventory" "$endpoint_inventory_err"
+      log "Registered extension $extension has mixed phone formats ($formats_csv), but Asterisk has no usable default_outbound_endpoint for contact-URI SIP NOTIFY."
+      log "Installation is stopping before commit because visual delivery would be known-broken for that extension. Configure a valid PBX-managed default outbound endpoint, use one phone family per extension, or apply an explicit format override and rerun the installer."
+      exit 1
+    fi
+    if [ "$mixed_format" = "1" ]; then
+      log "Warning: extension $extension has mixed registered phone formats ($formats_csv). Distinct contact-URI SIP NOTIFY submission is available; runtime delivery remains fail-closed if any registration URI cannot be resolved."
     fi
     if ! verify_registered_endpoint_route "$extension"; then
       rm -f "$endpoint_inventory" "$endpoint_inventory_err"
@@ -2313,6 +2843,11 @@ PY
     fi
     log "Registered endpoint $extension discovery verified through AMI: format=$phone_format contacts=$contact_count."
   done <<<"$endpoint_records"
+
+  if [ -n "$yealink_endpoint_list" ]; then
+    log "Warning: Yealink registration(s) detected on extension(s) $yealink_endpoint_list. Auto-answer requires the phone's Intercom Allow policy; XML SIP NOTIFY display requires push_xml.sip_notify = 1 (Features > Remote Control > SIP Notify)."
+    log "The installer does not modify handset provisioning, firmware, or SIP peers. Confirm these settings on each Yealink phone or in its authorized provisioning template."
+  fi
 
   if [ "$registered_endpoint_count" -eq 0 ]; then
     log "No registered numeric PJSIP contacts are present; AMI discovery and empty-PBX handling were verified."
@@ -2366,6 +2901,7 @@ PY
   update_count="$(printf '%s\n' "$root_cron" | grep -Fc '/usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh' || true)"
   maintenance_count="$(printf '%s\n' "$root_cron" | grep -Fc '/usr/local/bin/sls_mass_notify/sls_mass_notify_maintenance.sh' || true)"
   weather_count="$(printf '%s\n' "$asterisk_cron" | grep -Fc '/usr/local/bin/sls_mass_notify/sls_mass_notify_weather_poll.sh' || true)"
+  weather_canonical_count="$(printf '%s\n' "$asterisk_cron" | grep -Fxc '* * * * * /usr/bin/timeout 1200 /usr/local/bin/sls_mass_notify/sls_mass_notify_weather_poll.sh' || true)"
   schedule_count="$(printf '%s\n' "$asterisk_cron" | grep -Fc '/usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php' || true)"
   schedule_canonical_count="$(printf '%s\n' "$asterisk_cron" | grep -Fxc '* * * * * /usr/bin/timeout 1200 /usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php' || true)"
   if [ "$update_count" -ne 1 ]; then
@@ -2376,8 +2912,8 @@ PY
     log "Expected exactly one root maintenance cron entry; found $maintenance_count."
     exit 1
   fi
-  if [ "$weather_count" -ne 1 ]; then
-    log "Expected exactly one Asterisk weather scheduler cron entry; found $weather_count."
+  if [ "$weather_count" -ne 1 ] || [ "$weather_canonical_count" -ne 1 ]; then
+    log "Expected exactly one canonical Asterisk weather scheduler cron entry; found $weather_count total and $weather_canonical_count canonical."
     exit 1
   fi
   if [ "$schedule_count" -ne 1 ] || [ "$schedule_canonical_count" -ne 1 ]; then
@@ -2414,29 +2950,35 @@ PY
 main() {
   cd /tmp
   : >"$LOG_FILE"
+  trap guard_config_on_exit EXIT
+  set_install_stage "platform validation" "Confirm this is a healthy FreePBX 17 host with working database, Asterisk, fwconsole, package repositories, and local AMI access, then rerun the installer."
   require_freepbx
   acquire_maintenance_coordination
+  set_install_stage "dependency installation" "Restore Debian package repository access and install the prerequisite named in the installer log, then rerun the installer."
   install_dependencies
   preflight_platform
   preflight_python
   ensure_freepbx_prerequisites
+  set_install_stage "release download and validation" "Confirm the release URL and checksum, restore GitHub or network access if needed, and rerun the installer."
   download_tgz
   verify_tgz
+  acquire_settings_coordination
   snapshot_config
   validate_preserved_config_prerequisites
-  trap guard_config_on_exit EXIT
+  set_install_stage "module activation" "Run fwconsole ma list and inspect the installer log for the rejected module or signature check, correct that condition, then rerun the installer."
   stage_module_directory
   activate_staged_module
   ensure_local_signer
   if ! SLS_MASS_NOTIFY_DEFER_SIGNING=1 fwconsole ma install "$MODULE" >>"$LOG_FILE" 2>&1; then
     if ! module_registered_at_expected_version; then
-		log "FreePBX rejected the module installation before registering version 0.0.9-beta. See $LOG_FILE."
+		log "FreePBX rejected the module installation before registering version 0.1.0. See $LOG_FILE."
       exit 1
     fi
-	log "FreePBX registered version 0.0.9-beta but reported a nonfatal install status; runtime verification will continue."
+	log "FreePBX registered version 0.1.0 but reported a nonfatal install status; runtime verification will continue."
   fi
   fwconsole ma enable "$MODULE" >>"$LOG_FILE" 2>&1 || true
   SLS_MASS_NOTIFY_MODULE="$MODULE" sync_module_version
+  set_install_stage "runtime integration" "Use General Settings > Danger Zone > Repair Installation after correcting the reported Asterisk, Apache, cron, signer, or filesystem prerequisite."
   ensure_runtime_installed
   asterisk -rx "module reload res_pjsip_notify.so" >>"$LOG_FILE" 2>&1 || true
   ensure_piper_runtime
@@ -2454,10 +2996,12 @@ main() {
   fwconsole reload
   repair_runtime_permissions
   asterisk -rx "dialplan reload" || true
+  set_install_stage "post-install verification" "Review the failed verification in /tmp/slsmassnotifyserver-install.log, correct that PBX-specific prerequisite, and rerun the installer or Repair Installation."
   verify_piper_voices
   verify_install
   verify_config_unchanged
   INSTALL_COMMITTED=1
+  clear_install_failure
   log "SLS Mass Notify install finished."
 }
 

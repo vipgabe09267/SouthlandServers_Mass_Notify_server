@@ -39,16 +39,35 @@ PY
 
 python3 "${ROOT_DIR}/tools/test_release_portability.py"
 bash "${ROOT_DIR}/tools/test_installer_asterisk_capabilities.sh"
+bash "${ROOT_DIR}/tools/test_installer_config_safety.sh"
 bash "${ROOT_DIR}/tools/test_local_signer.sh"
 bash "${ROOT_DIR}/tools/test_uninstaller_signer_snapshot.sh"
 php "${ROOT_DIR}/tools/test_scheduling_contract.php"
+php "${ROOT_DIR}/tools/test_announcement_delivery_contract.php"
 python3 "${ROOT_DIR}/tools/test_announcement_display_timeout.py"
 php "${ROOT_DIR}/tools/test_desktop_announcement_expiry.php"
 php "${ROOT_DIR}/tools/test_email_sender_domain.php"
 python3 "${ROOT_DIR}/tools/test_email_sender_domain.py"
+php "${ROOT_DIR}/tools/test_notification_destinations.php"
+python3 "${ROOT_DIR}/tools/test_notification_destinations.py"
+php "${ROOT_DIR}/tools/test_nws_zone_destinations.php"
+python3 "${ROOT_DIR}/tools/test_nws_zone_destinations.py"
+php "${ROOT_DIR}/tools/test_configuration_security_contract.php"
+php "${ROOT_DIR}/tools/test_ui_performance_contract.php"
+python3 "${ROOT_DIR}/tools/test_external_delivery_retry.py"
+python3 "${ROOT_DIR}/tools/test_system_notifications.py"
+python3 "${ROOT_DIR}/tools/test_sls_notify_journal.py"
+python3 "${ROOT_DIR}/tools/test_xweather_runtime_safety.py"
 python3 "${ROOT_DIR}/tools/test_xweather_manual_test_status.py"
+python3 "${ROOT_DIR}/tools/test_xweather_usage_period.py"
+php "${ROOT_DIR}/tools/test_xweather_usage_period.php"
+python3 "${ROOT_DIR}/tools/test_xweather_groups.py"
+php "${ROOT_DIR}/tools/test_xweather_groups.php"
 python3 "${ROOT_DIR}/tools/test_nws_alert_dedup.py"
+python3 "${ROOT_DIR}/tools/test_nws_status_concurrency.py"
 python3 "${ROOT_DIR}/tools/test_alert_worker_cli_safety.py"
+python3 "${ROOT_DIR}/tools/test_weather_manual_test_contract.py"
+php "${ROOT_DIR}/tools/test_freepbx_backup_restore.php"
 
 cmp -s "${ROOT_DIR}/tools/uninstall_release.sh" "${ROOT_DIR}/${MODULE}/bin/sls_mass_notify_uninstall.sh" || {
   printf 'Standalone and packaged uninstallers differ.\n' >&2
@@ -111,7 +130,7 @@ if grep -RIlE 'ghp_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|-----BEGIN ([A-Z0-9 ]+ 
 fi
 
 for required in \
-  module.xml Slsmassnotifyserver.class.php install.php uninstall.php \
+  module.xml Slsmassnotifyserver.class.php Backup.php Restore.php install.php uninstall.php \
   page.slsmassnotifyserver_scheduling.php views/scheduling.php \
   page.slsmassnotifyserver_lightning.php views/lightning.php \
   api/sipnotify/index.php \
@@ -120,6 +139,9 @@ for required in \
   bin/sls_mass_notify/sls_notify.py bin/sls_mass_notify/sls_config.py \
   bin/sls_mass_notify/sls_branded_email.py \
   bin/sls_mass_notify/sls_branded_discord.py \
+  bin/sls_mass_notify/sls_notification_destinations.py \
+  bin/sls_mass_notify/sls_system_notifications.py \
+  bin/sls_mass_notify/sls_nws_status.py \
   bin/sls_mass_notify_nws_poll.sh bin/sls_mass_notify_test.sh \
   bin/sls_mass_notify_weather_poll.sh \
   bin/sls_mass_notify_schedule_worker.php \
@@ -139,7 +161,7 @@ for required in \
   }
 done
 
-tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner --mode='go-w' \
   --exclude='module.sig' --exclude='__pycache__' --exclude='*.pyc' \
   -C "${ROOT_DIR}" -cf - "${MODULE}" | gzip -n -9 > "${PACKAGE}"
 chmod 0640 "${PACKAGE}"
@@ -178,6 +200,14 @@ with tarfile.open(archive, "r:gz") as handle:
     if (root.findtext("version") or "").strip() != version:
         raise SystemExit("module version mismatch")
 PY
+
+EXPECTED_INSTALLER_HASH="$(sed -n 's/^EXPECTED_TGZ_SHA256="\([0-9a-f]\{64\}\)"$/\1/p' "${ROOT_DIR}/tools/install_release.sh")"
+ACTUAL_PACKAGE_HASH="$(sha256sum "${PACKAGE}" | awk '{print $1}')"
+if [ -z "${EXPECTED_INSTALLER_HASH}" ] || [ "${ACTUAL_PACKAGE_HASH}" != "${EXPECTED_INSTALLER_HASH}" ]; then
+  printf 'Installer/package SHA-256 mismatch. Expected %s but built %s.\n' \
+    "${EXPECTED_INSTALLER_HASH:-missing}" "${ACTUAL_PACKAGE_HASH}" >&2
+  exit 1
+fi
 
 sha256sum "${PACKAGE}"
 printf '%s\n' "${PACKAGE}"

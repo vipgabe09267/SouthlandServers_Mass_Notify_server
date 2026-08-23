@@ -2,7 +2,7 @@
 	<rawname>slsmassnotifyserver</rawname>
 	<repo>custom</repo>
 	<name>Southland Servers Mass Notifications Server</name>
-	<version>0.0.9-beta</version>
+	<version>0.1.0</version>
 	<publisher>Southland Servers</publisher>
 	<license>AGPLv3+</license>
 	<licenselink>http://www.gnu.org/licenses/agpl-3.0.txt</licenselink>
@@ -27,12 +27,16 @@
 		<version>17.0</version>
 		<module>framework ge 17.0.0</module>
 		<module>dashboard ge 17.0.0</module>
+		<module>backup ge 17.0.0</module>
 		<module>recordings ge 17.0.0</module>
 	</depends>
 	<hooks>
 		<dashboard class="Overview" namespace="FreePBX\modules\Dashboard\Sections">
 			<method callingMethod="getSummary" class="Slsmassnotifyserver" namespace="FreePBX\modules">dashboardService</method>
 		</dashboard>
+		<Backup class="Backup" namespace="FreePBX\modules">
+			<method callingMethod="postrestoreModulehook" class="Slsmassnotifyserver" namespace="FreePBX\modules">postRestoreHook</method>
+		</Backup>
 	</hooks>
 	<location/>
 	<md5sum/>

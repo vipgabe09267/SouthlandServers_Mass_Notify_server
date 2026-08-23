@@ -200,14 +200,114 @@ function retention_days(array $settings): int
     return min(365, max(1, (int)($settings['log_retention_days'] ?? 90)));
 }
 
+function atomic_replace_journal(string $eventsFile, string $contents, ?callable $replaceFile = null): bool
+{
+    $directory = realpath(dirname($eventsFile));
+    if (!is_string($directory) || $directory === '' || !is_dir($directory)) {
+        return false;
+    }
+    $directoryHandle = @fopen($directory, 'r');
+    if ($directoryHandle === false) {
+        return false;
+    }
+    $temporary = @tempnam($directory, '.sipnotify_events.');
+    if (!is_string($temporary) || $temporary === '' || realpath(dirname($temporary)) !== $directory) {
+        if (is_string($temporary) && $temporary !== '') {
+            @unlink($temporary);
+        }
+        fclose($directoryHandle);
+        return false;
+    }
+
+    $temporaryHandle = null;
+    $committed = false;
+    try {
+        $temporaryHandle = @fopen($temporary, 'wb');
+        if ($temporaryHandle === false) {
+            return false;
+        }
+        $offset = 0;
+        $length = strlen($contents);
+        while ($offset < $length) {
+            $written = @fwrite($temporaryHandle, substr($contents, $offset));
+            if (!is_int($written) || $written <= 0) {
+                return false;
+            }
+            $offset += $written;
+        }
+        if (!@fflush($temporaryHandle)) {
+            return false;
+        }
+        if (function_exists('fsync') && !@fsync($temporaryHandle)) {
+            return false;
+        }
+        fclose($temporaryHandle);
+        $temporaryHandle = null;
+        @chmod($temporary, 0640);
+        @chown($temporary, 'asterisk');
+        @chgrp($temporary, 'asterisk');
+
+        if ($replaceFile === null) {
+            $replaceFile = static function (string $source, string $destination): bool {
+                return @rename($source, $destination);
+            };
+        }
+        if (!$replaceFile($temporary, $eventsFile)) {
+            return false;
+        }
+        $committed = true;
+        if (function_exists('fsync')) {
+            @fsync($directoryHandle);
+        }
+        return true;
+    } finally {
+        if (is_resource($temporaryHandle)) {
+            fclose($temporaryHandle);
+        }
+        if (!$committed && (file_exists($temporary) || is_link($temporary))) {
+            @unlink($temporary);
+        }
+        fclose($directoryHandle);
+    }
+}
+
 function retained_events(array $settings): array
 {
-    $handle = @fopen(EVENTS_FILE, 'c+');
+    $eventsFile = EVENTS_FILE;
+    $lockFile = $eventsFile . '.lock';
+    if (is_link($lockFile)) {
+        respond(503, ['ok' => false, 'error' => 'journal_lock_unavailable']);
+    }
+    $lockHandle = @fopen($lockFile, 'c+');
+    if ($lockHandle === false || is_link($lockFile)) {
+        if (is_resource($lockHandle)) {
+            fclose($lockHandle);
+        }
+        respond(503, ['ok' => false, 'error' => 'journal_lock_unavailable']);
+    }
+    @chmod($lockFile, 0640);
+    @chown($lockFile, 'asterisk');
+    @chgrp($lockFile, 'asterisk');
+    if (!flock($lockHandle, LOCK_EX)) {
+        fclose($lockHandle);
+        respond(503, ['ok' => false, 'error' => 'journal_locked']);
+    }
+
+    if (is_link($eventsFile)) {
+        flock($lockHandle, LOCK_UN);
+        fclose($lockHandle);
+        respond(503, ['ok' => false, 'error' => 'journal_unavailable']);
+    }
+    $handle = @fopen($eventsFile, 'c+');
     if ($handle === false) {
+        flock($lockHandle, LOCK_UN);
+        fclose($lockHandle);
         respond(503, ['ok' => false, 'error' => 'journal_unavailable']);
     }
     if (!flock($handle, LOCK_EX)) {
         fclose($handle);
+        flock($lockHandle, LOCK_UN);
+        fclose($lockHandle);
         respond(503, ['ok' => false, 'error' => 'journal_locked']);
     }
     rewind($handle);
@@ -230,15 +330,18 @@ function retained_events(array $settings): array
         return (string)json_encode($event, JSON_UNESCAPED_SLASHES);
     }, $events));
     $normalized .= $normalized === '' ? '' : "\n";
-    if ($normalized !== $raw) {
-        rewind($handle);
-        ftruncate($handle, 0);
-        fwrite($handle, $normalized);
-        fflush($handle);
+    if ($normalized !== $raw && !atomic_replace_journal($eventsFile, $normalized)) {
+        flock($handle, LOCK_UN);
+        fclose($handle);
+        flock($lockHandle, LOCK_UN);
+        fclose($lockHandle);
+        respond(503, ['ok' => false, 'error' => 'journal_persist_failed']);
     }
     flock($handle, LOCK_UN);
     fclose($handle);
-    @chmod(EVENTS_FILE, 0640);
+    flock($lockHandle, LOCK_UN);
+    fclose($lockHandle);
+    @chmod($eventsFile, 0640);
     return $events;
 }
 

@@ -345,9 +345,14 @@ if (strlen($rawBody) > 65536) {
     respond(413, ['ok' => false, 'error' => 'request_too_large']);
 }
 $body = json_decode($rawBody, true);
-if (!is_array($body)) {
+if (!is_array($body) || array_is_list($body)) {
     audit_control_api($clientIp, 'invalid_json', 400, false);
-    respond(400, ['ok' => false, 'error' => 'invalid_json']);
+    respond(400, ['ok' => false, 'error' => 'json_object_required']);
+}
+
+if (!array_key_exists('action', $body) || !is_string($body['action'])) {
+    audit_control_api($clientIp, 'invalid_action', 400, false);
+    respond(400, ['ok' => false, 'error' => 'action_must_be_string']);
 }
 
 $action = strtolower(trim((string)($body['action'] ?? '')));

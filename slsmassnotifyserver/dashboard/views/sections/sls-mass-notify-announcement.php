@@ -63,12 +63,22 @@ $csrfToken = (string)($csrf_token ?? '');
 #dashboard-sls-mass-notify-announcement .sls-action-row {
 	display: flex;
 	align-items: center;
-	justify-content: space-between;
+	justify-content: flex-start;
 	gap: 12px;
 	padding: 13px 15px;
 	border-radius: 8px;
 	background: #f8fafc;
 	border: 1px solid #dfe5ec;
+}
+#dashboard-sls-mass-notify-announcement .sls-announcement-inline-status {
+	flex: 1 1 260px;
+	min-width: 0;
+	margin: 0;
+	padding: 8px 11px;
+	overflow-wrap: anywhere;
+}
+#dashboard-sls-mass-notify-announcement .sls-announcement-cooldown {
+	flex: 0 0 auto;
 }
 #dashboard-sls-mass-notify-announcement .sls-target-list {
 	max-height: 145px;
@@ -129,6 +139,7 @@ $csrfToken = (string)($csrf_token ?? '');
 	#dashboard-sls-mass-notify-announcement .sls-target-card { margin-bottom: 10px; }
 	#dashboard-sls-mass-notify-announcement .sls-action-row { display: block; }
 	#dashboard-sls-mass-notify-announcement .sls-action-row .btn { width: 100%; margin-bottom: 8px; }
+	#dashboard-sls-mass-notify-announcement .sls-announcement-inline-status { margin: 0 0 8px; }
 }
 </style>
 <div class="container-fluid" id="dashboard-sls-mass-notify-announcement" data-quiet-hours-active="<?php echo $quietHoursActive ? '1' : '0'; ?>">
@@ -162,7 +173,7 @@ $csrfToken = (string)($csrf_token ?? '');
 	</div>
 	<?php return; ?>
 	<?php } ?>
-	<div id="dashboard-sls-mass-notify-announcement-result" style="display: none;"></div>
+	<div id="dashboard-sls-mass-notify-group-result" style="display: none;"></div>
 	<p class="sls-widget-intro"><?php echo _('Build an announcement from top to bottom: choose recipients, write the message, select delivery options, then send.'); ?></p>
 		<form id="dashboard-sls-mass-notify-announcement-form" method="post" action="config.php?display=slsmassnotifyserver">
 			<input type="hidden" name="slsmassnotifyserver_action" value="send_announcement">
@@ -312,7 +323,8 @@ $csrfToken = (string)($csrf_token ?? '');
 		<div class="sls-action-row"><button type="submit" id="dashboard-sls-mass-notify-announcement-submit" class="btn btn-warning" <?php echo $announcementCooldown > 0 ? 'disabled' : ''; ?>>
 			<?php echo _('Send Announcement'); ?>
 		</button>
-		<span id="dashboard-sls-mass-notify-announcement-cooldown" class="text-muted" data-remaining="<?php echo $announcementCooldown; ?>" style="margin-left: 10px;">
+		<div id="dashboard-sls-mass-notify-announcement-result" class="sls-announcement-inline-status" role="status" aria-live="polite" aria-atomic="true" aria-busy="false" style="display: none;"></div>
+		<span id="dashboard-sls-mass-notify-announcement-cooldown" class="text-muted sls-announcement-cooldown" data-remaining="<?php echo $announcementCooldown; ?>">
 			<?php echo $announcementCooldown > 0 ? sprintf(_('Cooldown: %ss'), $announcementCooldown) : ''; ?>
 		</span>
 		</div>
@@ -399,6 +411,7 @@ $csrfToken = (string)($csrf_token ?? '');
 	var submit = document.getElementById('dashboard-sls-mass-notify-announcement-submit');
 	var cooldown = document.getElementById('dashboard-sls-mass-notify-announcement-cooldown');
 	var result = document.getElementById('dashboard-sls-mass-notify-announcement-result');
+	var groupResult = document.getElementById('dashboard-sls-mass-notify-group-result');
 	var groupList = document.getElementById('dashboard-announcement-groups');
 	var newGroup = document.getElementById('dashboard-announcement-new-group');
 	var groupForm = document.getElementById('dashboard-announcement-group-form');
@@ -433,8 +446,17 @@ $csrfToken = (string)($csrf_token ?? '');
 			}
 		}, 40);
 	}
-	if (!form || !submit || !cooldown || !result) {
+	if (!form || !submit || !cooldown || !result || !groupResult) {
 		return;
+	}
+	function setAnnouncementStatus(level, message, busy) {
+		var normalizedLevel = ['success', 'warning', 'danger', 'info'].indexOf(level) >= 0 ? level : 'info';
+		result.style.display = 'block';
+		result.className = 'alert alert-' + normalizedLevel + ' sls-announcement-inline-status';
+		result.setAttribute('aria-live', normalizedLevel === 'danger' ? 'assertive' : 'polite');
+		result.setAttribute('aria-busy', busy ? 'true' : 'false');
+		result.textContent = message;
+		scheduleDashboardLayout();
 	}
 	var groups = Array.isArray(initialGroups) ? initialGroups : [];
 	function renderColorDesigner() {
@@ -563,18 +585,18 @@ $csrfToken = (string)($csrf_token ?? '');
 			fetch(form.action, {method: 'POST', credentials: 'same-origin', body: body})
 				.then(parseJsonResponse)
 			.then(function(data) {
-				result.style.display = 'block';
-				result.className = 'alert alert-' + (data && data.success ? 'success' : 'warning');
-				result.textContent = data && data.message ? data.message : 'Group request finished.';
+				groupResult.style.display = 'block';
+				groupResult.className = 'alert alert-' + (data && data.success ? 'success' : 'warning');
+				groupResult.textContent = data && data.message ? data.message : 'Group request finished.';
 				if (data && Array.isArray(data.groups)) {
 					groups = data.groups;
 					renderGroups();
 				}
 			})
 				.catch(function(error) {
-					result.style.display = 'block';
-					result.className = 'alert alert-danger';
-					result.textContent = 'Group request failed: ' + (error && error.message ? error.message : 'unknown error');
+					groupResult.style.display = 'block';
+					groupResult.className = 'alert alert-danger';
+					groupResult.textContent = 'Group request failed: ' + (error && error.message ? error.message : 'unknown error');
 				});
 	}
 		function selectedGroupOfflineExtensions() {
@@ -613,9 +635,9 @@ $csrfToken = (string)($csrf_token ?? '');
 				fetch(form.action, {method: 'POST', credentials: 'same-origin', body: new FormData(groupForm)})
 					.then(parseJsonResponse)
 				.then(function(data) {
-					result.style.display = 'block';
-					result.className = 'alert alert-' + (data && data.success ? 'success' : 'warning');
-					result.textContent = data && data.message ? data.message : 'Group request finished.';
+					groupResult.style.display = 'block';
+					groupResult.className = 'alert alert-' + (data && data.success ? 'success' : 'warning');
+					groupResult.textContent = data && data.message ? data.message : 'Group request finished.';
 					if (data && Array.isArray(data.groups)) {
 						groups = data.groups;
 						renderGroups();
@@ -625,14 +647,20 @@ $csrfToken = (string)($csrf_token ?? '');
 					}
 				})
 					.catch(function(error) {
-						result.style.display = 'block';
-						result.className = 'alert alert-danger';
-						result.textContent = 'Group request failed: ' + (error && error.message ? error.message : 'unknown error');
+						groupResult.style.display = 'block';
+						groupResult.className = 'alert alert-danger';
+						groupResult.textContent = 'Group request failed: ' + (error && error.message ? error.message : 'unknown error');
 					});
 		});
 	}
 	var remaining = parseInt(cooldown.getAttribute('data-remaining') || '0', 10) || 0;
+	var deliveryOutcomeUnknown = false;
 	function renderCooldown() {
+		if (deliveryOutcomeUnknown) {
+			submit.disabled = true;
+			cooldown.textContent = 'Checking delivery status…';
+			return;
+		}
 		if (remaining > 0) {
 			submit.disabled = true;
 			cooldown.textContent = 'Cooldown: ' + remaining + 's';
@@ -652,6 +680,7 @@ $csrfToken = (string)($csrf_token ?? '');
 				.then(parseJsonResponse)
 			.then(function(data) {
 				if (data && data.cooldowns && data.cooldowns.announcement) {
+					deliveryOutcomeUnknown = false;
 					remaining = parseInt(data.cooldowns.announcement.remaining || '0', 10) || 0;
 					renderCooldown();
 				}
@@ -675,20 +704,28 @@ $csrfToken = (string)($csrf_token ?? '');
 			}
 		}
 		submit.disabled = true;
+		setAnnouncementStatus('info', 'Preparing announcement and starting the selected delivery channels…', true);
+		deliveryOutcomeUnknown = false;
 		var body = new FormData(form);
 			fetch(form.action, {method: 'POST', credentials: 'same-origin', body: body})
 				.then(parseJsonResponse)
 			.then(function(data) {
-				result.style.display = 'block';
-				result.className = 'alert alert-' + (data && data.success ? 'success' : 'warning');
-				result.textContent = data && data.message ? data.message : 'Announcement request finished.';
+				setAnnouncementStatus(
+					data && data.success ? 'success' : 'warning',
+					data && data.message ? data.message : 'Announcement request finished.',
+					false
+				);
+				deliveryOutcomeUnknown = false;
 				remaining = parseInt((data && data.cooldown_remaining) || '0', 10) || 0;
 				renderCooldown();
 			})
 				.catch(function(error) {
-					result.style.display = 'block';
-					result.className = 'alert alert-danger';
-					result.textContent = 'Announcement request failed: ' + (error && error.message ? error.message : 'unknown error');
+					deliveryOutcomeUnknown = true;
+					setAnnouncementStatus(
+						'danger',
+						'Announcement response could not be confirmed. Wait for cooldown status before retrying. ' + (error && error.message ? error.message : 'Unknown response error.'),
+						false
+					);
 					renderCooldown();
 				});
 	});

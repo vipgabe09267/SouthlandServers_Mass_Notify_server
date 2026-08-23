@@ -5,6 +5,7 @@ import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -17,6 +18,17 @@ SPEC.loader.exec_module(WORKER_MODULE)
 
 
 class XweatherManualTestStatusTests(unittest.TestCase):
+    def test_page_hold_covers_complete_audio_with_margin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sounds = Path(directory)
+            sound_file = sounds / "safe" / "sound.wav"
+            sound_file.parent.mkdir()
+            sound_file.write_bytes(b"not-read-by-the-mocked-soxi")
+            completed = SimpleNamespace(stdout="12.25\n")
+            with mock.patch.object(WORKER_MODULE, "ASTERISK_SOUNDS_DIR", sounds), \
+                    mock.patch.object(WORKER_MODULE.subprocess, "run", return_value=completed):
+                self.assertEqual(WORKER_MODULE.audio_page_hold_seconds("safe/sound"), 15)
+
     def test_archived_queue_result_keeps_its_extension(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -33,15 +45,21 @@ class XweatherManualTestStatusTests(unittest.TestCase):
             with mock.patch.object(WORKER_MODULE, "SPOOL_DIR", spool), \
                     mock.patch.object(WORKER_MODULE, "SPOOL_DONE_DIR", done), \
                     mock.patch.object(WORKER_MODULE.tempfile, "mkstemp", side_effect=local_mkstemp), \
+                    mock.patch.object(WORKER_MODULE, "audio_page_hold_seconds", return_value=15), \
                     mock.patch.object(WORKER_MODULE.os, "geteuid", return_value=1000):
-                queued, results = WORKER_MODULE.queue_audio(["1000"], "safe/sound", archive=True)
+                queued, results, page_hold_seconds = WORKER_MODULE.queue_audio(["1000"], "safe/sound", archive=True)
 
             self.assertEqual(queued, 1)
+            self.assertEqual(page_hold_seconds, 15)
             self.assertEqual(len(results), 1)
             archived_path, extension = results[0]
             self.assertEqual(extension, "1000")
             self.assertEqual(archived_path.parent, done)
-            self.assertTrue((spool / archived_path.name).is_file())
+            queued_call = spool / archived_path.name
+            self.assertTrue(queued_call.is_file())
+            call_text = queued_call.read_text(encoding="utf-8")
+            self.assertIn("WaitTime: 45\n", call_text)
+            self.assertIn("Data: 15\n", call_text)
 
     def test_completed_archive_is_removed_without_error(self):
         with tempfile.TemporaryDirectory() as directory:

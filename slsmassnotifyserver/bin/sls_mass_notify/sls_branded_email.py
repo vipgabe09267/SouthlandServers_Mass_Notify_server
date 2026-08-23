@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from email.message import EmailMessage
 from email.utils import formataddr
 from pathlib import Path
@@ -21,6 +22,9 @@ LOGO_PATHS = (
 )
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}")
 DOMAIN_LABEL_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+LOCAL_PART_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9._+-]{0,62}[a-z0-9])?")
+SENDMAIL_TIMEOUT_SECONDS = 5.0
+WORKER_EXIT_SAFETY_SECONDS = 2.0
 
 
 def normalized_sender_domain(value):
@@ -41,10 +45,43 @@ def normalized_sender_domain(value):
     return domain
 
 
+def normalized_sender_local_part(value):
+    local_part = str(value or "").strip().lower()
+    if not local_part or len(local_part) > 64 or ".." in local_part:
+        return ""
+    return local_part if LOCAL_PART_PATTERN.fullmatch(local_part) else ""
+
+
+def valid_recipient(value):
+    candidate = str(value or "").strip()
+    if len(candidate) > 254 or not EMAIL_PATTERN.fullmatch(candidate):
+        return False
+    local_part, domain = candidate.rsplit("@", 1)
+    if len(local_part) > 64 or local_part.startswith(".") or local_part.endswith(".") or ".." in local_part:
+        return False
+    return normalized_sender_domain(domain) != ""
+
+
+def sendmail_timeout(wall_clock=time.time):
+    """Keep local Postfix submission inside the weather worker's deadline."""
+    timeout = SENDMAIL_TIMEOUT_SECONDS
+    raw_deadline = os.environ.get("SLS_WORKER_DEADLINE_EPOCH", "").strip()
+    if raw_deadline:
+        try:
+            remaining = float(raw_deadline) - float(wall_clock()) - WORKER_EXIT_SAFETY_SECONDS
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("external delivery deadline is invalid") from exc
+        timeout = min(timeout, remaining)
+    if timeout < 0.25:
+        raise RuntimeError("external delivery budget is exhausted")
+    return timeout
+
+
 def sender_address(config):
     domain = normalized_sender_domain(config.get("mail_from_domain"))
     if domain:
-        return "no-reply@" + domain
+        local_part = normalized_sender_local_part(config.get("mail_from_local_part")) or "no-reply"
+        return local_part + "@" + domain
     legacy = str(config.get("mail_from_addr") or "").replace("\r", "").replace("\n", "").strip()
     if EMAIL_PATTERN.fullmatch(legacy):
         legacy_domain = normalized_sender_domain(legacy.rsplit("@", 1)[1])
@@ -58,6 +95,7 @@ def alert_profile(subject, body, event="", severity=""):
     if any(keyword in text for keyword in ("test only", "system test", "demo", "simulation", "simulated")):
         return "#6d28d9", "#ede9fe", "🧪", "SYSTEM TEST — NOT AN ACTUAL ALERT"
     profiles = (
+        (("system fault", "fault detected", "configuration error", "maintenance failed"), "#b91c1c", "#fee2e2", "⚠️", "SYSTEM FAULT"),
         (("tornado",), "#991b1b", "#fee2e2", "🌪️", "EXTREME WEATHER"),
         (("severe thunderstorm", "thunderstorm warning", "severe storm"), "#c2410c", "#ffedd5", "⛈️", "SEVERE WEATHER"),
         (("flash flood", "flood warning", "coastal flood"), "#0369a1", "#e0f2fe", "🌊", "FLOOD WARNING"),
@@ -128,13 +166,23 @@ def build_html(subject, body, event="", severity=""):
 </table></td></tr></table></body></html>"""
 
 
-def send_branded_email(config, subject, body, event="", severity="", recipients_override=""):
-    recipients = EMAIL_PATTERN.findall(str(recipients_override or config.get("mail_to") or ""))
-    recipients = list(dict.fromkeys(recipients))
+def send_branded_email(config, subject, body, event="", severity="", recipients_override=None):
+    recipient_source = config.get("system_notification_emails", "") if recipients_override is None else recipients_override
+    candidates = re.split(r"[\s,;]+", str(recipient_source or ""))
+    recipients = []
+    seen_recipients = set()
+    for candidate in candidates:
+        candidate = candidate.strip()
+        candidate_key = candidate.lower()
+        if valid_recipient(candidate) and candidate_key not in seen_recipients:
+            recipients.append(candidate)
+            seen_recipients.add(candidate_key)
+    if len(recipients) > 50:
+        raise RuntimeError("email delivery exceeds the 50-recipient limit")
     if not recipients:
         return False
     sendmail = Path("/usr/sbin/sendmail")
-    if not sendmail.is_file():
+    if not sendmail.is_file() or not os.access(sendmail, os.X_OK):
         raise RuntimeError("sendmail is unavailable")
     from_name = re.sub(r"[\r\n]+", " ", str(config.get("mail_from_name") or "SLS Mass Notification System"))[:80]
     from_addr = sender_address(config)
@@ -149,7 +197,12 @@ def send_branded_email(config, subject, body, event="", severity="", recipients_
     logo = next((path for path in LOGO_PATHS if path.is_file() and path.stat().st_size > 0), None)
     if logo is not None:
         message.get_payload()[1].add_related(logo.read_bytes(), maintype="image", subtype="png", cid="<sls-mass-notify-logo>", filename="Southland-Servers-Group.png", disposition="inline")
-    subprocess.run([str(sendmail), "-t", "-f", from_addr], input=message.as_bytes(), check=True, timeout=30)
+    subprocess.run(
+        [str(sendmail), "-oi", "-t", "-f", from_addr],
+        input=message.as_bytes(),
+        check=True,
+        timeout=sendmail_timeout(),
+    )
     return True
 
 
@@ -157,6 +210,14 @@ def main():
     config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CONFIG
     with config_path.open("r", encoding="utf-8") as handle:
         config = json.load(handle)
+    source = os.environ.get("SLS_NOTIFICATION_SOURCE", "").strip().lower()
+    if (
+        os.environ.get("SLS_NOTIFICATION_LIVE", "0") != "1"
+        or os.environ.get("SLS_NOTIFICATION_TEST", "0") == "1"
+        or os.environ.get("SLS_NOTIFICATION_DRY_RUN", "0") == "1"
+        or source not in {"nws", "weather.gov", "xweather"}
+    ):
+        return 0
     sent = send_branded_email(
         config,
         os.environ.get("SLS_EMAIL_SUBJECT", "Southland Servers Mass Notification"),

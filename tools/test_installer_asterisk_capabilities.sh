@@ -3,6 +3,21 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# The FreePBX raw module name also forms rollback paths. It is intentionally
+# fixed and an environment override must fail before any installer work starts.
+if SLS_MASS_NOTIFY_MODULE='../dashboard' \
+  bash -c 'source "$1"' _ "${ROOT_DIR}/tools/install_release.sh" \
+  >/dev/null 2>&1; then
+  printf 'Installer accepted an unsafe alternate module rawname.\n' >&2
+  exit 1
+fi
+if SLS_MASS_NOTIFY_MODULE='othermodule' \
+  bash -c 'source "$1"' _ "${ROOT_DIR}/tools/install_release.sh" \
+  >/dev/null 2>&1; then
+  printf 'Installer accepted a different FreePBX module rawname.\n' >&2
+  exit 1
+fi
 source "${ROOT_DIR}/tools/install_release.sh"
 
 LOG_FILE="/dev/null"
@@ -612,6 +627,7 @@ fi
 (
   mock_db_route="PJSIP/1000"
   mock_dynamic_route="PJSIP/1000/sip:1000@192.0.2.10"
+  mock_aor_route=""
   asterisk() {
     case "${2:-}" in
       "database get DEVICE 1000/dial")
@@ -625,6 +641,10 @@ fi
         printf '%s\n' "Return Value: Success (0)"
         [ -z "$mock_dynamic_route" ] || printf 'RESULT: %s\n' "$mock_dynamic_route"
         ;;
+      "dialplan eval function PJSIP_DIAL_CONTACTS(custom-aor)")
+        printf '%s\n' "Return Value: Success (0)"
+        [ -z "$mock_aor_route" ] || printf 'RESULT: %s\n' "$mock_aor_route"
+        ;;
       "pjsip show endpoint 1000")
         if [ "${mock_endpoint_available:-1}" -eq 1 ]; then
           printf '%s\n' ' Endpoint:  1000/1000                         Not in use    0 of inf'
@@ -637,12 +657,17 @@ fi
   }
   verify_registered_endpoint_route 1000
   mock_db_route="Local/1000@from-internal"
+  verify_registered_endpoint_route 1000
+  mock_dynamic_route=""
   if verify_registered_endpoint_route 1000; then
-    printf 'A non-PJSIP effective AstDB route was incorrectly accepted.\n' >&2
+    printf 'A non-PJSIP AstDB fallback was accepted without explicit PJSIP contacts.\n' >&2
     exit 1
   fi
-  mock_db_route=""
+  mock_db_route="PJSIP/custom-aor"
+  mock_aor_route="PJSIP/1000/sip:1000@192.0.2.12"
   verify_registered_endpoint_route 1000
+  mock_db_route=""
+  mock_aor_route=""
   mock_dynamic_route="PJSIP/9999/sip:9999@192.0.2.20"
   if verify_registered_endpoint_route 1000; then
     printf 'A paging route referencing a missing PJSIP endpoint was incorrectly accepted.\n' >&2
@@ -666,13 +691,25 @@ fi
   printf '%s\n' '{}' >"$inventory_dir/empty.json"
   [ -z "$(endpoint_inventory_records "$inventory_dir/empty.json")" ]
   printf '%s\n' '{"1000":{"contacts":2,"format":"unknown","formats":["unknown"],"user_agent":"Community Phone"}}' >"$inventory_dir/unknown.json"
-  [ "$(endpoint_inventory_records "$inventory_dir/unknown.json")" = $'1000\tunknown\t2\t1\tCommunity Phone' ]
+  [ "$(endpoint_inventory_records "$inventory_dir/unknown.json")" = $'1000\tunknown\t2\t1\t0\tunknown\tCommunity Phone' ]
+  printf '%s\n' '{"1000":{"contacts":2,"format":"yealink","formats":["yealink","poly"],"user_agent":"Yealink | Poly"}}' >"$inventory_dir/mixed.json"
+  [ "$(endpoint_inventory_records "$inventory_dir/mixed.json")" = $'1000\tyealink\t2\t0\t1\tpoly,yealink\tYealink | Poly' ]
   printf '%s\n' '{"1000":{"contacts":1,"format":"unsupported","formats":["unsupported"]}}' >"$inventory_dir/invalid.json"
   if endpoint_inventory_records "$inventory_dir/invalid.json" >/dev/null 2>&1; then
     printf 'An unsupported endpoint inventory format was incorrectly accepted.\n' >&2
     exit 1
   fi
 )
+
+# Mixed-vendor registrations require contact-URI routing. Installing anyway on
+# endpoint-fanout-only Asterisk would knowingly activate broken visual routing.
+mixed_endpoint_visual_route_supported 0 endpoint_fanout
+mixed_endpoint_visual_route_supported 0 contact_uri
+mixed_endpoint_visual_route_supported 1 contact_uri
+if mixed_endpoint_visual_route_supported 1 endpoint_fanout; then
+  printf 'Mixed-vendor endpoint fan-out was incorrectly accepted without contact-URI routing.\n' >&2
+  exit 1
+fi
 
 # Regression guard: AMI discovery is unconditional and no longer branches on
 # the display-only "Objects found" footer emitted by selected Asterisk builds.
@@ -685,6 +722,13 @@ fi
 # Regression guards for dependency-bootstrap ordering and the exact image
 # validation tools used by sls_notify.py and verify_install().
 installer_source="${ROOT_DIR}/tools/install_release.sh"
+class_dependency_source="${ROOT_DIR}/slsmassnotifyserver/Slsmassnotifyserver.class.php"
+module_xml_source="${ROOT_DIR}/slsmassnotifyserver/module.xml"
+grep -Fq '<module>backup ge 17.0.0</module>' "$module_xml_source"
+grep -Fq 'for prerequisite in framework dashboard backup recordings; do' "$installer_source"
+grep -Fq 'for required_module in framework dashboard backup recordings; do' "$installer_source"
+grep -Fq 'FreePBX did not discover the Mass Notify native backup adapter.' "$installer_source"
+grep -Fq 'Native FreePBX backup adapter verified; this PBX has no administrator-defined module backup jobs yet.' "$installer_source"
 require_body="$(declare -f require_freepbx)"
 bootstrap_call_line="$(grep -nFm1 'install_bootstrap_dependencies' <<<"$require_body" | cut -d: -f1)"
 bootstrap_utility_line="$(grep -nFm1 'for bootstrap_utility in /usr/bin/flock' <<<"$require_body" | cut -d: -f1)"
@@ -694,12 +738,36 @@ bootstrap_utility_line="$(grep -nFm1 'for bootstrap_utility in /usr/bin/flock' <
 
 main_body="$(declare -f main)"
 log_reset_line="$(grep -nFm1 ': > "$LOG_FILE"' <<<"$main_body" | cut -d: -f1)"
+failure_trap_line="$(grep -nFm1 'trap guard_config_on_exit EXIT' <<<"$main_body" | cut -d: -f1)"
 require_line="$(grep -nFm1 'require_freepbx' <<<"$main_body" | cut -d: -f1)"
 lock_line="$(grep -nFm1 'acquire_maintenance_coordination' <<<"$main_body" | cut -d: -f1)"
 dependency_line="$(grep -nFm1 'install_dependencies' <<<"$main_body" | cut -d: -f1)"
 [ "$log_reset_line" -lt "$require_line" ]
+[ "$failure_trap_line" -lt "$require_line" ]
 [ "$require_line" -lt "$lock_line" ]
 [ "$lock_line" -lt "$dependency_line" ]
+guard_body="$(declare -f guard_config_on_exit)"
+grep -Fq 'record_install_failure' <<<"$guard_body"
+grep -Fq 'clear_install_failure' <<<"$main_body"
+grep -Fq 'INSTALL_FAILURE_FILE="$DATA_DIR/install-failure.json"' "$installer_source"
+grep -Fq 'add_error(' "$installer_source"
+grep -Fq "const INSTALL_FAILURE_JSON = self::PLUGIN_DATA_DIR . '/install-failure.json';" "$class_dependency_source"
+grep -Fq 'The last installation or repair failed during %s. Possible solution: %s' "$class_dependency_source"
+maintenance_source="${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_maintenance.sh"
+repair_verify_line="$(grep -nFm1 'verifyProtectedRepairIntegration' "$maintenance_source" | cut -d: -f1)"
+repair_clear_line="$(grep -nF 'clear_install_failure' "$maintenance_source" | tail -n1 | cut -d: -f1)"
+[ -n "$repair_verify_line" ]
+[ -n "$repair_clear_line" ]
+[ "$repair_verify_line" -lt "$repair_clear_line" ]
+grep -Fq 'public function verifyProtectedRepairIntegration()' "$class_dependency_source"
+grep -Fq "foreach (['slsmassnotifyserver', 'dashboard', 'framework'] as \$module)" "$class_dependency_source"
+grep -Fq -- "--list-endpoints-json 2>/dev/null" "$class_dependency_source"
+class_install_body="$(sed -n '/public function install()/,/public function uninstall()/p' "$class_dependency_source")"
+if grep -Fq 'clearSuccessfulInstallFailureState' <<<"$class_install_body"; then
+  printf 'Module install clears protected failure state before comprehensive verification.\n' >&2
+  exit 1
+fi
+grep -Fq 'Healthy. Last Asterisk submission queued:' "$class_dependency_source"
 
 grep -Fq '{ [ -x /usr/bin/convert ] && [ -x /usr/bin/identify ]; } || add_missing_package imagemagick' "$installer_source"
 grep -Fq 'for package in /usr/bin/curl /usr/bin/wget /usr/bin/gpg /usr/bin/python3 /usr/bin/sox /usr/bin/soxi /usr/bin/convert /usr/bin/identify ' "$installer_source"
@@ -720,10 +788,55 @@ aor_fallback_line="$(grep -nFm1 'PJSIP_AOR(\${SLS_AUTOANSWER_AOR},contact)' "$cl
 [ -n "$aor_fallback_line" ]
 [ "$channel_contact_line" -lt "$aor_fallback_line" ]
 grep -Fq 'PJSIP_CONTACT(\${SLS_AUTOANSWER_CONTACT},user_agent)' "$class_source"
-grep -Fq 'b(sls-alert-autoanswer^s^1(\${EXTEN}))' "$class_source"
-grep -Fq 'b(sls-alert-autoanswer^s^1(${EXTEN}))A(${SLS_SAFE_SOUND})' "${ROOT_DIR}/tools/install_release.sh"
+grep -Fq '\${SLS_AUTOANSWER_UA:0:7}\"=\"yealink\"]?Set(SLS_ALERT_INFO=Intercom)' "$class_source"
+grep -Fq 'Page(\${SLS_DIAL},b(sls-alert-autoanswer^s^1(\${EXTEN}))A(\${SLS_SAFE_SOUND})inq,5)' "$class_source"
+if grep -Fq 'Dial(\${SLS_DIAL}' "$class_source"; then
+  printf 'Managed paging still uses first-answer Dial semantics.\n' >&2
+  exit 1
+fi
+dynamic_contacts_line="$(grep -nFm1 'Set(SLS_DIAL=\${PJSIP_DIAL_CONTACTS(\${EXTEN})})' "$class_source" | cut -d: -f1)"
+device_lookup_line="$(grep -nFm1 'Set(SLS_DEVICE_DIAL=\${DB(DEVICE/\${EXTEN}/dial)})' "$class_source" | cut -d: -f1)"
+device_aor_line="$(grep -nFm1 'Set(SLS_DEVICE_AOR=\${CUT(SLS_DEVICE_DIAL,/,2)})' "$class_source" | cut -d: -f1)"
+device_aor_default_line="$(grep -nFm1 'Set(SLS_DEVICE_AOR=\${EXTEN})' "$class_source" | cut -d: -f1)"
+device_contacts_line="$(grep -nFm1 'Set(SLS_DIAL=\${PJSIP_DIAL_CONTACTS(\${SLS_DEVICE_AOR})})' "$class_source" | cut -d: -f1)"
+device_fallback_line="$(grep -nFm1 'Set(SLS_DIAL=\${SLS_DEVICE_DIAL})' "$class_source" | cut -d: -f1)"
+[ "$dynamic_contacts_line" -lt "$device_lookup_line" ]
+[ "$device_lookup_line" -lt "$device_aor_line" ]
+[ "$device_aor_line" -lt "$device_aor_default_line" ]
+[ "$device_aor_default_line" -lt "$device_contacts_line" ]
+[ "$device_contacts_line" -lt "$device_fallback_line" ]
+[ "$dynamic_contacts_line" -lt "$device_fallback_line" ]
+grep -Fq 'Page(${SLS_DIAL},b(sls-alert-autoanswer^s^1(${EXTEN}))A(${SLS_SAFE_SOUND})inq,5)' "${ROOT_DIR}/tools/install_release.sh"
 
-expected_mapping=$'function|PJSIP_HEADER|res_pjsip_header_funcs.so\nfunction|PJSIP_CONTACT|func_pjsip_contact.so\nfunction|PJSIP_AOR|func_pjsip_aor.so\nfunction|PJSIP_DIAL_CONTACTS|chan_pjsip.so\nfunction|TOLOWER|func_strings.so\nfunction|CUT|func_strings.so\nfunction|FILTER|func_strings.so\nfunction|CHANNEL|func_channel.so\nfunction|IF|func_logic.so\nfunction|DB|func_db.so\nfunction|CALLERID|func_callerid.so\napplication|Dial|app_dial.so\napplication|ExecIf|app_exec.so\napplication|Gosub|app_stack.so\napplication|Return|app_stack.so\napplication|Log|app_verbose.so\napplication|Verbose|app_verbose.so\nrequired|application|Wait'
+# Every call-file origin must remain alive for the measured combined WAV. A
+# one-second origin destroys Page's ConfBridge before longer audio completes.
+grep -Fq 'Data: {$pageHoldSeconds}' "$class_source"
+grep -Fq 'return (int)ceil($duration) + 2;' "$class_source"
+grep -Fq 'audio_page_hold_seconds()' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_test.sh"
+grep -Fq 'Data: ${page_hold_seconds}' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_test.sh"
+grep -Fq 'print rounded + 2' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_test.sh"
+grep -Fq 'audio_page_hold_seconds()' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_nws_poll.sh"
+grep -Fq 'Data: ${page_hold_seconds}' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_nws_poll.sh"
+grep -Fq 'print rounded + 2' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_nws_poll.sh"
+grep -Fq 'def audio_page_hold_seconds(sound):' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py"
+grep -Fq 'Data: {page_hold_seconds}' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py"
+grep -Fq 'return math.ceil(duration) + 2' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py"
+for producer in \
+  "$class_source" \
+  "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_test.sh" \
+  "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_nws_poll.sh" \
+  "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py"; do
+  if grep -Fq 'Data: 1' "$producer"; then
+    printf 'Paging call-file producer still contains a one-second origin lifetime: %s\n' "$producer" >&2
+    exit 1
+  fi
+  if grep -Eq 'max\(33|rounded \+ 33|ceil\([^)]*\) \+ 33' "$producer"; then
+    printf 'Paging call-file producer still includes the obsolete 30-second silent hold: %s\n' "$producer" >&2
+    exit 1
+  fi
+done
+
+expected_mapping=$'function|PJSIP_HEADER|res_pjsip_header_funcs.so\nfunction|PJSIP_CONTACT|func_pjsip_contact.so\nfunction|PJSIP_AOR|func_pjsip_aor.so\nfunction|PJSIP_DIAL_CONTACTS|chan_pjsip.so\nfunction|TOLOWER|func_strings.so\nfunction|CUT|func_strings.so\nfunction|FILTER|func_strings.so\nfunction|CHANNEL|func_channel.so\nfunction|IF|func_logic.so\nfunction|DB|func_db.so\nfunction|CALLERID|func_callerid.so\napplication|ConfBridge|app_confbridge.so\napplication|Page|app_page.so\napplication|ExecIf|app_exec.so\napplication|Gosub|app_stack.so\napplication|Return|app_stack.so\napplication|Log|app_verbose.so\napplication|Verbose|app_verbose.so\nrequired|application|Wait'
 actual_mapping="$(
   ensure_asterisk_capability() {
     printf '%s|%s|%s\n' "$1" "$2" "$3"

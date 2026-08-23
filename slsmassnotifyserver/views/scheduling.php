@@ -35,6 +35,23 @@ $scheduleOccurrences = static function (array $schedule) {
 	$values = $schedule['occurrences'] ?? [];
 	return is_array($values) ? $values : [];
 };
+$scheduleRecurrenceMode = static function (array $schedule) {
+	$recurrence = is_array($schedule['recurrence'] ?? null) ? $schedule['recurrence'] : [];
+	$mode = strtolower(trim((string)($recurrence['mode'] ?? 'none')));
+	return in_array($mode, ['every_7_days', 'every_14_days'], true) ? $mode : 'none';
+};
+$scheduleRecurrenceSummary = static function (array $schedule) use ($scheduleRecurrenceMode, $scheduleOccurrences) {
+	$mode = $scheduleRecurrenceMode($schedule);
+	$count = count($scheduleOccurrences($schedule));
+	$runLabel = $count === 1 ? _('1 planned run') : sprintf(_('%d planned runs'), $count);
+	if ($mode === 'every_7_days') {
+		return _('Every 7 days') . ' · ' . $runLabel;
+	}
+	if ($mode === 'every_14_days') {
+		return _('Every 14 days') . ' · ' . $runLabel;
+	}
+	return $count === 1 ? _('One-time announcement') : sprintf(_('%d one-time dates'), $count);
+};
 $scheduleState = static function (array $schedule, array $executionState) use ($scheduleId) {
 	$id = $scheduleId($schedule);
 	$value = is_array($executionState[$id] ?? null) ? $executionState[$id] : [];
@@ -148,6 +165,30 @@ foreach ($schedules as $scheduleIndex => $schedule) {
 		}
 		$clientSchedule['occurrences'][$occurrenceIndex]['editor_datetime'] = str_replace(' ', 'T', substr($localValue, 0, 16));
 	}
+	$recurrenceMode = $scheduleRecurrenceMode($schedule);
+	$clientSchedule['recurrence'] = is_array($clientSchedule['recurrence'] ?? null) ? $clientSchedule['recurrence'] : [];
+	$clientSchedule['recurrence']['mode'] = $recurrenceMode;
+	$clientSchedule['recurrence']['editor_start_datetime'] = '';
+	if ($recurrenceMode !== 'none') {
+		foreach ($scheduleOccurrences($clientSchedule) as $occurrence) {
+			$utcValue = trim((string)($occurrence['run_at_utc'] ?? ''));
+			if ($utcValue === '') {
+				continue;
+			}
+			try {
+				$instant = new \DateTimeImmutable($utcValue);
+			} catch (\Throwable $exception) {
+				continue;
+			}
+			if ($instant >= $nowUtc) {
+				$clientSchedule['recurrence']['editor_start_datetime'] = (string)($occurrence['editor_datetime'] ?? '');
+				break;
+			}
+		}
+		if ($clientSchedule['recurrence']['editor_start_datetime'] === '') {
+			$clientSchedule['recurrence']['editor_start_datetime'] = str_replace(' ', 'T', substr((string)($clientSchedule['recurrence']['starts_at_local'] ?? ''), 0, 16));
+		}
+	}
 	$clientSchedules[] = $clientSchedule;
 }
 
@@ -205,7 +246,7 @@ $defaultOccurrenceLocal = $nextPbxHour->setTime((int)$nextPbxHour->format('H'), 
 			<div class="sls-schedule-heading">
 				<div>
 					<h1><i class="fa fa-calendar text-primary" aria-hidden="true"></i> <?php echo _('Scheduling'); ?></h1>
-					<div class="text-muted"><?php echo _('Plan one-time announcements for one or more calendar dates while retaining the same phone, desktop, audio, and color controls as a live announcement.'); ?></div>
+					<div class="text-muted"><?php echo _('Plan one-time or repeating announcements while retaining the same phone, desktop, audio, and color controls as a live announcement.'); ?></div>
 				</div>
 				<div class="sls-timezone-pill"><i class="fa fa-globe" aria-hidden="true"></i> <?php echo htmlspecialchars($timezoneName); ?></div>
 			</div>
@@ -255,7 +296,7 @@ $defaultOccurrenceLocal = $nextPbxHour->setTime((int)$nextPbxHour->format('H'), 
 							$style = (string)($delivery['style'] ?? 'standard');
 						?>
 							<tr data-schedule-id="<?php echo htmlspecialchars($id); ?>" data-rendered-state="<?php echo htmlspecialchars($stateName); ?>">
-								<td><div class="sls-schedule-name"><?php echo htmlspecialchars((string)($schedule['name'] ?? _('Scheduled announcement'))); ?></div><div class="sls-schedule-meta"><?php echo sprintf(_('%d date(s)'), count($scheduleOccurrences($schedule))); ?></div></td>
+								<td><div class="sls-schedule-name"><?php echo htmlspecialchars((string)($schedule['name'] ?? _('Scheduled announcement'))); ?></div><div class="sls-schedule-meta"><?php echo htmlspecialchars($scheduleRecurrenceSummary($schedule)); ?></div></td>
 								<td><?php if ($next !== null) { ?><strong><?php echo htmlspecialchars($formatInstant($next->format(DATE_ATOM))); ?></strong><?php } else { ?><span class="text-muted"><?php echo _('No future dates'); ?></span><?php } ?></td>
 								<td><div><?php echo htmlspecialchars($targetSummary($schedule)); ?></div></td>
 								<td><div><?php echo htmlspecialchars(ucwords(str_replace('_', ' + ', $audioMode))); ?></div><div class="sls-schedule-meta"><?php echo $style === 'colored' ? _('Colored announcement · Labs') : _('Standard announcement'); ?></div></td>
@@ -292,7 +333,12 @@ $defaultOccurrenceLocal = $nextPbxHour->setTime((int)$nextPbxHour->format('H'), 
 					<div class="form-group"><label for="sls-schedule-message"><?php echo _('Message'); ?></label><textarea class="form-control" id="sls-schedule-message" name="schedule_message" rows="3" maxlength="500" required placeholder="<?php echo htmlspecialchars(_('Announcement text')); ?>"></textarea><p class="help-block"><?php echo _('This text is displayed on phones and desktops and is read when TTS is selected.'); ?></p></div>
 				</div>
 
-				<div class="sls-editor-card"><h4><span class="sls-editor-step">2</span><?php echo _('Calendar dates and times'); ?></h4><p class="text-muted"><?php echo sprintf(_('Times are interpreted in %s. Add each one-time occurrence below.'), $timezoneName); ?></p><div class="alert alert-warning" style="padding:9px 11px"><i class="fa fa-clock-o" aria-hidden="true"></i> <?php echo _('Leave enough time between announcements for the configured cooldown. Closely scheduled items are serialized and may be delayed rather than played at the same moment.'); ?></div><div id="sls-occurrence-list"></div><button type="button" class="btn btn-default btn-sm" id="sls-occurrence-add"><i class="fa fa-plus" aria-hidden="true"></i> <?php echo _('Add date and time'); ?></button></div>
+				<div class="sls-editor-card"><h4><span class="sls-editor-step">2</span><?php echo _('Dates and times'); ?></h4>
+					<div class="row"><div class="col-sm-6"><div class="form-group"><label for="sls-schedule-recurrence"><?php echo _('Repeat'); ?></label><select class="form-control" id="sls-schedule-recurrence" name="schedule_recurrence_mode"><option value="none"><?php echo _('Does not repeat'); ?></option><option value="every_7_days"><?php echo _('Every 7 days'); ?></option><option value="every_14_days"><?php echo _('Every 14 days'); ?></option></select></div></div></div>
+					<p class="text-muted" id="sls-schedule-date-help"><?php echo sprintf(_('Times are interpreted in %s. Add each one-time occurrence below.'), $timezoneName); ?></p>
+					<div class="alert alert-warning" style="padding:9px 11px"><i class="fa fa-clock-o" aria-hidden="true"></i> <?php echo _('Leave enough time between announcements for the configured cooldown. Closely scheduled items are serialized and may be delayed rather than played at the same moment.'); ?></div>
+					<div id="sls-occurrence-list"></div><button type="button" class="btn btn-default btn-sm" id="sls-occurrence-add"><i class="fa fa-plus" aria-hidden="true"></i> <?php echo _('Add date and time'); ?></button>
+				</div>
 
 				<div class="sls-editor-card"><h4><span class="sls-editor-step">3</span><?php echo _('Recipients'); ?></h4>
 					<div class="row"><div class="col-sm-6"><div class="form-group"><label><?php echo _('Phones'); ?></label><div class="sls-target-box"><div class="checkbox"><label><input type="checkbox" name="schedule_all_phones" value="1"> <strong><?php echo _('All phones available at delivery time'); ?></strong></label></div><?php if (empty($extensions)) { ?><p class="text-muted"><?php echo _('No PJSIP extensions are configured.'); ?></p><?php } foreach ($extensions as $extension) { $number = preg_replace('/[^0-9]/', '', (string)($extension['extension'] ?? '')); if ($number === '') continue; ?><div class="checkbox"><label><input type="checkbox" name="schedule_extensions[]" value="<?php echo htmlspecialchars($number); ?>"> <?php echo htmlspecialchars($number); ?><?php if (!empty($extension['name'])) echo ' - ' . htmlspecialchars((string)$extension['name']); ?> <span class="text-muted"><?php echo !empty($extension['registered']) ? _('online') : _('offline'); ?></span></label></div><?php } ?></div></div></div>
@@ -321,6 +367,8 @@ $defaultOccurrenceLocal = $nextPbxHour->setTime((int)$nextPbxHour->format('H'), 
 	var createButton = document.getElementById('sls-schedule-create');
 	var occurrenceList = document.getElementById('sls-occurrence-list');
 	var occurrenceAdd = document.getElementById('sls-occurrence-add');
+	var recurrence = document.getElementById('sls-schedule-recurrence');
+	var dateHelp = document.getElementById('sls-schedule-date-help');
 	var audioMode = document.getElementById('sls-schedule-audio-mode');
 	var colored = document.getElementById('sls-schedule-colored');
 	var colorDesigner = document.getElementById('sls-schedule-color-designer');
@@ -369,7 +417,7 @@ $defaultOccurrenceLocal = $nextPbxHour->setTime((int)$nextPbxHour->format('H'), 
 		input.value = value || localDefaultDateTime();
 		var remove = document.createElement('button');
 		remove.type = 'button';
-		remove.className = 'btn btn-danger btn-sm';
+		remove.className = 'btn btn-danger btn-sm sls-occurrence-remove';
 		remove.innerHTML = '<i class="fa fa-times" aria-hidden="true"></i> ';
 		remove.appendChild(document.createTextNode(<?php echo json_encode(_('Remove')); ?>));
 		remove.addEventListener('click', function() {
@@ -379,6 +427,23 @@ $defaultOccurrenceLocal = $nextPbxHour->setTime((int)$nextPbxHour->format('H'), 
 		row.appendChild(input);
 		row.appendChild(remove);
 		occurrenceList.appendChild(row);
+	}
+	function renderRecurrenceOptions() {
+		var repeating = recurrence && recurrence.value !== 'none';
+		if (repeating) {
+			while (occurrenceList.children.length > 1) {
+				occurrenceList.removeChild(occurrenceList.lastElementChild);
+			}
+		}
+		if (occurrenceAdd) occurrenceAdd.style.display = repeating ? 'none' : '';
+		Array.prototype.forEach.call(occurrenceList.querySelectorAll('.sls-occurrence-remove'), function(button) {
+			button.style.display = repeating ? 'none' : '';
+		});
+		if (dateHelp) {
+			dateHelp.textContent = repeating
+				? <?php echo json_encode(sprintf(_('Choose the first local date and time in %s. The announcement will repeat at that same local time for up to five years.'), $timezoneName)); ?>
+				: <?php echo json_encode(sprintf(_('Times are interpreted in %s. Add each one-time occurrence below.'), $timezoneName)); ?>;
+		}
 	}
 	function setChecked(name, values) {
 		var lookup = {};
@@ -419,6 +484,7 @@ $defaultOccurrenceLocal = $nextPbxHour->setTime((int)$nextPbxHour->format('H'), 
 		occurrenceList.innerHTML = '';
 		addOccurrence('');
 		document.getElementById('sls-schedule-modal-title').textContent = <?php echo json_encode(_('Create Scheduled Announcement')); ?>;
+		renderRecurrenceOptions();
 		renderOptions();
 	}
 	function openEditor(schedule) {
@@ -426,6 +492,7 @@ $defaultOccurrenceLocal = $nextPbxHour->setTime((int)$nextPbxHour->format('H'), 
 		if (schedule) {
 			var targets = schedule.targets && typeof schedule.targets === 'object' ? schedule.targets : {};
 			var delivery = schedule.delivery && typeof schedule.delivery === 'object' ? schedule.delivery : {};
+			var recurrenceSettings = schedule.recurrence && typeof schedule.recurrence === 'object' ? schedule.recurrence : {};
 			setValue('sls-schedule-id', schedule.id || '');
 			setValue('sls-schedule-name', schedule.name || '');
 			setValue('sls-schedule-message', schedule.message || '');
@@ -443,17 +510,24 @@ $defaultOccurrenceLocal = $nextPbxHour->setTime((int)$nextPbxHour->format('H'), 
 			document.getElementById('sls-schedule-colored').checked = delivery.style === 'colored' || !!delivery.colored;
 			setValue('sls-schedule-title', delivery.title || 'Announcement');
 			setValue('sls-schedule-color', delivery.background_color || '#1f2937');
+			setValue('sls-schedule-recurrence', recurrenceSettings.mode || 'none');
 			occurrenceList.innerHTML = '';
-			(schedule.occurrences || []).forEach(function(occurrence) {
-				if (occurrence && occurrence.editor_datetime) addOccurrence(occurrence.editor_datetime);
-			});
+			if (recurrenceSettings.mode && recurrenceSettings.mode !== 'none') {
+				addOccurrence(recurrenceSettings.editor_start_datetime || recurrenceSettings.starts_at_local || '');
+			} else {
+				(schedule.occurrences || []).forEach(function(occurrence) {
+					if (occurrence && occurrence.editor_datetime) addOccurrence(occurrence.editor_datetime);
+				});
+			}
 			if (!occurrenceList.children.length) addOccurrence('');
 			document.getElementById('sls-schedule-modal-title').textContent = <?php echo json_encode(_('Edit Scheduled Announcement')); ?>;
+			renderRecurrenceOptions();
 			renderOptions();
 		}
 		if (modal) modal.modal('show');
 	}
 	if (occurrenceAdd) occurrenceAdd.addEventListener('click', function() { addOccurrence(''); });
+	if (recurrence) recurrence.addEventListener('change', renderRecurrenceOptions);
 	if (createButton) createButton.addEventListener('click', function() { openEditor(null); });
 	Array.prototype.forEach.call(document.querySelectorAll('.sls-schedule-edit'), function(button) {
 		button.addEventListener('click', function() {
@@ -505,6 +579,7 @@ $defaultOccurrenceLocal = $nextPbxHour->setTime((int)$nextPbxHour->format('H'), 
 			scheduleSubmit.innerHTML = '<i class="fa fa-spinner fa-spin" aria-hidden="true"></i> ' + <?php echo json_encode(_('Saving…')); ?>;
 		}
 	});
+	renderRecurrenceOptions();
 	renderOptions();
 }());
 </script>

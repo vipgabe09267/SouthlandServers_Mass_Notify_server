@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://southlandservers.xyz">
-    <img src="https://southlandservers.xyz/images/SLS_Mass_Notif_Plugin.png" width="180" alt="Southland Servers Mass Notifications Server">
+    <img src="https://southlandservers.xyz/images/SLS_Mass_Notif_Plugin.png" width="132" alt="Southland Servers Mass Notifications Server">
   </a>
 </p>
 
@@ -8,9 +8,9 @@
 
 An AGPL-3.0-or-later FreePBX 17 module for phone, desktop, weather, lightning, and audio-page notifications. It sends SIP NOTIFY messages directly through Asterisk/PJSIP, supports live authenticated desktop events, and can page tones or Piper TTS without a paging-group dependency.
 
-Configuration lives in one protected, portable `.config` file outside the module tree. Weather.gov routing, optional Xweather lightning detection, announcement groups, schedules, display timeouts, API access, email and Discord delivery, tones, voices, and retention settings are managed from FreePBX.
+Configuration lives in one protected, portable `.config` file outside the module tree. Weather.gov routing, optional Xweather lightning detection, announcement groups, schedules, display timeouts, API access, service-specific alert email recipients, Postfix sender and system/error email settings, Discord and generic webhooks, tones, voices, and retention settings are managed from FreePBX.
 
-Current release candidate: `0.0.9-beta`. This is beta software; test it on a non-critical FreePBX system before depending on it for emergency notifications.
+Current release: `0.1.0`. The project is still beta-stage software; test it on a non-critical FreePBX system before depending on it for emergency notifications.
 
 ## Install or update
 
@@ -19,9 +19,9 @@ Run as `root` on Debian 12 / FreePBX 17:
 ```bash
 cd /tmp
 curl -fsSL -o sls-install.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.0.9-beta/tools/install_release.sh
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.0/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.0.9-beta/slsmassnotifyserver-0.0.9-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.0/slsmassnotifyserver-0.1.0.tgz' \
 ./sls-install.sh
 ```
 
@@ -34,7 +34,7 @@ Existing settings and credentials are preserved. Fresh installations open the re
 - Dashboard widget: `Mass Notify Announcements`
 - Runtime scripts: `/usr/local/bin/sls_mass_notify`
 - Scheduled-announcement worker: `/usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php`
-- Central data/config folder: `/var/lib/asterisk/SLS_Mass_Notifications_Plugin`
+- Central data/config folder: `/var/lib/asterisk/SLS_Mass_Notifications_Plugin` (the historical path is retained for upgrade compatibility)
 - Public media folder: `/var/www/html/sls_mass_notify`
 - SIP Notify API: `/var/www/html/api/sipnotify`
 - Control API: `/var/www/html/api/sls-mass-notify`
@@ -81,20 +81,20 @@ From the repository root:
 The package is written to:
 
 ```text
-dist/slsmassnotifyserver-0.0.9-beta.tgz
+dist/slsmassnotifyserver-0.1.0.tgz
 ```
 
 ## Install From A Local `.tgz`
 
-Use this only if you already downloaded or built the release package and uploaded it to `/tmp/slsmassnotifyserver-0.0.9-beta.tgz` on the PBX.
+Use this only if you already downloaded or built the release package and uploaded it to `/tmp/slsmassnotifyserver-0.1.0.tgz` on the PBX.
 
 ```bash
 cd /tmp
-tar -tzf /tmp/slsmassnotifyserver-0.0.9-beta.tgz >/dev/null
+tar -tzf /tmp/slsmassnotifyserver-0.1.0.tgz >/dev/null
 curl -fsSL -o sls-install.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.0.9-beta/tools/install_release.sh
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.0/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ=/tmp/slsmassnotifyserver-0.0.9-beta.tgz ./sls-install.sh
+SLS_MASS_NOTIFY_TGZ=/tmp/slsmassnotifyserver-0.1.0.tgz ./sls-install.sh
 ```
 
 ## Uninstall
@@ -104,7 +104,7 @@ This removes the FreePBX module, its Manager/AMI database user, runtime scripts,
 ```bash
 cd /tmp
 curl -fsSL -o sls-uninstall.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.0.9-beta/tools/uninstall_release.sh
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.0/tools/uninstall_release.sh
 chmod +x sls-uninstall.sh
 ./sls-uninstall.sh
 ```
@@ -124,28 +124,19 @@ curl -k -s -o /tmp/sls-control-api.out -w '%{http_code}' http://127.0.0.1/api/sl
 
 ## First-Run Setup Flow
 
-FreePBX module installs are not a safe place for interactive questions, so the mandatory setup wizard is implemented as a first-run modal in the FreePBX UI. Until the wizard is accepted, the Dashboard announcement widget and Mass Notifications module pages show the setup modal and keep controls locked.
+FreePBX module installs are not a safe place for interactive questions, so the mandatory setup wizard is implemented as a first-run modal in the FreePBX UI. Until the wizard is accepted, the Dashboard announcement widget and Mass Notify pages show the setup modal and keep controls locked.
 
-1. Open any page under `Mass Notifications`.
+1. Open any page under `Mass Notify`.
 2. Read the beta warning and accept the at-your-own-risk acknowledgement.
 3. Review and accept the AGPL-3.0-or-later license notice.
 4. Read and accept the EULA.
 5. Choose whether to configure Weather Alerts. The default is No; weather fields remain hidden unless Yes is selected.
-6. If enabled, enter the first Weather.gov zone and its recipient extensions. Additional named zone groups can be added later from Weather Alerts.
+6. If enabled, enter the first Weather.gov zone and select at least one phone extension or enabled desktop client. Optional email recipients receive live alerts from that zone only. Additional named zone groups can be added later from Weather Alerts.
 7. Choose whether to configure Lightning Alerts. The default is No; Xweather fields remain hidden and are not validated unless Yes is selected.
 8. Configure optional quiet hours, the Control API, phone delivery, and general paging audio.
 9. Complete setup. The wizard writes the central `.config`; shell and Python services read that file directly.
 
-NWS zone/county examples:
-
-- County code: `TXC491`
-- Forecast zone: `TXZ163`
-
-NWS zone/county codes can be found from the official NWS GIS Zone/County page:
-
-```text
-https://www.weather.gov/gis/ZoneCounty
-```
+To find a Weather.gov forecast zone, open the [official NWS Public Zone Maps](https://www.weather.gov/pimar/PubZone), choose the state, and find the three-digit zone number covering the location. Enter the two-letter state abbreviation, the letter `Z`, and that number. For example, Texas zone `163` is `TXZ163`.
 
 ## Runtime Config
 
@@ -155,17 +146,21 @@ Live configuration is stored outside the module so updates do not overwrite it:
 /var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config
 ```
 
-That JSON `.config` file is the only settings source of truth. Shell, Python, PHP, API, desktop-client, announcement-group, NWS zone-group, Xweather, email, tone, TTS, and phone-format settings are normalized into it and runtime services read it directly. The canonical `mail_from_domain` value travels with this protected config; the runtime derives the alert sender as `no-reply@<mail_from_domain>`. Use the FreePBX UI or transplant the central `.config` file; obsolete generated `mass-notifications.conf` and `config.ini` copies are removed during install.
+That JSON `.config` file is the only settings source of truth. Shell, Python, PHP, API, desktop-client, announcement-group, NWS zone-group, Xweather, destination, tone, TTS, and phone-format settings are normalized into it and runtime services read it directly. The sender local part and domain travel with this protected config; a fresh install starts with `no-reply` and derives the domain from the local Postfix/PBX identity. Use the FreePBX UI or transplant the central `.config` file; obsolete generated `mass-notifications.conf` and `config.ini` copies are removed during install.
 
 ## Backup And Restore
 
-Before major updates, download the central `.config` from:
+Version 0.1.0 includes a native FreePBX 17 backup adapter. Module-based FreePBX backup jobs can include the protected config, the schedule execution journal, and custom module tones. Restore validates the manifest, size, hashes, config structure, credentials, and WAV content before replacing live data. Due or completed schedule occurrences are not replayed, and post-restore integration repair is verified separately.
+
+Custom modules are not fetched automatically by a stock FreePBX restore. Install this module on a replacement PBX before restoring an archive that contains its data. The installer enables the FreePBX Backup prerequisite, verifies native-adapter discovery, and adds Mass Notify to existing module-based jobs. A fresh PBX with no backup jobs is ready rather than faulty; create a job in **Backup & Restore** when you are ready to choose its schedule, storage, and retention policy. Review that job before relying on it.
+
+Also keep a separate copy of the central `.config`. Download it before major updates from:
 
 ```text
 Mass Notify > General Settings > Danger Zone
 ```
 
-To restore a deployment, upload the saved `.config` from the same page and apply changes. Replacing the config overwrites module settings such as endpoints, groups, tokens, voices, NWS settings, quiet hours, schedules, and log retention.
+To restore only the module configuration, upload the saved `.config` from the same page and apply changes. Replacing it overwrites module settings such as endpoints, groups, tokens, destinations, voices, NWS settings, quiet hours, schedules, and log retention.
 
 ## APIs
 
@@ -187,7 +182,9 @@ Control API:
 https://pbx.example.com/api/sls-mass-notify
 ```
 
-Desktop clients use their configured username and password. The live endpoint uses server-sent events with the same per-client targeting as the JSON endpoint, flushes its authenticated handshake through Apache immediately, supports `Last-Event-ID`, and asks clients to reconnect before the bounded PHP request ends. A desktop app should make a streaming HTTP request that can set the Basic `Authorization` header; the browser-only `EventSource` constructor cannot set that header. A legacy desktop that keeps requesting `/api/sipnotify/desktop` remains on the polling JSON fallback until that application is updated to use `/stream`. Notification records include flat presentation fields and a structured `presentation` object: Weather Alerts carry priority-derived background/header/accent/text colors, colored announcements retain the selected title and background, and Lightning publishes its branded warning color to the live desktop stream. For one phone family on an extension, Asterisk sends the vendor payload by endpoint and fans it out using that endpoint's own transports and contacts. Mixed-vendor contacts on one extension require complete contact URIs plus a configured Asterisk default outbound endpoint; otherwise delivery stops with a clear error instead of sending the wrong XML to every phone. The Control API is disabled by default and uses its own API key.
+Desktop clients use their configured username and password. The live endpoint uses server-sent events with the same per-client targeting as the JSON endpoint, flushes its authenticated handshake through Apache immediately, supports `Last-Event-ID`, and asks clients to reconnect before the bounded PHP request ends. A desktop app should make a streaming HTTP request that can set the Basic `Authorization` header; the browser-only `EventSource` constructor cannot set that header. A legacy desktop that keeps requesting `/api/sipnotify/desktop` remains on the polling JSON fallback until that application is updated to use `/stream`. Dashboard announcements publish the selected desktop event before synchronous TTS/phone work whenever possible, and each combined delivery writes one targeted journal record. Notification records include flat presentation fields and a structured `presentation` object: Weather Alerts carry priority-derived background/header/accent/text colors, colored announcements retain the selected title and background, and Lightning publishes its branded warning color to the live desktop stream. The Control API is disabled by default and uses its own API key.
+
+Audio paging uses Asterisk `Page()`/ConfBridge with every resolved PJSIP contact so a softphone registration does not displace a desk phone registration. Its originating channel follows the measured WAV plus a two-second teardown margin, and endpoints have five seconds to auto-answer; playback does not leave promptly answered phones in an extended silent page. The module submits visual payloads separately through AMI. If one extension has mixed phone formats, installation hard-fails unless every contact has a usable URI and Asterisk has a usable default outbound endpoint for safe per-contact visual routing. “Queued” or “submitted” means Asterisk accepted the request; it does not prove that every handset answered, displayed the message, or acknowledged a SIP NOTIFY. Review Asterisk and phone logs and test each target device.
 
 `Mass Notify > General Settings > Public PBX Hostname` is automatically detected and displayed read-only; it is not accepted from settings forms or Control API configuration patches. Phone Image Transport defaults to HTTP for legacy Yealink compatibility and can be changed to HTTPS when every target phone trusts the PBX certificate and supports its TLS configuration. Authenticated APIs remain HTTPS.
 
@@ -237,7 +234,7 @@ Module updates should not overwrite the central `.config` file. Back it up befor
 
 ### Why does NWS still appear in some places?
 
-NWS appears only for the **Weather Alerts** portion of the module: API details, U.S. weather.gov zone groups, recipients, weather TTS voice, and technical logs. Weather Alerts supports United States weather.gov zones only. The overall product remains Southland Servers Mass Notifications Server.
+NWS appears only for the **Weather Alerts** portion of the module: API details, U.S. weather.gov zone groups, phone/desktop/email recipients, weather TTS voice, and technical logs. Weather Alerts supports United States weather.gov zones only and is locked to the official `https://api.weather.gov` endpoint. The overall product remains Southland Servers Mass Notifications Server.
 
 ### How are announcements delivered?
 
@@ -245,11 +242,11 @@ The dashboard announcement widget can send SIP NOTIFY text/image payloads, publi
 
 ### How does Scheduling work?
 
-Open **Mass Notify > Scheduling** and create a schedule with one or more future PBX-local dates and times. Each schedule stores its phone, announcement-group, desktop, audio, voice, volume, tone, and optional Labs color choices in the protected central config. The Asterisk-owned worker checks once per minute. Pre-delivery cooldown, busy, or temporarily offline target conditions can retry inside a 15-minute grace window; a delivery already claimed by an interrupted worker is marked for review instead of being replayed.
+Open **Mass Notify > Scheduling** and create a one-time schedule with one or more future PBX-local dates and times, or select **Every 7 days** or **Every 14 days** with one starting date and time. A repeating schedule runs at that same PBX-local time and is expanded into a validated, protected occurrence series covering up to five years. Each schedule stores its phone, announcement-group, desktop, audio, voice, volume, tone, and optional Labs color choices in the protected central config. The Asterisk-owned worker checks once per minute. Pre-delivery cooldown, busy, or temporarily offline target conditions can retry inside a 15-minute grace window; a delivery already claimed by an interrupted worker is marked for review instead of being replayed.
 
-Scheduled pages use the PBX operating-system timezone. Nonexistent or ambiguous daylight-saving times are rejected, and Dashboard health warns when FreePBX's PHP timezone differs. Scheduling is serialized with ordinary announcements, so items placed closer together than the configured cooldown can run late and remain eligible only inside the protected grace window. To re-arm a failed or missed occurrence, remove that date and add a new future date; an uncertain occurrence must be reviewed and is never replayed automatically.
+Scheduled pages use the PBX operating-system timezone. Nonexistent or ambiguous daylight-saving times are rejected, including unsafe dates within a repeating series, and Dashboard health warns when FreePBX's PHP timezone differs. Scheduling is serialized with ordinary announcements, so items placed closer together than the configured cooldown can run late and remain eligible only inside the protected grace window. To re-arm a failed or missed occurrence, remove that date and add a new future date; an uncertain occurrence must be reviewed and is never replayed automatically.
 
-Configuration exports contain schedule definitions but not the PBX-local execution ledger. Imports and FreePBX restores therefore disable imported schedules automatically; review dates, targets, and delivery settings before enabling them on the destination PBX.
+Portable `.config` exports contain schedule definitions but not the PBX-local execution ledger, so importing one disables its schedules for review. Native FreePBX backups include the protected execution journal and restore it through the replay-safe validation path.
 
 Times that do not exist during a daylight-saving transition, or that occur twice during the fall transition, are rejected so the delivery instant is never ambiguous.
 
@@ -259,7 +256,7 @@ Yes. **General Settings > Announcement Timeout** defaults to **No expiry**. It c
 
 ### Is the setup wizard mandatory?
 
-Yes. New installs show a setup modal on the Dashboard announcement widget and Mass Notifications pages until the beta warning, AGPL notice, EULA, and first-run configuration are accepted. Existing deployments keep their central `.config` and are not forced through the wizard during an update.
+Yes. New installs show a setup modal on the Dashboard announcement widget and Mass Notify pages until the beta warning, AGPL notice, EULA, and first-run configuration are accepted. Existing deployments keep their central `.config` and are not forced through the wizard during an update.
 
 ### Do phones need separate API endpoints?
 
@@ -271,7 +268,7 @@ Yes. The Control API key can be regenerated, and desktop clients can be given ne
 
 ### Can I change the alert email domain?
 
-Yes. Open **Mass Notify > General Settings > Notification Destinations** and set **Email Sender Domain**. The module keeps the local part fixed as `no-reply`; for example, changing `pbx.example.com` to `example.com` changes the sender from `no-reply@pbx.example.com` to `no-reply@example.com`. Fresh installs default to the detected PBX hostname. Upgrades without `mail_from_domain` retain their existing valid sender domain by deriving it from the legacy `mail_from_addr` value. The canonical value follows protected config backups and is available to validated, allowlisted Control API configuration updates.
+Yes. Open **Mass Notify > General Settings > Outbound Delivery > Manage Delivery**. The local part and domain are both editable; a fresh install defaults to `no-reply@<postfix-or-pbx-domain>`. For example, changing the domain from `pbx.example.com` to `example.com` produces `no-reply@example.com`. Existing valid sender settings migrate forward, and the canonical values follow protected config backups and validated Control API updates.
 
 This setting changes only the sender address used by Mass Notify alert messages. It does not configure Postfix, an SMTP relay, DNS, SPF, DKIM, DMARC, or PTR/reverse DNS. Configure those separately so the selected domain is authorized to send mail from this PBX.
 
@@ -281,13 +278,13 @@ Only if enabled. It is disabled by default and protected by its own API key.
 
 ### How do automatic updates work?
 
-Automatic updates are disabled by default. When enabled, a root-owned job checks only the official beta repository, accepts release assets that include a GitHub SHA-256 digest, downloads the installer from the matching immutable release tag, and supplies the expected digest to the installer. The Asterisk service account cannot replace the updater or Piper executable runtime.
+Automatic updates are disabled by default. When enabled, a root-owned job checks only the official repository, accepts release assets that include a GitHub SHA-256 digest, downloads the installer from the matching immutable release tag, and supplies the expected digest to the installer. The Asterisk service account cannot replace the updater or Piper executable runtime.
 
-Update availability is checked even when automatic installation is disabled. General Settings and Dashboard health show a yellow warning when a newer beta is available. **Update to Latest Release** appears only while a strictly newer beta is available. After it is clicked, General Settings shows queued, checking, and installing progress, displays a completion checkmark, and refreshes to the installed version; failures remain visible instead of silently disappearing.
+Update availability is checked even when automatic installation is disabled. General Settings and Dashboard health show a yellow warning when a newer accepted release is available. **Update to Latest Release** appears only for a strictly newer version. The updater accepts the project’s normal three-part release tags with an optional `-beta` suffix. Progress moves through queued, checking, installing, and complete states; failures remain visible instead of silently disappearing.
 
 ### Are all phone models guaranteed to display SIP NOTIFY payloads?
 
-No. The module implements documented XML families and detects registered-contact User-Agents, but actual behavior depends on model, firmware, XML push provisioning, SIP NOTIFY authentication, and HTTPS certificate trust. Yealink XML push must be enabled on the handset or through provisioning; the PBX installer does not change phone firmware or provisioning. Use a manual format override when detection is wrong, choose **Yealink - Text Only** when a Yealink cannot retrieve an image, and test every target model before emergency use. The override manager also includes **Yealink - Color** and Panasonic KX. Unknown endpoints are flagged automatically but are not offered as a manual format. Use separate extensions for mixed vendors unless the PBX has a working default outbound endpoint for per-contact URI delivery.
+No. The module implements documented XML families and detects registered-contact User-Agents, but actual behavior depends on model, firmware, provisioning, authentication, and certificate trust. Yealink audio auto-answer uses `Alert-Info: Intercom`; the phone must allow intercom auto-answer. Yealink XML display also requires **Features > Remote Control > SIP Notify** or provisioning value `push_xml.sip_notify = 1`. The installer warns when it finds Yealink contacts but does not change phone firmware, provisioning, or SIP peers. Use **Yealink - Text Only** when a phone cannot retrieve the image, and test every target model before emergency use.
 
 ### What happens during quiet hours?
 
@@ -299,27 +296,29 @@ Yes. Upload audio through **Admin > System Recordings**, then select it as an op
 
 Generated TTS and combined announcement WAV files are automatically removed after 15 minutes.
 
-### Can different NWS zones notify different phones?
+### Can different NWS zones notify different devices and email addresses?
 
-Yes. Configure up to five named NWS zone groups and select extension recipients independently for each group. Manual NWS tests can target all configured groups or selected groups.
+Yes. Configure up to five named NWS zone groups and select phone extensions, enabled desktop clients, and optional live-alert email recipients independently for each group. Each group needs at least one phone or desktop target. A zone's email list is used only for live alerts from that zone and is limited to 50 unique addresses. The opt-in system/error recipients in General Settings are separate and do not receive Weather alerts. Manual NWS tests can target all configured groups or selected groups and never send email or webhooks.
 
 ### How do Xweather lightning alerts work?
 
-The dedicated **Lightning Alerts** tab uses Xweather `lightning/closest` for cloud-to-ground strikes. Administrators configure protected API credentials, a location, radius, recipients, independent quiet hours, optional all-clear delivery, opening/closing tones, and a 1–200% Lightning TTS volume that defaults to 25%. Coordinate locations are spoken naturally as “this area” instead of reading latitude/longitude aloud, while named locations use the configured city. Each combined Lightning page retains one second of leading silence before its pre-tone and speech.
+The dedicated **Lightning Alerts** tab uses Xweather `lightning/closest` for cloud-to-ground strikes. Configure up to five named trigger areas. Each area has its own Weather.gov adaptive trigger group, Xweather location and radius, phone extensions, desktop clients, optional live-alert email recipients, and all-clear choice. An area's email list is used only for live alerts from that area. API credentials, polling cadence, quiet hours, tones, voice, and volume are shared across the Lightning service. Coordinate locations are spoken naturally as “this area” instead of reading latitude/longitude aloud, while named locations use the configured city. Each combined Lightning page retains one second of leading silence before its pre-tone and speech.
 
-The default-on **Adaptive protection** toggle requires one selected Weather Alert zone. Its enabled state is shown with a green shield; Xweather stays in zero-token standby until that specific Weather.gov zone reports an active thunderstorm event, then polls every five minutes through a configurable 5–120 minute grace period that defaults to 60 minutes. A protected token bucket starts with one day of allowance, banks up to seven days, and limits scheduled queries to at most 15,000 tokens across 30 days. The optimized nearest-strike query observed on the production PBX costs 10 tokens, so continuous five-minute polling would require about 86,400 tokens per 30 days. Adaptive protection preserves the allowance by trading coverage: lightning outside an NWS event can be missed, and a long storm can temporarily enter quota-guard standby. Turning it off changes the state to a red shield and polls continuously at the configured 1–10 minute period regardless of NWS conditions; 1–4 minute choices display a hazard warning, and periods above 5 minutes can miss strikes because standard Xweather access covers only the recent five-minute window.
+The default-on **Adaptive protection** toggle requires a Weather Alert group for every enabled Lightning area. Xweather remains idle for an area until its selected Weather.gov group reports a thunderstorm event, then polls that location every five minutes through a configurable 5–120 minute grace period that defaults to 60 minutes. State is isolated per area, but the protected quota governor is shared across the account, so multiple storm-active areas consume tokens faster. Adaptive protection preserves allowance by trading coverage: lightning outside a Weather.gov event can be missed, and a long storm can temporarily enter quota-guard standby. Turning protection off polls every enabled area continuously at the configured 1–10 minute period; 1–4 minute choices display a hazard warning, and periods above 5 minutes can miss strikes because standard Xweather access covers only the recent five-minute window.
 
-The Lightning page presents that enabled/disabled state once beside the toggle. A separate quota warning appears only when adaptive protection is disabled and the observed continuous schedule exceeds the account allowance.
+The usage panel shows compact provider-period and token cards. A reset time that has already passed is labeled as a historical period and is never presented as current usage. A successful storm query or **Verify Applied Areas** refreshes the snapshot; verification performs one live query for every enabled area. A concise notice explains that multiple active areas use tokens faster.
 
 One warning is sent when a storm first enters the radius. The warning uses Xweather's nearest-strike distance and reports it to one decimal mile (for example, 4.1 miles) rather than reading the configured radius as the strike distance. Additional strikes from that active cluster do not create repeat alerts. Two consecutive clear queries reset the state; an optional all-clear can be sent, and a later storm can then generate a new warning. Credentials remain only in the protected central config and are redacted from diagnostics and Control API responses. The UI links to the official Xweather key setup guide; see the [Xweather Lightning API documentation](https://www.xweather.com/docs/weather-api/endpoints/lightning).
 
-The Lightning system test has its own 60-second anti-spam cooldown. Test phone, audio, and desktop content is explicitly labeled **TEST ONLY** so a validation cannot be mistaken for a real lightning event. Tests do not send email or Discord notifications. The saved Client Secret is masked in Lightning Alerts and can be revealed by an authenticated FreePBX administrator with the eye button; diagnostics and APIs never return it.
+Live Weather.gov and Xweather phone/Desktop dispatch uses a durable at-most-once local intent. If a worker stops after that intent is recorded, automatic recovery does not replay either local channel and reports the outcome as indeterminate; this prevents a likely duplicate at the cost of a possible missed local alert and is not an exactly-once guarantee. Email and webhook tasks are durably queued separately and retried after local handling, so that local crash tradeoff does not discard pending external deliveries.
+
+The Lightning system test can target one or more enabled, applied areas and has its own 60-second anti-spam cooldown. Test phone, audio, and desktop content is explicitly labeled **TEST ONLY** so a validation cannot be mistaken for a real lightning event. Tests do not send email, Discord, or generic webhook notifications. The saved Client Secret is masked in Lightning Alerts and can be revealed by an authenticated FreePBX administrator with the eye button; diagnostics and APIs never return it.
 
 Settings use FreePBX’s standard top-right **Apply Config** control. Saving a module form stages the protected central configuration and marks FreePBX for reload; the native config hook atomically applies it. Install and repair rebuild FreePBX Dashboard's stored hook index and verify that the announcement panel renders. A root maintenance check restores the managed Dashboard widget and menu placement after Dashboard or Framework replacement and corrects the central config to `0640 asterisk:asterisk` without rewriting its contents. Install, update, repair, and uninstall share the same root-owned maintenance lock so the minute worker cannot rewrite integration files during a deployment transaction. The menu repair supports both the numeric comparator used by earlier Framework 17 builds and the boolean comparator introduced by Framework 17.0.30.
 
 ### What do alert emails look like?
 
-Shared email recipients, the sender domain, and the optional Discord webhook are managed from the **Notification Destinations** popup in General Settings. When recipients are configured, Weather and Lightning alerts always use a branded multipart message. The HTML card embeds a compact Southland Servers logo inside the email, identifies Southland Servers Group and the SLS Mass Notification System, highlights the primary action, and renders structured alert details. Tornado, severe-storm, flood, winter, fire, lightning, test, and general alerts receive distinct urgency colors and icons. A plain-text alternative is included for non-HTML clients. Discord uses the same event-aware visual language in a smaller embed with the SLS identity, a public logo image/avatar, concise delivery fields, timestamp, and urgency/test footer; its logo URL is built from the automatically detected PBX hostname.
+General Settings manages the local Postfix sender identity and an optional list for module system/error notices. The maintenance worker submits each active operational fault once, clears its marker after recovery, and can notify again if the condition returns. Weather email recipients are selected in each Weather zone, and Lightning email recipients are selected in each trigger area; those service lists do not inherit the system/error list. Email is handed to the local Postfix/sendmail path as a branded multipart message with a plain-text alternative. General Settings also manages multiple Discord and generic HTTPS webhooks. Discord receives a compact event-aware embed whose avatar and card image use stable public Southland Servers HTTPS PNG assets; generic webhooks receive bounded structured JSON with an event ID and idempotency header. URLs must pass HTTPS, DNS, public-address, size, and redirect checks; stored secrets remain redacted. Manual Weather and Lightning tests never contact these external destinations.
 
 ### Where do I report bugs?
 
