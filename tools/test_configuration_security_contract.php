@@ -140,6 +140,45 @@ $typeErrors = $call('validateConfigValueTypes', [
 if (count($typeErrors) < 3) {
 	configuration_security_fail('Portable/native config scalar and nested-list validation is incomplete.');
 }
+$validZoneTypeErrors = $call('validateConfigValueTypes', [
+	'nws_zones' => [[
+		'id' => 'primary',
+		'name' => 'Primary',
+		'zone' => 'TXC491',
+		'extensions' => ['1000'],
+		'desktop_clients' => [],
+		'email_recipients' => [],
+		'quiet_hours_enabled' => '1',
+		'quiet_hours_start' => '22:00',
+		'quiet_hours_end' => '06:00',
+		'quiet_critical_events' => ['Tornado Warning'],
+		'discord_webhook_ids' => [],
+		'generic_webhook_ids' => [],
+	]],
+]);
+if (!empty($validZoneTypeErrors)) {
+	configuration_security_fail('A normalized Weather-zone quiet-hours policy was rejected as an overbroad protected configuration: ' . implode(' ', $validZoneTypeErrors));
+}
+$validZonePatch = $call('validateAndNormalizeControlConfigPatch', [
+	'nws_zones' => [[
+		'id' => 'primary',
+		'name' => 'Primary',
+		'zone' => 'TXC491',
+		'extensions' => ['1000'],
+		'desktop_clients' => [],
+		'email_recipients' => [],
+		'quiet_hours_enabled' => true,
+		'quiet_hours_start' => '22:00',
+		'quiet_hours_end' => '06:00',
+		'quiet_critical_events' => ['Tornado Warning'],
+		'discord_webhook_ids' => [],
+		'generic_webhook_ids' => [],
+	]],
+]);
+if (!empty($validZonePatch['errors'])
+	|| ($validZonePatch['patch']['nws_zones'][0]['quiet_hours_enabled'] ?? null) !== '1') {
+	configuration_security_fail('A valid Control API Weather-zone quiet-hours policy was rejected.');
+}
 $assignmentErrors = $call('validateNwsZoneDesktopAssignments', [[
 	'name' => 'Operations',
 	'zone' => 'TXC491',
@@ -258,10 +297,21 @@ foreach (['XWEATHER_LOCK_FILE', 'LOCK_EX | fcntl.LOCK_NB'] as $marker) {
 		configuration_security_fail("Xweather worker serialization marker is missing: {$marker}");
 	}
 }
-foreach (["child_relative == 'piper/venv'", "metadata.st_uid != 0", "stat.S_IMODE(metadata.st_mode) & 0o022"] as $marker) {
+foreach (["child_relative == 'piper/venv'", "metadata.st_uid != 0", "stat.S_IMODE(metadata.st_mode) & 0o022", "raise RuntimeError('runtime tree contains a symbolic link')"] as $marker) {
 	if (strpos($classSource, $marker) === false) {
 		configuration_security_fail("The web-safe root-owned Piper compatibility boundary is missing: {$marker}");
 	}
+}
+
+foreach (['dashboard-announcement-section.php', 'dedicated-sounds', 'mass-notify-api', 'visual-sip-notify-sender'] as $legacyLinkMarker) {
+	if (strpos($classSource, "'" . $legacyLinkMarker . "'") === false) {
+		configuration_security_fail('Known legacy runtime-link migration is incomplete: ' . $legacyLinkMarker);
+	}
+}
+$cleanupPosition = strpos($classSource, '$this->cleanupLegacyRuntimeArtifacts();');
+$permissionPosition = strpos($classSource, '$this->ensureRuntimePermissions();');
+if ($cleanupPosition === false || $permissionPosition === false || $cleanupPosition > $permissionPosition) {
+	configuration_security_fail('Legacy runtime links are not cleaned before the fail-closed permission scan.');
 }
 
 echo "Configuration and Control API security contract tests passed.\n";

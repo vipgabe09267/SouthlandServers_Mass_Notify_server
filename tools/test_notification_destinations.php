@@ -118,6 +118,31 @@ if (count($normalized) !== 2 || $normalized[0]['id'] === $normalized[1]['id'] ||
 	destination_fail('Destination normalization did not preserve rows with unique stable IDs and enabled state.');
 }
 
+$announcementNormalized = $call('normalizeWebhookDestinations', [
+	['name' => 'Dashboard channel', 'url' => $discord, 'enabled' => '1'],
+	['name' => 'Compatible receiver', 'url' => 'https://hooks.example.com/discord-compatible', 'enabled' => '1'],
+], 'announcement');
+if (count($announcementNormalized) !== 2
+	|| strpos((string)$announcementNormalized[0]['id'], 'announcement_') !== 0
+	|| ($announcementNormalized[0]['enabled'] ?? '') !== '1'
+	|| ($announcementNormalized[1]['url'] ?? '') !== 'https://hooks.example.com/discord-compatible') {
+	destination_fail('Dashboard announcement webhook normalization is not isolated from alert destinations.');
+}
+foreach ([$discord, 'https://hooks.example.com/discord-compatible'] as $input) {
+	if ($call('normalizeAnnouncementWebhookUrl', $input) !== $input) {
+		destination_fail("A valid Dashboard announcement webhook was rejected: {$input}");
+	}
+}
+foreach ([
+	'http://hooks.example.com/discord-compatible',
+	'https://127.0.0.1/discord-compatible',
+	'https://discord.com/not-a-webhook',
+] as $input) {
+	if ($call('normalizeAnnouncementWebhookUrl', $input) !== '') {
+		destination_fail("An invalid Dashboard announcement webhook was accepted: {$input}");
+	}
+}
+
 $validation = $call('validateWebhookDestinations', [
 	['id' => 'duplicate', 'name' => 'One', 'url' => $discord],
 	['id' => 'duplicate', 'name' => 'Two', 'url' => 'https://discord.com/api/webhooks/987654321/another-token'],
@@ -139,18 +164,33 @@ $redacted = $call('redactConfigSecrets', [
 	'discord_webhook_url' => $discord,
 	'discord_webhooks' => [['id' => 'd', 'url' => $discord]],
 	'generic_webhooks' => [['id' => 'g', 'url' => $generic]],
+	'announcement_webhooks' => [['id' => 'a', 'url' => $discord]],
 ]);
 if (($redacted['discord_webhook_url'] ?? '') !== '[redacted]'
 	|| ($redacted['discord_webhooks'][0]['url'] ?? '') !== '[redacted]'
-	|| ($redacted['generic_webhooks'][0]['url'] ?? '') !== '[redacted]') {
+	|| ($redacted['generic_webhooks'][0]['url'] ?? '') !== '[redacted]'
+	|| ($redacted['announcement_webhooks'][0]['url'] ?? '') !== '[redacted]') {
 	destination_fail('Control API redaction exposed a nested webhook URL.');
 }
 
 $view = (string)file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/views/other_settings.php');
-foreach (['system_notification_recipients_present', 'system_notification_recipients[]', 'System and Error Notifications', 'Weather and Lightning email recipients are selected within each zone or trigger area.', 'discord_webhooks_present', 'generic_webhooks_present', 'value="" autocomplete="new-password"'] as $marker) {
+foreach (['system_notification_recipients_present', 'system_notification_recipients[]', 'System and Error Notifications', 'Weather and Lightning email recipients are selected within each zone or trigger area.', 'discord_webhooks_present', 'generic_webhooks_present', 'announcement_webhooks_present', 'Dashboard Announcement Webhooks', 'value="" autocomplete="new-password"'] as $marker) {
 	if (strpos($view, $marker) === false) {
 		destination_fail("Notification destination UI secret-preservation contract is missing: {$marker}");
 	}
+}
+
+$defaults = $call('getDefaultSettings');
+if (($defaults['announcement_webhooks'] ?? null) !== []) {
+	destination_fail('Fresh-install Dashboard webhook configuration is not optional by default.');
+}
+$announcementPatch = $call('validateAndNormalizeControlConfigPatch', [
+	'announcement_webhooks' => [[
+		'id' => 'dashboard', 'name' => 'Dashboard', 'url' => $discord, 'enabled' => true,
+	]],
+]);
+if (!empty($announcementPatch['errors']) || !is_array($announcementPatch['patch']['announcement_webhooks'] ?? null)) {
+	destination_fail('Control API config validation rejected the protected Dashboard webhook list.');
 }
 foreach (['name="mail_recipients[]"', 'Shared Alert Destinations', 'Live Weather and Lightning alerts are submitted to every enabled destination.'] as $obsoleteMarker) {
 	if (strpos($view, $obsoleteMarker) !== false) {

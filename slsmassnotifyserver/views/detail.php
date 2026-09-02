@@ -4,13 +4,16 @@
 <?php return; } ?>
 <?php
 $typeMeta = [
-	'nws' => ['icon' => 'fa-cloud', 'class' => 'info'],
-	'xweather' => ['icon' => 'fa-bolt', 'class' => 'warning'],
-	'test' => ['icon' => 'fa-flask', 'class' => 'primary'],
-	'announcement' => ['icon' => 'fa-bullhorn', 'class' => 'primary'],
-	'announcement_audio' => ['icon' => 'fa-volume-up', 'class' => 'success'],
+	'weather' => ['icon' => 'fa-cloud', 'class' => 'info'],
+	'lightning' => ['icon' => 'fa-bolt', 'class' => 'warning'],
+	'manual_test' => ['icon' => 'fa-flask', 'class' => 'primary'],
+	'dashboard' => ['icon' => 'fa-bullhorn', 'class' => 'primary'],
+	'api' => ['icon' => 'fa-code', 'class' => 'info'],
+	'scheduling' => ['icon' => 'fa-calendar', 'class' => 'success'],
+	'desktop' => ['icon' => 'fa-desktop', 'class' => 'success'],
+	'system' => ['icon' => 'fa-cog', 'class' => 'warning'],
 ];
-$meta = $typeMeta[$event['type'] ?? ''] ?? ['icon' => 'fa-circle-o', 'class' => 'default'];
+$meta = $typeMeta[$event['notification_type'] ?? ''] ?? ['icon' => 'fa-circle-o', 'class' => 'default'];
 ?>
 <style>
 .sls-detail-page { color:#1f2937; }
@@ -35,7 +38,7 @@ $meta = $typeMeta[$event['type'] ?? ''] ?? ['icon' => 'fa-circle-o', 'class' => 
 <div class="container-fluid sls-detail-page"><div class="display full-border"><div class="fpbx-container">
 	<?php echo load_view(__DIR__ . '/hero.php', ['hero_image' => $hero_image]); ?>
 	<div class="sls-detail-top">
-		<div><h1><i class="fa <?php echo $meta['icon']; ?> text-primary" aria-hidden="true"></i> <?php echo htmlspecialchars($event['event'] !== '' ? $event['event'] : _('Notification Detail')); ?></h1><div class="sls-detail-badges"><span class="sls-detail-badge <?php echo $meta['class']; ?>"><i class="fa <?php echo $meta['icon']; ?>" aria-hidden="true"></i> <?php echo htmlspecialchars($event['type_label']); ?></span><?php if ($event['severity'] !== '') { ?><span class="sls-detail-badge"><i class="fa fa-exclamation-circle" aria-hidden="true"></i> <?php echo htmlspecialchars($event['severity']); ?></span><?php } ?><?php if ($event['status'] !== '') { ?><span class="sls-detail-badge"><i class="fa fa-check-circle" aria-hidden="true"></i> <?php echo htmlspecialchars($event['status']); ?></span><?php } ?></div></div>
+		<div><h1><i class="fa <?php echo $meta['icon']; ?> text-primary" aria-hidden="true"></i> <?php echo htmlspecialchars($event['event'] !== '' ? $event['event'] : _('Notification Detail')); ?></h1><div class="sls-detail-badges"><span class="sls-detail-badge <?php echo $meta['class']; ?>"><i class="fa <?php echo $meta['icon']; ?>" aria-hidden="true"></i> <?php echo htmlspecialchars($event['notification_type_label']); ?></span><?php if ($event['severity'] !== '') { ?><span class="sls-detail-badge"><i class="fa fa-exclamation-circle" aria-hidden="true"></i> <?php echo htmlspecialchars($event['severity']); ?></span><?php } ?><?php if ($event['status'] !== '') { ?><span class="sls-detail-badge"><i class="fa fa-check-circle" aria-hidden="true"></i> <?php echo htmlspecialchars($event['status']); ?></span><?php } ?></div></div>
 		<a class="btn btn-default" href="config.php?display=slsmassnotifyserver"><i class="fa fa-arrow-left" aria-hidden="true"></i> <?php echo _('Back to Logs'); ?></a>
 	</div>
 

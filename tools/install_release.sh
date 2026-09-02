@@ -10,12 +10,12 @@ if [ -n "${SLS_MASS_NOTIFY_MODULE:-}" ] \
     "SLS_MASS_NOTIFY_MODULE is fixed to the FreePBX raw module name '$MODULE'; refusing an alternate value." >&2
   exit 2
 fi
-TGZ="${SLS_MASS_NOTIFY_TGZ:-/tmp/slsmassnotifyserver-0.1.0.tgz}"
+TGZ="${SLS_MASS_NOTIFY_TGZ:-/tmp/slsmassnotifyserver-0.1.1-beta.tgz}"
 URL="${SLS_MASS_NOTIFY_TGZ_URL:-${1:-}}"
 SHA256="${SLS_MASS_NOTIFY_SHA256:-}"
 TOKEN="${SLS_MASS_NOTIFY_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
 LOG_FILE="${SLS_MASS_NOTIFY_INSTALL_LOG:-/tmp/slsmassnotifyserver-install.log}"
-EXPECTED_TGZ_SHA256="90ae525738d117a8141722590b33dbd4f4b23c32f31cb6e761f329e98504d704"
+EXPECTED_TGZ_SHA256="e6a61dfce8277b3464e72a93fb8e8dfdecff38688544391120fdc55877a82b11"
 DATA_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin"
 CONFIG_FILE="$DATA_DIR/mass-notifications.config"
 CONFIG_SNAPSHOT=""
@@ -33,6 +33,10 @@ ASTERISK_PACKAGE_REPAIR_ATTEMPTS=""
 REPAIR_ASTERISK_PACKAGES="${SLS_MASS_NOTIFY_REPAIR_ASTERISK_PACKAGES:-1}"
 INSTALL_MAINTENANCE_LOCK_FD=""
 FREEPBX_CONFIRMED=0
+REQUESTED_SYSTEM_TIMEZONE="${SLS_MASS_NOTIFY_TIMEZONE:-}"
+ORIGINAL_SYSTEM_TIMEZONE=""
+SYSTEM_TIMEZONE_CHANGED=0
+CONFIRMED_SYSTEM_TIMEZONE=""
 # Regression tests source this installer so they can exercise its protected
 # filesystem helpers.  Keep their fixture failure markers from creating or
 # deleting real FreePBX Dashboard notifications on the host running the test.
@@ -191,6 +195,18 @@ guard_config_on_exit() {
   status=$?
   trap - EXIT
 
+  if [ "$status" -ne 0 ] && [ "$SYSTEM_TIMEZONE_CHANGED" -eq 1 ] && [ -n "$ORIGINAL_SYSTEM_TIMEZONE" ]; then
+    if set_system_timezone "$ORIGINAL_SYSTEM_TIMEZONE" \
+      && timezone_names_equivalent "$(detect_system_timezone 2>/dev/null || true)" "$ORIGINAL_SYSTEM_TIMEZONE"; then
+      log "The installer restored the original system timezone after the failed installation."
+      SYSTEM_TIMEZONE_CHANGED=0
+    else
+      log "CRITICAL: the installer could not restore the original system timezone '$ORIGINAL_SYSTEM_TIMEZONE'."
+      log "Run: timedatectl set-timezone $ORIGINAL_SYSTEM_TIMEZONE"
+      status=1
+    fi
+  fi
+
   if [ "$status" -ne 0 ] && [ "$MODULE_ACTIVATED" -eq 1 ] && [ "$INSTALL_COMMITTED" -eq 0 ]; then
     log "Installation did not complete; removing partial integration and restoring the previous module files."
     # The activated module must remain present while its uninstall hook removes
@@ -256,6 +272,161 @@ exit(0);
   fi
 
   exit "$status"
+}
+
+timezone_zoneinfo_path() {
+  local timezone_name="$1"
+
+  TIMEZONE_NAME="$timezone_name" /usr/bin/python3 - <<'PY'
+import os
+import pathlib
+import re
+
+name = os.environ.get("TIMEZONE_NAME", "")
+if not name or len(name) > 128 or "\x00" in name:
+    raise SystemExit(1)
+if name.startswith("/") or "//" in name or any(part in {"", ".", ".."} for part in name.split("/")):
+    raise SystemExit(1)
+if not re.fullmatch(r"[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*", name):
+    raise SystemExit(1)
+
+base = pathlib.Path("/usr/share/zoneinfo").resolve(strict=True)
+candidate = base.joinpath(*name.split("/"))
+resolved = candidate.resolve(strict=True)
+try:
+    resolved.relative_to(base)
+except ValueError:
+    raise SystemExit(1)
+if not resolved.is_file():
+    raise SystemExit(1)
+print(resolved)
+PY
+}
+
+validate_system_timezone() {
+  local timezone_name="$1"
+  local listed_timezones
+
+  timezone_zoneinfo_path "$timezone_name" >/dev/null 2>&1 || return 1
+  [ -x /usr/bin/timedatectl ] || return 1
+  listed_timezones="$(/usr/bin/timedatectl list-timezones --no-pager 2>/dev/null || true)"
+  [ -n "$listed_timezones" ] || return 1
+  LC_ALL=C grep -Fxq -- "$timezone_name" <<<"$listed_timezones"
+}
+
+detect_system_timezone() {
+  local timezone_name=""
+
+  if [ -x /usr/bin/timedatectl ]; then
+    timezone_name="$(/usr/bin/timedatectl show --property=Timezone --value 2>/dev/null || true)"
+  fi
+  if ! timezone_zoneinfo_path "$timezone_name" >/dev/null 2>&1; then
+    if [ -r /etc/timezone ] && [ ! -L /etc/timezone ]; then
+      timezone_name="$(sed -n '1{s/[[:space:]]*$//;p;q;}' /etc/timezone)"
+    fi
+  fi
+  timezone_zoneinfo_path "$timezone_name" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$timezone_name"
+}
+
+timezone_names_equivalent() {
+  local left="$1"
+  local right="$2"
+  local left_path right_path
+
+  [ -n "$left" ] && [ -n "$right" ] || return 1
+  left_path="$(timezone_zoneinfo_path "$left" 2>/dev/null || true)"
+  right_path="$(timezone_zoneinfo_path "$right" 2>/dev/null || true)"
+  [ -n "$left_path" ] && [ "$left_path" = "$right_path" ]
+}
+
+set_system_timezone() {
+  local timezone_name="$1"
+
+  /usr/bin/timedatectl set-timezone "$timezone_name"
+}
+
+configure_system_timezone() {
+  local detected_timezone requested_timezone response confirmed_timezone
+
+  detected_timezone="$(detect_system_timezone 2>/dev/null || true)"
+  [ -n "$detected_timezone" ] || {
+    log "The installer could not detect a valid IANA system timezone through timedatectl and /usr/share/zoneinfo."
+    return 1
+  }
+  ORIGINAL_SYSTEM_TIMEZONE="$detected_timezone"
+  log "Detected system timezone: $detected_timezone"
+
+  requested_timezone="$REQUESTED_SYSTEM_TIMEZONE"
+  if [ -z "$requested_timezone" ] && [ -t 0 ] && [ -t 1 ]; then
+    printf 'Keep system timezone %s? [Y/n] ' "$detected_timezone" >&2
+    if ! IFS= read -r response; then
+      response=""
+    fi
+    case "${response:-y}" in
+      y|Y|yes|YES|Yes)
+        ;;
+      n|N|no|NO|No)
+        printf 'Enter an IANA timezone (for example, America/Chicago): ' >&2
+        IFS= read -r requested_timezone || requested_timezone=""
+        ;;
+      *)
+        log "Timezone confirmation must be yes or no."
+        return 1
+        ;;
+    esac
+  fi
+
+  if [ -z "$requested_timezone" ]; then
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+      log "Noninteractive install: keeping $detected_timezone. Set SLS_MASS_NOTIFY_TIMEZONE to a listed IANA timezone to change it explicitly."
+    else
+      log "System timezone confirmed: $detected_timezone"
+    fi
+    CONFIRMED_SYSTEM_TIMEZONE="$detected_timezone"
+    return 0
+  fi
+
+  if ! validate_system_timezone "$requested_timezone"; then
+    log "The requested system timezone is not a valid listed IANA timezone."
+    log "Choose an exact value from: timedatectl list-timezones"
+    return 1
+  fi
+  if timezone_names_equivalent "$detected_timezone" "$requested_timezone"; then
+    log "System timezone confirmed: $detected_timezone"
+    CONFIRMED_SYSTEM_TIMEZONE="$detected_timezone"
+    return 0
+  fi
+
+  log "Changing system timezone from $detected_timezone to $requested_timezone."
+  set_system_timezone "$requested_timezone" || {
+    log "timedatectl could not set the requested system timezone."
+    return 1
+  }
+  SYSTEM_TIMEZONE_CHANGED=1
+  confirmed_timezone="$(detect_system_timezone 2>/dev/null || true)"
+  if ! timezone_names_equivalent "$confirmed_timezone" "$requested_timezone"; then
+    log "System timezone verification failed after timedatectl returned success."
+    if set_system_timezone "$detected_timezone" >/dev/null 2>&1 \
+      && timezone_names_equivalent "$(detect_system_timezone 2>/dev/null || true)" "$detected_timezone"; then
+      SYSTEM_TIMEZONE_CHANGED=0
+    fi
+    return 1
+  fi
+  CONFIRMED_SYSTEM_TIMEZONE="$confirmed_timezone"
+  log "System timezone is now: $confirmed_timezone"
+}
+
+verify_confirmed_system_timezone() {
+  local current_timezone
+
+  [ -n "$CONFIRMED_SYSTEM_TIMEZONE" ] || return 1
+  current_timezone="$(detect_system_timezone 2>/dev/null || true)"
+  if ! timezone_names_equivalent "$current_timezone" "$CONFIRMED_SYSTEM_TIMEZONE"; then
+    log "The system timezone changed unexpectedly during installation."
+    return 1
+  fi
+  log "System timezone verified: $current_timezone"
 }
 
 require_freepbx() {
@@ -369,6 +540,26 @@ acquire_maintenance_coordination() {
     exit 1
   }
 }
+
+close_inherited_maintenance_lock_fds() {
+  local lock_file="${SLS_MASS_NOTIFY_MAINTENANCE_LOCK:-/run/lock/sls-mass-notify-maintenance.lock}"
+  local descriptor descriptor_path descriptor_target close_fd
+
+  for descriptor_path in "/proc/${BASHPID}/fd/"*; do
+    [ -e "$descriptor_path" ] || continue
+    descriptor="${descriptor_path##*/}"
+    [[ "$descriptor" =~ ^[0-9]+$ ]] && [ "$descriptor" -gt 2 ] || continue
+    descriptor_target="$(readlink -f -- "$descriptor_path" 2>/dev/null || true)"
+    [ "$descriptor_target" = "$lock_file" ] || continue
+    close_fd="$descriptor"
+    exec {close_fd}>&-
+  done
+}
+
+run_without_install_maintenance_lock() (
+  close_inherited_maintenance_lock_fds
+  "$@"
+)
 
 ensure_freepbx_prerequisites() {
   local prerequisite module_list
@@ -987,9 +1178,9 @@ PY
 }
 
 mixed_endpoint_visual_route_supported() {
-  local mixed_format="$1"
-  local routing_mode="$2"
-  [ "$mixed_format" != "1" ] || [ "$routing_mode" = "contact_uri" ]
+  # Contact-specific delivery is preferred, but portable endpoint fan-out with
+  # generic XML is a safe runtime fallback and must not abort installation.
+  return 0
 }
 
 preflight_platform() {
@@ -1093,6 +1284,8 @@ install_bootstrap_dependencies() {
   fi
   { [ -x /usr/bin/flock ] && [ -x /usr/sbin/runuser ]; } || missing_packages+=(util-linux)
   { [ -x /usr/bin/timeout ] && [ -x /usr/bin/readlink ]; } || missing_packages+=(coreutils)
+  [ -x /usr/bin/timedatectl ] || missing_packages+=(systemd)
+  [ -r /usr/share/zoneinfo/UTC ] || missing_packages+=(tzdata)
 
   if [ "${#missing_packages[@]}" -gt 0 ]; then
     command -v apt-get >/dev/null 2>&1 || {
@@ -1107,7 +1300,7 @@ install_bootstrap_dependencies() {
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --no-remove "${missing_packages[@]}"
   fi
 
-  for bootstrap_utility in /usr/bin/php /usr/bin/flock /usr/bin/readlink /usr/bin/timeout /usr/sbin/runuser; do
+  for bootstrap_utility in /usr/bin/php /usr/bin/flock /usr/bin/readlink /usr/bin/timeout /usr/bin/timedatectl /usr/sbin/runuser; do
     [ -x "$bootstrap_utility" ] || {
       log "A required installation bootstrap prerequisite is unavailable after dependency installation: $bootstrap_utility"
       exit 1
@@ -1115,6 +1308,10 @@ install_bootstrap_dependencies() {
   done
   /usr/bin/php -r 'exit(function_exists("openssl_encrypt") && function_exists("openssl_decrypt") ? 0 : 1);' || {
     log "The PHP OpenSSL extension is required for protected desktop credentials. Install php-common, then rerun the installer."
+    exit 1
+  }
+  [ -r /usr/share/zoneinfo/UTC ] || {
+    log "The IANA timezone database is required. Install tzdata, then rerun the installer."
     exit 1
   }
 }
@@ -1257,8 +1454,8 @@ verify_tgz() {
   actual_sha="$(sha256sum "$TGZ" | awk '{print $1}')"
   if [ -n "$SHA256" ]; then
     echo "$SHA256  $TGZ" | sha256sum -c -
-  elif [ "$(basename "$TGZ")" = "slsmassnotifyserver-0.1.0.tgz" ] && [ "$actual_sha" != "$EXPECTED_TGZ_SHA256" ]; then
-		log "$TGZ does not match the current slsmassnotifyserver-0.1.0 package."
+  elif [ "$(basename "$TGZ")" = "slsmassnotifyserver-0.1.1-beta.tgz" ] && [ "$actual_sha" != "$EXPECTED_TGZ_SHA256" ]; then
+		log "$TGZ does not match the current slsmassnotifyserver-0.1.1-beta package."
     log "Expected SHA256: $EXPECTED_TGZ_SHA256"
     log "Actual SHA256:   $actual_sha"
     log "Remove the stale local TGZ or install with SLS_MASS_NOTIFY_TGZ_URL so the current release is downloaded."
@@ -1302,8 +1499,8 @@ with tarfile.open(archive, "r:gz") as handle:
     root = ET.fromstring(module_xml.read())
     if (root.findtext("rawname") or "").strip() != module:
         raise SystemExit("module.xml rawname does not match the requested module")
-    if (root.findtext("version") or "").strip() != "0.1.0":
-        raise SystemExit("module.xml does not contain the expected 0.1.0 version")
+    if (root.findtext("version") or "").strip() != "0.1.1-beta":
+        raise SystemExit("module.xml does not contain the expected 0.1.1-beta version")
 PY
 }
 
@@ -1751,7 +1948,7 @@ $module = getenv("SLS_MASS_NOTIFY_MODULE") ?: "slsmassnotifyserver";
 $stmt = \FreePBX::Database()->prepare("SELECT version FROM modules WHERE modulename = ? LIMIT 1");
 $stmt->execute([$module]);
 $version = $stmt->fetchColumn();
-exit(is_string($version) && trim($version) === "0.1.0" ? 0 : 1);
+exit(is_string($version) && trim($version) === "0.1.1-beta" ? 0 : 1);
 ' >>"$LOG_FILE" 2>&1
 }
 
@@ -1763,18 +1960,92 @@ refresh_module_install() {
   fi
 }
 
+runtime_install_postconditions_available() {
+  [ -x /usr/local/bin/sls_mass_notify/sls_mass_notify_install_piper_voices.sh ] \
+    && [ -x /usr/local/bin/sls_mass_notify/sls_notify.py ] \
+    && [ -x /usr/local/bin/sls_mass_notify/sls_config.py ] \
+    && [ -x /usr/local/bin/sls_mass_notify/piper/venv/bin/piper ] \
+    && [ -x /usr/local/bin/piper ] \
+    && [ -x "$DATA_DIR/piper/venv/bin/piper" ] \
+    && MODULE_ROOT="/var/www/html/admin/modules/$MODULE" python3 - <<'PY'
+import filecmp
+import os
+import pathlib
+
+module = pathlib.Path(os.environ["MODULE_ROOT"])
+runtime = pathlib.Path("/usr/local/bin/sls_mass_notify")
+expected = {}
+for name in (
+    "sls_mass_notify_nws_poll.sh",
+    "sls_mass_notify_weather_poll.sh",
+    "sls_mass_notify_schedule_worker.php",
+    "sls_mass_notify_test.sh",
+    "sls_mass_notify_update.sh",
+    "sls_mass_notify_maintenance.sh",
+    "sls_mass_notify_uninstall.sh",
+    "sls_mass_notify_install_piper_voices.sh",
+):
+    expected[pathlib.PurePosixPath(name)] = module / "bin" / name
+source_root = module / "bin" / "sls_mass_notify"
+if not source_root.is_dir():
+    raise SystemExit(1)
+for source in source_root.rglob("*"):
+    if source.is_file() and "__pycache__" not in source.parts and source.suffix != ".pyc":
+        expected[pathlib.PurePosixPath(source.relative_to(source_root).as_posix())] = source
+actual = {
+    pathlib.PurePosixPath(path.relative_to(runtime).as_posix())
+    for path in runtime.rglob("*")
+    if path.is_file()
+    and path.relative_to(runtime).parts[:1] != ("piper",)
+    and "__pycache__" not in path.parts
+    and path.suffix != ".pyc"
+}
+if actual != set(expected):
+    raise SystemExit(1)
+for relative, source in expected.items():
+    target = runtime / pathlib.Path(str(relative))
+    if not target.is_file() or not filecmp.cmp(source, target, shallow=False):
+        raise SystemExit(1)
+PY
+}
+
 ensure_runtime_installed() {
+  if runtime_install_postconditions_available; then
+    return 0
+  fi
+
+  log "The FreePBX module hook left incomplete runtime postconditions; running one bounded direct refresh."
   refresh_module_install || {
     tail -60 "$LOG_FILE" 2>/dev/null || true
     exit 1
   }
 
-  if [ -x /usr/local/bin/sls_mass_notify/sls_mass_notify_install_piper_voices.sh ]; then
+  if runtime_install_postconditions_available; then
     return 0
   fi
 
-  log "Runtime installer is missing after fwconsole install and direct refresh. See $LOG_FILE."
+  log "Runtime postconditions are incomplete after fwconsole install and one direct refresh. See $LOG_FILE."
   exit 1
+}
+
+install_module_with_autoenable() {
+  local install_output install_status
+
+  if install_output="$(run_without_install_maintenance_lock fwconsole ma install --autoenable "$MODULE" 2>&1)"; then
+    printf '%s\n' "$install_output" >>"$LOG_FILE"
+    return 0
+  else
+    install_status=$?
+  fi
+  printf '%s\n' "$install_output" >>"$LOG_FILE"
+
+  if ! printf '%s\n' "$install_output" | grep -Eqi \
+    '(unknown|unrecognized|invalid|no such)[[:space:]-]+option[^[:cntrl:]]*autoenable|option[^[:cntrl:]]*autoenable[^[:cntrl:]]*(does not exist|is not defined|is unknown|is unrecognized)|autoenable[^[:cntrl:]]*option[^[:cntrl:]]*(does not exist|is not defined|is unknown|is unrecognized)'; then
+    return "$install_status"
+  fi
+
+  log "This fwconsole build requires global options before the module action; retrying compatible --autoenable syntax."
+  run_without_install_maintenance_lock fwconsole ma --autoenable install "$MODULE" >>"$LOG_FILE" 2>&1
 }
 
 ensure_piper_runtime() {
@@ -1847,61 +2118,68 @@ EOF
 }
 
 repair_runtime_permissions() {
-  PIPER_DIR="/usr/local/bin/sls_mass_notify/piper"
-  PIPER_BIN="$PIPER_DIR/venv/bin/piper"
-  PIPER_PY="$PIPER_DIR/venv/bin/python"
-  [ -e "$PIPER_BIN" ] && chmod 0755 "$PIPER_BIN" 2>/dev/null || true
-  [ -e "$PIPER_PY" ] && chmod 0755 "$PIPER_PY" 2>/dev/null || true
-  [ -e "$PIPER_DIR/venv/bin/python3" ] && chmod 0755 "$PIPER_DIR/venv/bin/python3" 2>/dev/null || true
-  if [ -e "$PIPER_BIN" ] || [ -e "$PIPER_PY" ]; then
-    rm -f /usr/local/bin/piper
-    cat > /usr/local/bin/piper <<'EOF'
-#!/bin/sh
-PIPER_BIN="/usr/local/bin/sls_mass_notify/piper/venv/bin/piper"
-PIPER_PY="/usr/local/bin/sls_mass_notify/piper/venv/bin/python"
-if [ -x "$PIPER_BIN" ]; then
-  exec "$PIPER_BIN" "$@"
-fi
-if [ -x "$PIPER_PY" ] && [ -r "$PIPER_BIN" ]; then
-  exec "$PIPER_PY" "$PIPER_BIN" "$@"
-fi
-if [ -x "$PIPER_PY" ]; then
-  exec "$PIPER_PY" -m piper "$@"
-fi
-echo "Piper TTS binary is not installed or not executable: $PIPER_BIN" >&2
-exit 126
-EOF
-  fi
-  [ -e /usr/local/bin/piper ] && chmod 0755 /usr/local/bin/piper 2>/dev/null || true
-  if [ -x /usr/local/bin/sls_mass_notify/piper/venv/bin/piper ]; then
-    mkdir -p "$DATA_DIR/piper"
-    rm -rf "$DATA_DIR/piper/venv"
-    mkdir -p "$DATA_DIR/piper/venv/bin"
-    ln -s /usr/local/bin/piper "$DATA_DIR/piper/venv/bin/piper"
+  if [ -d /usr/local/bin/sls_mass_notify ]; then
+    RUNTIME_PERMISSION_ROOT=/usr/local/bin/sls_mass_notify /usr/bin/python3 - <<'PY' || return 1
+import os
+import stat
+
+root = os.environ["RUNTIME_PERMISSION_ROOT"]
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+root_fd = os.open(root, flags)
+
+def secure_tree(directory_fd, relative=""):
+    os.fchown(directory_fd, 0, 0)
+    os.fchmod(directory_fd, 0o755)
+    for name in os.listdir(directory_fd):
+        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        child_relative = f"{relative}/{name}" if relative else name
+        if stat.S_ISDIR(metadata.st_mode):
+            child_fd = os.open(name, flags, dir_fd=directory_fd)
+            try:
+                secure_tree(child_fd, child_relative)
+            finally:
+                os.close(child_fd)
+        elif stat.S_ISREG(metadata.st_mode):
+            file_fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
+            try:
+                if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                    raise RuntimeError(f"runtime entry changed type during repair: {child_relative}")
+                os.fchown(file_fd, 0, 0)
+                executable = (
+                    "/" not in child_relative
+                    and (
+                        child_relative.endswith((".sh", ".py"))
+                        or child_relative == "sls_mass_notify_schedule_worker.php"
+                    )
+                ) or child_relative.startswith("piper/venv/bin/")
+                os.fchmod(file_fd, 0o755 if executable else 0o644)
+            finally:
+                os.close(file_fd)
+        elif stat.S_ISLNK(metadata.st_mode):
+            os.chown(name, 0, 0, dir_fd=directory_fd, follow_symlinks=False)
+        else:
+            raise RuntimeError(f"unsupported runtime entry: {child_relative}")
+
+try:
+    secure_tree(root_fd)
+finally:
+    os.close(root_fd)
+PY
   fi
 
-  if [ -d /usr/local/bin/sls_mass_notify ]; then
-    chown -R root:root /usr/local/bin/sls_mass_notify
-    find /usr/local/bin/sls_mass_notify -type d -exec chmod 0755 {} +
-    find /usr/local/bin/sls_mass_notify -type f -exec chmod 0644 {} +
-    find /usr/local/bin/sls_mass_notify/piper/venv/bin -type f -exec chmod 0755 {} + 2>/dev/null || true
-    chmod 0755 \
-	  /usr/local/bin/sls_mass_notify/sls_mass_notify_weather_poll.sh \
-      /usr/local/bin/sls_mass_notify/sls_mass_notify_nws_poll.sh \
-      /usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php \
-      /usr/local/bin/sls_mass_notify/sls_mass_notify_test.sh \
-	  /usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh \
-	  /usr/local/bin/sls_mass_notify/sls_mass_notify_maintenance.sh \
-	  /usr/local/bin/sls_mass_notify/sls_mass_notify_uninstall.sh \
-      /usr/local/bin/sls_mass_notify/sls_mass_notify_install_piper_voices.sh \
-	  /usr/local/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py \
-	  /usr/local/bin/sls_mass_notify/sls_branded_email.py \
-	  /usr/local/bin/sls_mass_notify/sls_branded_discord.py \
-	  /usr/local/bin/sls_mass_notify/sls_notification_destinations.py \
-	  /usr/local/bin/sls_mass_notify/sls_system_notifications.py \
-	  /usr/local/bin/sls_mass_notify/sls_nws_status.py \
-      /usr/local/bin/sls_mass_notify/sls_notify.py \
-      /usr/local/bin/sls_mass_notify/sls_config.py 2>/dev/null || true
+  # Delegate wrapper and compatibility-tree normalization to the packaged
+  # fail-closed helper. It recognizes only the exact SLS-managed layout and
+  # refuses to replace foreign files or unexpected directory contents.
+  if [ -x /usr/local/bin/sls_mass_notify/piper/venv/bin/piper ]; then
+    local piper_repair_script="/var/www/html/admin/modules/$MODULE/bin/sls_mass_notify_install_piper_voices.sh"
+    if [ ! -f "$piper_repair_script" ]; then
+      piper_repair_script="/usr/local/bin/sls_mass_notify/sls_mass_notify_install_piper_voices.sh"
+    fi
+    [ -f "$piper_repair_script" ] || {
+      log "Packaged Piper permission repair helper is unavailable."
+      return 1
+    }
+    /bin/bash "$piper_repair_script" --repair-permissions-only || return 1
   fi
 
   mkdir -p /var/spool/asterisk/tmp /var/spool/asterisk/outgoing /var/spool/asterisk/outgoing_done
@@ -2403,7 +2681,7 @@ sign_and_verify_touched_modules() {
   for module_name in "${modules_to_sign[@]}"; do
     signed=0
     for attempt in 1 2; do
-      if /usr/bin/timeout --signal=TERM 360 "$signer" "$module_name" >>"$LOG_FILE" 2>&1; then
+      if run_without_install_maintenance_lock /usr/bin/timeout --signal=TERM 360 "$signer" "$module_name" >>"$LOG_FILE" 2>&1; then
         signed=1
         break
       fi
@@ -2416,7 +2694,7 @@ sign_and_verify_touched_modules() {
       exit 1
     }
 
-    SLS_MASS_NOTIFY_MODULE="$module_name" php -r '
+    run_without_install_maintenance_lock /usr/bin/env SLS_MASS_NOTIFY_MODULE="$module_name" php -r '
 require "/etc/freepbx.conf";
 $module = getenv("SLS_MASS_NOTIFY_MODULE");
 $gpg = \FreePBX::GPG();
@@ -2696,6 +2974,7 @@ exit(0);
     /usr/local/bin/sls_mass_notify/sls_notification_destinations.py
     /usr/local/bin/sls_mass_notify/sls_system_notifications.py
     /usr/local/bin/sls_mass_notify/sls_nws_status.py
+    /usr/local/bin/sls_mass_notify/sls_nws_delivery_claims.py
     /usr/local/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py
   )
   for runtime_python in "${runtime_python_files[@]}"; do
@@ -2827,14 +3106,12 @@ PY
         yealink_endpoint_list="${yealink_endpoint_list}${yealink_endpoint_list:+,}${extension}"
         ;;
     esac
-    if ! mixed_endpoint_visual_route_supported "$mixed_format" "$notify_routing_mode"; then
-      rm -f "$endpoint_inventory" "$endpoint_inventory_err"
-      log "Registered extension $extension has mixed phone formats ($formats_csv), but Asterisk has no usable default_outbound_endpoint for contact-URI SIP NOTIFY."
-      log "Installation is stopping before commit because visual delivery would be known-broken for that extension. Configure a valid PBX-managed default outbound endpoint, use one phone family per extension, or apply an explicit format override and rerun the installer."
-      exit 1
-    fi
     if [ "$mixed_format" = "1" ]; then
-      log "Warning: extension $extension has mixed registered phone formats ($formats_csv). Distinct contact-URI SIP NOTIFY submission is available; runtime delivery remains fail-closed if any registration URI cannot be resolved."
+      if [ "$notify_routing_mode" = "contact_uri" ]; then
+        log "Warning: extension $extension has mixed registered phone formats ($formats_csv). Each resolved contact URI will receive its matching vendor payload."
+      else
+        log "Warning: extension $extension has mixed registered phone formats ($formats_csv), but contact-URI routing is unavailable. Runtime delivery will use one safe generic XML payload through portable endpoint fan-out."
+      fi
     fi
     if ! verify_registered_endpoint_route "$extension"; then
       rm -f "$endpoint_inventory" "$endpoint_inventory_err"
@@ -2901,7 +3178,7 @@ PY
   update_count="$(printf '%s\n' "$root_cron" | grep -Fc '/usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh' || true)"
   maintenance_count="$(printf '%s\n' "$root_cron" | grep -Fc '/usr/local/bin/sls_mass_notify/sls_mass_notify_maintenance.sh' || true)"
   weather_count="$(printf '%s\n' "$asterisk_cron" | grep -Fc '/usr/local/bin/sls_mass_notify/sls_mass_notify_weather_poll.sh' || true)"
-  weather_canonical_count="$(printf '%s\n' "$asterisk_cron" | grep -Fxc '* * * * * /usr/bin/timeout 1200 /usr/local/bin/sls_mass_notify/sls_mass_notify_weather_poll.sh' || true)"
+  weather_canonical_count="$(printf '%s\n' "$asterisk_cron" | grep -Fxc '* * * * * /usr/bin/timeout 5500 /usr/local/bin/sls_mass_notify/sls_mass_notify_weather_poll.sh' || true)"
   schedule_count="$(printf '%s\n' "$asterisk_cron" | grep -Fc '/usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php' || true)"
   schedule_canonical_count="$(printf '%s\n' "$asterisk_cron" | grep -Fxc '* * * * * /usr/bin/timeout 1200 /usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php' || true)"
   if [ "$update_count" -ne 1 ]; then
@@ -2956,6 +3233,8 @@ main() {
   acquire_maintenance_coordination
   set_install_stage "dependency installation" "Restore Debian package repository access and install the prerequisite named in the installer log, then rerun the installer."
   install_dependencies
+  set_install_stage "timezone validation" "Choose a valid IANA timezone listed by timedatectl, or repair the host's /etc/localtime and systemd timezone configuration before rerunning the installer."
+  configure_system_timezone
   preflight_platform
   preflight_python
   ensure_freepbx_prerequisites
@@ -2969,15 +3248,19 @@ main() {
   stage_module_directory
   activate_staged_module
   ensure_local_signer
-  if ! SLS_MASS_NOTIFY_DEFER_SIGNING=1 fwconsole ma install "$MODULE" >>"$LOG_FILE" 2>&1; then
+  # A prior fwconsole chown can make the data-tree Piper compatibility path
+  # asterisk-owned. Normalize the exact managed layout before the new module's
+  # install hook performs its fail-closed runtime-tree inspection.
+  repair_runtime_permissions
+  if ! SLS_MASS_NOTIFY_DEFER_SIGNING=1 install_module_with_autoenable; then
     if ! module_registered_at_expected_version; then
-		log "FreePBX rejected the module installation before registering version 0.1.0. See $LOG_FILE."
+		log "FreePBX rejected the module installation before registering version 0.1.1-beta. See $LOG_FILE."
       exit 1
     fi
-	log "FreePBX registered version 0.1.0 but reported a nonfatal install status; runtime verification will continue."
+	log "FreePBX registered version 0.1.1-beta but reported a nonfatal install status; runtime verification will continue."
   fi
-  fwconsole ma enable "$MODULE" >>"$LOG_FILE" 2>&1 || true
   SLS_MASS_NOTIFY_MODULE="$MODULE" sync_module_version
+  repair_runtime_permissions
   set_install_stage "runtime integration" "Use General Settings > Danger Zone > Repair Installation after correcting the reported Asterisk, Apache, cron, signer, or filesystem prerequisite."
   ensure_runtime_installed
   asterisk -rx "module reload res_pjsip_notify.so" >>"$LOG_FILE" 2>&1 || true
@@ -2987,18 +3270,19 @@ main() {
     exit 1
   }
   repair_runtime_permissions
-  fwconsole chown
-  secure_central_config
+  run_without_install_maintenance_lock fwconsole chown
   repair_runtime_permissions
-  fwconsole reload
+  secure_central_config
+  run_without_install_maintenance_lock fwconsole reload
   asterisk -rx "module reload res_pjsip_notify.so" >>"$LOG_FILE" 2>&1 || true
   repair_runtime_permissions
-  fwconsole reload
+  run_without_install_maintenance_lock fwconsole reload
   repair_runtime_permissions
   asterisk -rx "dialplan reload" || true
   set_install_stage "post-install verification" "Review the failed verification in /tmp/slsmassnotifyserver-install.log, correct that PBX-specific prerequisite, and rerun the installer or Repair Installation."
   verify_piper_voices
   verify_install
+  verify_confirmed_system_timezone
   verify_config_unchanged
   INSTALL_COMMITTED=1
   clear_install_failure

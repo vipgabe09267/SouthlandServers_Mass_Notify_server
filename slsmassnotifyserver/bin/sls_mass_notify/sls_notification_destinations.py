@@ -13,6 +13,7 @@ import ipaddress
 import json
 import math
 import os
+import pwd
 import re
 import signal
 import socket
@@ -39,10 +40,14 @@ MAX_RETRY_DELIVERIES = 500
 MAX_RETRY_STATE_BYTES = 4 * 1024 * 1024
 MAX_RETRY_RECORDS_PER_RUN = 3
 COMPLETED_RETRY_RETENTION_SECONDS = 7 * 86400
-USER_AGENT = "SouthlandServers-Mass-Notifications-Server/0.1.0"
+USER_AGENT = "SouthlandServers-Mass-Notifications-Server/0.1.1-beta"
 DISCORD_HOSTS = {"discord.com", "discordapp.com", "canary.discord.com", "ptb.discord.com"}
 DISCORD_PATH = re.compile(r"^/api/webhooks/[0-9]+/[A-Za-z0-9._~-]+$")
-DISCORD_AVATAR_URL = "https://southlandservers.xyz/images/webhook.png"
+SOUTHLAND_SERVERS_LOGO_URL = "https://southlandservers.xyz/images/webhook.png"
+# Preserve the public constant used by older integrations while making the
+# branding contract explicit: every Discord payload uses the Southland Servers
+# logo as the webhook profile picture.
+DISCORD_AVATAR_URL = SOUTHLAND_SERVERS_LOGO_URL
 DISCORD_EMBED_IMAGE_URL = "https://southlandservers.xyz/images/webhook_proxy.png"
 DNS_NAME = re.compile(
     r"^(?=.{1,253}\.?$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
@@ -292,13 +297,41 @@ def build_discord_payload(config, subject, body, event="", severity="", fields=N
         "description": _compact_description(body, subject),
         "color": color,
         "fields": embed_fields,
-        "footer": {"text": f"{urgency} • SLS Mass Notification System"[:2048]},
+        "footer": {
+            "text": f"{urgency} • SLS Mass Notification System"[:2048],
+            "icon_url": avatar_url,
+        },
         "timestamp": _normalize_timestamp(timestamp),
     }
     embed["author"]["icon_url"] = avatar_url
-    embed["image"] = {"url": DISCORD_EMBED_IMAGE_URL}
-    payload = {"username": "SLS Mass Notification System", "embeds": [embed]}
-    payload["avatar_url"] = avatar_url
+    # Discord does not expose image dimensions in webhook payloads. A thumbnail
+    # keeps the branding visible without turning the square logo into a large,
+    # full-width card image.
+    embed["thumbnail"] = {"url": DISCORD_EMBED_IMAGE_URL}
+    payload = {
+        "username": "SLS Mass Notification System",
+        "avatar_url": avatar_url,
+        "embeds": [embed],
+    }
+    return payload
+
+
+def build_announcement_discord_payload(config, title, body, background_color="#6d28d9", fields=None, timestamp=""):
+    """Build the bounded Discord-compatible card used by Dashboard announcements."""
+    normalized_title = _text(title, 220) or "Announcement"
+    payload = build_discord_payload(
+        config,
+        normalized_title,
+        body,
+        "Announcement",
+        "Information",
+        fields,
+        timestamp,
+    )
+    color = str(background_color or "").strip()
+    if re.fullmatch(r"#[0-9A-Fa-f]{6}", color):
+        payload["embeds"][0]["color"] = int(color[1:], 16)
+    payload["embeds"][0]["footer"]["text"] = "DASHBOARD ANNOUNCEMENT • SLS Mass Notification System"
     return payload
 
 
@@ -421,6 +454,30 @@ def _destination_rows(config, kind):
             "id": _safe_id(row.get("id"), kind, name),
             "name": name,
             "url": str(row.get("url") or row.get("webhook_url") or "").strip(),
+        })
+    return output
+
+
+def _announcement_destination_rows(config):
+    raw_rows = config.get("announcement_webhooks")
+    rows = raw_rows if isinstance(raw_rows, list) else []
+    output = []
+    for index, row in enumerate(rows[:MAX_DESTINATIONS]):
+        if not isinstance(row, dict) or not _enabled(row.get("enabled", "1")):
+            continue
+        name = _text(row.get("name"), 80) or f"Announcement Webhook {index + 1}"
+        url = str(row.get("url") or row.get("webhook_url") or "").strip()
+        try:
+            hostname = str(urlsplit(url).hostname or "").lower().rstrip(".")
+        except ValueError:
+            hostname = ""
+        output.append({
+            # Discord hosts retain strict webhook-path validation. Other public
+            # HTTPS receivers may implement the Discord-compatible JSON schema.
+            "kind": "discord" if hostname in DISCORD_HOSTS else "generic",
+            "id": _safe_id(row.get("id"), "announcement", name),
+            "name": name,
+            "url": url,
         })
     return output
 
@@ -564,6 +621,95 @@ def dispatch_webhook_destinations(
     return results
 
 
+def dispatch_announcement_webhooks(
+    config,
+    title,
+    body,
+    background_color="#6d28d9",
+    fields=None,
+    timestamp="",
+    event_id="",
+    destination_ids=None,
+    *,
+    source="dashboard",
+    live=False,
+    test=False,
+    dry_run=False,
+    transport=_request_once,
+    resolver=socket.getaddrinfo,
+    sleep=time.sleep,
+    budget_seconds=DEFAULT_DELIVERY_BUDGET,
+    clock=time.monotonic,
+    wall_clock=time.time,
+    enforce_wall_clock=True,
+):
+    """Deliver a real Dashboard announcement to explicitly selected destinations."""
+    if not live or test or dry_run or str(source or "").strip().lower() != "dashboard":
+        return []
+    selected = {
+        str(value)
+        for value in (destination_ids or [])
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(value))
+    }
+    if not selected:
+        return []
+    rows = [row for row in _announcement_destination_rows(config) if row["id"] in selected]
+    if not rows:
+        return []
+    budget = _effective_delivery_budget(budget_seconds, wall_clock)
+    normalized_timestamp = _normalize_timestamp(timestamp)
+    normalized_event_id = _normalized_event_id(
+        event_id,
+        "dashboard",
+        title,
+        "announcement",
+        normalized_timestamp,
+    )
+    payload = build_announcement_discord_payload(
+        config,
+        title,
+        body,
+        background_color,
+        fields,
+        normalized_timestamp,
+    )
+    if len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")) > MAX_PAYLOAD_BYTES:
+        return [
+            {**{key: row[key] for key in ("kind", "id", "name")}, "status": "failed", "attempts": 0,
+             "http_status": None, "error": "payload_too_large"}
+            for row in rows
+        ]
+    if budget <= 0:
+        return [_budget_failure(row) for row in rows]
+    deadline = clock() + budget
+    results = []
+    for index, row in enumerate(rows):
+        remaining = deadline - clock()
+        if remaining <= 0:
+            results.extend(_budget_failure(pending) for pending in rows[index:])
+            break
+        rows_left = len(rows) - index
+        row_budget = remaining / rows_left
+        row_deadline = clock() + row_budget
+        guard = _wall_clock_budget(row_budget) if enforce_wall_clock else nullcontext()
+        try:
+            with guard:
+                result = _deliver(
+                    row,
+                    payload,
+                    normalized_event_id,
+                    transport,
+                    resolver,
+                    sleep,
+                    row_deadline,
+                    clock,
+                )
+        except DeliveryBudgetExceeded:
+            result = _budget_failure(row)
+        results.append(result)
+    return results
+
+
 def _retry_delivery_key(source, correlation_key):
     normalized_source = str(source or "").strip().lower()
     correlation = str(correlation_key or "").replace("\x00", "")[:1024]
@@ -589,6 +735,9 @@ def _locked_retry_state(path):
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise RetryStateError("retry_state_lock_invalid")
         os.fchmod(descriptor, 0o640)
+        if os.geteuid() == 0:
+            account = pwd.getpwnam("asterisk")
+            os.fchown(descriptor, account.pw_uid, account.pw_gid)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         yield state_path
     finally:
@@ -646,6 +795,9 @@ def _write_retry_state(path, state):
             prefix=f".{state_path.name}.", suffix=".tmp", dir=str(state_path.parent)
         )
         os.fchmod(temporary_descriptor, 0o640)
+        if os.geteuid() == 0:
+            account = pwd.getpwnam("asterisk")
+            os.fchown(temporary_descriptor, account.pw_uid, account.pw_gid)
         with os.fdopen(temporary_descriptor, "wb") as handle:
             temporary_descriptor = -1
             handle.write(encoded)
@@ -772,6 +924,7 @@ def queue_external_delivery(
     event_id="",
     details=None,
     email_recipients="",
+    webhook_destination_keys=None,
     now=None,
 ):
     """Durably record external work before a caller commits local dedup state."""
@@ -796,10 +949,18 @@ def queue_external_delivery(
                     break
         if len(state["deliveries"]) >= MAX_RETRY_DELIVERIES:
             raise RetryStateError("retry_state_capacity_exhausted")
-        webhook_keys = [
+        configured_webhook_keys = [
             f"{row['kind']}:{row['id']}"
             for row in _destination_rows(config, "discord") + _destination_rows(config, "generic")
         ]
+        if webhook_destination_keys is None:
+            webhook_keys = configured_webhook_keys
+        else:
+            selected_webhook_keys = {
+                str(value) for value in webhook_destination_keys
+                if re.fullmatch(r"(?:discord|generic):[A-Za-z0-9_-]{1,64}", str(value))
+            }
+            webhook_keys = [key for key in configured_webhook_keys if key in selected_webhook_keys]
         recipients = str(email_recipients or "").replace("\x00", "")[:16384].strip()
         pending_email = bool(recipients)
         pending_webhooks = sorted(set(webhook_keys))
@@ -1046,11 +1207,15 @@ def main():
     config_path = Path(arguments.pop(0)) if arguments and not arguments[0].startswith("--") else DEFAULT_CONFIG
     retry_mode = ""
     retry_state_path = None
+    announcement_mode = False
     if arguments:
-        if len(arguments) != 2 or arguments[0] not in {"--retry-state", "--recorded"}:
-            print("Usage: sls_notification_destinations.py [config] [--retry-state state|--recorded state]", file=sys.stderr)
+        if arguments == ["--announcement"]:
+            announcement_mode = True
+        elif len(arguments) == 2 and arguments[0] in {"--retry-state", "--recorded"}:
+            retry_mode, retry_state_path = arguments[0], Path(arguments[1])
+        else:
+            print("Usage: sls_notification_destinations.py [config] [--announcement|--retry-state state|--recorded state]", file=sys.stderr)
             return 2
-        retry_mode, retry_state_path = arguments[0], Path(arguments[1])
     with config_path.open("r", encoding="utf-8") as handle:
         config = json.load(handle)
     is_test = os.environ.get("SLS_NOTIFICATION_TEST", "0") == "1"
@@ -1058,6 +1223,40 @@ def main():
     is_live = os.environ.get("SLS_NOTIFICATION_LIVE", "0") == "1"
     source = os.environ.get("SLS_DESTINATION_SOURCE", "")
     correlation_key = os.environ.get("SLS_EXTERNAL_CORRELATION_KEY", "")
+    if announcement_mode:
+        destination_ids = [
+            value
+            for value in os.environ.get("SLS_DESTINATION_IDS", "").split(",")
+            if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value)
+        ]
+        fields = []
+        try:
+            raw_fields = json.loads(os.environ.get("SLS_DESTINATION_FIELDS_JSON", "[]"))
+            if isinstance(raw_fields, list):
+                fields = [
+                    (str(entry[0]), str(entry[1]))
+                    for entry in raw_fields[:6]
+                    if isinstance(entry, list) and len(entry) == 2
+                ]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            fields = []
+        results = dispatch_announcement_webhooks(
+            config,
+            os.environ.get("SLS_DESTINATION_SUBJECT", "Announcement"),
+            os.environ.get("SLS_DESTINATION_BODY", ""),
+            os.environ.get("SLS_DESTINATION_COLOR", "#6d28d9"),
+            fields,
+            os.environ.get("SLS_DESTINATION_TIME", ""),
+            os.environ.get("SLS_DESTINATION_EVENT_ID", ""),
+            destination_ids,
+            source=source,
+            live=is_live,
+            test=is_test,
+            dry_run=is_dry_run,
+            budget_seconds=os.environ.get("SLS_DESTINATION_BUDGET_SECONDS", DEFAULT_DELIVERY_BUDGET),
+        )
+        print(json.dumps({"results": results}, separators=(",", ":"), ensure_ascii=True))
+        return 1 if len(results) != len(set(destination_ids)) or any(result["status"] != "accepted" for result in results) else 0
     if retry_mode == "--recorded":
         try:
             recorded = external_delivery_recorded(retry_state_path, source, correlation_key)

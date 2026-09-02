@@ -80,6 +80,21 @@ NWS_ALERTS_DRY_RUN="${NWS_ALERTS_DRY_RUN:-0}"
 API_FAULT_THRESHOLD="${API_FAULT_THRESHOLD:-3}"
 LOCK_FILE="${LOCK_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sls_mass_notify_nws_poll.lock}"
 LIGHTNING_GATE_FILE="${LIGHTNING_GATE_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/nws-lightning-gate-default.json}"
+NWS_AUDIO_DELIVERY_LOCK="${NWS_AUDIO_DELIVERY_LOCK:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/nws-audio-delivery.lock}"
+NWS_WEBHOOK_DESTINATION_KEYS_OVERRIDE="${NWS_WEBHOOK_DESTINATION_KEYS_OVERRIDE:-}"
+NWS_CROSS_ZONE_CLAIM_HELPER="${NWS_CROSS_ZONE_CLAIM_HELPER:-/usr/local/bin/sls_mass_notify/sls_nws_delivery_claims.py}"
+NWS_CROSS_ZONE_CLAIM_STATE="${NWS_CROSS_ZONE_CLAIM_STATE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/nws-cross-zone-delivery-claims.json}"
+NWS_DISPATCH_CYCLE_ID="${NWS_DISPATCH_CYCLE_ID:-}"
+NWS_DISPATCH_GROUP_RANK="${NWS_DISPATCH_GROUP_RANK:-0}"
+NWS_DISPATCH_GROUP_COUNT="${NWS_DISPATCH_GROUP_COUNT:-0}"
+NWS_DISPATCH_TURN_COMPLETED=0
+NWS_CLAIMED_PHONE_COUNT=0
+NWS_CLAIMED_DESKTOP_COUNT=0
+NWS_CLAIMED_EMAIL_COUNT=0
+NWS_CLAIMED_DISCORD_COUNT=0
+NWS_CLAIMED_GENERIC_COUNT=0
+NWS_LAST_PAGE_HOLD_SECONDS=0
+NWS_AUDIO_LOCK_FD=""
 MAIL_TO=""
 LIVE_EMAIL_TO=""
 DISCORD_WEBHOOK_URL=""
@@ -102,6 +117,302 @@ Audio: {{audio}}
 Alert ID: {{alert_id}}
 Zone: {{zone}}
 Time: {{time}}"
+
+nws_coordination_enabled() {
+  [ -n "$NWS_DISPATCH_CYCLE_ID" ]
+}
+
+nws_coordination_call() {
+  local request="$1"
+  [ -x "$NWS_CROSS_ZONE_CLAIM_HELPER" ] || return 1
+  printf '%s\n' "$request" \
+    | NWS_CROSS_ZONE_CLAIM_STATE="$NWS_CROSS_ZONE_CLAIM_STATE" \
+      "$NWS_CROSS_ZONE_CLAIM_HELPER"
+}
+
+complete_nws_dispatch_turn() {
+  local request
+  if ! nws_coordination_enabled || [ "$NWS_DISPATCH_TURN_COMPLETED" = "1" ]; then
+    return 0
+  fi
+  request="$(NWS_CYCLE_ID="$NWS_DISPATCH_CYCLE_ID" NWS_GROUP_RANK="$NWS_DISPATCH_GROUP_RANK" /usr/bin/python3 - <<'PY'
+import json
+import os
+
+print(json.dumps({
+    "op": "complete_turn",
+    "cycle_id": os.environ["NWS_CYCLE_ID"],
+    "rank": int(os.environ["NWS_GROUP_RANK"]),
+}, separators=(",", ":")))
+PY
+)" || return 1
+  if nws_coordination_call "$request" > /dev/null 2>> "$LOG"; then
+    NWS_DISPATCH_TURN_COMPLETED=1
+    return 0
+  fi
+  printf '%s: unable to complete the cross-zone Weather delivery turn\n' "$(date)" >> "$LOG"
+  return 1
+}
+
+trap 'complete_nws_dispatch_turn >/dev/null 2>&1 || true' EXIT
+
+wait_for_nws_dispatch_turn() {
+  local request
+  nws_coordination_enabled || return 0
+  request="$(NWS_CYCLE_ID="$NWS_DISPATCH_CYCLE_ID" NWS_GROUP_RANK="$NWS_DISPATCH_GROUP_RANK" /usr/bin/python3 - <<'PY'
+import json
+import os
+
+print(json.dumps({
+    "op": "wait_turn",
+    "cycle_id": os.environ["NWS_CYCLE_ID"],
+    "rank": int(os.environ["NWS_GROUP_RANK"]),
+    "timeout_seconds": 3300,
+}, separators=(",", ":")))
+PY
+)" || return 1
+  nws_coordination_call "$request" > /dev/null 2>> "$LOG"
+}
+
+claim_cross_zone_destinations() {
+  local alert_chain="$1"
+  local suppress_local="$2"
+  local claim_chain="$alert_chain"
+  local request response claimed_lines kind value duplicate_count=0 reserved_count=0 webhook_key
+  local -a claimed_phones=()
+  local -a claimed_desktops=()
+  local -a claimed_emails=()
+  local -a claimed_webhooks=()
+  local -a webhook_keys=()
+
+  NWS_CLAIMED_PHONE_COUNT=0
+  NWS_CLAIMED_DESKTOP_COUNT=0
+  NWS_CLAIMED_EMAIL_COUNT=0
+  NWS_CLAIMED_DISCORD_COUNT=0
+  NWS_CLAIMED_GENERIC_COUNT=0
+
+  # Standalone/manual workers retain their configured targets. Scheduled
+  # multi-zone workers always receive a cycle ID from the weather wrapper.
+  nws_coordination_enabled || return 0
+  [ "$NWS_ALERTS_DRY_RUN" != "1" ] || return 0
+  if [ "$FORCE_REPLAY" = "1" ]; then
+    claim_chain="${alert_chain}|operator-replay:${NWS_DISPATCH_CYCLE_ID}"
+  fi
+  if [ -n "$NWS_WEBHOOK_DESTINATION_KEYS_OVERRIDE" ]; then
+    IFS=',' read -r -a webhook_keys <<< "$NWS_WEBHOOK_DESTINATION_KEYS_OVERRIDE"
+  fi
+
+  request="$({
+    if [ "$suppress_local" != "1" ]; then
+      for value in "${NWS_ALERT_RECIPIENTS[@]}"; do
+        printf 'phone\0%s\0' "$value"
+      done
+      for value in "${NWS_DESKTOP_RECIPIENTS[@]}"; do
+        printf 'desktop\0%s\0' "$value"
+      done
+    fi
+    for value in "${NWS_ZONE_EMAIL_RECIPIENTS[@]}"; do
+      printf 'email\0%s\0' "$value"
+    done
+    for webhook_key in "${webhook_keys[@]}"; do
+      case "$webhook_key" in
+        discord:*) printf 'discord\0%s\0' "${webhook_key#discord:}" ;;
+        generic:*) printf 'generic\0%s\0' "${webhook_key#generic:}" ;;
+      esac
+    done
+  } | NWS_CLAIM_ALERT_CHAIN="$claim_chain" \
+      NWS_CLAIM_GROUP_ID="${NWS_ZONE_GROUP_ID_OVERRIDE:-default}" \
+      NWS_CLAIM_GROUP_RANK="$NWS_DISPATCH_GROUP_RANK" \
+      /usr/bin/python3 -c '
+import hashlib
+import json
+import os
+import sys
+
+raw = sys.stdin.buffer.read(262145)
+if len(raw) > 262144:
+    raise SystemExit(2)
+parts = raw.split(b"\0")
+if parts and parts[-1] == b"":
+    parts.pop()
+if len(parts) % 2:
+    raise SystemExit(2)
+destinations = {kind: [] for kind in ("phone", "desktop", "email", "discord", "generic")}
+for offset in range(0, len(parts), 2):
+    kind = parts[offset].decode("ascii", "strict")
+    value = parts[offset + 1].decode("utf-8", "strict")
+    if kind not in destinations:
+        raise SystemExit(2)
+    destinations[kind].append(value)
+print(json.dumps({
+    "op": "claim_many",
+    "alert_chain": os.environ["NWS_CLAIM_ALERT_CHAIN"],
+    "group_id": os.environ["NWS_CLAIM_GROUP_ID"],
+    "group_rank": int(os.environ["NWS_CLAIM_GROUP_RANK"]),
+    "reservation_id": "group_" + hashlib.sha256(
+        os.environ["NWS_CLAIM_GROUP_ID"].encode("utf-8")
+    ).hexdigest(),
+    "destinations": destinations,
+}, separators=(",", ":")))
+')" || return 1
+
+  response="$(nws_coordination_call "$request" 2>> "$LOG")" || return 1
+  claimed_lines="$(printf '%s\n' "$response" | /usr/bin/python3 -c '
+import json
+import sys
+
+result = json.load(sys.stdin)
+kinds = ("phone", "desktop", "email", "discord", "generic")
+if result.get("ok") is not True or not isinstance(result.get("claimed"), dict):
+    raise SystemExit(2)
+duplicates = result.get("duplicates")
+reserved = result.get("reserved")
+if not isinstance(duplicates, dict) or not isinstance(reserved, dict):
+    raise SystemExit(2)
+duplicate_count = 0
+reserved_count = 0
+for kind in kinds:
+    claimed = result["claimed"].get(kind)
+    skipped = duplicates.get(kind)
+    blocked = reserved.get(kind)
+    if not isinstance(claimed, list) or not isinstance(skipped, list) or not isinstance(blocked, list):
+        raise SystemExit(2)
+    duplicate_count += len(skipped)
+    reserved_count += len(blocked)
+    for value in claimed:
+        value = str(value)
+        if "\t" in value or "\n" in value or "\r" in value:
+            raise SystemExit(2)
+        print(f"{kind}\t{value}")
+print(f"meta\t{duplicate_count}")
+print(f"reserved\t{reserved_count}")
+')" || return 1
+
+  while IFS=$'\t' read -r kind value; do
+    case "$kind" in
+      phone)
+        claimed_phones+=("$value")
+        NWS_CLAIMED_PHONE_COUNT=$((NWS_CLAIMED_PHONE_COUNT + 1))
+        ;;
+      desktop)
+        claimed_desktops+=("$value")
+        NWS_CLAIMED_DESKTOP_COUNT=$((NWS_CLAIMED_DESKTOP_COUNT + 1))
+        ;;
+      email)
+        claimed_emails+=("$value")
+        NWS_CLAIMED_EMAIL_COUNT=$((NWS_CLAIMED_EMAIL_COUNT + 1))
+        ;;
+      discord)
+        claimed_webhooks+=("discord:$value")
+        NWS_CLAIMED_DISCORD_COUNT=$((NWS_CLAIMED_DISCORD_COUNT + 1))
+        ;;
+      generic)
+        claimed_webhooks+=("generic:$value")
+        NWS_CLAIMED_GENERIC_COUNT=$((NWS_CLAIMED_GENERIC_COUNT + 1))
+        ;;
+      meta) duplicate_count="$value" ;;
+      reserved) reserved_count="$value" ;;
+      *) return 1 ;;
+    esac
+  done <<< "$claimed_lines"
+
+  NWS_ALERT_RECIPIENTS=("${claimed_phones[@]}")
+  NWS_DESKTOP_RECIPIENTS=("${claimed_desktops[@]}")
+  LIVE_EMAIL_TO="${claimed_emails[*]}"
+  if [ "${#claimed_webhooks[@]}" -gt 0 ]; then
+    local IFS=,
+    NWS_WEBHOOK_DESTINATION_KEYS_OVERRIDE="${claimed_webhooks[*]}"
+  else
+    NWS_WEBHOOK_DESTINATION_KEYS_OVERRIDE=""
+  fi
+  DELIVERY_TARGETS="$(delivery_targets)"
+  if [[ "$duplicate_count" =~ ^[0-9]+$ ]] && [ "$duplicate_count" -gt 0 ]; then
+    printf '%s: suppressed %s cross-zone duplicate destination claim(s) for %s\n' \
+      "$(date)" "$duplicate_count" "$EVENT" >> "$LOG"
+  fi
+  if [[ "$reserved_count" =~ ^[0-9]+$ ]] && [ "$reserved_count" -gt 0 ]; then
+    # An earlier zone has not yet crossed its durable handoff boundary. Release
+    # this zone's partial reservations and defer the complete alert so its
+    # alert-level local intent cannot strand the blocked destinations.
+    finalize_cross_zone_destinations "$alert_chain" release phone desktop email discord generic >/dev/null 2>&1 || true
+    printf '%s: deferred %s because %s destination reservation(s) from an earlier Weather zone are still pending\n' \
+      "$(date)" "$EVENT" "$reserved_count" >> "$LOG"
+    return 10
+  fi
+  if [[ "$duplicate_count" =~ ^[0-9]+$ ]] \
+    && [ "$duplicate_count" -gt 0 ] \
+    && [ "$((${#claimed_phones[@]} + ${#claimed_desktops[@]} + ${#claimed_emails[@]} + ${#claimed_webhooks[@]}))" -eq 0 ]; then
+    return 11
+  fi
+  return 0
+}
+
+finalize_cross_zone_destinations() {
+  local alert_chain="$1"
+  local action="$2"
+  shift 2
+  local claim_chain="$alert_chain"
+  local request response kind expected_count=0
+
+  nws_coordination_enabled || return 0
+  [ "$NWS_ALERTS_DRY_RUN" != "1" ] || return 0
+  if [ "$FORCE_REPLAY" = "1" ]; then
+    claim_chain="${alert_chain}|operator-replay:${NWS_DISPATCH_CYCLE_ID}"
+  fi
+  for kind in "$@"; do
+    case "$kind" in
+      phone) expected_count=$((expected_count + NWS_CLAIMED_PHONE_COUNT)) ;;
+      desktop) expected_count=$((expected_count + NWS_CLAIMED_DESKTOP_COUNT)) ;;
+      email) expected_count=$((expected_count + NWS_CLAIMED_EMAIL_COUNT)) ;;
+      discord) expected_count=$((expected_count + NWS_CLAIMED_DISCORD_COUNT)) ;;
+      generic) expected_count=$((expected_count + NWS_CLAIMED_GENERIC_COUNT)) ;;
+      *) return 1 ;;
+    esac
+  done
+  request="$(NWS_CLAIM_ALERT_CHAIN="$claim_chain" \
+    NWS_CLAIM_GROUP_ID="${NWS_ZONE_GROUP_ID_OVERRIDE:-default}" \
+    NWS_CLAIM_ACTION="$action" \
+    NWS_CLAIM_EXPECTED_COUNT="$expected_count" \
+    /usr/bin/python3 - "$@" <<'PY'
+import hashlib
+import json
+import os
+import sys
+
+group_id = os.environ["NWS_CLAIM_GROUP_ID"]
+print(json.dumps({
+    "op": "finalize",
+    "alert_chain": os.environ["NWS_CLAIM_ALERT_CHAIN"],
+    "reservation_id": "group_" + hashlib.sha256(group_id.encode("utf-8")).hexdigest(),
+    "action": os.environ["NWS_CLAIM_ACTION"],
+    "expected_count": int(os.environ["NWS_CLAIM_EXPECTED_COUNT"]),
+    "kinds": sys.argv[1:],
+}, separators=(",", ":")))
+PY
+)" || return 1
+  response="$(nws_coordination_call "$request" 2>> "$LOG")" || return 1
+  FINALIZE_RESPONSE="$response" EXPECTED_COUNT="$expected_count" /usr/bin/python3 - <<'PY' || return 1
+import json
+import os
+
+result = json.loads(os.environ["FINALIZE_RESPONSE"])
+if (
+    result.get("ok") is not True
+    or isinstance(result.get("changed"), bool)
+    or result.get("changed") != int(os.environ["EXPECTED_COUNT"])
+):
+    raise SystemExit(2)
+PY
+  for kind in "$@"; do
+    case "$kind" in
+      phone) NWS_CLAIMED_PHONE_COUNT=0 ;;
+      desktop) NWS_CLAIMED_DESKTOP_COUNT=0 ;;
+      email) NWS_CLAIMED_EMAIL_COUNT=0 ;;
+      discord) NWS_CLAIMED_DISCORD_COUNT=0 ;;
+      generic) NWS_CLAIMED_GENERIC_COUNT=0 ;;
+    esac
+  done
+}
 
 run_status_mutation() {
   local mutation_json="$1"
@@ -475,6 +786,19 @@ fi
 if [ "${#NWS_ZONE_EMAIL_RECIPIENTS[@]}" -gt 0 ]; then
 	LIVE_EMAIL_TO="${NWS_ZONE_EMAIL_RECIPIENTS[*]}"
 fi
+if [ "${NWS_QUIET_HOURS_ENABLED_OVERRIDE+x}" = "x" ]; then
+  QUIET_HOURS_ENABLED="$NWS_QUIET_HOURS_ENABLED_OVERRIDE"
+  QUIET_HOURS_START="${NWS_QUIET_HOURS_START_OVERRIDE:-21:00}"
+  QUIET_HOURS_END="${NWS_QUIET_HOURS_END_OVERRIDE:-06:00}"
+  QUIET_HOURS_CRITICAL_EVENTS=()
+  if [ -n "${NWS_QUIET_CRITICAL_EVENTS_OVERRIDE:-}" ]; then
+    IFS=$'\x1f' read -r -a QUIET_HOURS_CRITICAL_EVENTS <<< "$NWS_QUIET_CRITICAL_EVENTS_OVERRIDE"
+  fi
+fi
+CONFIGURED_NWS_ALERT_RECIPIENTS=("${NWS_ALERT_RECIPIENTS[@]}")
+CONFIGURED_NWS_DESKTOP_RECIPIENTS=("${NWS_DESKTOP_RECIPIENTS[@]}")
+CONFIGURED_NWS_ZONE_EMAIL_RECIPIENTS=("${NWS_ZONE_EMAIL_RECIPIENTS[@]}")
+CONFIGURED_NWS_WEBHOOK_DESTINATION_KEYS_OVERRIDE="$NWS_WEBHOOK_DESTINATION_KEYS_OVERRIDE"
 prune_event_log
 DELIVERY_TARGETS="$(delivery_targets)"
 
@@ -589,6 +913,22 @@ queue_local_dispatch_intent() {
       /usr/bin/python3 "$NWS_STATUS_HELPER" local-intent >> "$LOG" 2>&1
   result=$?
   if [ "$result" -eq 0 ] || [ "$result" -eq 10 ]; then
+    chmod 0640 "$LOCAL_DISPATCH_STATE" "${LOCAL_DISPATCH_STATE}.lock" 2>/dev/null || true
+    chown asterisk:asterisk "$LOCAL_DISPATCH_STATE" "${LOCAL_DISPATCH_STATE}.lock" 2>/dev/null || true
+  fi
+  return "$result"
+}
+
+cancel_local_dispatch_intent() {
+  local alert_key="$1"
+  local result
+
+  NWS_LOCAL_DISPATCH_STATE_PATH="$LOCAL_DISPATCH_STATE" \
+  NWS_LOCAL_DISPATCH_KEY="$alert_key" \
+    /usr/bin/timeout --signal=TERM --kill-after=1 10 \
+      /usr/bin/python3 "$NWS_STATUS_HELPER" local-cancel >> "$LOG" 2>&1
+  result=$?
+  if [ "$result" -eq 0 ]; then
     chmod 0640 "$LOCAL_DISPATCH_STATE" "${LOCAL_DISPATCH_STATE}.lock" 2>/dev/null || true
     chown asterisk:asterisk "$LOCAL_DISPATCH_STATE" "${LOCAL_DISPATCH_STATE}.lock" 2>/dev/null || true
   fi
@@ -791,10 +1131,12 @@ trigger_visual_alert() {
   local alert_b64="$1"
   local event="$2"
   local alert_id="$3"
+  local phone_delay_seconds="${4:-0}"
   local visual_script="$VISUAL_SCRIPT"
   local targets
 	local desktop_targets
 	local -a notify_args=()
+	local submission_failed=0
 
   if [ -z "$alert_b64" ]; then
     echo "$(date): Visual live alert skipped for $event — missing alert payload" >> "$LOG"
@@ -811,26 +1153,35 @@ trigger_visual_alert() {
 		echo "$(date): Visual live alert skipped for $event — no NWS phone or desktop recipients configured" >> "$LOG"
     return 1
   fi
-	if [ -n "$targets" ]; then
-		notify_args+=(--targets "$targets")
-	else
-		notify_args+=(--api-only)
-	fi
+	# Desktop publication is a local durable-journal write. Do it immediately
+	# after the dispatch intent/audio queue boundary, without making a connected
+	# SSE client a prerequisite and without waiting for the handset visual delay.
 	if [ -n "$desktop_targets" ]; then
-		notify_args+=(--desktop-targets "$desktop_targets")
-	fi
-	if [ -n "$targets" ] && [ -n "$desktop_targets" ]; then
-		echo "$(date): Submitting visual live alert to Asterisk and the targeted desktop journal for $event — Alert ID: $alert_id" >> "$LOG"
-	elif [ -n "$targets" ]; then
-		echo "$(date): Submitting visual live alert to Asterisk for $event — Alert ID: $alert_id" >> "$LOG"
-	else
 		echo "$(date): Publishing visual live alert to the targeted desktop journal for $event — Alert ID: $alert_id" >> "$LOG"
-	fi
-	if ! /usr/bin/timeout 45 /usr/bin/python3 "$visual_script" --alert-json-b64 "$alert_b64" "${notify_args[@]}" --no-retry >> "$LOG" 2>&1; then
-    echo "$(date): ERROR — Visual live alert submission to Asterisk failed for $event" >> "$LOG"
-    return 1
+		notify_args=(--api-only --desktop-targets "$desktop_targets" --no-retry)
+		if ! /usr/bin/timeout 45 /usr/bin/python3 "$visual_script" --alert-json-b64 "$alert_b64" "${notify_args[@]}" >> "$LOG" 2>&1; then
+      echo "$(date): ERROR — Targeted Desktop journal publication failed for $event" >> "$LOG"
+      submission_failed=1
+    else
+      echo "$(date): Desktop alert published to the durable targeted journal; a sleeping or disconnected client is not treated as an error" >> "$LOG"
+    fi
   fi
-  return 0
+
+	# Phone SIP NOTIFY intentionally follows audio queueing/start. Its attempt is
+	# independent of the desktop result above, so a journal failure cannot
+	# suppress the handset visual submission.
+	if [ -n "$targets" ]; then
+		if [[ "$phone_delay_seconds" =~ ^[0-9]+$ ]] && [ "$phone_delay_seconds" -gt 0 ]; then
+			sleep "$phone_delay_seconds"
+		fi
+		echo "$(date): Submitting visual live alert to Asterisk for $event — Alert ID: $alert_id" >> "$LOG"
+		notify_args=(--targets "$targets" --no-api --no-retry)
+		if ! /usr/bin/timeout 45 /usr/bin/python3 "$visual_script" --alert-json-b64 "$alert_b64" "${notify_args[@]}" >> "$LOG" 2>&1; then
+      echo "$(date): ERROR — Phone visual alert submission to Asterisk failed for $event" >> "$LOG"
+      submission_failed=1
+    fi
+  fi
+  [ "$submission_failed" -eq 0 ]
 }
 
 get_nws_recipient_targets() {
@@ -852,13 +1203,15 @@ audio_page_hold_seconds() {
   sound_file="${ASTERISK_SOUNDS_DIR}/${sound_sequence}.wav"
   [ -r "$sound_file" ] || return 1
   duration="$(LC_ALL=C /usr/bin/soxi -D "$sound_file" 2>/dev/null)" || return 1
-  # Keep Page's originating Local channel through the complete WAV and a
-  # bounded teardown margin without adding its separate participant timeout.
+  # Keep Page's originating Local channel and the global serialization lock
+  # through its five-second answer window, the complete WAV, and a bounded
+  # teardown margin. A slow/no-auto-answer handset therefore cannot overlap
+  # the following alert merely because audio duration began at queue time.
   LC_ALL=C awk -v duration="$duration" 'BEGIN {
     if (duration <= 0 || duration > 1767) exit 1
     rounded = int(duration)
     if (duration > rounded) rounded++
-    print rounded + 2
+    print rounded + 7
   }'
 }
 
@@ -884,6 +1237,7 @@ queue_audio_to_recipients() {
     return 1
   fi
   call_wait_seconds=$((page_hold_seconds + 30))
+  NWS_LAST_PAGE_HOLD_SECONDS="$page_hold_seconds"
 
   for recipient in "${NWS_ALERT_RECIPIENTS[@]}"; do
     recipient="$(printf '%s' "$recipient" | tr -dc '0-9')"
@@ -895,8 +1249,8 @@ CallerID: "${SLS_CALLERID_NAME}" <${SLS_CALLERID_NUM}>
 Setvar: SLS_SOUND=${sound_sequence}
 Setvar: SLS_CALLERID_NAME=${SLS_CALLERID_NAME}
 Setvar: SLS_CALLERID_NUM=${SLS_CALLERID_NUM}
-MaxRetries: 6
-RetryTime: 10
+MaxRetries: 0
+RetryTime: 5
 WaitTime: ${call_wait_seconds}
 Application: Wait
 Data: ${page_hold_seconds}
@@ -918,6 +1272,26 @@ CALL
 
   echo "$(date): Alert call files queued for $event to $queued recipient(s) — ${sound_sequence}" >> "$LOG"
   return 0
+}
+
+acquire_audio_delivery_slot() {
+  mkdir -p "$(dirname "$NWS_AUDIO_DELIVERY_LOCK")"
+  exec {NWS_AUDIO_LOCK_FD}>"$NWS_AUDIO_DELIVERY_LOCK" || return 1
+  chmod 0640 "$NWS_AUDIO_DELIVERY_LOCK" 2>/dev/null || true
+  chown asterisk:asterisk "$NWS_AUDIO_DELIVERY_LOCK" 2>/dev/null || true
+  if ! /usr/bin/flock -w 3300 "$NWS_AUDIO_LOCK_FD"; then
+    exec {NWS_AUDIO_LOCK_FD}>&-
+    NWS_AUDIO_LOCK_FD=""
+    return 1
+  fi
+}
+
+release_audio_delivery_slot() {
+  if [ -n "$NWS_AUDIO_LOCK_FD" ]; then
+    /usr/bin/flock -u "$NWS_AUDIO_LOCK_FD" 2>/dev/null || true
+    exec {NWS_AUDIO_LOCK_FD}>&-
+    NWS_AUDIO_LOCK_FD=""
+  fi
 }
 
 if [ "${NWS_ALERTS_ENABLED:-1}" != "1" ]; then
@@ -1010,6 +1384,7 @@ queue_external_destinations() {
   SLS_DESTINATION_TRIGGER_EXTENSION="$trigger_extension" \
   SLS_DESTINATION_AUDIO_SEQUENCE="$audio_sequence" \
   SLS_EMAIL_RECIPIENTS="$LIVE_EMAIL_TO" \
+  SLS_WEBHOOK_DESTINATION_KEYS="$NWS_WEBHOOK_DESTINATION_KEYS_OVERRIDE" \
     /usr/bin/timeout --signal=TERM --kill-after=1 "$command_timeout" \
       /usr/bin/python3 - "$NOTIFICATION_DESTINATION_SCRIPT" "$CONFIG_JSON_FILE" "$EXTERNAL_DELIVERY_STATE" >> "$LOG" 2>&1 <<'PY'
 import importlib.util
@@ -1055,6 +1430,7 @@ try:
         os.environ.get("SLS_DESTINATION_EVENT_ID", ""),
         details,
         os.environ.get("SLS_EMAIL_RECIPIENTS", ""),
+        [value for value in os.environ.get("SLS_WEBHOOK_DESTINATION_KEYS", "").split(",") if value],
     )
 except Exception as exc:
     print(f"external_queue_failed:{type(exc).__name__}", file=sys.stderr)
@@ -1116,13 +1492,13 @@ if [ -n "$TEST_PAYLOAD" ]; then
 else
 	ALERTS=$(curl -fsS --retry 3 --retry-all-errors --retry-connrefused --connect-timeout 10 --max-time 30 --max-filesize 10485760 \
     -H "Accept: application/geo+json" \
-    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.0 (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
+    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.1-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
     "${NWS_API_BASE_URL%/}/alerts/active?zone=${NWS_ZONE}&status=actual" 2>>"$LOG") || ALERTS=""
   if [ -z "$ALERTS" ]; then
     echo "$(date): Initial NWS request failed; retrying over IPv4" >> "$LOG"
 	  ALERTS=$(curl -4 -fsS --retry 2 --retry-all-errors --retry-connrefused --connect-timeout 10 --max-time 30 --max-filesize 10485760 \
       -H "Accept: application/geo+json" \
-	    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.0 (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
+	    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.1-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
       "${NWS_API_BASE_URL%/}/alerts/active?zone=${NWS_ZONE}&status=actual" 2>>"$LOG") || ALERTS=""
   fi
 fi
@@ -1184,7 +1560,8 @@ features = data['features']
 if not features:
     sys.exit(0)
 
-for feature in features:
+parsed_alerts = []
+for source_index, feature in enumerate(features):
     if not isinstance(feature, dict):
         continue
     props = feature.get('properties', {})
@@ -1230,6 +1607,16 @@ for feature in features:
     alert_key = f'{event}|{key_source}'
     alert_b64 = base64.b64encode(json.dumps(feature, separators=(',', ':'), ensure_ascii=True).encode('utf-8')).decode('ascii')
     values = [alert_id, event, severity, msg_type, alert_key, alert_b64]
+    issued_at = str(props.get('onset') or props.get('effective') or props.get('sent') or '')
+    try:
+        issued_key = datetime.fromisoformat(issued_at.replace('Z', '+00:00')).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        issued_key = float('inf')
+    event_lower = event.lower()
+    type_order = 0 if 'advisory' in event_lower else (1 if 'watch' in event_lower else (2 if 'warning' in event_lower else 1))
+    parsed_alerts.append((issued_key, type_order, source_index, values))
+
+for _issued, _type_order, _source_index, values in sorted(parsed_alerts):
     print('\t'.join(value.replace('\t', ' ') for value in values))
 ")"
 PARSE_RC=$?
@@ -1319,11 +1706,23 @@ finally:
 PY
 clear_api_fault_state
 
+if ! wait_for_nws_dispatch_turn; then
+  echo "$(date): ERROR - Timed out waiting for an earlier configured Weather zone's delivery turn" >> "$LOG"
+  report_fault "delivery_queue" "Timed out waiting for an earlier configured Weather zone's delivery turn" "" ""
+  exit 1
+fi
+
 # Parse alerts
 printf '%s\n' "$PARSED_ALERTS" | while IFS=$'\t' read -r ALERT_ID EVENT SEVERITY MSG_TYPE ALERT_KEY ALERT_B64; do
 
   [ -z "$ALERT_ID" ] && continue
   [ -z "$ALERT_KEY" ] && ALERT_KEY="${EVENT}|${ALERT_ID}"
+  NWS_ALERT_RECIPIENTS=("${CONFIGURED_NWS_ALERT_RECIPIENTS[@]}")
+  NWS_DESKTOP_RECIPIENTS=("${CONFIGURED_NWS_DESKTOP_RECIPIENTS[@]}")
+  NWS_ZONE_EMAIL_RECIPIENTS=("${CONFIGURED_NWS_ZONE_EMAIL_RECIPIENTS[@]}")
+  LIVE_EMAIL_TO="${NWS_ZONE_EMAIL_RECIPIENTS[*]}"
+  NWS_WEBHOOK_DESTINATION_KEYS_OVERRIDE="$CONFIGURED_NWS_WEBHOOK_DESTINATION_KEYS_OVERRIDE"
+  DELIVERY_TARGETS="$(delivery_targets)"
 
   # Skip already processed alert chains. NWS time-only updates can arrive with
   # a new alert ID, but references keep them tied to the original alert.
@@ -1348,6 +1747,7 @@ printf '%s\n' "$PARSED_ALERTS" | while IFS=$'\t' read -r ALERT_ID EVENT SEVERITY
   AUDIO_LABEL="Piper TTS"
   AUDIO_SEQUENCE=""
   TTS_FILE=""
+  CROSS_ZONE_FINALIZE_OK=1
 
   if [ -n "${ALERT_SOUNDS[$EVENT]+_}" ]; then
     echo "$(date): Matched supported NWS event — using Piper TTS" >> "$LOG"
@@ -1360,6 +1760,32 @@ printf '%s\n' "$PARSED_ALERTS" | while IFS=$'\t' read -r ALERT_ID EVENT SEVERITY
       "$(json_string "$ALERT_ID")")"
     continue
   fi
+
+  claim_cross_zone_destinations "$ALERT_KEY" "$QUIET_SUPPRESS_PAGING"
+  CROSS_ZONE_CLAIM_STATUS=$?
+  case "$CROSS_ZONE_CLAIM_STATUS" in
+    0) ;;
+    10)
+      # Another configured zone still owns an uncommitted reservation. Do not
+      # create an alert-level local intent or processed marker that could
+      # strand that destination; a later poll retries after handoff or expiry.
+      continue
+      ;;
+    11)
+      update_status "$(printf '{"last_delivery_at":%s,"last_delivery_status":"skipped_cross_zone_duplicate","last_delivery_source":"nws","last_delivery_event":%s,"last_delivery_message":%s,"last_delivery_alert_id":%s}' \
+        "$(json_string "$(timestamp_now)")" \
+        "$(json_string "$EVENT")" \
+        "$(json_string "Skipped ${EVENT}; every destination was already durably claimed by an earlier configured Weather zone.")" \
+        "$(json_string "$ALERT_ID")")"
+      [ "$FORCE_REPLAY" = "1" ] || mark_processed_alert "$ALERT_KEY"
+      continue
+      ;;
+    *)
+      echo "$(date): ERROR - Cross-zone destination claims could not be persisted for $EVENT; no delivery was attempted" >> "$LOG"
+      report_fault "delivery_state" "Cross-zone destination claims could not be persisted; no delivery was attempted" "$EVENT" "$ALERT_ID"
+      exit 1
+      ;;
+  esac
 
   if [ "$QUIET_SUPPRESS_PAGING" = "1" ]; then
     CURRENT_TIME="$(date)"
@@ -1422,6 +1848,14 @@ ${QUIET_NOTE}"
 	        QUIET_AUX_OK=0
 	        QUIET_STATE_PERSISTED=0
 		      fi
+      if [ "$QUIET_STATE_PERSISTED" = "1" ]; then
+        if ! finalize_cross_zone_destinations "$ALERT_KEY" commit email discord generic; then
+          echo "$(date): WARNING - Quiet-hours external work is durable, but its cross-zone reservation could not yet be committed for $EVENT" >> "$LOG"
+          CROSS_ZONE_FINALIZE_OK=0
+        fi
+      else
+        finalize_cross_zone_destinations "$ALERT_KEY" release email discord generic >/dev/null 2>&1 || true
+      fi
       QUIET_TS="$(timestamp_now)"
       if [ "$QUIET_AUX_OK" = "1" ]; then
 	        QUIET_DELIVERY_STATUS="queued"
@@ -1442,7 +1876,7 @@ ${QUIET_NOTE}"
         "$(json_string "$DELIVERY_TARGETS")" \
         "$(json_string "$ALERT_ID")")"
       append_event_log "$EVENT" "$SEVERITY" "$MSG_TYPE" "$QUIET_AUDIO" "$ALERT_ID" "$MAIL_SUBJECT" "$MAIL_BODY" "$QUIET_EVENT_STATUS"
-	      if [ "$QUIET_STATE_PERSISTED" = "1" ]; then
+	      if [ "$QUIET_STATE_PERSISTED" = "1" ] && [ "$CROSS_ZONE_FINALIZE_OK" = "1" ]; then
 	        [ "$FORCE_REPLAY" = "1" ] || mark_processed_alert "$ALERT_KEY"
 	      fi
     fi
@@ -1451,10 +1885,12 @@ ${QUIET_NOTE}"
 
   LOCAL_PHONE_REQUESTED=0
   LOCAL_VISUAL_REQUESTED=0
+  LOCAL_DELIVERY_REQUESTED=0
   LOCAL_RECOVERY=0
   LOCAL_STATE_OK=1
   LOCAL_PREP_OK=1
   LOCAL_INTENT_COMMITTED=0
+  LOCAL_INTENT_NEW=0
   LOCAL_SUBMISSION_OK=1
   LOCAL_AUDIO_QUEUE_FAILED=0
   VISUAL_DELIVERY_OK=1
@@ -1462,10 +1898,13 @@ ${QUIET_NOTE}"
   if [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ] || [ "${#NWS_DESKTOP_RECIPIENTS[@]}" -gt 0 ]; then
     LOCAL_VISUAL_REQUESTED=1
   fi
+  if [ "$LOCAL_PHONE_REQUESTED" = "1" ] || [ "$LOCAL_VISUAL_REQUESTED" = "1" ]; then
+    LOCAL_DELIVERY_REQUESTED=1
+  fi
 
   # FORCE_REPLAY is an explicit operator override. Automatic recovery never
   # bypasses this at-most-once local intent check.
-  if [ "$FORCE_REPLAY" != "1" ]; then
+  if [ "$LOCAL_DELIVERY_REQUESTED" = "1" ] && [ "$FORCE_REPLAY" != "1" ]; then
     local_dispatch_intent_recorded "$ALERT_KEY"
     LOCAL_RECORDED_STATUS=$?
     case "$LOCAL_RECORDED_STATUS" in
@@ -1516,10 +1955,14 @@ ${QUIET_NOTE}"
         report_fault "audio" "Unable to build Piper TTS audio sequence" "$EVENT" "$ALERT_ID"
       fi
     fi
-  else
+  elif [ "${#NWS_DESKTOP_RECIPIENTS[@]}" -gt 0 ]; then
     AUDIO_LABEL="No phone audio requested"
     AUDIO_SEQUENCE=""
     echo "$(date): No phone recipients configured for $EVENT; preparing targeted desktop submission" >> "$LOG"
+  else
+    AUDIO_LABEL="No local phone or Desktop delivery requested"
+    AUDIO_SEQUENCE=""
+    echo "$(date): No local recipients configured for $EVENT; preparing external-only delivery" >> "$LOG"
   fi
 
   CURRENT_TIME="$(date)"
@@ -1575,49 +2018,78 @@ ${QUIET_NOTE}"
     fi
   fi
 
+  if [ "$EXTERNAL_STATE_PERSISTED" = "1" ]; then
+    if ! finalize_cross_zone_destinations "$ALERT_KEY" commit email discord generic; then
+      echo "$(date): WARNING - External work is durable, but its cross-zone reservation could not yet be committed for $EVENT" >> "$LOG"
+      CROSS_ZONE_FINALIZE_OK=0
+    fi
+  else
+    finalize_cross_zone_destinations "$ALERT_KEY" release email discord generic >/dev/null 2>&1 || true
+  fi
+
   if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
     [ "$LOCAL_PHONE_REQUESTED" = "0" ] || echo "$(date): Dry run - would queue call files for $EVENT using $AUDIO_SEQUENCE to recipients: ${NWS_ALERT_RECIPIENTS[*]}" >> "$LOG"
-    echo "$(date): Dry run - would queue visual live alert for $EVENT" >> "$LOG"
+    [ "$LOCAL_VISUAL_REQUESTED" = "0" ] || echo "$(date): Dry run - would queue visual live alert for $EVENT" >> "$LOG"
     DELIVERY_STATUS="dry_run"
     DELIVERY_MESSAGE="Dry run would submit live NWS alert for ${EVENT}; no local intent or external work was created"
   elif [ "$EXTERNAL_STATE_PERSISTED" = "0" ]; then
+    finalize_cross_zone_destinations "$ALERT_KEY" release phone desktop >/dev/null 2>&1 || true
     LOCAL_SUBMISSION_OK=0
     DELIVERY_STATUS="failed"
     DELIVERY_MESSAGE="External retry work could not be made durable for ${EVENT}; zero local phone or visual submissions were attempted"
   elif [ "$LOCAL_RECOVERY" = "1" ]; then
     LOCAL_INTENT_COMMITTED=1
+    if ! finalize_cross_zone_destinations "$ALERT_KEY" commit phone desktop; then
+      echo "$(date): WARNING - Durable local intent exists, but its cross-zone reservation could not yet be committed for $EVENT" >> "$LOG"
+      CROSS_ZONE_FINALIZE_OK=0
+    fi
     LOCAL_SUBMISSION_OK=0
     DELIVERY_STATUS="indeterminate"
     DELIVERY_MESSAGE="A durable local dispatch intent survived a restart; phone and visual submission were not replayed, so their outcome is indeterminate while external retries continue"
     report_fault "delivery" "Local dispatch outcome is indeterminate after restart; automatic local replay was suppressed" "$EVENT" "$ALERT_ID"
   elif [ "$LOCAL_STATE_OK" = "0" ]; then
+    finalize_cross_zone_destinations "$ALERT_KEY" release phone desktop >/dev/null 2>&1 || true
     LOCAL_SUBMISSION_OK=0
     DELIVERY_STATUS="failed"
     DELIVERY_MESSAGE="The durable local dispatch journal was unavailable for ${EVENT}; zero local phone or visual submissions were attempted while external retry work remained durable"
     report_fault "delivery" "Durable local dispatch journal unavailable; no local submission was attempted" "$EVENT" "$ALERT_ID"
   elif [ "$LOCAL_PREP_OK" = "0" ]; then
+    finalize_cross_zone_destinations "$ALERT_KEY" release phone desktop >/dev/null 2>&1 || true
     LOCAL_SUBMISSION_OK=0
     DELIVERY_STATUS="failed"
     DELIVERY_MESSAGE="Local audio preparation failed for ${EVENT}; no local dispatch intent or local submission was made, while external retry work remained durable"
+  elif [ "$LOCAL_DELIVERY_REQUESTED" = "0" ]; then
+    DELIVERY_STATUS="queued"
+    DELIVERY_MESSAGE="No local phone or Desktop channel was requested for ${EVENT}; configured external destination work was durably queued"
   else
     if [ "$FORCE_REPLAY" = "1" ]; then
       # An administrator explicitly requested a local replay. It is neither an
       # automatic recovery path nor an exactly-once delivery guarantee.
       LOCAL_INTENT_COMMITTED=1
+      if ! finalize_cross_zone_destinations "$ALERT_KEY" commit phone desktop; then
+        echo "$(date): WARNING - Operator replay reservation could not yet be committed for $EVENT" >> "$LOG"
+        CROSS_ZONE_FINALIZE_OK=0
+      fi
     else
       # Stage 2: persist intent before invoking either local channel.
       queue_local_dispatch_intent "$ALERT_KEY" "$ALERT_ID" "$EVENT" "$LOCAL_PHONE_REQUESTED" "$LOCAL_VISUAL_REQUESTED"
       LOCAL_INTENT_STATUS=$?
       if [ "$LOCAL_INTENT_STATUS" -eq 0 ]; then
         LOCAL_INTENT_COMMITTED=1
+        LOCAL_INTENT_NEW=1
       elif [ "$LOCAL_INTENT_STATUS" -eq 10 ]; then
         LOCAL_INTENT_COMMITTED=1
         LOCAL_RECOVERY=1
+        if ! finalize_cross_zone_destinations "$ALERT_KEY" commit phone desktop; then
+          echo "$(date): WARNING - Concurrent durable local intent exists, but its cross-zone reservation could not yet be committed for $EVENT" >> "$LOG"
+          CROSS_ZONE_FINALIZE_OK=0
+        fi
         LOCAL_SUBMISSION_OK=0
         DELIVERY_STATUS="indeterminate"
         DELIVERY_MESSAGE="A concurrent durable local dispatch intent was found; phone and visual submission were not replayed, so their outcome is indeterminate while external retries continue"
         report_fault "delivery" "Local dispatch outcome is indeterminate; automatic local replay was suppressed" "$EVENT" "$ALERT_ID"
       else
+        finalize_cross_zone_destinations "$ALERT_KEY" release phone desktop >/dev/null 2>&1 || true
         LOCAL_SUBMISSION_OK=0
         DELIVERY_STATUS="failed"
         DELIVERY_MESSAGE="The durable local dispatch intent could not be queued for ${EVENT}; zero local phone or visual submissions were attempted while external retry work remained durable"
@@ -1627,23 +2099,61 @@ ${QUIET_NOTE}"
 
     if [ "$LOCAL_INTENT_COMMITTED" = "1" ] && [ "$LOCAL_RECOVERY" = "0" ]; then
       if [ "$LOCAL_PHONE_REQUESTED" = "1" ]; then
-        echo "$(date): Queueing call files for $EVENT - audio sequence: $AUDIO_SEQUENCE" >> "$LOG"
-        if ! queue_audio_to_recipients "$AUDIO_SEQUENCE" "$EVENT" "$ALERT_ID"; then
+        if ! acquire_audio_delivery_slot; then
           LOCAL_SUBMISSION_OK=0
           LOCAL_AUDIO_QUEUE_FAILED=1
           DELIVERY_STATUS="failed"
-          DELIVERY_MESSAGE="Phone audio queueing failed before any call file was accepted for ${EVENT}; visual submission was not invoked and automatic local replay is suppressed"
+          if [ "$LOCAL_INTENT_NEW" = "1" ] && cancel_local_dispatch_intent "$ALERT_KEY"; then
+            finalize_cross_zone_destinations "$ALERT_KEY" release phone desktop >/dev/null 2>&1 || true
+            LOCAL_INTENT_COMMITTED=0
+            LOCAL_INTENT_NEW=0
+            DELIVERY_MESSAGE="Timed out waiting for the serialized Weather paging queue for ${EVENT}; zero local submissions occurred and the alert remains eligible for retry"
+          else
+            if ! finalize_cross_zone_destinations "$ALERT_KEY" commit phone desktop; then
+              CROSS_ZONE_FINALIZE_OK=0
+            fi
+            DELIVERY_MESSAGE="Timed out waiting for the serialized Weather paging queue for ${EVENT}; the durable local intent could not be cancelled safely, so automatic replay is suppressed"
+          fi
+          report_fault "delivery" "Timed out waiting for the serialized Weather paging queue" "$EVENT" "$ALERT_ID"
+        fi
+        echo "$(date): Queueing call files for $EVENT - audio sequence: $AUDIO_SEQUENCE" >> "$LOG"
+        if [ "$LOCAL_AUDIO_QUEUE_FAILED" = "0" ] && ! queue_audio_to_recipients "$AUDIO_SEQUENCE" "$EVENT" "$ALERT_ID"; then
+          LOCAL_SUBMISSION_OK=0
+          LOCAL_AUDIO_QUEUE_FAILED=1
+          DELIVERY_STATUS="failed"
+          if [ "$LOCAL_INTENT_NEW" = "1" ] && cancel_local_dispatch_intent "$ALERT_KEY"; then
+            finalize_cross_zone_destinations "$ALERT_KEY" release phone desktop >/dev/null 2>&1 || true
+            LOCAL_INTENT_COMMITTED=0
+            LOCAL_INTENT_NEW=0
+            DELIVERY_MESSAGE="Phone audio queueing failed before any call file was accepted for ${EVENT}; zero local submissions occurred and the alert remains eligible for retry"
+          else
+            if ! finalize_cross_zone_destinations "$ALERT_KEY" commit phone desktop; then
+              CROSS_ZONE_FINALIZE_OK=0
+            fi
+            DELIVERY_MESSAGE="Phone audio queueing failed before any call file was accepted for ${EVENT}; the durable local intent could not be cancelled safely, so automatic replay is suppressed"
+          fi
         fi
       fi
       if [ "$LOCAL_AUDIO_QUEUE_FAILED" = "0" ]; then
-        sleep 2
-        if ! trigger_visual_alert "$ALERT_B64" "$EVENT" "$ALERT_ID"; then
+        if ! finalize_cross_zone_destinations "$ALERT_KEY" commit phone desktop; then
+          echo "$(date): WARNING - Durable local intent exists, but its cross-zone reservation could not yet be committed for $EVENT" >> "$LOG"
+          CROSS_ZONE_FINALIZE_OK=0
+        fi
+      fi
+      if [ "$LOCAL_AUDIO_QUEUE_FAILED" = "0" ] && [ "$LOCAL_VISUAL_REQUESTED" = "1" ]; then
+        if ! trigger_visual_alert "$ALERT_B64" "$EVENT" "$ALERT_ID" 2; then
           VISUAL_DELIVERY_OK=0
           LOCAL_SUBMISSION_OK=0
           DELIVERY_STATUS="partial_failure"
-          DELIVERY_MESSAGE="Phone or desktop visual submission returned a failure for ${EVENT}; its outcome may be partial and automatic local replay is suppressed"
-          report_fault "visual" "Phone or desktop visual alert submission failed; automatic replay suppressed" "$EVENT" "$ALERT_ID"
+          DELIVERY_MESSAGE="Phone SIP NOTIFY submission or durable Desktop journal publication returned a failure for ${EVENT}; its outcome may be partial and automatic local replay is suppressed"
+          report_fault "visual" "Phone SIP NOTIFY submission or durable Desktop journal publication failed; automatic replay suppressed" "$EVENT" "$ALERT_ID"
         fi
+      fi
+      if [ "$LOCAL_PHONE_REQUESTED" = "1" ] && [ -n "$NWS_AUDIO_LOCK_FD" ]; then
+        if [ "$NWS_LAST_PAGE_HOLD_SECONDS" -gt 2 ]; then
+          sleep $((NWS_LAST_PAGE_HOLD_SECONDS - 2))
+        fi
+        release_audio_delivery_slot
       fi
       if [ "$LOCAL_SUBMISSION_OK" = "1" ]; then
         DELIVERY_STATUS="queued"
@@ -1670,7 +2180,8 @@ ${QUIET_NOTE}"
 
   if [ "$NWS_ALERTS_DRY_RUN" != "1" ] \
     && [ "$EXTERNAL_STATE_PERSISTED" = "1" ] \
-    && [ "$LOCAL_INTENT_COMMITTED" = "1" ]; then
+    && { [ "$LOCAL_INTENT_COMMITTED" = "1" ] || [ "$LOCAL_DELIVERY_REQUESTED" = "0" ]; } \
+    && [ "$CROSS_ZONE_FINALIZE_OK" = "1" ]; then
     [ "$FORCE_REPLAY" = "1" ] || mark_processed_alert "$ALERT_KEY"
     clear_audio_delivered "$ALERT_KEY"
   fi
@@ -1681,6 +2192,11 @@ ${QUIET_NOTE}"
   fi
 
 done
+ALERT_LOOP_STATUS=$?
+complete_nws_dispatch_turn || ALERT_LOOP_STATUS=1
+if [ "$ALERT_LOOP_STATUS" -ne 0 ]; then
+  exit "$ALERT_LOOP_STATUS"
+fi
 
 # Stage 3 runs only after every actionable alert has crossed its local intent
 # and local submission path. External network latency can never hold up an

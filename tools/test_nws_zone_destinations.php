@@ -56,13 +56,23 @@ $groups = $call('normalizeNwsZoneGroups', [[
 	'extensions' => ['1000', '9999'],
 	'desktop_clients' => ['Desk.One', 'desk.one', '../desk-two'],
 	'email_recipients' => ['Weather@example.com', 'weather@example.com', 'invalid'],
-]]);
+]], '', [], ['enabled' => '1', 'start' => '22:00', 'end' => '05:00', 'critical_events' => ['Tornado Warning'], 'discord_webhook_ids' => ['discord_primary'], 'generic_webhook_ids' => ['generic_primary']]);
 if (count($groups) !== 1
 	|| ($groups[0]['zone'] ?? '') !== 'TXC491'
 	|| ($groups[0]['extensions'] ?? []) !== ['1000']
 	|| ($groups[0]['desktop_clients'] ?? []) !== ['desk.one', '..desk-two']
-	|| ($groups[0]['email_recipients'] ?? []) !== ['weather@example.com']) {
+	|| ($groups[0]['email_recipients'] ?? []) !== ['weather@example.com']
+	|| ($groups[0]['quiet_hours_start'] ?? '') !== '22:00'
+	|| ($groups[0]['discord_webhook_ids'] ?? []) !== ['discord_primary']) {
 	zone_destination_fail('Weather-zone destination normalization failed: ' . json_encode($groups));
+}
+
+if ($call('normalizeNwsZoneGroups', [], '', []) !== []) {
+	zone_destination_fail('An explicitly empty Weather-zone selection was recreated unexpectedly.');
+}
+$legacyGroups = $call('normalizeNwsZoneGroups', [], 'TXC491', ['1000']);
+if (count($legacyGroups) !== 1 || ($legacyGroups[0]['zone'] ?? '') !== 'TXC491') {
+	zone_destination_fail('Missing-key legacy Weather aliases no longer migrate into the first zone.');
 }
 
 $valid = $call('validateNwsZoneGroupsInput', [[
@@ -76,15 +86,69 @@ if (!empty($valid)) {
 	zone_destination_fail('A desktop-only Weather zone was rejected: ' . implode(' ', $valid));
 }
 
-$invalid = $call('validateNwsZoneGroupsInput', [[
-	'name' => 'No direct target',
+$emailOnly = $call('validateNwsZoneGroupsInput', [[
+	'name' => 'Email only',
 	'zone' => 'TXC491',
 	'extensions' => [],
 	'desktop_clients' => [],
 	'email_recipients' => ['only-email@example.com'],
 ]]);
-if (stripos(implode(' ', $invalid), 'extension or desktop') === false) {
-	zone_destination_fail('An email-only Weather zone was not rejected visibly.');
+if (!empty($emailOnly)) {
+	zone_destination_fail('An email-only Weather zone was rejected: ' . implode(' ', $emailOnly));
+}
+
+$webhookOnly = $call('validateNwsZoneGroupsInput', [[
+	'name' => 'Webhook only',
+	'zone' => 'TXC491',
+	'extensions' => [],
+	'desktop_clients' => [],
+	'email_recipients' => [],
+	'discord_webhook_ids' => ['discord_primary'],
+]]);
+if (!empty($webhookOnly)) {
+	zone_destination_fail('A webhook-only Weather zone was rejected: ' . implode(' ', $webhookOnly));
+}
+
+$noDestination = $call('validateNwsZoneGroupsInput', [[
+	'name' => 'No destination',
+	'zone' => 'TXC491',
+	'extensions' => [],
+	'desktop_clients' => [],
+	'email_recipients' => [],
+	'discord_webhook_ids' => [],
+	'generic_webhook_ids' => [],
+]]);
+if (stripos(implode(' ', $noDestination), 'at least one') === false) {
+	zone_destination_fail('A Weather zone without any destination was not rejected visibly.');
+}
+
+$destinationSettings = [
+	'discord_webhooks' => [[
+		'id' => 'discord_primary',
+		'name' => 'Primary Discord',
+		'url' => 'https://discord.com/api/webhooks/1/test',
+		'enabled' => '1',
+	]],
+	'generic_webhooks' => [[
+		'id' => 'generic_disabled',
+		'name' => 'Disabled archive',
+		'url' => 'https://hooks.example.com/weather',
+		'enabled' => '0',
+	]],
+];
+$validAssignments = $call('validateNwsZoneDestinationAssignments', [[
+	'name' => 'Webhook only',
+	'discord_webhook_ids' => ['discord_primary'],
+]], $destinationSettings);
+if (!empty($validAssignments)) {
+	zone_destination_fail('An enabled selected Weather webhook was rejected: ' . implode(' ', $validAssignments));
+}
+$invalidAssignments = $call('validateNwsZoneDestinationAssignments', [[
+	'name' => 'Unavailable route',
+	'generic_webhook_ids' => ['generic_disabled'],
+]], $destinationSettings);
+if (stripos(implode(' ', $invalidAssignments), 'unavailable notification destination') === false) {
+	zone_destination_fail('A disabled Weather webhook assignment was not rejected visibly.');
 }
 
 $invalidEmail = $call('validateNwsZoneGroupsInput', [[
@@ -164,9 +228,23 @@ if (($migratedGroups[0]['desktop_clients'] ?? []) !== ['new.name', 'unchanged'])
 }
 
 $view = (string)file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/views/settings.php');
-foreach (['data-zone-desktop', 'data-zone-email', '[desktop_clients][]', '[email_recipients]'] as $marker) {
+foreach (['nws_zones_present', 'data-zone-desktop', 'data-zone-email', 'data-zone-discord', 'data-zone-generic', 'Zone Quiet Hours', 'aria-disabled', '[desktop_clients][]', '[email_recipients]'] as $marker) {
 	if (strpos($view, $marker) === false) {
 		zone_destination_fail("Weather-zone destination UI marker is missing: {$marker}");
+	}
+}
+if (strpos($view, 'Legacy Quiet-Hours Defaults') !== false) {
+	zone_destination_fail('Weather settings still expose a competing global quiet-hours editor.');
+}
+
+$classSource = (string)file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/Slsmassnotifyserver.class.php');
+foreach ([
+	'$primaryZonePolicy = $nwsZones[0] ?? [];',
+	'$primaryZonePolicy[\'quiet_hours_enabled\']',
+	'$primaryZonePolicy[\'quiet_critical_events\']',
+] as $marker) {
+	if (strpos($classSource, $marker) === false) {
+		zone_destination_fail("First-zone quiet-hour compatibility alias is missing: {$marker}");
 	}
 }
 foreach (['disabled — uncheck to remove this assignment', 'missing — uncheck to remove'] as $marker) {

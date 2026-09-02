@@ -43,6 +43,26 @@ except RuntimeError:
 else:
     fail("an invalid system notification email address was accepted")
 
+with tempfile.TemporaryDirectory(prefix="sls-system-status-read-") as directory:
+    status_path = Path(directory) / "status.json"
+    for corrupt in ("", '{"last_fault_status":', "\xff"):
+        status_path.write_bytes(corrupt.encode("latin-1"))
+        if MODULE._read_json(status_path, tolerate_corrupt=True) is not None:
+            fail("an empty, partial, or corrupt operational status snapshot was not deferred safely")
+    status_path.write_text("[]", encoding="utf-8")
+    if MODULE._read_json(status_path, tolerate_corrupt=True) is not None:
+        fail("a non-object operational status snapshot was not deferred safely")
+    status_path.write_text('{"last_fault_status":"ok"}\n', encoding="utf-8")
+    if MODULE._read_json(status_path, tolerate_corrupt=True).get("last_fault_status") != "ok":
+        fail("a valid operational status snapshot was not read")
+    status_path.write_text('{"partial":', encoding="utf-8")
+    try:
+        MODULE._read_json(status_path)
+    except RuntimeError:
+        pass
+    else:
+        fail("corrupt protected JSON was accepted outside the status-tolerant read path")
+
 
 manual_faults = MODULE.collect_faults(
     {

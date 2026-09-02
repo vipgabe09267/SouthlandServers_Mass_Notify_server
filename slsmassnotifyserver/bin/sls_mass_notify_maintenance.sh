@@ -25,6 +25,29 @@ log() {
   printf '%s: %s\n' "$(date)" "$*" >> "$LOG_FILE" 2>/dev/null || true
 }
 
+close_inherited_maintenance_lock_fds() {
+  local lock_file="${SLS_MASS_NOTIFY_MAINTENANCE_LOCK:-$LOCK_FILE}"
+  local descriptor descriptor_path descriptor_target close_fd
+
+  for descriptor_path in "/proc/${BASHPID}/fd/"*; do
+    [ -e "$descriptor_path" ] || continue
+    descriptor="${descriptor_path##*/}"
+    [[ "$descriptor" =~ ^[0-9]+$ ]] && [ "$descriptor" -gt 2 ] || continue
+    descriptor_target="$(readlink -f -- "$descriptor_path" 2>/dev/null || true)"
+    [ "$descriptor_target" = "$lock_file" ] || continue
+    close_fd="$descriptor"
+    exec {close_fd}>&-
+  done
+}
+
+# The parent maintenance shell keeps the lock. Child processes that can leave
+# background helpers behind receive no duplicate descriptor, preventing a GPG
+# key refresh from keeping repair/update/uninstall blocked after this run exits.
+run_without_maintenance_lock() (
+  close_inherited_maintenance_lock_fds
+  "$@"
+)
+
 write_update_progress() {
   local state="$1"
   local message="$2"
@@ -181,6 +204,62 @@ PY
   fi
 }
 
+repair_runtime_permissions() {
+  [ -d "$RUNTIME_DIR" ] || return 0
+  RUNTIME_PERMISSION_ROOT="$RUNTIME_DIR" /usr/bin/python3 - <<'PY' || return 1
+import os
+import stat
+
+root = os.environ["RUNTIME_PERMISSION_ROOT"]
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+root_fd = os.open(root, flags)
+
+def secure_tree(directory_fd, relative=""):
+    os.fchown(directory_fd, 0, 0)
+    os.fchmod(directory_fd, 0o755)
+    for name in os.listdir(directory_fd):
+        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        child_relative = f"{relative}/{name}" if relative else name
+        if stat.S_ISDIR(metadata.st_mode):
+            child_fd = os.open(name, flags, dir_fd=directory_fd)
+            try:
+                secure_tree(child_fd, child_relative)
+            finally:
+                os.close(child_fd)
+        elif stat.S_ISREG(metadata.st_mode):
+            file_fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
+            try:
+                if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                    raise RuntimeError(f"runtime entry changed type during repair: {child_relative}")
+                os.fchown(file_fd, 0, 0)
+                executable = (
+                    "/" not in child_relative
+                    and (
+                        child_relative.endswith((".sh", ".py"))
+                        or child_relative == "sls_mass_notify_schedule_worker.php"
+                    )
+                ) or child_relative.startswith("piper/venv/bin/")
+                os.fchmod(file_fd, 0o755 if executable else 0o644)
+            finally:
+                os.close(file_fd)
+        elif stat.S_ISLNK(metadata.st_mode):
+            os.chown(name, 0, 0, dir_fd=directory_fd, follow_symlinks=False)
+        else:
+            raise RuntimeError(f"unsupported runtime entry: {child_relative}")
+
+try:
+    secure_tree(root_fd)
+finally:
+    os.close(root_fd)
+PY
+
+  if [ -x "$RUNTIME_DIR/piper/venv/bin/piper" ]; then
+    [ -f "$RUNTIME_DIR/sls_mass_notify_install_piper_voices.sh" ] || return 1
+    /bin/bash "$RUNTIME_DIR/sls_mass_notify_install_piper_voices.sh" --repair-permissions-only || return 1
+  fi
+  return 0
+}
+
 [ "${EUID:-$(id -u)}" -eq 0 ] || exit 1
 MAINTENANCE_LOCK_FD=""
 exec {MAINTENANCE_LOCK_FD}>"$LOCK_FILE"
@@ -207,12 +286,13 @@ if [ -r "$MENU_FILE" ] && ! grep -Fq 'SLS Mass Notifications menu placement:' "$
 fi
 if [ "$integration_drift" -eq 1 ]; then
   log "FreePBX update drift detected; restoring Mass Notify dashboard/menu integration"
-  if SLS_MASS_NOTIFY_DEFER_SIGNING=1 php -r 'require "/etc/freepbx.conf"; \FreePBX::Create()->Slsmassnotifyserver->repairUpdateSensitiveIntegration(); exit(0);' >> "$LOG_FILE" 2>&1; then
-    /usr/sbin/fwconsole chown >> "$LOG_FILE" 2>&1 || true
+  if run_without_maintenance_lock /usr/bin/env SLS_MASS_NOTIFY_DEFER_SIGNING=1 /usr/bin/php -r 'require "/etc/freepbx.conf"; \FreePBX::Create()->Slsmassnotifyserver->repairUpdateSensitiveIntegration(); exit(0);' >> "$LOG_FILE" 2>&1; then
+    run_without_maintenance_lock /usr/sbin/fwconsole chown >> "$LOG_FILE" 2>&1 || true
+    repair_runtime_permissions || log "Unable to restore protected runtime permissions after fwconsole chown"
     secure_central_config
     for module in dashboard framework; do
       [ -d "/var/www/html/admin/modules/$module" ] || continue
-      "$SIGNER" "$module" >> "$LOG_FILE" 2>&1 || log "Unable to refresh local signature for $module"
+      run_without_maintenance_lock "$SIGNER" "$module" >> "$LOG_FILE" 2>&1 || log "Unable to refresh local signature for $module"
     done
     log "Mass Notify dashboard/menu integration restored after FreePBX update drift"
   else
@@ -289,29 +369,28 @@ rm -f "$REQUEST_FILE"
 log "Starting queued installation repair"
 write_maintenance_progress "repair" "running" "Refreshing runtime files, permissions, dialplan, dashboard integration, and local signatures."
 repair_ok=1
-SLS_MASS_NOTIFY_DEFER_SIGNING=1 php -r 'require "/etc/freepbx.conf"; require_once "/var/www/html/admin/modules/slsmassnotifyserver/Slsmassnotifyserver.class.php"; $class = "\\FreePBX\\modules\\Slsmassnotifyserver"; $obj = new $class(\FreePBX::Create()); $obj->install(); exit(0);' >> "$LOG_FILE" 2>&1 || repair_ok=0
+# Normalize the managed runtime before the module hook even when Piper is not
+# installed yet; secure runtime-tree validation must never depend on whether a
+# particular optional executable already exists.
+repair_runtime_permissions || repair_ok=0
 if [ "$repair_ok" -eq 1 ]; then
-  fwconsole chown >> "$LOG_FILE" 2>&1 || repair_ok=0
+run_without_maintenance_lock /usr/bin/env SLS_MASS_NOTIFY_DEFER_SIGNING=1 /usr/bin/php -r 'require "/etc/freepbx.conf"; require_once "/var/www/html/admin/modules/slsmassnotifyserver/Slsmassnotifyserver.class.php"; $class = "\\FreePBX\\modules\\Slsmassnotifyserver"; $obj = new $class(\FreePBX::Create()); $obj->install(); exit(0);' >> "$LOG_FILE" 2>&1 || repair_ok=0
+fi
+if [ "$repair_ok" -eq 1 ]; then
+  run_without_maintenance_lock /usr/sbin/fwconsole chown >> "$LOG_FILE" 2>&1 || repair_ok=0
+  repair_runtime_permissions || repair_ok=0
 fi
 if [ "$repair_ok" -eq 1 ]; then
   secure_central_config || repair_ok=0
 fi
 if [ "$repair_ok" -eq 1 ]; then
-  chown -R root:root "$RUNTIME_DIR" || repair_ok=0
-  find "$RUNTIME_DIR" -type d -exec chmod 0755 {} + || repair_ok=0
-  find "$RUNTIME_DIR" -type f -exec chmod 0644 {} + || repair_ok=0
-  find "$RUNTIME_DIR/piper/venv/bin" -type f -exec chmod 0755 {} + 2>/dev/null || true
-  chmod 0755 "$RUNTIME_DIR"/*.sh "$RUNTIME_DIR"/*.py 2>/dev/null || true
-  chmod 0755 /usr/local/bin/piper 2>/dev/null || true
-fi
-if [ "$repair_ok" -eq 1 ]; then
-  fwconsole reload >> "$LOG_FILE" 2>&1 || repair_ok=0
+  run_without_maintenance_lock /usr/sbin/fwconsole reload >> "$LOG_FILE" 2>&1 || repair_ok=0
   asterisk -rx "dialplan reload" >> "$LOG_FILE" 2>&1 || repair_ok=0
 fi
 if [ "$repair_ok" -eq 1 ]; then
   for module in slsmassnotifyserver dashboard framework; do
     [ -d "/var/www/html/admin/modules/$module" ] || continue
-    "$SIGNER" "$module" >> "$LOG_FILE" 2>&1 || repair_ok=0
+    run_without_maintenance_lock "$SIGNER" "$module" >> "$LOG_FILE" 2>&1 || repair_ok=0
   done
 fi
 if [ "$repair_ok" -eq 1 ]; then
@@ -319,7 +398,7 @@ if [ "$repair_ok" -eq 1 ]; then
   # Recheck signatures, generated dialplan, Asterisk capabilities and AMI,
   # runtime syntax/executability, Piper voices, cron, Apache/API and Dashboard
   # integration after the repair and signing steps have all completed.
-  /usr/bin/timeout 300 /usr/bin/php -r '
+  run_without_maintenance_lock /usr/bin/timeout 300 /usr/bin/php -r '
 require "/etc/freepbx.conf";
 require_once "/var/www/html/admin/modules/slsmassnotifyserver/Slsmassnotifyserver.class.php";
 $class = "\\FreePBX\\modules\\Slsmassnotifyserver";

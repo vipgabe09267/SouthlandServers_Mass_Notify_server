@@ -26,6 +26,7 @@ class SlsMassNotifyAnnouncement {
 				'announcement_targets' => $module->getSipNotifyTargets(),
 				'announcement_group_targets' => $module->getAllPjsipExtensions(),
 				'announcement_desktop_clients' => $module->getDesktopClients(),
+				'announcement_webhooks' => $module->getAnnouncementWebhookDestinations(),
 				'announcement_groups' => $module->getAnnouncementGroups(),
 				'announcement_cooldown_remaining' => $module->getCooldownState()['announcement']['remaining'] ?? 0,
 				'announcement_state' => $module->getAnnouncementDashboardState(),

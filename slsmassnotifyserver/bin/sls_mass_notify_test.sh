@@ -63,7 +63,11 @@ SPOOL="${SPOOL:-/var/spool/asterisk/outgoing}"
 SPOOL_TMP="${SPOOL_TMP:-/var/spool/asterisk/tmp}"
 TEST_CALL_QUEUE_PATHS=()
 declare -A TEST_CALL_RECIPIENTS=()
+declare -A TEST_CALL_ACCEPTED=()
+TEST_CALL_QUEUE_FAILURES=0
 TEST_SPOOL_PICKUP_TIMEOUT_SECONDS="${TEST_SPOOL_PICKUP_TIMEOUT_SECONDS:-10}"
+ASTERISK_CLI_BIN="${ASTERISK_CLI_BIN:-$(command -v asterisk 2>/dev/null || true)}"
+[ -n "$ASTERISK_CLI_BIN" ] || ASTERISK_CLI_BIN="/usr/sbin/asterisk"
 MAIL_TO=""
 DISCORD_WEBHOOK_URL=""
 MAIL_FROM_NAME="SLS Mass Notification System"
@@ -75,6 +79,7 @@ SOURCE_NAME="SLS Mass Notification System"
 DELIVERY_TARGETS=""
 DESKTOP_DELIVERY_TARGETS=""
 TEST_AUDIO_LABEL="None"
+VISUAL_TEST_ID=""
 TRIGGER_EXTENSION="${1:-unknown}"
 TRIGGER_NAME="${2:-Unknown Caller}"
 NWS_ALERTS_DRY_RUN="${NWS_ALERTS_DRY_RUN:-0}"
@@ -441,6 +446,7 @@ prune_tts_cache() {
 }
 
 trigger_visual_test() {
+	local channel="${1:-all}"
 	local event
 	local severity
 	local description
@@ -456,10 +462,21 @@ trigger_visual_test() {
 
   event="Manual NWS Test"
   severity="Test"
-  test_id="pbx-gui-test-$(date +%Y%m%d%H%M%S)-$$"
+  if [ -z "$VISUAL_TEST_ID" ]; then
+    VISUAL_TEST_ID="pbx-gui-test-$(date +%Y%m%d%H%M%S)-$$"
+  fi
+  test_id="$VISUAL_TEST_ID"
   description="PBX TEST - Simulated ${event}. This visual alert was triggered from the FreePBX Mass Notifications testing page."
   targets="$(get_nws_recipient_targets)"
   desktop_targets="$(get_nws_desktop_targets)"
+  if [ "$channel" = "phone" ]; then
+    desktop_targets=""
+  elif [ "$channel" = "desktop" ]; then
+    targets=""
+  elif [ "$channel" != "all" ]; then
+    echo "$(date): Visual test skipped — invalid requested channel" >> "$LOG"
+    return 1
+  fi
   if [ -z "$targets" ] && [ -z "$desktop_targets" ]; then
     echo "$(date): Visual test skipped — no phone or desktop recipients configured" >> "$LOG"
     return 1
@@ -524,6 +541,7 @@ audio_page_hold_seconds() {
 
 queue_test_audio_to_recipients() {
   local sound_sequence="$1"
+  local raw_recipient
   local recipient
   local callfile
   local queued=0
@@ -543,11 +561,20 @@ queue_test_audio_to_recipients() {
   fi
   call_wait_seconds=$((page_hold_seconds + 30))
 
-  for recipient in "${NWS_ALERT_RECIPIENTS[@]}"; do
-    recipient="$(printf '%s' "$recipient" | tr -dc '0-9')"
-    [ -n "$recipient" ] || continue
-    callfile=$(mktemp "$SPOOL_TMP/sls_test_XXXXXX.call")
-    cat > "$callfile" << CALL
+  TEST_CALL_QUEUE_FAILURES=0
+  for raw_recipient in "${NWS_ALERT_RECIPIENTS[@]}"; do
+    recipient="$(printf '%s' "$raw_recipient" | tr -dc '0-9')"
+    if [ -z "$recipient" ]; then
+      echo "$(date): ERROR — Invalid manual Weather audio recipient was not queued" >> "$LOG"
+      TEST_CALL_QUEUE_FAILURES=$((TEST_CALL_QUEUE_FAILURES + 1))
+      continue
+    fi
+    if ! callfile="$(mktemp "$SPOOL_TMP/sls_test_XXXXXX.call")"; then
+      echo "$(date): ERROR — Unable to create the manual Weather call file for extension $recipient" >> "$LOG"
+      TEST_CALL_QUEUE_FAILURES=$((TEST_CALL_QUEUE_FAILURES + 1))
+      continue
+    fi
+    if ! cat > "$callfile" << CALL
 Channel: Local/${recipient}@${SLS_AUDIO_CONTEXT}
 CallerID: "${SLS_CALLERID_NAME}" <${SLS_CALLERID_NUM}>
 Setvar: SLS_SOUND=${sound_sequence}
@@ -559,11 +586,23 @@ WaitTime: ${call_wait_seconds}
 Application: Wait
 Data: ${page_hold_seconds}
 CALL
+    then
+      echo "$(date): ERROR — Unable to write the manual Weather call file for extension $recipient" >> "$LOG"
+      rm -f "$callfile" 2>/dev/null || true
+      TEST_CALL_QUEUE_FAILURES=$((TEST_CALL_QUEUE_FAILURES + 1))
+      continue
+    fi
     chown asterisk:asterisk "$callfile" 2>/dev/null || true
-    chmod 0640 "$callfile"
+    if ! chmod 0640 "$callfile"; then
+      echo "$(date): ERROR — Unable to secure the manual Weather call file for extension $recipient" >> "$LOG"
+      rm -f "$callfile" 2>/dev/null || true
+      TEST_CALL_QUEUE_FAILURES=$((TEST_CALL_QUEUE_FAILURES + 1))
+      continue
+    fi
     if ! mv "$callfile" "$SPOOL/"; then
       echo "$(date): ERROR — Unable to move test call file for $recipient into $SPOOL" >> "$LOG"
       rm -f "$callfile" 2>/dev/null || true
+      TEST_CALL_QUEUE_FAILURES=$((TEST_CALL_QUEUE_FAILURES + 1))
       continue
     fi
     callfile="$SPOOL/$(basename "$callfile")"
@@ -573,18 +612,19 @@ CALL
   done
 
   if [ "$queued" -eq 0 ]; then
-    report_fault "delivery" "Unable to queue test calls to configured NWS recipients"
     return 1
   fi
 
   echo "$(date): Test call files queued to $queued recipient(s) — $sound_sequence" >> "$LOG"
-  return 0
+  [ "$TEST_CALL_QUEUE_FAILURES" -eq 0 ]
 }
 
 wait_for_test_call_pickup() {
   local timeout_seconds="$TEST_SPOOL_PICKUP_TIMEOUT_SECONDS"
   local deadline
   local queue_file
+  local recipient
+  local channel_inventory
   local pending
   local failed=0
 
@@ -595,15 +635,31 @@ wait_for_test_call_pickup() {
   [ "${#TEST_CALL_QUEUE_PATHS[@]}" -gt 0 ] || return 1
   while [ "$SECONDS" -lt "$deadline" ]; do
     pending=0
+    channel_inventory=""
+    if [ -x "$ASTERISK_CLI_BIN" ]; then
+      channel_inventory="$("$ASTERISK_CLI_BIN" -rx 'core show channels concise' 2>/dev/null || true)"
+    fi
     for queue_file in "${TEST_CALL_QUEUE_PATHS[@]}"; do
-      [ ! -e "$queue_file" ] || pending=$((pending + 1))
+      [ "${TEST_CALL_ACCEPTED[$queue_file]:-0}" = "1" ] && continue
+      recipient="${TEST_CALL_RECIPIENTS[$queue_file]:-}"
+      if [ ! -e "$queue_file" ]; then
+        TEST_CALL_ACCEPTED["$queue_file"]=1
+      elif [ -n "$recipient" ] && printf '%s\n' "$channel_inventory" \
+        | grep -Fq "Local/${recipient}@${SLS_AUDIO_CONTEXT}-"; then
+        # Asterisk keeps an active call file in the outgoing spool until the
+        # Local channel finishes.  Seeing that channel is positive pickup;
+        # requiring the file to disappear first falsely fails longer pages.
+        TEST_CALL_ACCEPTED["$queue_file"]=1
+      else
+        pending=$((pending + 1))
+      fi
     done
     [ "$pending" -eq 0 ] && break
     sleep 1
   done
 
   for queue_file in "${TEST_CALL_QUEUE_PATHS[@]}"; do
-    if [ -e "$queue_file" ]; then
+    if [ "${TEST_CALL_ACCEPTED[$queue_file]:-0}" != "1" ] && [ -e "$queue_file" ]; then
       echo "$(date): ERROR — Asterisk did not pick up the manual Weather audio job for extension ${TEST_CALL_RECIPIENTS[$queue_file]:-unknown} within ${timeout_seconds} seconds" >> "$LOG"
       rm -f "$queue_file" 2>/dev/null || true
       failed=1
@@ -644,7 +700,7 @@ load_central_config() {
 }
 
 if ! load_central_config; then
-  update_status "$(printf '{"last_test_at":%s,"last_test_status":"fault","last_test_message":"Central configuration is invalid or unavailable."}' \
+  update_status "$(printf '{"last_test_at":%s,"last_test_status":"fault","last_test_stage":"configuration","last_test_message":"Central configuration is invalid or unavailable."}' \
     "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$(timestamp_now)")")"
 	exit 1
 fi
@@ -675,7 +731,7 @@ fi
 
 if [ "${NWS_ALERTS_ENABLED:-1}" != "1" ]; then
   echo "$(date): NWS alerts are disabled in settings; manual test skipped" >> "$LOG"
-  update_status "$(printf '{"last_test_at":%s,"last_test_status":"skipped","last_test_message":"Manual test skipped because alerts are disabled."}' \
+  update_status "$(printf '{"last_test_at":%s,"last_test_status":"skipped","last_test_stage":"","last_test_message":"Manual test skipped because alerts are disabled."}' \
     "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$(timestamp_now)")")"
   exit 0
 fi
@@ -691,7 +747,7 @@ if [ "$COOLDOWN_EXIT" -eq 3 ]; then
     ''|*[!0-9]*) REMAINING="$COOLDOWN_SECONDS" ;;
   esac
   echo "$(date): Manual test blocked by cooldown — ${REMAINING}s remaining" >> "$LOG"
-  update_status "$(printf '{"last_test_at":%s,"last_test_status":"cooldown","last_test_message":%s}' \
+  update_status "$(printf '{"last_test_at":%s,"last_test_status":"cooldown","last_test_stage":"cooldown","last_test_message":%s}' \
     "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$(timestamp_now)")" \
     "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "Manual test blocked by cooldown (${REMAINING}s remaining).")")"
   echo "ERROR: Manual testing is on cooldown (${REMAINING}s remaining)."
@@ -707,21 +763,41 @@ fi
 echo "$(date): Manual Weather channel test triggered" >> "$LOG"
 
 AUDIO_SEQUENCE=""
+PHONE_AUDIO_OK=1
+PHONE_AUDIO_STARTED=0
+DELIVERY_FAILURES=()
+
+# Desktop delivery is a durable journal publication and does not depend on a
+# phone, Asterisk call-file pickup, or whether the desktop is presently awake.
+# Publish it before synchronous TTS preparation so a live SSE client receives
+# the test without waiting for phone work.
+if [ "${#NWS_DESKTOP_CLIENTS[@]}" -gt 0 ]; then
+  if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
+    echo "$(date): Dry run — would publish the manual Weather visual to the requested desktop channels" >> "$LOG"
+  elif trigger_visual_test desktop; then
+    echo "OK: Targeted Desktop journal publication completed."
+  else
+    DELIVERY_FAILURES+=("targeted Desktop journal publication failed")
+    echo "ERROR: Targeted Desktop journal publication failed."
+  fi
+fi
+
 if [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ]; then
   TTS_FILE="$(generate_test_tts_audio)"
   if [ -z "$TTS_FILE" ]; then
-    echo "ERROR: Piper TTS test audio was not generated"
-    report_fault "audio" "Piper TTS test audio was not generated"
-    exit 1
+    PHONE_AUDIO_OK=0
+    DELIVERY_FAILURES+=("Piper TTS test audio was not generated")
+    echo "ERROR: Piper TTS test audio was not generated."
+  else
+    AUDIO_SEQUENCE="$(build_audio_sequence "$TTS_FILE")"
+    if [ -z "$AUDIO_SEQUENCE" ]; then
+      PHONE_AUDIO_OK=0
+      DELIVERY_FAILURES+=("Piper TTS test audio sequence was not generated")
+      echo "ERROR: Piper TTS test audio sequence was not generated."
+    else
+      TEST_AUDIO_LABEL="Piper TTS"
+    fi
   fi
-
-  AUDIO_SEQUENCE="$(build_audio_sequence "$TTS_FILE")"
-  if [ -z "$AUDIO_SEQUENCE" ]; then
-    echo "ERROR: Piper TTS test audio sequence was not generated"
-    report_fault "audio" "Piper TTS test audio sequence was not generated"
-    exit 1
-  fi
-  TEST_AUDIO_LABEL="Piper TTS"
 fi
 
 # Build call files using the same direct audio path as live NWS alerts.
@@ -729,34 +805,50 @@ if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
   if [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ]; then
     echo "$(date): Dry run — would queue test call files using $AUDIO_SEQUENCE to recipients: ${NWS_ALERT_RECIPIENTS[*]}" >> "$LOG"
   fi
-elif [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ]; then
-  if ! queue_test_audio_to_recipients "$AUDIO_SEQUENCE"; then
-    exit 1
+elif [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ] && [ "$PHONE_AUDIO_OK" = "1" ]; then
+  QUEUE_RESULT=0
+  queue_test_audio_to_recipients "$AUDIO_SEQUENCE" || QUEUE_RESULT=$?
+  if [ "$QUEUE_RESULT" -ne 0 ]; then
+    PHONE_AUDIO_OK=0
+    DELIVERY_FAILURES+=("one or more Weather audio page jobs could not be queued")
+    echo "ERROR: One or more requested audio page jobs could not be queued."
   fi
-  if ! wait_for_test_call_pickup; then
-    report_fault "audio" "Asterisk did not pick up one or more manual Weather audio page jobs"
-    echo "ERROR: Asterisk did not pick up one or more requested audio page jobs. Review Asterisk service and outgoing-spool permissions."
-    exit 1
+  if [ "${#TEST_CALL_QUEUE_PATHS[@]}" -gt 0 ]; then
+    if wait_for_test_call_pickup; then
+      PHONE_AUDIO_STARTED=1
+    else
+      PHONE_AUDIO_OK=0
+      DELIVERY_FAILURES+=("Asterisk did not pick up one or more Weather audio page jobs")
+      echo "ERROR: Asterisk did not pick up one or more requested audio page jobs. Review Asterisk service and outgoing-spool permissions."
+    fi
   fi
 fi
 
-# Let the auto-answer call enter media before placing the visual screen on top.
+# Phone SIP NOTIFY remains page-first. Desktop publication above is independent
+# and must never be held behind an offline phone or a stuck outgoing job.
 if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
-  echo "$(date): Dry run — would publish the manual Weather visual to the requested phone/desktop channels" >> "$LOG"
-else
-  if [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ]; then
+  [ "${#NWS_ALERT_RECIPIENTS[@]}" -eq 0 ] \
+    || echo "$(date): Dry run — would publish the manual Weather visual to the requested phone channels" >> "$LOG"
+elif [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ]; then
+  if [ "$PHONE_AUDIO_STARTED" = "1" ]; then
     sleep 2
   fi
-  if ! trigger_visual_test; then
-    report_fault "visual" "Manual Weather visual submission to a requested phone or desktop channel failed"
-    echo "ERROR: Manual Weather visual submission failed for at least one requested phone or desktop channel."
-    exit 1
+  if ! trigger_visual_test phone; then
+    DELIVERY_FAILURES+=("phone SIP NOTIFY submission failed")
+    echo "ERROR: Phone SIP NOTIFY submission failed for at least one requested endpoint."
   fi
 fi
 
-echo "$(date): Requested manual Weather channels accepted the local submission — phones=${#NWS_ALERT_RECIPIENTS[@]} desktops=${#NWS_DESKTOP_CLIENTS[@]}" >> "$LOG"
+if [ "${#DELIVERY_FAILURES[@]}" -eq 0 ]; then
+  echo "$(date): Requested manual Weather channels accepted the local submission — phones=${#NWS_ALERT_RECIPIENTS[@]} desktops=${#NWS_DESKTOP_CLIENTS[@]}" >> "$LOG"
+else
+  printf -v TEST_FAILURE_MESSAGE '%s; ' "${DELIVERY_FAILURES[@]}"
+  TEST_FAILURE_MESSAGE="${TEST_FAILURE_MESSAGE%; }"
+  echo "$(date): ERROR — Manual Weather test completed with channel failures: $TEST_FAILURE_MESSAGE" >> "$LOG"
+fi
 DELIVERY_TS="$(timestamp_now)"
 TEST_DELIVERY_STATUS="submitted"
+TEST_DELIVERY_STAGE=""
 if [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ] && [ "${#NWS_DESKTOP_CLIENTS[@]}" -gt 0 ]; then
   TEST_DELIVERY_MESSAGE="Asterisk picked up the manual audio page jobs and accepted SIP NOTIFY submission; targeted desktop publication completed; endpoint display and handset acceptance are not confirmed"
 elif [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ]; then
@@ -767,6 +859,11 @@ fi
 if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
   TEST_DELIVERY_STATUS="dry_run"
   TEST_DELIVERY_MESSAGE="Dry run completed for manual Piper TTS test"
+elif [ "${#DELIVERY_FAILURES[@]}" -gt 0 ]; then
+  TEST_DELIVERY_STATUS="partial_failure"
+  TEST_DELIVERY_STAGE="delivery"
+  TEST_DELIVERY_MESSAGE="Manual Weather test completed with channel failures: ${TEST_FAILURE_MESSAGE}. Every requested local channel was attempted; successful submissions were not replayed"
+  report_fault "delivery" "$TEST_DELIVERY_MESSAGE"
 fi
 update_status "$(printf '{"last_delivery_at":%s,"last_delivery_status":%s,"last_delivery_source":"test","last_delivery_event":"Manual NWS Test","last_delivery_audio":%s,"last_delivery_message":%s,"last_delivery_page_group":%s,"last_delivery_desktop_clients":%s}' \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DELIVERY_TS")" \
@@ -775,9 +872,10 @@ update_status "$(printf '{"last_delivery_at":%s,"last_delivery_status":%s,"last_
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_DELIVERY_MESSAGE")" \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DELIVERY_TARGETS")" \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DESKTOP_DELIVERY_TARGETS")")"
-update_status "$(printf '{"last_test_at":%s,"last_test_status":%s,"last_test_message":%s,"last_test_audio":%s,"last_test_phone_count":%d,"last_test_desktop_count":%d}' \
+update_status "$(printf '{"last_test_at":%s,"last_test_status":%s,"last_test_stage":%s,"last_test_message":%s,"last_test_audio":%s,"last_test_phone_count":%d,"last_test_desktop_count":%d}' \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DELIVERY_TS")" \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_DELIVERY_STATUS")" \
+  "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_DELIVERY_STAGE")" \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_DELIVERY_MESSAGE")" \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_AUDIO_LABEL")" \
   "${#NWS_ALERT_RECIPIENTS[@]}" \
@@ -818,5 +916,9 @@ if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
   echo "Dry run complete. No phones were notified."
 else
   append_event_log "$MAIL_SUBJECT" "$MAIL_BODY" "$AUDIO_SEQUENCE"
+  if [ "${#DELIVERY_FAILURES[@]}" -gt 0 ]; then
+    echo "ERROR: Manual Weather test completed with channel failures: ${TEST_FAILURE_MESSAGE}. Every requested local channel was attempted; successful submissions were not replayed."
+    exit 1
+  fi
   echo "Weather test local submission completed for ${#NWS_ALERT_RECIPIENTS[@]} phone recipient(s) and ${#NWS_DESKTOP_CLIENTS[@]} desktop recipient(s). Endpoint display and handset acceptance are not confirmed. Email and webhooks were not sent."
 fi

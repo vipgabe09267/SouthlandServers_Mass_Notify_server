@@ -15,10 +15,14 @@ $desktopClients = is_array($desktop_clients ?? null) ? $desktop_clients : [];
 $packageStatus = is_array($package_update_status ?? null) ? $package_update_status : ['state' => 'latest', 'label' => 'LATEST'];
 $hasPackageUpdate = (($packageStatus['state'] ?? '') === 'update');
 $updateProgress = is_array($update_progress ?? null) ? $update_progress : ['state' => 'idle', 'message' => ''];
-$updateMonitorActive = !empty($update_monitor_active) || in_array(($updateProgress['state'] ?? 'idle'), ['queued', 'checking', 'installing'], true);
+$updateProgressState = in_array(($updateProgress['state'] ?? 'idle'), ['idle', 'queued', 'checking', 'installing', 'complete', 'failed'], true) ? (string)$updateProgress['state'] : 'idle';
+$updateMonitorActive = !empty($update_monitor_active) || in_array($updateProgressState, ['queued', 'checking', 'installing'], true);
+$updateProgressBusy = in_array($updateProgressState, ['queued', 'checking', 'installing'], true);
 $maintenanceProgress = is_array($maintenance_progress ?? null) ? $maintenance_progress : ['action' => '', 'state' => 'idle', 'message' => ''];
+$maintenanceProgressState = in_array(($maintenanceProgress['state'] ?? 'idle'), ['idle', 'queued', 'running', 'complete', 'failed'], true) ? (string)$maintenanceProgress['state'] : 'idle';
 $maintenanceMonitorAction = in_array(($maintenance_monitor_action ?? ''), ['repair', 'uninstall', 'config'], true) ? (string)$maintenance_monitor_action : '';
 $maintenanceMonitorActive = $maintenanceMonitorAction !== '';
+$maintenanceProgressBusy = in_array($maintenanceProgressState, ['queued', 'running'], true);
 $packageStatusClass = (($packageStatus['state'] ?? '') === 'update') ? 'label-warning' : 'label-success';
 $formatOverrides = [];
 $formatLabels = [
@@ -44,10 +48,14 @@ if (empty($discordWebhooks) && !empty($settings['discord_webhook_url'])) {
 	];
 }
 $genericWebhooks = is_array($settings['generic_webhooks'] ?? null) ? $settings['generic_webhooks'] : [];
+$announcementWebhooks = is_array($settings['announcement_webhooks'] ?? null) ? $settings['announcement_webhooks'] : [];
 $enabledDiscordWebhooks = array_filter($discordWebhooks, static function ($destination) {
 	return is_array($destination) && !empty($destination['enabled']);
 });
 $enabledGenericWebhooks = array_filter($genericWebhooks, static function ($destination) {
+	return is_array($destination) && !empty($destination['enabled']);
+});
+$enabledAnnouncementWebhooks = array_filter($announcementWebhooks, static function ($destination) {
 	return is_array($destination) && !empty($destination['enabled']);
 });
 $mailFromLocalPart = strtolower(trim((string)($settings['mail_from_local_part'] ?? 'no-reply')));
@@ -163,8 +171,50 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 .sls-empty-state { padding:22px 16px; border:1px dashed #cbd5e1; border-radius:6px; color:#64748b; text-align:center; background:#f8fafc; }
 .sls-destination-note { margin:12px 0 0; }
 .sls-save-actions { margin:26px 0 34px; padding:16px; border:1px solid #dfe5ec; border-radius:8px; background:#f8fafc; }
-.sls-update-controls { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
-.sls-update-controls .alert { display:inline-flex; align-items:center; gap:6px; margin:0; padding:7px 10px; }
+.sls-update-controls { display:flex; align-items:center; flex-wrap:wrap; gap:10px; }
+.sls-operation-status {
+	display:grid;
+	grid-template-columns:34px minmax(0,1fr);
+	gap:10px;
+	align-items:center;
+	width:100%;
+	margin:12px 0 0;
+	padding:10px 12px;
+	border:1px solid #bfdbfe;
+	border-left:4px solid #3b82f6;
+	border-radius:7px;
+	background:#f8fbff;
+	color:#334155;
+}
+.sls-operation-status[hidden] { display:none; }
+.sls-operation-status__icon {
+	display:flex;
+	align-items:center;
+	justify-content:center;
+	width:32px;
+	height:32px;
+	border-radius:50%;
+	background:#e8f1ff;
+	color:#2563eb;
+	font-size:15px;
+}
+.sls-operation-status__body { min-width:0; }
+.sls-operation-status__title { display:block; margin-bottom:1px; color:#172033; font-size:13px; font-weight:700; }
+.sls-operation-status__message { display:block; font-size:12px; line-height:1.4; overflow-wrap:anywhere; }
+.sls-operation-status__track { height:2px; margin-top:7px; overflow:hidden; border-radius:99px; background:#dbeafe; }
+.sls-operation-status__bar { display:block; width:38%; height:100%; border-radius:99px; background:#3b82f6; animation:sls-operation-progress 1.35s ease-in-out infinite; }
+.sls-operation-status[data-state="complete"] { border-color:#bbdfc7; border-left-color:#2f855a; background:#f5fbf7; }
+.sls-operation-status[data-state="complete"] .sls-operation-status__icon { background:#e1f3e7; color:#247347; }
+.sls-operation-status[data-state="failed"] { border-color:#efc2c2; border-left-color:#c53030; background:#fff8f8; }
+.sls-operation-status[data-state="failed"] .sls-operation-status__icon { background:#fbe7e7; color:#b42318; }
+.sls-operation-status[data-state="complete"] .sls-operation-status__track,
+.sls-operation-status[data-state="failed"] .sls-operation-status__track { display:none; }
+@keyframes sls-operation-progress {
+	0% { transform:translateX(-115%); }
+	50% { transform:translateX(80%); }
+	100% { transform:translateX(265%); }
+}
+@media (prefers-reduced-motion:reduce) { .sls-operation-status__bar { animation:none; width:100%; opacity:.55; } }
 .sls-config-backup { margin:0 0 14px; padding-top:24px; border-top:1px solid #d7dce2; }
 .sls-danger-panel { margin-top:24px; border-width:2px; }
 .sls-danger-panel .panel-heading { padding:13px 16px; font-size:16px; font-weight:700; }
@@ -176,8 +226,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 .sls-danger-action form { margin-top:auto; }
 .sls-danger-action .form-group { margin-bottom:12px; }
 .sls-danger-action--critical { border-color:#f0a8a1; background:#fff5f5; }
-.sls-maintenance-progress { margin:0 0 16px; display:flex; align-items:center; gap:8px; }
-.sls-maintenance-progress[hidden] { display:none; }
+.sls-maintenance-progress { margin:0 0 16px; }
 .sls-maintenance-form .btn[disabled] { cursor:wait; }
 @media (max-width:991px) { .sls-danger-grid { grid-template-columns:1fr; } }
 @media(max-width:767px){.sls-editor-row,#sls-format-editor-list .sls-editor-row,.sls-webhook-row{display:block}.sls-editor-row>*,.sls-webhook-row>*{margin-bottom:8px}.sls-manager-modal .modal-dialog{width:auto}.sls-manager-card .text-right{text-align:left;margin-top:10px}#sls-format-editor-list .sls-editor-row [data-remove-format]{margin-top:4px !important}}
@@ -244,7 +293,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 
 				<h3 class="sls-settings-heading"><i class="fa fa-envelope text-warning" aria-hidden="true"></i> <?php echo _('Email and Webhook Delivery'); ?></h3>
 				<div class="sls-manager-card">
-					<div class="row"><div class="col-md-8"><h4><i class="fa fa-paper-plane"></i> <?php echo _('Outbound Delivery'); ?></h4><div class="sls-manager-summary"><?php echo sprintf(_('Email sender %s; %d system/error recipient(s); %d enabled Discord destination(s); %d enabled generic webhook(s).'), htmlspecialchars($mailFromAddress), count($systemNotificationEmails), count($enabledDiscordWebhooks), count($enabledGenericWebhooks)); ?> <?php echo _('Weather and Lightning email recipients are selected within each zone or trigger area.'); ?></div></div><div class="col-md-4 text-right"><button type="button" class="btn btn-default" data-toggle="modal" data-target="#sls-notification-manager"><i class="fa fa-pencil"></i> <?php echo _('Manage Delivery'); ?></button></div></div>
+					<div class="row"><div class="col-md-8"><h4><i class="fa fa-paper-plane"></i> <?php echo _('Outbound Delivery'); ?></h4><div class="sls-manager-summary"><?php echo sprintf(_('Email sender %s; %d system/error recipient(s); %d enabled Discord alert destination(s); %d enabled generic alert webhook(s); %d enabled Dashboard announcement webhook(s).'), htmlspecialchars($mailFromAddress), count($systemNotificationEmails), count($enabledDiscordWebhooks), count($enabledGenericWebhooks), count($enabledAnnouncementWebhooks)); ?> <?php echo _('Weather and Lightning email recipients are selected within each zone or trigger area.'); ?></div></div><div class="col-md-4 text-right"><button type="button" class="btn btn-default" data-toggle="modal" data-target="#sls-notification-manager"><i class="fa fa-pencil"></i> <?php echo _('Manage Delivery'); ?></button></div></div>
 				</div>
 				<div class="modal fade sls-manager-modal" id="sls-notification-manager" tabindex="-1" role="dialog" aria-hidden="true"><div class="modal-dialog"><div class="modal-content">
 					<div class="modal-header"><button type="button" class="close" data-dismiss="modal" aria-label="<?php echo htmlspecialchars(_('Close')); ?>"><span aria-hidden="true">&times;</span></button><h4 class="modal-title"><?php echo _('Email and Webhook Delivery'); ?></h4></div>
@@ -252,10 +301,12 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						<input type="hidden" name="system_notification_recipients_present" value="1">
 						<input type="hidden" name="discord_webhooks_present" value="1">
 						<input type="hidden" name="generic_webhooks_present" value="1">
+						<input type="hidden" name="announcement_webhooks_present" value="1">
 						<ul class="nav nav-tabs sls-destination-tabs" role="tablist">
 							<li class="active" role="presentation"><a href="#sls-destination-email" data-toggle="tab" role="tab"><i class="fa fa-envelope"></i> <?php echo _('Email Setup'); ?> <span class="badge"><?php echo count($systemNotificationEmails); ?></span></a></li>
 							<li role="presentation"><a href="#sls-destination-discord" data-toggle="tab" role="tab"><i class="fa fa-comments"></i> <?php echo _('Discord'); ?> <span class="badge"><?php echo count($discordWebhooks); ?></span></a></li>
 							<li role="presentation"><a href="#sls-destination-generic" data-toggle="tab" role="tab"><i class="fa fa-exchange"></i> <?php echo _('Generic Webhooks'); ?> <span class="badge"><?php echo count($genericWebhooks); ?></span></a></li>
+							<li role="presentation"><a href="#sls-destination-announcement" data-toggle="tab" role="tab"><i class="fa fa-bullhorn"></i> <?php echo _('Dashboard Webhooks'); ?> <span class="badge"><?php echo count($announcementWebhooks); ?></span></a></li>
 						</ul>
 						<div class="tab-content">
 							<section class="tab-pane active sls-destination-pane" id="sls-destination-email" role="tabpanel">
@@ -286,6 +337,14 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 								<?php foreach ($genericWebhooks as $index => $destination) { ?><div class="sls-editor-row sls-webhook-row" data-webhook-row data-webhook-type="generic"><div class="sls-webhook-enabled"><input type="hidden" name="generic_webhooks[<?php echo (int)$index; ?>][enabled]" value="0"><label><input type="checkbox" name="generic_webhooks[<?php echo (int)$index; ?>][enabled]" value="1" <?php echo !empty($destination['enabled']) ? 'checked' : ''; ?>> <?php echo _('Enabled'); ?></label><input type="hidden" name="generic_webhooks[<?php echo (int)$index; ?>][id]" value="<?php echo htmlspecialchars($destination['id'] ?? ''); ?>"></div><div><label><?php echo _('Name'); ?></label><input class="form-control" name="generic_webhooks[<?php echo (int)$index; ?>][name]" value="<?php echo htmlspecialchars($destination['name'] ?? ''); ?>" maxlength="80"></div><div><label><?php echo _('HTTPS URL'); ?></label><input class="form-control" type="password" name="generic_webhooks[<?php echo (int)$index; ?>][url]" value="" autocomplete="new-password" placeholder="<?php echo htmlspecialchars(_('Stored; enter a new URL to replace')); ?>"><div class="sls-stored-secret"><i class="fa fa-lock"></i> <?php echo _('Stored in the protected central configuration'); ?></div></div><button type="button" class="btn btn-link text-danger" data-remove-webhook><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div><?php } ?>
 									</div><button type="button" class="btn btn-default btn-sm" data-add-webhook="generic"><i class="fa fa-plus"></i> <?php echo _('Add Generic Webhook'); ?></button><span class="text-muted sls-destination-limit" data-webhook-limit="generic" aria-live="polite" hidden><?php echo _('10-destination limit reached.'); ?></span>
 							</section>
+							<section class="tab-pane sls-destination-pane" id="sls-destination-announcement" role="tabpanel">
+								<h4><?php echo _('Dashboard Announcement Webhooks'); ?></h4>
+								<p class="text-muted"><?php echo _('Add up to 10 named Discord or Discord-compatible HTTPS webhook destinations. They are optional and appear as individual targets in the Dashboard announcement panel. A selected destination receives bounded branded Discord embed JSON; Weather and Lightning routing is unchanged.'); ?></p>
+								<div class="sls-destination-list" id="sls-announcement-editor-list">
+								<?php if (empty($announcementWebhooks)) { ?><div class="sls-empty-state" data-destination-empty><?php echo _('No Dashboard announcement webhooks are configured.'); ?></div><?php } ?>
+								<?php foreach ($announcementWebhooks as $index => $destination) { ?><div class="sls-editor-row sls-webhook-row" data-webhook-row data-webhook-type="announcement"><div class="sls-webhook-enabled"><input type="hidden" name="announcement_webhooks[<?php echo (int)$index; ?>][enabled]" value="0"><label><input type="checkbox" name="announcement_webhooks[<?php echo (int)$index; ?>][enabled]" value="1" <?php echo !empty($destination['enabled']) ? 'checked' : ''; ?>> <?php echo _('Enabled'); ?></label><input type="hidden" name="announcement_webhooks[<?php echo (int)$index; ?>][id]" value="<?php echo htmlspecialchars($destination['id'] ?? ''); ?>"></div><div><label><?php echo _('Name'); ?></label><input class="form-control" name="announcement_webhooks[<?php echo (int)$index; ?>][name]" value="<?php echo htmlspecialchars($destination['name'] ?? ''); ?>" maxlength="80"></div><div><label><?php echo _('HTTPS Webhook URL'); ?></label><div class="input-group"><input class="form-control" type="password" name="announcement_webhooks[<?php echo (int)$index; ?>][url]" value="" autocomplete="new-password" placeholder="<?php echo htmlspecialchars(_('Stored; enter a new URL to replace')); ?>"><span class="input-group-btn"><button type="button" class="btn btn-default" data-toggle-secret title="<?php echo htmlspecialchars(_('Show or hide the URL being entered')); ?>" aria-label="<?php echo htmlspecialchars(_('Show or hide the URL being entered')); ?>"><i class="fa fa-eye" aria-hidden="true"></i></button></span></div><div class="sls-stored-secret"><i class="fa fa-lock"></i> <?php echo _('Stored in the protected central configuration; the saved token is never returned to the page.'); ?></div></div><button type="button" class="btn btn-link text-danger" data-remove-webhook><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div><?php } ?>
+								</div><button type="button" class="btn btn-default btn-sm" data-add-webhook="announcement"><i class="fa fa-plus"></i> <?php echo _('Add Dashboard Webhook'); ?></button><span class="text-muted sls-destination-limit" data-webhook-limit="announcement" aria-live="polite" hidden><?php echo _('10-destination limit reached.'); ?></span>
+							</section>
 						</div>
 						<p class="text-muted sls-destination-note"><i class="fa fa-info-circle"></i> <?php echo _('Close this window, then use Save General Settings to stage the changes.'); ?></p>
 					</div>
@@ -294,6 +353,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 				<script type="text/template" id="sls-email-row-template"><div class="sls-editor-row" data-email-row><div class="sls-editor-grow"><input class="form-control" type="email" placeholder="pbx-operations@example.com"></div><button type="button" class="btn btn-link text-danger" data-remove-email><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div></script>
 				<script type="text/template" id="sls-discord-row-template"><div class="sls-editor-row sls-webhook-row" data-webhook-row data-webhook-type="discord"><div class="sls-webhook-enabled"><input type="hidden" data-field="enabled-hidden" value="0"><label><input type="checkbox" data-field="enabled" value="1" checked> <?php echo _('Enabled'); ?></label><input type="hidden" data-field="id" value=""></div><div><label><?php echo _('Name'); ?></label><input class="form-control" data-field="name" maxlength="80" placeholder="Operations"></div><div><label><?php echo _('Webhook URL'); ?></label><input class="form-control" type="password" data-field="url" autocomplete="new-password" placeholder="https://discord.com/api/webhooks/..."></div><button type="button" class="btn btn-link text-danger" data-remove-webhook><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div></script>
 				<script type="text/template" id="sls-generic-row-template"><div class="sls-editor-row sls-webhook-row" data-webhook-row data-webhook-type="generic"><div class="sls-webhook-enabled"><input type="hidden" data-field="enabled-hidden" value="0"><label><input type="checkbox" data-field="enabled" value="1" checked> <?php echo _('Enabled'); ?></label><input type="hidden" data-field="id" value=""></div><div><label><?php echo _('Name'); ?></label><input class="form-control" data-field="name" maxlength="80" placeholder="Incident Platform"></div><div><label><?php echo _('HTTPS URL'); ?></label><input class="form-control" type="password" data-field="url" autocomplete="new-password" placeholder="https://alerts.example.com/hooks/sls"></div><button type="button" class="btn btn-link text-danger" data-remove-webhook><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div></script>
+				<script type="text/template" id="sls-announcement-row-template"><div class="sls-editor-row sls-webhook-row" data-webhook-row data-webhook-type="announcement"><div class="sls-webhook-enabled"><input type="hidden" data-field="enabled-hidden" value="0"><label><input type="checkbox" data-field="enabled" value="1" checked> <?php echo _('Enabled'); ?></label><input type="hidden" data-field="id" value=""></div><div><label><?php echo _('Name'); ?></label><input class="form-control" data-field="name" maxlength="80" placeholder="Announcements"></div><div><label><?php echo _('HTTPS Webhook URL'); ?></label><div class="input-group"><input class="form-control" type="password" data-field="url" autocomplete="new-password" placeholder="https://discord.com/api/webhooks/..."><span class="input-group-btn"><button type="button" class="btn btn-default" data-toggle-secret title="<?php echo htmlspecialchars(_('Show or hide the URL being entered')); ?>" aria-label="<?php echo htmlspecialchars(_('Show or hide the URL being entered')); ?>"><i class="fa fa-eye" aria-hidden="true"></i></button></span></div></div><button type="button" class="btn btn-link text-danger" data-remove-webhook><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div></script>
 
 				<h3 class="sls-settings-heading"><i class="fa fa-volume-up text-success" aria-hidden="true"></i> <?php echo _('Regular Paging Audio'); ?></h3>
 				<div class="alert alert-info"><i class="fa fa-info-circle" aria-hidden="true"></i> <?php echo _('These defaults apply only to dashboard and API announcements. Weather Alerts and Lightning Alerts keep their own independent sounds and volume settings.'); ?></div>
@@ -533,12 +593,25 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 							<?php if ($hasPackageUpdate) { ?>
 								<button type="submit" class="btn btn-warning btn-sm" name="slsmassnotifyserver_action" value="manual_update"><i class="fa fa-refresh" aria-hidden="true"></i> <?php echo _('Update to Latest Release'); ?></button>
 							<?php } ?>
-							<div id="sls-update-progress" class="alert alert-info" role="status" aria-live="polite" data-active="<?php echo $updateMonitorActive ? '1' : '0'; ?>" data-status-url="config.php?display=slsmassnotifyserver_other&amp;sls_update_status=1" style="<?php echo $updateMonitorActive ? '' : 'display:none;'; ?>">
-								<i class="fa fa-spinner fa-spin" aria-hidden="true"></i>
-								<span><?php echo htmlspecialchars((string)($updateProgress['message'] ?? _('Preparing update status...'))); ?></span>
-							</div>
 						</div>
 					</div>
+				</div>
+				<div id="sls-update-progress"
+					class="sls-operation-status"
+					role="status"
+					aria-live="polite"
+					aria-atomic="true"
+					aria-busy="<?php echo $updateProgressBusy ? 'true' : 'false'; ?>"
+					data-active="<?php echo $updateMonitorActive ? '1' : '0'; ?>"
+					data-state="<?php echo htmlspecialchars($updateProgressState); ?>"
+					data-status-url="config.php?display=slsmassnotifyserver_other&amp;sls_update_status=1"
+					<?php echo $updateMonitorActive ? '' : 'hidden'; ?>>
+					<span class="sls-operation-status__icon" aria-hidden="true"><i class="fa <?php echo $updateProgressState === 'complete' ? 'fa-check' : ($updateProgressState === 'failed' ? 'fa-exclamation' : 'fa-cloud-download'); ?>"></i></span>
+					<span class="sls-operation-status__body">
+						<strong class="sls-operation-status__title"><?php echo _('Module update'); ?></strong>
+						<span class="sls-operation-status__message"><?php echo htmlspecialchars((string)($updateProgress['message'] ?? _('Preparing update status...'))); ?></span>
+						<span class="sls-operation-status__track" aria-hidden="true"><span class="sls-operation-status__bar"></span></span>
+					</span>
 				</div>
 
 				<div class="sls-save-actions">
@@ -555,15 +628,22 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 				<div class="panel-heading"><i class="fa fa-exclamation-triangle" aria-hidden="true"></i> <?php echo _('Danger Zone'); ?></div>
 				<div class="panel-body">
 					<div id="sls-maintenance-progress"
-						class="alert alert-info sls-maintenance-progress"
+						class="sls-operation-status sls-maintenance-progress"
 						role="status"
 						aria-live="polite"
+						aria-atomic="true"
+						aria-busy="<?php echo $maintenanceProgressBusy ? 'true' : 'false'; ?>"
 						data-active="<?php echo $maintenanceMonitorActive ? '1' : '0'; ?>"
 						data-action="<?php echo htmlspecialchars($maintenanceMonitorAction); ?>"
+						data-state="<?php echo htmlspecialchars($maintenanceProgressState); ?>"
 						data-status-url="config.php?display=slsmassnotifyserver_other&amp;sls_maintenance_status=1"
 						<?php echo $maintenanceMonitorActive ? '' : 'hidden'; ?>>
-						<i class="fa <?php echo (($maintenanceProgress['state'] ?? '') === 'complete') ? 'fa-check-circle' : 'fa-spinner fa-spin'; ?>" aria-hidden="true"></i>
-						<span><?php echo htmlspecialchars((string)($maintenanceProgress['message'] ?? _('Preparing maintenance status...'))); ?></span>
+						<span class="sls-operation-status__icon" aria-hidden="true"><i class="fa <?php echo $maintenanceProgressState === 'complete' ? 'fa-check' : ($maintenanceProgressState === 'failed' ? 'fa-exclamation' : 'fa-wrench'); ?>"></i></span>
+						<span class="sls-operation-status__body">
+							<strong class="sls-operation-status__title"><?php echo _('Maintenance'); ?></strong>
+							<span class="sls-operation-status__message"><?php echo htmlspecialchars((string)($maintenanceProgress['message'] ?? _('Preparing maintenance status...'))); ?></span>
+							<span class="sls-operation-status__track" aria-hidden="true"><span class="sls-operation-status__bar"></span></span>
+						</span>
 					</div>
 					<div class="sls-danger-grid">
 						<section class="sls-danger-action">
@@ -606,12 +686,20 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 	if (updateProgress && updateProgress.getAttribute('data-active') === '1') {
 		var updatePolls = 0;
 		var updateStatusUrl = updateProgress.getAttribute('data-status-url');
-		var updateIcon = updateProgress.querySelector('i');
-		var updateText = updateProgress.querySelector('span');
+		var updateIcon = updateProgress.querySelector('.sls-operation-status__icon i');
+		var updateTitle = updateProgress.querySelector('.sls-operation-status__title');
+		var updateText = updateProgress.querySelector('.sls-operation-status__message');
+		function renderUpdateDisplay(state, message) {
+			var terminal = state === 'complete' || state === 'failed';
+			updateProgress.hidden = false;
+			updateProgress.setAttribute('data-state', state);
+			updateProgress.setAttribute('aria-busy', terminal ? 'false' : 'true');
+			updateIcon.className = state === 'complete' ? 'fa fa-check' : (state === 'failed' ? 'fa fa-exclamation' : 'fa fa-cloud-download');
+			updateTitle.textContent = state === 'complete' ? 'Update complete' : (state === 'failed' ? 'Update needs attention' : 'Module update');
+			updateText.textContent = message || (state === 'complete' ? 'Update completed.' : (state === 'failed' ? 'Update failed.' : 'Checking update status...'));
+		}
 		function finishUpdateDisplay(state, message) {
-			updateProgress.className = state === 'complete' ? 'alert alert-success' : 'alert alert-danger';
-			updateIcon.className = state === 'complete' ? 'fa fa-check-circle' : 'fa fa-times-circle';
-			updateText.textContent = message || (state === 'complete' ? 'Update completed.' : 'Update failed.');
+			renderUpdateDisplay(state, message);
 			if (state === 'complete') {
 				window.setTimeout(function() {
 					var cleanUrl = new URL(window.location.href);
@@ -631,10 +719,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						finishUpdateDisplay(state, message);
 						return;
 					}
-					updateProgress.style.display = 'block';
-					updateProgress.className = 'alert alert-info';
-					updateIcon.className = 'fa fa-spinner fa-spin';
-					updateText.textContent = message;
+					renderUpdateDisplay(state, message);
 					window.setTimeout(pollUpdateStatus, 2000);
 				})
 				.catch(function() {
@@ -642,7 +727,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						finishUpdateDisplay('failed', 'Update status could not be confirmed. Check Notification Logs and try again.');
 						return;
 					}
-					updateText.textContent = 'Update is running; waiting for the PBX interface to respond...';
+					renderUpdateDisplay('checking', 'Update is running; waiting for the PBX interface to respond...');
 					window.setTimeout(pollUpdateStatus, 3000);
 				});
 		}
@@ -671,12 +756,20 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 					uninstall: 'Submitting complete uninstall request...',
 					config: 'Uploading and validating replacement configuration...'
 				};
+				var titles = {
+					repair: 'Installation repair',
+					uninstall: 'Complete uninstall',
+					config: 'Configuration replacement'
+				};
 				maintenanceProgress.hidden = false;
-				maintenanceProgress.className = 'alert alert-info sls-maintenance-progress';
 				maintenanceProgress.setAttribute('data-action', action);
-				var icon = maintenanceProgress.querySelector('i');
-				var text = maintenanceProgress.querySelector('span');
-				if (icon) icon.className = 'fa fa-spinner fa-spin';
+				maintenanceProgress.setAttribute('data-state', 'running');
+				maintenanceProgress.setAttribute('aria-busy', 'true');
+				var icon = maintenanceProgress.querySelector('.sls-operation-status__icon i');
+				var title = maintenanceProgress.querySelector('.sls-operation-status__title');
+				var text = maintenanceProgress.querySelector('.sls-operation-status__message');
+				if (icon) icon.className = action === 'config' ? 'fa fa-upload' : (action === 'uninstall' ? 'fa fa-trash' : 'fa fa-wrench');
+				if (title) title.textContent = titles[action] || 'Maintenance';
 				if (text) text.textContent = labels[action] || 'Submitting maintenance request...';
 			}
 		});
@@ -686,8 +779,14 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 		var maintenanceFailures = 0;
 		var maintenanceStatusUrl = maintenanceProgress.getAttribute('data-status-url');
 		var expectedAction = maintenanceProgress.getAttribute('data-action');
-		var maintenanceIcon = maintenanceProgress.querySelector('i');
-		var maintenanceText = maintenanceProgress.querySelector('span');
+		var maintenanceIcon = maintenanceProgress.querySelector('.sls-operation-status__icon i');
+		var maintenanceTitle = maintenanceProgress.querySelector('.sls-operation-status__title');
+		var maintenanceText = maintenanceProgress.querySelector('.sls-operation-status__message');
+		var maintenanceTitles = {
+			repair: 'Installation repair',
+			uninstall: 'Complete uninstall',
+			config: 'Configuration replacement'
+		};
 		function cleanMaintenanceUrl() {
 			var cleanUrl = new URL(window.location.href);
 			cleanUrl.searchParams.delete('sls_maintenance_action');
@@ -695,8 +794,10 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 		}
 		function finishMaintenanceDisplay(state, message) {
 			maintenanceProgress.hidden = false;
-			maintenanceProgress.className = state === 'complete' ? 'alert alert-success sls-maintenance-progress' : 'alert alert-danger sls-maintenance-progress';
-			maintenanceIcon.className = state === 'complete' ? 'fa fa-check-circle' : 'fa fa-times-circle';
+			maintenanceProgress.setAttribute('data-state', state);
+			maintenanceProgress.setAttribute('aria-busy', 'false');
+			maintenanceIcon.className = state === 'complete' ? 'fa fa-check' : 'fa fa-exclamation';
+			maintenanceTitle.textContent = state === 'complete' ? 'Maintenance complete' : 'Maintenance needs attention';
 			maintenanceText.textContent = message || (state === 'complete' ? 'Maintenance completed.' : 'Maintenance failed.');
 			cleanMaintenanceUrl();
 			if (state === 'complete' && expectedAction === 'repair') {
@@ -721,8 +822,10 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						return;
 					}
 					maintenanceProgress.hidden = false;
-					maintenanceProgress.className = 'alert alert-info sls-maintenance-progress';
-					maintenanceIcon.className = 'fa fa-spinner fa-spin';
+					maintenanceProgress.setAttribute('data-state', state);
+					maintenanceProgress.setAttribute('aria-busy', 'true');
+					maintenanceIcon.className = action === 'config' ? 'fa fa-upload' : (action === 'uninstall' ? 'fa fa-trash' : 'fa fa-wrench');
+					maintenanceTitle.textContent = maintenanceTitles[action] || 'Maintenance';
 					maintenanceText.textContent = message;
 					window.setTimeout(pollMaintenanceStatus, 1500);
 				})
@@ -736,6 +839,8 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						finishMaintenanceDisplay('failed', 'Maintenance status could not be confirmed. Review Notification Logs before retrying.');
 						return;
 					}
+					maintenanceProgress.setAttribute('data-state', 'running');
+					maintenanceProgress.setAttribute('aria-busy', 'true');
 					maintenanceText.textContent = 'Maintenance is running; waiting for the PBX interface to respond...';
 					window.setTimeout(pollMaintenanceStatus, 2500);
 				});
@@ -819,7 +924,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 		}
 		if (limitMessage) limitMessage.hidden = !limitReached;
 	}
-	['discord', 'generic'].forEach(function(type) {
+	['discord', 'generic', 'announcement'].forEach(function(type) {
 		var list = document.getElementById('sls-' + type + '-editor-list');
 		var template = document.getElementById('sls-' + type + '-row-template');
 		var addButton = document.querySelector('[data-add-webhook="' + type + '"]');

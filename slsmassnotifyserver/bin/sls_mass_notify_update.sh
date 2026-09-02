@@ -12,7 +12,7 @@ STATUS_FILE="${STATUS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/upda
 UPDATE_PROGRESS_FILE="${UPDATE_PROGRESS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/update-progress.json}"
 LOG_FILE="${LOG_FILE:-/var/log/sls_mass_notify.log}"
 LOCK_FILE="${LOCK_FILE:-/run/lock/sls-mass-notify-update.lock}"
-CURRENT_VERSION="${SLS_MASS_NOTIFY_CURRENT_VERSION:-0.1.0}"
+CURRENT_VERSION="${SLS_MASS_NOTIFY_CURRENT_VERSION:-0.1.1-beta}"
 
 GITHUB_UPDATES_ENABLED="0"
 MANUAL_UPDATE="${SLS_MASS_NOTIFY_MANUAL_UPDATE:-0}"
@@ -126,10 +126,11 @@ if ! flock -n 9; then
 fi
 
 if ! load_update_config; then
-  write_status "$(python3 - <<'PY'
+  write_status "$(CURRENT_VERSION="$CURRENT_VERSION" python3 - <<'PY'
 import json
+import os
 from datetime import datetime, timezone
-print(json.dumps({"checked_at": datetime.now(timezone.utc).astimezone().isoformat(), "update_available": False, "message": "Automatic update check failed: central config is invalid or unavailable."}, separators=(",", ":")))
+print(json.dumps({"ok": False, "checked_at": datetime.now(timezone.utc).astimezone().isoformat(), "update_available": False, "latest_version": os.environ["CURRENT_VERSION"], "message": "Automatic update check failed: central config is invalid or unavailable."}, separators=(",", ":")))
 PY
 )"
   write_manual_progress "failed" "The protected central configuration could not be read."
@@ -144,10 +145,10 @@ import urllib.request
 from datetime import datetime, timezone
 
 repo = os.environ.get("REPOSITORY", "")
-current = os.environ.get("CURRENT_VERSION", "0.1.0")
+current = os.environ.get("CURRENT_VERSION", "0.1.1-beta")
 now = datetime.now(timezone.utc).astimezone().isoformat()
 if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
-    print(json.dumps({"ok": False, "checked_at": now, "update_available": False, "message": "Configured GitHub repository is invalid."}, separators=(",", ":")))
+    print(json.dumps({"ok": False, "checked_at": now, "update_available": False, "latest_version": current, "message": "Configured GitHub repository is invalid."}, separators=(",", ":")))
     raise SystemExit(0)
 
 def norm(value):
@@ -165,12 +166,12 @@ def version_key(value):
 try:
     request = urllib.request.Request(
         f"https://api.github.com/repos/{repo}/releases",
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "SouthlandServers-Mass-Notifications-Updater/0.1.0"},
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "SouthlandServers-Mass-Notifications-Updater/0.1.1-beta"},
     )
     with urllib.request.urlopen(request, timeout=20) as response:
         releases = json.load(response)
 except Exception as exc:
-    print(json.dumps({"ok": False, "checked_at": now, "update_available": False, "message": f"GitHub update check failed: {exc}"}, separators=(",", ":")))
+    print(json.dumps({"ok": False, "checked_at": now, "update_available": False, "latest_version": current, "message": f"GitHub update check failed: {exc}"}, separators=(",", ":")))
     raise SystemExit(0)
 
 candidates = []

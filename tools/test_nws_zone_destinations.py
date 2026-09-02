@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,7 @@ MODULE_PATH = ROOT / "slsmassnotifyserver/bin/sls_mass_notify/sls_notify.py"
 WEATHER_WORKER = ROOT / "slsmassnotifyserver/bin/sls_mass_notify_weather_poll.sh"
 CONFIG_LOADER = ROOT / "slsmassnotifyserver/bin/sls_mass_notify/sls_config.py"
 EMAIL_MODULE_PATH = ROOT / "slsmassnotifyserver/bin/sls_mass_notify/sls_branded_email.py"
+CROSS_ZONE_CLAIM_HELPER = ROOT / "slsmassnotifyserver/bin/sls_mass_notify/sls_nws_delivery_claims.py"
 
 
 def fail(message):
@@ -270,10 +272,22 @@ def test_weather_worker_overrides():
             "'zone': os.environ.get('NWS_ZONE_OVERRIDE'),"
             "'phones': os.environ.get('NWS_RECIPIENTS_OVERRIDE'),"
             "'desktops': os.environ.get('NWS_DESKTOP_CLIENTS_OVERRIDE'),"
-            "'emails': os.environ.get('NWS_EMAIL_RECIPIENTS_OVERRIDE')}) + '\\n')\n",
+            "'emails': os.environ.get('NWS_EMAIL_RECIPIENTS_OVERRIDE'),"
+            "'quiet_enabled': os.environ.get('NWS_QUIET_HOURS_ENABLED_OVERRIDE'),"
+            "'quiet_start': os.environ.get('NWS_QUIET_HOURS_START_OVERRIDE'),"
+            "'quiet_end': os.environ.get('NWS_QUIET_HOURS_END_OVERRIDE'),"
+            "'critical': os.environ.get('NWS_QUIET_CRITICAL_EVENTS_OVERRIDE'),"
+            "'webhooks': os.environ.get('NWS_WEBHOOK_DESTINATION_KEYS_OVERRIDE'),"
+            "'cycle': os.environ.get('NWS_DISPATCH_CYCLE_ID'),"
+            "'rank': os.environ.get('NWS_DISPATCH_GROUP_RANK'),"
+            "'count': os.environ.get('NWS_DISPATCH_GROUP_COUNT'),"
+            "'claim_state': os.environ.get('NWS_CROSS_ZONE_CLAIM_STATE')}) + '\\n')\n",
             encoding="utf-8",
         )
         fake_core.chmod(0o755)
+        installed_claim_helper = runtime / "sls_nws_delivery_claims.py"
+        shutil.copyfile(CROSS_ZONE_CLAIM_HELPER, installed_claim_helper)
+        installed_claim_helper.chmod(0o755)
         config_path = temp / "mass-notifications.config"
         config = {
             "enabled": "1",
@@ -283,6 +297,12 @@ def test_weather_worker_overrides():
                 {"username": "desk.one", "enabled": "1"},
                 {"username": "desk.disabled", "enabled": "0"},
             ],
+            "discord_webhooks": [
+                {"id": "discord_ops", "name": "Operations", "enabled": "1", "url": "https://discord.com/api/webhooks/1/test"},
+            ],
+            "generic_webhooks": [
+                {"id": "generic_archive", "name": "Archive", "enabled": "1", "url": "https://hooks.example.com/weather"},
+            ],
             "nws_zones": [
                 {
                     "name": "Central",
@@ -290,6 +310,12 @@ def test_weather_worker_overrides():
                     "extensions": [],
                     "desktop_clients": ["desk.one", "desk.disabled", "missing"],
                     "email_recipients": ["zone@example.com"],
+                    "quiet_hours_enabled": "1",
+                    "quiet_hours_start": "22:15",
+                    "quiet_hours_end": "05:30",
+                    "quiet_critical_events": ["Tornado Warning", "Extreme Wind Warning"],
+                    "discord_webhook_ids": ["discord_ops"],
+                    "generic_webhook_ids": [],
                 },
                 {
                     "id": "phones_only",
@@ -298,6 +324,26 @@ def test_weather_worker_overrides():
                     "extensions": ["1000"],
                     "desktop_clients": [],
                     "email_recipients": [],
+                },
+                {
+                    "id": "email_only",
+                    "name": "Email Only",
+                    "zone": "TXC495",
+                    "extensions": [],
+                    "desktop_clients": [],
+                    "email_recipients": ["remote@example.net"],
+                    "discord_webhook_ids": [],
+                    "generic_webhook_ids": [],
+                },
+                {
+                    "id": "webhook_only",
+                    "name": "Webhook Only",
+                    "zone": "TXC497",
+                    "extensions": [],
+                    "desktop_clients": [],
+                    "email_recipients": [],
+                    "discord_webhook_ids": [],
+                    "generic_webhook_ids": ["generic_archive"],
                 },
             ],
         }
@@ -316,6 +362,19 @@ def test_weather_worker_overrides():
             if line
         ]
         legacy_id = "nws_" + hashlib.sha256(b"central|TXC491").hexdigest()[:12]
+        cycles = {record.pop("cycle") for record in captured}
+        if len(cycles) != 1 or not next(iter(cycles), "").startswith("nws_"):
+            fail(f"Weather workers did not share one bounded dispatch cycle: {cycles!r}")
+        rank_by_id = {record["id"]: record.pop("rank") for record in captured}
+        count_values = {record.pop("count") for record in captured}
+        claim_states = {record.pop("claim_state") for record in captured}
+        if rank_by_id != {legacy_id: "0", "phones_only": "1", "email_only": "2", "webhook_only": "3"}:
+            fail(f"Weather worker rank did not preserve configured zone order: {rank_by_id!r}")
+        if count_values != {"4"}:
+            fail(f"Weather workers did not receive the complete zone count: {count_values!r}")
+        expected_claim_state = str(data / "nws-cross-zone-delivery-claims.json")
+        if claim_states != {expected_claim_state} or not Path(expected_claim_state).is_file():
+            fail(f"Weather workers did not share initialized claim state: {claim_states!r}")
         expected = [
             {
                 "id": legacy_id,
@@ -323,6 +382,11 @@ def test_weather_worker_overrides():
                 "phones": "",
                 "desktops": "desk.one",
                 "emails": "zone@example.com",
+                "quiet_enabled": "1",
+                "quiet_start": "22:15",
+                "quiet_end": "05:30",
+                "critical": "Tornado Warning\x1fExtreme Wind Warning",
+                "webhooks": "discord:discord_ops",
             },
             {
                 "id": "phones_only",
@@ -330,6 +394,35 @@ def test_weather_worker_overrides():
                 "phones": "1000",
                 "desktops": "",
                 "emails": "",
+                "quiet_enabled": "0",
+                "quiet_start": "21:00",
+                "quiet_end": "06:00",
+                "critical": "",
+                "webhooks": "discord:discord_ops,generic:generic_archive",
+            },
+            {
+                "id": "email_only",
+                "zone": "TXC495",
+                "phones": "",
+                "desktops": "",
+                "emails": "remote@example.net",
+                "quiet_enabled": "0",
+                "quiet_start": "21:00",
+                "quiet_end": "06:00",
+                "critical": "",
+                "webhooks": "",
+            },
+            {
+                "id": "webhook_only",
+                "zone": "TXC497",
+                "phones": "",
+                "desktops": "",
+                "emails": "",
+                "quiet_enabled": "0",
+                "quiet_start": "21:00",
+                "quiet_end": "06:00",
+                "critical": "",
+                "webhooks": "generic:generic_archive",
             },
         ]
         captured.sort(key=lambda item: item["id"])
@@ -395,6 +488,94 @@ def test_weather_worker_overrides():
                 canonical_emitted.setdefault(key.decode("utf-8"), []).append(value.decode("utf-8"))
         if canonical_emitted.get("NWS_ZONE_EMAIL_RECIPIENT") != ["zone@example.com"]:
             fail("An explicit canonical system list did not disable legacy service fallback")
+
+        external_only_configs = [
+            (
+                "email",
+                {
+                    "enabled": "1",
+                    "nws_api_base_url": "https://api.weather.gov",
+                    "nws_zone": "TXC491",
+                    "alert_recipients": [],
+                    "desktop_clients": [],
+                    "system_notification_emails": "",
+                    "nws_zones": [{
+                        "id": "email_only",
+                        "name": "Email Only",
+                        "zone": "TXC491",
+                        "extensions": [],
+                        "desktop_clients": [],
+                        "email_recipients": ["weather@example.com"],
+                        "discord_webhook_ids": [],
+                        "generic_webhook_ids": [],
+                    }],
+                },
+            ),
+            (
+                "webhook",
+                {
+                    "enabled": "1",
+                    "nws_api_base_url": "https://api.weather.gov",
+                    "nws_zone": "TXC491",
+                    "alert_recipients": [],
+                    "desktop_clients": [],
+                    "system_notification_emails": "",
+                    "generic_webhooks": [{
+                        "id": "generic_archive",
+                        "name": "Archive",
+                        "enabled": "1",
+                        "url": "https://hooks.example.com/weather",
+                    }],
+                    "nws_zones": [{
+                        "id": "webhook_only",
+                        "name": "Webhook Only",
+                        "zone": "TXC491",
+                        "extensions": [],
+                        "desktop_clients": [],
+                        "email_recipients": [],
+                        "discord_webhook_ids": [],
+                        "generic_webhook_ids": ["generic_archive"],
+                    }],
+                },
+            ),
+        ]
+        clean_loader_environment = os.environ.copy()
+        for key in (
+            "NWS_RECIPIENTS_OVERRIDE",
+            "NWS_DESKTOP_CLIENTS_OVERRIDE",
+            "NWS_EMAIL_RECIPIENTS_OVERRIDE",
+            "NWS_WEBHOOK_DESTINATION_KEYS_OVERRIDE",
+        ):
+            clean_loader_environment.pop(key, None)
+        for label, external_config in external_only_configs:
+            config_path.write_text(json.dumps(external_config), encoding="utf-8")
+            external_result = subprocess.run(
+                [sys.executable, str(CONFIG_LOADER), str(config_path)],
+                env=clean_loader_environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=10,
+            )
+            if external_result.returncode != 0:
+                fail(
+                    f"The central config loader rejected a valid {label}-only Weather zone: "
+                    + external_result.stderr.decode("utf-8", "replace")
+                )
+
+        invalid_external_config = external_only_configs[1][1]
+        invalid_external_config["generic_webhooks"][0]["enabled"] = "0"
+        config_path.write_text(json.dumps(invalid_external_config), encoding="utf-8")
+        invalid_external_result = subprocess.run(
+            [sys.executable, str(CONFIG_LOADER), str(config_path)],
+            env=clean_loader_environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        if invalid_external_result.returncode == 0 or b"no configured delivery destination" not in invalid_external_result.stderr:
+            fail("The config loader accepted a Weather zone whose only selected webhook is disabled")
 
 
 def test_email_deduplication():

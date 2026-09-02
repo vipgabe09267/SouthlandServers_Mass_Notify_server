@@ -16,6 +16,14 @@ if SLS_MASS_NOTIFY_MODULE='othermodule' \
 fi
 source "${ROOT_DIR}/tools/uninstall_release.sh"
 
+run_fwconsole_body="$(declare -f run_fwconsole)"
+close_line="$(grep -nFm1 'close_inherited_maintenance_lock_fds' <<<"$run_fwconsole_body" | cut -d: -f1)"
+php_line="$(grep -nFm1 'php -d pcre.jit=0' <<<"$run_fwconsole_body" | cut -d: -f1)"
+[ -n "$close_line" ] && [ -n "$php_line" ] && [ "$close_line" -lt "$php_line" ] || {
+  printf 'Uninstaller fwconsole children can inherit the maintenance lock descriptor.\n' >&2
+  exit 1
+}
+
 cmp -s \
   "${ROOT_DIR}/tools/uninstall_release.sh" \
   "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_uninstall.sh" || {

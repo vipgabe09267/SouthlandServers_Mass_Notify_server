@@ -181,6 +181,29 @@ class JournalPersistenceTests(unittest.TestCase):
                 api_only=True,
             )
 
+    def test_api_only_lightning_style_alert_does_not_require_desktop_presence(self):
+        config = configparser.ConfigParser(interpolation=None)
+        alert = {
+            "id": "lightning-offline-desktop",
+            "properties": {"event": "Lightning Alert", "severity": "Severe"},
+        }
+        with mock.patch.object(SENDER_MODULE, "build_xml", return_value="<xml />"), mock.patch.object(
+            SENDER_MODULE, "append_sipnotify_event"
+        ) as append_event, mock.patch.object(SENDER_MODULE, "AmiClient") as ami_client:
+            SENDER_MODULE.push_alert(
+                config,
+                alert,
+                api_only=True,
+                desktop_targets=["sleeping_desktop"],
+            )
+
+        ami_client.assert_not_called()
+        append_event.assert_called_once()
+        self.assertEqual(
+            append_event.call_args.args[1]["desktop_recipients"],
+            ["sleeping_desktop"],
+        )
+
     def test_targeted_announcement_is_published_once_before_phone_discovery(self):
         config = configparser.ConfigParser(interpolation=None)
         config.read_dict({

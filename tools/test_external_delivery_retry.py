@@ -118,6 +118,24 @@ with tempfile.TemporaryDirectory(prefix="sls-external-retry-") as directory:
     if webhook_calls[-1] != {"discord:secondary"}:
         fail(f"an already accepted webhook destination was replayed: {webhook_calls[-1]}")
 
+    selected_key = MODULE.queue_external_delivery(
+        state_path,
+        config,
+        "Heat Advisory|zone-specific-destination",
+        "Heat Advisory",
+        "Take heat precautions.",
+        source="nws",
+        event_id="provider-alert-zone-specific",
+        webhook_destination_keys=["discord:secondary"],
+        now=1002,
+    )
+    selected_state = json.loads(state_path.read_text(encoding="utf-8"))
+    selected_record = selected_state["deliveries"][selected_key]
+    if selected_record.get("webhook_pending") != ["discord:secondary"]:
+        fail("zone-specific Weather delivery queued a webhook from another zone")
+    if selected_record.get("email_pending"):
+        fail("zone-specific webhook-only delivery invented an email route")
+
     before = state_path.read_bytes()
     state_path.write_text("{corrupt\n", encoding="utf-8")
     corrupt = state_path.read_bytes()

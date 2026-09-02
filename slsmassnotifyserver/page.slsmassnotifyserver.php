@@ -59,6 +59,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action
 			'phones_all' => !empty($_POST['announcement_all_phones']),
 			'desktop_all' => !empty($_POST['announcement_all_desktops']),
 			'desktop_clients' => $_POST['announcement_desktop_clients'] ?? [],
+			'webhook_ids' => $_POST['announcement_webhooks'] ?? [],
 			'style' => !empty($_POST['announcement_colored']) ? 'colored' : 'standard',
 			'image' => !empty($_POST['announcement_colored']),
 			'title' => $_POST['announcement_title'] ?? 'Announcement',

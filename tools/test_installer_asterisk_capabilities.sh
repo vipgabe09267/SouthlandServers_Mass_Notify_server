@@ -20,6 +20,49 @@ if SLS_MASS_NOTIFY_MODULE='othermodule' \
 fi
 source "${ROOT_DIR}/tools/install_release.sh"
 
+# Prefer the documented action-first --autoenable syntax. Retry the legacy
+# global-option ordering only when fwconsole explicitly reports a syntax error;
+# a real module installation failure must not be hidden by a second attempt.
+(
+  fixture="$(mktemp -d /tmp/sls-fwconsole-autoenable.XXXXXX)"
+  trap 'find "$fixture" -depth -delete' EXIT
+  LOG_FILE="$fixture/install.log"
+  calls="$fixture/calls"
+  mock_mode="success"
+  fwconsole() {
+    printf '%s\n' "$*" >>"$calls"
+    call_count="$(wc -l <"$calls")"
+    if [ "$mock_mode" = "syntax" ] && [ "$call_count" -eq 1 ]; then
+      printf '%s\n' 'The --autoenable option does not exist.'
+      return 2
+    fi
+    if [ "$mock_mode" = "failure" ]; then
+      printf '%s\n' 'Module installation failed.'
+      return 1
+    fi
+    return 0
+  }
+
+  install_module_with_autoenable
+  [ "$(sed -n '1p' "$calls")" = "ma install --autoenable slsmassnotifyserver" ]
+  [ "$(wc -l <"$calls")" -eq 1 ]
+
+  : >"$calls"
+  mock_mode="syntax"
+  install_module_with_autoenable
+  [ "$(sed -n '1p' "$calls")" = "ma install --autoenable slsmassnotifyserver" ]
+  [ "$(sed -n '2p' "$calls")" = "ma --autoenable install slsmassnotifyserver" ]
+  [ "$(wc -l <"$calls")" -eq 2 ]
+
+  : >"$calls"
+  mock_mode="failure"
+  if install_module_with_autoenable; then
+    printf 'A genuine FreePBX module failure incorrectly entered the syntax fallback.\n' >&2
+    exit 1
+  fi
+  [ "$(wc -l <"$calls")" -eq 1 ]
+)
+
 LOG_FILE="/dev/null"
 mock_capability_type="function"
 mock_capability_name="PJSIP_HEADER"
@@ -109,6 +152,27 @@ log() {
   [ -n "$INSTALL_MAINTENANCE_LOCK_FD" ]
   if flock -n "$SLS_MASS_NOTIFY_MAINTENANCE_LOCK" -c true; then
     printf 'Installer maintenance lock did not exclude a competing process.\n' >&2
+    exit 1
+  fi
+)
+# Commands run inside the transaction must not pass the maintenance descriptor
+# to grandchildren such as FreePBX's asynchronous GPG key refresher. The parent
+# installer must continue holding the same lock while that command runs.
+(
+  mock_lock_dir="$(mktemp -d /tmp/sls-installer-child-lock.XXXXXX)"
+  trap 'find "$mock_lock_dir" -depth -delete' EXIT
+  SLS_MASS_NOTIFY_MAINTENANCE_LOCK="$mock_lock_dir/maintenance.lock"
+  child_lock_fd=""
+  exec {child_lock_fd}>"$SLS_MASS_NOTIFY_MAINTENANCE_LOCK"
+  flock -n "$child_lock_fd"
+  run_without_install_maintenance_lock bash -c '
+    target="$1"
+    for descriptor_path in "/proc/${BASHPID}/fd/"*; do
+      [ "$(readlink -f -- "$descriptor_path" 2>/dev/null || true)" != "$target" ] || exit 1
+    done
+  ' _ "$SLS_MASS_NOTIFY_MAINTENANCE_LOCK"
+  if flock -n "$SLS_MASS_NOTIFY_MAINTENANCE_LOCK" -c true; then
+    printf 'Child lock cleanup also released the parent installer lock.\n' >&2
     exit 1
   fi
 )
@@ -701,15 +765,12 @@ fi
   fi
 )
 
-# Mixed-vendor registrations require contact-URI routing. Installing anyway on
-# endpoint-fanout-only Asterisk would knowingly activate broken visual routing.
+# Mixed-vendor registrations prefer contact-URI routing, but endpoint-fanout
+# Asterisk remains supported through the safe generic XML runtime fallback.
 mixed_endpoint_visual_route_supported 0 endpoint_fanout
 mixed_endpoint_visual_route_supported 0 contact_uri
 mixed_endpoint_visual_route_supported 1 contact_uri
-if mixed_endpoint_visual_route_supported 1 endpoint_fanout; then
-  printf 'Mixed-vendor endpoint fan-out was incorrectly accepted without contact-URI routing.\n' >&2
-  exit 1
-fi
+mixed_endpoint_visual_route_supported 1 endpoint_fanout
 
 # Regression guard: AMI discovery is unconditional and no longer branches on
 # the display-only "Objects found" footer emitted by selected Asterisk builds.
@@ -817,7 +878,7 @@ grep -Fq 'Data: ${page_hold_seconds}' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_m
 grep -Fq 'print rounded + 2' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_test.sh"
 grep -Fq 'audio_page_hold_seconds()' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_nws_poll.sh"
 grep -Fq 'Data: ${page_hold_seconds}' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_nws_poll.sh"
-grep -Fq 'print rounded + 2' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_nws_poll.sh"
+grep -Fq 'print rounded + 7' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_nws_poll.sh"
 grep -Fq 'def audio_page_hold_seconds(sound):' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py"
 grep -Fq 'Data: {page_hold_seconds}' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py"
 grep -Fq 'return math.ceil(duration) + 2' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py"

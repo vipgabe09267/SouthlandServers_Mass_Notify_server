@@ -85,7 +85,110 @@ main_body="$(declare -f main)"
 lock_line="$(grep -nFm1 'acquire_settings_coordination' <<<"$main_body" | cut -d: -f1)"
 snapshot_line="$(grep -nFm1 'snapshot_config' <<<"$main_body" | cut -d: -f1)"
 [ -n "$lock_line" ] && [ -n "$snapshot_line" ] && [ "$lock_line" -lt "$snapshot_line" ]
+activation_line="$(grep -nFm1 'install_module_with_autoenable' <<<"$main_body" | cut -d: -f1)"
+sync_line="$(grep -nFm1 'sync_module_version' <<<"$main_body" | cut -d: -f1)"
+runtime_line="$(grep -nFm1 'ensure_runtime_installed' <<<"$main_body" | cut -d: -f1)"
+mapfile -t repair_lines < <(grep -nF 'repair_runtime_permissions' <<<"$main_body" | cut -d: -f1)
+pre_activation_repair=0
+post_sync_repair=0
+for repair_line in "${repair_lines[@]}"; do
+  if [ "$repair_line" -lt "$activation_line" ]; then
+    pre_activation_repair=1
+  fi
+  if [ "$repair_line" -gt "$sync_line" ] && [ "$repair_line" -lt "$runtime_line" ]; then
+    post_sync_repair=1
+  fi
+done
+[ "$pre_activation_repair" -eq 1 ] || {
+  printf 'Installer does not normalize runtime permissions before the FreePBX module hook.\n' >&2
+  exit 1
+}
+[ "$post_sync_repair" -eq 1 ] || {
+  printf 'Installer does not normalize runtime permissions after version sync and before runtime refresh.\n' >&2
+  exit 1
+}
+while IFS=: read -r chown_line _; do
+  next_command="$(tail -n +$((chown_line + 1)) <<<"$main_body" | sed -n '/[^[:space:]]/{s/^[[:space:]]*//;p;q;}')"
+  case "$next_command" in
+    repair_runtime_permissions*) ;;
+    *)
+      printf 'Installer fwconsole chown is not followed immediately by runtime permission repair.\n' >&2
+      exit 1
+      ;;
+  esac
+done < <(grep -nE '^[[:space:]]*(/usr/sbin/)?fwconsole chown' <<<"$main_body")
+
+maintenance_script="${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_maintenance.sh"
+while IFS=: read -r chown_line _; do
+  next_command="$(tail -n +$((chown_line + 1)) "$maintenance_script" | sed -n '/[^[:space:]]/{s/^[[:space:]]*//;p;q;}')"
+  case "$next_command" in
+    repair_runtime_permissions*) ;;
+    *)
+      printf 'Maintenance fwconsole chown is not followed immediately by runtime permission repair.\n' >&2
+      exit 1
+      ;;
+  esac
+done < <(grep -nE '^[[:space:]]*(/usr/sbin/)?fwconsole chown' "$maintenance_script")
+maintenance_repair_line="$(grep -nFm1 'repair_runtime_permissions || repair_ok=0' "$maintenance_script" | cut -d: -f1)"
+maintenance_install_line="$(grep -nFm1 'new $class' "$maintenance_script" | cut -d: -f1)"
+[ -n "$maintenance_repair_line" ] && [ -n "$maintenance_install_line" ] \
+  && [ "$maintenance_repair_line" -lt "$maintenance_install_line" ] || {
+    printf 'Maintenance does not normalize an existing Piper runtime before module repair.\n' >&2
+    exit 1
+  }
+
+piper_installer="${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_install_piper_voices.sh"
+grep -Fq -- '--repair-permissions-only' "$piper_installer"
+grep -Fq 'if [ "$PIPER_ARTIFACTS_CHANGED" -eq 1 ]' "$piper_installer"
+grep -Fq "[ -L /var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper ]" "$piper_installer"
+grep -Fq 'dir_fd=bin_fd, follow_symlinks=False' "$piper_installer"
+grep -Fq 'os.open(component, directory_flags, dir_fd=parent_fd)' "$piper_installer"
+if grep -Eq 'chown root:root "\$compatibility"|chmod 0755 "\$compatibility"' "$piper_installer"; then
+  printf 'Piper compatibility repair reverted to path-based privileged metadata changes.\n' >&2
+  exit 1
+fi
+if grep -Fq 'rm -rf --one-file-system "$compatibility"' "$piper_installer"; then
+  printf 'Piper permission repair still recursively deletes its compatibility tree.\n' >&2
+  exit 1
+fi
+if grep -Fq 'chown -R root:root "$PIPER_DIR"' "$piper_installer" \
+  || grep -Fq 'find "$PIPER_DIR" -type d' "$piper_installer"; then
+  printf 'Piper executable permission repair reverted to recursive pathname operations.\n' >&2
+  exit 1
+fi
+grep -Fq 'PIPER_PERMISSION_ROOT="$PIPER_DIR"' "$piper_installer"
+grep -Fq 'SLS_PIPER_VOICE_SOURCE="$tmp"' "$piper_installer"
+if grep -Fq 'chown -R asterisk:asterisk "$VOICE_DIR"' "$piper_installer" \
+  || grep -Fq 'find "$VOICE_DIR" -type f' "$piper_installer"; then
+  printf 'Piper voice permission repair reverted to recursive pathname operations.\n' >&2
+  exit 1
+fi
+grep -Fq 'PIPER_VOICE_PERMISSION_ROOT="$VOICE_DIR"' "$piper_installer"
+if grep -Fq 'python3 --version >> "$LOG_FILE"' "$piper_installer"; then
+  printf 'No-op Piper verification still appends Python version noise.\n' >&2
+  exit 1
+fi
 grep -Fq "getattr(os, 'O_NOFOLLOW', 0)" "${ROOT_DIR}/slsmassnotifyserver/Slsmassnotifyserver.class.php"
+if grep -Fq "'/bin/chown -R root:root ' . escapeshellarg(self::RUNTIME_DIR)" "${ROOT_DIR}/slsmassnotifyserver/Slsmassnotifyserver.class.php"; then
+  printf 'Module executable-runtime repair reverted to recursive pathname ownership changes.\n' >&2
+  exit 1
+fi
 grep -Fq 'getattr(os, "O_NOFOLLOW", 0)' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_maintenance.sh"
+grep -Fq 'root_fd = os.open(root, flags)' "${ROOT_DIR}/tools/install_release.sh"
+grep -Fq 'root_fd = os.open(root, flags)' "$maintenance_script"
+grep -Fq 'runtime entry changed type during repair' "${ROOT_DIR}/tools/install_release.sh"
+grep -Fq 'runtime entry changed type during repair' "$maintenance_script"
+grep -Fq 'child_relative == "sls_mass_notify_schedule_worker.php"' "${ROOT_DIR}/tools/install_release.sh"
+grep -Fq 'child_relative == "sls_mass_notify_schedule_worker.php"' "$maintenance_script"
+grep -Fq 'if temporary and bin_fd >= 0:' "$piper_installer"
+grep -Fq 'mktemp /usr/local/bin/.sls-piper.XXXXXX' "$piper_installer"
+grep -Fq 'close_inherited_maintenance_lock' "${ROOT_DIR}/slsmassnotifyserver/bin/sign_sls_mass_notify_local_sig.sh"
+grep -Fq 'run_without_maintenance_lock /usr/bin/timeout 300 /usr/bin/php' "$maintenance_script"
+grep -Fq 'run_without_install_maintenance_lock /usr/bin/timeout --signal=TERM 360' "${ROOT_DIR}/tools/install_release.sh"
+if grep -Fq 'chown -R root:root /usr/local/bin/sls_mass_notify' "${ROOT_DIR}/tools/install_release.sh" \
+  || grep -Fq 'chown -R root:root "$RUNTIME_DIR"' "$maintenance_script"; then
+  printf 'Runtime permission repair reverted to a recursive path-following chown.\n' >&2
+  exit 1
+fi
 
 printf 'Installer protected-config regressions passed.\n'

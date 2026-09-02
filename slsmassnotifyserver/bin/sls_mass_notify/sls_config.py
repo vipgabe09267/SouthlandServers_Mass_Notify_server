@@ -3,6 +3,7 @@
 
 import json
 import ipaddress
+import os
 import re
 import sys
 from pathlib import Path
@@ -181,9 +182,11 @@ def main():
     }
     zone_desktop_recipients = []
     zone_email_recipients = []
+    matching_zone_groups = []
     for group in data.get("nws_zones") or []:
         if not isinstance(group, dict) or text(group.get("zone")).upper() != zone:
             continue
+        matching_zone_groups.append(group)
         for username in group.get("desktop_clients") or []:
             username = text(username).lower()
             if (
@@ -195,7 +198,7 @@ def main():
         for recipient in emails(" ".join(map(str, group.get("email_recipients") or []))).split():
             if recipient.lower() not in {value.lower() for value in zone_email_recipients}:
                 zone_email_recipients.append(recipient)
-    # Pre-0.1.0 configurations used mail_to for both live alerts and faults.
+    # Pre-0.1.1-beta configurations used mail_to for both live alerts and faults.
     # Preserve that live route only until the canonical system-recipient key is
     # written; new configurations use the selected zone list exclusively.
     if "system_notification_emails" not in data:
@@ -204,8 +207,74 @@ def main():
                 zone_email_recipients.append(recipient)
             if len(zone_email_recipients) >= 50:
                 break
-    if enabled(data.get("enabled")) == "1" and (not zone or (not recipients and not zone_desktop_recipients)):
-        print("NWS is enabled but its zone has no phone or desktop recipients", file=sys.stderr)
+
+    enabled_webhook_ids = {"discord": set(), "generic": set()}
+    enabled_webhook_kinds = set()
+    for kind, config_key in (("discord", "discord_webhooks"), ("generic", "generic_webhooks")):
+        destinations = data.get(config_key)
+        if not isinstance(destinations, list):
+            continue
+        for destination in destinations[:10]:
+            if not isinstance(destination, dict) or enabled(destination.get("enabled", "1")) != "1":
+                continue
+            candidate = text(destination.get("url") or destination.get("webhook_url"))
+            parsed = urlparse(candidate)
+            try:
+                valid_port = parsed.port in {None, 443}
+            except ValueError:
+                valid_port = False
+            valid_url = (
+                parsed.scheme == "https"
+                and bool(parsed.hostname)
+                and not parsed.username
+                and not parsed.password
+                and not parsed.fragment
+                and valid_port
+            )
+            if kind == "discord":
+                valid_url = bool(re.fullmatch(
+                    r"https://(?:discord|discordapp|canary\.discord|ptb\.discord)\.com/api/webhooks/[0-9]+/[A-Za-z0-9._~-]+",
+                    candidate,
+                ))
+            if not valid_url:
+                continue
+            enabled_webhook_kinds.add(kind)
+            identifier = re.sub(r"[^A-Za-z0-9_-]", "", text(destination.get("id")))[:64]
+            if identifier:
+                enabled_webhook_ids[kind].add(identifier)
+    if not (data.get("discord_webhooks") or []) and legacy_discord_url(data):
+        enabled_webhook_kinds.add("discord")
+        enabled_webhook_ids["discord"].add("discord_legacy")
+
+    zone_has_webhook_destination = False
+    for group in matching_zone_groups:
+        if "discord_webhook_ids" not in group and "generic_webhook_ids" not in group:
+            zone_has_webhook_destination = bool(enabled_webhook_kinds)
+        else:
+            zone_has_webhook_destination = any(
+                re.sub(r"[^A-Za-z0-9_-]", "", text(identifier))[:64] in enabled_webhook_ids[kind]
+                for kind, key in (("discord", "discord_webhook_ids"), ("generic", "generic_webhook_ids"))
+                for identifier in (group.get(key) if isinstance(group.get(key), list) else [])
+            )
+        if zone_has_webhook_destination:
+            break
+    worker_has_destination_override = any(text(os.environ.get(key)) for key in (
+        "NWS_RECIPIENTS_OVERRIDE",
+        "NWS_DESKTOP_CLIENTS_OVERRIDE",
+        "NWS_EMAIL_RECIPIENTS_OVERRIDE",
+        "NWS_WEBHOOK_DESTINATION_KEYS_OVERRIDE",
+    ))
+    if enabled(data.get("enabled")) == "1" and (
+        not zone
+        or not (
+            recipients
+            or zone_desktop_recipients
+            or zone_email_recipients
+            or zone_has_webhook_destination
+            or worker_has_destination_override
+        )
+    ):
+        print("NWS is enabled but its zone has no configured delivery destination", file=sys.stderr)
         return 1
 
     ami = data.get("ami") if isinstance(data.get("ami"), dict) else {}

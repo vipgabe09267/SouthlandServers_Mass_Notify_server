@@ -58,6 +58,17 @@ CURRENT_GROUP_ID = ""
 CURRENT_GROUP_NAME = ""
 CURRENT_GROUP_INDEX = 0
 CURRENT_GROUP_LEGACY = False
+NWS_USER_AGENT = "SouthlandServers-Mass-Notifications-Server/0.1.1-beta (https://southlandservers.xyz)"
+NWS_FORECAST_CACHE_SECONDS = 10 * 60
+NWS_FORECAST_STALE_SECONDS = 30 * 60
+NWS_POINT_CACHE_SECONDS = 24 * 60 * 60
+NWS_FORECAST_TRANSITION_LOOKAHEAD_SECONDS = 6 * 60 * 60
+NWS_THUNDER_PROBABILITY_THRESHOLD = 15
+STRIKE_FILTERS = {
+    "cloud_to_ground": "cg",
+    "cloud_to_cloud": "ic",
+    "both": "all",
+}
 
 
 class _RejectRedirects(urllib.request.HTTPRedirectHandler):
@@ -109,6 +120,9 @@ def _atomic_state_update(path, patch):
         if not stat.S_ISREG(os.fstat(lock_descriptor).st_mode):
             raise RuntimeError("Xweather state lock is not a regular file")
         os.fchmod(lock_descriptor, 0o640)
+        if os.geteuid() == 0:
+            account = pwd.getpwnam("asterisk")
+            os.fchown(lock_descriptor, account.pw_uid, account.pw_gid)
         fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
         data = _read_json_file(path)
         data.update(patch)
@@ -116,6 +130,9 @@ def _atomic_state_update(path, patch):
             prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
         )
         os.fchmod(temporary_descriptor, 0o640)
+        if os.geteuid() == 0:
+            account = pwd.getpwnam("asterisk")
+            os.fchown(temporary_descriptor, account.pw_uid, account.pw_gid)
         with os.fdopen(temporary_descriptor, "w", encoding="utf-8") as handle:
             temporary_descriptor = -1
             json.dump(data, handle, indent=2, sort_keys=True)
@@ -232,7 +249,7 @@ def load_config():
     if not isinstance(config, dict):
         raise ValueError("central configuration is not an object")
     xweather = config.get("xweather") if isinstance(config.get("xweather"), dict) else {}
-    # Before 0.1.0, mail_to was shared by live alerts and fault notices. Keep
+    # Before 0.1.1-beta, mail_to was shared by live alerts and fault notices. Keep
     # those live routes during an upgrade only when the new canonical system
     # recipient key is absent. Newly saved configurations use each area's
     # email_recipients list exclusively.
@@ -272,6 +289,7 @@ def configured_groups(xweather, include_disabled=False):
             "adaptive_nws_zone_id": xweather.get("adaptive_nws_zone_id", ""),
             "location": xweather.get("location", ""),
             "radius_miles": xweather.get("radius_miles", 25),
+            "strike_type": xweather.get("strike_type", "cloud_to_ground"),
             "extensions": xweather.get("recipients", []),
             "desktop_clients": [],
             "email_recipients": xweather.get("email_recipients", []),
@@ -349,8 +367,8 @@ def fetch_payload(xweather):
         "p": xweather["location"],
         "format": "json",
         "radius": f"{xweather['radius_miles']}miles",
-        "filter": "cg",
-        # The worker only needs the closest current CG strike to determine
+        "filter": STRIKE_FILTERS.get(str(xweather.get("strike_type") or "cloud_to_ground"), "cg"),
+        # The worker only needs the closest current matching strike to determine
         # cluster state and announce the measured nearest distance.
         "limit": "1",
         "fields": "id,ob.timestamp,ob.pulse.type,relativeTo.distanceMI",
@@ -358,7 +376,7 @@ def fetch_payload(xweather):
         "client_secret": xweather["client_secret"],
     }
     url = "https://data.api.xweather.com/lightning/closest?" + urllib.parse.urlencode(params)
-    request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "SouthlandServers-Mass-Notifications-Server/0.1.0"})
+    request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "SouthlandServers-Mass-Notifications-Server/0.1.1-beta"})
     last_error = None
     for attempt in range(3):
         try:
@@ -383,7 +401,7 @@ def fetch_payload(xweather):
     raise RuntimeError(f"request failed after retries: {last_error}")
 
 
-def normalize_records(payload):
+def normalize_records(payload, strike_type="cloud_to_ground"):
     if not isinstance(payload, dict) or payload.get("success") is not True:
         raise ValueError("API response did not report success")
     response = payload.get("response")
@@ -409,7 +427,15 @@ def normalize_records(payload):
             distance_miles = None
         if not record_id or timestamp <= 0 or timestamp < now - 600 or timestamp > now + 120:
             continue
-        normalized.append({"id": record_id, "timestamp": timestamp, "type": str(pulse.get("type") or "").lower(), "distance_miles": distance_miles})
+        pulse_type = str(pulse.get("type") or "").strip().lower()
+        allowed_types = {
+            "cloud_to_ground": {"cg"},
+            "cloud_to_cloud": {"ic"},
+            "both": {"cg", "ic"},
+        }.get(str(strike_type or "cloud_to_ground"), {"cg"})
+        if pulse_type not in allowed_types:
+            continue
+        normalized.append({"id": record_id, "timestamp": timestamp, "type": pulse_type, "distance_miles": distance_miles})
     return normalized
 
 
@@ -479,8 +505,249 @@ def read_json_object(path):
         return {}
 
 
-def adaptive_storm_gate(state, now, grace_minutes, selected_zone_id):
-    """Use fresh per-zone NWS summaries to decide whether storm mode is active."""
+def _nws_json(url, maximum_bytes=5 * 1024 * 1024):
+    parsed = urllib.parse.urlsplit(str(url or ""))
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").lower() != "api.weather.gov"
+        or parsed.port not in (None, 443)
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        raise RuntimeError("untrusted Weather.gov response URL")
+    request = urllib.request.Request(
+        urllib.parse.urlunsplit(parsed),
+        headers={"Accept": "application/geo+json", "User-Agent": NWS_USER_AGENT},
+    )
+    last_error = None
+    for attempt in range(2):
+        try:
+            with XWEATHER_OPENER.open(request, timeout=15) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Weather.gov HTTP {response.status}")
+                payload = response.read(maximum_bytes + 1)
+                if len(payload) > maximum_bytes:
+                    raise RuntimeError("Weather.gov response is too large")
+                decoded = json.loads(payload.decode("utf-8"))
+                if not isinstance(decoded, dict):
+                    raise RuntimeError("Weather.gov response is not an object")
+                return decoded
+        except Exception as exc:
+            last_error = exc
+            if attempt == 0:
+                time.sleep(1)
+    raise RuntimeError(f"Weather.gov request failed: {last_error}")
+
+
+def _coordinate_pair(value):
+    match = re.fullmatch(
+        r"\s*([+-]?(?:\d+(?:\.\d+)?))\s*,\s*([+-]?(?:\d+(?:\.\d+)?))\s*",
+        str(value or ""),
+    )
+    if not match:
+        return None
+    latitude, longitude = map(float, match.groups())
+    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+        return None
+    return latitude, longitude
+
+
+def _polygon_centroid(geometry):
+    if not isinstance(geometry, dict):
+        return None
+    geometry_type = str(geometry.get("type") or "")
+    coordinates = geometry.get("coordinates")
+    rings = []
+    if geometry_type == "Polygon" and isinstance(coordinates, list):
+        rings = coordinates[:1]
+    elif geometry_type == "MultiPolygon" and isinstance(coordinates, list):
+        rings = [polygon[0] for polygon in coordinates if isinstance(polygon, list) and polygon]
+    best = None
+    for ring in rings:
+        if not isinstance(ring, list) or len(ring) < 4:
+            continue
+        points = []
+        for point in ring:
+            if not isinstance(point, list) or len(point) < 2:
+                continue
+            try:
+                longitude, latitude = float(point[0]), float(point[1])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(latitude) and math.isfinite(longitude):
+                points.append((longitude, latitude))
+        if len(points) < 4:
+            continue
+        area_twice = 0.0
+        centroid_x = 0.0
+        centroid_y = 0.0
+        for left, right in zip(points, points[1:] + points[:1]):
+            cross = left[0] * right[1] - right[0] * left[1]
+            area_twice += cross
+            centroid_x += (left[0] + right[0]) * cross
+            centroid_y += (left[1] + right[1]) * cross
+        if abs(area_twice) < 1e-9:
+            continue
+        candidate = (centroid_y / (3.0 * area_twice), centroid_x / (3.0 * area_twice))
+        if -90 <= candidate[0] <= 90 and -180 <= candidate[1] <= 180:
+            size = abs(area_twice)
+            if best is None or size > best[0]:
+                best = (size, candidate)
+    return best[1] if best else None
+
+
+def _linked_zone_code(config, selected_zone_id):
+    for group in (config.get("nws_zones") or [])[:5]:
+        if not isinstance(group, dict) or str(group.get("id") or "") != str(selected_zone_id or ""):
+            continue
+        zone = str(group.get("zone") or "").strip().upper()
+        if re.fullmatch(r"[A-Z]{2}[CZ][0-9]{3}", zone):
+            return zone
+    return ""
+
+
+def _valid_time_bounds(value):
+    match = re.fullmatch(r"([^/]+)/P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?", str(value or ""))
+    if not match:
+        return None
+    try:
+        start = datetime.fromisoformat(match.group(1).replace("Z", "+00:00")).timestamp()
+        duration = int(match.group(2) or 0) * 86400 + int(match.group(3) or 0) * 3600 + int(match.group(4) or 0) * 60 + float(match.group(5) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if duration <= 0:
+        return None
+    return start, start + duration
+
+
+def _valid_time_overlaps(value, window_start, window_end):
+    bounds = _valid_time_bounds(value)
+    return bool(bounds and bounds[0] < window_end and bounds[1] > window_start)
+
+
+def _forecast_indicates_thunder(payload, now, horizon_seconds):
+    properties = payload.get("properties") if isinstance(payload, dict) else None
+    if not isinstance(properties, dict):
+        raise RuntimeError("Weather.gov grid forecast schema is invalid")
+    lookahead_end = now + max(3600, min(NWS_FORECAST_TRANSITION_LOOKAHEAD_SECONDS, int(horizon_seconds)))
+    maximum_probability = 0.0
+    transition_times = []
+    probability = properties.get("probabilityOfThunder")
+    for period in (probability.get("values") if isinstance(probability, dict) else []) or []:
+        if not isinstance(period, dict):
+            continue
+        bounds = _valid_time_bounds(period.get("validTime"))
+        if not bounds:
+            continue
+        try:
+            value = float(period.get("value") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value):
+            continue
+        if bounds[0] <= now < bounds[1]:
+            maximum_probability = max(maximum_probability, value)
+        if value >= NWS_THUNDER_PROBABILITY_THRESHOLD:
+            if bounds[0] <= now < bounds[1]:
+                transition_times.append(bounds[1])
+            elif now < bounds[0] <= lookahead_end:
+                transition_times.append(bounds[0])
+    structured_thunder = False
+    weather = properties.get("weather")
+    for period in (weather.get("values") if isinstance(weather, dict) else []) or []:
+        if not isinstance(period, dict):
+            continue
+        bounds = _valid_time_bounds(period.get("validTime"))
+        if not bounds:
+            continue
+        values = period.get("value") if isinstance(period.get("value"), list) else []
+        period_has_thunder = any(
+            str(item.get("weather") or "").lower() == "thunderstorms"
+            for item in values
+            if isinstance(item, dict)
+        )
+        if not period_has_thunder:
+            continue
+        if bounds[0] <= now < bounds[1]:
+            structured_thunder = True
+            transition_times.append(bounds[1])
+        elif now < bounds[0] <= lookahead_end:
+            transition_times.append(bounds[0])
+    active = structured_thunder or maximum_probability >= NWS_THUNDER_PROBABILITY_THRESHOLD
+    next_transition = min((value for value in transition_times if value > now), default=0)
+    reason = (
+        f"Weather.gov grid forecast indicates thunder for the current forecast period (maximum probability {maximum_probability:.0f}%)."
+        if active
+        else f"Weather.gov grid forecast does not indicate thunder for the current forecast period at or above {NWS_THUNDER_PROBABILITY_THRESHOLD}%."
+    )
+    return active, reason, round(maximum_probability, 1), int(next_transition)
+
+
+def forecast_storm_gate(config, xweather, now, grace_minutes):
+    """Evaluate a cached structured Weather.gov grid forecast for one area."""
+    cache_id = CURRENT_GROUP_ID or "default"
+    cache_path = DATA_DIR / f"nws-forecast-gate-{cache_id}.json"
+    cache = read_json_object(cache_path)
+    checked_at = int(cache.get("checked_at", 0) or 0)
+    cache_expires_at = int(cache.get("expires_at", 0) or 0)
+    if checked_at > 0 and now - checked_at < NWS_FORECAST_CACHE_SECONDS and (cache_expires_at <= 0 or now < cache_expires_at):
+        return bool(cache.get("active")), str(cache.get("message") or "Weather.gov forecast cache is current."), True
+    try:
+        forecast_fixture = os.environ.get("NWS_FORECAST_TEST_PAYLOAD", "").strip()
+        if forecast_fixture:
+            fixture_path = Path(forecast_fixture)
+            if not fixture_path.is_file() or fixture_path.stat().st_size > 5 * 1024 * 1024:
+                raise RuntimeError("Weather.gov forecast fixture is unavailable")
+            forecast = json.loads(fixture_path.read_text(encoding="utf-8"))
+            grid_url = "fixture"
+            coordinates = _coordinate_pair(xweather.get("location")) or (0.0, 0.0)
+        else:
+            coordinates = _coordinate_pair(xweather.get("location"))
+            selected_zone_id = str(xweather.get("adaptive_nws_zone_id") or "")
+            zone = _linked_zone_code(config, selected_zone_id)
+            if coordinates is None:
+                if not zone:
+                    raise RuntimeError("linked Weather.gov zone is unavailable for forecast lookup")
+                zone_type = "county" if zone[2] == "C" else "forecast"
+                zone_payload = _nws_json(f"https://api.weather.gov/zones/{zone_type}/{zone}")
+                coordinates = _polygon_centroid(zone_payload.get("geometry"))
+            if coordinates is None:
+                raise RuntimeError("Weather.gov forecast point could not be resolved")
+            latitude, longitude = coordinates
+            cached_grid_url = str(cache.get("grid_url") or "")
+            point_checked_at = int(cache.get("point_checked_at", 0) or 0)
+            if cached_grid_url and point_checked_at > 0 and now - point_checked_at < NWS_POINT_CACHE_SECONDS:
+                grid_url = cached_grid_url
+            else:
+                point = _nws_json(f"https://api.weather.gov/points/{latitude:.4f},{longitude:.4f}")
+                properties = point.get("properties") if isinstance(point, dict) else None
+                grid_url = str((properties or {}).get("forecastGridData") or "")
+                parsed_grid = urllib.parse.urlsplit(grid_url)
+                if parsed_grid.scheme != "https" or (parsed_grid.hostname or "").lower() != "api.weather.gov":
+                    raise RuntimeError("Weather.gov did not provide a trusted grid forecast URL")
+                cache["point_checked_at"] = now
+            forecast = _nws_json(grid_url)
+        active, message, probability, next_transition = _forecast_indicates_thunder(
+            forecast,
+            now,
+            NWS_FORECAST_TRANSITION_LOOKAHEAD_SECONDS,
+        )
+        expires_at = now + NWS_FORECAST_CACHE_SECONDS
+        if next_transition > now:
+            expires_at = min(expires_at, next_transition)
+        patch = {"checked_at": now, "expires_at": expires_at, "next_transition_at": next_transition, "point_checked_at": int(cache.get("point_checked_at", now) or now), "grid_url": grid_url, "coordinates": [round(float(coordinates[0]), 4), round(float(coordinates[1]), 4)], "active": active, "maximum_probability": probability, "message": message}
+        _atomic_state_update(cache_path, patch)
+        return active, message, True
+    except Exception as exc:
+        if checked_at > 0 and now - checked_at <= NWS_FORECAST_STALE_SECONDS:
+            return bool(cache.get("active")), "Weather.gov forecast refresh failed; the recent protected cache remains in use.", True
+        log(f"adaptive forecast check unavailable for {CURRENT_GROUP_NAME}: {exc}")
+        return False, "Adaptive standby: Weather.gov structured forecast is unavailable; no Xweather tokens used.", False
+
+
+def adaptive_storm_gate(state, now, grace_minutes, selected_zone_id, config, xweather):
+    """Use fresh alert and structured forecast data to gate paid polling."""
     active_events = []
     fresh_gates = 0
     for gate_path in DATA_DIR.glob("nws-lightning-gate-*.json"):
@@ -503,14 +770,20 @@ def adaptive_storm_gate(state, now, grace_minutes, selected_zone_id):
     if active_events:
         state["last_nws_storm_active"] = now
         return True, f"Weather.gov storm gate active: {', '.join(active_events[:3])}.", fresh_gates
+    forecast_active, forecast_message, forecast_available = forecast_storm_gate(config, xweather, now, grace_minutes)
+    if forecast_active:
+        state["last_nws_storm_active"] = now
+        return True, forecast_message, fresh_gates
     last_active = int(state.get("last_nws_storm_active", 0) or 0)
     grace_seconds = max(5, min(120, int(grace_minutes))) * 60
     if last_active > 0 and now - last_active <= grace_seconds:
         remaining = max(1, math.ceil((grace_seconds - (now - last_active)) / 60))
         return True, f"Weather.gov storm gate grace period active for about {remaining} more minute(s).", fresh_gates
+    if forecast_available:
+        return False, forecast_message + " No Xweather tokens used.", fresh_gates
     if fresh_gates == 0:
-        return False, "Adaptive standby: waiting for fresh Weather.gov zone status; no Xweather tokens used.", fresh_gates
-    return False, "Adaptive standby: no active Weather.gov thunderstorm event; no Xweather tokens used.", fresh_gates
+        return False, "Adaptive standby: waiting for fresh Weather.gov zone and forecast status; no Xweather tokens used.", fresh_gates
+    return False, "Adaptive standby: no active Weather.gov thunderstorm event and no usable structured forecast; no Xweather tokens used.", fresh_gates
 
 
 def quota_governor(state, now):
@@ -765,23 +1038,48 @@ def record_xweather_outcome(is_test, status, message):
     })
 
 
-def send_visual(recipients, desktop_clients, message, is_test=False):
+def send_visual(recipients, desktop_clients, message, is_test=False, phone_delay_seconds=0):
     # ImageScreen is reliable on the legacy Yealink T48G where a long
     # TextScreen can produce a phone-side "Layout Error". Other vendors still
     # receive the normal safe text fallback from sls_notify.py.
     title = "Lightning Test" if is_test else "Lightning Alert"
-    command = [
+    base_command = [
         "/usr/bin/python3", str(VISUAL_SCRIPT), "--announcement", message,
         "--announcement-image", "--announcement-title", title,
         "--announcement-bg-color", "#92400e",
     ]
-    if recipients:
-        command.extend(["--targets", ",".join(recipients)])
+    submitted = False
+    failures = []
+    # A desktop publication is a durable local journal write, not a live-client
+    # presence probe. Publish it first so a sleeping/disconnected laptop is not
+    # an error and connected SSE clients do not inherit the handset delay.
     if desktop_clients:
-        command.extend(["--desktop-targets", ",".join(desktop_clients)])
-    if not recipients and not desktop_clients:
+        command = [*base_command, "--api-only", "--desktop-targets", ",".join(desktop_clients), "--no-retry"]
+        try:
+            subprocess.run(command, check=True, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError) as exc:
+            failures.append(f"desktop journal publication failed: {exc}")
+        submitted = True
+    # The handset visual remains deliberately delayed until after paging audio
+    # starts. Attempt it even if desktop publication failed, keeping the two
+    # local visual channels independent.
+    if recipients:
+        try:
+            delay = max(0.0, min(float(phone_delay_seconds), 10.0))
+        except (TypeError, ValueError):
+            delay = 0.0
+        if delay:
+            time.sleep(delay)
+        command = [*base_command, "--targets", ",".join(recipients), "--no-api", "--no-retry"]
+        try:
+            subprocess.run(command, check=True, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError) as exc:
+            failures.append(f"phone SIP NOTIFY submission failed: {exc}")
+        submitted = True
+    if not submitted:
         raise RuntimeError("Lightning trigger area has no local delivery routes")
-    subprocess.run(command, check=True, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if failures:
+        raise RuntimeError("; ".join(failures))
 
 
 def send_webhooks(config, subject, message, event_name, severity, state_label, radius, alert_id, nearest_miles=None):
@@ -912,18 +1210,41 @@ def main():
         extension = re.sub(r"[^0-9]", "", str(value))
         if extension and extension not in recipients:
             recipients.append(extension)
+    enabled_desktops = {
+        str(client.get("username") or "").strip().lower()
+        for client in (config.get("desktop_clients") or [])
+        if isinstance(client, dict)
+        and str(client.get("enabled", "0")).strip().lower() in {"1", "true", "yes", "on"}
+    }
     desktop_clients = []
     for value in xweather.get("desktop_clients") or []:
         username = re.sub(r"[^A-Za-z0-9_.@-]", "", str(value))[:80]
-        if username and username not in desktop_clients:
+        if username and username.lower() in enabled_desktops and username not in desktop_clients:
             desktop_clients.append(username)
-    if not location or (not recipients and not desktop_clients) or (test_event not in {"entry", "clear"} and (not client_id or not client_secret)):
+    configured_email_values = xweather.get("email_recipients") or []
+    if not isinstance(configured_email_values, list):
+        configured_email_values = re.split(r"[\s,;]+", str(configured_email_values))
+    has_email_destination = any(valid_recipient(str(value).strip()) for value in configured_email_values)
+    has_shared_webhook_destination = any(
+        isinstance(destination, dict)
+        and str(destination.get("enabled", "1")).strip().lower() not in {"0", "false", "no", "off", ""}
+        and bool(str(destination.get("url") or destination.get("webhook_url") or "").strip())
+        for destination_type in ("discord_webhooks", "generic_webhooks")
+        for destination in (config.get(destination_type) or [])
+    )
+    has_local_destination = bool(recipients or desktop_clients)
+    has_live_destination = has_local_destination or has_email_destination or has_shared_webhook_destination
+    # Manual Lightning tests deliberately skip email/webhook delivery, so a
+    # selected external-only area has no safe local test target.
+    has_test_destination = has_local_destination if test_event in {"entry", "clear"} else has_live_destination
+    if not location or not has_test_destination or (test_event not in {"entry", "clear"} and (not client_id or not client_secret)):
         log("enabled integration is missing credentials, location, or recipients")
         return 1
     adaptive = str(xweather.get("adaptive_free_tier", "1")) not in {"0", "false", "False"}
     settings = {
         "location": location,
         "radius_miles": min(62, max(1, int(xweather.get("radius_miles", 25)))),
+        "strike_type": str(xweather.get("strike_type") or "cloud_to_ground") if str(xweather.get("strike_type") or "cloud_to_ground") in STRIKE_FILTERS else "cloud_to_ground",
         "query_interval_minutes": 5 if adaptive else min(10, max(1, int(xweather.get("query_interval_minutes", 5)))),
         "client_id": client_id,
         "client_secret": client_secret,
@@ -931,7 +1252,7 @@ def main():
     verify_only = os.environ.get("XWEATHER_VERIFY_ONLY", "0") == "1"
     if verify_only:
         try:
-            records = normalize_records(fetch_payload(settings))
+            records = normalize_records(fetch_payload(settings), settings["strike_type"])
         except Exception as exc:
             safe_error = str(exc)
             for secret in (client_id, client_secret):
@@ -940,8 +1261,9 @@ def main():
             log(f"credential validation failed: {safe_error[:240]}")
             atomic_json_update(STATUS_FILE, {"last_xweather_poll_at": datetime.now().astimezone().isoformat(), "last_xweather_poll_status": "fault", "last_xweather_poll_message": f"Xweather credential validation failed: {safe_error[:180]}"})
             return 1
-        atomic_json_update(STATUS_FILE, {"last_xweather_poll_at": datetime.now().astimezone().isoformat(), "last_xweather_poll_ok_at": datetime.now().astimezone().isoformat(), "last_xweather_poll_status": "ok", "last_xweather_poll_message": f"Xweather credentials accepted; API returned {len(records)} recent cloud-to-ground strike record(s) inside the configured radius.", **rate_limit_status_patch()})
-        log(f"credential validation succeeded; {len(records)} recent cloud-to-ground strike record(s)")
+        strike_label = {"cloud_to_ground": "cloud-to-ground", "cloud_to_cloud": "intracloud", "both": "cloud-to-ground or intracloud"}[settings["strike_type"]]
+        atomic_json_update(STATUS_FILE, {"last_xweather_poll_at": datetime.now().astimezone().isoformat(), "last_xweather_poll_ok_at": datetime.now().astimezone().isoformat(), "last_xweather_poll_status": "ok", "last_xweather_poll_message": f"Xweather credentials accepted; API returned {len(records)} recent {strike_label} record(s) inside the configured radius.", **rate_limit_status_patch()})
+        log(f"credential validation succeeded; {len(records)} recent {strike_label} record(s)")
         return 0
     try:
         state = read_state()
@@ -958,7 +1280,7 @@ def main():
     if test_event == "":
         if adaptive:
             selected_zone_id = re.sub(r"[^A-Za-z0-9_-]", "", str(xweather.get("adaptive_nws_zone_id") or ""))[:64]
-            gate_open, gate_message, fresh_gate_count = adaptive_storm_gate(state, now, xweather.get("adaptive_grace_minutes", 60), selected_zone_id)
+            gate_open, gate_message, fresh_gate_count = adaptive_storm_gate(state, now, xweather.get("adaptive_grace_minutes", 60), selected_zone_id, config, xweather)
             state["adaptive_last_check"] = now
             state["adaptive_fresh_gate_count"] = fresh_gate_count
             if not gate_open:
@@ -994,7 +1316,7 @@ def main():
         records = [{"id": f"manual-{int(time.time())}", "timestamp": int(time.time()), "type": "test"}] if test_event == "entry" else []
     else:
         try:
-            records = normalize_records(fetch_payload(settings))
+            records = normalize_records(fetch_payload(settings), settings["strike_type"])
             if adaptive:
                 actual_cost = max(1, int(LAST_RATE_LIMIT.get("cost_tokens") or reserved_cost))
                 adjust_shared_quota(actual_cost, reserved_cost)
@@ -1112,7 +1434,7 @@ def main():
     if cluster_started <= 0 or cluster_started > 9_999_999_999:
         cluster_started = now
         if external_live:
-            # Older installations can have an active pre-0.1.0 state without a
+            # Older installations can have an active pre-0.1.1-beta state without a
             # cluster identity. Persist its migration before deriving the key;
             # otherwise a crash would substitute a different poll time and
             # defeat the durable local-dispatch marker on restart.
@@ -1122,9 +1444,7 @@ def main():
     external_fields = [("Trigger Area", CURRENT_GROUP_NAME), ("Storm State", state_label), ("Detection Radius", f"{settings['radius_miles']} miles")]
     if nearest_miles is not None:
         external_fields.append(("Nearest Strike", f"{format_miles(nearest_miles)} miles"))
-    group_email_values = xweather.get("email_recipients") or []
-    if not isinstance(group_email_values, list):
-        group_email_values = re.split(r"[\s,;]+", str(group_email_values))
+    group_email_values = configured_email_values
     email_lookup = {}
     for value in group_email_values:
         value = str(value).strip()
@@ -1190,12 +1510,21 @@ def main():
             except RetryStateError as exc:
                 still_pending = True
                 log(f"recovered external delivery remains pending because retry state failed: {exc}")
-            recovery_message = (
-                "Recovered a durable Lightning dispatch intent after an interrupted run; "
-                "the local phone/Desktop outcome is indeterminate and will not be replayed; "
-                + ("external destinations remain pending." if still_pending else "external destinations are complete.")
-            )
-            record_xweather_outcome(False, "partial_failure", recovery_message)
+            if local_intent_recorded:
+                recovery_message = (
+                    "Recovered a durable Lightning dispatch intent after an interrupted run; "
+                    "the local phone/Desktop outcome is indeterminate and will not be replayed; "
+                    + ("external destinations remain pending." if still_pending else "external destinations are complete.")
+                )
+                recovery_status = "partial_failure"
+            else:
+                recovery_message = (
+                    "Recovered durable Lightning external delivery after an interrupted run; "
+                    "no local phone/Desktop channel was requested; "
+                    + ("external destinations remain pending." if still_pending else "external destinations are complete.")
+                )
+                recovery_status = "partial_failure" if still_pending else "queued"
+            record_xweather_outcome(False, recovery_status, recovery_message)
             log(recovery_message)
             return 0
     spoken_message = build_spoken_message(event_kind, is_test, settings["radius_miles"], location, nearest_miles)
@@ -1203,7 +1532,7 @@ def main():
     queued = 0
     archived_results = []
     try:
-        if not dry_run:
+        if not dry_run and recipients:
             sound = generate_audio(config, xweather, spoken_message, re.sub(r"[^A-Za-z0-9_-]", "", alert_id))
     except Exception as exc:
         log(f"alert preparation failed before dispatch intent was recorded: {exc}")
@@ -1216,16 +1545,19 @@ def main():
     delivery_key = ""
     external_failures = []
     if external_live:
-        # Audio generation above is reversible preparation. Persist the local
-        # at-most-once marker next, then require the external retry record, all
-        # before invoking either Asterisk/phone or Desktop delivery.
-        state["local_dispatch_intent"] = correlation_key
-        try:
-            atomic_json_update(STATE_FILE, state)
-        except Exception as exc:
-            log(f"local dispatch intent could not be persisted; no local alert was submitted: {exc}")
-            record_xweather_outcome(False, "fault", "Local dispatch intent could not be persisted; no phone or Desktop delivery was attempted.")
-            return 1
+        # Audio generation above is reversible preparation. When a local
+        # phone/Desktop route exists, persist its at-most-once marker before
+        # queuing durable external work. External-only areas need no local
+        # marker and therefore cannot be misreported as an indeterminate local
+        # delivery after a restart.
+        if has_local_destination:
+            state["local_dispatch_intent"] = correlation_key
+            try:
+                atomic_json_update(STATE_FILE, state)
+            except Exception as exc:
+                log(f"local dispatch intent could not be persisted; no local alert was submitted: {exc}")
+                record_xweather_outcome(False, "fault", "Local dispatch intent could not be persisted; no phone or Desktop delivery was attempted.")
+                return 1
         try:
             delivery_key = queue_current_external_delivery()
         except RetryStateError as exc:
@@ -1233,27 +1565,32 @@ def main():
             # known external-queue failure can safely clear the local marker and
             # leave this cluster retryable. If clearing fails, retaining it is
             # conservative and recovery will report an indeterminate outcome.
-            state["local_dispatch_intent"] = ""
-            try:
-                atomic_json_update(STATE_FILE, {"local_dispatch_intent": ""})
-            except Exception as clear_exc:
-                log(f"failed to clear unused local dispatch intent safely: {clear_exc}")
-            log(f"dispatch intent could not be persisted; no local alert was submitted: {exc}")
-            record_xweather_outcome(False, "fault", "Dispatch intent could not be persisted; no phone or Desktop delivery was attempted.")
+            if has_local_destination:
+                state["local_dispatch_intent"] = ""
+                try:
+                    atomic_json_update(STATE_FILE, {"local_dispatch_intent": ""})
+                except Exception as clear_exc:
+                    log(f"failed to clear unused local dispatch intent safely: {clear_exc}")
+            log(f"durable external delivery could not be persisted; no local alert was submitted: {exc}")
+            record_xweather_outcome(False, "fault", "Durable external delivery could not be persisted; no phone or Desktop delivery was attempted.")
             return 1
 
     # Live delivery is deliberately at-most-once across a process interruption.
     # If the process stops after the local marker was persisted, the next poll
     # treats phone/Desktop acceptance as indeterminate and does not replay it;
     # SIP/Asterisk cannot make endpoint receipt atomic or exactly once.
-    local_delivery_outcome = "dry_run" if dry_run else "submitted"
+    local_delivery_outcome = "dry_run" if dry_run else ("submitted" if has_local_destination else "not_requested")
     local_delivery_error = ""
     try:
-        if not dry_run:
+        if not dry_run and has_local_destination:
             queued, archived_results, page_hold_seconds = queue_audio(recipients, sound, archive=is_test)
-            if sound:
-                time.sleep(2)
-            send_visual(recipients, desktop_clients, message, is_test=is_test)
+            send_visual(
+                recipients,
+                desktop_clients,
+                message,
+                is_test=is_test,
+                phone_delay_seconds=2 if sound and recipients else 0,
+            )
             if is_test:
                 wait_for_archived_calls(archived_results, timeout=page_hold_seconds + 45)
     except Exception as exc:
@@ -1297,10 +1634,16 @@ def main():
     append_event({"event_id": f"xweather-{alert_id}", "logged_at": datetime.now(timezone.utc).astimezone().isoformat(), "type": "xweather", "status": event_status, "system_name": "SLS Mass Notify System", "source_name": "Xweather Lightning API", "trigger_source": "Manual Lightning Test" if test_event else "Xweather API", "trigger_name": os.environ.get("XWEATHER_TEST_TRIGGER_NAME", "")[:80], "trigger_area_id": CURRENT_GROUP_ID, "trigger_area_name": CURRENT_GROUP_NAME, "page_group": ",".join(recipients), "desktop_targets": desktop_clients, "event": event_name, "severity": severity, "message_type": "Lightning", "audio": "Piper TTS" if sound else "None", "audio_sequence": [sound] if sound else [], "body": message, "radius_miles": settings["radius_miles"], "nearest_strike_miles": round(nearest_miles, 1) if nearest_miles is not None else None, "storm_state": state_label, "local_delivery_outcome": local_delivery_outcome, "local_delivery_error": local_delivery_error[:240], "external_destination_failures": external_failures})
     delivery_state = event_status
     call_label = "completed" if is_test else "queued"
-    delivery_message = (
-        f"Submitted {event_name.lower()} for area {CURRENT_GROUP_NAME}: {len(recipients)} extension(s), {len(desktop_clients)} desktop target(s); "
-        f"{queued} audio call(s) {call_label}. Handset acceptance is not confirmed by Asterisk queueing."
-    )
+    if local_delivery_outcome == "not_requested":
+        delivery_message = (
+            f"Submitted {event_name.lower()} for area {CURRENT_GROUP_NAME} to configured external destinations; "
+            "no local phone or Desktop channel was requested."
+        )
+    else:
+        delivery_message = (
+            f"Submitted {event_name.lower()} for area {CURRENT_GROUP_NAME}: {len(recipients)} extension(s), {len(desktop_clients)} desktop target(s); "
+            f"{queued} audio call(s) {call_label}. Handset acceptance is not confirmed by Asterisk queueing."
+        )
     if local_delivery_outcome == "indeterminate":
         delivery_message = "Local phone/Desktop dispatch outcome is indeterminate; the durable intent prevents replay."
     if external_failures:

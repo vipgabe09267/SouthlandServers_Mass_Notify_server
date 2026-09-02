@@ -122,6 +122,16 @@ assert MODULE.ami_field(ordered_event, "Endpoint", "AOR", "ObjectName") == "1000
 assert MODULE.contact_uri_for_event(ordered_event, "1000", {}) == "sip:1000@192.0.2.10:5061;transport=TLS"
 
 
+transport_uris = (
+    "sip:1000@192.0.2.10:5060;transport=UDP",
+    "sip:1000@192.0.2.11:5060;transport=tcp;ob",
+    "sip:1000@192.0.2.12:5061;transport=TLS;x-ast-orig-host=10.0.0.12:5061",
+    "sips:1000@[2001:db8::10]:5061;transport=tls",
+)
+for transport_uri in transport_uris:
+    assert MODULE.registered_contact_uri(transport_uri) == transport_uri
+
+
 class InventoryAmi:
     def action(self, fields, complete_event=None):
         return {"Response": "Success"}, [ordered_event, {"Event": "ContactListComplete"}]
@@ -141,6 +151,20 @@ class NotifyAmi:
     def action(self, fields, complete_event=None):
         self.actions.append(fields)
         return self.response, []
+
+
+for transport_uri in transport_uris:
+    transport_ami = NotifyAmi()
+    MODULE.send_notify(
+        transport_ami,
+        transport_uri,
+        "<MassNotification><Text>Transport test</Text></MassNotification>",
+        "generic",
+        "URI",
+    )
+    assert len(transport_ami.actions) == 1
+    assert transport_ami.actions[0].get("URI") == transport_uri
+    assert "Endpoint" not in transport_ami.actions[0]
 
 
 try:
@@ -178,6 +202,35 @@ notify_actions = [action for action in ami.actions if action.get("Action") == "P
 assert len(notify_actions) == 1
 assert notify_actions[0].get("Endpoint") == "1000"
 assert "URI" not in notify_actions[0]
+
+unknown_ami = NotifyAmi()
+try:
+    MODULE.pjsip_notify_capabilities = lambda: dict(without_default)
+    delivered = MODULE.send_notify_batch(
+        unknown_ami,
+        {
+            "1001": {
+                "format": "unknown",
+                "formats": ["unknown"],
+                "user_agent": "Unrecognized Desk Phone",
+                "contacts": [{
+                    "contact": "sip:1001@192.0.2.20:5060;transport=UDP",
+                    "format": "unknown",
+                    "user_agent": "Unrecognized Desk Phone",
+                }],
+            },
+        },
+        lambda phone_format: MODULE.text_xml_for_format(phone_format, "Test", "Safe text"),
+        "unknown-safe-fallback-test",
+    )
+finally:
+    MODULE.pjsip_notify_capabilities = original_capabilities
+unknown_actions = [action for action in unknown_ami.actions if action.get("Action") == "PJSIPNotify"]
+assert delivered == 1
+assert len(unknown_actions) == 1
+assert unknown_actions[0].get("Endpoint") == "1001"
+assert "URI" not in unknown_actions[0]
+assert any("<MassNotification>" in value for value in unknown_actions[0].get("Variable", []))
 
 multi_contact_ami = NotifyAmi()
 try:
@@ -253,12 +306,12 @@ try:
                 "user_agent": "mixed",
                 "contacts": [
                     {
-                        "contact": "sip:1000@192.0.2.10:5061",
+                        "contact": "sip:1000@192.0.2.10:5061;transport=TLS",
                         "format": "yealink",
                         "user_agent": "Yealink",
                     },
                     {
-                        "contact": "sip:1000@192.0.2.11:5061",
+                        "contact": "sip:1000@192.0.2.11:5060;transport=TCP",
                         "format": "poly",
                         "user_agent": "Poly",
                     },
@@ -274,40 +327,41 @@ mixed_actions = [action for action in successful_mixed_ami.actions if action.get
 assert delivered == 2
 assert len(mixed_actions) == 2
 assert {action.get("URI") for action in mixed_actions} == {
-    "sip:1000@192.0.2.10:5061",
-    "sip:1000@192.0.2.11:5061",
+    "sip:1000@192.0.2.10:5061;transport=TLS",
+    "sip:1000@192.0.2.11:5060;transport=TCP",
 }
 assert all("Endpoint" not in action for action in mixed_actions)
-assert any("vendor='yealink'" in "\n".join(action.get("Variable", [])) for action in mixed_actions)
-assert any("vendor='poly'" in "\n".join(action.get("Variable", [])) for action in mixed_actions)
+mixed_by_uri = {action["URI"]: "\n".join(action.get("Variable", [])) for action in mixed_actions}
+assert "vendor='yealink'" in mixed_by_uri["sip:1000@192.0.2.10:5061;transport=TLS"]
+assert "vendor='poly'" in mixed_by_uri["sip:1000@192.0.2.11:5060;transport=TCP"]
 
 mixed_ami = NotifyAmi()
 try:
     MODULE.pjsip_notify_capabilities = lambda: dict(without_default)
-    try:
-        MODULE.send_notify_batch(
-            mixed_ami,
-            {
-                "1000": {
-                    "format": "yealink",
-                    "formats": ["yealink", "poly"],
-                    "user_agent": "mixed",
-                    "contacts": [
-                        {"contact": "sip:1000@192.0.2.10:5061", "format": "yealink", "user_agent": "Yealink"},
-                        {"contact": "sip:1000@192.0.2.11:5061", "format": "poly", "user_agent": "Poly"},
-                    ],
-                },
+    delivered = MODULE.send_notify_batch(
+        mixed_ami,
+        {
+            "1000": {
+                "format": "yealink",
+                "formats": ["yealink", "poly"],
+                "user_agent": "mixed",
+                "contacts": [
+                    {"contact": "sip:1000@192.0.2.10:5061", "format": "yealink", "user_agent": "Yealink"},
+                    {"contact": "sip:1000@192.0.2.11:5061", "format": "poly", "user_agent": "Poly"},
+                ],
             },
-            lambda phone_format: f"<{phone_format}/>",
-            "mixed-portability-test",
-        )
-    except RuntimeError as exc:
-        assert "mixed phone formats" in str(exc)
-    else:
-        raise AssertionError("mixed-format endpoint fan-out was not rejected")
+        },
+        lambda phone_format: f"<{phone_format}/>",
+        "mixed-portability-test",
+    )
 finally:
     MODULE.pjsip_notify_capabilities = original_capabilities
-assert not mixed_ami.actions
+assert delivered == 2
+mixed_fallback_actions = [action for action in mixed_ami.actions if action.get("Action") == "PJSIPNotify"]
+assert len(mixed_fallback_actions) == 1
+assert mixed_fallback_actions[0].get("Endpoint") == "1000"
+assert "URI" not in mixed_fallback_actions[0]
+assert "Content=<generic/>" in mixed_fallback_actions[0].get("Variable", [])
 
 for incomplete_contacts in (
     [
@@ -322,27 +376,27 @@ for incomplete_contacts in (
     incomplete_ami = NotifyAmi()
     try:
         MODULE.pjsip_notify_capabilities = lambda: dict(with_default)
-        try:
-            MODULE.send_notify_batch(
-                incomplete_ami,
-                {
-                    "1000": {
-                        "format": "yealink",
-                        "formats": ["yealink", "poly"],
-                        "user_agent": "mixed",
-                        "contacts": incomplete_contacts,
-                    },
+        delivered = MODULE.send_notify_batch(
+            incomplete_ami,
+            {
+                "1000": {
+                    "format": "yealink",
+                    "formats": ["yealink", "poly"],
+                    "user_agent": "mixed",
+                    "contacts": incomplete_contacts,
                 },
-                lambda phone_format: f"<{phone_format}/>",
-                "mixed-missing-uri-test",
-            )
-        except RuntimeError as exc:
-            assert "distinct contact URI for every registration" in str(exc)
-        else:
-            raise AssertionError("mixed-format registrations with missing contact URIs were not rejected")
+            },
+            lambda phone_format: f"<{phone_format}/>",
+            "mixed-missing-uri-test",
+        )
     finally:
         MODULE.pjsip_notify_capabilities = original_capabilities
-    assert not incomplete_ami.actions
+    assert delivered == 2
+    incomplete_actions = [action for action in incomplete_ami.actions if action.get("Action") == "PJSIPNotify"]
+    assert len(incomplete_actions) == 1
+    assert incomplete_actions[0].get("Endpoint") == "1000"
+    assert "URI" not in incomplete_actions[0]
+    assert "Content=<generic/>" in incomplete_actions[0].get("Variable", [])
 
 uri_failure_ami = NotifyAmi({"Response": "Error", "Message": "URI delivery failed"})
 try:

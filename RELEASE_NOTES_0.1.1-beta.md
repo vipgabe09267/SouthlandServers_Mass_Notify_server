@@ -1,0 +1,29 @@
+# Southland Servers Mass Notifications Server 0.1.1-beta
+
+Version 0.1.1-beta focuses on area-specific routing and dependable operation across different FreePBX/Asterisk installations. It remains beta software; verify every phone family, desktop client, external destination, audio path, and restore workflow on a non-critical PBX.
+
+## Major changes
+
+- General Settings now supports up to 10 optional named Dashboard announcement webhooks. Each enabled Discord or Discord-compatible HTTPS destination appears as an individual Dashboard target, can be used without a phone or desktop target, and receives the same branded, bounded embed format. Local phone, audio, and desktop submission always runs before external webhook I/O, and partial failures identify destinations by name without exposing their URLs.
+- Weather zones now select their own quiet-hour behavior, email recipients, Discord webhooks, and generic HTTPS webhooks. Lightning areas independently select quiet hours, email recipients, and strike type while using the enabled shared webhook set.
+- Adaptive Lightning polling now follows the forecast period active at the current time. A future thunder interval does not spend Xweather tokens early, and its cached standby state expires at the forecast boundary so polling can start on the next one-minute scheduler pass. Qualifying current Weather.gov alerts, existing grace periods, and the shared protected quota governor still apply.
+- Lightning Alerts and trigger areas no longer carry a Labs badge. The Dashboard announcement composer is more compact, uses collapsible phone/desktop/webhook destinations, and has polished accessible send status; AJAX refreshes dispose the prior widget's timers, observers, listeners, and delayed layouts instead of accumulating background work. Weather, Lightning, update, repair, and configuration operations use matching progress presentation.
+- Weather Alert audio is serialized through one bounded queue so simultaneous NWS alerts do not overlap pages. Alerts use deterministic zone turns and a protected cross-zone claim journal, preventing the same NWS chain from reaching a shared phone, desktop, email address, Discord webhook, or generic webhook twice.
+- Manual Weather testing now recognizes an active Asterisk Local page instead of falsely requiring its call file to disappear within 10 seconds. Desktop, audio, and phone visual paths are attempted independently, with partial failures reported only after successful channels are preserved.
+- Live Weather and Lightning groups may use email or an enabled webhook without a phone or desktop route. Manual tests remain intentionally local-only. The protected-config validator also recognizes the canonical per-zone critical-event bypass field, avoiding the earlier false “configuration too broad” status.
+- Weather and Lightning desktop records are published immediately after accepted local queueing. The two-second page-first delay now applies only to handset SIP NOTIFY.
+- Desktop presence now distinguishes live streams, recent disconnects, and sleeping/offline clients. Reconnected clients receive only records still allowed by targeting and expiry rules.
+- Mixed phone families receive contact-specific vendor payloads when Asterisk can safely target every contact URI. Otherwise the extension receives one generic XML endpoint payload. An unknown phone format alone no longer blocks installation, and UDP, TCP, TLS, SIP, SIPS, parameters, ports, and IPv6 contact syntax are preserved.
+- Every Discord and Discord-compatible card uses the Southland Servers logo as its webhook profile, author, and footer identity, with compact thumbnail artwork backed by stable public HTTPS PNG assets and validated payload limits.
+- Notification Logs now presents a notification **Type** instead of treating every record as a severity. Dashboard, Control API, scheduling, Weather, Lightning, manual test, desktop, and system/error records are classified without rewriting historic logs; Weather severity remains visible in event details.
+- The installer validates and reports the operating-system timezone before module activation. Interactive installs can keep it or select a valid IANA timezone, unattended installs support the explicit `SLS_MASS_NOTIFY_TIMEZONE` override without prompting, and a failed install restores any timezone change it made.
+- Manual and automatic update checks retain verified release metadata, reject stale failure state, and show compact terminal progress. Automatic installation remains an explicit opt-in and continues to require the official repository, immutable tag installer, and matching SHA-256 asset metadata.
+- Dashboard health and repair checks cover more Weather, Lightning, scheduling, desktop, external-destination, protected-config, audio-queue, runtime-parity, and installation faults.
+- Installer and repair logic has broader compatibility checks for FreePBX module hooks, Asterisk providers, AMI discovery, local signing, ownership, and packaged/runtime parity without changing handset firmware, SIP peers, or unrelated FreePBX settings.
+- The full queued repair path now preserves the executable scheduling worker through `fwconsole chown`, completes its protected verifier, and releases the shared maintenance lock even when FreePBX leaves a background GPG key refresh running.
+
+## Delivery boundaries
+
+“Queued” and “submitted to Asterisk” describe the last result the module can prove. Phone auto-answer, XML display, final SIP acceptance, email receipt, and webhook presentation remain dependent on the receiving device or service. Unknown phones may ignore generic XML even when Asterisk accepts it.
+
+Manual Weather and Lightning tests remain local and do not send email or webhook traffic. Back up the protected `.config`, retain a module-based FreePBX backup, and review Dashboard health after every install, update, FreePBX upgrade, or restore.

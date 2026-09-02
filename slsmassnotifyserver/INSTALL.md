@@ -5,7 +5,7 @@
 - FreePBX 17
 - Debian 12
 - Asterisk with PJSIP endpoints
-- FreePBX Framework, Dashboard, and System Recordings modules. The release installer installs a missing dependency or enables an installed disabled dependency; it does not silently upgrade an already installed core module.
+- FreePBX Framework, Dashboard, Backup & Restore, and System Recordings modules. The release installer installs a missing dependency or enables an installed disabled dependency; it does not silently upgrade an already installed core module.
 - Active Apache and cron services, with Apache rewrite and authorization-header support
 - Canonical `/usr/bin/php` CLI plus PHP OpenSSL, mbstring, and POSIX support for encrypted desktop credentials, scheduling, account lookup, and bounded alert-text handling
 - Python 3 with `venv` and `pip`
@@ -24,17 +24,28 @@ Run as `root` on the FreePBX server:
 ```bash
 cd /tmp
 curl -fsSL -o sls-install.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.0/tools/install_release.sh
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.1-beta/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.0/slsmassnotifyserver-0.1.0.tgz' \
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.1-beta/slsmassnotifyserver-0.1.1-beta.tgz' \
 ./sls-install.sh
 ```
+
+The installer prints the PBX operating-system timezone before module activation. When it is run directly from an interactive terminal, you can keep the detected value or enter another timezone from `timedatectl list-timezones`. Scheduled announcements, quiet hours, logs, and alert timing all use this system timezone. Unattended and UI-triggered installs never prompt and keep the existing value. For a scripted timezone change, pass an exact IANA name explicitly:
+
+```bash
+SLS_MASS_NOTIFY_TIMEZONE='America/Chicago' \
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.1-beta/slsmassnotifyserver-0.1.1-beta.tgz' \
+./sls-install.sh
+```
+
+The requested name must exist in both the systemd timezone catalogue and `/usr/share/zoneinfo`. If a later installation stage fails after changing it, the installer restores the original system timezone as part of rollback.
 
 ## Install Hooks
 
 The module install hook prepares the local PBX integration by applying managed configuration only:
 
 - detects and installs only missing native prerequisites, then verifies the exact executable paths and PHP extensions used at runtime
+- reports and validates the operating-system timezone before activation; an interactive root install can change it safely, while unattended installs require the explicit `SLS_MASS_NOTIFY_TIMEZONE` override and cannot pause for input
 - copies runtime scripts to `/usr/local/bin/sls_mass_notify`
 - copies API endpoints to `/var/www/html/api/sipnotify` and `/var/www/html/api/sls-mass-notify`
 - copies web assets to `/var/www/html/sls_mass_notify`
@@ -46,7 +57,7 @@ The module install hook prepares the local PBX integration by applying managed c
 - enables Apache directory access for the API/media paths
 - installs the dashboard announcement widget compatibility files, rebuilds FreePBX Dashboard's persisted hook index, and verifies that the SIP NOTIFY announcement panel renders
 - enforces `0640 asterisk:asterisk` on the protected central configuration after FreePBX ownership operations without changing its contents
-- creates the Asterisk-owned one-minute weather scheduler for U.S. weather.gov zone groups; free-tier adaptive Lightning polling uses one selected zone as its storm gate and queries Xweather every five minutes only while that gate or its grace period is active
+- creates the Asterisk-owned one-minute Weather scheduler, a serialized NWS Weather Alert audio queue, and a bounded cross-zone destination-claim journal so overlapping zones cannot duplicate an alert to a shared target; adaptive Lightning polling uses current Weather.gov alerts plus the structured forecast period active at the current time, without spending Xweather tokens merely because thunder is forecast for a later period
 - creates exactly one Asterisk-owned one-minute scheduled-announcement worker, verifies it as the `asterisk` account, and keeps its PBX-local execution ledger outside the module tree
 - installs the ownership-safe **SLS Mass Notify - Paging Tone Opening**, **SLS Mass Notify - Paging Tone Closing**, **SLS Mass Notify - NWS Alert**, and **SLS Mass Notify - Lightning Alert** recordings and managed Asterisk audio. A conflicting user-owned recording stops installation instead of being overwritten
 - verifies the real AMI contact-discovery and `PJSIPNotify` actions, matches registered numeric phones between the Asterisk CLI and AMI, checks spool access, sound links, WAV support, default audio formats, and the exact paging dialplan before reporting success
@@ -58,9 +69,9 @@ The module install hook prepares the local PBX integration by applying managed c
 - verifies all six Piper model/metadata hashes and performs a real synthesis with Amy, Lessac, and Ryan
 - refuses to replace an existing `/usr/local/bin/piper` wrapper unless its contents prove it is already managed by SLS Mass Notify
 - renders a phone image as the `asterisk` account in the real public media directory and retrieves the exact file through Apache
-- completes an authenticated desktop live-SSE handshake without printing or storing the client password outside protected memory
+- completes an authenticated desktop live-SSE handshake without printing or storing the client password outside protected memory; Weather and Lightning publish the durable desktop record independently before the handset-only visual delay
 - verifies an authenticated Control API status request when the Control API is enabled and loopback is allowed; disabled or deliberately loopback-blocked APIs remain valid configurations
-- resolves every PJSIP contact for audio and pages them together through `Page()`/ConfBridge, so a softphone registration does not replace a desk phone registration. Visual SIP NOTIFY remains per endpoint/contact. Installation hard-fails for a mixed-format extension unless every contact has a usable URI and Asterisk has a usable default outbound endpoint; unsafe cross-vendor payload fallback is never accepted
+- resolves every PJSIP contact for audio and pages them together through `Page()`/ConfBridge, so a softphone registration does not replace a desk phone registration. Mixed-family visual SIP NOTIFY uses contact-specific vendor payloads when URI routing is available and one safe generic endpoint payload otherwise; an unknown format alone does not block installation, and UDP/TCP/TLS SIP/SIPS URI syntax is retained
 - accepts an authenticated Asterisk 22 `No Contacts found` AMI response as an authorized empty inventory on PBXs where no phones are currently registered, without accepting authentication or permission failures
 - restores the packaged local signer as an exact root-owned executable, discovers the FreePBX web account, module root, and GPG home from that PBX, repairs ownership on the selected keyring before importing trust, and requires exact trusted status 129 for every touched module
 - serializes install, update, repair, and uninstall work with the root maintenance lock. A child installer launched by the maintenance worker reuses the inherited lock instead of deadlocking, while direct CLI operations wait for an active maintenance transaction to finish
@@ -78,14 +89,14 @@ After installing the module:
 4. Read and accept the EULA.
 5. Enable Weather Alerts only if you want U.S. weather.gov alerts.
 6. If Weather Alerts is enabled, configure the primary Weather.gov forecast zone, for example `TXZ163`.
-7. Select phone extensions and/or enabled desktop clients for that primary zone. Optional email recipients receive live alerts from that zone only; manual tests do not send external messages. After setup, use **Weather Alerts > Manage Zone Groups** to add as many as four more independently routed zones.
+7. Select phone extensions and/or enabled desktop clients for that primary zone. Each zone can independently select quiet hours, email recipients, Discord webhooks, and generic HTTPS webhooks; manual tests do not send external messages. After setup, use **Weather Alerts > Manage Zone Groups** to add as many as four more independently routed zones.
 8. Configure quiet hours and critical bypass events.
 9. Choose whether to enable the Control API. It is disabled by default.
 10. After setup, configure desktop app clients in **General Settings**, review detected phone formats, and add manual extension overrides through the extension-and-phone-family popup only where needed. Desktop lists longer than approximately five rows use the sticky-header scroll region.
 11. Select the announcement and weather TTS voices. Fresh regular announcements default to Lessac; Weather and Lightning alerts default to Amy.
 12. Review the announcement, Weather Alert, and Lightning Alert volume controls; fresh installs default all three to 25%.
 13. Set notification log retention.
-14. Optionally configure Xweather under **Lightning Alerts**. Up to five named trigger areas can each select a Weather Alert group, location, radius, phone extensions, desktop clients, live-alert email recipients, and all-clear behavior. An area's email list is used only for that area's live alerts. Credentials, cadence, quiet hours, tones, and TTS volume are shared. Adaptive protection is enabled by default and gates each area from its selected Weather Alert group with a 60-minute default grace period; switching it off continuously polls every enabled area. Multiple storm-active areas can consume the account allowance faster. Lightning volume defaults to 25%, and coordinate locations are spoken as “this area.”
+14. Optionally configure Xweather under **Lightning Alerts**. Up to five named trigger areas can each select a Weather Alert group, strike type, location, radius, phones, desktops, email recipients, quiet hours, and all-clear behavior; enabled shared webhooks remain managed in General Settings. Adaptive protection is enabled by default and can open from a qualifying current Weather.gov alert or from thunder in the forecast period active at that time, then remains open for the configured grace period. A later forecast period does not start paid polling before its boundary. Multiple active areas can consume the shared account allowance faster. Lightning volume defaults to 25%, and coordinate locations are spoken as “this area.”
 15. After setup, review **General Settings > Outbound Delivery**. Fresh installs send through local Postfix as `no-reply` at the detected Postfix/PBX domain; the sender local part and domain can be edited. Add system/error email recipients only if those operational notices are wanted. Weather and Lightning email recipients are selected inside their individual zones and trigger areas. Discord and generic HTTPS webhooks remain available from the same General Settings manager.
 16. Complete setup, then use FreePBX’s standard top-right **Apply Config** control when it appears.
 
@@ -167,7 +178,7 @@ The default uninstall preserves the central config, config backups, uploaded ton
 ```bash
 cd /tmp
 curl -fsSL -o sls-uninstall.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.0/tools/uninstall_release.sh
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.1-beta/tools/uninstall_release.sh
 chmod +x sls-uninstall.sh
 ./sls-uninstall.sh
 ```

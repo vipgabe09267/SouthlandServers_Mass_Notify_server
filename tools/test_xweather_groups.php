@@ -47,6 +47,7 @@ $legacy = $normalize->invoke($module, [
 if (count($legacy['groups'] ?? []) !== 1
 	|| ($legacy['groups'][0]['id'] ?? '') !== 'lightning_primary'
 	|| ($legacy['groups'][0]['extensions'] ?? []) !== ['1000']
+	|| ($legacy['groups'][0]['strike_type'] ?? '') !== 'cloud_to_ground'
 	|| ($legacy['location'] ?? '') !== 'Round Rock, TX') {
 	xweather_group_fail('Legacy singleton Lightning config did not migrate into one compatible trigger area.');
 }
@@ -74,15 +75,28 @@ $errors = $validate->invoke($module, $groups);
 if (!array_filter($errors, static function ($message) { return stripos((string)$message, 'limited to five') !== false; })) {
 	xweather_group_fail('Lightning trigger-area validation did not reject a sixth area.');
 }
+$invalidStrike = $validate->invoke($module, [[
+	'id' => 'bad_strike', 'name' => 'Bad strike', 'enabled' => '1',
+	'location' => 'Test', 'radius_miles' => 10, 'extensions' => ['1000'],
+	'desktop_clients' => [], 'strike_type' => 'unsupported',
+]]);
+if (stripos(implode(' ', $invalidStrike), 'strike type') === false) {
+	xweather_group_fail('An unsupported Lightning strike type was not rejected.');
+}
 
 $view = (string)file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/views/lightning.php');
-foreach (['xweather[groups][', 'data-lightning-desktop', 'Each enabled area uses its own Xweather query while active', 'groups_present'] as $marker) {
+foreach (['xweather[groups][', 'data-lightning-desktop', 'data-lightning-field="strike_type"', 'data-lightning-field="quiet_hours_enabled"', 'Forecast-aware adaptive protection:', 'cloud-to-cloud strikes', 'Each enabled area uses its own Xweather query while active', 'groups_present'] as $marker) {
 	if (strpos($view, $marker) === false) {
 		xweather_group_fail('Lightning trigger-area UI contract is missing: ' . $marker);
 	}
 }
 if (strpos($view, 'Storm-mode planning estimate') !== false || strpos($view, 'sls-projection') !== false) {
 	xweather_group_fail('The removed Lightning storm-mode planning calculator remains in the UI.');
+}
+foreach (['sls-lightning-labs-badge', "_('Labs')", 'Labs · token usage'] as $removedMarker) {
+	if (strpos($view, $removedMarker) !== false) {
+		xweather_group_fail('Lightning Alerts still exposes removed Labs branding: ' . $removedMarker);
+	}
 }
 if (strpos($view, 'name="xweather[recipients][]"') !== false || strpos($view, '--desktop-all') !== false) {
 	xweather_group_fail('Legacy global Lightning recipient routing remains in the group UI.');

@@ -25,6 +25,26 @@ log() {
 	printf 'SLS local signer: %s\n' "$*" >&2
 }
 
+# The installer, updater, repair worker, and uninstaller deliberately hold one
+# shared maintenance lock while invoking this signer. FreePBX signature checks
+# can start a background GPG key refresh, so the signer must not pass that lock
+# descriptor to its descendants after the parent transaction has already kept
+# its own copy open.
+close_inherited_maintenance_lock() {
+	local lock_file="${SLS_MASS_NOTIFY_MAINTENANCE_LOCK:-/run/lock/sls-mass-notify-maintenance.lock}"
+	local descriptor descriptor_path descriptor_target close_fd
+
+	for descriptor_path in "/proc/${BASHPID}/fd/"*; do
+		[ -e "$descriptor_path" ] || continue
+		descriptor="${descriptor_path##*/}"
+		[[ "$descriptor" =~ ^[0-9]+$ ]] && [ "$descriptor" -gt 2 ] || continue
+		descriptor_target="$(readlink -f -- "$descriptor_path" 2>/dev/null || true)"
+		[ "$descriptor_target" = "$lock_file" ] || continue
+		close_fd="$descriptor"
+		exec {close_fd}>&-
+	done
+}
+
 restore_previous_signature() {
 	local restore_target
 
@@ -587,6 +607,7 @@ main() {
 			exit 1
 		}
 	done
+	close_inherited_maintenance_lock
 
 	SLS_SIGNER_HOSTNAME="$(hostname -f 2>/dev/null || hostname || true)"
 	SLS_SIGNER_HOSTNAME="$(printf '%s' "$SLS_SIGNER_HOSTNAME" | tr -cd 'A-Za-z0-9.-')"

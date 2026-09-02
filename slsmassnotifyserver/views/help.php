@@ -24,6 +24,32 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 	vertical-align: middle !important;
 	overflow-wrap: anywhere;
 }
+.sls-help-endpoint-table {
+	min-width: 660px;
+}
+.sls-help-endpoint-table th:nth-child(1),
+.sls-help-endpoint-table td:nth-child(1),
+.sls-help-endpoint-table th:nth-child(3),
+.sls-help-endpoint-table td:nth-child(3) {
+	width: 92px;
+	min-width: 92px;
+	white-space: nowrap;
+	overflow-wrap: normal;
+}
+.sls-help-endpoint-table th:nth-child(1),
+.sls-help-endpoint-table td:nth-child(1) {
+	padding-left: 14px;
+	padding-right: 20px;
+}
+.sls-help-endpoint-table th:nth-child(2),
+.sls-help-endpoint-table td:nth-child(2) {
+	min-width: 150px;
+	overflow-wrap: normal;
+}
+.sls-help-endpoint-table th:nth-child(4),
+.sls-help-endpoint-table td:nth-child(4) {
+	min-width: 260px;
+}
 .sls-help-diagnostics .panel {
 	margin-bottom: 16px;
 }
@@ -48,7 +74,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 		<li><?php echo _('The module is designed to keep deployment settings outside module code in a centralized .config file so updates do not overwrite local configuration.'); ?></li>
 		<li><?php echo _('Custom/local FreePBX module signatures normally show as Unknown. Altered means the module should be signed again on that PBX.'); ?></li>
 		<li><?php echo _('General Settings shows the installed package version and whether the known release status is LATEST or an update is available.'); ?></li>
-			<li><?php echo _('Version 0.1.0 adds service-specific email recipients, system/error email notices, multiple Discord and generic webhook destinations, recurring scheduling, native FreePBX backup and restore, multi-contact Page/ConfBridge audio, protected installer-failure health, and broader cross-PBX verification. The installer checks native prerequisites, required Asterisk functions/applications and restart providers, the configured local AMI host/port, endpoint discovery, and effective PJSIP paging routes without modifying phone provisioning or SIP peers.'); ?></li>
+		<li><?php echo _('Version 0.1.1-beta adds per-zone Weather quiet hours and destinations, per-area Lightning strike type, quiet hours, and recipients, forecast-aware adaptive Lightning gating, serialized Weather Alert audio, clearer sleeping-desktop status, safer mixed and unknown phone routing, compact Discord branding, broader Dashboard health, and stronger cross-PBX installation verification.'); ?></li>
 		<li><?php echo _('Local signing now uses the web account, module root, and GPG home reported by FreePBX. Install, update, repair, and uninstall share a maintenance lock; each candidate signature must return trusted status 129 before it replaces the previous module.sig.'); ?></li>
 		<li><?php echo _('After a Dashboard or Framework upgrade, Repair Installation restores the managed announcement widget and menu placement, rebuilds the stored Dashboard hook index, and verifies that the announcement controls render. Framework 17.0.30 and earlier Framework 17 menu comparator forms are supported.'); ?></li>
 	</ul>
@@ -84,8 +110,8 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 				<p class="text-muted"><?php echo _('No registered phone endpoints were detected or AMI endpoint detection is unavailable.'); ?></p>
 			<?php } else { ?>
 				<div class="sls-help-scroll-table">
-					<table class="table table-condensed table-striped">
-						<thead><tr><th><?php echo _('Ext'); ?></th><th><?php echo _('Format'); ?></th><th><?php echo _('Contacts'); ?></th><th><?php echo _('User Agent'); ?></th></tr></thead>
+					<table class="table table-condensed table-striped sls-help-endpoint-table">
+						<thead><tr><th><?php echo _('Extension'); ?></th><th><?php echo _('Format'); ?></th><th><?php echo _('Contacts'); ?></th><th><?php echo _('User Agent'); ?></th></tr></thead>
 						<tbody>
 							<?php foreach ($endpointDiagnostics as $endpoint) { ?>
 								<tr>
@@ -164,7 +190,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 	<h3><?php echo _('Core Workflows'); ?></h3>
 	<ul>
 		<li><?php echo _('The one-minute weather scheduler reads the centralized config, polls up to five independent NWS zone groups, routes each group to its selected phone extensions and desktop clients, deduplicates alert chains, applies quiet hours, and can also check the optional Xweather lightning API.'); ?></li>
-			<li><?php echo _('Dashboard announcements can submit phone SIP NOTIFY text, publish to the SLS Mass Notify desktop API, and independently use opening/closing tones, Piper TTS, both, or neither. Audio uses Page/ConfBridge and includes every resolved PJSIP contact, so a softphone registration does not displace a desk phone registration.'); ?></li>
+			<li><?php echo _('Dashboard announcements can submit phone SIP NOTIFY text, publish to the SLS Mass Notify desktop API, and send branded Discord embed JSON to individually selected Discord or Discord-compatible HTTPS webhook destinations. A webhook can be the only target. Announcements independently use opening/closing tones, Piper TTS, both, or neither. Audio uses Page/ConfBridge and includes every resolved PJSIP contact, so a softphone registration does not displace a desk phone registration.'); ?></li>
 		<li><?php echo _('Scheduling creates one-time announcements for one or more PBX-local calendar dates, or repeats from one selected start time every 7 or 14 days. Recurring dates are generated as a protected, DST-validated series for up to five years. Each schedule can select phones, groups, desktops, audio mode, Piper voice, volume, tones, and the Labs colored Yealink presentation. The worker checks once per minute and retries pre-delivery cooldown, busy, temporarily offline, or no-audio-target conditions inside a 15-minute grace window. It revalidates the live schedule before claiming it; a claimed delivery is never replayed after an interrupted worker. Failed or missed items must be re-armed with a new future date, while uncertain items require review.'); ?></li>
 			<li><?php echo _('Scheduling uses the PBX operating-system timezone and rejects missing or ambiguous daylight-saving times. Dashboard health reports a mismatch with the FreePBX PHP timezone. Worker, cron, and journal faults are enforced only while at least one schedule is enabled, so viewing an unused Scheduling page cannot create a false fault.'); ?></li>
 		<li><?php echo _('General Settings can leave regular announcement screens without expiry, expire them with the generated page audio, or use a fixed 1–86,400 second timeout. The timeout is carried by regular Yealink XML and live desktop metadata; an expired desktop record advances the live cursor without being displayed, and weather alert validity is unchanged.'); ?></li>
@@ -180,13 +206,13 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 		<li><?php echo _('Accept the AGPL-3.0 license notice.'); ?></li>
 		<li><?php echo _('Read and accept the EULA.'); ?></li>
 		<li><?php echo _('Choose whether to enable Weather Alerts. If enabled, configure the primary U.S. weather.gov zone/county group and select its phone and/or enabled desktop recipients. Add up to four more independently routed zones later from Weather Alerts.'); ?></li>
-		<li><?php echo _('Choose whether to enable Labs Lightning Alerts. If enabled, configure Xweather credentials and the first Lightning trigger area. Up to five areas can later select independent Weather Alert triggers, locations, radii, phones, desktops, email recipients, and all-clear behavior.'); ?></li>
+		<li><?php echo _('Choose whether to enable Lightning Alerts. If enabled, configure Xweather credentials and the first Lightning trigger area. Up to five areas can later select independent Weather Alert triggers, locations, radii, phones, desktops, email recipients, and all-clear behavior.'); ?></li>
 		<li><?php echo _('Review Control API access, paging audio, TTS voices and volume, and log retention in setup. After setup, manage desktop clients, the Postfix sender identity, optional system/error recipients, and webhooks under General Settings. The desktop-client table keeps approximately five rows visible, then scrolls with a sticky header.'); ?></li>
 	</ol>
 
 	<h3><?php echo _('Notification Logs'); ?></h3>
 	<ul>
-		<li><?php echo _('Use the Event Type selector and calendar field together to filter notification history by category and PBX-local date. Clear Filters returns to the complete recent view.'); ?></li>
+		<li><?php echo _('Use the Notification Type selector and calendar field together to filter history by origin and PBX-local date. Types distinguish Dashboard, Control API, Scheduling, Weather, Lightning, manual test, desktop, and system/error activity. Clear Filters returns to the complete recent view.'); ?></li>
 		<li><?php echo _('The row limit is applied after the selected type and date filters, so the requested number of matching events is retained.'); ?></li>
 	</ul>
 
@@ -226,7 +252,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 	<h3><?php echo _('Weather Alerts'); ?></h3>
 	<ul>
 		<li><?php echo _('The setup wizard defaults Weather Alerts to No and keeps weather-specific fields hidden and excluded from validation until Yes is selected.'); ?></li>
-		<li><?php echo _('Weather polling is optional and can be disabled during setup or from Weather Alerts. It supports U.S. weather.gov zones only and is locked to the official https://api.weather.gov endpoint. Up to five named weather-zone groups can each have their own phone extensions, enabled desktop clients, and email recipients. Only the matching zone email list receives that live alert; manual tests never send email or webhooks.'); ?></li>
+		<li><?php echo _('Weather polling is optional and can be disabled during setup or from Weather Alerts. It supports U.S. weather.gov zones only and is locked to the official https://api.weather.gov endpoint. Up to five named weather-zone groups can each have their own phones, desktops, email recipients, quiet hours, critical bypass events, and selected Discord or generic webhook destinations. A live zone may be email-only or webhook-only, but a manual test still needs a phone or enabled desktop because tests never contact external destinations. Only the matching zone routes receive that live alert.'); ?></li>
 		<li><?php echo _('To find a zone, open the official maps, choose your state, and find the three-digit number covering your location. Enter the state abbreviation, Z, and that number; for example, Texas zone 163 is TXZ163.'); ?> <a href="https://www.weather.gov/pimar/PubZone" target="_blank" rel="noopener noreferrer"><?php echo _('Open official NWS zone maps'); ?> <i class="fa fa-external-link" aria-hidden="true"></i></a></li>
 		<li><?php echo _('Supported event names are mapped internally to priorities, SIP NOTIFY colors, quiet-hour behavior, and TTS summaries.'); ?></li>
 		<li><?php echo _('Heat Advisory is supported. First-seen alerts remain eligible when Weather.gov labels them Update; reference-based chain keys suppress later timestamp-only reissues only after that chain has actually been processed.'); ?></li>
@@ -236,9 +262,9 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 
 	<h3><?php echo _('Lightning Alerts'); ?></h3>
 	<ul>
-		<li><?php echo _('Lightning Alerts is labeled Labs while the Xweather integration continues beta testing. The setup wizard defaults it to No and does not require credentials, recipients, or a Weather trigger zone unless the administrator opts in.'); ?></li>
-		<li><?php echo _('Lightning Alerts uses protected Xweather credentials and cloud-to-ground strikes. Up to five named trigger areas can each select a Weather Alert trigger group, Xweather location and radius, phone extensions, enabled desktop clients, email recipients, and an optional all-clear. Only the matching area email list receives that live alert. Credentials, query period, quiet hours, tones, voice, and volume are shared across the service.'); ?></li>
-		<li><?php echo _('Adaptive protection is enabled by default and requires every enabled Lightning area to select a Weather Alert group. The green shield means an area stays idle until its selected Weather.gov group has a thunderstorm event, then polls that location every five minutes through the grace period, which defaults to 60 minutes. Turning the toggle off changes the card to a red shield and polls every enabled area continuously; Lightning outside a Weather.gov event can be missed while protection is enabled.'); ?></li>
+		<li><?php echo _('The setup wizard defaults Lightning Alerts to No and does not require credentials, recipients, or a Weather trigger zone unless the administrator opts in. The overall module remains beta software and should be verified with each deployment’s devices and provider plan.'); ?></li>
+		<li><?php echo _('Lightning Alerts uses protected Xweather credentials. Up to five named trigger areas can independently select cloud-to-ground strikes, cloud-to-cloud strikes, or both; a forecast-aware Weather Alert trigger group; Xweather location and radius; phone, desktop, and email recipients; quiet hours; and an optional all-clear. Credentials, query period, tones, voice, volume, and the enabled shared webhook destinations remain service-wide.'); ?></li>
+		<li><?php echo _('Adaptive protection is enabled by default and requires every enabled Lightning area to select a Weather Alert group. The green shield means an area stays idle until a qualifying current Weather.gov alert or the structured forecast period active at that time indicates thunder, then polls that location every five minutes through the grace period, which defaults to 60 minutes. A future thunder period is remembered but does not spend Xweather tokens before its start. Turning the toggle off changes the card to a red shield and polls every enabled area continuously; Lightning outside a Weather.gov signal can be missed while protection is enabled.'); ?></li>
 		<li><?php echo _('Xweather usage is measured in cost tokens. Area state is isolated, but one protected quota governor is shared, so multiple storm-active areas consume tokens faster. The usage card shows the provider’s latest counters and labels an expired period as historical until a successful query refreshes it.'); ?></li>
 		<li><?php echo _('The 5-minute default is the longest gap-free period for standard Xweather access. Periods from 6–10 minutes can miss strikes unless the subscription includes extended lightning history.'); ?></li>
 		<li><?php echo _('A storm creates one entry alert using the nearest strike distance reported by Xweather, rounded to one decimal mile. Repeated strikes do not alert again until two clear queries reset the state; an optional all-clear can be sent. Lightning uses its own quiet-hours toggle and opening/closing tones.'); ?></li>
@@ -250,6 +276,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 	<h3><?php echo _('Dashboard Announcements'); ?></h3>
 	<ul>
 		<li><?php echo _('The dashboard widget can target online registered extensions, all phones, selected desktop clients, all desktops, announcement groups, or a combination.'); ?></li>
+		<li><?php echo _('General Settings can define up to 10 optional named Discord or Discord-compatible HTTPS Dashboard announcement webhooks. Each enabled destination appears as a separate checkbox, may be used without a local target, and receives bounded branded Discord embed JSON only when selected. Local phone, audio, and desktop submission runs before external webhook I/O.'); ?></li>
 		<li><?php echo _('Announcement groups can include online or offline extensions plus desktop app clients. Offline extensions are skipped when sending and the UI warns the sender.'); ?></li>
 		<li><?php echo _('Announcement audio can be disabled, tones only, TTS only, or tones plus TTS. Opening and closing recordings can be selected per announcement, and either may be None without changing the dialplan.'); ?></li>
 		<li><?php echo _('The Labs colored-announcement designer provides a title, background color, and preview. Colored image announcements are currently limited to compatible Yealink phones; other vendors receive their text format.'); ?></li>
@@ -257,7 +284,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 	</ul>
 
 	<h3><?php echo _('SIP NOTIFY and Desktop API'); ?></h3>
-		<p><?php echo _('Phones receive SIP NOTIFY pushes directly from Asterisk/PJSIP. Audio pages every resolved PJSIP contact through Page/ConfBridge. Visual delivery uses endpoint fan-out or safe per-contact routing. Installation hard-fails for mixed phone formats unless every contact has a usable URI and Asterisk has a usable default outbound endpoint; an unsafe cross-vendor fallback is never accepted. Asterisk submission is not handset acceptance. Desktop clients authenticate with their assigned username and password and can use either the live event stream or the JSON endpoint.'); ?></p>
+		<p><?php echo _('Phones receive SIP NOTIFY pushes directly from Asterisk/PJSIP. Audio pages every resolved PJSIP contact through Page/ConfBridge. Mixed phone families receive contact-specific vendor payloads when URI routing is available and one safe generic endpoint payload otherwise; unknown devices also use generic XML. Asterisk submission is not handset acceptance. Desktop clients authenticate with their assigned username and password and can use either the live event stream or the JSON endpoint. Sleeping or disconnected clients are not reported as live.'); ?></p>
 	<ul>
 		<li><code>/api/sipnotify/desktop</code> <?php echo _('returns JSON for the SLS Mass Notify desktop app. Use HTTP Basic authentication with the desktop client username and password configured in General Settings.'); ?></li>
 		<li><code>/api/sipnotify/desktop/stream</code> <?php echo _('returns a live server-sent-event stream using the same Basic authentication and per-client target filtering. The authenticated handshake is flushed through Apache immediately; clients should reconnect after the server reconnect event and may send Last-Event-ID when resuming. Expired authorized records advance the cursor without being emitted so the next valid notification is not skipped.'); ?></li>
@@ -283,7 +310,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 	</ul>
 
 		<h3><?php echo _('Email and Webhook Delivery'); ?></h3>
-		<p><?php echo _('General Settings manages the sender local part/domain, optional recipients for deduplicated system and error notices, and multiple Discord or generic HTTPS webhooks. Weather and Lightning email recipients are configured independently on each zone or trigger area. Fresh installs default to no-reply at the local Postfix/PBX domain.'); ?></p>
+		<p><?php echo _('General Settings manages the sender local part/domain, optional recipients for deduplicated system and error notices, multiple Discord or generic HTTPS alert webhooks, and a separate protected list of Discord or Discord-compatible HTTPS Dashboard announcement webhooks. Weather and Lightning email recipients are configured independently on each zone or trigger area. Fresh installs default to no-reply at the local Postfix/PBX domain.'); ?></p>
 		<p><?php echo _('Changing the email identity does not configure Postfix, an SMTP relay, DNS, SPF, DKIM, DMARC, or PTR/reverse DNS. Configure those separately so the selected identity is authorized to send from this PBX.'); ?></p>
 		<p><?php echo _('Live alert and system/error email is submitted through the local sendmail path as a branded Southland Servers HTML card with a plain-text alternative. Repeated active system faults are deduplicated. Discord uses a compact branded embed. Generic webhooks receive bounded structured JSON with an event ID and idempotency header. Webhook delivery requires HTTPS and public DNS/address validation, verifies TLS, refuses redirects, and redacts stored URLs from results. Manual tests, previews, and dry runs do not contact external destinations.'); ?></p>
 

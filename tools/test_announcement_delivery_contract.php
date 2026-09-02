@@ -59,14 +59,64 @@ $earlyDesktop = strpos($sendSource, 'if ($desktopRequested && !$desktopNeedsAudi
 $audioPreparation = strpos($sendSource, '$audioResult = $this->sendAnnouncementTtsAudio');
 $durationDesktop = strpos($sendSource, 'if ($desktopNeedsAudioDuration)', ($audioPreparation === false ? 0 : $audioPreparation));
 $phoneDelay = strpos($sendSource, 'sleep($notifyDelay)');
+$postLocalWebhookDispatch = strrpos($sendSource, "\n\t\t\$dispatchWebhooks();");
 if ($earlyDesktop === false || $audioPreparation === false || $durationDesktop === false || $phoneDelay === false
-	|| !($earlyDesktop < $audioPreparation && $audioPreparation < $durationDesktop && $durationDesktop < $phoneDelay)) {
+	|| $postLocalWebhookDispatch === false
+	|| !($earlyDesktop < $audioPreparation && $audioPreparation < $durationDesktop && $durationDesktop < $phoneDelay && $phoneDelay < $postLocalWebhookDispatch)) {
 	announcement_contract_fail('Desktop publication is not ordered before TTS, or immediately after duration discovery and before the phone delay.');
 }
 foreach (['desktop_publish_failed_after_audio', 'audio_failed_after_desktop', 'notify_failed_after_desktop', "'partial_delivery' => true"] as $marker) {
 	if (strpos($sendSource, $marker) === false) {
 		announcement_contract_fail('Mixed-channel partial-delivery reporting is missing: ' . $marker);
 	}
+}
+foreach ([
+	"(!empty(\$selected) || \$desktopRequested) && !is_executable(self::VISUAL_PUSH_SCRIPT)",
+	"empty(\$selected) && !\$desktopRequested && !\$webhookRequested",
+	"'webhook_destination_ids' => array_keys(\$selectedAnnouncementWebhooks)",
+	"'announcement_webhook_failed'",
+] as $marker) {
+	if (strpos($sendSource, $marker) === false) {
+		announcement_contract_fail('Dashboard webhook-only or partial-delivery contract is missing: ' . $marker);
+	}
+}
+
+$webhookMethodStart = strpos($classSource, "\n\tprivate function dispatchAnnouncementWebhooks");
+$webhookMethodEnd = strpos($classSource, "\n\tprivate function buildAnnouncementVisualPushCommand", $webhookMethodStart ?: 0);
+$webhookMethod = ($webhookMethodStart !== false && $webhookMethodEnd !== false)
+	? substr($classSource, $webhookMethodStart, $webhookMethodEnd - $webhookMethodStart)
+	: '';
+foreach (['proc_open($command', "['bypass_shell' => true]", "'--announcement'", "'SLS_NOTIFICATION_LIVE'"] as $marker) {
+	if (strpos($webhookMethod, $marker) === false) {
+		announcement_contract_fail('Dashboard webhook dispatcher is missing its shell-free bounded handoff: ' . $marker);
+	}
+}
+if (strpos($webhookMethod, 'exec(') !== false || strpos($webhookMethod, 'shell_exec(') !== false) {
+	announcement_contract_fail('Dashboard webhook request fields can reach a shell command.');
+}
+
+$audioStart = strpos($classSource, "\tprivate function sendAnnouncementTtsAudio");
+$audioEnd = strpos($classSource, "\n\tprivate function generateAnnouncementTtsFile", $audioStart === false ? 0 : $audioStart);
+if ($audioStart === false || $audioEnd === false) {
+	announcement_contract_fail('Unable to isolate announcement audio preparation source.');
+}
+$audioSource = substr($classSource, $audioStart, $audioEnd - $audioStart);
+foreach (['ensureRuntimePermissions(', 'ensurePiperRuntime(', 'ensurePluginDataDir('] as $forbidden) {
+	if (strpos($audioSource, $forbidden) !== false) {
+		announcement_contract_fail('A dashboard announcement request still invokes privileged runtime mutation: ' . $forbidden);
+	}
+}
+if (strpos($audioSource, 'announcement audio workspace is unavailable') === false) {
+	announcement_contract_fail('Announcement runtime validation does not direct the operator to protected repair.');
+}
+
+$installStart = strpos($classSource, "\tpublic function install()");
+$installEnd = strpos($classSource, "\n\tpublic function uninstall()", $installStart === false ? 0 : $installStart);
+$installSource = ($installStart !== false && $installEnd !== false) ? substr($classSource, $installStart, $installEnd - $installStart) : '';
+$piperPosition = strpos($installSource, '$this->ensurePiperRuntime();');
+$permissionsPosition = strpos($installSource, '$this->ensureRuntimePermissions();');
+if ($piperPosition === false || $permissionsPosition === false || $permissionsPosition < $piperPosition) {
+	announcement_contract_fail('Install scans the managed data tree before repairing the Piper compatibility boundary.');
 }
 
 $dashboard = (string)file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/dashboard/views/sections/sls-mass-notify-announcement.php');
@@ -78,13 +128,61 @@ foreach ([
 	'aria-atomic="true"',
 	'function setAnnouncementStatus',
 	'Preparing announcement and starting the selected delivery channels',
+	'name="announcement_webhooks[]"',
+	"checkbox.name = 'announcement_groups[]'",
+	'name="announcement_extensions[]"',
+	'name="announcement_desktop_clients[]"',
+	'name="announcement_all_phones"',
+	'name="announcement_all_desktops"',
+	'name="announcement_audio_mode"',
+	'name="announcement_opening_tone"',
+	'name="announcement_closing_tone"',
+	'name="announcement_colored"',
+	'Each Discord or compatible HTTPS selection receives a branded Discord embed JSON payload.',
 	'Announcement response could not be confirmed. Wait for cooldown status before retrying.',
 	'deliveryOutcomeUnknown = true',
-	"cooldown.textContent = 'Checking delivery status…'",
+	"setCooldownText('Checking delivery status…', 'refresh fa-spin')",
+	'class="sls-destination-grid"',
+	'<details class="sls-destination-panel">',
+	'class="fa fa-circle-o-notch fa-spin sls-submit-spinner"',
+	'function setSubmitBusy',
+	'requestInFlight',
+	"panel.addEventListener('toggle', scheduleDashboardLayout)",
+	'lifecycle.timeouts = [35, 180].map',
+	'id="dashboard-announcement-character-count"',
+	"var lifecycleKey = '__slsMassNotifyAnnouncementWidget'",
+	"previousLifecycle.dispose()",
+	'this.intervals.forEach(function(timer) { window.clearInterval(timer); })',
+	'this.timeouts.forEach(function(timer) { window.clearTimeout(timer); })',
+	'this.resizeObserver.disconnect()',
+	"window.removeEventListener('resize', this.resizeHandler)",
+	'document.documentElement.contains(root)',
+	'lifecycle.resizeObserver = new ResizeObserver(scheduleDashboardLayout)',
+	"window.addEventListener('resize', lifecycle.resizeHandler)",
 ] as $marker) {
 	if (strpos($dashboard, $marker) === false) {
 		announcement_contract_fail('Dashboard delivery feedback contract is missing: ' . $marker);
 	}
+}
+if (substr_count($dashboard, '<details class="sls-destination-panel">') !== 3) {
+	announcement_contract_fail('Dashboard destinations are not consolidated into exactly three disclosure panels.');
+}
+if (substr_count($dashboard, '<section class="sls-step-card"') !== 2) {
+	announcement_contract_fail('Dashboard composer is no longer consolidated into two primary sections.');
+}
+if (substr_count($dashboard, "var lifecycleKey = '__slsMassNotifyAnnouncementWidget'") < 2
+	|| substr_count($dashboard, 'lifecycle.intervals.push(window.setInterval(') !== 2
+	|| substr_count($dashboard, 'if (!instanceActive())') < 8
+	|| strpos($dashboard, 'new ResizeObserver(scheduleDashboardLayout).observe(root)') !== false
+	|| strpos($dashboard, "window.addEventListener('resize', scheduleDashboardLayout)") !== false) {
+	announcement_contract_fail('Dashboard AJAX-refresh lifecycle cleanup or stale-callback guards regressed.');
+}
+if (strpos($dashboard, '#dashboard-sls-mass-notify-announcement {') === false
+	|| strpos($dashboard, 'grid-template-columns: repeat(auto-fit, minmax(165px, 1fr));') === false
+	|| strpos($dashboard, "dashboardItem.style.height = 'auto'") === false
+	|| strpos($dashboard, "dashboardContent.style.height = 'auto'") === false
+	|| strpos($dashboard, '@media (max-width: 767px)') === false) {
+	announcement_contract_fail('Dashboard overflow containment or responsive destination layout is missing.');
 }
 $buttonPosition = strpos($dashboard, 'dashboard-sls-mass-notify-announcement-submit');
 $inlineStatusPosition = strpos($dashboard, 'dashboard-sls-mass-notify-announcement-result', $buttonPosition === false ? 0 : $buttonPosition);

@@ -269,6 +269,19 @@ def queue_local_dispatch_intent(
     return True
 
 
+def cancel_local_dispatch_intent(path: Path, alert_key: Any) -> bool:
+    """Remove an intent only when the caller proved that zero local work ran."""
+    key = _local_dispatch_key(alert_key)
+    with _locked_local_dispatch_state(Path(path)) as state_path:
+        state = _load_local_dispatch_state(state_path)
+        _prune_local_dispatch_state(state)
+        if key not in state["intents"]:
+            return False
+        state["intents"].pop(key, None)
+        _write_local_dispatch_state(state_path, state)
+    return True
+
+
 def _text(value: Any, limit: int) -> str:
     return re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or "")).strip()[:limit]
 
@@ -621,14 +634,14 @@ def _json_env(name: str, fallback: Any) -> Any:
 
 
 def main() -> int:
-    commands = {"mutate", "reconcile", "local-intent", "local-recorded"}
+    commands = {"mutate", "reconcile", "local-intent", "local-recorded", "local-cancel"}
     if len(sys.argv) != 2 or sys.argv[1] not in commands:
         print(
-            "Usage: sls_nws_status.py {mutate|reconcile|local-intent|local-recorded}",
+            "Usage: sls_nws_status.py {mutate|reconcile|local-intent|local-recorded|local-cancel}",
             file=sys.stderr,
         )
         return 2
-    if sys.argv[1] in {"local-intent", "local-recorded"}:
+    if sys.argv[1] in {"local-intent", "local-recorded", "local-cancel"}:
         state_path = Path(os.environ.get("NWS_LOCAL_DISPATCH_STATE_PATH", ""))
         if not str(state_path) or str(state_path) == ".":
             print("NWS_LOCAL_DISPATCH_STATE_PATH is required", file=sys.stderr)
@@ -641,6 +654,13 @@ def main() -> int:
                 )
                 print(json.dumps({"recorded": recorded}, separators=(",", ":")))
                 return 0 if recorded else 1
+            if sys.argv[1] == "local-cancel":
+                cancelled = cancel_local_dispatch_intent(
+                    state_path,
+                    os.environ.get("NWS_LOCAL_DISPATCH_KEY", ""),
+                )
+                print(json.dumps({"cancelled": cancelled}, separators=(",", ":")))
+                return 0 if cancelled else 10
             queued = queue_local_dispatch_intent(
                 state_path,
                 os.environ.get("NWS_LOCAL_DISPATCH_KEY", ""),

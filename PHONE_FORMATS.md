@@ -23,9 +23,9 @@ Use the popup to enter a numeric extension and select a supported family. The Ye
 Multiple contacts on one extension
 ----------------------------------
 
-When every phone on an extension uses the same detected or manually overridden format, the sender submits one endpoint-targeted NOTIFY and lets Asterisk fan it out with that endpoint's own transport, NAT, and contact handling. This is the portable default and does not require `default_outbound_endpoint`.
+When every phone on an extension uses the same detected or manually overridden format, the sender submits one endpoint-targeted NOTIFY and lets Asterisk fan it out with that endpoint's own transport, NAT, and contact handling. This is the portable default and does not require `default_outbound_endpoint`. UDP, TCP, and TLS are inherited from each registered PJSIP contact; the module does not force a transport or rewrite phone endpoint settings.
 
-Mixed phone formats on one extension require a distinct full contact URI for every registration and an Asterisk `default_outbound_endpoint` that can originate arbitrary-URI NOTIFY requests. Only then does the sender route each vendor payload to its matching contact. If either requirement is missing, delivery fails clearly instead of sending incompatible XML to every phone. A manual extension override intentionally makes all contacts on that extension use one format.
+When mixed phone formats share an extension, the sender routes each vendor payload to its matching contact only if every registration has a distinct full URI and Asterisk has a usable `default_outbound_endpoint` for arbitrary-URI NOTIFY requests. SIP/SIPS URIs retain their registered UDP, TCP, or TLS transport, port, URI parameters, and IPv6 syntax. If safe contact-specific routing is unavailable, the sender submits one conservative generic XML payload through portable endpoint fan-out instead of failing the installation or sending one vendor's XML to another vendor. A manual extension override intentionally makes all contacts on that extension use one format.
 
 Implemented format families
 ---------------------------
@@ -51,4 +51,4 @@ Hardware testing requirement
 
 Vendor XML documentation describes object shapes, but it does not guarantee that every firmware accepts those objects through an unsolicited SIP NOTIFY. Actual behavior depends on phone model, firmware, XML browser/push configuration, authentication settings, HTTPS trust, and whether the phone accepts a push while idle or in-call. An AMI `PJSIPNotify` success means Asterisk queued the request; it does not prove that the handset displayed it.
 
-For mixed-vendor contacts sharing one extension, the module uses contact-specific URI delivery only after proving that every contact is addressable and Asterisk has a usable default outbound endpoint. Separate extensions remain the recommended and easiest-to-diagnose arrangement.
+For mixed-vendor contacts sharing one extension, the module uses contact-specific URI delivery only after proving that every contact is addressable and Asterisk has a usable default outbound endpoint. Otherwise it uses the generic endpoint fallback described above. Separate extensions remain the recommended and easiest-to-diagnose arrangement.

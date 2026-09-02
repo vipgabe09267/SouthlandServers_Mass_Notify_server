@@ -4,6 +4,7 @@
 import importlib.util
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -86,6 +87,21 @@ for marker in (
 assert "'Heat Advisory'," in module_class_source, "Heat Advisory missing from FreePBX event choices"
 assert '"Heat Advisory"' in poller_source, "Heat Advisory missing from poller event map"
 
+# Simultaneous candidates are deterministically ordered before delivery and a
+# PBX-wide audio lock remains held for the measured page lifetime. A failed
+# endpoint is not retried by the call spool, which would otherwise overlap a
+# later alert and could produce stale/expired call-file notices.
+for marker in (
+    "parsed_alerts.append((issued_key, type_order, source_index, values))",
+    "for _issued, _type_order, _source_index, values in sorted(parsed_alerts):",
+    "NWS_AUDIO_DELIVERY_LOCK",
+    "/usr/bin/flock -w 3300",
+    "release_audio_delivery_slot",
+    "MaxRetries: 0",
+):
+    assert marker in poller_source, f"missing serialized Weather delivery guard: {marker}"
+assert "MaxRetries: 6" not in poller_source, "Weather call files can still retry into the next queued alert"
+
 # The local journal is atomic, private, append-only within its bounded alert
 # history, and fail-closed. A second queue result is recovery, not permission
 # to submit the same phone/Desktop work again.
@@ -114,6 +130,9 @@ with tempfile.TemporaryDirectory(prefix="sls-nws-local-intent-unit-") as directo
     )
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert len(state["intents"]) == 1
+    assert STATUS_MODULE.cancel_local_dispatch_intent(state_path, "Heat Advisory|intent-unit")
+    assert not STATUS_MODULE.local_dispatch_intent_recorded(state_path, "Heat Advisory|intent-unit")
+    assert not STATUS_MODULE.cancel_local_dispatch_intent(state_path, "Heat Advisory|intent-unit")
 
     corrupt_path = Path(directory) / "corrupt-local-dispatch.json"
     corrupt_path.write_bytes(b"{corrupt\n")
@@ -207,6 +226,7 @@ def run_live_poller_case(
     crash_after_visual=False,
     repair_journal=False,
     force_replay=False,
+    external_only=False,
 ):
     """Exercise the real shell flow with local-only fakes and no network."""
     with tempfile.TemporaryDirectory(prefix=f"sls-nws-intent-{case_name}-") as directory:
@@ -306,6 +326,30 @@ def run_live_poller_case(
                         raise SystemExit("external sender ran before local submission")
                     with Path(os.environ["NWS_EXTERNAL_RETRY_MARKER"]).open("a", encoding="utf-8") as handle:
                         handle.write("after-local\\n")
+                    raise SystemExit(0)
+                """,
+            )
+        if external_only:
+            destination_path = root / "external-only.py"
+            write_executable(
+                destination_path,
+                """
+                #!/usr/bin/env python3
+                import json
+                import os
+                from pathlib import Path
+
+                def queue_external_delivery(state_path, _config, correlation_key, *_args, **_kwargs):
+                    path = Path(state_path)
+                    state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"deliveries": {}}
+                    state["deliveries"].setdefault(correlation_key, {"completed_at": 0})
+                    path.write_text(json.dumps(state) + "\\n", encoding="utf-8")
+                    path.chmod(0o640)
+                    return correlation_key
+
+                if __name__ == "__main__":
+                    with Path(os.environ["NWS_EXTERNAL_RETRY_MARKER"]).open("a", encoding="utf-8") as handle:
+                        handle.write("external-only\\n")
                     raise SystemExit(0)
                 """,
             )
@@ -410,8 +454,8 @@ def run_live_poller_case(
             "VISUAL_SCRIPT": str(visual_path),
             "NWS_ZONE_OVERRIDE": "TXC001",
             "NWS_RECIPIENTS_OVERRIDE": "",
-            "NWS_DESKTOP_CLIENTS_OVERRIDE": "test-desktop",
-            "NWS_EMAIL_RECIPIENTS_OVERRIDE": "",
+            "NWS_DESKTOP_CLIENTS_OVERRIDE": "" if external_only else "test-desktop",
+            "NWS_EMAIL_RECIPIENTS_OVERRIDE": "external@example.com" if external_only else "",
             "NWS_TEST_PAYLOAD_SOURCE": str(payload_path),
             "NWS_EXPECTED_ALERT_KEY": alert_key,
             "NWS_VISUAL_MARKER": str(visual_marker),
@@ -433,7 +477,12 @@ def run_live_poller_case(
             timeout=60,
             check=False,
         )
-        if result.returncode != 0:
+        expected_crash = (
+            (crash_after_intent or crash_after_visual)
+            and crash_marker.exists()
+            and result.returncode in {-signal.SIGKILL, 128 + signal.SIGKILL}
+        )
+        if result.returncode != 0 and not expected_crash:
             log = (root / "poller.log").read_text(encoding="utf-8", errors="replace")
             raise AssertionError(
                 f"poller case {case_name} failed ({result.returncode}): "
@@ -580,6 +629,20 @@ assert force_key not in force_processed, "operator replay was silently committed
 assert not force_external, "operator-only local replay unexpectedly queued external work"
 assert force_status["last_delivery_status"] == "queued"
 
+external_only_status, external_only_processed, external_only_visual, external_only_local, external_only_key, external_only_recorded, _ = run_live_poller_case(
+    "external-only", external_only=True
+)
+assert external_only_visual == [], "external-only Weather delivery invoked a local visual channel"
+assert external_only_local == b"", "external-only Weather delivery created a local at-most-once intent"
+assert external_only_key in external_only_processed and external_only_recorded, (
+    external_only_status,
+    external_only_processed,
+    external_only_key,
+    external_only_recorded,
+)
+assert external_only_status["last_delivery_status"] == "queued"
+assert "No local phone or Desktop channel was requested" in external_only_status["last_delivery_message"]
+
 # Source order backs the behavioral fakes: external task first, local intent
 # second, and both irreversible local calls strictly after those markers.
 external_stage = poller_source.index("# Stage 1: durable external work")
@@ -591,6 +654,70 @@ visual_queue = poller_source.index('trigger_visual_alert "$ALERT_B64"', audio_qu
 retry_stage = poller_source.index("# Stage 3 runs only after every actionable alert", visual_queue)
 retry_call = poller_source.index("retry_pending_external_destinations", retry_stage)
 assert external_stage < external_queue < intent_stage < intent_queue < audio_queue < visual_queue < retry_stage < retry_call
+
+# The durable Desktop journal is published immediately after accepted audio
+# queueing. Only the phone SIP NOTIFY waits for audio to start, and both legs
+# are attempted independently before their aggregate status is returned.
+visual_function = poller_source[
+    poller_source.index("trigger_visual_alert() {"):
+    poller_source.index("get_nws_recipient_targets()")
+]
+desktop_submit = visual_function.index('--api-only --desktop-targets "$desktop_targets"')
+phone_delay = visual_function.index('sleep "$phone_delay_seconds"', desktop_submit)
+phone_submit = visual_function.index('--targets "$targets" --no-api', phone_delay)
+assert desktop_submit < phone_delay < phone_submit
+assert 'trigger_visual_alert "$ALERT_B64" "$EVENT" "$ALERT_ID" 2' in poller_source
+assert "sleeping or disconnected client is not treated as an error" in visual_function
+
+# Exercise the real shell function with both channels configured. A failure in
+# either subprocess must still leave evidence that both independent attempts
+# ran, with the Desktop journal always first.
+with tempfile.TemporaryDirectory(prefix="sls-nws-visual-channels-") as directory:
+    visual_root = Path(directory)
+    visual_harness_functions = poller_source[
+        poller_source.index("trigger_visual_alert() {"):
+        poller_source.index("audio_page_hold_seconds()")
+    ]
+    visual_probe = visual_root / "visual-probe.py"
+    write_probe_source = """
+        #!/usr/bin/env python3
+        import os
+        import sys
+        channel = "desktop" if "--api-only" in sys.argv else "phone"
+        with open(os.environ["NWS_VISUAL_ORDER"], "a", encoding="utf-8") as handle:
+            handle.write(channel + "\\n")
+        raise SystemExit(1 if os.environ.get("NWS_FAIL_CHANNEL") == channel else 0)
+    """
+    visual_probe.write_text(textwrap.dedent(write_probe_source).lstrip(), encoding="utf-8")
+    visual_probe.chmod(0o755)
+    harness = visual_root / "visual-harness.sh"
+    harness.write_text(
+        "#!/bin/bash\n"
+        "NWS_ALERT_RECIPIENTS=(1000)\n"
+        "NWS_DESKTOP_RECIPIENTS=(test-desktop)\n"
+        f"VISUAL_SCRIPT={str(visual_probe)!r}\n"
+        f"LOG={str(visual_root / 'visual.log')!r}\n"
+        + visual_harness_functions
+        + "\ntrigger_visual_alert payload 'Heat Advisory' alert-id 0\n",
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    for failed_channel in ("desktop", "phone"):
+        order_file = visual_root / f"{failed_channel}-order.txt"
+        visual_env = os.environ.copy()
+        visual_env.update({
+            "NWS_VISUAL_ORDER": str(order_file),
+            "NWS_FAIL_CHANNEL": failed_channel,
+        })
+        visual_result = subprocess.run(
+            [str(harness)], env=visual_env, capture_output=True, text=True, check=False
+        )
+        assert visual_result.returncode == 1
+        assert order_file.read_text(encoding="utf-8").splitlines() == ["desktop", "phone"], (
+            failed_channel,
+            visual_result.stdout,
+            visual_result.stderr,
+        )
 for marker in (
     'DELIVERY_STATUS="indeterminate"',
     "automatic local replay is suppressed",

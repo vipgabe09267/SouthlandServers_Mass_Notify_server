@@ -143,11 +143,29 @@ cleanup_recovery_signer() {
   RECOVERY_SIGNER=""
 }
 
-run_fwconsole() {
+close_inherited_maintenance_lock_fds() {
+  local lock_file="${SLS_MASS_NOTIFY_MAINTENANCE_LOCK:-/run/lock/sls-mass-notify-maintenance.lock}"
+  local descriptor descriptor_path descriptor_target close_fd
+
+  for descriptor_path in "/proc/${BASHPID}/fd/"*; do
+    [ -e "$descriptor_path" ] || continue
+    descriptor="${descriptor_path##*/}"
+    [[ "$descriptor" =~ ^[0-9]+$ ]] && [ "$descriptor" -gt 2 ] || continue
+    descriptor_target="$(readlink -f -- "$descriptor_path" 2>/dev/null || true)"
+    [ "$descriptor_target" = "$lock_file" ] || continue
+    close_fd="$descriptor"
+    exec {close_fd}>&-
+  done
+}
+
+run_fwconsole() (
+  # The parent uninstaller or maintenance worker retains the transaction lock;
+  # descendants must not inherit it and accidentally extend its lifetime.
+  close_inherited_maintenance_lock_fds
   # PCRE JIT allocation can be denied by otherwise healthy unprivileged LXC
   # containers. Limit this compatibility override to the uninstall process.
   php -d pcre.jit=0 "$(command -v fwconsole)" "$@"
-}
+)
 
 module_registry_exists() {
   SLS_MODULE_NAME="$MODULE" php -d pcre.jit=0 -r '

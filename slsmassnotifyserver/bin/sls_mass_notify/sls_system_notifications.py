@@ -35,7 +35,7 @@ MAX_ACTIVE_FAULTS = 16
 MAX_HISTORY_RECORDS = 512
 
 
-def _read_json(path: Path, *, required: bool = False) -> dict:
+def _read_json(path: Path, *, required: bool = False, tolerate_corrupt: bool = False):
     flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
@@ -49,17 +49,38 @@ def _read_json(path: Path, *, required: bool = False) -> dict:
             raise RuntimeError(f"unsafe JSON file: {path.name}")
         with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
             descriptor = -1
-            decoded = json.load(handle)
+            # The Weather status writers take an exclusive inode lock while
+            # updating in place. A shared lock prevents this reader from seeing
+            # their temporary truncate/write window.
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            try:
+                raw = handle.read()
+            except UnicodeError as exc:
+                if tolerate_corrupt:
+                    return None
+                raise RuntimeError(f"JSON file is corrupt: {path.name}") from exc
+        if not raw.strip():
+            if tolerate_corrupt:
+                return None
+            raise RuntimeError(f"JSON file is empty: {path.name}")
+        try:
+            decoded = json.loads(raw)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            if tolerate_corrupt:
+                return None
+            raise RuntimeError(f"JSON file is corrupt: {path.name}") from exc
     finally:
         if descriptor >= 0:
             os.close(descriptor)
     if not isinstance(decoded, dict):
+        if tolerate_corrupt:
+            return None
         raise RuntimeError(f"JSON root is not an object: {path.name}")
     return decoded
 
 
 def _recipient_values(config: dict) -> list[str]:
-    # System/error mail is deliberately opt-in. The pre-0.1.0 mail_to field is
+    # System/error mail is deliberately opt-in. The pre-0.1.1-beta mail_to field is
     # migrated into Weather/Lightning service routes by the module, not into
     # this operational-notification channel.
     raw = config.get("system_notification_emails", "")
@@ -379,7 +400,14 @@ def process_faults(config: dict, faults: dict[str, dict], state_path: Path, *, s
 def main() -> int:
     config = _read_json(CONFIG_FILE, required=True)
     _recipient_values(config)
-    status = _read_json(STATUS_FILE)
+    # status.json is operational telemetry written by several bounded workers.
+    # A truncated legacy write must neither crash this notifier nor look like a
+    # healthy transition that clears the active-fault journal. Skip this cycle
+    # and retry the next minute; protected config and notifier state stay strict.
+    status = _read_json(STATUS_FILE, tolerate_corrupt=True)
+    if status is None:
+        print("Weather status snapshot is temporarily unavailable; system notification evaluation will retry later.", file=sys.stderr)
+        return 0
     faults = collect_faults(
         status,
         _read_json(INSTALL_FAILURE_FILE),

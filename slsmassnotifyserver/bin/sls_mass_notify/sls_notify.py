@@ -1503,14 +1503,33 @@ def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_resul
         )
 
         if mixed_formats and not use_contact_uri:
-            error = (
-                f"mixed phone formats {contact_formats} require a distinct contact URI for every registration "
-                "and a usable default outbound endpoint; use one phone family per extension or apply a manual format override"
-            )
-            failures.append(f"{extension}: {error}")
-            logging.error("Unable to route SIP NOTIFY for extension %s: %s", extension, error)
-            if print_results:
-                print(f"{extension}: failed ({attempt_label}) - {error}")
+            # Endpoint targeting is the portable fallback when Asterisk cannot
+            # address every registration URI independently. A vendor-specific
+            # document could be invalid for another phone family, so submit one
+            # deliberately generic XML document for Asterisk to fan out.
+            try:
+                xml_payload = payload_builder("generic")
+                result = send_notify(ami, extension, xml_payload, "generic", "Endpoint")
+                successes += max(1, len(contacts))
+                logging.warning(
+                    "Submitted generic endpoint-fan-out SIP NOTIFY %s extension=%s mixed_formats=%s "
+                    "contacts=%s attempt=%s route=%s: %s",
+                    alert_id, extension, contact_formats, len(contacts), attempt_label,
+                    capabilities.get("routing_mode", "endpoint_fanout"), result,
+                )
+                if print_results:
+                    print(
+                        f"{extension}: submitted safe generic endpoint fallback for mixed formats "
+                        f"{contact_formats} ({attempt_label})"
+                    )
+            except Exception as exc:
+                failures.append(f"{extension}/generic: mixed-format endpoint fallback: {exc}")
+                logging.error(
+                    "Failed generic mixed-format SIP NOTIFY %s extension=%s formats=%s attempt=%s: %s",
+                    alert_id, extension, contact_formats, attempt_label, exc,
+                )
+                if print_results:
+                    print(f"{extension}: failed safe generic endpoint fallback ({attempt_label}) - {exc}")
             continue
 
         if contact_targets and not use_contact_uri:

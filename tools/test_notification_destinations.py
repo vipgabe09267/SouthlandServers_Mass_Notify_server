@@ -107,10 +107,62 @@ discord_payload = destinations.build_discord_payload(
 discord_embed = discord_payload["embeds"][0]
 assert discord_payload["avatar_url"] == "https://southlandservers.xyz/images/webhook.png"
 assert discord_embed["author"]["icon_url"] == "https://southlandservers.xyz/images/webhook.png"
-assert discord_embed["image"]["url"] == "https://southlandservers.xyz/images/webhook_proxy.png"
+assert discord_embed["footer"]["icon_url"] == "https://southlandservers.xyz/images/webhook.png"
+assert discord_embed["thumbnail"]["url"] == "https://southlandservers.xyz/images/webhook_proxy.png"
+assert "image" not in discord_embed
 assert "sls_mass_notify/assets" not in json.dumps(discord_payload)
 assert "v=010" not in json.dumps(discord_payload)
 assert destinations.public_logo_url({}) == "https://southlandservers.xyz/images/webhook.png"
+
+announcement_payload = destinations.build_announcement_discord_payload(
+    {},
+    "Facility announcement",
+    "Please report to the main lobby.",
+    "#123456",
+    [("Audio", "TONES + TTS")],
+    "2026-09-02T12:00:00Z",
+)
+announcement_embed = announcement_payload["embeds"][0]
+assert announcement_embed["color"] == 0x123456
+assert announcement_embed["footer"]["text"] == "DASHBOARD ANNOUNCEMENT • SLS Mass Notification System"
+assert announcement_payload["avatar_url"] == destinations.DISCORD_AVATAR_URL
+assert announcement_embed["author"]["icon_url"] == destinations.SOUTHLAND_SERVERS_LOGO_URL
+assert announcement_embed["footer"]["icon_url"] == destinations.SOUTHLAND_SERVERS_LOGO_URL
+assert announcement_embed["thumbnail"]["url"] == destinations.DISCORD_EMBED_IMAGE_URL
+
+def assert_discord_limits(payload):
+    embed = payload["embeds"][0]
+    assert len(payload["username"]) <= 80
+    assert len(embed["author"]["name"]) <= 256
+    assert len(embed["title"]) <= 256
+    assert len(embed["description"]) <= 4096
+    assert len(embed["fields"]) <= 25
+    assert all(len(field["name"]) <= 256 and len(field["value"]) <= 1024 for field in embed["fields"])
+    assert len(embed["footer"]["text"]) <= 2048
+    text_total = (
+        len(embed["author"]["name"])
+        + len(embed["title"])
+        + len(embed["description"])
+        + len(embed["footer"]["text"])
+        + sum(len(field["name"]) + len(field["value"]) for field in embed["fields"])
+    )
+    assert text_total <= 6000
+
+
+# Keep every user-controlled Discord field comfortably inside Discord's
+# documented webhook/embed limits, including the aggregate 6000-character cap.
+assert_discord_limits(discord_payload)
+oversized_discord_payload = destinations.build_discord_payload(
+    {},
+    "S" * 2000,
+    "\n".join(["B" * 2000] * 12),
+    "E" * 1000,
+    "Extreme",
+    fields=[("N" * 1000, "V" * 4000) for _index in range(30)],
+    timestamp="2026-08-15T12:00:00Z",
+)
+assert_discord_limits(oversized_discord_payload)
+assert len(oversized_discord_payload["embeds"][0]["fields"]) == 6
 
 config = {
     "discord_webhooks": [
@@ -143,6 +195,66 @@ for live, test, dry_run, source in (
     )
     assert results == []
 assert calls == []
+
+announcement_config = {
+    "announcement_webhooks": [
+        {"id": "announcement_one", "name": "Main channel", "url": "https://discord.com/api/webhooks/11/ANNOUNCEMENT-SECRET", "enabled": "1"},
+        {"id": "announcement_two", "name": "Compatible receiver", "url": "https://hooks.example.com/discord-compatible/BACKUP-SECRET", "enabled": "1"},
+        {"id": "announcement_disabled", "name": "Disabled", "url": "https://discord.com/api/webhooks/13/DISABLED-SECRET", "enabled": "0"},
+    ],
+    "discord_webhooks": config["discord_webhooks"],
+    "generic_webhooks": config["generic_webhooks"],
+}
+announcement_calls = []
+
+
+def announcement_transport(url, kind, payload, timeout, resolver, event_id):
+    announcement_calls.append((url, kind, payload, timeout, resolver, event_id))
+    return (500, "0") if "BACKUP-SECRET" in url else (204, "")
+
+
+for kwargs in (
+    {"live": False, "source": "dashboard"},
+    {"live": True, "test": True, "source": "dashboard"},
+    {"live": True, "dry_run": True, "source": "dashboard"},
+    {"live": True, "source": "nws"},
+):
+    assert destinations.dispatch_announcement_webhooks(
+        announcement_config,
+        "Announcement",
+        "Body",
+        destination_ids=["announcement_one"],
+        transport=announcement_transport,
+        resolver=public_resolver,
+        sleep=lambda _seconds: None,
+        **kwargs,
+    ) == []
+assert announcement_calls == []
+
+announcement_results = destinations.dispatch_announcement_webhooks(
+    announcement_config,
+    "Facility announcement",
+    "Please report to the main lobby.",
+    "#123456",
+    [("Presentation", "Colored / Labs")],
+    "2026-09-02T12:00:00Z",
+    "dashboard-event-1",
+    ["announcement_one", "announcement_two", "announcement_disabled", "unknown"],
+    source="dashboard",
+    live=True,
+    transport=announcement_transport,
+    resolver=public_resolver,
+    sleep=lambda _seconds: None,
+)
+assert [result["id"] for result in announcement_results] == ["announcement_one", "announcement_two"]
+assert [result["status"] for result in announcement_results] == ["accepted", "failed"]
+assert announcement_calls[0][1] == "discord"
+assert all(call[1] == "generic" for call in announcement_calls[1:])
+assert announcement_calls[0][2]["embeds"][0]["color"] == 0x123456
+assert announcement_calls[1][2]["embeds"][0]["color"] == 0x123456
+serialized_announcement_results = json.dumps(announcement_results)
+for secret in ("ANNOUNCEMENT-SECRET", "BACKUP-SECRET", "DISABLED-SECRET"):
+    assert secret not in serialized_announcement_results
 
 results = destinations.dispatch_webhook_destinations(
     config,
@@ -302,14 +414,17 @@ assert quiet_block.rfind("update_status") > quiet_block.index("queue_external_de
 
 weather_scheduler_source = (ROOT / "slsmassnotifyserver" / "bin" / "sls_mass_notify_weather_poll.sh").read_text(encoding="utf-8")
 assert "SLS_WORKER_DEADLINE_EPOCH" not in weather_scheduler_source
-assert "CORE_WORKER_TIMEOUT_SECONDS=1100" in weather_scheduler_source
+assert "CORE_WORKER_TIMEOUT_SECONDS=5400" in weather_scheduler_source
 assert "/usr/bin/timeout --signal=TERM --kill-after=10" in weather_scheduler_source
 assert "sls_mass_notify_xweather_poll.lock" in weather_scheduler_source
 assert "/usr/bin/flock -n 8" in weather_scheduler_source
 assert "/usr/bin/timeout 50" not in weather_scheduler_source
 
 class_source = (ROOT / "slsmassnotifyserver" / "Slsmassnotifyserver.class.php").read_text(encoding="utf-8")
-assert "* * * * * /usr/bin/timeout 1200 /usr/local/bin/sls_mass_notify/sls_mass_notify_weather_poll.sh" in class_source
+assert "* * * * * /usr/bin/timeout 5500 /usr/local/bin/sls_mass_notify/sls_mass_notify_weather_poll.sh" in class_source
+assert "$weatherCronLine = '* * * * * /usr/bin/timeout 5500 /usr/local/bin/sls_mass_notify/sls_mass_notify_weather_poll.sh';" in class_source
+assert "trim($line) !== $weatherCronLine" in class_source
+assert "strpos((string)$line, '/usr/bin/timeout 1200')" not in class_source
 assert "/usr/bin/timeout 55 /usr/local/bin/sls_mass_notify/sls_mass_notify_weather_poll.sh" not in class_source
 
 xweather_source = (RUNTIME / "sls_mass_notify_xweather_poll.py").read_text(encoding="utf-8")

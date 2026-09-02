@@ -39,6 +39,7 @@ PY
 
 python3 "${ROOT_DIR}/tools/test_release_portability.py"
 bash "${ROOT_DIR}/tools/test_installer_asterisk_capabilities.sh"
+bash "${ROOT_DIR}/tools/test_installer_timezone.sh"
 bash "${ROOT_DIR}/tools/test_installer_config_safety.sh"
 bash "${ROOT_DIR}/tools/test_local_signer.sh"
 bash "${ROOT_DIR}/tools/test_uninstaller_signer_snapshot.sh"
@@ -50,10 +51,13 @@ php "${ROOT_DIR}/tools/test_email_sender_domain.php"
 python3 "${ROOT_DIR}/tools/test_email_sender_domain.py"
 php "${ROOT_DIR}/tools/test_notification_destinations.php"
 python3 "${ROOT_DIR}/tools/test_notification_destinations.py"
+php "${ROOT_DIR}/tools/test_notification_log_taxonomy.php"
 php "${ROOT_DIR}/tools/test_nws_zone_destinations.php"
 python3 "${ROOT_DIR}/tools/test_nws_zone_destinations.py"
+python3 "${ROOT_DIR}/tools/test_nws_cross_zone_claims.py"
 php "${ROOT_DIR}/tools/test_configuration_security_contract.php"
 php "${ROOT_DIR}/tools/test_ui_performance_contract.php"
+php "${ROOT_DIR}/tools/test_update_contract.php"
 python3 "${ROOT_DIR}/tools/test_external_delivery_retry.py"
 python3 "${ROOT_DIR}/tools/test_system_notifications.py"
 python3 "${ROOT_DIR}/tools/test_sls_notify_journal.py"
@@ -68,6 +72,7 @@ python3 "${ROOT_DIR}/tools/test_nws_status_concurrency.py"
 python3 "${ROOT_DIR}/tools/test_alert_worker_cli_safety.py"
 python3 "${ROOT_DIR}/tools/test_weather_manual_test_contract.py"
 php "${ROOT_DIR}/tools/test_freepbx_backup_restore.php"
+php "${ROOT_DIR}/tools/test_help_ui_contract.php"
 
 cmp -s "${ROOT_DIR}/tools/uninstall_release.sh" "${ROOT_DIR}/${MODULE}/bin/sls_mass_notify_uninstall.sh" || {
   printf 'Standalone and packaged uninstallers differ.\n' >&2
@@ -142,6 +147,7 @@ for required in \
   bin/sls_mass_notify/sls_notification_destinations.py \
   bin/sls_mass_notify/sls_system_notifications.py \
   bin/sls_mass_notify/sls_nws_status.py \
+  bin/sls_mass_notify/sls_nws_delivery_claims.py \
   bin/sls_mass_notify_nws_poll.sh bin/sls_mass_notify_test.sh \
   bin/sls_mass_notify_weather_poll.sh \
   bin/sls_mass_notify_schedule_worker.php \

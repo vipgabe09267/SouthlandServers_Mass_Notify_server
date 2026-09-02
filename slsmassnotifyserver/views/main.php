@@ -1,11 +1,15 @@
 <?php
 $typeOptions = [
-	'' => _('All Events'),
-	'nws' => _('Weather Alerts'),
-	'xweather' => _('Lightning Alerts'),
-	'test' => _('Manual Tests'),
-	'announcement' => _('Announcements'),
-	'announcement_audio' => _('Announcement Audio'),
+	'' => _('All Notification Types'),
+	'weather' => _('Weather Alerts'),
+	'lightning' => _('Lightning Alerts'),
+	'manual_test' => _('Manual Tests'),
+	'dashboard' => _('Dashboard Announcements'),
+	'api' => _('API Announcements'),
+	'scheduling' => _('Scheduled Announcements'),
+	'desktop' => _('Desktop Events'),
+	'system' => _('System and Errors'),
+	'other' => _('Other'),
 ];
 $limitOptions = [50, 100, 200, 500];
 $statusCards = is_array($status_summary ?? null) ? $status_summary : [];
@@ -15,21 +19,17 @@ $statusMeta = [
 	'notice' => ['class' => 'warning', 'icon' => 'fa-clock-o'],
 	'unknown' => ['class' => 'default', 'icon' => 'fa-question-circle'],
 ];
-$eventMeta = [
-	'nws' => ['class' => 'info', 'icon' => 'fa-cloud'],
-	'xweather' => ['class' => 'warning', 'icon' => 'fa-bolt'],
-	'test' => ['class' => 'primary', 'icon' => 'fa-flask'],
-	'announcement' => ['class' => 'primary', 'icon' => 'fa-bullhorn'],
-	'announcement_audio' => ['class' => 'success', 'icon' => 'fa-volume-up'],
+$notificationTypeMeta = [
+	'weather' => ['class' => 'info', 'icon' => 'fa-cloud'],
+	'lightning' => ['class' => 'warning', 'icon' => 'fa-bolt'],
+	'manual_test' => ['class' => 'primary', 'icon' => 'fa-flask'],
+	'dashboard' => ['class' => 'primary', 'icon' => 'fa-bullhorn'],
+	'api' => ['class' => 'info', 'icon' => 'fa-code'],
+	'scheduling' => ['class' => 'success', 'icon' => 'fa-calendar'],
+	'desktop' => ['class' => 'success', 'icon' => 'fa-desktop'],
+	'system' => ['class' => 'warning', 'icon' => 'fa-cog'],
 	'' => ['class' => 'default', 'icon' => 'fa-circle-o'],
 ];
-$severityClass = static function ($severity) {
-	$value = strtolower(trim((string)$severity));
-	if (preg_match('/extreme|emergency|tornado|severe|critical/', $value)) return 'danger';
-	if (preg_match('/warning|moderate|test/', $value)) return 'warning';
-	if (preg_match('/clear|minor|notice|advisory/', $value)) return 'success';
-	return 'default';
-};
 ?>
 <style>
 .sls-log-page { color:#1f2937; }
@@ -70,7 +70,7 @@ $severityClass = static function ($severity) {
 		<div class="fpbx-container">
 			<?php echo load_view(__DIR__ . '/hero.php', ['hero_image' => $hero_image]); ?>
 			<div class="sls-log-heading">
-				<div><h1><i class="fa fa-list-alt text-primary" aria-hidden="true"></i> <?php echo _('Notification Logs'); ?></h1><div class="text-muted"><?php echo _('Delivery history and operational health for Weather, Lightning, desktop, phone, and audio notifications.'); ?></div></div>
+				<div><h1><i class="fa fa-list-alt text-primary" aria-hidden="true"></i> <?php echo _('Notification Logs'); ?></h1><div class="text-muted"><?php echo _('Delivery history and operational health for Dashboard, API, scheduled, Weather, Lightning, desktop, phone, and audio notifications.'); ?></div></div>
 				<div class="sls-log-count"><i class="fa fa-database" aria-hidden="true"></i> <?php echo sprintf(_('%d event(s) shown'), count((array)$events)); ?></div>
 			</div>
 
@@ -88,7 +88,7 @@ $severityClass = static function ($severity) {
 			<form method="get" action="config.php" class="sls-log-toolbar">
 				<input type="hidden" name="display" value="slsmassnotifyserver">
 				<div class="sls-log-filter-row">
-					<div class="form-group"><label for="log_type"><i class="fa fa-filter" aria-hidden="true"></i> <?php echo _('Event Type'); ?></label><select class="form-control" id="log_type" name="log_type"><?php foreach ($typeOptions as $value => $label) { ?><option value="<?php echo htmlspecialchars($value); ?>" <?php echo $selected_type === $value ? 'selected' : ''; ?>><?php echo htmlspecialchars($label); ?></option><?php } ?></select></div>
+					<div class="form-group"><label for="log_type"><i class="fa fa-filter" aria-hidden="true"></i> <?php echo _('Notification Type'); ?></label><select class="form-control" id="log_type" name="log_type"><?php foreach ($typeOptions as $value => $label) { ?><option value="<?php echo htmlspecialchars($value); ?>" <?php echo $selected_type === $value ? 'selected' : ''; ?>><?php echo htmlspecialchars($label); ?></option><?php } ?></select></div>
 					<div class="form-group"><label for="log_date"><i class="fa fa-calendar" aria-hidden="true"></i> <?php echo _('Date'); ?></label><input class="form-control" id="log_date" name="log_date" type="date" value="<?php echo htmlspecialchars((string)($selected_date ?? '')); ?>"></div>
 					<div class="form-group"><label for="limit"><?php echo _('Show'); ?></label><select class="form-control" id="limit" name="limit"><?php foreach ($limitOptions as $value) { ?><option value="<?php echo (int)$value; ?>" <?php echo (int)$selected_limit === (int)$value ? 'selected' : ''; ?>><?php echo sprintf(_('%d rows'), (int)$value); ?></option><?php } ?></select></div>
 					<div class="sls-log-filter-actions"><button type="submit" class="btn btn-primary"><i class="fa fa-refresh" aria-hidden="true"></i> <?php echo _('Refresh View'); ?></button><?php if (!empty($selected_type) || !empty($selected_date)) { ?><a class="btn btn-default" href="config.php?display=slsmassnotifyserver"><i class="fa fa-times" aria-hidden="true"></i> <?php echo _('Clear Filters'); ?></a><?php } ?></div>
@@ -99,13 +99,13 @@ $severityClass = static function ($severity) {
 				<div class="sls-log-empty"><i class="fa fa-inbox" aria-hidden="true"></i><strong><?php echo _('No matching notification events'); ?></strong><div><?php echo _('New deliveries will appear here automatically after they are recorded.'); ?></div></div>
 			<?php } else { ?>
 				<div class="table-responsive sls-log-table-wrap"><table class="table sls-log-table">
-					<colgroup><col style="width:14%"><col style="width:27%"><col style="width:10%"><col style="width:17%"><col style="width:24%"><col style="width:8%"></colgroup>
-					<thead><tr><th><?php echo _('Time'); ?></th><th><?php echo _('Event'); ?></th><th><?php echo _('Severity'); ?></th><th><?php echo _('Triggered By'); ?></th><th><?php echo _('Delivery'); ?></th><th></th></tr></thead>
-					<tbody><?php foreach ($events as $event) { $type = (string)($event['type'] ?? ''); $meta = $eventMeta[$type] ?? $eventMeta['']; $body = trim((string)($event['body'] ?? '')); if (function_exists('mb_strlen') && mb_strlen($body) > 140) $body = mb_substr($body, 0, 137) . '…'; elseif (strlen($body) > 140) $body = substr($body, 0, 137) . '…'; ?>
+					<colgroup><col style="width:14%"><col style="width:30%"><col style="width:17%"><col style="width:15%"><col style="width:16%"><col style="width:8%"></colgroup>
+					<thead><tr><th><?php echo _('Time'); ?></th><th><?php echo _('Event'); ?></th><th><?php echo _('Type'); ?></th><th><?php echo _('Triggered By'); ?></th><th><?php echo _('Delivery'); ?></th><th></th></tr></thead>
+					<tbody><?php foreach ($events as $event) { $notificationType = (string)($event['notification_type'] ?? ''); $meta = $notificationTypeMeta[$notificationType] ?? $notificationTypeMeta['']; $body = trim((string)($event['body'] ?? '')); if (function_exists('mb_strlen') && mb_strlen($body) > 140) $body = mb_substr($body, 0, 137) . '…'; elseif (strlen($body) > 140) $body = substr($body, 0, 137) . '…'; ?>
 						<tr>
 							<td><div class="sls-log-time"><i class="fa fa-clock-o" aria-hidden="true"></i> <?php echo htmlspecialchars($event['display_time']); ?></div></td>
-							<td><span class="sls-log-badge <?php echo $meta['class']; ?>"><i class="fa <?php echo $meta['icon']; ?>" aria-hidden="true"></i> <?php echo htmlspecialchars($event['type_label']); ?></span><div class="sls-event-title"><?php echo htmlspecialchars($event['event'] !== '' ? $event['event'] : _('Unknown event')); ?></div><?php if ($body !== '') { ?><div class="sls-event-summary"><?php echo htmlspecialchars($body); ?></div><?php } ?></td>
-							<td><span class="label label-<?php echo $severityClass($event['severity']); ?>"><?php echo htmlspecialchars($event['severity'] !== '' ? $event['severity'] : _('Unknown')); ?></span></td>
+							<td><div class="sls-event-title" style="margin-top:0"><?php echo htmlspecialchars($event['event'] !== '' ? $event['event'] : _('Unknown event')); ?></div><?php if ($body !== '') { ?><div class="sls-event-summary"><?php echo htmlspecialchars($body); ?></div><?php } ?></td>
+							<td><span class="sls-log-badge <?php echo $meta['class']; ?>"><i class="fa <?php echo $meta['icon']; ?>" aria-hidden="true"></i> <?php echo htmlspecialchars($event['notification_type_label']); ?></span></td>
 							<td><strong><?php echo htmlspecialchars($event['triggered_by']); ?></strong><?php if (!empty($event['source_name'])) { ?><div class="sls-event-summary"><?php echo htmlspecialchars($event['source_name']); ?></div><?php } ?></td>
 							<td><div class="sls-log-audio"><i class="fa fa-volume-up text-muted" aria-hidden="true"></i> <?php echo htmlspecialchars($event['audio'] !== '' ? $event['audio'] : _('No audio')); ?></div><div class="sls-log-target"><i class="fa fa-users" aria-hidden="true"></i> <?php echo htmlspecialchars($event['page_group'] !== '' ? $event['page_group'] : _('No phone recipients recorded')); ?></div></td>
 							<td class="text-right"><a class="btn btn-default btn-sm" title="<?php echo htmlspecialchars(_('View full event details')); ?>" href="config.php?display=slsmassnotifyserver&amp;view=detail&amp;id=<?php echo urlencode($event['event_id']); ?>"><i class="fa fa-chevron-right" aria-hidden="true"></i></a></td>
