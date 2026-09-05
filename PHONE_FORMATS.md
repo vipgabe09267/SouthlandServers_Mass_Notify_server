@@ -52,3 +52,12 @@ Hardware testing requirement
 Vendor XML documentation describes object shapes, but it does not guarantee that every firmware accepts those objects through an unsolicited SIP NOTIFY. Actual behavior depends on phone model, firmware, XML browser/push configuration, authentication settings, HTTPS trust, and whether the phone accepts a push while idle or in-call. An AMI `PJSIPNotify` success means Asterisk queued the request; it does not prove that the handset displayed it.
 
 For mixed-vendor contacts sharing one extension, the module uses contact-specific URI delivery only after proving that every contact is addressable and Asterisk has a usable default outbound endpoint. Otherwise it uses the generic endpoint fallback described above. Separate extensions remain the recommended and easiest-to-diagnose arrangement.
+
+
+## Per-device overrides and capability labels
+
+General Settings supports an extension-wide format override and a more specific registration override. The latter is bound to the extension and current contact URI; changing the registration address requires selecting it again. A per-device override takes priority, allowing different phone families on one extension.
+
+The inventory distinguishes a detected or overridden template from a verified PBX route. Neither proves the handset accepts XML or auto-answers. UDP, TCP, and TLS are preserved as reported by PJSIP; encrypted transport must not be downgraded to force a test to pass. Unknown formats do not halt installation and receive the generic XML fallback.
+
+The Page answer window defaults to five seconds and may be shortened to one through five seconds. Do not lengthen ringing or rewrite handset provisioning to conceal an auto-answer failure. Review Asterisk call outcomes and test every registration, especially mixed desk-phone/softphone extensions.

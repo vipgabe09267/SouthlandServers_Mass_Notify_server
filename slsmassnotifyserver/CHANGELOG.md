@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.1.2-beta
+
+- Simplified the Dashboard announcement footer: one Send button, one busy indicator, a separate compact result, and expandable delivery details. Removed Review destinations, suppressed duplicate submits, retained expanded receipts across refreshes, and stopped displaying raw HTTP exception responses.
+- Green completion feedback now appears only after terminal successful submission and includes the authenticated sender; accepting a background job is not reported as completed delivery.
+- Added Normal/Urgent announcement audio priority, including strict Control API validation. Urgent prepared audio moves ahead of waiting routine audio on overlapping recipients without interrupting active playback or bypassing cooldown. Waiting jobs are bounded, abandoned tickets expire, and media retention begins at the actual reserved playback slot.
+- Added a CSRF-protected, authenticated diagnostic JSON download in General Settings. An explicit field allowlist includes versions, health results, permissions, anonymous device-format/transport counts, and queue counts; configuration, secrets, addresses, identifiers, raw logs, and message contents are excluded.
+- Kept Saved Channel Checks collapsed and marked optional, with an accessible question-mark explanation. Added priority, redaction, and Dashboard-state regression tests.
+- Added authenticated sender attribution to general announcements and creator attribution to newly saved schedules.
+- Moved Dashboard announcement delivery into durable background jobs, with resolved destinations, progress, per-channel receipts, interrupted-worker protection, and a bounded pending index.
+- Kept announcement channels independent: an audio or desktop failure does not suppress the other requested destinations. Partial audio queueing is no longer reported as complete success.
+- Fixed first-event and reconnect-cursor handling in desktop streams. Added pre-authentication throttling, bounded concurrent streams, active credential revocation, presence timestamps, and an optional targeted-event acknowledgement endpoint.
+- Added shared recipient-aware audio reservations for Dashboard, scheduled, Weather, and Lightning pages. Media retention respects queued playback and preserves generated audio for fifteen minutes after its reserved playback ends.
+- Tightened Lightning response and forecast validation, invalidated location-dependent caches after area edits, and made all-clear messages describe recent observations instead of claiming that a storm is gone. Added per-area all-clear observation periods and query-round quota rotation.
+- Added optional Bearer tokens and HMAC-SHA256 signatures for generic HTTPS receivers. Secrets remain in the central configuration and are redacted from API configuration responses.
+- Expired pending external deliveries after one hour, retaining which destinations expired. Changed Control API audit writes to bounded appends with scheduled retention, and bounded request-body reads before JSON parsing.
+- Pinned updater downloads to the resolved release commit. Added early checks for nonstandard FreePBX runtime paths, functional Piper checks, and a pinned fresh-install Piper dependency set.
+- Added publisher-signed Ed25519 manifests covering the installer and TGZ. The updater verifies both and installs the exact verified archive, without downloading a mutable second copy. Release-building tools produce the detached manifest signature separately from the module archive.
+- Added confirmed-failure-only announcement retries, duplicate-click protection, and revalidation of enabled destinations before queued delivery. Uncertain submissions are not automatically replayed.
+- Added per-registration phone-format overrides alongside extension-wide overrides. Device previews identify transport, vendor template availability, and unavailable targets without claiming handset acceptance.
+- Released the FreePBX session during authenticated Weather and Lightning AJAX tests so they do not block navigation in other tabs. Weather test exceptions now return a sanitized, non-retry-assuring result instead of an HTML exception page.
+- Added desktop connection and acknowledgment diagnostics, bounded on-demand device discovery, operational log rotation, and disk/external-retry queue health summaries.
+- Updated the private Piper environment and installer pins from pip 26.1.2 to 26.2.0 for CVE-2026-13346.
+- Added regressions for durable jobs, recipient concurrency, media leases, symlink rejection, HMAC authentication, header injection, retry expiry, desktop reconnects, and Lightning cache identity.
+- Fixed installer runtime inventories and executable-permission repair for the new announcement and weather workers. The release gate now checks every packaged worker against both installer inventories and the module/maintenance permission rules.
+
+- Separated Weather.gov and Lightning observations from delivery and external retries. Added a protected, bounded weather outbox, globally chronological NWS selection, same-chain queued update replacement, cancellation/expiry revalidation, and no automatic replay of interrupted deliveries.
+- Added saved local channel-check profiles: up to ten named, config-backed phone/desktop scopes with audio-only, visual-only, or combined checks. Profiles never send email/webhooks or query Xweather.
+- Added a paging answer timeout of one through five seconds, default five, distinct from audio length and visual expiry.
+- Added weather queue pending, failed, uncertain, and expired health counts. Lightning delivery revalidates current area identity and storm observations without overwriting the observer’s state, and publishes desktops before synthesis or audio queue waits.
+- Exposed recurring-schedule creator and finite last-occurrence information. Recurrence remains a bounded series, not automatic indefinite renewal.
+- Updated Help, installation, phone compatibility, and security documentation; reduced README bulk and kept the expanded installation command near the top.
+- Expanded behavioral and installer regressions for multi-zone chronology, observation/delivery lock separation, stale Lightning jobs, independently failing channels, protected config preservation, local signing, and rollback fixtures.
+
+Delivery results report the PBX submission boundary, not confirmed handset display or human receipt. Device/firmware testing, real-browser layout review, and a disposable full-install/uninstall/restore test remain deployment-specific release checks.
+
 ## 0.1.1-beta
 
 - Added installation-time timezone confirmation. The release installer reports the validated system timezone before activation, lets a directly attached administrator keep it or choose a listed IANA timezone, supports the noninteractive `SLS_MASS_NOTIFY_TIMEZONE` override, and restores the original timezone if a later installation stage rolls back.

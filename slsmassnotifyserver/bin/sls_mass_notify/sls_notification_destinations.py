@@ -7,6 +7,7 @@ the caller also identifies the event as a live NWS or Xweather alert.
 """
 
 import hashlib
+import hmac
 import http.client
 import fcntl
 import ipaddress
@@ -40,7 +41,8 @@ MAX_RETRY_DELIVERIES = 500
 MAX_RETRY_STATE_BYTES = 4 * 1024 * 1024
 MAX_RETRY_RECORDS_PER_RUN = 3
 COMPLETED_RETRY_RETENTION_SECONDS = 7 * 86400
-USER_AGENT = "SouthlandServers-Mass-Notifications-Server/0.1.1-beta"
+PENDING_RETRY_MAX_AGE_SECONDS = 3600
+USER_AGENT = "SouthlandServers-Mass-Notifications-Server/0.1.2-beta"
 DISCORD_HOSTS = {"discord.com", "discordapp.com", "canary.discord.com", "ptb.discord.com"}
 DISCORD_PATH = re.compile(r"^/api/webhooks/[0-9]+/[A-Za-z0-9._~-]+$")
 SOUTHLAND_SERVERS_LOGO_URL = "https://southlandservers.xyz/images/webhook.png"
@@ -383,7 +385,23 @@ def build_generic_payload(subject, body, event="", severity="", source="", event
     return payload
 
 
-def _request_once(url, kind, payload, timeout=DEFAULT_TIMEOUT, resolver=socket.getaddrinfo, idempotency_key=""):
+def webhook_auth_headers(authentication, body, event_id, now=None):
+    headers = {}
+    for field in ('bearer_token', 'signing_secret'):
+        secret = authentication.get(field, '')
+        if not isinstance(secret, str) or len(secret) > 512 or re.search(r'[^\x21-\x7e]', secret):
+            raise DestinationError('invalid_webhook_authentication')
+    if authentication.get('bearer_token'):
+        headers['Authorization'] = 'Bearer ' + authentication['bearer_token']
+    if authentication.get('signing_secret'):
+        timestamp = str(int(time.time() if now is None else now))
+        material = timestamp.encode() + b'.' + event_id.encode() + b'.' + body
+        digest = hmac.new(authentication['signing_secret'].encode(), material, hashlib.sha256).hexdigest()
+        headers.update({'X-SLS-Timestamp': timestamp, 'X-SLS-Signature': 'sha256=' + digest, 'X-SLS-Event-ID': event_id})
+    return headers
+
+
+def _request_once(url, kind, payload, timeout=DEFAULT_TIMEOUT, resolver=socket.getaddrinfo, idempotency_key="", authentication=None):
     request_deadline = time.monotonic() + max(0.1, float(timeout))
     hostname, path, addresses = _validated_url(url, kind, resolver)
     body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -397,6 +415,8 @@ def _request_once(url, kind, payload, timeout=DEFAULT_TIMEOUT, resolver=socket.g
         "Content-Length": str(len(body)),
         "Idempotency-Key": _normalized_event_id(idempotency_key, kind, "webhook", "", ""),
     }
+    if kind == 'generic' and authentication:
+        headers.update(webhook_auth_headers(authentication, body, headers['Idempotency-Key']))
     last_category = "network_failure"
     for address in addresses:
         remaining = request_deadline - time.monotonic()
@@ -454,6 +474,7 @@ def _destination_rows(config, kind):
             "id": _safe_id(row.get("id"), kind, name),
             "name": name,
             "url": str(row.get("url") or row.get("webhook_url") or "").strip(),
+            "authentication": {key: row.get(key, '') for key in ('bearer_token', 'signing_secret')} if kind == 'generic' else {},
         })
     return output
 
@@ -478,6 +499,7 @@ def _announcement_destination_rows(config):
             "id": _safe_id(row.get("id"), "announcement", name),
             "name": name,
             "url": url,
+            "authentication": {key: row.get(key, '') for key in ('bearer_token', 'signing_secret')} if hostname not in DISCORD_HOSTS else {},
         })
     return output
 
@@ -502,7 +524,9 @@ def _deliver(row, payload, event_id, transport, resolver, sleep, deadline, clock
             return _budget_failure(row, attempt - 1)
         request_timeout = min(DEFAULT_TIMEOUT, remaining)
         try:
-            status, retry_after = transport(row["url"], row["kind"], payload, request_timeout, resolver, event_id)
+            auth = row.get('authentication', {})
+            kwargs = {'authentication': auth} if any(auth.values()) else {}
+            status, retry_after = transport(row["url"], row["kind"], payload, request_timeout, resolver, event_id, **kwargs)
         except DeliveryBudgetExceeded:
             raise
         except DestinationError as exc:
@@ -832,6 +856,12 @@ def _prune_retry_state(state, now=None):
         if not isinstance(record, dict):
             raise RetryStateError("retry_state_corrupt")
         completed_at = int(record.get("completed_at", 0) or 0)
+        created_at = _retry_record_integer(record, 'created_at')
+        expires_at = _retry_record_integer(record, 'expires_at') or created_at + PENDING_RETRY_MAX_AGE_SECONDS
+        if not completed_at and current >= expires_at:
+            record['expired_channels'] = list(record.get('webhook_pending') or []) + (['email'] if record.get('email_pending') else [])
+            record.update(completed_at=current, terminal_status='expired', email_pending=False, webhook_pending=[])
+            completed_at = current
         if completed_at and completed_at < current - COMPLETED_RETRY_RETENTION_SECONDS:
             deliveries.pop(key, None)
     if len(deliveries) <= MAX_RETRY_DELIVERIES:
@@ -966,6 +996,7 @@ def queue_external_delivery(
         pending_webhooks = sorted(set(webhook_keys))
         state["deliveries"][delivery_key] = {
             "created_at": current,
+            "expires_at": current + PENDING_RETRY_MAX_AGE_SECONDS,
             "completed_at": 0 if pending_email or pending_webhooks else current,
             "last_attempt_at": 0,
             "last_attempt_sequence": 0,

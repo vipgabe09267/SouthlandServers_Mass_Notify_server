@@ -414,10 +414,11 @@ assert quiet_block.rfind("update_status") > quiet_block.index("queue_external_de
 
 weather_scheduler_source = (ROOT / "slsmassnotifyserver" / "bin" / "sls_mass_notify_weather_poll.sh").read_text(encoding="utf-8")
 assert "SLS_WORKER_DEADLINE_EPOCH" not in weather_scheduler_source
-assert "CORE_WORKER_TIMEOUT_SECONDS=5400" in weather_scheduler_source
-assert "/usr/bin/timeout --signal=TERM --kill-after=10" in weather_scheduler_source
-assert "sls_mass_notify_xweather_poll.lock" in weather_scheduler_source
-assert "/usr/bin/flock -n 8" in weather_scheduler_source
+weather_queue_source = (ROOT / 'slsmassnotifyserver/bin/sls_mass_notify/sls_weather_queue.py').read_text()
+assert 'timeout=5400' in weather_queue_source
+assert 'weather-observation.lock' in weather_queue_source
+assert 'weather-dispatch-worker.lock' in weather_queue_source
+assert 'SLS_WEATHER_QUEUE_ENABLED' in weather_queue_source
 assert "/usr/bin/timeout 50" not in weather_scheduler_source
 
 class_source = (ROOT / "slsmassnotifyserver" / "Slsmassnotifyserver.class.php").read_text(encoding="utf-8")

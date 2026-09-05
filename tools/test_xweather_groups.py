@@ -106,7 +106,7 @@ class XweatherGroupTests(unittest.TestCase):
                 mock.patch.object(worker, "main", side_effect=run_one), \
                 mock.patch.dict(worker.os.environ, {}, clear=True):
             self.assertEqual(worker.run_configured_group_cycle(), 0)
-        self.assertEqual(calls, ["north", "south"])
+        self.assertCountEqual(calls, ["north", "south"])
 
         calls.clear()
         with mock.patch.object(worker, "load_config", return_value=({}, fixture_config())), \
@@ -269,6 +269,7 @@ class XweatherGroupTests(unittest.TestCase):
             fixture.write_text(json.dumps(payload), encoding="utf-8")
             cache = root / "nws-forecast-gate-area.json"
             cache.write_text(json.dumps({
+                "configuration_identity": worker.lightning_area_identity({}, {"location": "30.5000,-97.7000"}),
                 "checked_at": storm_start - 300,
                 "expires_at": storm_start,
                 "active": False,

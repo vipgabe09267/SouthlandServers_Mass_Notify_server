@@ -441,7 +441,8 @@ build_audio_sequence() {
 
 prune_tts_cache() {
   if [ -d "$SLS_TTS_DIR" ]; then
-    find "$SLS_TTS_DIR" -maxdepth 1 -type f -name '*.wav' -mmin +15 -delete 2>/dev/null || true
+    # Shared maintenance owns media retention and honors active paging leases.
+    :
   fi
 }
 

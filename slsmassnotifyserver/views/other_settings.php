@@ -12,6 +12,14 @@ $systemSounds = is_array($available_system_sounds ?? null) ? $available_system_s
 $control = is_array($settings['control_api'] ?? null) ? $settings['control_api'] : [];
 $updates = is_array($settings['updates'] ?? null) ? $settings['updates'] : [];
 $desktopClients = is_array($desktop_clients ?? null) ? $desktop_clients : [];
+$testProfilePhones = [];
+foreach (($available_extensions ?? []) as $extension) {
+	$testProfilePhones[] = ['value' => (string)$extension['extension'], 'label' => (string)$extension['extension'] . ' · ' . (string)($extension['name'] ?? '')];
+}
+$testProfileDesktops = [];
+foreach ($desktopClients as $client) {
+	$testProfileDesktops[] = ['value' => (string)($client['username'] ?? ''), 'label' => (string)($client['name'] ?? $client['username'] ?? '')];
+}
 $packageStatus = is_array($package_update_status ?? null) ? $package_update_status : ['state' => 'latest', 'label' => 'LATEST'];
 $hasPackageUpdate = (($packageStatus['state'] ?? '') === 'update');
 $updateProgress = is_array($update_progress ?? null) ? $update_progress : ['state' => 'idle', 'message' => ''];
@@ -286,7 +294,16 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 					<div class="modal-header"><button type="button" class="close" data-dismiss="modal"><span>&times;</span></button><h4 class="modal-title"><?php echo _('Manage Phone Format Overrides'); ?></h4></div>
 					<div class="modal-body"><input type="hidden" name="sipnotify_format_overrides_present" value="1"><p class="text-muted"><?php echo _('Enter the extension and select its phone family. Leave extensions without an override on automatic detection. Use Yealink text fallback only when a model cannot display generated image alerts.'); ?></p><div id="sls-format-editor-list">
 					<?php foreach ($formatOverrides as $index => $override) { ?><div class="sls-editor-row" data-format-row><div class="sls-editor-grow"><label><?php echo _('Extension'); ?></label><input class="form-control" inputmode="numeric" pattern="[0-9]+" name="sipnotify_format_overrides[<?php echo (int)$index; ?>][extension]" value="<?php echo htmlspecialchars($override['extension']); ?>"></div><div class="sls-editor-format"><label><?php echo _('Phone family'); ?></label><select class="form-control" name="sipnotify_format_overrides[<?php echo (int)$index; ?>][format]"><?php foreach ($formatLabels as $formatValue => $formatLabel) { ?><option value="<?php echo htmlspecialchars($formatValue); ?>" <?php echo $override['format'] === $formatValue ? 'selected' : ''; ?>><?php echo htmlspecialchars($formatLabel); ?></option><?php } ?></select></div><button type="button" class="btn btn-link text-danger" data-remove-format style="margin-top:20px"><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div><?php } ?>
-					</div><button type="button" class="btn btn-default" id="sls-add-format"><i class="fa fa-plus"></i> <?php echo _('Add Override'); ?></button></div>
+					</div><button type="button" class="btn btn-default" id="sls-add-format"><i class="fa fa-plus"></i> <?php echo _('Add Override'); ?></button>
+					<details style="margin-top:18px;"><summary><?php echo _('Individual registered devices'); ?></summary>
+					<p class="text-muted" style="margin-top:10px;"><?php echo _('A device override takes precedence over the extension override. It is tied to the current registration address; if that changes, automatic detection or the extension override applies. Up to 100 bindings.'); ?></p>
+					<input type="hidden" name="sipnotify_device_overrides_present" value="1">
+					<div id="sls-device-override-list" style="max-height:280px;overflow:auto;"></div>
+					<button type="button" class="btn btn-default btn-sm" id="sls-device-refresh"><?php echo _('Load registered devices'); ?></button>
+					<select class="form-control" id="sls-device-picker" aria-label="<?php echo htmlspecialchars(_('Registered device')); ?>" style="margin:10px 0;"></select>
+					<button type="button" class="btn btn-default btn-sm" id="sls-device-add"><?php echo _('Add device override'); ?></button>
+					<small id="sls-device-status" role="status" style="display:block;margin-top:8px;"></small>
+					</details></div>
 					<div class="modal-footer"><button type="button" class="btn btn-primary" data-dismiss="modal"><?php echo _('Done'); ?></button></div>
 				</div></div></div>
 				<script type="text/template" id="sls-format-row-template"><div class="sls-editor-row" data-format-row><div class="sls-editor-grow"><label><?php echo _('Extension'); ?></label><input class="form-control" inputmode="numeric" pattern="[0-9]+"></div><div class="sls-editor-format"><label><?php echo _('Phone family'); ?></label><select class="form-control"><?php foreach ($formatLabels as $formatValue => $formatLabel) { ?><option value="<?php echo htmlspecialchars($formatValue); ?>"><?php echo htmlspecialchars($formatLabel); ?></option><?php } ?></select></div><button type="button" class="btn btn-link text-danger" data-remove-format style="margin-top:20px"><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div></script>
@@ -614,6 +631,19 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 					</span>
 				</div>
 
+				<details style="margin:20px 0;padding:14px;border:1px solid #dce2e8;border-radius:8px">
+					<summary><i class="fa fa-check-square-o text-primary" aria-hidden="true"></i> <?php echo _('Saved Channel Checks (optional)'); ?> <span tabindex="0" class="fa fa-question-circle text-muted" role="img" title="<?php echo htmlspecialchars(_('Optional shortcuts for testing selected phones and desktops with audio, visuals, or both. Not required for normal announcements or weather alerts.')); ?>" aria-label="<?php echo htmlspecialchars(_('Optional shortcuts for testing selected phones and desktops with audio, visuals, or both. Not required for normal announcements or weather alerts.')); ?>"></span></summary>
+					<p class="help-block"><?php echo _('Save up to ten scoped phone/desktop test profiles. Checks use the regular announcement audio settings and send no email or webhooks. They do not test Weather.gov or Xweather. Save and apply new profiles before running them.'); ?></p>
+					<input type="hidden" name="test_profiles_present" value="1">
+					<div id="sls-test-profile-list"></div>
+					<button type="button" class="btn btn-default" id="sls-add-test-profile"><?php echo _('Add profile'); ?></button>
+					<p id="sls-test-profile-status" role="status" aria-live="polite" style="margin-top:12px;white-space:pre-wrap"></p>
+				</details>
+				<div class="form-group" style="max-width:340px;margin:20px 0">
+					<label for="sls-paging-answer-timeout"><?php echo _('Paging Answer Window'); ?></label>
+					<div class="input-group"><input id="sls-paging-answer-timeout" name="paging_answer_timeout" type="number" min="1" max="5" class="form-control" value="<?php echo (int)($settings['paging_answer_timeout'] ?? 5); ?>"><span class="input-group-addon"><?php echo _('seconds'); ?></span></div>
+					<p class="help-block"><?php echo _('Default 5 seconds; may be shortened to 1–4. Paging requires automatic answering. This does not change the visual alert expiry or extend playback.'); ?></p>
+				</div>
 				<div class="sls-save-actions">
 					<button type="submit" class="btn btn-primary btn-lg"><i class="fa fa-save" aria-hidden="true"></i> <?php echo _('Save General Settings'); ?></button>
 				</div>
@@ -623,6 +653,11 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 			<form method="post" style="margin-bottom: 15px;">
 				<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
 				<button type="submit" class="btn btn-default" name="slsmassnotifyserver_action" value="export_config"><?php echo _('Download .config'); ?></button>
+			</form>
+			<form method="post" action="config.php?display=slsmassnotifyserver" style="margin:24px 0">
+				<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
+				<button type="submit" class="btn btn-default" name="slsmassnotifyserver_action" value="diagnostic_download"><i class="fa fa-stethoscope" aria-hidden="true"></i> <?php echo _('Download diagnostics'); ?></button>
+				<p class="help-block"><?php echo _('Redacted support report: versions, health checks, permissions, and anonymized device counts. No credentials, configuration, message contents, or addresses.'); ?></p>
 			</form>
 			<div class="panel panel-danger sls-danger-panel">
 				<div class="panel-heading"><i class="fa fa-exclamation-triangle" aria-hidden="true"></i> <?php echo _('Danger Zone'); ?></div>
@@ -882,6 +917,45 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 		addFormat.addEventListener('click', function() { var shell=document.createElement('div'); shell.innerHTML=formatTemplate.innerHTML.trim(); formatList.appendChild(shell.firstElementChild); reindexFormats(); });
 	}
 	reindexFormats();
+	var deviceList = document.getElementById('sls-device-override-list');
+	var devicePicker = document.getElementById('sls-device-picker');
+	var deviceStatus = document.getElementById('sls-device-status');
+	var deviceInventory = {};
+	var deviceFormats = <?php echo json_encode($formatLabels, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
+	var savedDevices = <?php echo json_encode((object)($settings['sipnotify']['device_format_overrides'] ?? []), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
+	function addDeviceBinding(key, device) {
+		if (!deviceList || !/^[a-f0-9]{32}$/.test(key) || deviceList.querySelector('[data-device-key="' + key + '"]')) return;
+		if (deviceList.children.length >= 100) { deviceStatus.textContent = 'Remove a binding before adding another.'; return; }
+		var row = document.createElement('div'); row.className = 'sls-editor-row'; row.setAttribute('data-device-key',key);
+		var label = device.label || device.user_agent || 'Registered device';
+		var text = document.createElement('span'); text.className = 'sls-editor-grow'; text.textContent = device.extension + ' · ' + label; row.appendChild(text);
+		[['extension',device.extension],['label',label]].forEach(function(pair) {
+			var input = document.createElement('input'); input.type = 'hidden'; input.name = 'sipnotify_device_overrides[' + key + '][' + pair[0] + ']'; input.value = pair[1]; row.appendChild(input);
+		});
+		var select = document.createElement('select'); select.className = 'form-control sls-editor-format'; select.name = 'sipnotify_device_overrides[' + key + '][format]'; select.setAttribute('aria-label','Device phone family');
+		var automatic = document.createElement('option'); automatic.value = ''; automatic.textContent = 'No device override'; select.appendChild(automatic);
+		Object.keys(deviceFormats).forEach(function(format) { var option = document.createElement('option'); option.value = format; option.textContent = deviceFormats[format]; select.appendChild(option); });
+		select.value = device.format in deviceFormats ? device.format : ''; row.appendChild(select);
+		var remove = document.createElement('button'); remove.type = 'button'; remove.className = 'btn btn-link text-danger'; remove.textContent = 'Remove'; remove.addEventListener('click',function(){row.remove();}); row.appendChild(remove); deviceList.appendChild(row);
+	}
+	Object.keys(savedDevices).forEach(function(key) { addDeviceBinding(key,savedDevices[key]); });
+	var refreshDevices = document.getElementById('sls-device-refresh');
+	if (refreshDevices) refreshDevices.addEventListener('click',function() {
+		refreshDevices.disabled = true; deviceStatus.textContent = 'Reading current registrations…';
+		fetch('config.php?display=slsmassnotifyserver&slsmassnotifyserver_action=device_inventory',{credentials:'same-origin',cache:'no-store'})
+		.then(function(response) { if (!response.ok) throw new Error(); return response.json(); }).then(function(data) {
+			devicePicker.innerHTML = ''; deviceInventory = {};
+			if (!data.success) { deviceStatus.textContent = data.message || 'Device discovery is unavailable.'; return; }
+			(data.devices || []).forEach(function(device) {
+				if (!/^[a-f0-9]{32}$/.test(device.key || '')) return;
+				deviceInventory[device.key] = device;
+				var option = document.createElement('option'); option.value = device.key;
+				option.textContent = device.extension + ' · ' + (device.user_agent || 'Unknown device') + ' · ' + device.transport.toUpperCase(); devicePicker.appendChild(option);
+			}); deviceStatus.textContent = devicePicker.options.length + ' registrations. Templates do not confirm handset support.';
+		}).catch(function() { deviceStatus.textContent = 'Unable to read registrations. No settings were changed.'; }).then(function(){refreshDevices.disabled=false;});
+	});
+	var addDevice = document.getElementById('sls-device-add');
+	if (addDevice) addDevice.addEventListener('click',function() { var device = deviceInventory[devicePicker.value]; if (device) addDeviceBinding(devicePicker.value,device); });
 	var emailList = document.getElementById('sls-email-editor-list');
 	var addEmail = document.getElementById('sls-add-email');
 	var emailTemplate = document.getElementById('sls-email-row-template');
@@ -913,6 +987,37 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 			if (id) id.name = prefix + '[id]';
 			if (name) name.name = prefix + '[name]';
 			if (url) url.name = prefix + '[url]';
+			if (type !== 'discord') {
+				var auth = row.querySelector('[data-webhook-auth]');
+				if (!auth) {
+					auth = document.createElement('details');
+					auth.setAttribute('data-webhook-auth', '');
+					auth.style.gridColumn = '1 / -1';
+					var summary = document.createElement('summary');
+					summary.textContent = 'Receiver authentication (optional)';
+					auth.appendChild(summary);
+					['bearer_token', 'signing_secret'].forEach(function(field) {
+						var label = document.createElement('label');
+						label.style.display = 'block'; label.style.marginTop = '10px';
+						label.textContent = field === 'bearer_token' ? 'Bearer token' : 'HMAC-SHA256 signing secret';
+						var input = document.createElement('input');
+						input.type = 'password'; input.className = 'form-control'; input.maxLength = 512;
+						input.autocomplete = 'new-password'; input.placeholder = 'Leave blank to keep the stored value';
+						input.setAttribute('data-auth-field', field); label.appendChild(input); auth.appendChild(label);
+						var clearLabel = document.createElement('label'); clearLabel.style.marginRight = '16px';
+						var clear = document.createElement('input'); clear.type = 'checkbox'; clear.value = '1';
+						clear.setAttribute('data-auth-field', 'clear_' + field);
+						clearLabel.appendChild(clear); clearLabel.appendChild(document.createTextNode(' Remove stored ' + (field === 'bearer_token' ? 'token' : 'signing secret')));
+						auth.appendChild(clearLabel);
+					});
+					var hint = document.createElement('p'); hint.className = 'help-block';
+					hint.textContent = 'For generic HTTPS receivers only. Discord uses the token in its webhook URL. Secrets stay in the protected central configuration.';
+					auth.appendChild(hint); row.appendChild(auth);
+				}
+				auth.querySelectorAll('[data-auth-field]').forEach(function(input) {
+					input.name = prefix + '[' + input.getAttribute('data-auth-field') + ']';
+				});
+			}
 		});
 		updateDestinationEmptyState(list, '[data-webhook-row]');
 		var addButton = document.querySelector('[data-add-webhook="' + type + '"]');
@@ -1022,5 +1127,71 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 				desktopScroller.scrollTop = desktopScroller.scrollHeight;
 			}
 	});
+}());
+</script>
+<script>
+(function () {
+ 'use strict';
+ var list = document.getElementById('sls-test-profile-list');
+ var add = document.getElementById('sls-add-test-profile');
+ var status = document.getElementById('sls-test-profile-status');
+ if (!list || !add || !status) return;
+ var phones = <?php echo json_encode($testProfilePhones, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
+ var desktops = <?php echo json_encode($testProfileDesktops, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
+ var profiles = <?php echo json_encode(array_values($settings['test_profiles'] ?? []), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
+ var index = 0, busy = false, pollTimer = null;
+ function field(parent, title, name, values, selected, multiple) {
+  var label = document.createElement('label'); label.textContent = title; parent.appendChild(label);
+  var select = document.createElement('select'); select.className = 'form-control'; select.name = name;
+  select.multiple = !!multiple; if (multiple) select.size = 3;
+  values.forEach(function (item) { var option = document.createElement('option'); option.value = item.value;
+   option.textContent = item.label; option.selected = selected.indexOf(item.value) !== -1; select.appendChild(option); });
+  parent.appendChild(select); return select;
+ }
+ function finish(data) {
+  status.textContent = (data.message || 'Check finished.') + (data.receipts || []).map(function(r) {
+   return '\n' + r.channel + ' · ' + r.target + ' · ' + r.state;
+  }).join('');
+  busy = false; list.querySelectorAll('[data-profile-run]').forEach(function(button) { button.disabled = false; });
+ }
+ function poll(id, started) {
+  if (!document.body.contains(list)) return;
+  if (Date.now() - started > 900000) { finish({message:'Check is taking longer than expected. Review Dashboard delivery status before retrying.'}); return; }
+  fetch('config.php?display=slsmassnotifyserver&slsmassnotifyserver_action=announcement_job&job_id=' + encodeURIComponent(id), {credentials:'same-origin', cache:'no-store'})
+   .then(function(r) { if (!r.ok) throw new Error(); return r.json(); }).then(function(data) {
+    status.textContent = data.message || 'Checking delivery…';
+    if (data.state === 'queued' || data.state === 'running') pollTimer = window.setTimeout(function() { poll(id, started); },2000);
+    else finish(data);
+   }).catch(function() { status.textContent = 'Waiting for delivery status. Do not resend yet.'; pollTimer = window.setTimeout(function() { poll(id, started); },3000); });
+ }
+ function addProfile(profile) {
+  if (list.children.length >= 10) return;
+  var key = index++, prefix = 'test_profiles[' + key + ']';
+  var row = document.createElement('div'); row.style.cssText = 'padding:12px 0;border-bottom:1px solid #e5e7eb;margin-bottom:12px';
+  var id = document.createElement('input'); id.type = 'hidden'; id.name = prefix + '[id]';
+  id.value = profile.id || 'test_' + Date.now().toString(36) + '_' + key; row.appendChild(id);
+  var name = document.createElement('input'); name.className = 'form-control'; name.name = prefix + '[name]';
+  name.value = profile.name || ''; name.maxLength = 64; name.placeholder = 'Profile name'; name.setAttribute('aria-label','Profile name'); row.appendChild(name);
+  var grid = document.createElement('div'); grid.style.cssText = 'display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:10px 0'; row.appendChild(grid);
+  [['Phones','extensions',phones,profile.extensions || []],['Desktops','desktop_clients',desktops,profile.desktop_clients || []]].forEach(function(value) {
+   var cell = document.createElement('div'); grid.appendChild(cell); field(cell,value[0],prefix+'['+value[1]+'][]',value[2],value[3].map(String),true);
+  });
+  var cell = document.createElement('div'); grid.appendChild(cell);
+  field(cell,'Channels',prefix+'[channels]',[{value:'all',label:'Audio and visuals'},{value:'audio',label:'Phone audio only'},{value:'visual',label:'Phone/desktop visuals only'}],[profile.channels || 'all'],false);
+  var run = document.createElement('button'); run.type='button'; run.className='btn btn-primary btn-sm'; run.textContent='Run saved check'; run.setAttribute('data-profile-run',''); row.appendChild(run);
+  run.addEventListener('click',function() {
+   if (busy) return; busy=true;
+   list.querySelectorAll('[data-profile-run]').forEach(function(button) { button.disabled=true; }); status.textContent='Queuing channel check…';
+   var body=new FormData(); body.set('slsmassnotifyserver_action','run_test_profile'); body.set('profile_id',id.value);
+   body.set('slsmassnotifyserver_csrf',document.querySelector('#sls-other-settings-form [name="slsmassnotifyserver_csrf"]').value);
+   fetch('config.php?display=slsmassnotifyserver',{method:'POST',credentials:'same-origin',body:body}).then(function(r) { if(!r.ok)throw new Error();return r.json(); })
+    .then(function(data) { if(data.queued && data.job_id) poll(data.job_id,Date.now()); else finish(data); })
+    .catch(function() { finish({message:'Request could not be confirmed. Check Dashboard status before trying again.'}); });
+  });
+  var remove=document.createElement('button'); remove.type='button'; remove.className='btn btn-default btn-sm'; remove.style.marginLeft='8px'; remove.textContent='Remove';
+  remove.addEventListener('click',function() { if(!busy) { row.remove();add.disabled=false; } }); row.appendChild(remove); list.appendChild(row); add.disabled=list.children.length>=10;
+ }
+ profiles.forEach(addProfile); add.addEventListener('click',function() { addProfile({}); });
+ window.addEventListener('pagehide',function() { if(pollTimer)window.clearTimeout(pollTimer); });
 }());
 </script>

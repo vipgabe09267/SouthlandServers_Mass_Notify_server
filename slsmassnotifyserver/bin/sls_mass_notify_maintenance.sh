@@ -237,6 +237,7 @@ def secure_tree(directory_fd, relative=""):
                     and (
                         child_relative.endswith((".sh", ".py"))
                         or child_relative == "sls_mass_notify_schedule_worker.php"
+                        or child_relative == "sls_mass_notify_announcement_worker.php"
                     )
                 ) or child_relative.startswith("piper/venv/bin/")
                 os.fchmod(file_fd, 0o755 if executable else 0o644)
@@ -268,7 +269,7 @@ flock -n "$MAINTENANCE_LOCK_FD" || exit 0
 secure_central_config
 
 # Generated speech and composite audio are short-lived delivery artifacts.
-find /var/lib/asterisk/SLS_Mass_Notifications_Plugin/sounds/tts -maxdepth 1 -type f -name '*.wav' -mmin +15 -delete 2>/dev/null || true
+/usr/bin/python3 "$RUNTIME_DIR/sls_storage_maintenance.py" >> "$LOG_FILE" 2>&1 || log "Storage retention could not complete; existing media was preserved."
 
 # Dashboard and Framework upgrades can replace the two managed widget files or
 # the menu ordering hook. Detect that drift and restore only those integration

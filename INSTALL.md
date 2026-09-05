@@ -9,8 +9,8 @@
 - Active Apache and cron services, with Apache rewrite and authorization-header support
 - Canonical `/usr/bin/php` CLI plus PHP OpenSSL, mbstring, and POSIX support for encrypted desktop credentials, scheduling, account lookup, and bounded alert-text handling
 - Python 3 with `venv` and `pip`
-- `curl`, `wget`, CA certificates, GnuPG, and `tar`
-- Piper TTS runtime. The installer creates the root-owned `/usr/local/bin/sls_mass_notify/piper/venv`, exposes it at the compatibility path `/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/venv`, installs pinned packaging tools plus `piper-tts`, and downloads checksum-verified voices to the module data folder.
+- `curl`, `wget`, CA certificates, GnuPG, OpenSSL 3, `logrotate`, and `tar`
+- Piper TTS runtime. The installer creates the root-owned `/usr/local/bin/sls_mass_notify/piper/venv`, exposes it at the compatibility path `/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/venv`, installs the versioned `piper-requirements.txt` dependency set and pinned packaging tools, and downloads checksum-verified voices to the module data folder.
 - SoX/soxi for audio conversion and normalization
 - ImageMagick and DejaVu fonts for validated phone alert images
 - cron plus `flock`, `timeout`, `readlink`, and `runuser`
@@ -24,9 +24,9 @@ Run as `root` on the FreePBX server:
 ```bash
 cd /tmp
 curl -fsSL -o sls-install.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.1-beta/tools/install_release.sh
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.2-beta/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.1-beta/slsmassnotifyserver-0.1.1-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.2-beta/slsmassnotifyserver-0.1.2-beta.tgz' \
 ./sls-install.sh
 ```
 
@@ -34,11 +34,25 @@ The installer prints the PBX operating-system timezone before module activation.
 
 ```bash
 SLS_MASS_NOTIFY_TIMEZONE='America/Chicago' \
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.1-beta/slsmassnotifyserver-0.1.1-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.2-beta/slsmassnotifyserver-0.1.2-beta.tgz' \
 ./sls-install.sh
 ```
 
 The requested name must exist in both the systemd timezone catalogue and `/usr/share/zoneinfo`. If a later installation stage fails after changing it, the installer restores the original system timezone as part of rollback.
+
+## Package verification and supported layouts
+
+The updater resolves a release tag to its commit, verifies the publisher’s Ed25519 signature on `release-manifest.json`, checks both the installer and TGZ hashes, and hands the already verified local archive to the installer. Each release must publish `release-manifest.json` and `release-manifest.sig` alongside the TGZ. A fresh download still requires trusting the initial installer and its embedded public key. FreePBX’s locally generated module signatures serve a separate purpose.
+
+For an offline/local package, obtain its SHA-256 through a trusted channel and use the matching version’s installer:
+
+```bash
+SLS_MASS_NOTIFY_TGZ='/tmp/slsmassnotifyserver-0.1.2-beta.tgz' \
+SLS_MASS_NOTIFY_SHA256='<trusted 64-character SHA-256>' \
+./sls-install.sh
+```
+
+Unsupported nonstandard FreePBX runtime layouts fail early with the required path/capability instead of being rewritten speculatively. A custom-built Asterisk that already provides a required capability is accepted; a missing unmanaged provider requires administrator repair. The installer does not replace custom Asterisk binaries, alter SIP peers, disable device security, or upgrade unrelated installed FreePBX modules.
 
 ## Install Hooks
 
@@ -57,7 +71,7 @@ The module install hook prepares the local PBX integration by applying managed c
 - enables Apache directory access for the API/media paths
 - installs the dashboard announcement widget compatibility files, rebuilds FreePBX Dashboard's persisted hook index, and verifies that the SIP NOTIFY announcement panel renders
 - enforces `0640 asterisk:asterisk` on the protected central configuration after FreePBX ownership operations without changing its contents
-- creates the Asterisk-owned one-minute Weather scheduler, a serialized NWS Weather Alert audio queue, and a bounded cross-zone destination-claim journal so overlapping zones cannot duplicate an alert to a shared target; adaptive Lightning polling uses current Weather.gov alerts plus the structured forecast period active at the current time, without spending Xweather tokens merely because thunder is forecast for a later period
+- creates the Asterisk-owned one-minute Weather observer, a separate chronological delivery worker, and a bounded cross-zone destination-claim journal so overlapping zones cannot duplicate an alert to a shared target; adaptive Lightning polling uses current Weather.gov alerts plus the structured forecast period active at the current time, without spending Xweather tokens merely because thunder is forecast for a later period
 - creates exactly one Asterisk-owned one-minute scheduled-announcement worker, verifies it as the `asterisk` account, and keeps its PBX-local execution ledger outside the module tree
 - installs the ownership-safe **SLS Mass Notify - Paging Tone Opening**, **SLS Mass Notify - Paging Tone Closing**, **SLS Mass Notify - NWS Alert**, and **SLS Mass Notify - Lightning Alert** recordings and managed Asterisk audio. A conflicting user-owned recording stops installation instead of being overwritten
 - verifies the real AMI contact-discovery and `PJSIPNotify` actions, matches registered numeric phones between the Asterisk CLI and AMI, checks spool access, sound links, WAV support, default audio formats, and the exact paging dialplan before reporting success
@@ -115,6 +129,16 @@ Scheduling supports one-time dates plus **Every 7 days** and **Every 14 days** r
 
 `fwconsole ma install` cannot safely ask interactive questions, so the mandatory setup wizard is implemented as this first-run FreePBX UI modal. Leave NWS disabled if the deployment only needs manual announcements, desktop notifications, SIP NOTIFY phone pushes, or TTS audio.
 
+## Local channel checks and delivery state
+
+General Settings can save up to ten named profiles with explicit phone/desktop targets and audio-only, visual-only, or combined checks. Save and apply the profile before running it. These checks use general-announcement audio settings and cooldown; they do not test the Weather.gov/Xweather fetch path and never send email or webhooks.
+
+The paging answer timeout is one through five seconds, default five. It controls unanswered Page invitations, not visual-message expiry or the length of the prepared audio. Handsets still need correctly configured auto-answer.
+
+Weather and Lightning observations are separate from queued delivery and external retries. Unsent work is bounded to one hour; interrupted work is marked uncertain and is not automatically replayed. NWS expiry/cancellation and current destination configuration are checked before submission. Consult the weather queue health check and channel logs when an observation exists without a delivered page.
+
+Desktop protocol 2 fixes initial/reconnect event cursors and supports optional authenticated acknowledgments. The client must implement ACK to populate acknowledgment status. A connected stream is not proof of app display or human receipt.
+
 ## Update Safety
 
 Module code is installed under FreePBX modules. Runtime configuration is stored under:
@@ -129,7 +153,7 @@ Portable `.config` exports include schedule definitions but not the PBX-local ex
 
 The native FreePBX 17 backup adapter includes the protected config, schedule execution journal, and custom module tones in module-based backup jobs. The installer enables FreePBX Backup, verifies adapter discovery, and enrolls Mass Notify in existing module-based jobs. A system with no administrator-defined jobs is healthy; create one in **Backup & Restore** when its schedule, storage, and retention policy have been chosen. Restores validate manifest records, SHA-256 hashes, size limits, config structure, credentials, and WAV data before an atomic replacement, then run post-restore integration repair. Due or completed occurrences are not replayed. FreePBX cannot download an unknown custom module from this project automatically, so install `slsmassnotifyserver` on a replacement PBX before restoring its archive and keep an independent `.config` backup.
 
-Executable runtime, including Piper and the automatic updater, is root-owned. Mutable config, voice models, tones, journals, and generated audio remain in the Asterisk data folder. Generated TTS and combined announcement audio is removed automatically after 15 minutes. This prevents the Asterisk service account from replacing code later executed by a privileged maintenance/update job.
+Executable runtime, including Piper and the automatic updater, is root-owned. Mutable config, voice models, tones, journals, and generated audio remain in the Asterisk data folder. Generated TTS and combined announcement audio is removed automatically fifteen minutes after its reserved playback ends; queued media is leased until then. This prevents the Asterisk service account from replacing code later executed by a privileged maintenance/update job.
 
 ## FAQ
 
@@ -178,7 +202,7 @@ The default uninstall preserves the central config, config backups, uploaded ton
 ```bash
 cd /tmp
 curl -fsSL -o sls-uninstall.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.1-beta/tools/uninstall_release.sh
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.2-beta/tools/uninstall_release.sh
 chmod +x sls-uninstall.sh
 ./sls-uninstall.sh
 ```

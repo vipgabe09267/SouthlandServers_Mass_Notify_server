@@ -20,6 +20,10 @@ SPEC = importlib.util.spec_from_file_location(
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
+# Use the same deterministic clock for enqueue, expiry and retry operations.
+from unittest import mock
+test_clock = mock.patch.object(MODULE.time, 'time', return_value=1100)
+test_clock.start()
 
 
 def fail(message):

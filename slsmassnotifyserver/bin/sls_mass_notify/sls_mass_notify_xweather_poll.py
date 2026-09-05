@@ -21,6 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sls_branded_email import send_branded_email, valid_recipient
+from sls_audio_queue import wait_for_slot
 from sls_notification_destinations import (
     RetryStateError,
     dispatch_webhook_destinations,
@@ -58,7 +59,7 @@ CURRENT_GROUP_ID = ""
 CURRENT_GROUP_NAME = ""
 CURRENT_GROUP_INDEX = 0
 CURRENT_GROUP_LEGACY = False
-NWS_USER_AGENT = "SouthlandServers-Mass-Notifications-Server/0.1.1-beta (https://southlandservers.xyz)"
+NWS_USER_AGENT = "SouthlandServers-Mass-Notifications-Server/0.1.2-beta (https://southlandservers.xyz)"
 NWS_FORECAST_CACHE_SECONDS = 10 * 60
 NWS_FORECAST_STALE_SECONDS = 30 * 60
 NWS_POINT_CACHE_SECONDS = 24 * 60 * 60
@@ -319,6 +320,7 @@ def configured_groups(xweather, include_disabled=False):
         merged["desktop_clients"] = raw_group.get("desktop_clients", [])
         merged["email_recipients"] = raw_group.get("email_recipients", [])
         merged["all_clear"] = raw_group.get("all_clear", "none")
+        merged["all_clear_minutes"] = raw_group.get("all_clear_minutes", 10)
         merged["_service_enabled"] = str(xweather.get("enabled", "0"))
         merged["_group_index"] = index
         merged["_legacy_singleton"] = legacy
@@ -376,7 +378,7 @@ def fetch_payload(xweather):
         "client_secret": xweather["client_secret"],
     }
     url = "https://data.api.xweather.com/lightning/closest?" + urllib.parse.urlencode(params)
-    request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "SouthlandServers-Mass-Notifications-Server/0.1.1-beta"})
+    request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "SouthlandServers-Mass-Notifications-Server/0.1.2-beta"})
     last_error = None
     for attempt in range(3):
         try:
@@ -389,7 +391,8 @@ def fetch_payload(xweather):
                     ("X-Cost-Tokens", "cost_tokens"),
                 ):
                     try:
-                        LAST_RATE_LIMIT[target] = max(0, int(response.headers.get(source, "0")))
+                        if response.headers.get(source) is not None:
+                            LAST_RATE_LIMIT[target] = max(0, int(response.headers[source]))
                     except (TypeError, ValueError):
                         pass
                 LAST_RATE_LIMIT["reset_at"] = str(response.headers.get("X-Ratelimit-Reset-Period", ""))[:100]
@@ -405,19 +408,23 @@ def normalize_records(payload, strike_type="cloud_to_ground"):
     if not isinstance(payload, dict) or payload.get("success") is not True:
         raise ValueError("API response did not report success")
     response = payload.get("response")
-    records = response if isinstance(response, list) else ([response] if isinstance(response, dict) else [])
+    if not isinstance(response, list):
+        raise ValueError("Lightning response must contain a records array")
+    records = response
     normalized = []
     now = int(os.environ.get("XWEATHER_TEST_NOW") or time.time())
     for record in records:
         if not isinstance(record, dict):
-            continue
+            raise ValueError("Lightning record must be an object")
         record_id = re.sub(r"[^A-Za-z0-9_.:-]", "", str(record.get("id") or ""))[:160]
         observation = record.get("ob") if isinstance(record.get("ob"), dict) else {}
         pulse = observation.get("pulse") if isinstance(observation.get("pulse"), dict) else {}
+        if not record_id or "timestamp" not in observation or str(pulse.get("type") or "").strip().lower() not in {"cg", "ic"}:
+            raise ValueError("Lightning record is missing required observation fields")
         try:
             timestamp = int(observation.get("timestamp") or 0)
         except (TypeError, ValueError):
-            timestamp = 0
+            raise ValueError("Lightning timestamp is invalid")
         relative_to = record.get("relativeTo") if isinstance(record.get("relativeTo"), dict) else {}
         try:
             distance_miles = float(relative_to.get("distanceMI"))
@@ -630,6 +637,9 @@ def _forecast_indicates_thunder(payload, now, horizon_seconds):
     properties = payload.get("properties") if isinstance(payload, dict) else None
     if not isinstance(properties, dict):
         raise RuntimeError("Weather.gov grid forecast schema is invalid")
+    if not any(isinstance(properties.get(key), dict) and isinstance(properties[key].get("values"), list)
+               for key in ("probabilityOfThunder", "weather")):
+        raise RuntimeError("Weather.gov grid forecast has no usable thunder observations")
     lookahead_end = now + max(3600, min(NWS_FORECAST_TRANSITION_LOOKAHEAD_SECONDS, int(horizon_seconds)))
     maximum_probability = 0.0
     transition_times = []
@@ -689,6 +699,9 @@ def forecast_storm_gate(config, xweather, now, grace_minutes):
     cache_id = CURRENT_GROUP_ID or "default"
     cache_path = DATA_DIR / f"nws-forecast-gate-{cache_id}.json"
     cache = read_json_object(cache_path)
+    identity = lightning_area_identity(config, xweather)
+    if cache.get("configuration_identity") != identity:
+        cache = {}
     checked_at = int(cache.get("checked_at", 0) or 0)
     cache_expires_at = int(cache.get("expires_at", 0) or 0)
     if checked_at > 0 and now - checked_at < NWS_FORECAST_CACHE_SECONDS and (cache_expires_at <= 0 or now < cache_expires_at):
@@ -736,7 +749,7 @@ def forecast_storm_gate(config, xweather, now, grace_minutes):
         expires_at = now + NWS_FORECAST_CACHE_SECONDS
         if next_transition > now:
             expires_at = min(expires_at, next_transition)
-        patch = {"checked_at": now, "expires_at": expires_at, "next_transition_at": next_transition, "point_checked_at": int(cache.get("point_checked_at", now) or now), "grid_url": grid_url, "coordinates": [round(float(coordinates[0]), 4), round(float(coordinates[1]), 4)], "active": active, "maximum_probability": probability, "message": message}
+        patch = {"configuration_identity": identity, "checked_at": now, "expires_at": expires_at, "next_transition_at": next_transition, "point_checked_at": int(cache.get("point_checked_at", now) or now), "grid_url": grid_url, "coordinates": [round(float(coordinates[0]), 4), round(float(coordinates[1]), 4)], "active": active, "maximum_probability": probability, "message": message}
         _atomic_state_update(cache_path, patch)
         return active, message, True
     except Exception as exc:
@@ -744,6 +757,16 @@ def forecast_storm_gate(config, xweather, now, grace_minutes):
             return bool(cache.get("active")), "Weather.gov forecast refresh failed; the recent protected cache remains in use.", True
         log(f"adaptive forecast check unavailable for {CURRENT_GROUP_NAME}: {exc}")
         return False, "Adaptive standby: Weather.gov structured forecast is unavailable; no Xweather tokens used.", False
+
+
+def lightning_area_identity(config, xweather):
+    identity = {
+        "location": str(xweather.get("location") or "").strip().lower(),
+        "linked_zone": _linked_zone_code(config, str(xweather.get("adaptive_nws_zone_id") or "")),
+        "radius": int(xweather.get("radius_miles") or 25),
+        "strike_type": str(xweather.get("strike_type") or "cloud_to_ground"),
+    }
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
 
 def adaptive_storm_gate(state, now, grace_minutes, selected_zone_id, config, xweather):
@@ -877,7 +900,7 @@ def spoken_location(location):
 def build_spoken_message(event_kind, is_test, radius_miles, location, nearest_miles=None):
     location_label = spoken_location(location)
     if event_kind == "clear":
-        message = f"All clear. Lightning is now outside the configured {radius_miles}-mile radius of {location_label}."
+        message = f"No recent lightning has been detected within {radius_miles} miles of {location_label} during the configured observation period."
     else:
         detected_miles = format_miles(nearest_miles if nearest_miles is not None else radius_miles)
         message = f"Warning. Lightning has been detected {detected_miles} miles from {location_label}. Please seek shelter now."
@@ -958,6 +981,8 @@ def queue_audio(recipients, sound, archive=False):
     if not sound:
         return 0, [], 0
     page_hold_seconds = audio_page_hold_seconds(sound)
+    if recipients:
+        wait_for_slot(recipients, page_hold_seconds, sound)
     call_wait_seconds = page_hold_seconds + 30
     queued = 0
     archived_results = []
@@ -1082,6 +1107,28 @@ def send_visual(recipients, desktop_clients, message, is_test=False, phone_delay
         raise RuntimeError("; ".join(failures))
 
 
+def submit_local_channels(recipients, desktop_clients, message, sound, is_test=False, preparation_error=""):
+    """Attempt independent local channels; never infer display from queue acceptance."""
+    errors = [preparation_error] if preparation_error else []
+    queued, archived_results, page_hold_seconds = 0, [], 0
+    if recipients and sound:
+        try:
+            queued, archived_results, page_hold_seconds = queue_audio(recipients, sound, archive=is_test)
+        except Exception as exc:
+            errors.append(f"audio submission: {exc}")
+    try:
+        send_visual(recipients, desktop_clients, message, is_test=is_test,
+                    phone_delay_seconds=2 if queued else 0)
+    except Exception as exc:
+        errors.append(f"visual submission: {exc}")
+    if is_test and archived_results:
+        try:
+            wait_for_archived_calls(archived_results, timeout=page_hold_seconds + 45)
+        except Exception as exc:
+            errors.append(f"audio completion: {exc}")
+    return queued, errors
+
+
 def send_webhooks(config, subject, message, event_name, severity, state_label, radius, alert_id, nearest_miles=None):
     fields = [("Storm State", state_label), ("Detection Radius", f"{radius} miles")]
     if nearest_miles is not None:
@@ -1133,6 +1180,8 @@ def commit_local_event_state(state, event_kind, now):
             "last_poll": now,
             "last_query": state.get("last_query", now),
             "last_cleared": now,
+            "last_observed_at": state.get("last_observed_at", now),
+            "observation_gap_seconds": state.get("observation_gap_seconds", 0),
             "local_dispatch_intent": "",
         })
         return
@@ -1174,6 +1223,10 @@ def main():
 
     def retry_external_now(preferred_correlation_key=""):
         if not external_live:
+            return {"results": [], "pending": 0}
+        if os.environ.get('SLS_WEATHER_QUEUE_ENABLED') == '1':
+            # The delivery worker services durable retries. Observations must
+            # not wait for a slow or unavailable external receiver.
             return {"results": [], "pending": 0}
         try:
             outcome = retry_external_deliveries(
@@ -1277,6 +1330,15 @@ def main():
         retry_external_now()
         return 1
     now = int(os.environ.get("XWEATHER_TEST_NOW") or time.time())
+    area_identity = lightning_area_identity(config, xweather)
+    if state.get("configuration_identity") not in (None, area_identity):
+        # A different location/radius/type is a new observation area. Preserve
+        # unresolved dispatch evidence, but do not reuse its storm/forecast gate.
+        if state.get("local_dispatch_intent"):
+            record_xweather_outcome(False, "fault", "Area changed while a previous delivery is unresolved; review the delivery before rearming.")
+            return 1
+        state = {}
+    state["configuration_identity"] = area_identity
     if test_event == "":
         if adaptive:
             selected_zone_id = re.sub(r"[^A-Za-z0-9_-]", "", str(xweather.get("adaptive_nws_zone_id") or ""))[:64]
@@ -1312,6 +1374,7 @@ def main():
                 return 1 if retry_external_now() is None else 0
         state["last_query"] = now
         atomic_json_update(STATE_FILE, state)
+        atomic_json_update(STATUS_FILE, {"last_xweather_query_at": datetime.now().astimezone().isoformat()})
     if test_event in {"entry", "clear"}:
         records = [{"id": f"manual-{int(time.time())}", "timestamp": int(time.time()), "type": "test"}] if test_event == "entry" else []
     else:
@@ -1329,6 +1392,20 @@ def main():
             atomic_json_update(STATUS_FILE, {"last_xweather_poll_at": datetime.now().astimezone().isoformat(), "last_xweather_poll_status": "fault", "last_xweather_poll_message": f"Unable to reach or process the Xweather API: {safe_error[:180]}"})
             retry_external_now()
             return 1
+    last_observed = int(state.get("last_observed_at", 0) or 0)
+    clear_seconds = max(5, min(120, int(xweather.get("all_clear_minutes", 10) or 10))) * 60
+    expected_interval = max(1, min(10, int(xweather.get("query_interval_minutes", 5) or 5))) * 60
+    observation_gap = max(0, now - last_observed - expected_interval) if last_observed else 0
+    if test_event == "":
+        atomic_json_update(STATUS_FILE, {
+            "last_xweather_observation_at": datetime.now().astimezone().isoformat(),
+            "xweather_observation_gap_seconds": observation_gap,
+            "xweather_observed_record_count": len(records),
+        })
+    if test_event == "" and last_observed and now - last_observed > max(660, clear_seconds, 2 * expected_interval + 60) and not state.get("local_dispatch_intent"):
+        # We cannot claim continuity across an unobserved storm. A fresh strike
+        # after this gap rearms once; never announce an all-clear for the gap.
+        state.update(active=False, notified=False, empty_polls=0, rearmed_after_gap=True)
     active_before = bool(state.get("active", False))
     notified = bool(state.get("notified", False))
     empty_polls = int(state.get("empty_polls", 0) or 0)
@@ -1341,7 +1418,7 @@ def main():
         event_kind = test_event
     elif has_lightning:
         if not active_before:
-            state = {"active": True, "notified": False, "empty_polls": 0, "cluster_started": now, "last_query": now}
+            state.update(active=True, notified=False, empty_polls=0, cluster_started=now, last_query=now)
             # Persist the cluster identity before any local delivery.  Keeping
             # notified=false makes an early crash retryable, while a crash after
             # the external record is queued can recover the same correlation key
@@ -1350,12 +1427,14 @@ def main():
             notified = False
         else:
             state["empty_polls"] = 0
+        state["last_strike_observed_at"] = now
         if not notified:
             event_kind = "entry"
     elif active_before:
         empty_polls += 1
         state["empty_polls"] = empty_polls
-        if empty_polls >= 2:
+        last_strike = int(state.get("last_strike_observed_at", state.get("cluster_started", now)) or now)
+        if empty_polls >= 2 and now - last_strike >= clear_seconds and observation_gap <= 60:
             event_kind = "clear" if notified and str(xweather.get("all_clear", "none")) == "send" else "reset"
     if external_live:
         recovered_intent_key = str(state.get("local_dispatch_intent") or "")
@@ -1369,13 +1448,15 @@ def main():
             event_kind = intent_match.group("kind")
             recovering_local_intent = True
     state["last_poll"] = now
+    state["last_observed_at"] = now
+    state["observation_gap_seconds"] = observation_gap
     if has_lightning and nearest_miles is not None:
         poll_message = f"Lightning cluster active; nearest recent strike is {format_miles(nearest_miles)} miles away inside the configured {settings['radius_miles']}-mile radius."
     elif has_lightning:
         poll_message = f"Lightning cluster active inside the {settings['radius_miles']}-mile radius."
     else:
         poll_message = f"No recent lightning inside the {settings['radius_miles']}-mile radius."
-    atomic_json_update(STATUS_FILE, {"last_xweather_poll_at": datetime.now().astimezone().isoformat(), "last_xweather_poll_status": "ok", "last_xweather_poll_message": poll_message, "xweather_adaptive_mode": adaptive, "xweather_adaptive_gate_active": adaptive, **rate_limit_status_patch()})
+    atomic_json_update(STATUS_FILE, {"last_xweather_poll_at": datetime.now().astimezone().isoformat(), "last_xweather_observation_at": datetime.now(timezone.utc).isoformat(), "xweather_observation_gap_seconds": observation_gap, "last_xweather_poll_status": "ok", "last_xweather_poll_message": poll_message, "xweather_adaptive_mode": adaptive, "xweather_adaptive_gate_active": adaptive, **rate_limit_status_patch()})
 
     if event_kind == "reset":
         atomic_json_update(STATE_FILE, {"active": False, "notified": False, "empty_polls": 0, "last_poll": now, "last_query": state.get("last_query", now), "last_cleared": now})
@@ -1402,7 +1483,7 @@ def main():
     is_test = test_event in {"entry", "clear"}
     location_label = spoken_location(location)
     if event_kind == "clear":
-        message = f"All clear. Lightning is now outside the configured {settings['radius_miles']}-mile radius of {location_label}."
+        message = f"No recent lightning has been detected within {settings['radius_miles']} miles of {location_label} during the configured observation period."
         subject = "Southland Servers PBX: Lightning all clear"
         event_name = "Lightning All Clear"
         severity = "All Clear"
@@ -1527,20 +1608,35 @@ def main():
             record_xweather_outcome(False, recovery_status, recovery_message)
             log(recovery_message)
             return 0
+    if external_live and os.environ.get('SLS_WEATHER_QUEUE_ENABLED') == '1':
+        from sls_weather_queue import enqueue_lightning
+        try:
+            enqueue_lightning(CURRENT_GROUP_ID, correlation_key, {
+                'group_id': CURRENT_GROUP_ID, 'configuration_identity': area_identity,
+                'observed_at': now, 'cluster_started': cluster_started, 'event_kind': event_kind,
+                'alert_id': alert_id, 'correlation_key': correlation_key, 'message': message,
+                'subject': subject, 'event_name': event_name, 'severity': severity,
+                'state_label': state_label, 'nearest_miles': nearest_miles,
+            })
+            # This flag means a durable dispatch exists, not that a handset
+            # received anything. Receipt state lives in the separate outbox.
+            commit_local_event_state(state, event_kind, now)
+            record_xweather_outcome(False, 'queued', 'Lightning event queued for independent delivery; observation polling continues.')
+            return 0
+        except Exception as exc:
+            record_xweather_outcome(False, 'fault', 'Lightning delivery could not be queued (' + type(exc).__name__ + '); no local alert was sent.')
+            return 1
     spoken_message = build_spoken_message(event_kind, is_test, settings["radius_miles"], location, nearest_miles)
     sound = ""
     queued = 0
     archived_results = []
+    preparation_error = ""
     try:
         if not dry_run and recipients:
             sound = generate_audio(config, xweather, spoken_message, re.sub(r"[^A-Za-z0-9_-]", "", alert_id))
     except Exception as exc:
-        log(f"alert preparation failed before dispatch intent was recorded: {exc}")
-        record_xweather_outcome(is_test, "fault", str(exc))
-        if test_event == "":
-            atomic_json_update(STATE_FILE, state)
-        retry_external_now()
-        return 1
+        preparation_error = f"audio preparation: {exc}"
+        log(f"{preparation_error}; visual destinations will still be attempted")
 
     delivery_key = ""
     external_failures = []
@@ -1583,16 +1679,10 @@ def main():
     local_delivery_error = ""
     try:
         if not dry_run and has_local_destination:
-            queued, archived_results, page_hold_seconds = queue_audio(recipients, sound, archive=is_test)
-            send_visual(
-                recipients,
-                desktop_clients,
-                message,
-                is_test=is_test,
-                phone_delay_seconds=2 if sound and recipients else 0,
-            )
-            if is_test:
-                wait_for_archived_calls(archived_results, timeout=page_hold_seconds + 45)
+            queued, channel_errors = submit_local_channels(
+                recipients, desktop_clients, message, sound, is_test, preparation_error)
+            if channel_errors:
+                raise RuntimeError("; ".join(channel_errors))
     except Exception as exc:
         local_delivery_outcome = "indeterminate"
         local_delivery_error = str(exc)
@@ -1654,6 +1744,70 @@ def main():
     return 1 if local_delivery_outcome == "indeterminate" else 0
 
 
+def deliver_queued_event(record):
+    """Use current routing without rewriting the observer's evolving storm state."""
+    config, root = load_config()
+    area = select_group(root, record['group_id'])
+    if not area or str(area.get('_service_enabled')) not in {'1', 'true', 'True'} or area.get('enabled') != '1':
+        return 'cancelled', 'Lightning area is disabled or removed.'
+    configure_group_runtime(area)
+    if record['configuration_identity'] != lightning_area_identity(config, area) or quiet_hours_active(area):
+        return 'cancelled', 'Lightning area changed or quiet hours now apply.'
+    observation = read_state()
+    interval = max(1, min(10, int(area.get('query_interval_minutes', 5) or 5))) * 60
+    if not 0 <= time.time() - observation.get('last_observed_at', 0) <= max(660, 2 * interval + 60):
+        return 'cancelled', 'Lightning observation is stale; no delayed alert was sent.'
+    if record['event_kind'] == 'entry':
+        if not observation.get('active') or observation.get('cluster_started') != record['cluster_started']:
+            return 'cancelled', 'Lightning cluster has cleared or changed before delivery.'
+    elif observation.get('active') or area.get('all_clear') != 'send':
+        return 'cancelled', 'All-clear superseded by a new cluster or disabled.'
+    recipients = [str(value) for value in area.get('recipients', []) if re.fullmatch(r'[0-9]{1,20}', str(value))]
+    enabled_desktops = {str(client.get('username') or '').lower() for client in config.get('desktop_clients', [])
+        if isinstance(client, dict) and str(client.get('enabled', '0')).lower() in {'1', 'true', 'yes', 'on'}}
+    desktops = [str(value) for value in area.get('desktop_clients', []) if str(value).lower() in enabled_desktops]
+    errors, sound, queued = [], '', 0
+    # Publish the desktop journal before synthesis and any recipient queue wait.
+    if desktops:
+        try:
+            send_visual([], desktops, record['message'])
+        except Exception as exc:
+            errors.append('desktop publication: ' + type(exc).__name__)
+    if recipients:
+        try:
+            spoken = build_spoken_message(record['event_kind'], False, int(area['radius_miles']),
+                                          area['location'], record.get('nearest_miles'))
+            sound = generate_audio(config, area, spoken, re.sub(r'[^A-Za-z0-9_-]', '', record['alert_id']))
+        except Exception as exc:
+            errors.append('audio preparation: ' + type(exc).__name__)
+        queued, local_errors = submit_local_channels(recipients, [], record['message'], sound)
+        errors.extend(local_errors)
+    fields = [('Trigger Area', CURRENT_GROUP_NAME), ('Storm State', record['state_label']),
+              ('Detection Radius', str(area['radius_miles']) + ' miles')]
+    if record.get('nearest_miles') is not None:
+        fields.append(('Nearest Strike', format_miles(record['nearest_miles']) + ' miles'))
+    email_recipients = ' '.join(str(value) for value in area.get('email_recipients', []) if valid_recipient(str(value)))
+    try:
+        queue_external_delivery(EXTERNAL_DELIVERY_STATE_FILE, config, record['correlation_key'],
+            record['subject'], record['message'], record['event_name'], record['severity'], fields,
+            datetime.fromtimestamp(record['observed_at'], timezone.utc).isoformat(), 'xweather',
+            'xweather-' + record['alert_id'], {'trigger_area_id': CURRENT_GROUP_ID,
+            'trigger_area_name': CURRENT_GROUP_NAME, 'radius_miles': int(area['radius_miles']),
+            'storm_state': record['state_label'], 'nearest_strike_miles': record.get('nearest_miles')}, email_recipients)
+        # A separate bounded worker sends/retries these durable external records.
+    except Exception as exc:
+        errors.append('external delivery: ' + type(exc).__name__)
+    status = 'partial_failure' if errors else 'queued'
+    detail = '; '.join(errors) if errors else 'Local destinations submitted and external delivery queued; handset acceptance is not confirmed.'
+    append_event({'event_id': 'xweather-' + record['alert_id'], 'logged_at': datetime.now(timezone.utc).isoformat(),
+        'type': 'xweather', 'status': status, 'event': record['event_name'], 'severity': record['severity'],
+        'body': record['message'], 'trigger_area_id': CURRENT_GROUP_ID, 'trigger_area_name': CURRENT_GROUP_NAME,
+        'page_group': ','.join(recipients), 'desktop_targets': desktops, 'audio_sequence': [sound] if sound else [],
+        'local_delivery_error': detail if errors else '', 'source_name': 'Xweather Lightning API', 'trigger_source': 'Xweather API'})
+    record_xweather_outcome(False, status, detail)
+    return ('failed' if errors else 'complete'), detail
+
+
 def run_configured_group_cycle():
     try:
         _config, xweather = load_config()
@@ -1683,6 +1837,12 @@ def run_configured_group_cycle():
         service_enabled = str(xweather.get("enabled", "0")).strip().lower() in {"1", "true"}
         return 1 if test_event in {"entry", "clear"} or verify_only or service_enabled else 0
     results = []
+    # Rotate by query round, not minute: five areas with a five-minute interval
+    # would otherwise keep exactly the same first area on every due query.
+    if selected and not test_event and not verify_only:
+        interval = max(1, min(10, int(xweather.get('query_interval_minutes', 5) or 5))) * 60
+        offset = (int(time.time()) // interval) % len(selected)
+        selected = selected[offset:] + selected[:offset]
     for group in selected:
         previous_group_id = os.environ.get("XWEATHER_ACTIVE_GROUP_ID")
         selected_group_id = str(group.get("id") or "")

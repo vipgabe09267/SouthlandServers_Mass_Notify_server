@@ -330,6 +330,11 @@ def load_config():
                 for endpoint, fmt in (sipnotify.get("format_overrides") or {}).items()
                 if str(endpoint).isdigit()
             },
+            "device_format_overrides": {
+                str(key): str(row.get('format', ''))
+                for key, row in (sipnotify.get('device_format_overrides') or {}).items()
+                if re.fullmatch('[a-f0-9]{32}', str(key)) and isinstance(row, dict)
+            },
         })
         return config
 
@@ -917,14 +922,29 @@ def normalize_phone_format(value):
 
 def endpoint_format_overrides(config):
     overrides = {}
-    if not config.has_section("endpoint_format_overrides"):
-        return overrides
-    for endpoint, fmt in config.items("endpoint_format_overrides"):
+    for endpoint, fmt in config.items("endpoint_format_overrides") if config.has_section("endpoint_format_overrides") else []:
         endpoint = re.sub(r"[^0-9]+", "", endpoint or "")
         fmt = normalize_phone_format(fmt)
         if endpoint and fmt:
             overrides[endpoint] = fmt
+    for key, fmt in config.items('device_format_overrides') if config.has_section('device_format_overrides') else []:
+        if re.fullmatch('[a-f0-9]{32}', key) and normalize_phone_format(fmt):
+            overrides['device:' + key] = normalize_phone_format(fmt)
     return overrides
+
+
+def device_registration_key(endpoint, uri):
+    # Bind the override to this registration, never to an extension's other
+    # contacts. Address/port changes intentionally fall back to autodetection.
+    return hashlib.sha256((str(endpoint) + '\n' + str(uri)).encode()).hexdigest()[:32] if uri else ''
+
+
+def contact_transport(uri):
+    uri = str(uri).lower()
+    transport = re.search(r';transport=([a-z]+)(?:[;?]|$)', uri)
+    if transport:
+        return transport.group(1)
+    return 'tls' if uri.startswith('sips:') else ('udp' if uri.startswith('sip:') else 'unresolved')
 
 
 def detect_phone_format(user_agent, endpoint=""):
@@ -1041,8 +1061,12 @@ def get_registered_endpoint_info(ami, allowed_targets=None, format_overrides=Non
             continue
         normalized_status = status.lower().split()[0] if status else "unknown"
         if normalized_status in registered_statuses and normalized_status not in blocked_statuses:
+            contact_index = contact_uri_offsets.get(endpoint, 0)
+            contact_uri_offsets[endpoint] = contact_index + 1
+            contact_uri = contact_uri_for_event(event, endpoint, contact_uri_inventory, contact_index)
+            device_key = device_registration_key(endpoint, contact_uri)
             detected_format = detect_phone_format(user_agent, endpoint)
-            override_format = format_overrides.get(endpoint, "")
+            override_format = format_overrides.get('device:' + device_key, '') or format_overrides.get(endpoint, "")
             fmt = override_format or detected_format
             info = endpoints.setdefault(endpoint, {
                 "status": status,
@@ -1061,14 +1085,15 @@ def get_registered_endpoint_info(ami, allowed_targets=None, format_overrides=Non
             info["status"] = status or info.get("status", "")
             info["format"] = info["formats"][0] if info["formats"] else fmt
             info["override"] = info.get("override", False) or bool(override_format)
-            contact_index = contact_uri_offsets.get(endpoint, 0)
-            contact_uri_offsets[endpoint] = contact_index + 1
             info["contacts"].append({
                 "status": status,
                 "user_agent": user_agent,
                 "detected_format": detected_format,
                 "format": fmt,
-                "contact": contact_uri_for_event(event, endpoint, contact_uri_inventory, contact_index),
+                "contact": contact_uri,
+                "device_key": device_key,
+                "override": bool(override_format),
+                "capability": 'unverified_generic' if fmt == 'unknown' else 'vendor_template',
             })
         else:
             skipped.append((endpoint, status or "Unknown", user_agent))
@@ -1442,6 +1467,7 @@ def announcement_api_record(alert_id, message, xml_payload, extensions, desktop_
         "kind": "announcement",
         "id": alert_id,
         "event": "Announcement",
+        "sender": clean_payload_text(os.environ.get("SLS_ANNOUNCEMENT_SENDER", ""), 80),
         "title": normalized_title,
         "priority": "notice",
         "priority_label": ALERT_COLORS["notice"]["label"],
@@ -1643,6 +1669,12 @@ def endpoint_format_summary(endpoint_info):
             "user_agent": info.get("user_agent", ""),
             "contacts": len(info.get("contacts") or []),
             "override": bool(info.get("override")),
+            "devices": [{
+                'key': row.get('device_key', ''), 'format': row.get('format', 'unknown'),
+                'user_agent': row.get('user_agent', ''), 'override': row.get('override', False),
+                'capability': row.get('capability', 'unverified_generic'),
+                'transport': contact_transport(row.get('contact', '')),
+            } for row in info.get('contacts', [])],
         }
         for endpoint, info in sorted(endpoint_info.items())
     }

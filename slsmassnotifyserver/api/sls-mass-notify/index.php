@@ -160,50 +160,28 @@ function control_rate_allowed(array $control, string $ip): bool
 
 function audit_control_api(string $ip, string $action, int $status, bool $ok): void
 {
-    $normalizedAction = preg_replace('/[^a-z0-9_.-]+/i', '_', $action) ?: 'unknown';
-    if (in_array($ip, ['127.0.0.1', '::1'], true) && $ok && $status === 200 && in_array($normalizedAction, ['get_config', 'get_status'], true)) {
-        // Successful PBX self-checks are health probes, not administrator API use.
+    $action = substr(preg_replace('/[^a-z0-9_.-]+/i', '_', $action) ?: 'unknown', 0, 80);
+    if (in_array($ip, ['127.0.0.1', '::1'], true) && $ok && $status === 200 && in_array($action, ['get_config', 'get_status'], true)) {
         return;
     }
-    $record = [
-        'created_at' => gmdate('c'),
-        'ip' => $ip,
-        'method' => (string)($_SERVER['REQUEST_METHOD'] ?? ''),
-        'action' => $normalizedAction,
-        'status' => $status,
-        'ok' => $ok,
-    ];
-    $dir = dirname(CONTROL_API_AUDIT_LOG);
-    if (!is_dir($dir)) {
-        @mkdir($dir, 0750, true);
-    }
-    $handle = @fopen(CONTROL_API_AUDIT_LOG, 'c+');
-    if ($handle === false || !flock($handle, LOCK_EX)) {
-        if (is_resource($handle)) {
-            fclose($handle);
-        }
-        return;
-    }
-    rewind($handle);
-    $lines = preg_split('/\R/', (string)stream_get_contents($handle), -1, PREG_SPLIT_NO_EMPTY) ?: [];
-    $cutoff = time() - (30 * 86400);
-    $kept = [];
-    foreach ($lines as $line) {
-        $decoded = json_decode($line, true);
-        $created = strtotime((string)($decoded['created_at'] ?? '')) ?: 0;
-        if ($created >= $cutoff) {
-            $kept[] = $line;
-        }
-    }
-    $kept[] = json_encode($record, JSON_UNESCAPED_SLASHES);
-    $kept = array_slice($kept, -10000);
-    rewind($handle);
-    ftruncate($handle, 0);
-    fwrite($handle, implode("\n", $kept) . "\n");
-    fflush($handle);
-    flock($handle, LOCK_UN);
-    fclose($handle);
-    @chmod(CONTROL_API_AUDIT_LOG, 0640);
+    if (is_link(CONTROL_API_AUDIT_LOG)) { return; }
+    $record = json_encode([
+        'created_at' => gmdate('c'), 'ip' => substr($ip, 0, 64),
+        'method' => substr((string)($_SERVER['REQUEST_METHOD'] ?? ''), 0, 12),
+        'action' => $action, 'status' => $status, 'ok' => $ok,
+    ], JSON_UNESCAPED_SLASHES) . "\n";
+    $handle = @fopen(CONTROL_API_AUDIT_LOG, 'ab');
+    if ($handle === false) { return; }
+    try {
+        if (!flock($handle, LOCK_EX)) { return; }
+        $metadata = fstat($handle);
+        // Maintenance prunes this bounded append-only log. Rejected requests
+        // never parse/rewrite the history and cannot grow it without limit.
+        if (($metadata['mode'] & 0170000) !== 0100000 || $metadata['size'] >= 8 * 1024 * 1024) { return; }
+        fwrite($handle, $record);
+        fflush($handle);
+        flock($handle, LOCK_UN);
+    } finally { fclose($handle); }
 }
 
 function read_json_file(string $path): array
@@ -304,6 +282,11 @@ if ($expected === '' || $provided === '' || !hash_equals($expected, $provided)) 
 
 if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     $resource = strtolower(trim((string)($_GET['resource'] ?? 'status')));
+    if ($resource === 'delivery') {
+        $result = freepbx_module()->getAnnouncementJob((string)($_GET['job_id'] ?? ''));
+        audit_control_api($clientIp, 'get_delivery', 200, !empty($result['success']));
+        respond(200, ['ok' => !empty($result['success']), 'resource' => 'delivery'] + $result);
+    }
     if ($resource === 'events') {
         audit_control_api($clientIp, 'get_events', 200, true);
         respond(200, ['ok' => true, 'resource' => 'events', 'events' => recent_events((int)($_GET['limit'] ?? 25))]);
@@ -339,7 +322,7 @@ if ($contentLength > 65536) {
     audit_control_api($clientIp, 'request_too_large', 413, false);
     respond(413, ['ok' => false, 'error' => 'request_too_large']);
 }
-$rawBody = (string)file_get_contents('php://input');
+$rawBody = (string)file_get_contents('php://input', false, null, 0, 65537);
 if (strlen($rawBody) > 65536) {
     audit_control_api($clientIp, 'request_too_large', 413, false);
     respond(413, ['ok' => false, 'error' => 'request_too_large']);
@@ -358,6 +341,15 @@ if (!array_key_exists('action', $body) || !is_string($body['action'])) {
 $action = strtolower(trim((string)($body['action'] ?? '')));
 try {
     $module = freepbx_module();
+
+    if ($action === 'retry_announcement') {
+        if (!is_string($body['job_id'] ?? null) || count(array_diff(array_keys($body), ['action', 'job_id'])) > 0) {
+            respond(400, ['ok' => false, 'error' => 'job_id_required']);
+        }
+        $result = $module->retryFailedAnnouncementJob($body['job_id'], ['trigger_source' => 'Control API']);
+        audit_control_api($clientIp, $action, !empty($result['success']) ? 200 : 400, !empty($result['success']));
+        respond(!empty($result['success']) ? 200 : 400, ['ok' => !empty($result['success']), 'action' => $action] + $result);
+    }
 
     if ($action === 'send_announcement') {
         $result = $module->controlApiSendAnnouncement($body);

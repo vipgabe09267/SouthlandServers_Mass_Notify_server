@@ -73,6 +73,19 @@ python3 "${ROOT_DIR}/tools/test_alert_worker_cli_safety.py"
 python3 "${ROOT_DIR}/tools/test_weather_manual_test_contract.py"
 php "${ROOT_DIR}/tools/test_freepbx_backup_restore.php"
 php "${ROOT_DIR}/tools/test_help_ui_contract.php"
+php "${ROOT_DIR}/tools/test_desktop_reliability.php"
+php "${ROOT_DIR}/tools/test_independent_channels.php"
+python3 "${ROOT_DIR}/tools/test_delivery_storage_security.py"
+python3 "${ROOT_DIR}/tools/test_lightning_observations.py"
+python3 "${ROOT_DIR}/tools/test_weather_channel_isolation.py"
+python3 "${ROOT_DIR}/tools/test_release_manifest.py"
+python3 "${ROOT_DIR}/tools/test_device_overrides.py"
+python3 "${ROOT_DIR}/tools/test_weather_queue.py"
+python3 "${ROOT_DIR}/tools/test_installer_runtime_manifest.py"
+php "${ROOT_DIR}/tools/test_profiles.php"
+python3 "${ROOT_DIR}/tools/test_audio_priority.py"
+python3 "${ROOT_DIR}/tools/test_announcement_footer.py"
+php "${ROOT_DIR}/tools/test_support_diagnostics.php"
 
 cmp -s "${ROOT_DIR}/tools/uninstall_release.sh" "${ROOT_DIR}/${MODULE}/bin/sls_mass_notify_uninstall.sh" || {
   printf 'Standalone and packaged uninstallers differ.\n' >&2
@@ -135,7 +148,7 @@ if grep -RIlE 'ghp_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|-----BEGIN ([A-Z0-9 ]+ 
 fi
 
 for required in \
-  module.xml Slsmassnotifyserver.class.php Backup.php Restore.php install.php uninstall.php \
+  module.xml Slsmassnotifyserver.class.php AnnouncementDelivery.php TestProfiles.php SupportDiagnostics.php Backup.php Restore.php install.php uninstall.php \
   page.slsmassnotifyserver_scheduling.php views/scheduling.php \
   page.slsmassnotifyserver_lightning.php views/lightning.php \
   api/sipnotify/index.php \
@@ -145,6 +158,11 @@ for required in \
   bin/sls_mass_notify/sls_branded_email.py \
   bin/sls_mass_notify/sls_branded_discord.py \
   bin/sls_mass_notify/sls_notification_destinations.py \
+  bin/sls_mass_notify/sls_release_verify.py bin/sls_mass_notify/release-signing.pub \
+  bin/sls_mass_notify/piper-requirements.txt \
+  bin/sls_mass_notify/sls_audio_queue.py bin/sls_mass_notify/sls_storage_maintenance.py \
+  bin/sls_mass_notify/sls_weather_queue.py \
+  bin/sls_mass_notify_announcement_worker.php \
   bin/sls_mass_notify/sls_system_notifications.py \
   bin/sls_mass_notify/sls_nws_status.py \
   bin/sls_mass_notify/sls_nws_delivery_claims.py \
@@ -216,4 +234,5 @@ if [ -z "${EXPECTED_INSTALLER_HASH}" ] || [ "${ACTUAL_PACKAGE_HASH}" != "${EXPEC
 fi
 
 sha256sum "${PACKAGE}"
+python3 "${ROOT_DIR}/tools/sign_release.py"
 printf '%s\n' "${PACKAGE}"

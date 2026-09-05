@@ -10,12 +10,12 @@ if [ -n "${SLS_MASS_NOTIFY_MODULE:-}" ] \
     "SLS_MASS_NOTIFY_MODULE is fixed to the FreePBX raw module name '$MODULE'; refusing an alternate value." >&2
   exit 2
 fi
-TGZ="${SLS_MASS_NOTIFY_TGZ:-/tmp/slsmassnotifyserver-0.1.1-beta.tgz}"
+TGZ="${SLS_MASS_NOTIFY_TGZ:-/tmp/slsmassnotifyserver-0.1.2-beta.tgz}"
 URL="${SLS_MASS_NOTIFY_TGZ_URL:-${1:-}}"
 SHA256="${SLS_MASS_NOTIFY_SHA256:-}"
 TOKEN="${SLS_MASS_NOTIFY_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
 LOG_FILE="${SLS_MASS_NOTIFY_INSTALL_LOG:-/tmp/slsmassnotifyserver-install.log}"
-EXPECTED_TGZ_SHA256="e6a61dfce8277b3464e72a93fb8e8dfdecff38688544391120fdc55877a82b11"
+EXPECTED_TGZ_SHA256="c5e7f190f1e109393eed58d753e02958367b4382323ffa6355f2ef3a62e08aea"
 DATA_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin"
 CONFIG_FILE="$DATA_DIR/mass-notifications.config"
 CONFIG_SNAPSHOT=""
@@ -1185,6 +1185,26 @@ mixed_endpoint_visual_route_supported() {
 
 preflight_platform() {
   local apache_module apache_modules available_kb check_path required_kb utility
+  # Runtime and dialplan paths are conventional FreePBX paths. Detect a
+  # relocated installation explicitly instead of creating a second, unused tree.
+  /usr/bin/timeout 20 /usr/bin/php <<'PHP' || {
+<?php
+require '/etc/freepbx.conf';
+$expected = ['AMPWEBROOT'=>'/var/www/html', 'ASTETCDIR'=>'/etc/asterisk',
+    'ASTSPOOLDIR'=>'/var/spool/asterisk', 'ASTVARLIBDIR'=>'/var/lib/asterisk',
+    'AMPASTERISKUSER'=>'asterisk', 'AMPASTERISKGROUP'=>'asterisk'];
+foreach ($expected as $key => $path) {
+    $actual = rtrim((string)($amp_conf[$key] ?? ''), '/');
+    if ($actual !== $path) {
+        fwrite(STDERR, 'Unsupported FreePBX layout: ' . $key . ' must be ' . $path . '. No alternate runtime tree will be created.' . PHP_EOL);
+        exit(1);
+    }
+}
+exit(0);
+PHP
+    log "This FreePBX layout requires an explicitly supported path adapter; installation stopped before activation."
+    exit 1
+  }
   for check_path in /var/lib/asterisk /usr/local /var/www /tmp; do
     case "$check_path" in
       /var/lib/asterisk|/usr/local) required_kb=524288 ;;
@@ -1333,6 +1353,8 @@ install_dependencies() {
     [ -x /usr/bin/wget ] || add_missing_package wget
     [ -r /etc/ssl/certs/ca-certificates.crt ] || add_missing_package ca-certificates
     [ -x /usr/bin/gpg ] || add_missing_package gnupg
+    [ -x /usr/bin/openssl ] || add_missing_package openssl
+    [ -x /usr/sbin/logrotate ] || add_missing_package logrotate
     [ -x /usr/bin/python3 ] || add_missing_package python3
     if [ -x /usr/bin/python3 ]; then
       /usr/bin/python3 -c 'import venv' >/dev/null 2>&1 || add_missing_package python3-venv
@@ -1454,14 +1476,20 @@ verify_tgz() {
   actual_sha="$(sha256sum "$TGZ" | awk '{print $1}')"
   if [ -n "$SHA256" ]; then
     echo "$SHA256  $TGZ" | sha256sum -c -
-  elif [ "$(basename "$TGZ")" = "slsmassnotifyserver-0.1.1-beta.tgz" ] && [ "$actual_sha" != "$EXPECTED_TGZ_SHA256" ]; then
-		log "$TGZ does not match the current slsmassnotifyserver-0.1.1-beta package."
+  elif [ "$(basename "$TGZ")" = "slsmassnotifyserver-0.1.2-beta.tgz" ] && [ "$actual_sha" != "$EXPECTED_TGZ_SHA256" ]; then
+		log "$TGZ does not match the current slsmassnotifyserver-0.1.2-beta package."
     log "Expected SHA256: $EXPECTED_TGZ_SHA256"
     log "Actual SHA256:   $actual_sha"
     log "Remove the stale local TGZ or install with SLS_MASS_NOTIFY_TGZ_URL so the current release is downloaded."
     exit 1
   else
     printf '%s  %s\n' "$actual_sha" "$TGZ"
+  fi
+  if [ -n "$URL" ]; then
+    verify_publisher_release
+  elif [ -z "$SHA256" ]; then
+    log 'A local/offline TGZ requires an explicit trusted SLS_MASS_NOTIFY_SHA256.'
+    return 1
   fi
   TGZ_PATH="$TGZ" MODULE_NAME="$MODULE" python3 - <<'PY'
 import os
@@ -1499,8 +1527,57 @@ with tarfile.open(archive, "r:gz") as handle:
     root = ET.fromstring(module_xml.read())
     if (root.findtext("rawname") or "").strip() != module:
         raise SystemExit("module.xml rawname does not match the requested module")
-    if (root.findtext("version") or "").strip() != "0.1.1-beta":
-        raise SystemExit("module.xml does not contain the expected 0.1.1-beta version")
+    if (root.findtext("version") or "").strip() != "0.1.2-beta":
+        raise SystemExit("module.xml does not contain the expected 0.1.2-beta version")
+PY
+}
+
+verify_publisher_release() {
+  SLS_RELEASE_URL="$URL" SLS_RELEASE_TGZ="$TGZ" SLS_RELEASE_INSTALLER="${BASH_SOURCE[0]}" /usr/bin/python3 - <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import tempfile
+import urllib.request
+
+url = os.environ['SLS_RELEASE_URL']
+match = re.fullmatch(r'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/download/slsmassnotifyserver-([0-9]+\.[0-9]+\.[0-9]+(?:-beta)?)/(slsmassnotifyserver-\1\.tgz)', url)
+if not match:
+    raise SystemExit('Use a signed GitHub release URL, or an offline TGZ with an explicitly trusted SHA-256.')
+version, package = match.groups()
+base = url.rsplit('/', 1)[0]
+public_key = b'-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAFMDOgOaBGcaI8d+v0w/NX4RbwGlBsoktNc2V2F8UkUQ=\n-----END PUBLIC KEY-----\n'
+try:
+    with tempfile.TemporaryDirectory(prefix='sls-release-verification-') as directory:
+        root = Path(directory)
+        for name, limit in [('release-manifest.json', 16384), ('release-manifest.sig', 64)]:
+            request = urllib.request.Request(base + '/' + name, headers={'User-Agent': 'SLS-Mass-Notify-Installer'})
+            with urllib.request.urlopen(request, timeout=30) as response:
+                if not response.geturl().startswith('https://'):
+                    raise ValueError('Insecure release redirect')
+                body = response.read(limit + 1)
+            if len(body) > limit or (name.endswith('.sig') and len(body) != 64):
+                raise ValueError('Invalid manifest/signature size')
+            (root / name).write_bytes(body)
+        (root / 'publisher.pub').write_bytes(public_key)
+        subprocess.run(['/usr/bin/openssl', 'pkeyutl', '-verify', '-rawin', '-pubin', '-inkey', str(root / 'publisher.pub'),
+                        '-in', str(root / 'release-manifest.json'), '-sigfile', str(root / 'release-manifest.sig')],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        manifest = json.loads((root / 'release-manifest.json').read_bytes())
+        if not isinstance(manifest, dict) or manifest.get('schema') != 1 or manifest.get('version') != version \
+                or manifest.get('tag') != 'slsmassnotifyserver-' + version or manifest.get('package') != package:
+            raise ValueError('Signed release identity mismatch')
+        for field, path in [('package_sha256', os.environ['SLS_RELEASE_TGZ']), ('installer_sha256', os.environ['SLS_RELEASE_INSTALLER'])]:
+            with open(path, 'rb') as handle:
+                actual = hashlib.file_digest(handle, 'sha256').hexdigest()
+            if manifest.get(field) != actual:
+                raise ValueError('Signed release artifact mismatch: ' + field)
+except Exception as error:
+    raise SystemExit('Publisher verification failed before activation: ' + str(error))
+print('Publisher signature and installer/package hashes verified.')
 PY
 }
 
@@ -1948,7 +2025,7 @@ $module = getenv("SLS_MASS_NOTIFY_MODULE") ?: "slsmassnotifyserver";
 $stmt = \FreePBX::Database()->prepare("SELECT version FROM modules WHERE modulename = ? LIMIT 1");
 $stmt->execute([$module]);
 $version = $stmt->fetchColumn();
-exit(is_string($version) && trim($version) === "0.1.1-beta" ? 0 : 1);
+exit(is_string($version) && trim($version) === "0.1.2-beta" ? 0 : 1);
 ' >>"$LOG_FILE" 2>&1
 }
 
@@ -1979,6 +2056,7 @@ for name in (
     "sls_mass_notify_nws_poll.sh",
     "sls_mass_notify_weather_poll.sh",
     "sls_mass_notify_schedule_worker.php",
+    "sls_mass_notify_announcement_worker.php",
     "sls_mass_notify_test.sh",
     "sls_mass_notify_update.sh",
     "sls_mass_notify_maintenance.sh",
@@ -2054,7 +2132,9 @@ ensure_piper_runtime() {
   PIPER_PY="$PIPER_DIR/venv/bin/python"
   mkdir -p "$PIPER_DIR"
 
-  if [ -x "$PIPER_BIN" ] || { [ -x "$PIPER_PY" ] && "$PIPER_PY" -m piper -h >/dev/null 2>&1; }; then
+  if [ -x "$PIPER_BIN" ] && [ -x "$PIPER_PY" ] && /usr/bin/timeout 20 "$PIPER_PY" -m piper -h >/dev/null 2>&1 \
+    && "$PIPER_PY" -c 'from importlib.metadata import version; from packaging.version import Version; assert Version(version("pip")) >= Version("26.2.0")' >/dev/null 2>&1 \
+    && "$PIPER_PY" -m pip check >/dev/null 2>&1; then
     return 0
   fi
 
@@ -2063,11 +2143,11 @@ ensure_piper_runtime() {
     log "Unable to create Piper virtualenv. See $LOG_FILE."
     exit 1
   }
-  "$PIPER_DIR/venv/bin/pip" install --upgrade 'pip==26.1.2' 'setuptools==83.0.0' 'wheel==0.47.0' >>"$LOG_FILE" 2>&1 || {
+  "$PIPER_DIR/venv/bin/pip" install --upgrade 'pip==26.2.0' 'setuptools==83.0.0' 'wheel==0.47.0' >>"$LOG_FILE" 2>&1 || {
     log "Unable to install the pinned Piper packaging runtime. See $LOG_FILE."
     exit 1
   }
-  "$PIPER_DIR/venv/bin/pip" install 'piper-tts==1.4.2' >>"$LOG_FILE" 2>&1 || {
+  "$PIPER_DIR/venv/bin/pip" install -r /usr/local/bin/sls_mass_notify/piper-requirements.txt >>"$LOG_FILE" 2>&1 || {
     log "Unable to install piper-tts into the Piper virtualenv. See $LOG_FILE."
     exit 1
   }
@@ -2075,7 +2155,8 @@ ensure_piper_runtime() {
   [ -e "$PIPER_PY" ] && chmod 0755 "$PIPER_PY" 2>/dev/null || true
   [ -e "$PIPER_DIR/venv/bin/python3" ] && chmod 0755 "$PIPER_DIR/venv/bin/python3" 2>/dev/null || true
 
-  if [ -x "$PIPER_BIN" ] || { [ -x "$PIPER_PY" ] && "$PIPER_PY" -m piper -h >/dev/null 2>&1; }; then
+  if [ -x "$PIPER_BIN" ] && /usr/bin/timeout 20 "$PIPER_PY" -m piper -h >/dev/null 2>&1 \
+    && "$PIPER_PY" -m pip check >/dev/null 2>&1; then
     return 0
   fi
 
@@ -2150,6 +2231,7 @@ def secure_tree(directory_fd, relative=""):
                     and (
                         child_relative.endswith((".sh", ".py"))
                         or child_relative == "sls_mass_notify_schedule_worker.php"
+                        or child_relative == "sls_mass_notify_announcement_worker.php"
                     )
                 ) or child_relative.startswith("piper/venv/bin/")
                 os.fchmod(file_fd, 0o755 if executable else 0o644)
@@ -2346,6 +2428,7 @@ for name in (
     "sls_mass_notify_nws_poll.sh",
     "sls_mass_notify_weather_poll.sh",
     "sls_mass_notify_schedule_worker.php",
+    "sls_mass_notify_announcement_worker.php",
     "sls_mass_notify_test.sh",
     "sls_mass_notify_update.sh",
     "sls_mass_notify_maintenance.sh",
@@ -2789,10 +2872,10 @@ exit(0);
   }
   audio_dialplan="$(asterisk -rx "dialplan show 1000@sls-alert-audio" 2>&1)"
   printf '%s\n' "$audio_dialplan"
-  printf '%s\n' "$audio_dialplan" | grep -Fq 'Page(${SLS_DIAL},b(sls-alert-autoanswer^s^1(${EXTEN}))A(${SLS_SAFE_SOUND})inq,5)' || {
+  if ! printf '%s\n' "$audio_dialplan" | /usr/bin/python3 -c 'import sys; text=sys.stdin.read(); prefix="Page(${SLS_DIAL},b(sls-alert-autoanswer^s^1(${EXTEN}))A(${SLS_SAFE_SOUND})inq,"; sys.exit(0 if any(prefix+str(seconds)+")" in text for seconds in range(1,6)) else 1)'; then
     log "The SLS audio paging context is missing its multi-contact Page/ConfBridge auto-answer and audio handler."
     exit 1
-  }
+  fi
   if printf '%s\n' "$audio_dialplan" | grep -Fq 'Dial(${SLS_DIAL}'; then
     log "The SLS audio paging context still uses first-answer Dial semantics instead of multi-contact Page semantics."
     exit 1
@@ -2976,6 +3059,10 @@ exit(0);
     /usr/local/bin/sls_mass_notify/sls_nws_status.py
     /usr/local/bin/sls_mass_notify/sls_nws_delivery_claims.py
     /usr/local/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py
+    /usr/local/bin/sls_mass_notify/sls_weather_queue.py
+    /usr/local/bin/sls_mass_notify/sls_audio_queue.py
+    /usr/local/bin/sls_mass_notify/sls_storage_maintenance.py
+    /usr/local/bin/sls_mass_notify/sls_release_verify.py
   )
   for runtime_python in "${runtime_python_files[@]}"; do
     [ -x "$runtime_python" ] || {
@@ -3254,10 +3341,10 @@ main() {
   repair_runtime_permissions
   if ! SLS_MASS_NOTIFY_DEFER_SIGNING=1 install_module_with_autoenable; then
     if ! module_registered_at_expected_version; then
-		log "FreePBX rejected the module installation before registering version 0.1.1-beta. See $LOG_FILE."
+		log "FreePBX rejected the module installation before registering version 0.1.2-beta. See $LOG_FILE."
       exit 1
     fi
-	log "FreePBX registered version 0.1.1-beta but reported a nonfatal install status; runtime verification will continue."
+	log "FreePBX registered version 0.1.2-beta but reported a nonfatal install status; runtime verification will continue."
   fi
   SLS_MASS_NOTIFY_MODULE="$MODULE" sync_module_version
   repair_runtime_permissions

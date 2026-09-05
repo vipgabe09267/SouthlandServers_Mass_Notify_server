@@ -294,9 +294,14 @@ $defaultOccurrenceLocal = $nextPbxHour->setTime((int)$nextPbxHour->format('H'), 
 							$delivery = is_array($schedule['delivery'] ?? null) ? $schedule['delivery'] : [];
 							$audioMode = (string)($delivery['audio_mode'] ?? 'none');
 							$style = (string)($delivery['style'] ?? 'standard');
+							$lastRun = '';
+							foreach ($scheduleOccurrences($schedule) as $planned) {
+								$value = (string)($planned['run_at_utc'] ?? '');
+								if ($value > $lastRun) { $lastRun = $value; }
+							}
 						?>
 							<tr data-schedule-id="<?php echo htmlspecialchars($id); ?>" data-rendered-state="<?php echo htmlspecialchars($stateName); ?>">
-								<td><div class="sls-schedule-name"><?php echo htmlspecialchars((string)($schedule['name'] ?? _('Scheduled announcement'))); ?></div><div class="sls-schedule-meta"><?php echo htmlspecialchars($scheduleRecurrenceSummary($schedule)); ?></div></td>
+								<td><div class="sls-schedule-name"><?php echo htmlspecialchars((string)($schedule['name'] ?? _('Scheduled announcement'))); ?></div><div class="sls-schedule-meta"><?php echo htmlspecialchars($scheduleRecurrenceSummary($schedule)); ?></div><div class="sls-schedule-meta"><?php echo htmlspecialchars('Created by: ' . ($schedule['created_by'] ?? 'Scheduled announcement')); ?></div><?php if ($scheduleRecurrenceMode($schedule) !== 'none' && $lastRun !== '') { ?><div class="sls-schedule-meta"><?php echo htmlspecialchars('Scheduled through ' . $formatInstant($lastRun) . '. Edit the schedule to extend it.'); ?></div><?php } ?></td>
 								<td><?php if ($next !== null) { ?><strong><?php echo htmlspecialchars($formatInstant($next->format(DATE_ATOM))); ?></strong><?php } else { ?><span class="text-muted"><?php echo _('No future dates'); ?></span><?php } ?></td>
 								<td><div><?php echo htmlspecialchars($targetSummary($schedule)); ?></div></td>
 								<td><div><?php echo htmlspecialchars(ucwords(str_replace('_', ' + ', $audioMode))); ?></div><div class="sls-schedule-meta"><?php echo $style === 'colored' ? _('Colored announcement · Labs') : _('Standard announcement'); ?></div></td>

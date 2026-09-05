@@ -174,40 +174,37 @@ foreach ($desktopClients as $desktopClient) {
 	font-size: 12px;
 }
 #dashboard-sls-mass-notify-announcement .sls-action-row {
-	display: flex;
-	align-items: center;
-	justify-content: flex-start;
-	gap: 10px;
-	padding: 10px 12px;
-	border-radius: 9px;
-	background: linear-gradient(135deg, #f8fafc 0%, #f5f3ff 100%);
-	border: 1px solid #d8dee8;
-	box-shadow: 0 2px 6px rgba(15, 23, 42, .045);
+	display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+	padding: 14px 0 0; border-top: 1px solid #e2e8f0;
 }
+#dashboard-sls-mass-notify-announcement .sls-send-button {
+	flex: 0 0 auto; min-height: 38px; min-width: 175px; padding: 9px 16px;
+	border-radius: 6px; font-size: 13px; font-weight: 600; line-height: 20px;
+	white-space: nowrap; box-shadow: none;
+}
+#dashboard-sls-mass-notify-announcement .sls-send-button:focus-visible { outline: 2px solid #2563eb; outline-offset: 3px; }
+#dashboard-sls-mass-notify-announcement .sls-send-button:disabled { opacity: .65; }
 #dashboard-sls-mass-notify-announcement .sls-announcement-inline-status {
-	flex: 1 1 260px;
-	min-width: 0;
-	margin: 0;
-	padding: 7px 9px;
-	border-radius: 6px;
+	display: flex; align-items: flex-start; gap: 8px; margin: 12px 0 0;
+	padding: 10px 12px; border: 1px solid #e2e8f0; border-radius: 6px;
+	background: #f8fafc; color: #475569; font-size: 13px; line-height: 1.5;
 	overflow-wrap: anywhere;
 }
-#dashboard-sls-mass-notify-announcement .sls-announcement-inline-status .fa { margin-right: 6px; }
-#dashboard-sls-mass-notify-announcement .sls-announcement-cooldown {
-	flex: 0 0 auto;
-	padding: 0;
-	border: 1px solid transparent;
-	border-radius: 999px;
-	white-space: nowrap;
-}
-#dashboard-sls-mass-notify-announcement .sls-announcement-cooldown:not(:empty) {
-	padding: 4px 8px;
-	border-color: #d8dee8;
-	background: #fff;
-}
-#dashboard-sls-mass-notify-announcement .sls-submit-spinner { display: none; margin-right: 5px; }
+#dashboard-sls-mass-notify-announcement .sls-announcement-inline-status .fa { margin-top: 3px; flex: 0 0 auto; }
+#dashboard-sls-mass-notify-announcement .sls-status-success { color: #166534; background: #f0fdf4; border-color: #bbf7d0; }
+#dashboard-sls-mass-notify-announcement .sls-status-warning,
+#dashboard-sls-mass-notify-announcement .sls-status-danger { color: #92400e; background: #fffbeb; border-color: #fde68a; }
+#dashboard-sls-mass-notify-announcement .sls-announcement-cooldown { margin: 0; font-size: 12px; color: #64748b; }
+#dashboard-sls-mass-notify-announcement .sls-delivery-details { margin-top: 9px; font-size: 12px; color: #64748b; }
+#dashboard-sls-mass-notify-announcement .sls-delivery-details summary { cursor: pointer; padding: 4px 0; }
+#dashboard-sls-mass-notify-announcement .sls-delivery-details ul { max-height: 180px; overflow-y: auto; padding-left: 20px; margin: 8px 0; }
+#dashboard-sls-mass-notify-announcement .sls-delivery-details li { padding: 3px 0; overflow-wrap: anywhere; }
+#dashboard-sls-mass-notify-announcement .sls-submit-spinner { display: none; margin-right: 7px; }
 #dashboard-sls-mass-notify-announcement .sls-submit-busy .sls-submit-spinner { display: inline-block; }
 #dashboard-sls-mass-notify-announcement .sls-submit-busy { cursor: wait; }
+#dashboard-sls-mass-notify-announcement .sls-priority-field { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0 12px; }
+#dashboard-sls-mass-notify-announcement .sls-priority-field label { margin: 0; font-size: 12px; }
+#dashboard-sls-mass-notify-announcement .sls-priority-field select { width: auto; max-width: 100%; height: 32px; padding: 4px 8px; }
 #dashboard-sls-mass-notify-announcement .sls-composer-grid {
 	display: grid;
 	grid-template-columns: minmax(0, 1.35fr) minmax(210px, .65fr);
@@ -508,13 +505,22 @@ foreach ($desktopClients as $desktopClient) {
 			</div>
 			<p class="help-block sls-compact-help"><?php echo _('Opening and closing sounds are included only when a tone audio mode is selected.'); ?></p>
 		</section>
+		<div class="sls-priority-field">
+			<label for="sls-announcement-priority"><?php echo _('Priority'); ?></label>
+			<select class="form-control" name="announcement_priority" id="sls-announcement-priority" aria-describedby="sls-priority-help">
+				<option value="normal"><?php echo _('Normal'); ?></option>
+				<option value="urgent"><?php echo _('Urgent'); ?></option>
+			</select>
+			<span id="sls-priority-help" class="text-muted" style="font-size:12px"><?php echo _('Urgent audio goes ahead of waiting routine pages, never an active page.'); ?></span>
+		</div>
 		<div class="sls-action-row">
-			<button type="submit" id="dashboard-sls-mass-notify-announcement-submit" class="btn btn-warning" <?php echo $announcementCooldown > 0 ? 'disabled' : ''; ?>>
+			<button type="submit" id="dashboard-sls-mass-notify-announcement-submit" class="btn btn-primary sls-send-button" <?php echo $announcementCooldown > 0 ? 'disabled' : ''; ?>>
 				<i class="fa fa-circle-o-notch fa-spin sls-submit-spinner" aria-hidden="true"></i><span class="sls-submit-label"><?php echo _('Send Announcement'); ?></span>
 			</button>
-			<div id="dashboard-sls-mass-notify-announcement-result" class="sls-announcement-inline-status" role="status" aria-live="polite" aria-atomic="true" aria-busy="false" style="display: none;"></div>
 			<span id="dashboard-sls-mass-notify-announcement-cooldown" class="text-muted sls-announcement-cooldown" data-remaining="<?php echo $announcementCooldown; ?>"><?php echo $announcementCooldown > 0 ? sprintf(_('Cooldown: %ss'), $announcementCooldown) : ''; ?></span>
 		</div>
+		<div id="dashboard-sls-mass-notify-announcement-result" class="sls-announcement-inline-status" role="status" aria-live="polite" aria-atomic="true" aria-busy="false" style="display: none;"></div>
+		<div id="sls-announcement-receipts" class="sls-delivery-details"></div>
 	</form>
 	<div class="modal fade" id="dashboard-announcement-group-modal" tabindex="-1" role="dialog" aria-hidden="true">
 		<div class="modal-dialog" role="document">
@@ -706,14 +712,14 @@ foreach ($desktopClients as $desktopClient) {
 			return;
 		}
 		var normalizedLevel = ['success', 'warning', 'danger', 'info'].indexOf(level) >= 0 ? level : 'info';
-		var iconNames = {success: 'check-circle', warning: 'exclamation-triangle', danger: 'times-circle', info: 'circle-o-notch fa-spin'};
-		result.style.display = 'block';
-		result.className = 'alert alert-' + normalizedLevel + ' sls-announcement-inline-status sls-status-' + normalizedLevel;
+		var iconNames = {success: 'check-circle', warning: 'exclamation-triangle', danger: 'times-circle', info: 'clock-o'};
+		result.style.display = 'flex';
+		result.className = 'sls-announcement-inline-status sls-status-' + normalizedLevel;
 		result.setAttribute('aria-live', normalizedLevel === 'danger' ? 'assertive' : 'polite');
 		result.setAttribute('aria-busy', busy ? 'true' : 'false');
 		result.innerHTML = '';
 		var icon = document.createElement('i');
-		icon.className = 'fa fa-' + (busy ? 'circle-o-notch fa-spin' : iconNames[normalizedLevel]);
+		icon.className = 'fa fa-' + iconNames[normalizedLevel];
 		icon.setAttribute('aria-hidden', 'true');
 		var statusText = document.createElement('span');
 		statusText.textContent = message;
@@ -955,6 +961,60 @@ foreach ($desktopClients as $desktopClient) {
 	var remaining = parseInt(cooldown.getAttribute('data-remaining') || '0', 10) || 0;
 	var deliveryOutcomeUnknown = false;
 	var requestInFlight = false;
+	var activeJob = '';
+	var jobPollBusy = false;
+	var receiptsPanel = document.getElementById('sls-announcement-receipts');
+	var lastReceiptView = '';
+	function showReceipts(data) {
+		if (!receiptsPanel) return;
+		var rows = Array.isArray(data.receipts) ? data.receipts : [];
+		var fingerprint = JSON.stringify(rows);
+		if (fingerprint === lastReceiptView) return;
+		lastReceiptView = fingerprint;
+		var wasOpen = !!(receiptsPanel.querySelector('details') && receiptsPanel.querySelector('details').open);
+		receiptsPanel.innerHTML = '';
+		if (!rows.length) return;
+		var details = document.createElement('details'); details.open = wasOpen;
+		var summary = document.createElement('summary'); summary.textContent = 'Delivery details · ' + rows.length + ' destination(s)';
+		details.appendChild(summary);
+		var list = document.createElement('ul'); list.style.maxHeight = '200px'; list.style.overflowY = 'auto';
+		rows.forEach(function(row) {
+			var item = document.createElement('li'); item.style.overflowWrap = 'anywhere';
+			item.textContent = row.channel + ' · ' + row.target + ' · ' + row.state + (row.detail ? ' — ' + row.detail : '');
+			list.appendChild(item);
+		});
+		details.appendChild(list); receiptsPanel.appendChild(details);
+	}
+	function renderDeliveryStatus(data) {
+		var pending = ['queued', 'running'].indexOf(data.state) >= 0 || !!data.queued;
+		if (pending) {
+			setAnnouncementStatus('info', data.state === 'running' ? 'Sending announcement…' : 'Announcement queued…', true);
+		} else if (data.success) {
+			setAnnouncementStatus('success', 'Announcement submitted' + (data.sender ? ' · Sent by ' + data.sender : ''), false);
+		} else {
+			setAnnouncementStatus('warning', data.message || 'Delivery needs attention. Check the details before retrying.', false);
+		}
+	}
+	function rememberJob(id) {
+		activeJob = /^job_[a-f0-9]{32}$/.test(id || '') ? id : '';
+		try { if (activeJob) sessionStorage.setItem('sls-announcement-job', activeJob); else sessionStorage.removeItem('sls-announcement-job'); } catch (ignored) {}
+	}
+	function pollJob() {
+		if (!activeJob || jobPollBusy || !instanceActive()) return;
+		jobPollBusy = true;
+		fetch('config.php?display=slsmassnotifyserver&slsmassnotifyserver_action=announcement_job&job_id=' + encodeURIComponent(activeJob), {credentials:'same-origin', cache:'no-store'})
+			.then(parseJsonResponse).then(function(data) {
+				if (!instanceActive()) return;
+				var pending = ['queued', 'running'].indexOf(data.state) >= 0;
+				renderDeliveryStatus(data);
+				showReceipts(data); setSubmitBusy(pending);
+				if (!pending) { rememberJob(''); remaining = parseInt(data.cooldown_remaining || '0', 10) || 0; }
+				renderCooldown();
+			}).catch(function() {
+				if (instanceActive()) setAnnouncementStatus('warning', 'Waiting for the PBX delivery result. Do not resend yet.', false);
+			}).then(function() { jobPollBusy = false; });
+	}
+	lifecycle.intervals.push(window.setInterval(pollJob, 2000));
 	function setSubmitBusy(busy) {
 		requestInFlight = !!busy;
 		submit.classList.toggle('sls-submit-busy', requestInFlight);
@@ -977,7 +1037,7 @@ foreach ($desktopClients as $desktopClient) {
 	function renderCooldown() {
 		if (requestInFlight) {
 			submit.disabled = true;
-			setCooldownText('Submitting', 'circle-o-notch fa-spin');
+			setCooldownText('', '');
 			return;
 		}
 		if (deliveryOutcomeUnknown) {
@@ -1025,7 +1085,7 @@ foreach ($desktopClients as $desktopClient) {
 		if (!instanceActive()) {
 			return;
 		}
-		if (remaining > 0) {
+		if (remaining > 0 || requestInFlight || deliveryOutcomeUnknown || activeJob) {
 			return;
 		}
 		if (root.getAttribute('data-quiet-hours-active') === '1') {
@@ -1041,7 +1101,8 @@ foreach ($desktopClients as $desktopClient) {
 		}
 		setSubmitBusy(true);
 		renderCooldown();
-		setAnnouncementStatus('info', 'Preparing announcement and starting the selected delivery channels…', true);
+		showReceipts({receipts: []});
+		setAnnouncementStatus('info', 'Queueing announcement…', true);
 		deliveryOutcomeUnknown = false;
 		var body = new FormData(form);
 			fetch(form.action, {method: 'POST', credentials: 'same-origin', body: body})
@@ -1050,11 +1111,11 @@ foreach ($desktopClients as $desktopClient) {
 				if (!instanceActive()) {
 					return;
 				}
-				setAnnouncementStatus(
-					data && data.success ? 'success' : 'warning',
-					data && data.message ? data.message : 'Announcement request finished.',
-					false
-				);
+				renderDeliveryStatus(data || {});
+				if (data && data.queued && data.job_id) {
+					rememberJob(data.job_id); setSubmitBusy(true); pollJob(); renderCooldown(); return;
+				}
+				showReceipts(data || {});
 				setSubmitBusy(false);
 				deliveryOutcomeUnknown = false;
 				remaining = parseInt((data && data.cooldown_remaining) || '0', 10) || 0;
@@ -1068,7 +1129,7 @@ foreach ($desktopClients as $desktopClient) {
 					deliveryOutcomeUnknown = true;
 					setAnnouncementStatus(
 						'danger',
-						'Announcement response could not be confirmed. Wait for cooldown status before retrying. ' + (error && error.message ? error.message : 'Unknown response error.'),
+						'Announcement response could not be confirmed. Wait for cooldown status before retrying.',
 						false
 					);
 					renderCooldown();
@@ -1081,5 +1142,7 @@ foreach ($desktopClients as $desktopClient) {
 	setSubmitBusy(false);
 	renderCooldown();
 	scheduleDashboardLayout();
+	try { rememberJob(sessionStorage.getItem('sls-announcement-job') || ''); } catch (ignored) {}
+	if (activeJob) { setSubmitBusy(true); renderCooldown(); pollJob(); }
 }());
 </script>

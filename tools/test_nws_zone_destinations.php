@@ -253,7 +253,7 @@ foreach (['disabled — uncheck to remove this assignment', 'missing — uncheck
 	}
 }
 
-$worker = (string)file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/bin/sls_mass_notify_weather_poll.sh');
+$worker = (string)file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/bin/sls_mass_notify/sls_weather_queue.py');
 foreach (['NWS_DESKTOP_CLIENTS_OVERRIDE', 'NWS_EMAIL_RECIPIENTS_OVERRIDE'] as $marker) {
 	if (strpos($worker, $marker) === false) {
 		zone_destination_fail("Weather worker routing marker is missing: {$marker}");

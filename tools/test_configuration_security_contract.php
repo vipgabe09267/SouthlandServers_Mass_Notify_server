@@ -297,7 +297,7 @@ foreach (['XWEATHER_LOCK_FILE', 'LOCK_EX | fcntl.LOCK_NB'] as $marker) {
 		configuration_security_fail("Xweather worker serialization marker is missing: {$marker}");
 	}
 }
-foreach (["child_relative == 'piper/venv'", "metadata.st_uid != 0", "stat.S_IMODE(metadata.st_mode) & 0o022", "raise RuntimeError('runtime tree contains a symbolic link')"] as $marker) {
+foreach (["child_relative == 'piper/venv'", "metadata.st_uid != 0", "stat.S_IMODE(metadata.st_mode) & 0o022", "raise RuntimeError('runtime tree contains a symbolic link: '", "SLS runtime safety: "] as $marker) {
 	if (strpos($classSource, $marker) === false) {
 		configuration_security_fail("The web-safe root-owned Piper compatibility boundary is missing: {$marker}");
 	}

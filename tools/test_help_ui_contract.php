@@ -11,6 +11,9 @@ $required = [
 	'min-width: 660px',
 	'white-space: nowrap',
 	"<?php echo _('Extension'); ?>",
+	"last_acknowledged_at",
+	"Live stream active",
+	"do not prove the user read the message",
 ];
 foreach ($required as $needle) {
 	if (strpos($view, $needle) === false) {

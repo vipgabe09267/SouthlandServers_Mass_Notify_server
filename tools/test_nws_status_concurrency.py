@@ -53,8 +53,9 @@ def main() -> None:
         "api_failure",
     ):
         assert marker in poller_source, f"NWS poller is missing status integration: {marker}"
-    for marker in ("NWS_CONFIGURED_GROUP_IDS_JSON", "sls_nws_status.py", '"$status_helper" reconcile'):
-        assert marker in wrapper_source, f"Weather wrapper is missing status reconciliation: {marker}"
+    queue_source = (WEATHER_WRAPPER.parent / 'sls_mass_notify/sls_weather_queue.py').read_text()
+    for marker in ('reconcile_status', 'mutate_status', "'last_poll_ok_at'", "'api_failure'"):
+        assert marker in queue_source, f"Weather observer is missing status reconciliation: {marker}"
     assert "get_status_value()" not in poller_source
 
     helper = load_helper()

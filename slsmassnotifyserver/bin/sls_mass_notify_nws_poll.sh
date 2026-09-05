@@ -75,6 +75,7 @@ SPOOL="${SPOOL:-/var/spool/asterisk/outgoing}"
 SPOOL_TMP="${SPOOL_TMP:-/var/spool/asterisk/tmp}"
 VISUAL_SCRIPT="${VISUAL_SCRIPT:-/usr/local/bin/sls_mass_notify/sls_notify.py}"
 TEST_PAYLOAD="${TEST_PAYLOAD:-}"
+NWS_DELIVERY_PAYLOAD="${NWS_DELIVERY_PAYLOAD:-}"
 FORCE_REPLAY="${FORCE_REPLAY:-0}"
 NWS_ALERTS_DRY_RUN="${NWS_ALERTS_DRY_RUN:-0}"
 API_FAULT_THRESHOLD="${API_FAULT_THRESHOLD:-3}"
@@ -468,6 +469,11 @@ fi
 
 timestamp_now() {
   date --iso-8601=seconds
+}
+
+queued_delivery_is_current() {
+  [ -n "${SLS_WEATHER_JOB_ID:-}" ] || return 0
+  /usr/bin/python3 /usr/local/bin/sls_mass_notify/sls_weather_queue.py check "$SLS_WEATHER_JOB_ID"
 }
 
 prune_event_log() {
@@ -1123,11 +1129,13 @@ build_audio_sequence() {
 
 prune_tts_cache() {
   if [ -d "$SLS_TTS_DIR" ]; then
-    find "$SLS_TTS_DIR" -maxdepth 1 -type f -name '*.wav' -mmin +15 -delete 2>/dev/null || true
+    # Shared maintenance owns media retention and honors active paging leases.
+    :
   fi
 }
 
 trigger_visual_alert() {
+  if [ -n "${SLS_WEATHER_JOB_ID:-}" ] && ! queued_delivery_is_current; then return 1; fi
   local alert_b64="$1"
   local event="$2"
   local alert_id="$3"
@@ -1238,6 +1246,13 @@ queue_audio_to_recipients() {
   fi
   call_wait_seconds=$((page_hold_seconds + 30))
   NWS_LAST_PAGE_HOLD_SECONDS="$page_hold_seconds"
+  local reservation_recipients
+  reservation_recipients="$(IFS=,; echo "${NWS_ALERT_RECIPIENTS[*]}")"
+  if ! /usr/bin/python3 /usr/local/bin/sls_mass_notify/sls_audio_queue.py --recipients "$reservation_recipients" --duration "$page_hold_seconds" --sound "$sound_sequence" >> "$LOG" 2>&1; then
+    report_fault "delivery" "Shared paging queue could not reserve these recipients; no audio was submitted" "$event" "$alert_id"
+    return 1
+  fi
+  queued_delivery_is_current || return 1
 
   for recipient in "${NWS_ALERT_RECIPIENTS[@]}"; do
     recipient="$(printf '%s' "$recipient" | tr -dc '0-9')"
@@ -1265,8 +1280,8 @@ CALL
     queued=$((queued + 1))
   done
 
-  if [ "$queued" -eq 0 ]; then
-    report_fault "delivery" "Unable to queue alert calls to configured NWS recipients" "$event" "$alert_id"
+  if [ "$queued" -ne "${#NWS_ALERT_RECIPIENTS[@]}" ]; then
+    report_fault "delivery" "Not every configured NWS recipient accepted an audio job; some jobs may already be queued" "$event" "$alert_id"
     return 1
   fi
 
@@ -1323,6 +1338,8 @@ external_command_timeout() {
 }
 
 retry_pending_external_destinations() {
+  # Scheduled deliveries have a separate bounded external retry worker.
+  [ -z "${SLS_WEATHER_JOB_ID:-}" ] || return 0
   local command_timeout result
   external_destinations_allowed || return 0
   [ -x "$NOTIFICATION_DESTINATION_SCRIPT" ] || return 75
@@ -1343,6 +1360,7 @@ retry_pending_external_destinations() {
 }
 
 queue_external_destinations() {
+  if [ -n "${SLS_WEATHER_JOB_ID:-}" ] && ! queued_delivery_is_current; then return 75; fi
   local subject="$1"
   local body="$2"
   local alert_type="$3"
@@ -1475,30 +1493,32 @@ done
 
 echo "$(date): Checking NWS alerts for zone $NWS_ZONE" >> "$LOG"
 
-# Fetch active alerts from NWS unless a test payload is provided
-if [ -n "$TEST_PAYLOAD" ]; then
-	if [ ! -f "$TEST_PAYLOAD" ]; then
+# Scheduled delivery consumes the observer's validated snapshot without
+# pretending to be a manual test (live external routes remain enabled).
+INPUT_PAYLOAD="${TEST_PAYLOAD:-$NWS_DELIVERY_PAYLOAD}"
+if [ -n "$INPUT_PAYLOAD" ]; then
+	if [ ! -f "$INPUT_PAYLOAD" ]; then
 	  echo "$(date): ERROR — Test payload not found: $TEST_PAYLOAD" >> "$LOG"
 	  report_fault "payload" "Test payload not found" "" "$TEST_PAYLOAD"
 	  exit 1
 	fi
-	if [ "$(stat -c %s "$TEST_PAYLOAD" 2>/dev/null || echo 0)" -gt 10485760 ]; then
+	if [ "$(stat -c %s "$INPUT_PAYLOAD" 2>/dev/null || echo 0)" -gt 10485760 ]; then
 	  echo "$(date): ERROR - Test payload exceeds the 10 MB safety limit" >> "$LOG"
 	  report_fault "payload" "Test payload exceeds the 10 MB safety limit" "" "$TEST_PAYLOAD"
 	  exit 1
 	fi
-	ALERTS=$(cat "$TEST_PAYLOAD")
-  echo "$(date): Using test payload from $TEST_PAYLOAD" >> "$LOG"
+	ALERTS=$(cat "$INPUT_PAYLOAD")
+  echo "$(date): Using validated delivery/test payload" >> "$LOG"
 else
 	ALERTS=$(curl -fsS --retry 3 --retry-all-errors --retry-connrefused --connect-timeout 10 --max-time 30 --max-filesize 10485760 \
     -H "Accept: application/geo+json" \
-    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.1-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
+    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.2-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
     "${NWS_API_BASE_URL%/}/alerts/active?zone=${NWS_ZONE}&status=actual" 2>>"$LOG") || ALERTS=""
   if [ -z "$ALERTS" ]; then
     echo "$(date): Initial NWS request failed; retrying over IPv4" >> "$LOG"
 	  ALERTS=$(curl -4 -fsS --retry 2 --retry-all-errors --retry-connrefused --connect-timeout 10 --max-time 30 --max-filesize 10485760 \
       -H "Accept: application/geo+json" \
-	    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.1-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
+	    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.2-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
       "${NWS_API_BASE_URL%/}/alerts/active?zone=${NWS_ZONE}&status=actual" 2>>"$LOG") || ALERTS=""
   fi
 fi
@@ -1627,6 +1647,7 @@ if [ $PARSE_RC -ne 0 ]; then
   exit 1
 fi
 
+if [ -z "$NWS_DELIVERY_PAYLOAD" ]; then
 NOW_STATUS_TS="$(timestamp_now)"
 POLL_MESSAGE="$(POLL_SUMMARY="$POLL_SUMMARY" python3 - <<'PY'
 import json
@@ -1705,6 +1726,7 @@ finally:
         pass
 PY
 clear_api_fault_state
+fi
 
 if ! wait_for_nws_dispatch_turn; then
   echo "$(date): ERROR - Timed out waiting for an earlier configured Weather zone's delivery turn" >> "$LOG"
@@ -1716,6 +1738,10 @@ fi
 printf '%s\n' "$PARSED_ALERTS" | while IFS=$'\t' read -r ALERT_ID EVENT SEVERITY MSG_TYPE ALERT_KEY ALERT_B64; do
 
   [ -z "$ALERT_ID" ] && continue
+  if ! queued_delivery_is_current; then
+    echo "$(date): Queued Weather alert is no longer current; no new delivery attempted" >> "$LOG"
+    continue
+  fi
   [ -z "$ALERT_KEY" ] && ALERT_KEY="${EVENT}|${ALERT_ID}"
   NWS_ALERT_RECIPIENTS=("${CONFIGURED_NWS_ALERT_RECIPIENTS[@]}")
   NWS_DESKTOP_RECIPIENTS=("${CONFIGURED_NWS_DESKTOP_RECIPIENTS[@]}")
@@ -2053,11 +2079,6 @@ ${QUIET_NOTE}"
     DELIVERY_STATUS="failed"
     DELIVERY_MESSAGE="The durable local dispatch journal was unavailable for ${EVENT}; zero local phone or visual submissions were attempted while external retry work remained durable"
     report_fault "delivery" "Durable local dispatch journal unavailable; no local submission was attempted" "$EVENT" "$ALERT_ID"
-  elif [ "$LOCAL_PREP_OK" = "0" ]; then
-    finalize_cross_zone_destinations "$ALERT_KEY" release phone desktop >/dev/null 2>&1 || true
-    LOCAL_SUBMISSION_OK=0
-    DELIVERY_STATUS="failed"
-    DELIVERY_MESSAGE="Local audio preparation failed for ${EVENT}; no local dispatch intent or local submission was made, while external retry work remained durable"
   elif [ "$LOCAL_DELIVERY_REQUESTED" = "0" ]; then
     DELIVERY_STATUS="queued"
     DELIVERY_MESSAGE="No local phone or Desktop channel was requested for ${EVENT}; configured external destination work was durably queued"
@@ -2099,48 +2120,30 @@ ${QUIET_NOTE}"
 
     if [ "$LOCAL_INTENT_COMMITTED" = "1" ] && [ "$LOCAL_RECOVERY" = "0" ]; then
       if [ "$LOCAL_PHONE_REQUESTED" = "1" ]; then
-        if ! acquire_audio_delivery_slot; then
+        if [ "$LOCAL_PREP_OK" = "0" ] || ! acquire_audio_delivery_slot; then
           LOCAL_SUBMISSION_OK=0
           LOCAL_AUDIO_QUEUE_FAILED=1
-          DELIVERY_STATUS="failed"
-          if [ "$LOCAL_INTENT_NEW" = "1" ] && cancel_local_dispatch_intent "$ALERT_KEY"; then
-            finalize_cross_zone_destinations "$ALERT_KEY" release phone desktop >/dev/null 2>&1 || true
-            LOCAL_INTENT_COMMITTED=0
-            LOCAL_INTENT_NEW=0
-            DELIVERY_MESSAGE="Timed out waiting for the serialized Weather paging queue for ${EVENT}; zero local submissions occurred and the alert remains eligible for retry"
-          else
-            if ! finalize_cross_zone_destinations "$ALERT_KEY" commit phone desktop; then
-              CROSS_ZONE_FINALIZE_OK=0
-            fi
-            DELIVERY_MESSAGE="Timed out waiting for the serialized Weather paging queue for ${EVENT}; the durable local intent could not be cancelled safely, so automatic replay is suppressed"
-          fi
-          report_fault "delivery" "Timed out waiting for the serialized Weather paging queue" "$EVENT" "$ALERT_ID"
+          DELIVERY_STATUS="partial_failure"
+          DELIVERY_MESSAGE="Audio preparation or reservation failed for ${EVENT}; visual channels are still attempted independently"
+          report_fault "delivery" "$DELIVERY_MESSAGE" "$EVENT" "$ALERT_ID"
         fi
         echo "$(date): Queueing call files for $EVENT - audio sequence: $AUDIO_SEQUENCE" >> "$LOG"
         if [ "$LOCAL_AUDIO_QUEUE_FAILED" = "0" ] && ! queue_audio_to_recipients "$AUDIO_SEQUENCE" "$EVENT" "$ALERT_ID"; then
           LOCAL_SUBMISSION_OK=0
           LOCAL_AUDIO_QUEUE_FAILED=1
-          DELIVERY_STATUS="failed"
-          if [ "$LOCAL_INTENT_NEW" = "1" ] && cancel_local_dispatch_intent "$ALERT_KEY"; then
-            finalize_cross_zone_destinations "$ALERT_KEY" release phone desktop >/dev/null 2>&1 || true
-            LOCAL_INTENT_COMMITTED=0
-            LOCAL_INTENT_NEW=0
-            DELIVERY_MESSAGE="Phone audio queueing failed before any call file was accepted for ${EVENT}; zero local submissions occurred and the alert remains eligible for retry"
-          else
-            if ! finalize_cross_zone_destinations "$ALERT_KEY" commit phone desktop; then
-              CROSS_ZONE_FINALIZE_OK=0
-            fi
-            DELIVERY_MESSAGE="Phone audio queueing failed before any call file was accepted for ${EVENT}; the durable local intent could not be cancelled safely, so automatic replay is suppressed"
-          fi
+          DELIVERY_STATUS="partial_failure"
+          DELIVERY_MESSAGE="One or more audio jobs were not accepted for ${EVENT}; visual channels are still attempted and automatic local replay is suppressed"
         fi
       fi
-      if [ "$LOCAL_AUDIO_QUEUE_FAILED" = "0" ]; then
+      # Keep the durable intent even if audio failed: visual submission below
+      # is irreversible, and a partial audio queue must never be replayed.
+      if [ "$LOCAL_INTENT_COMMITTED" = "1" ]; then
         if ! finalize_cross_zone_destinations "$ALERT_KEY" commit phone desktop; then
           echo "$(date): WARNING - Durable local intent exists, but its cross-zone reservation could not yet be committed for $EVENT" >> "$LOG"
           CROSS_ZONE_FINALIZE_OK=0
         fi
       fi
-      if [ "$LOCAL_AUDIO_QUEUE_FAILED" = "0" ] && [ "$LOCAL_VISUAL_REQUESTED" = "1" ]; then
+      if [ "$LOCAL_VISUAL_REQUESTED" = "1" ]; then
         if ! trigger_visual_alert "$ALERT_B64" "$EVENT" "$ALERT_ID" 2; then
           VISUAL_DELIVERY_OK=0
           LOCAL_SUBMISSION_OK=0

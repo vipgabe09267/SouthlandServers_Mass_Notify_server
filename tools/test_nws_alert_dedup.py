@@ -722,10 +722,10 @@ for marker in (
     'DELIVERY_STATUS="indeterminate"',
     "automatic local replay is suppressed",
     'if [ "$FORCE_REPLAY" = "1" ]; then',
-    'LOCAL_DISPATCH_STATE="$DATA_DIR/local-dispatch-intents-${safe_id}.json"',
+    "('LOCAL_DISPATCH_STATE', 'local-dispatch-intents')",
 ):
-    source = poller_source if marker != 'LOCAL_DISPATCH_STATE="$DATA_DIR/local-dispatch-intents-${safe_id}.json"' else (
-        ROOT / "slsmassnotifyserver/bin/sls_mass_notify_weather_poll.sh"
+    source = poller_source if marker != "('LOCAL_DISPATCH_STATE', 'local-dispatch-intents')" else (
+        ROOT / "slsmassnotifyserver/bin/sls_mass_notify/sls_weather_queue.py"
     ).read_text(encoding="utf-8")
     assert marker in source, f"missing NWS local at-most-once marker: {marker}"
 

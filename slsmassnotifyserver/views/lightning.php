@@ -12,6 +12,11 @@ $openingSelection = (string)($xweather['opening_tone'] ?? 'opening_Lightning_ale
 $closingSelection = (string)($xweather['closing_tone'] ?? '');
 $cooldownRemaining = max(0, (int)($cooldown_remaining ?? 0));
 $apiUsage = is_array($api_usage ?? null) ? $api_usage : [];
+$areaCoverage = is_array($area_coverage ?? null) ? $area_coverage : [];
+$coverageTime = static function ($value) {
+	$timestamp = is_string($value) ? strtotime($value) : false;
+	return $timestamp ? date('M j, g:i A T', $timestamp) : _('Not recorded');
+};
 $adaptiveFreeTier = !array_key_exists('adaptive_free_tier', $xweather) || !empty($xweather['adaptive_free_tier']);
 $weatherZones = is_array($settings['nws_zones'] ?? null) ? $settings['nws_zones'] : [];
 $weatherZoneNames = [];
@@ -229,6 +234,22 @@ $emailText = static function ($value) {
 				<div class="sls-usage-status"><i class="fa fa-info-circle" aria-hidden="true"></i><div><strong><?php echo _('No provider usage snapshot yet'); ?></strong><?php echo _('Run Verify Applied Areas or wait for the next storm query to populate token counters and period timing.'); ?></div></div>
 			<?php } ?>
 
+			<?php if ($activeLightningGroups) { ?>
+			<details style="margin:14px 0;"><summary><?php echo _('Area coverage'); ?></summary>
+			<div class="table-responsive" style="margin-top:10px;"><table class="table table-condensed">
+			<thead><tr><th><?php echo _('Area'); ?></th><th><?php echo _('Polling state'); ?></th><th><?php echo _('Last API attempt'); ?></th><th><?php echo _('Last valid observation'); ?></th></tr></thead><tbody>
+			<?php foreach ($activeLightningGroups as $coverageGroup) {
+				$coverage = (array)($areaCoverage[$coverageGroup['id'] ?? ''] ?? []);
+				$coverageState = empty($coverageGroup['enabled']) ? _('Disabled') : (string)($coverage['last_xweather_poll_status'] ?? _('Not recorded'));
+			?>
+			<tr><td><?php echo htmlspecialchars((string)($coverageGroup['name'] ?? '')); ?></td>
+			<td title="<?php echo htmlspecialchars((string)($coverage['last_xweather_poll_message'] ?? '')); ?>"><?php echo htmlspecialchars($coverageState); ?></td>
+			<td><?php echo htmlspecialchars($coverageTime($coverage['last_xweather_query_at'] ?? '')); ?></td>
+			<td><?php echo htmlspecialchars($coverageTime($coverage['last_xweather_observation_at'] ?? '')); ?></td></tr>
+			<?php } ?></tbody></table></div>
+			<small class="text-muted"><?php echo _('Standby and quota protection are not continuous lightning coverage. An API attempt is not a valid observation unless its response passes validation.'); ?></small>
+			</details>
+			<?php } ?>
 			<?php if ($usageLimit > 0) { ?>
 			<div class="sls-usage-grid" aria-label="<?php echo htmlspecialchars(_('Xweather token usage snapshot')); ?>">
 				<div class="sls-usage-stat"><span class="sls-usage-stat-label"><?php echo $usageSnapshotCurrent ? _('Current tokens used') : _('Historical tokens used'); ?></span><span class="sls-usage-stat-value"><?php echo number_format($usageUsed); ?></span></div>
@@ -309,6 +330,7 @@ $emailText = static function ($value) {
 						<div class="sls-lightning-editor" data-lightning-editor>
 							<div class="sls-lightning-editor-header"><strong class="sls-lightning-editor-title" data-lightning-title><?php echo htmlspecialchars(trim((string)($group['name'] ?? '')) ?: sprintf(_('Lightning Area %d'), $groupIndex + 1)); ?></strong><div class="sls-lightning-editor-actions"><select class="form-control input-sm" data-lightning-field="enabled" aria-label="<?php echo htmlspecialchars(_('Area status')); ?>"><option value="1" <?php echo !empty($group['enabled']) ? 'selected' : ''; ?>><?php echo _('Enabled'); ?></option><option value="0" <?php echo empty($group['enabled']) ? 'selected' : ''; ?>><?php echo _('Disabled'); ?></option></select><button type="button" class="btn btn-link btn-sm text-danger" data-lightning-remove><i class="fa fa-trash" aria-hidden="true"></i> <?php echo _('Remove'); ?></button></div></div>
 							<input type="hidden" data-lightning-field="id" value="<?php echo htmlspecialchars((string)($group['id'] ?? '')); ?>">
+							<label style="display:block;margin:12px 0;"><?php echo _('All-clear observation period (minutes)'); ?><input class="form-control" type="number" min="5" max="120" data-lightning-field="all_clear_minutes" value="<?php echo (int)($group['all_clear_minutes'] ?? 10); ?>"></label>
 							<div class="row">
 								<div class="col-md-6"><div class="form-group"><label><?php echo _('Area Name'); ?></label><input class="form-control" data-lightning-field="name" maxlength="64" value="<?php echo htmlspecialchars((string)($group['name'] ?? '')); ?>" placeholder="<?php echo htmlspecialchars(_('North Campus')); ?>"></div></div>
 								<div class="col-md-6"><div class="form-group"><label><?php echo _('Weather.gov Adaptive Trigger Zone'); ?></label><select class="form-control" data-lightning-field="adaptive_nws_zone_id"><option value=""><?php echo _('Select a configured Weather zone group'); ?></option><?php if ($groupZoneId !== '' && !isset($weatherZoneNames[$groupZoneId])) { ?><option value="<?php echo htmlspecialchars($groupZoneId); ?>" selected><?php echo htmlspecialchars(sprintf(_('Unavailable saved zone (%s) — reselect to repair'), $groupZoneId)); ?></option><?php } ?><?php foreach ($weatherZoneNames as $zoneId => $zoneLabel) { ?><option value="<?php echo htmlspecialchars($zoneId); ?>" <?php echo $groupZoneId === $zoneId ? 'selected' : ''; ?>><?php echo htmlspecialchars($zoneLabel); ?></option><?php } ?></select><p class="help-block"><?php echo _('This selects a configured Weather Alerts group, not a location guessed from the area name.'); ?> <a href="config.php?display=slsmassnotifyserver_nws" target="_blank" rel="noopener noreferrer"><?php echo _('Manage Weather zones'); ?> <i class="fa fa-external-link" aria-hidden="true"></i></a></p></div></div>
@@ -393,6 +415,12 @@ $emailText = static function ($value) {
 	function editors(){return editorList?Array.prototype.slice.call(editorList.querySelectorAll('[data-lightning-editor]')):[];}
 	function setEditorNames(){
 		editors().forEach(function(editor,index){
+			if (!editor.querySelector('[data-lightning-field="all_clear_minutes"]')) {
+				var label=document.createElement('label');label.style.display='block';label.style.margin='12px 0';
+				label.textContent='All-clear observation period (minutes)';
+				var field=document.createElement('input');field.type='number';field.min='5';field.max='120';field.value='10';field.className='form-control';
+				field.setAttribute('data-lightning-field','all_clear_minutes');label.appendChild(field);editor.appendChild(label);
+			}
 			editor.querySelectorAll('[data-lightning-field]').forEach(function(field){field.name='xweather[groups]['+index+']['+field.getAttribute('data-lightning-field')+']';});
 			editor.querySelectorAll('[data-lightning-extension]').forEach(function(field){field.name='xweather[groups]['+index+'][extensions][]';});
 			editor.querySelectorAll('[data-lightning-desktop]').forEach(function(field){field.name='xweather[groups]['+index+'][desktop_clients][]';});

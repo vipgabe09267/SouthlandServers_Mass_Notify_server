@@ -570,6 +570,7 @@ PY
 }
 
 disable_apache_conf() {
+  rm -f /etc/logrotate.d/sls-mass-notify
   command -v a2disconf >/dev/null && a2disconf sls-mass-notify >/dev/null 2>&1 || true
   rm -f /etc/apache2/conf-enabled/sls-mass-notify.conf
   rm -f /etc/apache2/conf-available/sls-mass-notify.conf

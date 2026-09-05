@@ -2,6 +2,19 @@
 
 declare(strict_types=1);
 
+foreach (['nws' => 'triggerTest(', 'lightning' => 'triggerLightningTest('] as $page => $call) {
+	$controller = file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/page.slsmassnotifyserver_' . $page . '.php');
+	$unlock = strpos($controller, 'session_write_close();');
+	$csrf = strpos($controller, 'validateCsrfToken(');
+	$sender = strpos($controller, '$triggerName =');
+	$delivery = strpos($controller, $call);
+	if ($unlock === false || $csrf === false || $sender === false || $delivery === false
+		|| $csrf >= $unlock || $sender >= $unlock || $unlock >= $delivery
+		|| strpos(substr($controller, max(0, $unlock - 150), 150), "(\$_POST['ajax'] ?? '') === '1'") === false) {
+		throw new RuntimeException($page . ': authenticated AJAX tests must release the session before waiting for delivery.');
+	}
+}
+
 if (!interface_exists('BMO')) { interface BMO {} }
 if (!function_exists('load_view')) { function load_view($path, array $variables = []): string { return ''; } }
 if (!function_exists('_')) { function _($value) { return $value; } }

@@ -355,7 +355,13 @@ def test_weather_worker_overrides():
             "DATA_DIR": str(data),
             "LOG": str(temp / "worker.log"),
         })
-        subprocess.run([str(WEATHER_WORKER)], env=environment, check=True, timeout=15)
+        normalized = subprocess.run([str(WEATHER_WORKER), '--groups-json'], env=environment, check=True, timeout=15, text=True, capture_output=True)
+        queue_module = load_source_module('weather_queue_zone_fixture', ROOT / 'slsmassnotifyserver/bin/sls_mass_notify/sls_weather_queue.py')
+        queue_module.DATA = data
+        queue_module.RUNTIME = runtime
+        for index, row in enumerate(json.loads(normalized.stdout)):
+            scoped_environment = queue_module.nws_environment(row, 'nws_fixture_' + str(index))
+            subprocess.run([str(fake_core)], env=scoped_environment, check=True, timeout=5)
         captured = [
             json.loads(line)
             for line in capture.read_text(encoding="utf-8").splitlines()
@@ -363,18 +369,18 @@ def test_weather_worker_overrides():
         ]
         legacy_id = "nws_" + hashlib.sha256(b"central|TXC491").hexdigest()[:12]
         cycles = {record.pop("cycle") for record in captured}
-        if len(cycles) != 1 or not next(iter(cycles), "").startswith("nws_"):
-            fail(f"Weather workers did not share one bounded dispatch cycle: {cycles!r}")
+        if len(cycles) != 4 or not all(value.startswith('nws_') for value in cycles):
+            fail(f"Queued Weather jobs did not receive separate bounded dispatch cycles: {cycles!r}")
         rank_by_id = {record["id"]: record.pop("rank") for record in captured}
         count_values = {record.pop("count") for record in captured}
         claim_states = {record.pop("claim_state") for record in captured}
-        if rank_by_id != {legacy_id: "0", "phones_only": "1", "email_only": "2", "webhook_only": "3"}:
-            fail(f"Weather worker rank did not preserve configured zone order: {rank_by_id!r}")
-        if count_values != {"4"}:
-            fail(f"Weather workers did not receive the complete zone count: {count_values!r}")
+        if set(rank_by_id.values()) != {'0'} or len(rank_by_id) != 4:
+            fail(f"Chronological jobs must each own a single coordinator turn: {rank_by_id!r}")
+        if count_values != {"1"}:
+            fail(f"Weather job received an invalid turn count: {count_values!r}")
         expected_claim_state = str(data / "nws-cross-zone-delivery-claims.json")
-        if claim_states != {expected_claim_state} or not Path(expected_claim_state).is_file():
-            fail(f"Weather workers did not share initialized claim state: {claim_states!r}")
+        if claim_states != {expected_claim_state}:
+            fail(f"Weather workers did not share cross-zone claim state: {claim_states!r}")
         expected = [
             {
                 "id": legacy_id,

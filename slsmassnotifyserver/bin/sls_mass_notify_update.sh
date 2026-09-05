@@ -12,7 +12,7 @@ STATUS_FILE="${STATUS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/upda
 UPDATE_PROGRESS_FILE="${UPDATE_PROGRESS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/update-progress.json}"
 LOG_FILE="${LOG_FILE:-/var/log/sls_mass_notify.log}"
 LOCK_FILE="${LOCK_FILE:-/run/lock/sls-mass-notify-update.lock}"
-CURRENT_VERSION="${SLS_MASS_NOTIFY_CURRENT_VERSION:-0.1.1-beta}"
+CURRENT_VERSION="${SLS_MASS_NOTIFY_CURRENT_VERSION:-0.1.2-beta}"
 
 GITHUB_UPDATES_ENABLED="0"
 MANUAL_UPDATE="${SLS_MASS_NOTIFY_MANUAL_UPDATE:-0}"
@@ -145,7 +145,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 repo = os.environ.get("REPOSITORY", "")
-current = os.environ.get("CURRENT_VERSION", "0.1.1-beta")
+current = os.environ.get("CURRENT_VERSION", "0.1.2-beta")
 now = datetime.now(timezone.utc).astimezone().isoformat()
 if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
     print(json.dumps({"ok": False, "checked_at": now, "update_available": False, "latest_version": current, "message": "Configured GitHub repository is invalid."}, separators=(",", ":")))
@@ -166,7 +166,7 @@ def version_key(value):
 try:
     request = urllib.request.Request(
         f"https://api.github.com/repos/{repo}/releases",
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "SouthlandServers-Mass-Notifications-Updater/0.1.1-beta"},
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "SouthlandServers-Mass-Notifications-Updater/0.1.2-beta"},
     )
     with urllib.request.urlopen(request, timeout=20) as response:
         releases = json.load(response)
@@ -199,6 +199,21 @@ if not candidates:
 
 _, tag, tgz_url, sha256 = candidates[0]
 available = version_key(tag) > version_key(current)
+installer_commit = ""
+if available:
+    try:
+        commit_request = urllib.request.Request(
+            f"https://api.github.com/repos/{repo}/commits/{tag}",
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "SLS-Mass-Notify-Updater"},
+        )
+        with urllib.request.urlopen(commit_request, timeout=20) as response:
+            commit_info = json.loads(response.read(1048576))
+        installer_commit = str(commit_info.get("sha", ""))
+        if not re.fullmatch(r"[0-9a-f]{40}", installer_commit):
+            raise ValueError("release commit is unavailable")
+    except Exception:
+        print(json.dumps({"ok": False, "checked_at": now, "update_available": False, "latest_version": norm(tag), "message": "Release commit verification failed; no installer will run."}, separators=(",", ":")))
+        raise SystemExit(0)
 print(json.dumps({
     "ok": True,
     "checked_at": now,
@@ -207,7 +222,8 @@ print(json.dumps({
     "tag_name": tag,
     "tgz_url": tgz_url,
     "sha256": sha256,
-    "installer_url": f"https://raw.githubusercontent.com/{repo}/{tag}/tools/install_release.sh",
+    "installer_commit": installer_commit,
+    "installer_url": f"https://raw.githubusercontent.com/{repo}/{installer_commit}/tools/install_release.sh" if installer_commit else "",
     "message": "Update available." if available else "Installed package is current.",
 }, separators=(",", ":")))
 PY
@@ -241,17 +257,34 @@ if [ -z "$tgz_url" ] || ! [[ "$sha256" =~ ^[0-9a-f]{64}$ ]] || [ -z "$installer_
   exit 0
 fi
 
-tmp_script="$(mktemp /tmp/slsmassnotifyserver-auto-install.XXXXXX)" || exit 0
-trap 'rm -f "$tmp_script"' EXIT
+release_work="$(mktemp -d /tmp/slsmassnotifyserver-update.XXXXXX)" || exit 0
+tmp_script="$release_work/install_release.sh"
+release_manifest="$release_work/release-manifest.json"
+release_signature="$release_work/release-manifest.sig"
+release_package="$release_work/package.tgz"
+trap 'rm -f "$tmp_script" "$release_manifest" "$release_signature" "$release_package"; rmdir "$release_work" 2>/dev/null || true' EXIT
 write_manual_progress "installing" "Downloading and installing Mass Notify ${latest}."
 if ! curl -fsSL --proto '=https' --tlsv1.2 -o "$tmp_script" "$installer_url" >> "$LOG_FILE" 2>&1; then
   log "Automatic update could not download the tagged installer for $latest"
   write_manual_progress "failed" "The tagged installer for ${latest} could not be downloaded."
   exit 0
 fi
+release_base="${tgz_url%/*}"
+if ! curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 120 --max-filesize 16384 -o "$release_manifest" "$release_base/release-manifest.json" >> "$LOG_FILE" 2>&1 \
+  || ! curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 120 --max-filesize 64 -o "$release_signature" "$release_base/release-manifest.sig" >> "$LOG_FILE" 2>&1 \
+  || ! curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 900 --max-filesize 52428800 -o "$release_package" "$tgz_url" >> "$LOG_FILE" 2>&1 \
+  || ! /usr/bin/python3 /usr/local/bin/sls_mass_notify/sls_release_verify.py \
+      --manifest "$release_manifest" --signature "$release_signature" --installer "$tmp_script" --package "$release_package" --version "$latest" >> "$LOG_FILE" 2>&1; then
+  log "Update rejected: publisher signature or artifact verification failed for $latest"
+  write_manual_progress "failed" "Release authenticity could not be verified. No downloaded installer was executed."
+  exit 0
+fi
 chmod 0700 "$tmp_script"
 log "Automatic update installing $latest"
-SLS_MASS_NOTIFY_TGZ_URL="$tgz_url" SLS_MASS_NOTIFY_SHA256="$sha256" "$tmp_script" >> "$LOG_FILE" 2>&1 || {
+# Install the exact authenticated bytes. Do not fetch the mutable release asset
+# a second time or substitute the GitHub API's unauthenticated digest.
+verified_sha256="$(sha256sum "$release_package" | awk '{print $1}')"
+SLS_MASS_NOTIFY_TGZ="$release_package" SLS_MASS_NOTIFY_TGZ_URL='' SLS_MASS_NOTIFY_SHA256="$verified_sha256" "$tmp_script" >> "$LOG_FILE" 2>&1 || {
   log "Automatic update install failed for $latest"
   write_manual_progress "failed" "Installation of Mass Notify ${latest} failed. Review Notification Logs for details."
   exit 0

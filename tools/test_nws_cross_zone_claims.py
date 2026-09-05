@@ -64,22 +64,24 @@ class CrossZoneClaimTests(unittest.TestCase):
         self.assertIn('finalize_cross_zone_destinations "$ALERT_KEY" commit phone desktop', poller)
         self.assertIn('finalize_cross_zone_destinations "$ALERT_KEY" commit email discord generic', poller)
         self.assertIn('finalize_cross_zone_destinations "$ALERT_KEY" release phone desktop', poller)
-        self.assertIn('cancel_local_dispatch_intent "$ALERT_KEY"', poller)
-        self.assertIn("the alert remains eligible for retry", poller)
+        self.assertIn("a partial audio queue must never be replayed", poller)
         self.assertIn('"expected_count": int(os.environ["NWS_CLAIM_EXPECTED_COUNT"])', poller)
         self.assertIn("skipped_cross_zone_duplicate", poller)
         self.assertIn("print rounded + 7", poller)
         self.assertIn('"timeout_seconds": 3300', poller)
-        self.assertIn("CORE_WORKER_TIMEOUT_SECONDS=5400", wrapper)
+        queue_source = (NWS_POLLER.parent / 'sls_mass_notify/sls_weather_queue.py').read_text()
+        self.assertIn("timeout=5400", queue_source)
         self.assertGreater(claims.RESERVATION_LEASE_SECONDS, 3300)
-        self.assertIn('exec 7>"$DATA_DIR/weather-poll-cycle.lock"', wrapper)
-        self.assertIn(
+        self.assertIn("weather-observation.lock", queue_source)
+        self.assertIn("weather-dispatch-worker.lock", queue_source)
+        self.assertIn('sls_weather_queue.py" cycle', wrapper)
+        self.assertNotIn(
             '[ "$LOCAL_AUDIO_QUEUE_FAILED" = "0" ] && [ "$LOCAL_VISUAL_REQUESTED" = "1" ]',
             poller,
         )
         self.assertIn("complete_nws_dispatch_turn || ALERT_LOOP_STATUS=1", poller)
         self.assertIn('> /dev/null 2>> "$LOG"', poller)
-        self.assertIn('> /dev/null 2>> "$LOG"', wrapper)
+        self.assertIn('stdout=subprocess.DEVNULL', queue_source)
 
     def test_shell_claim_adapter_builds_and_consumes_real_helper_protocol(self):
         poller = NWS_POLLER.read_text(encoding="utf-8")

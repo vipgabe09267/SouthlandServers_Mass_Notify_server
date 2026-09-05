@@ -23,7 +23,7 @@ download_file() {
   tmp="$(mktemp /tmp/sls-piper-voice.XXXXXXXX)" || return 1
   if command -v curl >/dev/null 2>&1; then
     if ! curl -fL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 900 \
-      -A "SouthlandServers-Mass-Notifications-Server/0.1.1-beta" \
+      -A "SouthlandServers-Mass-Notifications-Server/0.1.2-beta" \
       -o "$tmp" "$url"; then
       rm -f "$tmp"
       return 1
@@ -138,7 +138,9 @@ ensure_piper_runtime() {
     log "Piper install failed: python3 is installed but not executable or broken"
     return 1
   fi
-  if [ -x "$PIPER_BIN" ] || { [ -x "$PIPER_PY" ] && "$PIPER_PY" -m piper -h >/dev/null 2>&1; }; then
+  if [ -x "$PIPER_BIN" ] && [ -x "$PIPER_PY" ] && /usr/bin/timeout 20 "$PIPER_PY" -m piper -h >/dev/null 2>&1 \
+    && "$PIPER_PY" -c 'from importlib.metadata import version; from packaging.version import Version; assert Version(version("pip")) >= Version("26.2.0")' >/dev/null 2>&1 \
+    && "$PIPER_PY" -m pip check >/dev/null 2>&1; then
     return 0
   fi
   if ! command -v python3 >/dev/null 2>&1; then
@@ -157,10 +159,10 @@ ensure_piper_runtime() {
       fi
     fi
   fi
-  "$PIPER_DIR/venv/bin/pip" install --upgrade 'pip==26.1.2' 'setuptools==83.0.0' 'wheel==0.47.0' >> "$LOG_FILE" 2>&1 || return 1
-  "$PIPER_DIR/venv/bin/pip" install 'piper-tts==1.4.2' >> "$LOG_FILE" 2>&1 || return 1
+  "$PIPER_DIR/venv/bin/pip" install --upgrade 'pip==26.2.0' 'setuptools==83.0.0' 'wheel==0.47.0' >> "$LOG_FILE" 2>&1 || return 1
+  "$PIPER_DIR/venv/bin/pip" install -r /usr/local/bin/sls_mass_notify/piper-requirements.txt >> "$LOG_FILE" 2>&1 || return 1
   PIPER_ARTIFACTS_CHANGED=1
-  [ -x "$PIPER_BIN" ] || { [ -x "$PIPER_PY" ] && "$PIPER_PY" -m piper -h >/dev/null 2>&1; }
+  [ -x "$PIPER_BIN" ] && /usr/bin/timeout 20 "$PIPER_PY" -m piper -h >/dev/null 2>&1 && "$PIPER_PY" -m pip check >/dev/null 2>&1
 }
 
 install_piper_wrapper() {

@@ -31,8 +31,11 @@ foreach ([
 	'readonly GITHUB_UPDATES_REPOSITORY="vipgabe09267/SouthlandServers_Mass_Notify_server"',
 	'https://api.github.com/repos/{repo}/releases',
 	're.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest)',
-	'installer_url": f"https://raw.githubusercontent.com/{repo}/{tag}/tools/install_release.sh"',
-	'SLS_MASS_NOTIFY_TGZ_URL="$tgz_url" SLS_MASS_NOTIFY_SHA256="$sha256"',
+	'installer_url": f"https://raw.githubusercontent.com/{repo}/{installer_commit}/tools/install_release.sh"',
+	'if not re.fullmatch(r"[0-9a-f]{40}", installer_commit)',
+	'SLS_MASS_NOTIFY_TGZ="$release_package"',
+	'SLS_MASS_NOTIFY_SHA256="$verified_sha256"',
+	'--manifest "$release_manifest" --signature "$release_signature"',
 ] as $required) {
 	if (strpos($updateScript, $required) === false) {
 		update_contract_fail('Updater is missing a verified-release control: ' . $required);

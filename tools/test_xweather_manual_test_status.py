@@ -46,6 +46,7 @@ class XweatherManualTestStatusTests(unittest.TestCase):
                     mock.patch.object(WORKER_MODULE, "SPOOL_DONE_DIR", done), \
                     mock.patch.object(WORKER_MODULE.tempfile, "mkstemp", side_effect=local_mkstemp), \
                     mock.patch.object(WORKER_MODULE, "audio_page_hold_seconds", return_value=15), \
+                    mock.patch.object(WORKER_MODULE, "wait_for_slot"), \
                     mock.patch.object(WORKER_MODULE.os, "geteuid", return_value=1000):
                 queued, results, page_hold_seconds = WORKER_MODULE.queue_audio(["1000"], "safe/sound", archive=True)
 

@@ -3,10 +3,17 @@
 
 namespace FreePBX\modules;
 
+require_once __DIR__ . '/AnnouncementDelivery.php';
+require_once __DIR__ . '/TestProfiles.php';
+require_once __DIR__ . '/SupportDiagnostics.php';
+
 #[\AllowDynamicProperties]
 class Slsmassnotifyserver implements \BMO
 {
-	const MODULE_VERSION = '0.1.1-beta';
+	use SlsAnnouncementDelivery;
+	use SlsTestProfiles;
+	use SlsSupportDiagnostics;
+	const MODULE_VERSION = '0.1.2-beta';
 	const EVENTS_LOG = '/var/log/sls_mass_notify_events.jsonl';
 	const LEGACY_EVENTS_LOG = '/var/log/nws_weather_alert_events.jsonl';
 	const PLUGIN_DATA_DIR = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin';
@@ -86,6 +93,7 @@ class Slsmassnotifyserver implements \BMO
 	private $extensionNameMapCache = null;
 	private $allPjsipExtensionsCache = null;
 	private $sipNotifyTargetsCache = null;
+	private $deviceInventoryError = '';
 
 	public function __construct($freepbx = null)
 	{
@@ -130,6 +138,7 @@ class Slsmassnotifyserver implements \BMO
 		$this->ensureMenuPlacement();
 		$this->ensureDashboardWidget();
 		$this->ensureCronJob();
+		$this->ensureOperationalLogRotation();
 		$backupEnrollment = $this->ensureFreePbxBackupEnrollment();
 		if (empty($backupEnrollment['success'])) {
 			throw new \RuntimeException(_('FreePBX backup enrollment could not be verified.'));
@@ -740,6 +749,7 @@ class Slsmassnotifyserver implements \BMO
 					'test_result' => $params['test_result'] ?? null,
 					'connection_result' => $params['connection_result'] ?? null,
 					'api_usage' => $this->getXweatherApiUsageSummary(),
+					'area_coverage' => $this->loadStatusData()['xweather_groups'] ?? [],
 					'cooldown_remaining' => $lightningCooldown['remaining'],
 					'hero_image' => self::HERO_IMAGE,
 					'csrf_token' => $csrfToken,
@@ -1448,6 +1458,8 @@ class Slsmassnotifyserver implements \BMO
 		$sipnotifySettings['media_scheme'] = $this->normalizePhoneMediaScheme((string)($input['sipnotify_media_scheme'] ?? $sipnotifySettings['media_scheme'] ?? 'http'));
 		$formatOverrideInput = $input['sipnotify_format_overrides'] ?? (!empty($input['sipnotify_format_overrides_present']) ? [] : ($sipnotifySettings['format_overrides'] ?? []));
 		$sipnotifySettings['format_overrides'] = $this->normalizeEndpointFormatOverrides($formatOverrideInput);
+		$deviceOverrideInput = $input['sipnotify_device_overrides'] ?? (!empty($input['sipnotify_device_overrides_present']) ? [] : ($sipnotifySettings['device_format_overrides'] ?? []));
+		$sipnotifySettings['device_format_overrides'] = $this->normalizeDeviceFormatOverrides($deviceOverrideInput);
 		$settings['sipnotify'] = $this->normalizeSipNotifySettings($sipnotifySettings);
 		$systemMailInput = $input['system_notification_recipients']
 			?? (!empty($input['system_notification_recipients_present'])
@@ -1522,6 +1534,10 @@ class Slsmassnotifyserver implements \BMO
 		$settings['announcement_cooldown_seconds'] = $this->normalizeAnnouncementCooldownSeconds($input['announcement_cooldown_seconds'] ?? $settings['announcement_cooldown_seconds'] ?? self::ANNOUNCEMENT_COOLDOWN_SECONDS);
 		$settings['announcement_timeout_mode'] = $this->normalizeAnnouncementTimeoutMode($input['announcement_timeout_mode'] ?? $settings['announcement_timeout_mode'] ?? 'none');
 		$settings['announcement_timeout_seconds'] = $this->normalizeAnnouncementTimeoutSeconds($input['announcement_timeout_seconds'] ?? $settings['announcement_timeout_seconds'] ?? 300);
+		$settings['paging_answer_timeout'] = $this->normalizePagingAnswerTimeout($input['paging_answer_timeout'] ?? $settings['paging_answer_timeout'] ?? 5);
+		if (isset($input['test_profiles_present'])) {
+			$settings['test_profiles'] = $this->normalizeTestProfiles($input['test_profiles'] ?? []);
+		}
 		$settings['log_retention_days'] = $this->normalizeRetentionDays($input['log_retention_days'] ?? $settings['log_retention_days'] ?? 90);
 		$updates = is_array($input['updates'] ?? null) ? $input['updates'] : [];
 		$settings['updates'] = [
@@ -1891,11 +1907,11 @@ class Slsmassnotifyserver implements \BMO
 		];
 		$integerFields = [
 			'tts_max_seconds', 'nws_tts_volume', 'announcement_tts_volume', 'announcement_cooldown_seconds',
-			'announcement_timeout_seconds', 'log_retention_days',
+			'announcement_timeout_seconds', 'log_retention_days', 'paging_answer_timeout',
 		];
 		$listFields = [
 			'alert_recipients', 'nws_zones', 'quiet_critical_events', 'announcement_groups', 'desktop_clients',
-			'scheduled_announcements', 'discord_webhooks', 'generic_webhooks', 'announcement_webhooks',
+			'scheduled_announcements', 'discord_webhooks', 'generic_webhooks', 'announcement_webhooks', 'test_profiles',
 		];
 		$objectFields = ['control_api', 'updates', 'setup', 'sipnotify', 'ami', 'xweather'];
 		foreach ($stringFields as $field) {
@@ -1941,7 +1957,7 @@ class Slsmassnotifyserver implements \BMO
 				'flag' => ['completed', 'beta_accepted', 'agpl_accepted', 'eula_accepted'], 'array' => [],
 			],
 			'sipnotify' => [
-				'string' => ['pbx_host', 'base_url', 'media_scheme', 'media_base_url'], 'integer' => [], 'flag' => [], 'array' => ['format_overrides'],
+				'string' => ['pbx_host', 'base_url', 'media_scheme', 'media_base_url'], 'integer' => [], 'flag' => [], 'array' => ['format_overrides', 'device_format_overrides'],
 			],
 			'xweather' => [
 				'string' => ['enabled', 'client_id', 'client_secret', 'location', 'adaptive_free_tier', 'adaptive_nws_zone_id', 'opening_tone', 'closing_tone', 'all_clear', 'quiet_hours_enabled', 'quiet_hours_start', 'quiet_hours_end'],
@@ -1970,7 +1986,7 @@ class Slsmassnotifyserver implements \BMO
 				}
 			}
 			foreach ($schema['array'] as $field) {
-				$requiresList = !($objectField === 'sipnotify' && $field === 'format_overrides');
+				$requiresList = !($objectField === 'sipnotify' && in_array($field, ['format_overrides', 'device_format_overrides'], true));
 				if (array_key_exists($field, $settings[$objectField])
 					&& (!is_array($settings[$objectField][$field]) || ($requiresList && !array_is_list($settings[$objectField][$field])))) {
 					$errors[] = sprintf(_('%s.%s must be an array.'), $objectField, $field);
@@ -2451,7 +2467,7 @@ class Slsmassnotifyserver implements \BMO
 		$this->setOwnership(self::ANNOUNCEMENT_LOCK_FILE);
 
 		$cooldown = $this->getAnnouncementCooldownState();
-		if ($cooldown['remaining'] > 0) {
+		if ($cooldown['remaining'] > 0 && empty($options['preview'])) {
 			return [
 				'success' => false,
 				'message' => sprintf(_('SIP NOTIFY announcements are on cooldown. Wait %s seconds and try again.'), $cooldown['remaining']),
@@ -2479,6 +2495,7 @@ class Slsmassnotifyserver implements \BMO
 
 		$activeSettings = $this->getActiveSettings();
 		$allowedTargets = $this->getSipNotifyTargets();
+		$unavailableTargets = [];
 		$allowed = [];
 		foreach ($allowedTargets as $target) {
 			$allowed[$target['extension']] = true;
@@ -2542,6 +2559,7 @@ class Slsmassnotifyserver implements \BMO
 				continue;
 			}
 			foreach ((array)$groupLookup[$groupId]['extensions'] as $extension) {
+				if (!isset($allowed[$extension])) { $unavailableTargets[(string)$extension] = (string)$extension; }
 				if (isset($allowed[$extension])) {
 					$selected[$extension] = $extension;
 				}
@@ -2555,6 +2573,7 @@ class Slsmassnotifyserver implements \BMO
 		}
 			foreach ((array)$extensions as $extension) {
 				$extension = preg_replace('/[^0-9]/', '', (string)$extension);
+				if ($extension !== '' && !isset($allowed[$extension])) { $unavailableTargets[$extension] = $extension; }
 				if ($extension !== '' && isset($allowed[$extension])) {
 					$selected[$extension] = $extension;
 				}
@@ -2630,286 +2649,26 @@ class Slsmassnotifyserver implements \BMO
 			$displayTimeout = $timeoutMode === 'custom'
 				? $this->normalizeAnnouncementTimeoutSeconds($settings['announcement_timeout_seconds'] ?? 300)
 				: 0;
-			$desktopPublished = false;
-			$deliveryCooldownStarted = false;
-			$startDeliveryCooldown = function () use (&$deliveryCooldownStarted) {
-				if (!$deliveryCooldownStarted) {
-					$this->setAnnouncementCooldown();
-					$deliveryCooldownStarted = true;
-				}
-			};
-			$webhookDelivery = [
-				'attempted' => false,
-				'requested' => array_keys($selectedAnnouncementWebhooks),
-				'accepted' => [],
-				'failed' => [],
-			];
-			$dispatchWebhooks = function () use (
-				&$webhookDelivery,
-				$webhookRequested,
-				$selectedAnnouncementWebhooks,
-				$message,
-				$title,
-				$backgroundColor,
-				$selected,
-				$desktopAll,
-				$desktopClients,
-				$selectedDesktopClients,
-				$audioMode,
-				$image,
-				$startDeliveryCooldown
-			) {
-				if (!empty($webhookDelivery['attempted']) || !$webhookRequested) {
-					return;
-				}
-				$webhookDelivery = $this->dispatchAnnouncementWebhooks(
-					array_keys($selectedAnnouncementWebhooks),
-					$message,
-					$title,
-					$backgroundColor,
-					[
-						['Targets', sprintf('%d phone(s), %d desktop(s)', count($selected), $desktopAll ? count($desktopClients) : count($selectedDesktopClients))],
-						['Audio', strtoupper(str_replace('_', ' + ', $audioMode))],
-						['Presentation', $image ? 'Colored / Labs' : 'Standard'],
-					]
-				);
-				$webhookDelivery['attempted'] = true;
-				if (!empty($webhookDelivery['accepted'])) {
-					$startDeliveryCooldown();
-				}
-			};
-			$withWebhookDelivery = function (array $response) use (&$webhookDelivery, $dispatchWebhooks) {
-				$dispatchWebhooks();
-				$accepted = array_values((array)($webhookDelivery['accepted'] ?? []));
-				$failed = array_values((array)($webhookDelivery['failed'] ?? []));
-				if (empty($webhookDelivery['requested'])) {
-					return $response;
-				}
-				$response['webhook_requested'] = count($webhookDelivery['requested']);
-				$response['webhook_accepted'] = count($accepted);
-				$response['webhook_failed'] = count($failed);
-				if (!empty($accepted)) {
-					if (empty($response['success'])) {
-						$response['partial_delivery'] = true;
-					}
-					$response['delivery_started'] = true;
-					$response['cooldown_remaining'] = $this->getAnnouncementCooldownState()['remaining'] ?? (int)($response['cooldown_remaining'] ?? 0);
-					$response['message'] = trim((string)($response['message'] ?? '') . ' ' . sprintf(
-						_('%d selected Dashboard webhook(s) accepted the branded announcement payload.'),
-						count($accepted)
-					));
-				}
-				if (!empty($failed)) {
-					$hadDelivery = !empty($response['delivery_started']);
-					$response['success'] = false;
-					$response['delivery_started'] = $hadDelivery;
-					$response['partial_delivery'] = $hadDelivery;
-					if (empty($response['error_code'])) {
-						$response['error_code'] = 'announcement_webhook_failed';
-					}
-					$response['message'] = trim((string)($response['message'] ?? '') . ' ' . sprintf(
-						_('Dashboard webhook delivery failed for: %s.'),
-						implode(', ', array_column($failed, 'name'))
-					));
-				}
-				return $response;
-			};
-			$publishDesktop = function ($timeoutSeconds) use (
-				$message,
-				$image,
-				$title,
-				$backgroundColor,
-				$desktopAll,
-				$selectedDesktopClients
-			) {
-				$command = $this->buildAnnouncementVisualPushCommand($message, [], $timeoutSeconds, [
-					'mode' => 'api_only',
-					'image' => $image,
-					'title' => $title,
-					'background_color' => $backgroundColor,
-					'desktop_all' => $desktopAll,
-					'desktop_clients' => array_values($selectedDesktopClients),
-				]);
-				return $this->executeAnnouncementVisualPushCommand($command);
-			};
-			$desktopNeedsAudioDuration = $desktopRequested && $timeoutMode === 'audio' && $audioEnabled;
-			if ($desktopRequested && !$desktopNeedsAudioDuration) {
-				$desktopResult = $publishDesktop($displayTimeout);
-				if (empty($desktopResult['success'])) {
-					$failureCooldown = $this->getAnnouncementCooldownState();
-					return $withWebhookDelivery([
-						'success' => false,
-						'message' => $this->announcementVisualFailureMessage(
-							_('The Desktop App announcement could not be published.'),
-							$desktopResult
-						),
-						'cooldown_remaining' => $failureCooldown['remaining'],
-						'error_code' => 'desktop_publish_failed',
-						'delivery_started' => false,
-						'desktop_published' => false,
-						'partial_delivery' => false,
-					]);
-				}
-				$desktopPublished = true;
-				$startDeliveryCooldown();
+			$priority = $options['priority'] ?? 'normal';
+			if (!is_string($priority) || !in_array($priority, ['normal', 'urgent'], true)) {
+				return ['success' => false, 'message' => _('Announcement priority must be normal or urgent.')];
 			}
-
-			$audioMessage = '';
-			$notifyDelay = 0;
-			$audioDuration = 0;
-			$notifyStatus = 'submitted';
-			if ($audioEnabled) {
-				$audioResult = $this->sendAnnouncementTtsAudio(array_values($selected), $message, [
-					'trigger_source' => $triggerSource,
-					'announcement_style' => $style,
-					'desktop_all' => $desktopAll,
-					'desktop_clients' => array_values($selectedDesktopClients),
-					'audio_mode' => $audioMode,
-					'opening_tone' => $openingTone,
-					'closing_tone' => $closingTone,
-					'piper_voice' => (string)($options['piper_voice'] ?? ''),
-					'tts_volume' => $options['tts_volume'] ?? null,
-				]);
-				if (empty($audioResult['success'])) {
-					$messagePrefix = $desktopPublished
-						? _('The Desktop App announcement was published, but announcement audio failed and phone SIP NOTIFY was not submitted.')
-						: _('Announcement TTS audio failed; SIP NOTIFY was not submitted to Asterisk.');
-					return $withWebhookDelivery([
-						'success' => false,
-						'message' => $messagePrefix . ' ' . (string)($audioResult['message'] ?? ''),
-						'cooldown_remaining' => $desktopPublished
-							? $this->getAnnouncementCooldownState()['remaining']
-							: 0,
-						'error_code' => $desktopPublished ? 'audio_failed_after_desktop' : 'audio_failed',
-						'delivery_started' => $desktopPublished || !empty($audioResult['delivery_started']),
-						'desktop_published' => $desktopPublished,
-						'partial_delivery' => $desktopPublished,
-					]);
-				}
-				$startDeliveryCooldown();
-				$audioMessage = $ttsAudio ? _(' with TTS audio') : _(' with tone audio');
-				$notifyDelay = (int)($audioResult['notify_delay_seconds'] ?? 0);
-				$audioDuration = max(0, (int)ceil((float)($audioResult['audio_duration_seconds'] ?? 0)));
-			}
-			if ($timeoutMode === 'audio' && $audioDuration > 0) {
-				$displayTimeout = max(1, $audioDuration - max(0, $notifyDelay));
-			}
-
-			if ($desktopNeedsAudioDuration) {
-				$startDeliveryCooldown();
-				$desktopResult = $publishDesktop($displayTimeout);
-				if (empty($desktopResult['success'])) {
-					$failureCooldown = $this->getAnnouncementCooldownState();
-					return $withWebhookDelivery([
-						'success' => false,
-						'message' => $this->announcementVisualFailureMessage(
-							_('Announcement audio was queued, but the Desktop App announcement could not be published; phone SIP NOTIFY was not submitted.'),
-							$desktopResult
-						),
-						'cooldown_remaining' => $failureCooldown['remaining'],
-						'error_code' => 'desktop_publish_failed_after_audio',
-						'delivery_started' => true,
-						'desktop_published' => false,
-						'partial_delivery' => true,
-					]);
-				}
-				$desktopPublished = true;
-			}
-
-			if (!empty($selected)) {
-				$startDeliveryCooldown();
-				if ($notifyDelay > 0) {
-					sleep($notifyDelay);
-				}
-				$phoneCommand = $this->buildAnnouncementVisualPushCommand(
-					$message,
-					array_values($selected),
-					$displayTimeout,
-					[
-						'mode' => 'phone_only',
-						'image' => $image,
-						'title' => $title,
-						'background_color' => $backgroundColor,
-					]
-				);
-				$phoneResult = $this->executeAnnouncementVisualPushCommand($phoneCommand);
-				if (empty($phoneResult['success'])) {
-					if ($desktopPublished && $notifyDelay > 0) {
-						$failurePrefix = _('The Desktop App announcement was published and announcement audio was queued, but the SIP NOTIFY announcement could not be submitted to Asterisk.');
-					} elseif ($desktopPublished) {
-						$failurePrefix = _('The Desktop App announcement was published, but the SIP NOTIFY announcement could not be submitted to Asterisk.');
-					} else {
-						$failurePrefix = $notifyDelay > 0
-							? _('Announcement audio was queued, but the SIP NOTIFY announcement could not be submitted to Asterisk.')
-							: _('The SIP NOTIFY announcement could not be submitted to Asterisk.');
-					}
-					$failureCooldown = $this->getAnnouncementCooldownState();
-					return $withWebhookDelivery([
-						'success' => false,
-						'message' => $this->announcementVisualFailureMessage($failurePrefix, $phoneResult),
-						'cooldown_remaining' => $failureCooldown['remaining'],
-						'error_code' => $desktopPublished
-							? 'notify_failed_after_desktop'
-							: ($notifyDelay > 0 ? 'notify_failed_after_audio' : 'notify_failed'),
-						'delivery_started' => true,
-						'desktop_published' => $desktopPublished,
-						'partial_delivery' => $desktopPublished || $notifyDelay > 0,
-					]);
-				}
-				if ($notifyDelay > 0) {
-					$audioMessage .= sprintf(_('; text notification submitted to Asterisk after %s seconds'), $notifyDelay);
-				}
-			}
-		$dispatchWebhooks();
-		if (!empty($webhookDelivery['failed'])) {
-			$notifyStatus = ($desktopPublished || !empty($selected) || !empty($webhookDelivery['accepted'])) ? 'partial_failure' : 'failed';
-		}
-
-		$this->appendAnnouncementNotifyLog($message, [
-			'status' => $notifyStatus,
-			'trigger_source' => $triggerSource,
-			'announcement_style' => $style,
-			'phones' => array_values($selected),
-			'desktop_all' => $desktopAll,
-			'desktop_clients' => array_values($selectedDesktopClients),
-			'mass_notify' => $desktopPublished,
-			'tts_audio' => $ttsAudio,
-			'audio_mode' => $audioMode,
-			'image' => $image,
-			'title' => $title,
-			'background_color' => $backgroundColor,
-			'notify_delay_seconds' => $notifyDelay,
-			'display_timeout_seconds' => $displayTimeout,
-			'webhook_destination_ids' => array_keys($selectedAnnouncementWebhooks),
-			'webhook_destination_names' => array_values($selectedAnnouncementWebhooks),
-			'webhook_accepted_ids' => array_column((array)($webhookDelivery['accepted'] ?? []), 'id'),
-			'webhook_failed_ids' => array_column((array)($webhookDelivery['failed'] ?? []), 'id'),
-		]);
-		if ($desktopPublished || !empty($selected) || !empty($webhookDelivery['accepted'])) {
-			$startDeliveryCooldown();
-		}
-
-			$successMessage = empty($selected)
-				? ($desktopPublished
-					? _('Announcement published to the selected SLS Mass Notify App clients. Desktop-app display is not confirmed.')
-					: _('Dashboard webhook announcement delivery completed.'))
-				: sprintf(
-					_('Announcement submitted to Asterisk for %s extension(s)%s%s. Handset acceptance is not confirmed.'),
-					count($selected),
-					$desktopPublished ? _(' and SLS Mass Notify App') : '',
-					$audioMessage
-				);
-			return $withWebhookDelivery([
-				'success' => true,
-				'message' => $successMessage,
-				'cooldown_remaining' => $this->normalizeAnnouncementCooldownSeconds($this->getActiveSettings()['announcement_cooldown_seconds'] ?? self::ANNOUNCEMENT_COOLDOWN_SECONDS),
-				'error_code' => '',
-				'delivery_started' => $desktopPublished || !empty($selected) || !empty($webhookDelivery['accepted']),
-				'desktop_published' => $desktopPublished,
-				'partial_delivery' => false,
-				'display_timeout_seconds' => $displayTimeout,
-			]);
-		}
+			return $this->deliverResolvedAnnouncement([
+                'priority' => $priority,
+                'message' => $message, 'sender' => $this->announcementSender($options),
+                'only_channels' => $options['_test_channels'] ?? null,
+                'phones' => array_values($selected),
+                'desktops' => $desktopAll ? array_keys($desktopClients) : array_values($selectedDesktopClients),
+                'webhooks' => array_keys($selectedAnnouncementWebhooks),
+                'audio_mode' => $audioMode, 'opening_tone' => $openingTone, 'closing_tone' => $closingTone,
+                'voice' => (string)($options['piper_voice'] ?? ''),
+                'volume' => $options['tts_volume'] ?? ($settings['announcement_tts_volume'] ?? 25),
+                'timeout_mode' => $timeoutMode, 'display_timeout' => $displayTimeout,
+                'image' => $image, 'title' => $title, 'background_color' => $backgroundColor,
+                'trigger_source' => $triggerSource, 'preview' => !empty($options['preview']),
+                'unavailable_phones' => array_values($unavailableTargets),
+            ]);
+	}
 
 	private function dispatchAnnouncementWebhooks(array $destinationIds, $message, $title, $backgroundColor, array $fields = [])
 	{
@@ -3015,6 +2774,9 @@ class Slsmassnotifyserver implements \BMO
 			. escapeshellarg(self::VISUAL_PUSH_SCRIPT)
 			. ' --announcement ' . escapeshellarg((string)$message)
 			. ' --announcement-timeout-seconds ' . max(0, (int)$displayTimeout);
+		if (!empty($options['sender'])) {
+			$command = '/usr/bin/env ' . escapeshellarg('SLS_ANNOUNCEMENT_SENDER=' . $this->sanitizeScheduleText($options['sender'], 80, true)) . ' ' . $command;
+		}
 		if (!empty($options['image'])) {
 			$command .= ' --announcement-image'
 				. ' --announcement-title ' . escapeshellarg((string)($options['title'] ?? 'Announcement'))
@@ -3106,7 +2868,7 @@ class Slsmassnotifyserver implements \BMO
 		}
 
 		$audioDuration = $this->getAnnouncementSequenceDuration($sequence);
-		$queued = $this->queueAnnouncementAudioCalls($extensions, $sequence, $audioDuration);
+		$queued = $this->queueAnnouncementAudioCalls($extensions, $sequence, $audioDuration, $context['priority'] ?? 'normal');
 		if ($queued < 1) {
 			return ['success' => false, 'message' => _('Unable to queue announcement audio calls.')];
 		}
@@ -3124,8 +2886,8 @@ class Slsmassnotifyserver implements \BMO
 		$this->appendAnnouncementAudioLog($message, $sequence, $extensions, $context);
 
 		return [
-			'success' => true,
-			'message' => sprintf(_('Queued announcement audio to %s extension(s).'), $queued),
+			'success' => $queued === count($extensions),
+			'message' => sprintf(_('Queued announcement audio to %s of %s extension(s).'), $queued, count($extensions)),
 			'audio_sequence' => $sequence,
 			'notify_delay_seconds' => 1,
 			'audio_duration_seconds' => $audioDuration,
@@ -3393,8 +3155,9 @@ class Slsmassnotifyserver implements \BMO
 		return (int)ceil($duration) + 2;
 	}
 
-	private function queueAnnouncementAudioCalls(array $extensions, $sequence, $audioDuration)
+	private function queueAnnouncementAudioCalls(array $extensions, $sequence, $audioDuration, $priority = 'normal')
 	{
+		if (!in_array($priority, ['normal', 'urgent'], true)) { return 0; }
 		if ($sequence === '' || !is_dir(self::ASTERISK_OUTGOING_SPOOL) || !is_dir(self::ASTERISK_SPOOL_TMP)) {
 			return 0;
 		}
@@ -3403,9 +3166,20 @@ class Slsmassnotifyserver implements \BMO
 			return 0;
 		}
 		$callWaitSeconds = $pageHoldSeconds + 30;
+		$reservation = [
+			'/usr/bin/python3', self::RUNTIME_DIR . '/sls_audio_queue.py',
+			'--recipients', implode(',', $extensions), '--duration', (string)$pageHoldSeconds, '--sound', $sequence,
+			'--priority', $priority,
+		];
+		$pipes = [];
+		$process = proc_open($reservation, [0 => ['file', '/dev/null', 'r'], 1 => ['file', '/dev/null', 'w'], 2 => ['pipe', 'w']], $pipes, null, null, ['bypass_shell' => true]);
+		if (!is_resource($process)) { return 0; }
+		stream_get_contents($pipes[2]); fclose($pipes[2]);
+		if (proc_close($process) !== 0) { return 0; }
 
 		$queued = 0;
 		foreach ($extensions as $extension) {
+			$this->lastAudioQueueResults[(string)$extension] = false;
 			$recipient = preg_replace('/[^0-9]/', '', (string)$extension);
 			if ($recipient === '') {
 				continue;
@@ -3437,6 +3211,7 @@ class Slsmassnotifyserver implements \BMO
 			$target = self::ASTERISK_OUTGOING_SPOOL . '/' . basename($callFile) . '.call';
 			if (@rename($callFile, $target)) {
 				$queued++;
+				$this->lastAudioQueueResults[(string)$extension] = true;
 			} else {
 				@unlink($callFile);
 			}
@@ -3525,7 +3300,10 @@ class Slsmassnotifyserver implements \BMO
 			'type' => $type,
 			'status' => trim((string)($context['status'] ?? 'triggered')),
 			'system_name' => 'SLS Mass Notify System',
-			'source_name' => 'SLS Mass Notify System',
+			'source_name' => (string)($context['sender'] ?? 'SLS Mass Notify System'),
+			'sender' => (string)($context['sender'] ?? ''),
+			'priority' => ($context['priority'] ?? 'normal') === 'urgent' ? 'urgent' : 'normal',
+			'delivery_receipts' => (array)($context['delivery_receipts'] ?? []),
 			'trigger_source' => trim((string)($context['trigger_source'] ?? 'FreePBX Dashboard')),
 			'page_group' => trim((string)($context['page_group'] ?? '')),
 			'event' => trim((string)($context['event'] ?? 'Announcement')),
@@ -3560,11 +3338,8 @@ class Slsmassnotifyserver implements \BMO
 
 	private function pruneTtsCache()
 	{
-		foreach (glob(self::TTS_DIR . '/*.wav') ?: [] as $path) {
-			if (is_file($path) && filemtime($path) !== false && filemtime($path) < (time() - 15 * 60)) {
-				@unlink($path);
-			}
-		}
+		// The maintenance worker honors active playback reservations and spool
+		// references. A request must never delete another worker's audio by age.
 	}
 
 	public function getCooldownState()
@@ -3841,6 +3616,7 @@ class Slsmassnotifyserver implements \BMO
 		$checks[] = $this->diagnosticCheck(_('SIP NOTIFY sender'), is_executable(self::VISUAL_PUSH_SCRIPT), self::VISUAL_PUSH_SCRIPT);
 		$checks[] = $this->diagnosticCheck(_('NWS poller'), is_executable('/usr/local/bin/sls_mass_notify/sls_mass_notify_nws_poll.sh'), '/usr/local/bin/sls_mass_notify/sls_mass_notify_nws_poll.sh');
 		$checks[] = $this->diagnosticCheck(_('Weather scheduler'), is_executable('/usr/local/bin/sls_mass_notify/sls_mass_notify_weather_poll.sh'), '/usr/local/bin/sls_mass_notify/sls_mass_notify_weather_poll.sh');
+		$checks[] = $this->diagnosticCheck(_('Weather delivery worker'), is_executable(self::RUNTIME_DIR . '/sls_weather_queue.py'), self::RUNTIME_DIR . '/sls_weather_queue.py');
 		$checks[] = $this->diagnosticCheck(_('Announcement scheduler'), is_executable('/usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php'), '/usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php');
 		$checks[] = $this->diagnosticCheck(_('Xweather poller'), is_executable('/usr/local/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py'), '/usr/local/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py');
 		$checks[] = $this->diagnosticCheck(_('Branded email sender'), is_executable('/usr/local/bin/sls_mass_notify/sls_branded_email.py'), '/usr/local/bin/sls_mass_notify/sls_branded_email.py');
@@ -3860,6 +3636,15 @@ class Slsmassnotifyserver implements \BMO
 		$controlEnabled = !empty($settings['control_api']['enabled']);
 		$controlKeyValid = preg_match('/^[A-Za-z0-9_-]{24,128}$/', (string)($settings['control_api']['api_key'] ?? '')) === 1;
 		$checks[] = $this->diagnosticCheck(_('Control API'), !$controlEnabled || $controlKeyValid, $controlEnabled ? _('Enabled') : _('Disabled (optional)'));
+		$storage = $this->loadJsonFile(self::PLUGIN_DATA_DIR . '/storage-summary.json');
+		if ($storage) {
+			$checks[] = $this->diagnosticCheck(_('Storage available'), (int)($storage['free_bytes'] ?? 0) >= 1024 * 1024 * 1024,
+				sprintf(_('%s MiB free'), number_format((int)($storage['free_bytes'] ?? 0) / 1048576)));
+			$checks[] = $this->diagnosticCheck(_('External delivery queue'), empty($storage['queue_errors']) && empty($storage['expired_external']),
+				sprintf(_('%d pending; %d expired; %d unreadable queues'), (int)($storage['pending_external'] ?? 0), (int)($storage['expired_external'] ?? 0), (int)($storage['queue_errors'] ?? 0)));
+			$checks[] = $this->diagnosticCheck(_('Weather delivery queue'), empty($storage['failed_weather']) && empty($storage['uncertain_weather']) && empty($storage['expired_weather']),
+				sprintf(_('%d pending; %d failed; %d uncertain; %d expired'), (int)($storage['pending_weather'] ?? 0), (int)($storage['failed_weather'] ?? 0), (int)($storage['uncertain_weather'] ?? 0), (int)($storage['expired_weather'] ?? 0)));
+		}
 
 		return [
 			'checks' => $checks,
@@ -3881,17 +3666,21 @@ class Slsmassnotifyserver implements \BMO
 
 	private function getDetectedEndpointFormats()
 	{
+		$this->deviceInventoryError = '';
 		if (!is_executable(self::VISUAL_PUSH_SCRIPT)) {
+			$this->deviceInventoryError = _('Device discovery runtime is unavailable.');
 			return [];
 		}
 		$output = [];
 		$code = 1;
-		exec('/usr/bin/python3 ' . escapeshellarg(self::VISUAL_PUSH_SCRIPT) . ' --list-endpoints-json 2>/dev/null', $output, $code);
+		exec('/usr/bin/timeout --signal=TERM --kill-after=2 20 /usr/bin/python3 ' . escapeshellarg(self::VISUAL_PUSH_SCRIPT) . ' --list-endpoints-json 2>/dev/null', $output, $code);
 		if ($code !== 0 || empty($output)) {
+			$this->deviceInventoryError = _('Device discovery did not complete. Check Asterisk Manager connectivity and try again.');
 			return [];
 		}
 		$decoded = json_decode(implode('', $output), true);
 		if (!is_array($decoded)) {
+			$this->deviceInventoryError = _('Device discovery returned an invalid response.');
 			return [];
 		}
 		$endpoints = [];
@@ -3907,6 +3696,7 @@ class Slsmassnotifyserver implements \BMO
 				'formats' => $formats,
 				'user_agent' => (string)($info['user_agent'] ?? ''),
 				'contacts' => (int)($info['contacts'] ?? 1),
+				'devices' => array_values(array_filter((array)($info['devices'] ?? []), 'is_array')),
 				'override' => !empty($info['override']),
 				'unknown' => in_array('unknown', $formats, true),
 			];
@@ -3934,6 +3724,9 @@ class Slsmassnotifyserver implements \BMO
 				'enabled' => !empty($client['enabled']),
 				'last_seen_at' => $seenAt,
 				'last_seen_ip' => (string)($seen['ip'] ?? ''),
+				'connected' => (int)($seen['connected_until'] ?? 0) >= time(),
+				'last_acknowledged_event' => (string)($seen['ack_event_id'] ?? ''),
+				'last_acknowledged_at' => (string)($seen['ack_at'] ?? ''),
 				'state' => $state,
 			];
 		}
@@ -3966,11 +3759,18 @@ class Slsmassnotifyserver implements \BMO
 
 	private function loadJsonFile($path)
 	{
-		if (!is_readable($path)) {
+		if (!is_readable($path) || is_link($path)) {
 			return [];
 		}
-		$decoded = json_decode((string)file_get_contents($path), true);
-		return is_array($decoded) ? $decoded : [];
+		$handle = @fopen($path, 'r');
+		if (!$handle) { return []; }
+		try {
+			if (!flock($handle, LOCK_SH)) { return []; }
+			$metadata = fstat($handle);
+			if (!$metadata || ($metadata['mode'] & 0170000) !== 0100000 || $metadata['size'] > 8 * 1024 * 1024) { return []; }
+			$decoded = json_decode((string)stream_get_contents($handle, 8 * 1024 * 1024), true);
+			return is_array($decoded) ? $decoded : [];
+		} finally { flock($handle, LOCK_UN); fclose($handle); }
 	}
 
 	private function migrateLegacyTestStatus()
@@ -4435,6 +4235,17 @@ class Slsmassnotifyserver implements \BMO
 		if (strtolower(trim((string)($statusData['last_delivery_status'] ?? ''))) === 'fault') {
 			$warnings[] = $this->normalizeStatusMessage($statusData['last_delivery_message'] ?? '', _('Mass Notify delivery reported a fault'));
 		}
+		$storage = $this->loadJsonFile(self::PLUGIN_DATA_DIR . '/storage-summary.json');
+		if ($storage) {
+			if ((int)($storage['checked_at'] ?? 0) < $now - 300) { $warnings[] = _('Storage and delivery-queue health checks are stale'); }
+			if ((int)($storage['free_bytes'] ?? 0) < 1024 * 1024 * 1024) { $warnings[] = _('Less than 1 GiB is available for PBX data'); }
+			if (!empty($storage['queue_errors'])) { $warnings[] = _('An external delivery queue is unreadable; inspect the maintenance log'); }
+			if (!empty($storage['expired_external'])) { $warnings[] = sprintf(_('%d external deliveries expired without acceptance in the last seven days'), (int)$storage['expired_external']); }
+			if (!empty($storage['audit_at_capacity'])) { $warnings[] = _('Control API audit storage reached its limit; recent events may be missing'); }
+			if (!empty($storage['failed_weather']) || !empty($storage['uncertain_weather']) || !empty($storage['expired_weather'])) {
+				$warnings[] = _('A queued Weather or Lightning delivery failed, expired, or has an uncertain outcome. Review Help diagnostics and Notification Logs; do not blindly replay it.');
+			}
+		}
 		if (!empty($enabledSchedules)) {
 			$warnings = array_merge($warnings, $this->getScheduledAnnouncementHealthWarnings($settings));
 			$scheduleWorkerAt = $this->parseTimestamp($statusData['last_schedule_worker_at'] ?? '');
@@ -4872,6 +4683,8 @@ class Slsmassnotifyserver implements \BMO
 		$now = gmdate('c');
 		$schedule = [
 			'id' => $id,
+			'created_by' => (string)($existing['created_by'] ?? $this->announcementSender()),
+			'updated_by' => $this->announcementSender(),
 			'name' => $name,
 			'enabled' => empty($input['schedule_enabled']) ? '0' : '1',
 			'timezone' => $timezone->getName(),
@@ -5084,6 +4897,7 @@ class Slsmassnotifyserver implements \BMO
 						'piper_voice' => (string)($delivery['voice'] ?? ''),
 						'tts_volume' => $delivery['tts_volume'] ?? 25,
 						'trigger_source' => 'Scheduled: ' . (string)($schedule['name'] ?? 'Announcement'),
+						'sender' => (string)($schedule['created_by'] ?? 'Scheduled announcement'),
 					]
 				);
 				$processed++;
@@ -5308,7 +5122,7 @@ class Slsmassnotifyserver implements \BMO
 		$groups = $this->normalizeControlGroupSelectors($payload['groups'] ?? $payload['announcement_groups'] ?? []);
 		$options = is_array($payload['options'] ?? null) ? $payload['options'] : [];
 		$options['trigger_source'] = 'Control API';
-		foreach (['style', 'image', 'title', 'background_color', 'audio_mode', 'opening_tone', 'closing_tone'] as $key) {
+		foreach (['style', 'image', 'title', 'background_color', 'audio_mode', 'opening_tone', 'closing_tone', 'priority'] as $key) {
 			if (array_key_exists($key, $payload)) {
 				$options[$key] = $payload[$key];
 			}
@@ -5544,6 +5358,11 @@ class Slsmassnotifyserver implements \BMO
 	private function validateControlApiAnnouncementPayload(array $payload)
 	{
 		$errors = [];
+		foreach ([$payload, is_array($payload['options'] ?? null) ? $payload['options'] : []] as $fields) {
+			if (array_key_exists('priority', $fields) && !in_array($fields['priority'], ['normal', 'urgent'], true)) {
+				$errors[] = _('priority must be "normal" or "urgent".');
+			}
+		}
 		foreach (['message', 'body', 'text', 'style', 'title', 'background_color', 'audio_mode', 'opening_tone', 'closing_tone'] as $field) {
 			if (array_key_exists($field, $payload) && !is_string($payload[$field])) {
 				$errors[] = sprintf(_('%s must be a JSON string.'), $field);
@@ -5720,6 +5539,11 @@ class Slsmassnotifyserver implements \BMO
 				continue;
 			}
 			foreach ($settings[$listKey] as $index => $destination) {
+				foreach (['bearer_token', 'signing_secret'] as $secretField) {
+					if (is_array($destination) && array_key_exists($secretField, $destination)) {
+						$settings[$listKey][$index][$secretField] = '[redacted]';
+					}
+				}
 				if (is_array($destination) && array_key_exists('url', $destination)) {
 					$settings[$listKey][$index]['url'] = '[redacted]';
 				}
@@ -5784,7 +5608,7 @@ class Slsmassnotifyserver implements \BMO
 			'nws_piper_voice', 'announcement_piper_voice', 'nws_tts_volume',
 				'announcement_tts_volume', 'tts_max_seconds', 'announcement_timeout_mode',
 				'announcement_timeout_seconds', 'log_retention_days', 'control_api',
-				'sipnotify', 'announcement_groups', 'updates',
+				'sipnotify', 'announcement_groups', 'updates', 'test_profiles', 'paging_answer_timeout',
 		];
 	}
 
@@ -5805,14 +5629,14 @@ class Slsmassnotifyserver implements \BMO
 		}
 
 		$booleanFields = ['enabled', 'quiet_hours_enabled', 'email_html_enabled'];
-		$integerFields = ['nws_tts_volume', 'announcement_tts_volume', 'tts_max_seconds', 'announcement_timeout_seconds', 'log_retention_days'];
+		$integerFields = ['nws_tts_volume', 'announcement_tts_volume', 'tts_max_seconds', 'announcement_timeout_seconds', 'log_retention_days', 'paging_answer_timeout'];
 		$stringFields = [
 			'system_notification_emails', 'mail_to', 'mail_from_local_part', 'mail_from_domain', 'quiet_hours_start', 'quiet_hours_end',
 			'nws_api_base_url', 'nws_zone', 'alert_email_subject', 'alert_email_body', 'test_email_subject',
 			'test_email_body', 'opening_tone', 'closing_tone', 'nws_opening_tone', 'nws_closing_tone',
 			'nws_piper_voice', 'announcement_piper_voice', 'announcement_timeout_mode',
 		];
-		$listFields = ['alert_recipients', 'quiet_critical_events', 'nws_zones', 'discord_webhooks', 'generic_webhooks', 'announcement_webhooks', 'announcement_groups'];
+		$listFields = ['alert_recipients', 'quiet_critical_events', 'nws_zones', 'discord_webhooks', 'generic_webhooks', 'announcement_webhooks', 'announcement_groups', 'test_profiles'];
 		$objectFields = ['xweather', 'control_api', 'sipnotify', 'updates'];
 
 		foreach ($booleanFields as $field) {
@@ -5867,7 +5691,7 @@ class Slsmassnotifyserver implements \BMO
 			'sipnotify' => [
 				'boolean' => [],
 				'integer' => [],
-				'array' => ['format_overrides'],
+				'array' => ['format_overrides', 'device_format_overrides'],
 				'string' => ['pbx_host', 'base_url', 'media_scheme', 'media_base_url'],
 			],
 			'updates' => [
@@ -5903,7 +5727,7 @@ class Slsmassnotifyserver implements \BMO
 				}
 			}
 			foreach ($schema['array'] as $key) {
-				$requiresList = !($objectField === 'sipnotify' && $key === 'format_overrides');
+				$requiresList = !($objectField === 'sipnotify' && in_array($key, ['format_overrides', 'device_format_overrides'], true));
 				if (array_key_exists($key, $patch[$objectField])
 					&& (!is_array($patch[$objectField][$key]) || ($requiresList && !array_is_list($patch[$objectField][$key])))) {
 					$errors[] = sprintf(_('%s.%s must be a JSON array.'), $objectField, $key);
@@ -6086,6 +5910,8 @@ class Slsmassnotifyserver implements \BMO
 			'announcement_cooldown_seconds' => self::ANNOUNCEMENT_COOLDOWN_SECONDS,
 			'announcement_timeout_mode' => 'none',
 			'announcement_timeout_seconds' => 300,
+			'paging_answer_timeout' => 5,
+			'test_profiles' => [],
 			'log_retention_days' => 90,
 			'desktop_auth_key' => $this->generateDesktopAuthKey(),
 			'desktop_clients' => [
@@ -6591,7 +6417,7 @@ def secure_directory(directory_fd, relative=''):
         child_relative = relative + '/' + name if relative else name
         metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if stat.S_ISLNK(metadata.st_mode):
-            raise RuntimeError('runtime tree contains a symbolic link')
+            raise RuntimeError('runtime tree contains a symbolic link: ' + repr(child_relative)[:220])
         if profile == 'data' and child_relative == 'piper/venv':
             # The compatibility venv is deliberately root-owned and contains a
             # root-owned wrapper link into the executable runtime. Web/Asterisk
@@ -6599,7 +6425,7 @@ def secure_directory(directory_fd, relative=''):
             # Accept only the exact non-writable root-owned directory created by
             # install/repair; anything writable or differently owned fails closed.
             if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
-                raise RuntimeError('unsafe Piper compatibility directory')
+                raise RuntimeError('unsafe Piper compatibility directory: piper/venv must be root:root and not group/world writable')
             continue
         if stat.S_ISDIR(metadata.st_mode):
             child_fd = os.open(name, directory_flags, dir_fd=directory_fd)
@@ -6621,20 +6447,27 @@ def secure_directory(directory_fd, relative=''):
             finally:
                 os.close(child_fd)
             continue
-        raise RuntimeError('runtime tree contains a special file')
+        raise RuntimeError('runtime tree contains a special file: ' + repr(child_relative)[:220])
 
 try:
     secure_directory(root_fd)
     os.fchown(root_fd, account.pw_uid, account.pw_gid)
     os.fchmod(root_fd, directory_mode(''))
+except (OSError, RuntimeError) as error:
+    print('SLS runtime safety: ' + str(error), file=sys.stderr)
+    raise SystemExit(1)
 finally:
     os.close(root_fd)
 PY;
 		$output = [];
 		$status = 1;
-		@exec('/usr/bin/python3 -c ' . escapeshellarg($program) . ' ' . escapeshellarg($root) . ' ' . escapeshellarg($profile) . ' 2>/dev/null', $output, $status);
+		@exec('/usr/bin/python3 -c ' . escapeshellarg($program) . ' ' . escapeshellarg($root) . ' ' . escapeshellarg($profile) . ' 2>&1', $output, $status);
 		if ($status !== 0) {
-			throw new \RuntimeException(_('Unable to secure a Mass Notifications runtime tree without following symbolic links.'));
+			$reason = 'Runtime tree could not be opened or inspected; check the managed path and its parent permissions.';
+			foreach ($output as $line) {
+				if (strpos($line, 'SLS runtime safety: ') === 0) { $reason = $this->sanitizeScheduleText($line, 300, true); }
+			}
+			throw new \RuntimeException(_('Unable to secure a Mass Notifications runtime tree without following symbolic links.') . ' ' . $reason);
 		}
 	}
 
@@ -7203,6 +7036,8 @@ PY;
 		$settings['announcement_cooldown_seconds'] = $this->normalizeAnnouncementCooldownSeconds($settings['announcement_cooldown_seconds'] ?? self::ANNOUNCEMENT_COOLDOWN_SECONDS);
 		$settings['announcement_timeout_mode'] = $this->normalizeAnnouncementTimeoutMode($settings['announcement_timeout_mode'] ?? 'none');
 		$settings['announcement_timeout_seconds'] = $this->normalizeAnnouncementTimeoutSeconds($settings['announcement_timeout_seconds'] ?? 300);
+		$settings['paging_answer_timeout'] = $this->normalizePagingAnswerTimeout($settings['paging_answer_timeout'] ?? 5);
+		$settings['test_profiles'] = $this->normalizeTestProfiles($settings['test_profiles'] ?? []);
 		$settings['log_retention_days'] = $this->normalizeRetentionDays($settings['log_retention_days'] ?? 90);
 		unset($settings['desktop_api_token']);
 		$ami = is_array($settings['ami'] ?? null) ? $settings['ami'] : [];
@@ -7287,6 +7122,7 @@ PY;
 			'media_scheme' => 'http',
 			'media_base_url' => 'http://' . $host . '/sls_mass_notify',
 			'format_overrides' => [],
+			'device_format_overrides' => [],
 		];
 	}
 
@@ -7595,6 +7431,8 @@ PY;
 			}
 			$schedules[] = [
 				'id' => $id,
+				'created_by' => $this->sanitizeScheduleText($rawSchedule['created_by'] ?? 'Scheduled announcement', 80, true),
+				'updated_by' => $this->sanitizeScheduleText($rawSchedule['updated_by'] ?? '', 80, true),
 				'name' => $name,
 				'enabled' => empty($rawSchedule['enabled']) ? '0' : '1',
 				'timezone' => $timezone->getName(),
@@ -8340,6 +8178,7 @@ PY;
 			'media_scheme' => $mediaScheme,
 			'media_base_url' => $mediaScheme . '://' . $host . '/sls_mass_notify',
 			'format_overrides' => $this->normalizeEndpointFormatOverrides($value['format_overrides'] ?? []),
+			'device_format_overrides' => $this->normalizeDeviceFormatOverrides($value['device_format_overrides'] ?? []),
 		];
 	}
 
@@ -8401,6 +8240,37 @@ PY;
 		return $normalized;
 	}
 
+	private function normalizeDeviceFormatOverrides($value)
+	{
+		$result = [];
+		foreach (array_slice((array)$value, 0, 100, true) as $key => $row) {
+			if (!is_array($row)) { continue; }
+			$key = (string)($row['key'] ?? $key);
+			$extension = (string)($row['extension'] ?? '');
+			if (!preg_match('/^[a-f0-9]{32}$/', $key) || !preg_match('/^[0-9]{1,20}$/', $extension)) { continue; }
+			$format = $this->normalizeEndpointFormatOverrides([$extension => $row['format'] ?? ''])[$extension] ?? '';
+			if ($format === '') { continue; }
+			$result[$key] = ['extension' => $extension, 'format' => $format,
+				'label' => $this->sanitizeScheduleText($row['label'] ?? '', 80, true)];
+		}
+		ksort($result);
+		return $result;
+	}
+
+	public function getDeviceOverrideInventory()
+	{
+		$devices = [];
+		foreach ($this->getDetectedEndpointFormats() as $endpoint) {
+			foreach ($endpoint['devices'] ?? [] as $device) {
+				if (preg_match('/^[a-f0-9]{32}$/', (string)($device['key'] ?? ''))) {
+					$devices[] = ['extension' => $endpoint['extension']] + $device;
+				}
+			}
+		}
+		return ['success' => $this->deviceInventoryError === '', 'message' => $this->deviceInventoryError,
+			'devices' => array_slice($devices, 0, 1000)];
+	}
+
 	private function normalizeEndpointUsername($value, $slug)
 	{
 		$value = strtolower(trim((string)$value));
@@ -8431,6 +8301,7 @@ PY;
 		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_nws_poll.sh', $runtimeDir . '/sls_mass_notify_nws_poll.sh', 0755);
 		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_weather_poll.sh', $runtimeDir . '/sls_mass_notify_weather_poll.sh', 0755);
 		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_schedule_worker.php', $runtimeDir . '/sls_mass_notify_schedule_worker.php', 0755);
+		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_announcement_worker.php', $runtimeDir . '/sls_mass_notify_announcement_worker.php', 0755);
 		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_test.sh', $runtimeDir . '/sls_mass_notify_test.sh', 0755);
 		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_update.sh', $runtimeDir . '/sls_mass_notify_update.sh', 0755);
 		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_maintenance.sh', $runtimeDir . '/sls_mass_notify_maintenance.sh', 0755);
@@ -8442,6 +8313,7 @@ PY;
 			'sls_mass_notify_nws_poll.sh',
 			'sls_mass_notify_weather_poll.sh',
 			'sls_mass_notify_schedule_worker.php',
+			'sls_mass_notify_announcement_worker.php',
 			'sls_mass_notify_test.sh',
 			'sls_mass_notify_update.sh',
 			'sls_mass_notify_maintenance.sh',
@@ -8458,6 +8330,25 @@ PY;
 		$this->copyRuntimeDirectory(__DIR__ . '/sounds', self::SOUNDS_DIR, 0644, false);
 		@unlink($runtimeDir . '/config.ini');
 		$this->secureExecutableRuntimeTree();
+	}
+
+	private function ensureOperationalLogRotation()
+	{
+		if (!function_exists('posix_geteuid') || posix_geteuid() !== 0) { return; }
+		$path = '/etc/logrotate.d/sls-mass-notify';
+		if (!is_dir(dirname($path)) || is_link($path)) {
+			throw new \RuntimeException('Operational log rotation directory is unavailable or unsafe. Install logrotate and retry.');
+		}
+		$days = $this->normalizeRetentionDays($this->getActiveSettings()['log_retention_days'] ?? 90);
+		$content = "/var/log/sls_mass_notify.log {\n    daily\n    maxsize 2M\n    rotate {$days}\n    maxage {$days}\n    missingok\n    notifempty\n    compress\n    delaycompress\n    copytruncate\n    su root asterisk\n}\n";
+		if (is_file($path) && file_get_contents($path) === $content) { return; }
+		$temporary = tempnam(dirname($path), '.sls-logrotate-');
+		if ($temporary === false) { throw new \RuntimeException('Unable to stage log rotation.'); }
+		try {
+			if (file_put_contents($temporary, $content) !== strlen($content)) { throw new \RuntimeException('Unable to write log rotation.'); }
+			chmod($temporary, 0644); chown($temporary, 'root'); chgrp($temporary, 'root');
+			if (!rename($temporary, $path)) { throw new \RuntimeException('Unable to install log rotation.'); }
+		} finally { if (is_file($temporary)) { unlink($temporary); } }
 	}
 
 	private function ensureBundledSystemRecordings()
@@ -8765,8 +8656,8 @@ PY;
 				}
 			}
 			if (is_executable(self::PIPER_RUNTIME_DIR . '/venv/bin/pip')) {
-				$this->runCommand(escapeshellarg(self::PIPER_RUNTIME_DIR . '/venv/bin/pip') . " install --upgrade 'pip==26.1.2' 'setuptools==83.0.0' 'wheel==0.47.0'");
-				$this->runCommand(escapeshellarg(self::PIPER_RUNTIME_DIR . '/venv/bin/pip') . " install 'piper-tts==1.4.2'");
+				$this->runCommand(escapeshellarg(self::PIPER_RUNTIME_DIR . '/venv/bin/pip') . " install --upgrade 'pip==26.2.0' 'setuptools==83.0.0' 'wheel==0.47.0'");
+				$this->runCommand(escapeshellarg(self::PIPER_RUNTIME_DIR . '/venv/bin/pip') . ' install -r ' . escapeshellarg(self::RUNTIME_DIR . '/piper-requirements.txt'));
 				$this->repairPiperRuntimePermissions();
 			}
 		}
@@ -8855,6 +8746,11 @@ executables = {
     'sls_mass_notify_weather_poll.sh',
     'sls_mass_notify_nws_poll.sh',
     'sls_mass_notify_schedule_worker.php',
+    'sls_mass_notify_announcement_worker.php',
+    'sls_storage_maintenance.py',
+    'sls_weather_queue.py',
+    'sls_audio_queue.py',
+    'sls_release_verify.py',
     'sls_mass_notify_test.sh',
     'sls_mass_notify_update.sh',
     'sls_mass_notify_maintenance.sh',
@@ -9168,6 +9064,7 @@ PY;
 
 	private function ensureDialplan()
 	{
+		$pagingAnswerTimeout = $this->normalizePagingAnswerTimeout($this->getActiveSettings()['paging_answer_timeout'] ?? 5);
 		$path = '/etc/asterisk/extensions_custom.conf';
 		$current = is_readable($path) ? (string)file_get_contents($path) : '';
 		if (strpos($current, '[nws-alert-audio]') !== false) {
@@ -9232,7 +9129,7 @@ PY;
 				. " same => n,Set(CALLERID(name)=\${IF($[\"\${SLS_CALLERID_NAME}\"=\"\"]?SLS Mass Notification System:\${SLS_CALLERID_NAME})})\n"
 			. " same => n,Set(CALLERID(num)=\${IF($[\"\${SLS_CALLERID_NUM}\"=\"\"]?SLS:\${SLS_CALLERID_NUM})})\n"
 			. " same => n,Set(__SIP_URI_OPTIONS=intercom=true)\n"
-				. " same => n,Page(\${SLS_DIAL},b(sls-alert-autoanswer^s^1(\${EXTEN}))A(\${SLS_SAFE_SOUND})inq,5)\n"
+				. " same => n,Page(\${SLS_DIAL},b(sls-alert-autoanswer^s^1(\${EXTEN}))A(\${SLS_SAFE_SOUND})inq,{$pagingAnswerTimeout})\n"
 				. " same => n,Log(NOTICE,SLS Mass Notification page completed for \${EXTEN})\n"
 				. " same => n,Verbose(1,SLS Mass Notification page completed for \${EXTEN})\n"
 				. " same => n(done),Hangup()\n";
@@ -9759,6 +9656,11 @@ PY;
 			$cron->addLine($weatherCronLine);
 		}
 		$cron->addLine('* * * * * /usr/bin/timeout 1200 /usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php');
+		$announcementWorkerLine = '* * * * * /usr/bin/timeout 900 /usr/bin/php /usr/local/bin/sls_mass_notify/sls_mass_notify_announcement_worker.php';
+		foreach ($cron->getAll() as $line) {
+			if (strpos((string)$line, 'sls_mass_notify_announcement_worker.php') !== false) { $cron->remove($line); }
+		}
+		$cron->addLine($announcementWorkerLine);
 		$this->ensureRootUpdateCron();
 	}
 
@@ -9817,7 +9719,7 @@ PY;
 	{
 		$cron = $this->FreePBX->Cron();
 		foreach ($cron->getAll() as $line) {
-			if (strpos((string)$line, 'sls_mass_notify_nws_poll.sh') !== false || strpos((string)$line, 'sls_mass_notify_weather_poll.sh') !== false || strpos((string)$line, 'sls_mass_notify_schedule_worker.php') !== false || strpos((string)$line, 'sls_mass_notify_update.sh') !== false) {
+			if (strpos((string)$line, 'sls_mass_notify_nws_poll.sh') !== false || strpos((string)$line, 'sls_mass_notify_weather_poll.sh') !== false || strpos((string)$line, 'sls_mass_notify_schedule_worker.php') !== false || strpos((string)$line, 'sls_mass_notify_announcement_worker.php') !== false || strpos((string)$line, 'sls_mass_notify_update.sh') !== false) {
 				$cron->remove($line);
 			}
 		}
@@ -10003,12 +9905,20 @@ PY;
 				}
 			}
 			$seenIds[$id] = true;
+			$auth = [];
+			foreach (['bearer_token', 'signing_secret'] as $secretField) {
+				$secret = (string)($entry[$secretField] ?? '');
+				if (strlen($secret) > 512 || preg_match('/[^\x21-\x7e]/', $secret)) {
+					throw new \InvalidArgumentException('Webhook authentication must be at most 512 printable ASCII characters without whitespace.');
+				}
+				$auth[$secretField] = $type === 'discord' ? '' : $secret;
+			}
 			$destinations[] = [
 				'id' => $id,
 				'name' => $name,
 				'url' => $url,
 				'enabled' => array_key_exists('enabled', $entry) && empty($entry['enabled']) ? '0' : '1',
-			];
+			] + $auth;
 		}
 		return $destinations;
 	}
@@ -10079,6 +9989,13 @@ PY;
 			$url = trim((string)($entry['url'] ?? $entry['webhook_url'] ?? ''));
 			if (($url === '' || $url === '[redacted]') && $id !== '' && isset($existingById[$id])) {
 				$entry['url'] = (string)$existingById[$id]['url'];
+			}
+			foreach (['bearer_token', 'signing_secret'] as $secretField) {
+				if (!empty($entry['clear_' . $secretField])) {
+					$entry[$secretField] = '';
+				} elseif (empty($entry[$secretField]) || $entry[$secretField] === '[redacted]') {
+					$entry[$secretField] = (string)($existingById[$id][$secretField] ?? '');
+				}
 			}
 			$merged[] = $entry;
 		}
@@ -10448,7 +10365,7 @@ PY;
 				$errors[] = sprintf(_('%s must be an object.'), $label);
 				continue;
 			}
-			$allowedFields = ['id', 'name', 'enabled', 'adaptive_nws_zone_id', 'location', 'radius_miles', 'extensions', 'recipients', 'desktop_clients', 'email_recipients', 'all_clear', 'strike_type', 'quiet_hours_enabled', 'quiet_hours_start', 'quiet_hours_end'];
+			$allowedFields = ['id', 'name', 'enabled', 'adaptive_nws_zone_id', 'location', 'radius_miles', 'extensions', 'recipients', 'desktop_clients', 'email_recipients', 'all_clear', 'all_clear_minutes', 'strike_type', 'quiet_hours_enabled', 'quiet_hours_start', 'quiet_hours_end'];
 			foreach (array_keys($group) as $field) {
 				if (!in_array($field, $allowedFields, true)) {
 					$errors[] = sprintf(_('%s contains an unsupported field: %s.'), $label, (string)$field);
@@ -10493,6 +10410,9 @@ PY;
 			}
 			if (isset($group['all_clear']) && !in_array((string)$group['all_clear'], ['none', 'send'], true)) {
 				$errors[] = sprintf(_('%s has an invalid all-clear action.'), $label);
+			}
+			if (isset($group['all_clear_minutes']) && (filter_var($group['all_clear_minutes'], FILTER_VALIDATE_INT) === false || (int)$group['all_clear_minutes'] < 5 || (int)$group['all_clear_minutes'] > 120)) {
+				$errors[] = sprintf(_('%s all-clear observation period must be 5–120 minutes.'), $label);
 			}
 			if (isset($group['strike_type']) && !in_array((string)$group['strike_type'], ['cloud_to_ground', 'cloud_to_cloud', 'both'], true)) {
 				$errors[] = sprintf(_('%s has an invalid strike type.'), $label);
@@ -10737,6 +10657,7 @@ PY;
 				'desktop_clients' => array_values($desktopClients),
 				'email_recipients' => $this->normalizeEmailRecipientList($group['email_recipients'] ?? []),
 				'all_clear' => $allClear,
+				'all_clear_minutes' => $this->normalizeInt($group['all_clear_minutes'] ?? 10, 5, 120, 10),
 				'strike_type' => $strikeType,
 				'quiet_hours_enabled' => empty($group['quiet_hours_enabled']) ? '0' : '1',
 				'quiet_hours_start' => $this->normalizeHour((string)($group['quiet_hours_start'] ?? $legacy['quiet_hours_start'] ?? '21:00'), '21:00'),
@@ -10756,14 +10677,7 @@ PY;
 
 	private function loadStatusData()
 	{
-		$status = [];
-		if (is_readable(self::STATUS_JSON)) {
-			$decoded = json_decode((string)file_get_contents(self::STATUS_JSON), true);
-			if (is_array($decoded)) {
-				$status = $decoded;
-			}
-		}
-		return $status;
+		return $this->loadJsonFile(self::STATUS_JSON);
 	}
 
 	private function normalizeStatusState($state)
@@ -12126,6 +12040,8 @@ PY;
 		$requiredFiles = [
 			__DIR__ . '/Backup.php' => false,
 			__DIR__ . '/Restore.php' => false,
+			__DIR__ . '/AnnouncementDelivery.php' => false,
+			__DIR__ . '/TestProfiles.php' => false,
 			self::RUNTIME_DIR . '/sls_notify.py' => true,
 			self::RUNTIME_DIR . '/sls_config.py' => true,
 			self::RUNTIME_DIR . '/sls_branded_email.py' => true,
@@ -12142,6 +12058,13 @@ PY;
 			self::RUNTIME_DIR . '/sls_mass_notify_uninstall.sh' => true,
 			self::RUNTIME_DIR . '/sls_mass_notify_install_piper_voices.sh' => true,
 			self::RUNTIME_DIR . '/sls_mass_notify_schedule_worker.php' => true,
+			self::RUNTIME_DIR . '/sls_mass_notify_announcement_worker.php' => true,
+			self::RUNTIME_DIR . '/sls_storage_maintenance.py' => true,
+			self::RUNTIME_DIR . '/sls_weather_queue.py' => true,
+			self::RUNTIME_DIR . '/sls_audio_queue.py' => true,
+			self::RUNTIME_DIR . '/sls_release_verify.py' => true,
+			self::RUNTIME_DIR . '/release-signing.pub' => false,
+			self::RUNTIME_DIR . '/piper-requirements.txt' => false,
 			self::RUNTIME_DIR . '/sls_mass_notify_weather_poll.sh' => true,
 			'/var/www/html/admin/modules/dashboard/sections/SlsMassNotifyAnnouncement.class.php' => false,
 			'/var/www/html/admin/modules/dashboard/views/sections/sls-mass-notify-announcement.php' => false,
@@ -12179,6 +12102,13 @@ PY;
 			__DIR__ . '/bin/sls_mass_notify_uninstall.sh' => self::RUNTIME_DIR . '/sls_mass_notify_uninstall.sh',
 			__DIR__ . '/bin/sls_mass_notify_install_piper_voices.sh' => self::RUNTIME_DIR . '/sls_mass_notify_install_piper_voices.sh',
 			__DIR__ . '/bin/sls_mass_notify_schedule_worker.php' => self::RUNTIME_DIR . '/sls_mass_notify_schedule_worker.php',
+			__DIR__ . '/bin/sls_mass_notify_announcement_worker.php' => self::RUNTIME_DIR . '/sls_mass_notify_announcement_worker.php',
+			__DIR__ . '/bin/sls_mass_notify/sls_storage_maintenance.py' => self::RUNTIME_DIR . '/sls_storage_maintenance.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_weather_queue.py' => self::RUNTIME_DIR . '/sls_weather_queue.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_audio_queue.py' => self::RUNTIME_DIR . '/sls_audio_queue.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_release_verify.py' => self::RUNTIME_DIR . '/sls_release_verify.py',
+			__DIR__ . '/bin/sls_mass_notify/release-signing.pub' => self::RUNTIME_DIR . '/release-signing.pub',
+			__DIR__ . '/bin/sls_mass_notify/piper-requirements.txt' => self::RUNTIME_DIR . '/piper-requirements.txt',
 			__DIR__ . '/bin/sls_mass_notify_weather_poll.sh' => self::RUNTIME_DIR . '/sls_mass_notify_weather_poll.sh',
 			__DIR__ . '/dashboard/sections/SlsMassNotifyAnnouncement.class.php' => '/var/www/html/admin/modules/dashboard/sections/SlsMassNotifyAnnouncement.class.php',
 			__DIR__ . '/dashboard/views/sections/sls-mass-notify-announcement.php' => '/var/www/html/admin/modules/dashboard/views/sections/sls-mass-notify-announcement.php',
@@ -12391,7 +12321,7 @@ PY;
 			if (strpos($command, 'dialplan show') !== false) {
 				$dialplanText = implode("\n", $output);
 				if (stripos($dialplanText, "context 'sls-alert-audio'") === false
-					|| strpos($dialplanText, 'Page(${SLS_DIAL},b(sls-alert-autoanswer^s^1(${EXTEN}))A(${SLS_SAFE_SOUND})inq,5)') === false
+					|| !preg_match('/Page\(\$\{SLS_DIAL\},b\(sls-alert-autoanswer\^s\^1\(\$\{EXTEN\}\)\)A\(\$\{SLS_SAFE_SOUND\}\)inq,[1-5]\)/', $dialplanText)
 					|| strpos($dialplanText, 'Dial(${SLS_DIAL}') !== false) {
 					throw new \RuntimeException(_('Post-restore verification found an invalid multi-contact paging context.'));
 				}

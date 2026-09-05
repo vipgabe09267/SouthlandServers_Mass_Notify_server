@@ -74,7 +74,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 		<li><?php echo _('The module is designed to keep deployment settings outside module code in a centralized .config file so updates do not overwrite local configuration.'); ?></li>
 		<li><?php echo _('Custom/local FreePBX module signatures normally show as Unknown. Altered means the module should be signed again on that PBX.'); ?></li>
 		<li><?php echo _('General Settings shows the installed package version and whether the known release status is LATEST or an update is available.'); ?></li>
-		<li><?php echo _('Version 0.1.1-beta adds per-zone Weather quiet hours and destinations, per-area Lightning strike type, quiet hours, and recipients, forecast-aware adaptive Lightning gating, serialized Weather Alert audio, clearer sleeping-desktop status, safer mixed and unknown phone routing, compact Discord branding, broader Dashboard health, and stronger cross-PBX installation verification.'); ?></li>
+		<li><?php echo _('Version 0.1.2-beta adds background announcement jobs with sender attribution and per-channel results, saved local channel checks, per-device format overrides, reliable desktop reconnects with optional app acknowledgments, independent Weather observation and delivery, fresher Lightning state, and signed release verification.'); ?></li>
 		<li><?php echo _('Local signing now uses the web account, module root, and GPG home reported by FreePBX. Install, update, repair, and uninstall share a maintenance lock; each candidate signature must return trusted status 129 before it replaces the previous module.sig.'); ?></li>
 		<li><?php echo _('After a Dashboard or Framework upgrade, Repair Installation restores the managed announcement widget and menu placement, rebuilds the stored Dashboard hook index, and verifies that the announcement controls render. Framework 17.0.30 and earlier Framework 17 menu comparator forms are supported.'); ?></li>
 	</ul>
@@ -83,6 +83,9 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 	<p><?php echo _('Yealink overrides are labeled “Yealink - Color” and “Yealink - Text Only.” Panasonic KX phones are detected from registered User-Agent data and can also be selected manually. Unknown endpoints remain visible in diagnostics but are not offered as a manual format.'); ?></p>
 
 	<h3><?php echo _('Diagnostics'); ?></h3>
+	<p><?php echo _('General Settings can save up to ten local channel-check profiles. Choose explicit phones and desktops, then audio-only, visual-only, or both. Save and apply the profile before running it. These checks use announcement settings and cooldown; they do not send email/webhooks or query Xweather.'); ?></p>
+	<p><?php echo _('Paging answer timeout is one through five seconds, default five. It limits unanswered invitations, not visual-message expiry or audio length. Phones still need auto-answer enabled.'); ?></p>
+	<p><?php echo _('Weather observations run separately from delivery. Queued alerts are checked for current routing, expiry, cancellation, and fresh observations before submission. Interrupted or uncertain deliveries are not automatically repeated. For general announcements, retry is available only for confirmed failed destinations; inspect the channel results first.'); ?></p>
 	<div class="sls-help-diagnostics">
 		<div class="panel panel-default">
 			<div class="panel-heading"><h4><?php echo _('System Checks'); ?></h4></div>
@@ -143,21 +146,23 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 				<?php } else { ?>
 					<div class="sls-help-scroll-table">
 						<table class="table table-condensed table-striped">
-							<thead><tr><th><?php echo _('Client'); ?></th><th><?php echo _('Last Seen'); ?></th><th><?php echo _('State'); ?></th></tr></thead>
+							<thead><tr><th><?php echo _('Client'); ?></th><th><?php echo _('Last Seen'); ?></th><th><?php echo _('Connection'); ?></th><th><?php echo _('Last Acknowledgment'); ?></th></tr></thead>
 							<tbody>
 								<?php foreach ($desktopDiagnostics as $client) { ?>
 									<tr>
 										<td><?php echo htmlspecialchars(($client['name'] ?? '') . ' (' . ($client['client_id'] ?? '') . ')'); ?></td>
 										<td><?php echo htmlspecialchars(($client['last_seen_at'] ?? '') ?: _('Never')); ?> <?php echo !empty($client['last_seen_ip']) ? htmlspecialchars(' from ' . $client['last_seen_ip']) : ''; ?></td>
 										<td>
-											<?php $state = (string)($client['state'] ?? 'never'); ?>
-											<span class="label <?php echo $state === 'recent' ? 'label-success' : ($state === 'stale' ? 'label-warning' : 'label-default'); ?>"><?php echo htmlspecialchars($state); ?></span>
+											<?php $connected = !empty($client['connected']); ?>
+											<span class="label <?php echo $connected ? 'label-success' : 'label-default'; ?>"><?php echo $connected ? _('Live stream active') : _('Not connected'); ?></span>
 										</td>
+										<td><?php echo htmlspecialchars(($client['last_acknowledged_at'] ?? '') ?: _('Not reported')); ?></td>
 									</tr>
 								<?php } ?>
 							</tbody>
 						</table>
 					</div>
+					<p class="text-muted"><?php echo _('A live connection does not confirm display. Acknowledgments require a compatible desktop app and do not prove the user read the message.'); ?></p>
 				<?php } ?>
 			</div>
 		</div>
@@ -274,6 +279,9 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 	</ul>
 
 	<h3><?php echo _('Dashboard Announcements'); ?></h3>
+	<p><?php echo _('The Dashboard shows one Send Announcement button, progress underneath, and a green check with the authenticated sender after all requested channels accept submission. Control API announcements identify the API, and new schedules retain their creator. Expand Delivery details for per-channel results. Queued audio and submitted SIP NOTIFY confirm PBX acceptance, not that a person heard or saw the message. Interrupted jobs are not replayed automatically.'); ?></p>
+	<p><?php echo _('Normal is the default priority. Urgent moves prepared announcement audio ahead of waiting normal pages for the same phones. It does not interrupt active playback, change visual delivery, or bypass cooldown. A page waits at most five minutes for an audio slot.'); ?></p>
+	<p><?php echo _('General Settings → Download diagnostics saves a redacted JSON support report with versions, check results, permissions, device-format/transport counts, and queue counts. It excludes configuration, credentials, addresses, device identifiers, raw logs, and message text. Saved Channel Checks are optional reusable local test profiles; the question-mark beside the heading explains their purpose.'); ?></p>
 	<ul>
 		<li><?php echo _('The dashboard widget can target online registered extensions, all phones, selected desktop clients, all desktops, announcement groups, or a combination.'); ?></li>
 		<li><?php echo _('General Settings can define up to 10 optional named Discord or Discord-compatible HTTPS Dashboard announcement webhooks. Each enabled destination appears as a separate checkbox, may be used without a local target, and receives bounded branded Discord embed JSON only when selected. Local phone, audio, and desktop submission runs before external webhook I/O.'); ?></li>
@@ -284,6 +292,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 	</ul>
 
 	<h3><?php echo _('SIP NOTIFY and Desktop API'); ?></h3>
+	<p><?php echo _('Desktop stream protocol 2 preserves reconnect cursors, signals history gaps, and rechecks revoked credentials while connected. Updated desktop apps may POST an event_id to /api/sipnotify/desktop/ack using their own credentials to acknowledge a targeted event. Publication, current connection, and acknowledgement are separate states; sleeping desktops are not delivery errors.'); ?></p>
 		<p><?php echo _('Phones receive SIP NOTIFY pushes directly from Asterisk/PJSIP. Audio pages every resolved PJSIP contact through Page/ConfBridge. Mixed phone families receive contact-specific vendor payloads when URI routing is available and one safe generic endpoint payload otherwise; unknown devices also use generic XML. Asterisk submission is not handset acceptance. Desktop clients authenticate with their assigned username and password and can use either the live event stream or the JSON endpoint. Sleeping or disconnected clients are not reported as live.'); ?></p>
 	<ul>
 		<li><code>/api/sipnotify/desktop</code> <?php echo _('returns JSON for the SLS Mass Notify desktop app. Use HTTP Basic authentication with the desktop client username and password configured in General Settings.'); ?></li>

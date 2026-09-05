@@ -2,13 +2,22 @@
 
 Southland Servers Mass Notifications Server is beta-stage FreePBX software that can send PBX alerts, desktop notifications, SIP NOTIFY messages, webhooks, and optional TTS audio pages. Treat it like infrastructure software: test changes on a non-critical PBX first, restrict administrative access, and keep FreePBX, Asterisk, Debian packages, and this module updated.
 
+## Redacted support downloads
+
+General Settings can download a small JSON diagnostic report through an authenticated FreePBX POST with a valid CSRF token. The response is an attachment with `private, no-store` caching and a 128 KiB limit; no report is stored on the PBX. Exported fields are explicitly allowlisted. Configuration, credentials, hostnames, addresses, device identifiers, message contents, raw logs, and diagnostic detail strings are never copied into it. Versions, permission modes, health booleans, and anonymous device/queue counts remain visible, so share even this report only with intended support recipients. A `.config` backup is a separate, sensitive download.
+
+Urgent priority affects only prepared announcement audio waiting for shared recipients. It does not grant additional destination access, bypass authentication or cooldown, or interrupt active audio. Dead waiting tickets expire; unsafe queue paths and malformed state fail closed.
+
 ## Supported Versions
 
 Security fixes are currently targeted at the latest release only.
 
+Version `0.1.2-beta` pins the private Piper environment to pip `26.2.0`, addressing [CVE-2026-13346](https://osv.dev/vulnerability/GHSA-qwm4-qh6w-59xr). Dependency checks are point-in-time checks, not a guarantee that the PBX has no vulnerabilities.
+
 | Version | Supported |
 | --- | --- |
-| `0.1.1-beta` | Yes |
+| `0.1.2-beta` | Yes |
+| `0.1.1-beta` | Upgrade recommended |
 | `0.0.9-beta` | No |
 | `0.0.8-beta` | No |
 | `0.0.7-beta` | No |
@@ -18,6 +27,16 @@ Security fixes are currently targeted at the latest release only.
 | `0.0.3-beta` | No |
 | `0.0.2-beta` | No |
 | Older beta builds | No |
+
+## Portable desktop credentials
+
+Desktop credentials remain encrypted, recoverable, and revocable in the protected central configuration, as an explicit product choice. The encryption key travels with that configuration for migration. Someone who obtains the complete file can therefore recover these credentials. Protect configuration backups accordingly. Desktop credentials authorize receipt of that client's targeted notifications and optional acknowledgements, not administrative Control API actions.
+
+## Generic webhook authentication (0.1.2-beta)
+
+Generic HTTPS destinations may configure `bearer_token`, `signing_secret`, or both. A signature is HMAC-SHA256 over `timestamp + "." + event_id + "." + raw_request_body`. Headers are `X-SLS-Timestamp`, `X-SLS-Event-ID`, and `X-SLS-Signature: sha256=<hex>`. Receivers should verify signatures in constant time, reject stale timestamps, and deduplicate event IDs. These headers authenticate origin; TLS still protects transport. Discord uses its webhook URL token instead.
+
+API configuration responses redact destination URLs and authentication secrets. Blank fields preserve stored secrets; the explicit remove controls clear them. Release verification also checks the publisher-signed manifest described below.
 
 ## Reporting
 
@@ -76,13 +95,13 @@ Alert email uses canonical sender-local-part and domain values stored in protect
 
 Live Weather and Lightning destinations share a bounded dispatcher. Email recipients are scoped to the matching Weather zone or Lightning area; Weather zones also choose specific enabled webhook destinations, while Lightning uses the enabled shared webhook set. Dashboard announcements use a separate protected list of no more than 10 Discord or Discord-compatible HTTPS webhooks and send only to the IDs explicitly selected by an authenticated FreePBX administrator. Discord-hosted URLs must match Discord's HTTPS webhook shape; compatible receivers require a DNS hostname whose resolved addresses are all globally routable. Requests use certificate verification, validated-address pinning, no redirects, limited retries, bounded payloads, and an idempotency key. Dashboard webhook work begins only after requested local phone, audio, and desktop submissions, so external network latency cannot gate those urgent local channels. Destination secrets are omitted from API/config responses, UI markup, logs, and safe result records. Manual tests, previews, dry runs, and direct CLI use cannot send external webhook traffic without the internal live-delivery gate.
 
-Concurrent Weather-zone workers coordinate through a root-path-constrained, no-follow state file and sidecar lock. The journal stores domain-separated hashes rather than phone numbers, desktop usernames, email addresses, or webhook identifiers, rejects non-regular files and invalid schemas, and applies entry, size, and retention bounds. Claims are made before irreversible local or external submission, so a crash favors suppression of a possible duplicate over automatic replay.
+The chronological Weather dispatcher coordinates cross-zone delivery through a root-path-constrained, no-follow state file and sidecar lock. The journal stores domain-separated hashes rather than phone numbers, desktop usernames, email addresses, or webhook identifiers, rejects non-regular files and invalid schemas, and applies entry, size, and retention bounds. Claims are made before irreversible local or external submission, so a crash favors suppression of a possible duplicate over automatic replay.
 
 Settings participate in FreePBX’s native Apply Config hook and remain staged in a protected Asterisk-owned file until reload. The root maintenance worker compares only the managed Dashboard widget and menu integration files after FreePBX updates; when drift is detected it restores those known files from the installed module and refreshes local signatures. Install, update, repair, and uninstall operations use the same root-owned maintenance lock, preventing the minute worker from changing managed files during a deployment transaction. A maintenance-launched child reuses the inherited lock rather than opening a second transaction, while signer and verifier children close their inherited copies so a background FreePBX GPG refresh cannot extend the lock beyond the parent transaction. These paths do not modify phone provisioning, PJSIP peers, or unrelated FreePBX module content.
 
 Scheduled-announcement definitions live in the protected central config, while the execution ledger is a separate Asterisk-owned `0640` state file. The worker claims an occurrence before submitting delivery and fails closed if its worker lock or ledger cannot be opened safely, favoring a missed page over an accidental duplicate. It revalidates the live schedule immediately before claiming delivery. Portable `.config` imports lack execution history and disable imported schedules for review; native FreePBX backup includes the journal and restores it through replay-safe validation. A normal uninstall preserves the local ledger so reinstalling cannot replay a completed occurrence; an explicit purge removes it. Scheduling shares the normal announcement lock and cooldown and does not bypass recipient, audio, or SIP NOTIFY validation.
 
-Executable runtime under `/usr/local/bin/sls_mass_notify`, including Piper, maintenance, and updater code, is owned by `root:root`. Mutable deployment data remains under the Asterisk data folder. The root updater accepts only the official repository, requires GitHub release SHA-256 metadata, accepts normal three-part tags with an optional `-beta` suffix, and executes the installer from the matching immutable tag. Automatic updates remain disabled by default.
+Executable runtime under `/usr/local/bin/sls_mass_notify`, including Piper, maintenance, and updater code, is owned by `root:root`. Mutable deployment data remains under the Asterisk data folder. The root updater accepts only the official repository, checks release asset hashes and a publisher-signed manifest, accepts normal three-part tags with an optional `-beta` suffix, and executes the installer from the resolved release commit. Automatic updates remain disabled by default.
 
 Phone SIP NOTIFY requests are submitted directly through Asterisk/PJSIP to registered endpoints. Mixed phone families use contact-specific payloads only when every registration URI is resolved and Asterisk can safely route it; otherwise one generic XML document is submitted by endpoint fan-out. Unknown formats also use generic XML. SIP/SIPS URI transport parameters and IPv6 literals are preserved, while control characters and malformed contacts are rejected. Vendor XML support is model-, firmware-, provisioning-, authentication-, and certificate-dependent; do not interpret a successful AMI action as proof that a phone displayed the payload.
 
@@ -90,7 +109,19 @@ Native FreePBX backup records use a manifest with type, restore name, byte count
 
 The module does not replace FreePBX system hardening. Firewall rules, TLS certificates, fail2ban policies, OS patching, mail transport security, backup encryption, and SIP trunk security remain the responsibility of the PBX administrator.
 
+## Delivery state and resource limits
+
+Desktop authentication is throttled before expensive credential work. Live streams are capped per client and globally; active credentials are rechecked during a stream. Event acknowledgments are authenticated and restricted to eligible targeted events. Password encryption remains portable by design and is not protection against theft of the complete configuration.
+
+Announcement and weather jobs use bounded, protected journals and claims made before irreversible submission. Known failed announcement destinations can be retried deliberately; uncertain or interrupted submissions are not automatically repeated. This prevents duplicate alerts at the cost of requiring operator review after some crashes. Separate observation, delivery, and external-retry workers prevent slow recipients from holding the observation lock.
+
+The weather outbox is limited to 1,000 jobs and 16 MiB. Pending jobs and external retries expire after one hour; terminal weather/retry records are retained for seven days. API audit retention is 30 days with capacity limits, and operational logs use module-specific rotation. Disk and queue health checks report faults; no unlimited-retention guarantee is made.
+
 ## Dependency Security
+
+The `0.1.2-beta` updater verifies an Ed25519-signed release manifest using the already installed publisher public key. The manifest binds the version, tag, installer checksum, and TGZ checksum. The verified archive is passed locally to the installer to avoid a second mutable download. Release signing keys are kept outside the source tree and package; back them up securely before publication. This mechanism is separate from PBX-local FreePBX module signing. A fresh bootstrap still requires trusting the initially downloaded installer and its embedded public key.
+
+New-format releases are versioned, not overwritten: a correction requires a new version and signed assets. The updater intentionally ignores an equal version. Signed manifests authenticate bytes, not code quality, and do not protect against a compromised publisher signing key.
 
 The installer detects native prerequisites and installs only missing Debian packages, creates a dedicated Piper virtual environment with pinned packaging tools and `piper-tts`, and downloads Piper voice models from a pinned repository revision with exact SHA-256 verification. It validates a loopback-only FreePBX AMI host/port, verifies required Asterisk modules will remain available after restart, refuses an unrelated `/usr/local/bin/piper` wrapper, and refuses conflicting reserved SLS System Recording ownership. Release TGZ paths and metadata are validated before extraction, while the build gate rejects credentials, private keys, models, logs, caches, backups, signatures, nested archives, and generated artifacts. Use a trusted network for installation, verify release checksums, and run installers only from the official project source.
 

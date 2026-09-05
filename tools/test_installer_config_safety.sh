@@ -180,6 +180,11 @@ grep -Fq 'runtime entry changed type during repair' "${ROOT_DIR}/tools/install_r
 grep -Fq 'runtime entry changed type during repair' "$maintenance_script"
 grep -Fq 'child_relative == "sls_mass_notify_schedule_worker.php"' "${ROOT_DIR}/tools/install_release.sh"
 grep -Fq 'child_relative == "sls_mass_notify_schedule_worker.php"' "$maintenance_script"
+grep -Fq 'child_relative == "sls_mass_notify_announcement_worker.php"' "${ROOT_DIR}/tools/install_release.sh"
+grep -Fq 'child_relative == "sls_mass_notify_announcement_worker.php"' "$maintenance_script"
+declare -f runtime_install_postconditions_available | grep -Fq '"sls_mass_notify_announcement_worker.php",'
+declare -f verify_installed_payload_parity | grep -Fq '"sls_mass_notify_announcement_worker.php",'
+grep -Fq "'sls_weather_queue.py'," "${ROOT_DIR}/slsmassnotifyserver/Slsmassnotifyserver.class.php"
 grep -Fq 'if temporary and bin_fd >= 0:' "$piper_installer"
 grep -Fq 'mktemp /usr/local/bin/.sls-piper.XXXXXX' "$piper_installer"
 grep -Fq 'close_inherited_maintenance_lock' "${ROOT_DIR}/slsmassnotifyserver/bin/sign_sls_mass_notify_local_sig.sh"

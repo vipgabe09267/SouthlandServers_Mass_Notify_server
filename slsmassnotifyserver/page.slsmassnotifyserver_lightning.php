@@ -40,6 +40,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 		$triggerName = isset($_SESSION['AMP_user']->username) && $_SESSION['AMP_user']->username !== ''
 			? (string)$_SESSION['AMP_user']->username
 			: 'FreePBX Dashboard';
+		if (($_POST['ajax'] ?? '') === '1' && session_status() === PHP_SESSION_ACTIVE) {
+			session_write_close();
+		}
 		try {
 			$selectedGroupIds = is_array($_POST['lightning_group_ids'] ?? null)
 				? $_POST['lightning_group_ids']

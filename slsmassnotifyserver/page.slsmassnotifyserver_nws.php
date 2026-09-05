@@ -47,13 +47,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
 		$selectedZoneScope = (($_POST['test_zone_scope'] ?? 'all') === 'selected');
 		$testZoneIds = $selectedZoneScope ? (array)($_POST['test_zone_ids'] ?? []) : [];
-		$result = ($selectedZoneScope && empty($testZoneIds))
-			? ['success' => false, 'message' => _('Select at least one NWS zone for the test.')]
-			: $slsmassnotifyserver->triggerTest('tts', '', $triggerName, $testZoneIds);
+		// Authentication, CSRF validation and sender capture are complete. A long
+		// AJAX test must not block other tabs or delivery-status requests.
+		if (($_POST['ajax'] ?? '') === '1' && session_status() === PHP_SESSION_ACTIVE) {
+			session_write_close();
+		}
+		try {
+			$result = ($selectedZoneScope && empty($testZoneIds))
+				? ['success' => false, 'message' => _('Select at least one NWS zone for the test.')]
+				: $slsmassnotifyserver->triggerTest('tts', '', $triggerName, $testZoneIds);
+		} catch (\Throwable $e) {
+			error_log('SLS Mass Notify Weather test response failed: ' . get_class($e));
+			$result = [
+				'success' => false,
+				'message' => _('Weather test could not return a confirmed delivery result.'),
+				'errors' => [_('Check Notification Logs and Dashboard health before retrying; some destinations may already have received the test.')],
+			];
+		}
 		if (($_POST['ajax'] ?? '') === '1') {
 			header('Content-Type: application/json');
+			header('Cache-Control: no-store');
 			$result['cooldowns'] = $slsmassnotifyserver->getCooldownState();
-			echo json_encode($result);
+			echo json_encode($result, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
 			exit;
 		}
 		$_SESSION['slsmassnotifyserver_test_result'] = $result;

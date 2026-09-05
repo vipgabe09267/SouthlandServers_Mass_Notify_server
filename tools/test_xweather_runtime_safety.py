@@ -108,12 +108,11 @@ intent_position = xweather_source.index(
 )
 queue_position = xweather_source.index("delivery_key = queue_current_external_delivery()", intent_position)
 audio_position = xweather_source.index(
-    "queued, archived_results, page_hold_seconds = queue_audio(", queue_position
+    "queued, channel_errors = submit_local_channels(", queue_position
 )
-visual_position = xweather_source.index("send_visual(", audio_position)
 commit_position = xweather_source.index("commit_local_event_state(state, event_kind, now)", queue_position)
 retry_position = xweather_source.index("retry_outcome = retry_external_now(correlation_key)", commit_position)
-if not generation_position < intent_position < queue_position < audio_position < visual_position < commit_position < retry_position:
+if not generation_position < intent_position < queue_position < audio_position < commit_position < retry_position:
     fail("Xweather did not generate audio, persist intent, submit locally, commit dedup, and retry in order")
 
 

@@ -133,8 +133,11 @@ function authorized_desktop_client(array $settings, string $providedUser, string
     return [];
 }
 
-function desktop_auth_failure_allowed(string $ip): bool
+function desktop_auth_attempt_allowed(string $ip, string $username): bool
 {
+    if (is_link(DESKTOP_AUTH_RATE_FILE)) {
+        return false;
+    }
     $handle = @fopen(DESKTOP_AUTH_RATE_FILE, 'c+');
     if ($handle === false || !flock($handle, LOCK_EX)) {
         if (is_resource($handle)) {
@@ -149,11 +152,20 @@ function desktop_auth_failure_allowed(string $ip): bool
     $data = array_filter($data, static function ($entry) use ($bucket): bool {
         return is_array($entry) && (string)($entry['bucket'] ?? '') === $bucket;
     });
-    $key = hash('sha256', $ip !== '' ? $ip : 'unknown');
-    $entry = is_array($data[$key] ?? null) ? $data[$key] : ['bucket' => $bucket, 'count' => 0];
-    $entry['bucket'] = $bucket;
-    $entry['count'] = (int)($entry['count'] ?? 0) + 1;
-    $data[$key] = $entry;
+    $allowed = true;
+    foreach (['ip:' . $ip => 120, 'account:' . strtolower(substr($username, 0, 80)) => 60] as $identity => $limit) {
+        $key = hash('sha256', $identity);
+        $entry = is_array($data[$key] ?? null) ? $data[$key] : ['bucket' => $bucket, 'count' => 0];
+        $entry['bucket'] = $bucket;
+        $entry['count'] = (int)($entry['count'] ?? 0) + 1;
+        $data[$key] = $entry;
+        $allowed = $allowed && $entry['count'] <= $limit;
+    }
+    // Bound memory and disk work even when requests use random usernames.
+    if (count($data) > 2048) {
+        $data = array_slice($data, -2048, null, true);
+        $allowed = false;
+    }
     rewind($handle);
     ftruncate($handle, 0);
     fwrite($handle, json_encode($data, JSON_UNESCAPED_SLASHES) . "\n");
@@ -161,10 +173,10 @@ function desktop_auth_failure_allowed(string $ip): bool
     flock($handle, LOCK_UN);
     fclose($handle);
     @chmod(DESKTOP_AUTH_RATE_FILE, 0640);
-    return $entry['count'] <= 10;
+    return $allowed;
 }
 
-function update_desktop_seen(array $client): void
+function update_desktop_seen(array $client, array $presence = []): void
 {
     $username = (string)($client['username'] ?? '');
     if ($username === '') {
@@ -180,12 +192,13 @@ function update_desktop_seen(array $client): void
     rewind($handle);
     $decoded = json_decode((string)stream_get_contents($handle), true);
     $data = is_array($decoded) ? $decoded : [];
-    $data[$username] = [
+    $previous = is_array($data[$username] ?? null) ? $data[$username] : [];
+    $data[$username] = array_merge($previous, [
         'seen_at' => gmdate('c'),
         'ip' => (string)($_SERVER['REMOTE_ADDR'] ?? ''),
         'client_id' => (string)($client['client_id'] ?? ''),
         'name' => (string)($client['name'] ?? ''),
-    ];
+    ], $presence);
     rewind($handle);
     ftruncate($handle, 0);
     fwrite($handle, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n");
@@ -273,7 +286,16 @@ function atomic_replace_journal(string $eventsFile, string $contents, ?callable 
 
 function retained_events(array $settings): array
 {
+    static $cachedFingerprint = null;
+    static $cachedEvents = [];
+    static $cachedAt = 0;
     $eventsFile = EVENTS_FILE;
+    clearstatcache(true, $eventsFile);
+    $metadata = @stat($eventsFile);
+    $fingerprint = $metadata ? implode(':', [$metadata['ino'], $metadata['size'], $metadata['mtime'], $metadata['ctime']]) : '';
+    if ($fingerprint !== '' && $fingerprint === $cachedFingerprint && time() - $cachedAt < 15) {
+        return $cachedEvents;
+    }
     $lockFile = $eventsFile . '.lock';
     if (is_link($lockFile)) {
         respond(503, ['ok' => false, 'error' => 'journal_lock_unavailable']);
@@ -342,7 +364,48 @@ function retained_events(array $settings): array
     flock($lockHandle, LOCK_UN);
     fclose($lockHandle);
     @chmod($eventsFile, 0640);
+    clearstatcache(true, $eventsFile);
+    $metadata = @stat($eventsFile);
+    $cachedFingerprint = $metadata ? implode(':', [$metadata['ino'], $metadata['size'], $metadata['mtime'], $metadata['ctime']]) : null;
+    $cachedEvents = $events;
+    $cachedAt = time();
     return $events;
+}
+
+function desktop_stream_slot(string $username)
+{
+    $directory = dirname(EVENTS_FILE) . '/stream-slots';
+    if (is_link($directory) || (!is_dir($directory) && !@mkdir($directory, 0750))) {
+        respond(503, ['ok' => false, 'error' => 'stream_capacity_unavailable']);
+    }
+    $handles = [];
+    foreach (['client-' . hash('sha256', $username) => 2, 'global' => 32] as $prefix => $limit) {
+        $claimed = false;
+        for ($slot = 0; $slot < $limit; $slot++) {
+            $path = $directory . '/' . $prefix . '-' . $slot . '.lock';
+            if (is_link($path)) {
+                continue;
+            }
+            $handle = @fopen($path, 'c+');
+            if ($handle !== false && flock($handle, LOCK_EX | LOCK_NB)) {
+                @chmod($path, 0640);
+                $handles[] = $handle;
+                $claimed = true;
+                break;
+            }
+            if (is_resource($handle)) {
+                fclose($handle);
+            }
+        }
+        if (!$claimed) {
+            foreach ($handles as $handle) {
+                fclose($handle);
+            }
+            header('Retry-After: 15');
+            respond(429, ['ok' => false, 'error' => 'stream_capacity_reached']);
+        }
+    }
+    return $handles;
 }
 
 function announcement_display_expired(array $event, ?int $now = null): bool
@@ -395,6 +458,7 @@ function desktop_stream_events_after_cursor(
 
     $nextEvents = [];
     if ($lastEventId === '') {
+        $lastEventId = '@sls:empty';
         if (!empty($routedEvents)) {
             $lastEventId = (string)$routedEvents[count($routedEvents) - 1][0];
         }
@@ -407,12 +471,7 @@ function desktop_stream_events_after_cursor(
             $lastIndex = (int)$index;
         }
     }
-    if ($lastIndex < 0) {
-        if (!empty($routedEvents)) {
-            $lastEventId = (string)$routedEvents[count($routedEvents) - 1][0];
-        }
-        return ['last_event_id' => $lastEventId, 'events' => $nextEvents];
-    }
+    $cursorGap = $lastIndex < 0 && $lastEventId !== '@sls:empty';
 
     foreach (array_slice($routedEvents, $lastIndex + 1) as $routedEvent) {
         [$eventId, $event] = $routedEvent;
@@ -426,11 +485,11 @@ function desktop_stream_events_after_cursor(
         $nextEvents[] = [$eventId, $event];
     }
 
-    return ['last_event_id' => $lastEventId, 'events' => $nextEvents];
+    return ['last_event_id' => $lastEventId, 'events' => $nextEvents, 'cursor_gap' => $cursorGap];
 }
 
 $endpoint = endpoint_slug();
-if (!in_array($endpoint, ['desktop', 'desktop/stream'], true)) {
+if (!in_array($endpoint, ['desktop', 'desktop/stream', 'desktop/ack'], true)) {
     respond(404, ['ok' => false, 'error' => 'unknown_endpoint']);
 }
 $remoteIp = (string)($_SERVER['REMOTE_ADDR'] ?? '');
@@ -438,28 +497,43 @@ $https = !empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 
 if (!$https && !in_array($remoteIp, ['127.0.0.1', '::1'], true)) {
     respond(426, ['ok' => false, 'error' => 'https_required']);
 }
-if ((string)($_SERVER['REQUEST_METHOD'] ?? '') !== 'GET') {
+if ((string)($_SERVER['REQUEST_METHOD'] ?? '') !== ($endpoint === 'desktop/ack' ? 'POST' : 'GET')) {
     respond(405, ['ok' => false, 'error' => 'method_not_allowed']);
 }
 
 $settings = settings_config();
 [$basicUser, $basicPass] = basic_credentials();
+if (!desktop_auth_attempt_allowed($remoteIp, $basicUser)) {
+    header('Retry-After: 60');
+    respond(429, ['ok' => false, 'error' => 'rate_limited']);
+}
 $client = authorized_desktop_client($settings, $basicUser, $basicPass);
 if (empty($client)) {
-    if (!desktop_auth_failure_allowed((string)($_SERVER['REMOTE_ADDR'] ?? ''))) {
-        respond(429, ['ok' => false, 'error' => 'rate_limited']);
-    }
     header('WWW-Authenticate: Basic realm="SLS Mass Notify Desktop"');
     respond(401, ['ok' => false, 'error' => 'unauthorized']);
 }
 
 update_desktop_seen($client);
 $username = (string)$client['username'];
+if ($endpoint === 'desktop/ack') {
+    $raw = (string)file_get_contents('php://input', false, null, 0, 4097);
+    $ack = strlen($raw) <= 4096 ? json_decode($raw, true) : null;
+    $eventId = is_array($ack) && is_string($ack['event_id'] ?? null) ? $ack['event_id'] : '';
+    foreach (retained_events($settings) as $event) {
+        if ($eventId !== '' && hash_equals((string)($event['id'] ?? $event['event_id'] ?? ''), $eventId)
+            && desktop_event_routed_to_client($event, $username)) {
+            update_desktop_seen($client, ['ack_event_id' => $eventId, 'ack_at' => gmdate('c')]);
+            respond(200, ['ok' => true, 'event_id' => $eventId]);
+        }
+    }
+    respond(400, ['ok' => false, 'error' => 'unknown_or_unauthorized_event']);
+}
 $streamRequested = $endpoint === 'desktop/stream'
     || (string)($_GET['stream'] ?? '') === '1'
     || stripos(request_header_value('Accept'), 'text/event-stream') !== false;
 
 if ($streamRequested) {
+    $streamSlots = desktop_stream_slot($username);
     @set_time_limit(0);
 	ignore_user_abort(false);
 	@ini_set('zlib.output_compression', '0');
@@ -480,9 +554,16 @@ if ($streamRequested) {
         $lastEventId = trim((string)($_GET['last_event_id'] ?? ''));
     }
 	$sessionId = bin2hex(random_bytes(16));
+    // Establish the baseline before the handshake; later arrivals, including
+    // the first targeted record ever written, must be emitted by the loop.
+    if ($lastEventId === '') {
+        $baseline = desktop_stream_events_after_cursor(retained_events($settings), $username, '');
+        $lastEventId = $baseline['last_event_id'];
+    }
     echo "retry: 1000\n";
+    echo 'id: ' . str_replace(["\r", "\n"], '', $lastEventId) . "\n";
     echo "event: authenticated\n";
-    echo 'data: ' . json_encode(['ok' => true, 'transport' => 'live_sse', 'session_id' => $sessionId, 'client_id' => (string)($client['client_id'] ?? ''), 'name' => (string)($client['name'] ?? ''), 'heartbeat_seconds' => 15, 'connected_at' => gmdate('c')], JSON_UNESCAPED_SLASHES) . "\n\n";
+    echo 'data: ' . json_encode(['ok' => true, 'transport' => 'live_sse', 'protocol_version' => 2, 'ack_path' => '/api/sipnotify/desktop/ack', 'session_id' => $sessionId, 'client_id' => (string)($client['client_id'] ?? ''), 'name' => (string)($client['name'] ?? ''), 'heartbeat_seconds' => 15, 'connected_at' => gmdate('c')], JSON_UNESCAPED_SLASHES) . "\n\n";
 	// A valid SSE comment fills Apache's initial output bucket so the
 	// authenticated handshake above reaches the desktop immediately.
 	echo ':' . str_repeat(' ', 8192) . "\n";
@@ -490,12 +571,25 @@ if ($streamRequested) {
     $started = time();
 	$streamSeconds = min(300, max(1, (int)($_GET['stream_seconds'] ?? 300)));
     $lastKeepalive = 0;
+    $lastAuthCheck = 0;
     while (!connection_aborted() && time() - $started < $streamSeconds) {
+        if (time() - $lastAuthCheck >= 5) {
+            $settings = settings_config();
+            if (empty(authorized_desktop_client($settings, $basicUser, $basicPass))) {
+                echo "event: revoked\ndata: {\"ok\":false,\"error\":\"credentials_revoked\"}\n\n";
+                @flush();
+                break;
+            }
+            $lastAuthCheck = time();
+        }
 		$streamBatch = desktop_stream_events_after_cursor(
 			retained_events($settings),
 			$username,
 			$lastEventId
 		);
+        if (!empty($streamBatch['cursor_gap'])) {
+            echo "event: cursor_reset\ndata: {\"reason\":\"history_gap\",\"replay\":true}\n\n";
+        }
 		foreach ($streamBatch['events'] as $streamEvent) {
 			[$eventId, $event] = $streamEvent;
 			echo 'id: ' . str_replace(["\r", "\n"], '', (string)$eventId) . "\n";
@@ -504,6 +598,7 @@ if ($streamRequested) {
 		}
 		$lastEventId = (string)$streamBatch['last_event_id'];
         if (time() - $lastKeepalive >= 15) {
+            update_desktop_seen($client, ['connected_until' => time() + 30]);
             echo ': keepalive ' . time() . "\n\n";
             $lastKeepalive = time();
         }

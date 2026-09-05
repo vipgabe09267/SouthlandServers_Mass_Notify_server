@@ -850,7 +850,7 @@ aor_fallback_line="$(grep -nFm1 'PJSIP_AOR(\${SLS_AUTOANSWER_AOR},contact)' "$cl
 [ "$channel_contact_line" -lt "$aor_fallback_line" ]
 grep -Fq 'PJSIP_CONTACT(\${SLS_AUTOANSWER_CONTACT},user_agent)' "$class_source"
 grep -Fq '\${SLS_AUTOANSWER_UA:0:7}\"=\"yealink\"]?Set(SLS_ALERT_INFO=Intercom)' "$class_source"
-grep -Fq 'Page(\${SLS_DIAL},b(sls-alert-autoanswer^s^1(\${EXTEN}))A(\${SLS_SAFE_SOUND})inq,5)' "$class_source"
+grep -Fq 'Page(\${SLS_DIAL},b(sls-alert-autoanswer^s^1(\${EXTEN}))A(\${SLS_SAFE_SOUND})inq,{$pagingAnswerTimeout})' "$class_source"
 if grep -Fq 'Dial(\${SLS_DIAL}' "$class_source"; then
   printf 'Managed paging still uses first-answer Dial semantics.\n' >&2
   exit 1
@@ -867,7 +867,8 @@ device_fallback_line="$(grep -nFm1 'Set(SLS_DIAL=\${SLS_DEVICE_DIAL})' "$class_s
 [ "$device_aor_default_line" -lt "$device_contacts_line" ]
 [ "$device_contacts_line" -lt "$device_fallback_line" ]
 [ "$dynamic_contacts_line" -lt "$device_fallback_line" ]
-grep -Fq 'Page(${SLS_DIAL},b(sls-alert-autoanswer^s^1(${EXTEN}))A(${SLS_SAFE_SOUND})inq,5)' "${ROOT_DIR}/tools/install_release.sh"
+grep -Fq 'Page(${SLS_DIAL},b(sls-alert-autoanswer^s^1(${EXTEN}))A(${SLS_SAFE_SOUND})inq,' "${ROOT_DIR}/tools/install_release.sh"
+grep -Fq 'for seconds in range(1,6)' "${ROOT_DIR}/tools/install_release.sh"
 
 # Every call-file origin must remain alive for the measured combined WAV. A
 # one-second origin destroys Page's ConfBridge before longer audio completes.

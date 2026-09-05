@@ -16,6 +16,15 @@ function announcement_contract_fail(string $message): void
 
 $reflection = new ReflectionClass(\FreePBX\modules\Slsmassnotifyserver::class);
 $module = $reflection->newInstanceWithoutConstructor();
+$priorityValidator = $reflection->getMethod('validateControlApiAnnouncementPayload');
+foreach (['normal', 'urgent', [], true, 'urgent;id'] as $priority) {
+    foreach ([['priority' => $priority], ['options' => ['priority' => $priority]]] as $payload) {
+        $errors = $priorityValidator->invoke($module, $payload);
+        if (in_array($priority, ['normal', 'urgent'], true) !== empty($errors)) {
+            announcement_contract_fail('Announcement priority schema accepted invalid input or rejected an allowed value.');
+        }
+    }
+}
 $buildCommand = $reflection->getMethod('buildAnnouncementVisualPushCommand');
 $buildCommand->setAccessible(true);
 
@@ -55,30 +64,26 @@ if ($sendStart === false || $sendEnd === false) {
 	announcement_contract_fail('Unable to isolate the announcement delivery orchestration source.');
 }
 $sendSource = substr($classSource, $sendStart, $sendEnd - $sendStart);
-$earlyDesktop = strpos($sendSource, 'if ($desktopRequested && !$desktopNeedsAudioDuration)');
-$audioPreparation = strpos($sendSource, '$audioResult = $this->sendAnnouncementTtsAudio');
-$durationDesktop = strpos($sendSource, 'if ($desktopNeedsAudioDuration)', ($audioPreparation === false ? 0 : $audioPreparation));
-$phoneDelay = strpos($sendSource, 'sleep($notifyDelay)');
-$postLocalWebhookDispatch = strrpos($sendSource, "\n\t\t\$dispatchWebhooks();");
+$deliverySource = (string)file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/AnnouncementDelivery.php');
+$earlyDesktop = strpos($deliverySource, 'if (!$needsDuration) { $publishDesktop(); }');
+$audioPreparation = strpos($deliverySource, '$audio = $this->sendAnnouncementTtsAudio');
+$durationDesktop = strpos($deliverySource, 'if ($needsDuration) { $publishDesktop(); }');
+$phoneDelay = strpos($deliverySource, 'if ($audioQueued) { sleep(1); }');
+$webhookDispatch = strpos($deliverySource, '$this->dispatchAnnouncementWebhooks');
 if ($earlyDesktop === false || $audioPreparation === false || $durationDesktop === false || $phoneDelay === false
-	|| $postLocalWebhookDispatch === false
-	|| !($earlyDesktop < $audioPreparation && $audioPreparation < $durationDesktop && $durationDesktop < $phoneDelay && $phoneDelay < $postLocalWebhookDispatch)) {
-	announcement_contract_fail('Desktop publication is not ordered before TTS, or immediately after duration discovery and before the phone delay.');
+    || $webhookDispatch === false || !($earlyDesktop < $audioPreparation && $audioPreparation < $durationDesktop
+    && $durationDesktop < $phoneDelay && $phoneDelay < $webhookDispatch)) {
+    announcement_contract_fail('Independent delivery ordering regressed.');
 }
-foreach (['desktop_publish_failed_after_audio', 'audio_failed_after_desktop', 'notify_failed_after_desktop', "'partial_delivery' => true"] as $marker) {
-	if (strpos($sendSource, $marker) === false) {
-		announcement_contract_fail('Mixed-channel partial-delivery reporting is missing: ' . $marker);
-	}
-}
+require __DIR__ . '/test_independent_channels.php';
 foreach ([
-	"(!empty(\$selected) || \$desktopRequested) && !is_executable(self::VISUAL_PUSH_SCRIPT)",
-	"empty(\$selected) && !\$desktopRequested && !\$webhookRequested",
-	"'webhook_destination_ids' => array_keys(\$selectedAnnouncementWebhooks)",
-	"'announcement_webhook_failed'",
+    "(!empty(\$selected) || \$desktopRequested) && !is_executable(self::VISUAL_PUSH_SCRIPT)",
+    "empty(\$selected) && !\$desktopRequested && !\$webhookRequested",
+    "'webhooks' => array_keys(\$selectedAnnouncementWebhooks)",
 ] as $marker) {
-	if (strpos($sendSource, $marker) === false) {
-		announcement_contract_fail('Dashboard webhook-only or partial-delivery contract is missing: ' . $marker);
-	}
+    if (strpos($sendSource, $marker) === false) {
+        announcement_contract_fail('Resolved destination validation is missing: ' . $marker);
+    }
 }
 
 $webhookMethodStart = strpos($classSource, "\n\tprivate function dispatchAnnouncementWebhooks");
@@ -127,7 +132,9 @@ foreach ([
 	'aria-live="polite"',
 	'aria-atomic="true"',
 	'function setAnnouncementStatus',
-	'Preparing announcement and starting the selected delivery channels',
+	'Queueing announcement…',
+	'function renderDeliveryStatus',
+	'name="announcement_priority"',
 	'name="announcement_webhooks[]"',
 	"checkbox.name = 'announcement_groups[]'",
 	'name="announcement_extensions[]"',
@@ -171,7 +178,7 @@ if (substr_count($dashboard, '<section class="sls-step-card"') !== 2) {
 	announcement_contract_fail('Dashboard composer is no longer consolidated into two primary sections.');
 }
 if (substr_count($dashboard, "var lifecycleKey = '__slsMassNotifyAnnouncementWidget'") < 2
-	|| substr_count($dashboard, 'lifecycle.intervals.push(window.setInterval(') !== 2
+	|| substr_count($dashboard, 'lifecycle.intervals.push(window.setInterval(') !== 3
 	|| substr_count($dashboard, 'if (!instanceActive())') < 8
 	|| strpos($dashboard, 'new ResizeObserver(scheduleDashboardLayout).observe(root)') !== false
 	|| strpos($dashboard, "window.addEventListener('resize', scheduleDashboardLayout)") !== false) {
