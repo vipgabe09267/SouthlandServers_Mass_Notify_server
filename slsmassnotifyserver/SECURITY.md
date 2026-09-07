@@ -10,13 +10,22 @@ Urgent priority affects only prepared announcement audio waiting for shared reci
 
 ## Supported Versions
 
+### 0.1.3-beta reliability hardening
+
+General-announcement state can be recorded before FreePBX bootstrap. Workers run as the PBX runtime account; a root invocation drops privileges before opening job storage. Supervision captures bounded child output, records fixed failure categories rather than raw exceptions, and uses a process-group timeout. Interrupted submissions are marked failed with uncertainty retained and are not replayed automatically. Harmless health probes never submit alert channels.
+
+Root installer logs and maintenance locks use exclusive, no-follow creation and descriptor identity checks before writes. Symlinks, hardlinks, special files, and unsafe ownership are rejected. Configuration compatibility migration is narrow and precedes strict type/key validation; it does not relax unknown-field rejection. Shared delivery activity locks and exclusive configuration/backup locks coordinate general announcements without serializing independent workers.
+
+These checks do not establish handset display, human receipt, or compatibility with every PBX deployment. Real-device testing and disposable install/restore testing remain necessary.
+
 Security fixes are currently targeted at the latest release only.
 
 Version `0.1.2-beta` pins the private Piper environment to pip `26.2.0`, addressing [CVE-2026-13346](https://osv.dev/vulnerability/GHSA-qwm4-qh6w-59xr). Dependency checks are point-in-time checks, not a guarantee that the PBX has no vulnerabilities.
 
 | Version | Supported |
 | --- | --- |
-| `0.1.2-beta` | Yes |
+| `0.1.3-beta` | Yes |
+| `0.1.2-beta` | Upgrade recommended |
 | `0.1.1-beta` | Upgrade recommended |
 | `0.0.9-beta` | No |
 | `0.0.8-beta` | No |

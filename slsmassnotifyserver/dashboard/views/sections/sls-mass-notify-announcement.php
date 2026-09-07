@@ -986,9 +986,9 @@ foreach ($desktopClients as $desktopClient) {
 		details.appendChild(list); receiptsPanel.appendChild(details);
 	}
 	function renderDeliveryStatus(data) {
-		var pending = ['queued', 'running'].indexOf(data.state) >= 0 || !!data.queued;
+		var pending = ['queued', 'worker_starting', 'running'].indexOf(data.state) >= 0 || !!data.queued;
 		if (pending) {
-			setAnnouncementStatus('info', data.state === 'running' ? 'Sending announcement…' : 'Announcement queued…', true);
+			setAnnouncementStatus('info', data.state === 'running' ? 'Sending announcement…' : (data.state === 'worker_starting' ? 'Starting announcement worker…' : 'Announcement queued…'), true);
 		} else if (data.success) {
 			setAnnouncementStatus('success', 'Announcement submitted' + (data.sender ? ' · Sent by ' + data.sender : ''), false);
 		} else {
@@ -1005,7 +1005,7 @@ foreach ($desktopClients as $desktopClient) {
 		fetch('config.php?display=slsmassnotifyserver&slsmassnotifyserver_action=announcement_job&job_id=' + encodeURIComponent(activeJob), {credentials:'same-origin', cache:'no-store'})
 			.then(parseJsonResponse).then(function(data) {
 				if (!instanceActive()) return;
-				var pending = ['queued', 'running'].indexOf(data.state) >= 0;
+				var pending = ['queued', 'worker_starting', 'running'].indexOf(data.state) >= 0;
 				renderDeliveryStatus(data);
 				showReceipts(data); setSubmitBusy(pending);
 				if (!pending) { rememberJob(''); remaining = parseInt(data.cooldown_remaining || '0', 10) || 0; }

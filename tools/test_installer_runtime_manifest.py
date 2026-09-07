@@ -25,4 +25,11 @@ for worker in workers:
 runtime_check = re.search(r'runtime_python_files=\((.*?)\n  \)', installer, re.S)[1]
 for helper in helpers:
     assert '/usr/local/bin/sls_mass_notify/' + helper + '\n' in runtime_check + '\n', ('missing runtime verification', helper)
+restore_required = source.split('$requiredFiles = [', 1)[1].split('\n\t\t];', 1)[0]
+restore_parity = source.split('$parityFiles = [', 1)[1].split('\n\t\t];', 1)[0]
+for helper in (module / 'bin/sls_mass_notify').glob('*.php'):
+    assert "self::RUNTIME_DIR . '/" + helper.name + "' => false" in restore_required, (
+        'post-restore verification omits PHP helper', helper.name)
+    assert "__DIR__ . '/bin/sls_mass_notify/" + helper.name + "' => self::RUNTIME_DIR . '/" + helper.name + "'" in restore_parity, (
+        'post-restore parity omits PHP helper', helper.name)
 print('Every packaged runtime worker/helper is covered by installer manifests and permission repair.')

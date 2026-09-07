@@ -179,7 +179,7 @@ class AmiClient:
             "Events": "off",
         })
         if response.get("Response", "").lower() != "success":
-            raise RuntimeError(response.get("Message", "AMI login failed"))
+            raise RuntimeError("AMI login failed: " + notify_ami_response_summary(response)["message_category"])
 
     def close(self):
         try:
@@ -283,6 +283,22 @@ def resolve_local_ami_endpoint(ami):
     return "127.0.0.1", port
 
 
+def phone_media_base_url(host, media_scheme, configured_url=""):
+    """Keep the PBX host/path fixed while preserving a configured external port."""
+    authority = host
+    if isinstance(configured_url, str):
+        match = re.fullmatch(
+            r"https?://" + re.escape(host) + r"(?::([0-9]{1,5}))?/sls_mass_notify/?",
+            configured_url,
+            flags=re.IGNORECASE | re.ASCII,
+        )
+        if match and match.group(1):
+            port = int(match.group(1))
+            if 1 <= port <= 65535:
+                authority = f"{host}:{port}"
+    return f"{media_scheme}://{authority}/sls_mass_notify"
+
+
 def load_config():
     config = configparser.ConfigParser(interpolation=None)
     if CENTRAL_SETTINGS_FILE.is_file():
@@ -319,7 +335,7 @@ def load_config():
             "logging": {"log_file": "/var/log/sls_mass_notify_push.log"},
             "visual": {
                 "web_dir": "/var/www/html/sls_mass_notify",
-                "public_base_url": f"{media_scheme}://{host}/sls_mass_notify",
+                "public_base_url": phone_media_base_url(host, media_scheme, sipnotify.get("media_base_url")),
                 "image_width": "480",
                 "image_height": "272",
                 "retry_delays": "",
@@ -1025,7 +1041,7 @@ def get_registered_endpoint_info(ami, allowed_targets=None, format_overrides=Non
     if response.get("Response", "").lower() == "error":
         if ami_response_is_empty_contact_inventory(response):
             return {}
-        raise RuntimeError(response.get("Message", "PJSIPShowContacts failed"))
+        raise RuntimeError("PJSIPShowContacts failed: " + notify_ami_response_summary(response)["message_category"])
     allowed_targets = set(allowed_targets or [])
     format_overrides = format_overrides or {}
     candidate_endpoints = set()
@@ -1240,40 +1256,104 @@ def pjsip_notify_capabilities():
     return capabilities
 
 
+def safe_notify_log_value(value):
+    """Bound log identifiers and hide URI credentials without changing send targets."""
+    value = str(value or "")
+    value = re.sub(r"(?i)((?:sips?:|https?://)[^@\s<>]*?):[^@\s<>]*@", r"\1:[redacted]@", value)
+    value = re.sub(r"(?i)\b(?:basic|bearer)\s+[a-z0-9+/_.~=-]+", "[redacted]", value)
+    value = re.sub(
+        r"(?i)\b(password|passwd|secret|token|api[_-]?key|authorization)(\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+        r"\1\2[redacted]",
+        value,
+    )
+    return re.sub(r"[\x00-\x1f\x7f]", " ", value)[:512]
+
+
+def notify_ami_response_summary(response):
+    """Do not log arbitrary AMI fields, messages, payloads, or credentials."""
+    response_name = str(ami_field(response, "Response") or "").strip().lower()
+    message = str(ami_field(response, "Message") or "").lower()
+    if response_name == "success":
+        category = "request_accepted"
+    elif any(word in message for word in ("permission", "authorization", "authentication", "denied")):
+        category = "authorization_failed"
+    elif "endpoint" in message and any(word in message for word in ("find", "retrieve", "exist", "not found")):
+        category = "endpoint_unavailable"
+    elif response_name == "error":
+        category = "request_rejected"
+    else:
+        category = "no_explicit_success"
+    return {
+        "response": response_name if response_name in {"success", "error"} else "missing_or_unrecognized",
+        "message_category": category,
+    }
+
+
+class NotifySubmissionResult(str):
+    def __new__(cls, message, details):
+        result = super().__new__(cls, message)
+        result.details = details
+        return result
+
+
+class NotifySubmissionError(RuntimeError):
+    def __init__(self, message, details):
+        super().__init__(message)
+        self.details = details
+
+
+class NotifyBatchError(RuntimeError):
+    def __init__(self, message, result):
+        super().__init__(message)
+        self.result = result
+
+
 def send_notify(ami, target, xml_payload, phone_format="yealink", target_field="Endpoint"):
     if target_field not in {"Endpoint", "URI"}:
         raise ValueError("Invalid PJSIPNotify target field")
     content_type = notify_content_type_for_format(phone_format)
-    errors = []
-    successes = []
+    attempts = []
     for event_name in notify_events_for_format(phone_format):
-        response, _ = ami.action({
-            "Action": "PJSIPNotify",
-            target_field: target,
-            "Variable": [
-                f"Event={event_name}",
-                f"Content-Type={content_type}",
-                f"Content={xml_payload}",
-            ],
-        })
-        if response.get("Response", "").lower() == "success":
-            manager_message = response.get("Message", "request accepted")
-            successes.append(f"{event_name}: Asterisk accepted the submission ({manager_message})")
-            break
-        message = response.get("Message", "PJSIPNotify returned no explicit success response")
-        errors.append(f"{event_name}: {message}")
+        try:
+            response, _ = ami.action({
+                "Action": "PJSIPNotify",
+                target_field: target,
+                "Variable": [
+                    f"Event={event_name}",
+                    f"Content-Type={content_type}",
+                    f"Content={xml_payload}",
+                ],
+            })
+        except Exception:
+            attempts.append({"event": event_name, "response": "unavailable", "message_category": "ami_action_error"})
+            # Preserve the existing no-retry-on-transport-error behavior. The
+            # server may have received the action before the connection failed.
+            raise NotifySubmissionError("PJSIPNotify AMI action failed; submission not confirmed", {
+                "status": "failed", "event_attempts": attempts,
+                "event_fallback_outcome": "failed" if len(attempts) > 1 else "not_used",
+            }) from None
+        attempt = {"event": event_name, **notify_ami_response_summary(response)}
+        attempts.append(attempt)
+        if attempt["response"] == "success":
+            details = {
+                "status": "submitted_to_asterisk", "event_attempts": attempts,
+                "event_fallback_outcome": "submitted_to_asterisk" if len(attempts) > 1 else "not_used",
+            }
+            return NotifySubmissionResult(
+                f"{event_name}: Asterisk accepted the submission target={target_field} content_type={content_type}",
+                details,
+            )
         logging.warning(
-            "PJSIPNotify event=%s content_type=%s failed for %s=%s format=%s: %s",
-            event_name,
-            content_type,
-            target_field,
-            target,
-            phone_format,
-            message,
+            "PJSIPNotify event=%s content_type=%s failed for target_field=%s target=%s format=%s ami_response=%s message_category=%s",
+            event_name, content_type, target_field, safe_notify_log_value(target), safe_notify_log_value(phone_format),
+            attempt["response"], attempt["message_category"],
         )
-    if successes:
-        return f"{'; '.join(successes)} target={target_field} content_type={content_type}"
-    raise RuntimeError("; ".join(errors) if errors else "PJSIPNotify failed")
+    raise NotifySubmissionError("PJSIPNotify submission failed: " + "; ".join(
+        f"{attempt['event']}: {attempt['message_category']}" for attempt in attempts
+    ), {
+        "status": "failed", "event_attempts": attempts,
+        "event_fallback_outcome": "failed" if len(attempts) > 1 else "not_used",
+    })
 
 
 def visual_retry_delays(config):
@@ -1499,13 +1579,90 @@ def announcement_api_record(alert_id, message, xml_payload, extensions, desktop_
     }
 
 
-def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_results=False, attempt_label="initial"):
+def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_results=False, attempt_label="initial", unavailable_targets=None, defer_unavailable_failure=False):
+    # Keep the historical integer return (contact coverage of accepted actions)
+    # for callers. It is not a count of handset deliveries. The structured result
+    # reports AMI submissions and independently addressed contacts separately.
     successes = 0
-    failures = []
+    submitted_targets = 0
+    failed_targets = 0
+    submitted_contact_targets = 0
+    failed_contact_targets = 0
+    ami_attempts = 0
+    results = []
+    unavailable_targets = sorted(set(unavailable_targets or []) - set(endpoint_info))
     capabilities = pjsip_notify_capabilities()
+
+    def submit(extension, info, target, phone_format, target_field, requested_formats,
+               requested_route, fallback_reason, resolved_contacts, coverage, unavailable=False):
+        nonlocal successes, submitted_targets, failed_targets
+        nonlocal submitted_contact_targets, failed_contact_targets, ami_attempts
+        record = {
+            "alert_id": safe_notify_log_value(alert_id),
+            "attempt": safe_notify_log_value(attempt_label),
+            "extension": safe_notify_log_value(extension),
+            "requested_formats": [safe_notify_log_value(fmt) for fmt in requested_formats],
+            "format": safe_notify_log_value(phone_format),
+            "requested_route": requested_route,
+            "actual_route": "none" if unavailable else "contact_uri" if target_field == "URI" else "endpoint",
+            "target_field": target_field,
+            "target": safe_notify_log_value(target),
+            "registered_contacts": len(info.get("contacts") or []),
+            "resolved_contact_uris": resolved_contacts,
+            "fallback_reason": fallback_reason,
+            "handset_delivery_confirmed": False,
+        }
+        if unavailable:
+            details = {"status": "failed", "event_attempts": [], "event_fallback_outcome": "not_used"}
+            record["error_category"] = "endpoint_not_registered_or_reachable"
+        else:
+            try:
+                xml_payload = payload_builder(phone_format)
+            except Exception:
+                details = {"status": "failed", "event_attempts": [], "event_fallback_outcome": "not_used"}
+                record["error_category"] = "payload_build_failed"
+                record["actual_route"] = "none"
+                record["target_field"] = None
+            else:
+                try:
+                    result = send_notify(ami, target, xml_payload, phone_format, target_field)
+                    details = result.details
+                except NotifySubmissionError as exc:
+                    details = exc.details
+                except Exception:
+                    # Never expose arbitrary exception text (payloads/secrets).
+                    details = {"status": "failed", "event_attempts": [], "event_fallback_outcome": "not_used"}
+                    record["error_category"] = "notify_action_failed"
+        record.update(details)
+        record["ami_response"] = details["event_attempts"][-1] if details["event_attempts"] else None
+        record["fallback_outcome"] = record["status"] if fallback_reason != "none" else "not_used"
+        ami_attempts += len(details["event_attempts"])
+        if record["status"] == "submitted_to_asterisk":
+            successes += coverage
+            submitted_targets += 1
+            if target_field == "URI":
+                submitted_contact_targets += 1
+        else:
+            failed_targets += 1
+            if target_field == "URI":
+                failed_contact_targets += 1
+        # Log each attempted target, but keep subprocess result output bounded.
+        logging.log(
+            logging.INFO if record["status"] == "submitted_to_asterisk" else logging.ERROR,
+            "SIP_NOTIFY_TARGET %s", json.dumps(record, sort_keys=True),
+        )
+        if len(results) < 1000:
+            results.append(record)
+        if print_results:
+            print(
+                f"{record['extension']}: {record['status']} format={record['format']} "
+                f"requested_route={requested_route} route={record['actual_route']} "
+                f"target_field={record['target_field']} target={record['target']} "
+                f"fallback_outcome={record['fallback_outcome']} ({record['attempt']})"
+            )
+
     for extension, info in sorted(endpoint_info.items()):
         contacts = info.get("contacts") or []
-        user_agent = info.get("user_agent", "")
         contact_targets = []
         seen_contact_targets = set()
         for contact in contacts:
@@ -1514,7 +1671,7 @@ def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_resul
             contact_key = (contact_uri, phone_format)
             if contact_uri and contact_key not in seen_contact_targets:
                 seen_contact_targets.add(contact_key)
-                contact_targets.append((contact_uri, phone_format, contact.get("user_agent", "")))
+                contact_targets.append((contact_uri, phone_format))
 
         contact_formats = sorted({
             contact.get("format") or info.get("format", "yealink")
@@ -1529,136 +1686,84 @@ def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_resul
         )
 
         if mixed_formats and not use_contact_uri:
-            # Endpoint targeting is the portable fallback when Asterisk cannot
-            # address every registration URI independently. A vendor-specific
-            # document could be invalid for another phone family, so submit one
-            # deliberately generic XML document for Asterisk to fan out.
-            try:
-                xml_payload = payload_builder("generic")
-                result = send_notify(ami, extension, xml_payload, "generic", "Endpoint")
-                successes += max(1, len(contacts))
-                logging.warning(
-                    "Submitted generic endpoint-fan-out SIP NOTIFY %s extension=%s mixed_formats=%s "
-                    "contacts=%s attempt=%s route=%s: %s",
-                    alert_id, extension, contact_formats, len(contacts), attempt_label,
-                    capabilities.get("routing_mode", "endpoint_fanout"), result,
-                )
-                if print_results:
-                    print(
-                        f"{extension}: submitted safe generic endpoint fallback for mixed formats "
-                        f"{contact_formats} ({attempt_label})"
-                    )
-            except Exception as exc:
-                failures.append(f"{extension}/generic: mixed-format endpoint fallback: {exc}")
-                logging.error(
-                    "Failed generic mixed-format SIP NOTIFY %s extension=%s formats=%s attempt=%s: %s",
-                    alert_id, extension, contact_formats, attempt_label, exc,
-                )
-                if print_results:
-                    print(f"{extension}: failed safe generic endpoint fallback ({attempt_label}) - {exc}")
+            # Preserve the portable generic endpoint fallback when each vendor's
+            # registration cannot be addressed separately.
+            fallback_reason = (
+                "mixed_formats_incomplete_contact_uris"
+                if not contact_targets or len(contact_targets) != len(contacts)
+                else "mixed_formats_uri_route_unavailable"
+            )
+            submit(extension, info, extension, "generic", "Endpoint", contact_formats,
+                   "contact_uri", fallback_reason, len(contact_targets), max(1, len(contacts)))
             continue
 
         if contact_targets and not use_contact_uri:
-            formats = contact_formats or [info.get("format", "yealink")]
-            for phone_format in formats:
-                try:
-                    xml_payload = payload_builder(phone_format)
-                    result = send_notify(ami, extension, xml_payload, phone_format, "Endpoint")
-                    successes += max(1, len(contact_targets))
-                    logging.info(
-                        "Submitted SIP NOTIFY %s to Asterisk by endpoint fan-out extension=%s contacts=%s format=%s "
-                        "user_agent=%s attempt=%s route=%s: %s",
-                        alert_id,
-                        extension,
-                        len(contact_targets),
-                        phone_format,
-                        user_agent or "unknown",
-                        attempt_label,
-                        capabilities.get("routing_mode", "endpoint_fanout"),
-                        result,
-                    )
-                    if print_results:
-                        print(
-                            f"{extension}: submitted to Asterisk by endpoint fan-out contacts={len(contact_targets)} "
-                            f"format={phone_format} ({attempt_label})"
-                        )
-                except Exception as exc:
-                    failures.append(f"{extension}/{phone_format}: endpoint fan-out: {exc}")
-                    logging.error(
-                        "Failed endpoint-fan-out SIP NOTIFY %s extension=%s format=%s attempt=%s: %s",
-                        alert_id,
-                        extension,
-                        phone_format,
-                        attempt_label,
-                        exc,
-                    )
-                    if print_results:
-                        print(f"{extension}: failed endpoint fan-out format={phone_format} ({attempt_label}) - {exc}")
+            for phone_format in contact_formats or [info.get("format", "yealink")]:
+                submit(extension, info, extension, phone_format, "Endpoint", [phone_format],
+                       "endpoint", "none", len(contact_targets), max(1, len(contact_targets)))
             continue
 
         if contact_targets:
-            format_results = {}
-            for contact_uri, phone_format, contact_user_agent in contact_targets:
-                result_state = format_results.setdefault(phone_format, {"successes": 0, "failures": []})
-                try:
-                    xml_payload = payload_builder(phone_format)
-                    result = send_notify(ami, contact_uri, xml_payload, phone_format, "URI")
-                    result_state["successes"] += 1
-                    successes += 1
-                    logging.info(
-                        "Submitted SIP NOTIFY %s to Asterisk contact %s extension=%s format=%s user_agent=%s attempt=%s: %s",
-                        alert_id,
-                        contact_uri,
-                        extension,
-                        phone_format,
-                        contact_user_agent or user_agent or "unknown",
-                        attempt_label,
-                        result,
-                    )
-                    if print_results:
-                        print(f"{extension}: submitted to Asterisk contact={contact_uri} format={phone_format} ({attempt_label})")
-                except Exception as exc:
-                    result_state["failures"].append((contact_uri, str(exc)))
-
-            for phone_format, result_state in format_results.items():
-                contact_failures = result_state["failures"]
-                if not contact_failures:
-                    continue
-                for contact_uri, error in contact_failures:
-                    failures.append(f"{extension}/{phone_format}/{contact_uri}: {error}")
-                    logging.error(
-                        "Failed SIP NOTIFY %s to contact %s extension=%s format=%s user_agent=%s attempt=%s: %s",
-                        alert_id,
-                        contact_uri,
-                        extension,
-                        phone_format,
-                        user_agent or "unknown",
-                        attempt_label,
-                        error,
-                    )
-                    if print_results:
-                        print(f"{extension}: failed contact={contact_uri} format={phone_format} ({attempt_label}) - {error}")
+            for contact_uri, phone_format in contact_targets:
+                submit(extension, info, contact_uri, phone_format, "URI", [phone_format],
+                       "contact_uri", "none", len(contact_targets), 1)
+            # A URI failure must not trigger endpoint fan-out, which could submit
+            # the wrong vendor format or duplicate contacts already submitted.
             continue
 
-        formats = info.get("formats") or [info.get("format", "yealink")]
-        for phone_format in formats:
-            try:
-                xml_payload = payload_builder(phone_format)
-                result = send_notify(ami, extension, xml_payload, phone_format, "Endpoint")
-                successes += 1
-                logging.info("Submitted SIP NOTIFY %s to Asterisk target %s format=%s user_agent=%s attempt=%s: %s", alert_id, extension, phone_format, user_agent or "unknown", attempt_label, result)
-                if print_results:
-                    print(f"{extension}: submitted to Asterisk format={phone_format} ({attempt_label})")
-            except Exception as exc:
-                failures.append(f"{extension}/{phone_format}: {exc}")
-                logging.error("Failed SIP NOTIFY %s to %s format=%s user_agent=%s attempt=%s: %s", alert_id, extension, phone_format, user_agent or "unknown", attempt_label, exc)
-                if print_results:
-                    print(f"{extension}: failed format={phone_format} ({attempt_label}) - {exc}")
-    if failures:
-        raise RuntimeError(f"SIP NOTIFY submission failed for {len(failures)} target format(s): " + "; ".join(failures))
+        for phone_format in info.get("formats") or [info.get("format", "yealink")]:
+            submit(extension, info, extension, phone_format, "Endpoint", [phone_format],
+                   "endpoint", "none", 0, 1)
+
+    for extension in unavailable_targets:
+        submit(extension, {}, extension, "", None, [], "endpoint", "none", 0, 0, unavailable=True)
+
+    status = (
+        "partial" if submitted_targets and failed_targets else
+        "failed" if failed_targets else
+        "submitted_to_asterisk" if submitted_targets else "no_targets"
+    )
+    summary = {
+        "kind": "sip_notify_batch",
+        "alert_id": safe_notify_log_value(alert_id),
+        "attempt": safe_notify_log_value(attempt_label),
+        "status": status,
+        "submitted_targets": submitted_targets,
+        "failed_targets": failed_targets,
+        "submitted_contact_targets": submitted_contact_targets,
+        "failed_contact_targets": failed_contact_targets,
+        "submitted_endpoint_targets": submitted_targets - submitted_contact_targets,
+        "failed_endpoint_targets": failed_targets - failed_contact_targets,
+        "unavailable_targets": len(unavailable_targets),
+        "ami_attempts": ami_attempts,
+        "handset_delivery_confirmed": False,
+        "targets": results,
+        "targets_truncated": submitted_targets + failed_targets > len(results),
+    }
+    logging.log(
+        logging.ERROR if failed_targets else logging.INFO,
+        "SIP_NOTIFY_RESULT %s", json.dumps(summary, sort_keys=True),
+    )
+    if print_results:
+        print("SLS_NOTIFY_RESULT " + json.dumps(summary, sort_keys=True), flush=True)
+    if failed_targets and (not defer_unavailable_failure or failed_targets > len(unavailable_targets)):
+        label = "partial submission" if submitted_targets else "submission failed"
+        raise NotifyBatchError(
+            f"SIP NOTIFY {label}: submitted_to_asterisk={submitted_targets} failed={failed_targets}; "
+            "handset delivery is not confirmed",
+            summary,
+        )
     if endpoint_info and successes == 0:
-        raise RuntimeError("SIP NOTIFY was not submitted to Asterisk for any requested endpoint")
+        raise NotifyBatchError("SIP NOTIFY was not submitted to Asterisk for any requested endpoint", summary)
     return successes
+
+
+def raise_unavailable_notify_targets(unavailable_targets):
+    if unavailable_targets:
+        raise RuntimeError(
+            "SIP NOTIFY partial submission: requested phone endpoints not registered/reachable="
+            + str(len(unavailable_targets)) + "; handset delivery is not confirmed"
+        )
 
 
 def endpoint_format_summary(endpoint_info):
@@ -1735,7 +1840,10 @@ def push_alert(
             requested = ", ".join(missing_extensions)
             raise RuntimeError(f"Requested phone endpoints are not registered/reachable for SIP NOTIFY: {requested}")
         payload_builder = lambda fmt: primary_xml_payload if fmt == "yealink" else build_phone_xml_for_format(config, fmt, "alert", alert=alert)
-        send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_results, "initial")
+        send_notify_batch(
+            ami, endpoint_info, payload_builder, alert_id, print_results, "initial",
+            unavailable_targets=missing_extensions, defer_unavailable_failure=True,
+        )
         # Manual mixed-channel tests defer publication until every requested
         # phone endpoint resolves and Asterisk accepts the initial batch.
         # Live targeted desktop delivery was already published above and must
@@ -1743,11 +1851,16 @@ def push_alert(
         if api_publish and not desktop_pre_published:
             append_sipnotify_event(config, alert_api_record(alert, primary_xml_payload, extensions, desktop_targets, desktop_all, phone_formats))
         if not retries:
+            raise_unavailable_notify_targets(missing_extensions)
             return
         for delay in visual_retry_delays(config):
             logging.info("Waiting %s seconds before visual alert retry for %s", delay, alert_id)
             time.sleep(delay)
-            send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_results, f"retry+{delay}s")
+            send_notify_batch(
+                ami, endpoint_info, payload_builder, alert_id, print_results, f"retry+{delay}s",
+                unavailable_targets=missing_extensions, defer_unavailable_failure=True,
+            )
+        raise_unavailable_notify_targets(missing_extensions)
 
 
 def push_announcement(config, message, targets, print_results=True, api_publish=True, api_only=False, image=False, title="Announcement", background_color="#1f2937", background_image="", desktop_targets=None, desktop_all=False, timeout_seconds=0):
@@ -1782,10 +1895,15 @@ def push_announcement(config, message, targets, print_results=True, api_publish=
         if targets and not extensions:
             requested = ", ".join(sorted(targets))
             raise RuntimeError(f"No requested phone endpoints are registered/reachable for SIP NOTIFY: {requested}")
+        missing_extensions = sorted(set(targets or []) - set(extensions))
         payload_builder = lambda fmt: xml_payload if fmt == "yealink" else build_phone_xml_for_format(config, fmt, "announcement", message=message, image=image, title=title, background_color=background_color, background_image=background_image, timeout_seconds=timeout_seconds)
-        send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_results, "initial")
+        send_notify_batch(
+            ami, endpoint_info, payload_builder, alert_id, print_results, "initial",
+            unavailable_targets=missing_extensions, defer_unavailable_failure=True,
+        )
         if api_publish and not desktop_pre_published:
             append_sipnotify_event(config, announcement_api_record(alert_id, message, xml_payload, extensions, desktop_targets, desktop_all, phone_formats, title=title, background_color=background_color, image=image, timeout_seconds=timeout_seconds))
+        raise_unavailable_notify_targets(missing_extensions)
         return extensions
 
 

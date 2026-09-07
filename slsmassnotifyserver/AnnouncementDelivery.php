@@ -1,5 +1,8 @@
 <?php
 namespace FreePBX\modules;
+if (!class_exists('SlsAnnouncementJobStore', false)) {
+    require_once __DIR__ . '/bin/sls_mass_notify/sls_announcement_jobs.php';
+}
 
 /** Shared announcement submission and durable, independently reported channels. */
 trait SlsAnnouncementDelivery
@@ -31,46 +34,7 @@ trait SlsAnnouncementDelivery
 
     private function writeAnnouncementJob(array $job)
     {
-        if (!preg_match('/^job_[a-f0-9]{32}$/', (string)($job['id'] ?? ''))) {
-            throw new \RuntimeException('Invalid announcement job identifier.');
-        }
-        $directory = $this->announcementJobDirectory();
-        $temporary = tempnam($directory, '.job-');
-        if ($temporary === false || dirname($temporary) !== $directory) {
-            throw new \RuntimeException('Unable to stage announcement job.');
-        }
-        try {
-            $json = json_encode($job, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
-            if (strlen($json) > 2 * 1024 * 1024) {
-                throw new \RuntimeException('Announcement job exceeds its storage limit.');
-            }
-            if (file_put_contents($temporary, $json . "\n", LOCK_EX) !== strlen($json) + 1) {
-                throw new \RuntimeException('Unable to persist announcement job.');
-            }
-            chmod($temporary, 0640);
-            if (function_exists('posix_geteuid') && posix_geteuid() === 0) {
-                chown($temporary, 'asterisk');
-                chgrp($temporary, 'asterisk');
-            }
-            if (!rename($temporary, $directory . '/' . $job['id'] . '.json')) {
-                throw new \RuntimeException('Unable to commit announcement job.');
-            }
-            $pendingPath = $directory . '/pending_' . $job['id'] . '.mark';
-            if (is_link($pendingPath)) { throw new \RuntimeException('Unsafe announcement queue marker.'); }
-            if (in_array($job['state'] ?? '', ['queued', 'running'], true)) {
-                if (!file_exists($pendingPath)) {
-                    $pendingHandle = fopen($pendingPath, 'x');
-                    if (!$pendingHandle) { throw new \RuntimeException('Unable to index the pending announcement.'); }
-                    fclose($pendingHandle); chmod($pendingPath, 0640);
-                }
-            } elseif (file_exists($pendingPath)) {
-                unlink($pendingPath);
-            }
-        } finally {
-            if (is_file($temporary)) {
-                unlink($temporary);
-            }
-        }
+        (new \SlsAnnouncementJobStore($this->announcementJobDirectory()))->write($job);
     }
 
     public function getAnnouncementJob($id)
@@ -78,24 +42,32 @@ trait SlsAnnouncementDelivery
         if (!is_string($id) || !preg_match('/^job_[a-f0-9]{32}$/', $id)) {
             return ['success' => false, 'state' => 'missing', 'message' => 'Unknown announcement job.'];
         }
-        $path = $this->announcementJobDirectory() . '/' . $id . '.json';
-        if (is_link($path) || !is_file($path) || filesize($path) > 2 * 1024 * 1024) {
+        try {
+            $store = new \SlsAnnouncementJobStore($this->announcementJobDirectory());
+            if (function_exists('posix_geteuid') && posix_geteuid() === fileowner($store->directory())) { $store->reconcile($id); }
+            $job = $store->read($id);
+        } catch (\Throwable $error) {
             return ['success' => false, 'state' => 'missing', 'message' => 'Announcement job is unavailable.'];
         }
-        $job = json_decode((string)file_get_contents($path), true);
         if (!is_array($job)) {
             return ['success' => false, 'state' => 'failed', 'message' => 'Announcement job is unreadable.'];
         }
-        $retryable = ($job['state'] ?? '') === 'partial_or_failed' && empty($job['retry_job_id'])
+        $retryable = in_array($job['state'] ?? '', ['failed', 'partial_or_failed'], true)
+            && empty($job['submission_uncertain']) && empty($job['retry_job_id'])
             && time() - (strtotime($job['created_at'] ?? '') ?: 0) <= 900
             && count(array_filter($job['receipts'] ?? [], static function ($row) { return ($row['state'] ?? '') === 'failed'; })) > 0;
         return array_merge([
-            'success' => in_array($job['state'] ?? '', ['queued', 'running', 'complete'], true),
+            'success' => in_array($job['state'] ?? '', ['queued', 'worker_starting', 'running', 'complete'], true),
             'job_id' => $id, 'state' => $job['state'] ?? 'failed',
             'sender' => $job['request']['sender'] ?? '',
             'created_at' => $job['created_at'] ?? '',
             'message' => $job['message'] ?? 'Announcement queued.',
             'receipts' => $job['receipts'] ?? [],
+            'failure_category' => $job['failure_category'] ?? '',
+            'startup_attempted_at' => $job['startup_attempted_at'] ?? '',
+            'started_at' => $job['started_at'] ?? '',
+            'finished_at' => $job['finished_at'] ?? '',
+            'submission_uncertain' => !empty($job['submission_uncertain']),
             'retryable' => $retryable,
         ], $job['result'] ?? []);
     }
@@ -142,18 +114,41 @@ trait SlsAnnouncementDelivery
             $this->writeAnnouncementJob($job);
             $this->writeAnnouncementJob($child);
             $this->setAnnouncementCooldown();
-            $this->startAnnouncementWorker($child['id']);
-            return ['success' => true, 'queued' => true, 'state' => 'queued', 'job_id' => $child['id'],
-                'message' => $child['message']];
+            if ($this->startAnnouncementWorker($child['id']) === false) { return $this->getAnnouncementJob($child['id']); }
+            return ['success' => true, 'queued' => true, 'state' => 'worker_starting', 'job_id' => $child['id'],
+                'message' => 'Starting announcement worker.'];
         } finally { flock($lock, LOCK_UN); fclose($lock); }
     }
 
     private function startAnnouncementWorker($id)
     {
         if (session_status() === PHP_SESSION_ACTIVE) { session_write_close(); }
-        exec('/usr/bin/nohup /usr/bin/timeout 900 /usr/bin/php '
-            . escapeshellarg(self::RUNTIME_DIR . '/sls_mass_notify_announcement_worker.php')
-            . ' ' . escapeshellarg($id) . ' </dev/null >/dev/null 2>&1 &');
+        $store = new \SlsAnnouncementJobStore($this->announcementJobDirectory());
+        $lock = $store->lock($id); if (!$lock) { return false; }
+        try {
+            $job = $store->read($id);
+            if (!$job || ($job['state'] ?? '') !== 'queued') { return false; }
+            $job['state'] = 'worker_starting'; $job['startup_attempted_at'] = gmdate('c');
+            $job['message'] = 'Starting announcement worker.'; $store->write($job);
+            $worker = self::RUNTIME_DIR . '/sls_mass_notify_announcement_worker.php';
+            foreach (['/usr/bin/nohup', '/usr/bin/timeout', '/usr/bin/php', $worker] as $required) {
+                if (!is_executable($required)) { $store->failure($job, 'worker_start_failed'); return false; }
+            }
+            if (!is_readable(self::RUNTIME_DIR . '/sls_announcement_jobs.php') || !is_callable('exec')) {
+                $store->failure($job, 'worker_start_failed'); return false;
+            }
+            $output = []; $exit = 1;
+            exec('/usr/bin/nohup /usr/bin/timeout --kill-after=5s 930 /usr/bin/php '
+                . escapeshellarg($worker) . ' --supervise ' . escapeshellarg($id)
+                . ' </dev/null >/dev/null 2>&1 & echo $!', $output, $exit);
+            if ($exit !== 0 || !preg_match('/^[1-9][0-9]*$/D', trim(implode('', $output)))) {
+                $store->failure($job, 'worker_start_failed'); return false;
+            }
+            return true;
+        } catch (\Throwable $error) {
+            if (isset($job) && is_array($job)) { $store->failure($job, 'worker_start_failed'); }
+            return false;
+        } finally { \SlsAnnouncementJobStore::unlock($lock); }
     }
 
     private function deliverResolvedAnnouncement(array $request)
@@ -169,6 +164,7 @@ trait SlsAnnouncementDelivery
                 'unavailable_phones' => $request['unavailable_phones'] ?? [], 'devices' => $selectedDevices];
         }
         if (PHP_SAPI !== 'cli') {
+            $this->reconcileAnnouncementJobs();
             // Admission only reads the small pending index, never a month's
             // completed delivery history on an interactive request.
             $pending = count(glob($this->announcementJobDirectory() . '/pending_job_*.mark') ?: []);
@@ -181,8 +177,8 @@ trait SlsAnnouncementDelivery
             $this->setAnnouncementCooldown();
             // Only a generated identifier enters this fixed command. No message,
             // destination, credential, or supplied executable enters a shell.
-            $this->startAnnouncementWorker($job['id']);
-            return ['success' => true, 'queued' => true, 'state' => 'queued', 'job_id' => $job['id'],
+            if ($this->startAnnouncementWorker($job['id']) === false) { return $this->getAnnouncementJob($job['id']); }
+            return ['success' => true, 'queued' => true, 'state' => 'worker_starting', 'job_id' => $job['id'],
                 'message' => 'Announcement queued. Waiting for delivery results.', 'sender' => $request['sender']];
         }
         return $this->executeResolvedAnnouncement($request);
@@ -192,32 +188,31 @@ trait SlsAnnouncementDelivery
     {
         if (PHP_SAPI !== 'cli') { throw new \RuntimeException('Announcement workers require CLI execution.'); }
         if ($requestedId !== '' && !preg_match('/^job_[a-f0-9]{32}$/', $requestedId)) { return false; }
-        $paths = $requestedId !== '' ? [$this->announcementJobDirectory() . '/' . $requestedId . '.json']
-            : array_map(static function ($path) {
-                return dirname($path) . '/' . substr(basename($path), 8, -5) . '.json';
-            }, glob($this->announcementJobDirectory() . '/pending_job_*.mark') ?: []);
-        sort($paths);
-        foreach ($paths as $path) {
-            if (is_link($path) || !is_file($path) || filesize($path) > 2 * 1024 * 1024) { continue; }
-            $lockPath = $path . '.lock';
-            if (is_link($lockPath)) { continue; }
-            $lock = fopen($lockPath, 'c');
-            if (!$lock || !flock($lock, LOCK_EX | LOCK_NB)) { if (is_resource($lock)) { fclose($lock); } continue; }
+        $store = new \SlsAnnouncementJobStore($this->announcementJobDirectory());
+        $ids = $requestedId !== '' ? [$requestedId] : $store->pendingIds(); sort($ids);
+        $allSucceeded = true;
+        foreach ($ids as $id) {
+            $lock = $store->lock($id);
+            if (!$lock) { continue; }
+            $finished = false; $job = null;
+            register_shutdown_function(static function () use (&$finished, &$job, $store, $lock) {
+                if (!$finished && is_array($job) && is_resource($lock) && ($job['state'] ?? '') === 'running') {
+                    try { $store->failure($job, 'worker_runtime_failed', true); } catch (\Throwable $ignored) {}
+                }
+            });
             try {
-                $job = json_decode((string)file_get_contents($path), true);
+                $job = $store->read($id);
                 if (!is_array($job) || !is_array($job['request'] ?? null)) { continue; }
                 if (($job['state'] ?? '') === 'running') {
-                    $job['state'] = 'uncertain';
-                    $job['message'] = 'The delivery worker stopped before confirming its result. Check receipts before sending again.';
-                    $this->writeAnnouncementJob($job);
+                    $store->failure($job, 'worker_runtime_failed', true); $allSucceeded = false;
                     continue;
                 }
-                if (($job['state'] ?? '') !== 'queued') { continue; }
+                if (!in_array($job['state'] ?? '', ['queued', 'worker_starting'], true)) { continue; }
                 if (time() - (strtotime($job['created_at'] ?? '') ?: 0) > 900) {
-                    $job['state'] = 'expired'; $job['message'] = 'Announcement expired before delivery started.';
-                    $this->writeAnnouncementJob($job); continue;
+                    $store->failure($job, 'job_expired'); $allSucceeded = false; continue;
                 }
                 $job['state'] = 'running'; $job['message'] = 'Preparing and submitting selected channels.';
+                $job['started_at'] = gmdate('c');
                 $this->writeAnnouncementJob($job);
                 $progress = function (array $receipts, string $message) use (&$job) {
                     $job['receipts'] = $receipts; $job['message'] = $message;
@@ -225,20 +220,79 @@ trait SlsAnnouncementDelivery
                 };
                 try {
                     $result = $this->executeResolvedAnnouncement($job['request'], $progress);
-                    $job['state'] = !empty($result['success']) ? 'complete' : 'partial_or_failed';
+                    $job['state'] = !empty($result['success']) ? 'complete' : 'failed';
                     $job['result'] = $result; $job['message'] = $result['message'];
+                    if ($job['state'] === 'failed') {
+                        $allSucceeded = false;
+                        $failedChannels = array_unique(array_column(array_filter($job['receipts'] ?? [],
+                            static function ($receipt) { return in_array($receipt['state'] ?? '', ['failed', 'uncertain'], true); }), 'channel'));
+                        $job['failure_category'] = ($result['failure_category'] ?? '') === 'announcement_activity_timeout' ? 'announcement_activity_timeout'
+                            : (count($failedChannels) === 1 && reset($failedChannels) === 'audio' ? 'audio_submission_failed'
+                            : (count($failedChannels) === 1 && reset($failedChannels) === 'sip_notify' ? 'sip_notify_submission_failed' : 'channel_submission_failed'));
+                    }
                 } catch (\Throwable $exception) {
-                    $job['state'] = 'uncertain';
-                    $job['message'] = 'Delivery could not be fully confirmed. Review the recorded channel results.';
-                    error_log('SLS announcement job ' . $job['id'] . ': ' . $exception->getMessage());
+                    $job = $store->failure($job, 'worker_runtime_failed', true); $allSucceeded = false;
                 }
                 $job['finished_at'] = gmdate('c'); $this->writeAnnouncementJob($job);
-            } finally { flock($lock, LOCK_UN); fclose($lock); }
+            } finally { $finished = true; \SlsAnnouncementJobStore::unlock($lock); }
         }
-        return true;
+        return $allSucceeded;
+    }
+
+    public function reconcileAnnouncementJobs()
+    {
+        $store = new \SlsAnnouncementJobStore($this->announcementJobDirectory());
+        foreach ($store->pendingIds() as $id) {
+            try { $store->reconcile($id); }
+            catch (\Throwable $error) { error_log('SLS announcement reconcile: unsafe_job_state'); }
+        }
+    }
+
+    public function getAnnouncementWorkerHealth()
+    {
+        $worker = self::RUNTIME_DIR . '/sls_mass_notify_announcement_worker.php';
+        $result = ['worker_exists' => is_file($worker) && is_readable($worker) && is_executable($worker),
+            'php_cli_exists' => is_executable('/usr/bin/php'), 'storage_writable' => false,
+            'bootstrap_ok' => false, 'probe_fresh' => false, 'latest_state' => 'idle',
+            'failure_category' => '', 'failure_reason' => ''];
+        try {
+            $store = new \SlsAnnouncementJobStore($this->announcementJobDirectory());
+            $result['storage_writable'] = is_readable($store->directory()) && is_writable($store->directory());
+            $probe = $store->health(); $state = $store->state();
+            $result['bootstrap_ok'] = !empty($probe['ok']) && !empty($probe['bootstrap']) && !empty($probe['module_loaded']);
+            $result['probe_fresh'] = time() - (strtotime($probe['checked_at'] ?? '') ?: 0) < 600;
+            $result['latest_state'] = in_array($state['state'] ?? '', ['queued', 'worker_starting', 'running', 'complete', 'failed', 'expired'], true) ? $state['state'] : 'idle';
+            $category = !$result['bootstrap_ok'] ? ($probe['failure_category'] ?? '') : ($state['failure_category'] ?? '');
+            if (isset(\SlsAnnouncementJobStore::REASONS[$category])) {
+                $result['failure_category'] = $category; $result['failure_reason'] = \SlsAnnouncementJobStore::reason($category);
+            }
+        } catch (\Throwable $error) { $result['failure_reason'] = 'Announcement job storage is unavailable or unsafe.'; }
+        $result['ok'] = $result['worker_exists'] && $result['php_cli_exists'] && $result['storage_writable']
+            && $result['bootstrap_ok'] && $result['probe_fresh'];
+        return $result;
     }
 
     private function executeResolvedAnnouncement(array $request, $progress = null)
+    {
+        try {
+            $activity = $this->acquireAnnouncementActivityLock(false, 30);
+        } catch (\Throwable $error) {
+            // No delivery method has run. End this attempt explicitly instead of
+            // replaying an expired/blocked announcement after maintenance ends.
+            return ['success' => false, 'receipts' => [], 'delivery_started' => false,
+                'partial_delivery' => false, 'submission_uncertain' => false,
+                'failure_category' => 'announcement_activity_timeout',
+                'error_code' => 'announcement_activity_timeout',
+                'message' => 'Announcement delivery could not acquire its protected activity lock. No channels were submitted; this request was not replayed.'];
+        }
+        try {
+            return $this->executeResolvedAnnouncementWithActivity($request, $progress);
+        } finally {
+            $this->releaseNativeBackupFileLock($activity);
+        }
+    }
+
+    private function executeResolvedAnnouncementWithActivity(array $request, $progress = null)
     {
         $channelTargets = function ($channel, array $targets) use ($request) {
             if (!isset($request['only_channels'])) { return $targets; }

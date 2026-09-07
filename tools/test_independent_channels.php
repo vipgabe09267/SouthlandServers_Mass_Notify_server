@@ -1,6 +1,6 @@
 <?php
 declare(strict_types=1);
-require_once dirname(__DIR__) . '/slsmassnotifyserver/AnnouncementDelivery.php';
+require_once (getenv('SLS_ANNOUNCEMENT_TRAIT') ?: dirname(__DIR__) . '/slsmassnotifyserver/AnnouncementDelivery.php');
 class TestDelivery {
     use \FreePBX\modules\SlsAnnouncementDelivery;
     public $commands = [];
@@ -13,6 +13,8 @@ class TestDelivery {
     public $currentTargets = ['phones' => ['1000'], 'desktops' => ['gabe'], 'webhooks' => ['hook']];
     private function currentAnnouncementDestinationIds() { return $this->currentTargets; }
     private function startAnnouncementWorker($id) {}
+    private function acquireAnnouncementActivityLock($exclusive = false, $timeoutSeconds = 30) { return null; }
+    private function releaseNativeBackupFileLock($lock) {}
     private function announcementJobDirectory() { return $this->jobDirectory; }
     public function run($request) { return $this->executeResolvedAnnouncement($request); }
     private function sanitizeScheduleText($text, $limit, $single) { return substr($text, 0, $limit); }
@@ -50,7 +52,7 @@ try {
     file_put_contents($path, json_encode(['id'=>$id, 'state'=>'queued', 'created_at'=>gmdate('c'), 'request'=>$request]));
     $fixture->processAnnouncementJobs($id);
     $job = $fixture->getAnnouncementJob($id);
-    if ($job['state'] !== 'partial_or_failed' || count($job['receipts']) !== 4) { throw new RuntimeException('Durable receipts were not persisted'); }
+    if ($job['state'] !== 'failed' || count($job['receipts']) !== 4) { throw new RuntimeException('Durable receipts were not persisted'); }
     if (!$job['retryable']) { throw new RuntimeException('Known audio failure did not offer retry'); }
     $retry = $fixture->retryFailedAnnouncementJob($id, ['sender'=>'Retry operator']);
     if (empty($retry['queued'])) { throw new RuntimeException('Failed destination retry was not queued'); }
@@ -65,7 +67,7 @@ try {
     if (count($fixture->commands) !== $before) { throw new RuntimeException('Completed job was replayed'); }
     file_put_contents($path, json_encode(['id'=>$id, 'state'=>'running', 'created_at'=>gmdate('c'), 'request'=>$request]));
     $fixture->processAnnouncementJobs($id);
-    if ($fixture->getAnnouncementJob($id)['state'] !== 'uncertain' || count($fixture->commands) !== $before) { throw new RuntimeException('Interrupted job was replayed'); }
+    if ($fixture->getAnnouncementJob($id)['state'] !== 'failed' || !$fixture->getAnnouncementJob($id)['submission_uncertain'] || count($fixture->commands) !== $before) { throw new RuntimeException('Interrupted job was replayed'); }
     file_put_contents($path, json_encode(['id'=>$id, 'state'=>'queued', 'created_at'=>gmdate('c', time()-901), 'request'=>$request]));
     $fixture->processAnnouncementJobs($id);
     if ($fixture->getAnnouncementJob($id)['state'] !== 'expired') { throw new RuntimeException('Stale job was delivered'); }

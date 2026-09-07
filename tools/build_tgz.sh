@@ -45,6 +45,12 @@ bash "${ROOT_DIR}/tools/test_local_signer.sh"
 bash "${ROOT_DIR}/tools/test_uninstaller_signer_snapshot.sh"
 php "${ROOT_DIR}/tools/test_scheduling_contract.php"
 php "${ROOT_DIR}/tools/test_announcement_delivery_contract.php"
+php "${ROOT_DIR}/tools/test_protected_config_compatibility.php"
+php "${ROOT_DIR}/tools/test_announcement_activity_lock.php"
+python3 "${ROOT_DIR}/tools/test_announcement_worker_lifecycle.py"
+python3 "${ROOT_DIR}/tools/test_sip_notify_submission_status.py"
+php "${ROOT_DIR}/tools/test_phone_media_url.php"
+python3 "${ROOT_DIR}/tools/test_phone_media_url.py"
 python3 "${ROOT_DIR}/tools/test_announcement_display_timeout.py"
 php "${ROOT_DIR}/tools/test_desktop_announcement_expiry.php"
 php "${ROOT_DIR}/tools/test_email_sender_domain.php"
@@ -58,6 +64,7 @@ python3 "${ROOT_DIR}/tools/test_nws_cross_zone_claims.py"
 php "${ROOT_DIR}/tools/test_configuration_security_contract.php"
 php "${ROOT_DIR}/tools/test_ui_performance_contract.php"
 php "${ROOT_DIR}/tools/test_update_contract.php"
+python3 "${ROOT_DIR}/tools/test_maintenance_failure_propagation.py"
 python3 "${ROOT_DIR}/tools/test_external_delivery_retry.py"
 python3 "${ROOT_DIR}/tools/test_system_notifications.py"
 python3 "${ROOT_DIR}/tools/test_sls_notify_journal.py"
@@ -162,6 +169,7 @@ for required in \
   bin/sls_mass_notify/piper-requirements.txt \
   bin/sls_mass_notify/sls_audio_queue.py bin/sls_mass_notify/sls_storage_maintenance.py \
   bin/sls_mass_notify/sls_weather_queue.py \
+  bin/sls_mass_notify/sls_announcement_jobs.php \
   bin/sls_mass_notify_announcement_worker.php \
   bin/sls_mass_notify/sls_system_notifications.py \
   bin/sls_mass_notify/sls_nws_status.py \

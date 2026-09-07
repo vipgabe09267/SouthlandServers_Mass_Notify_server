@@ -76,6 +76,44 @@ class QueueTests(unittest.TestCase):
         item = feature(); item['properties']['expires'] = iso(time.time()-1)
         self.assertFalse(queue.actionable(item, time.time()))
 
+    def test_fetch_allows_system_dns_failover_with_bounded_deadlines(self):
+        result = mock.Mock(returncode=0, stdout=b'{"type":"FeatureCollection","features":[]}', stderr=b'')
+        with mock.patch.object(queue.subprocess, 'run', return_value=result) as run:
+            self.assertEqual(queue.fetch_zone('TXC491'), [])
+        command = run.call_args.args[0]
+        self.assertGreater(int(command[command.index('--connect-timeout')+1]), 5)
+        self.assertEqual(command[command.index('--max-time')+1], '20')
+        self.assertEqual(run.call_args.kwargs['timeout'], 50)
+        self.assertNotIn('-k', command)
+        self.assertNotIn('--insecure', command)
+        self.assertNotIn('--resolve', command)
+
+    def test_fetch_failures_are_useful_without_leaking_responses(self):
+        for code, stderr, expected in [(6, b'SECRET', 'DNS'),
+            (28, b'curl: (28) Resolving timed out SECRET', 'DNS'),
+            (60, b'SECRET', 'TLS'), (22, b'curl: (22) The requested URL returned error: 503 SECRET', 'HTTP 503'),
+            (28, b'Connection timed out SECRET', 'timed out')]:
+            with mock.patch.object(queue.subprocess, 'run', return_value=mock.Mock(returncode=code, stderr=stderr, stdout=b'SECRET')):
+                with self.assertRaises(queue.WeatherPollError) as error: queue.fetch_zone('TXC491')
+                self.assertIn(expected, str(error.exception)); self.assertNotIn('SECRET', str(error.exception))
+
+    def test_poll_failure_then_recovery_resets_only_api_fault(self):
+        row = ['north','North','TXC491','1000','','','0','21:00','06:00','','']
+        with mock.patch.object(queue, 'groups', return_value={'north': row}), \
+             mock.patch.object(queue, 'fetch_zone', side_effect=queue.WeatherPollError('Weather.gov DNS resolution failed.')):
+            for _ in range(3): queue.observe_nws()
+        status = json.loads((self.directory / 'status.json').read_text())
+        self.assertEqual(status['last_poll_status'], 'fault')
+        self.assertIn('DNS', status['last_poll_message'])
+        self.assertEqual(status['last_poll_fail_count'], 3)
+        with mock.patch.object(queue, 'groups', return_value={'north': row}), \
+             mock.patch.object(queue, 'fetch_zone', return_value=[]):
+            queue.observe_nws()
+        status = json.loads((self.directory / 'status.json').read_text())
+        self.assertEqual(status['last_poll_status'], 'ok')
+        self.assertEqual(status['last_poll_fail_count'], 0)
+        self.assertNotIn('api', status['nws_groups']['north'].get('faults', {}))
+
     def test_symlink_queue_rejected(self):
         target = self.directory / 'outside'; target.write_text('{}')
         (self.directory / 'weather-delivery.json').symlink_to(target)

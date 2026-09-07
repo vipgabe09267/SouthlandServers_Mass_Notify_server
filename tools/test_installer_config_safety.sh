@@ -129,7 +129,7 @@ while IFS=: read -r chown_line _; do
       ;;
   esac
 done < <(grep -nE '^[[:space:]]*(/usr/sbin/)?fwconsole chown' "$maintenance_script")
-maintenance_repair_line="$(grep -nFm1 'repair_runtime_permissions || repair_ok=0' "$maintenance_script" | cut -d: -f1)"
+maintenance_repair_line="$(grep -nFm1 'repair_runtime_permissions || { repair_status=$?; repair_ok=0; }' "$maintenance_script" | cut -d: -f1)"
 maintenance_install_line="$(grep -nFm1 'new $class' "$maintenance_script" | cut -d: -f1)"
 [ -n "$maintenance_repair_line" ] && [ -n "$maintenance_install_line" ] \
   && [ "$maintenance_repair_line" -lt "$maintenance_install_line" ] || {

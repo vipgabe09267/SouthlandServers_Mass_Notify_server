@@ -31,14 +31,27 @@ trait SlsSupportDiagnostics
         // Only these static labels can appear; diagnostic details may contain
         // settings or paths and must never be copied into the downloadable file.
         $labels = ['Central config', 'Central config loader', 'SIP NOTIFY sender', 'NWS poller',
-            'Weather scheduler', 'Weather delivery worker', 'Announcement scheduler', 'Xweather poller',
+            'Weather scheduler', 'Weather delivery worker', 'Announcement scheduler', 'General announcement worker', 'Xweather poller',
             'Branded email sender', 'Branded Discord sender', 'Notification destination dispatcher',
             'System/error email notifier', 'Weather zone status helper', 'Weather cross-zone delivery coordinator',
             'Maintenance worker', 'Piper binary', 'Executable runtime ownership', 'Piper voice',
             'Notification log', 'Desktop journal', 'Local email transport', 'Control API',
             'Storage available', 'External delivery queue', 'Weather delivery queue'];
         try {
-            $checks = $this->getDiagnosticsSummary()['checks'] ?? [];
+            $summary = $this->getDiagnosticsSummary();
+            $checks = $summary['checks'] ?? [];
+            if (is_array($summary['announcement_worker'] ?? null)) {
+                $worker = $summary['announcement_worker'];
+                $safe = [];
+                foreach (['ok', 'worker_exists', 'php_cli_exists', 'storage_writable', 'bootstrap_ok', 'probe_fresh'] as $key) {
+                    $safe[$key] = ($worker[$key] ?? null) === true;
+                }
+                $safe['latest_state'] = in_array($worker['latest_state'] ?? '', ['idle', 'queued', 'worker_starting', 'running', 'complete', 'failed', 'expired'], true) ? $worker['latest_state'] : 'unavailable';
+                $safe['failure_category'] = in_array($worker['failure_category'] ?? '', ['worker_start_failed', 'worker_bootstrap_failed',
+                    'worker_module_load_failed', 'worker_runtime_failed', 'worker_timeout', 'audio_submission_failed',
+                    'sip_notify_submission_failed', 'channel_submission_failed', 'announcement_activity_timeout', 'job_expired'], true) ? $worker['failure_category'] : '';
+                $report['announcement_worker'] = $safe;
+            }
             foreach ($labels as $label) {
                 foreach ($checks as $check) {
                     if (is_array($check) && ($check['label'] ?? '') === _($label)) {

@@ -31,7 +31,8 @@ $maintenanceProgressState = in_array(($maintenanceProgress['state'] ?? 'idle'), 
 $maintenanceMonitorAction = in_array(($maintenance_monitor_action ?? ''), ['repair', 'uninstall', 'config'], true) ? (string)$maintenance_monitor_action : '';
 $maintenanceMonitorActive = $maintenanceMonitorAction !== '';
 $maintenanceProgressBusy = in_array($maintenanceProgressState, ['queued', 'running'], true);
-$packageStatusClass = (($packageStatus['state'] ?? '') === 'update') ? 'label-warning' : 'label-success';
+$packageStatusClass = (($packageStatus['state'] ?? '') === 'error') ? 'label-danger'
+    : ((($packageStatus['state'] ?? '') === 'update') ? 'label-warning' : 'label-success');
 $formatOverrides = [];
 $formatLabels = [
 	'yealink' => _('Yealink - Color'), 'yealink_text' => _('Yealink - Text Only'),
@@ -279,6 +280,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 								<option value="https" <?php echo (($settings['sipnotify']['media_scheme'] ?? 'http') === 'https') ? 'selected' : ''; ?>>HTTPS</option>
 							</select>
 							<p class="help-block"><?php echo _('HTTP is the compatibility default for legacy phones such as the Yealink T48G. Authenticated APIs remain HTTPS.'); ?></p>
+							<p class="help-block" style="overflow-wrap:anywhere;"><?php echo _('Phone image address:'); ?> <span><?php echo htmlspecialchars((string)($settings['sipnotify']['media_base_url'] ?? ''), ENT_QUOTES, 'UTF-8'); ?></span></p>
 						</div>
 					</div>
 					<div class="col-md-6">

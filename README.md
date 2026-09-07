@@ -4,7 +4,7 @@
 
 # Southland Servers Mass Notifications Server
 
-Phone, desktop, weather, lightning, and scheduled notifications for FreePBX 17 / Debian 12. AGPL-3.0-or-later. Version `0.1.2-beta`.
+Phone, desktop, weather, lightning, and scheduled notifications for FreePBX 17 / Debian 12. AGPL-3.0-or-later. Version `0.1.3-beta`.
 
 ## Install or update
 
@@ -13,9 +13,9 @@ Run as `root` on the PBX:
 ```bash
 cd /tmp
 curl -fsSL -o sls-install.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.2-beta/tools/install_release.sh
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.3-beta/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.2-beta/slsmassnotifyserver-0.1.2-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.3-beta/slsmassnotifyserver-0.1.3-beta.tgz' \
 ./sls-install.sh
 ```
 
@@ -44,9 +44,19 @@ To find a Weather.gov zone, open the [NWS Public Zone Maps](https://www.weather.
 
 “Submitted” means the PBX accepted that channel’s work—not that a person heard it, a handset displayed it, or an email arrived. Failed channels do not suppress independent destinations. Retry is available only for confirmed failed announcement destinations; interrupted or uncertain submissions are not automatically replayed.
 
+General announcements run in a background worker. The Dashboard distinguishes queueing, worker startup, running, completion, failure, and expiry. Startup or bootstrap failures retain a specific reason rather than leaving a permanent queued result. **General announcement worker** in diagnostics is separate from the scheduling check. This command checks its bootstrap and job storage without sending notifications:
+
+```bash
+php /usr/local/bin/sls_mass_notify/sls_mass_notify_announcement_worker.php --health-check
+```
+
 Desktop clients use authenticated live SSE at `/api/sipnotify/desktop/stream`. The JSON endpoint remains a compatibility fallback. Reconnecting clients receive eligible retained events, and compatible clients can acknowledge events through the optional ACK endpoint. Connection presence, publication, app acknowledgment, and human receipt are different states. The module cannot make a sleeping app receive immediately.
 
 PJSIP UDP, TCP, and TLS contact syntax is preserved. Vendor payloads are selected per registration where Asterisk supports safe contact routing; otherwise a generic XML endpoint fallback is used. Unknown devices do not block installation, but may ignore generic XML. See [phone compatibility](PHONE_FORMATS.md) for provisioning requirements and limits.
+
+SIP logs identify the route actually used (`endpoint` or `contact_uri`), AMI submission result, and any fallback. Partial registrations or unavailable requested phones are not reported as complete success. For Weather.gov poll faults, check the reported DNS, TLS, or HTTP category; a successful fresh poll clears the API fault without resetting alert history.
+
+For phone images behind port forwarding, `sipnotify.media_base_url` can retain an external port for the configured PBX hostname. **General Settings > Phone Delivery** shows the effective image address. The port stays in that PBX's configuration; it does not change shared defaults, Apache's local listener, or SIP transport. Phones must be able to reach that address and validate its HTTPS certificate.
 
 ## Configuration, backup, and updates
 
@@ -64,6 +74,8 @@ Manual and opt-in automatic updates verify a publisher-signed manifest covering 
 
 Locally signed custom modules may display **Unknown** in FreePBX. Verification must still return trusted status `129`. Dashboard integration is checked and repaired after FreePBX updates; review health after any upgrade or restore.
 
+Update and repair failures retain their command exit status and failure category. Do not treat a queued operation as finished. Existing Lightning strike-type settings are accepted across repair, import, upgrade, and restore; unknown or invalid settings still fail validation. Backups and active configuration changes coordinate with running general announcements rather than replacing their configuration mid-submission.
+
 ## Uninstall
 
 Normal uninstall preserves the central configuration, backups, uploaded tones, and schedule execution history:
@@ -71,7 +83,7 @@ Normal uninstall preserves the central configuration, backups, uploaded tones, a
 ```bash
 cd /tmp
 curl -fsSL -o sls-uninstall.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.2-beta/tools/uninstall_release.sh
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.3-beta/tools/uninstall_release.sh
 chmod +x sls-uninstall.sh
 ./sls-uninstall.sh
 ```
@@ -80,8 +92,8 @@ A complete purge is destructive and requires explicit confirmation. See [INSTALL
 
 ## Documentation and development
 
-[Installation and recovery](INSTALL.md) · [Phone formats](PHONE_FORMATS.md) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md) · [Release notes](RELEASE_NOTES_0.1.2-beta.md)
+[Installation and recovery](INSTALL.md) · [Phone formats](PHONE_FORMATS.md) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md)
 
-Run `./tools/build_tgz.sh` from the repository root to run the release checks and produce `dist/slsmassnotifyserver-0.1.2-beta.tgz`. Signing requires the publisher’s private Ed25519 key outside the repository; `SLS_RELEASE_SIGNING_KEY` selects it. Publish the archive, `release-manifest.json`, and `release-manifest.sig` together. No configuration, credentials, voice models, generated media, logs, or private signing keys belong in the package.
+Run `./tools/build_tgz.sh` from the repository root to run the release checks and produce `dist/slsmassnotifyserver-0.1.3-beta.tgz`. Signing requires the publisher’s private Ed25519 key outside the repository; `SLS_RELEASE_SIGNING_KEY` selects it. Publish the archive, `release-manifest.json`, and `release-manifest.sig` together. No configuration, credentials, voice models, generated media, logs, or private signing keys belong in the package.
 
 [Southland Servers](https://southlandservers.xyz) · [Discord](https://southlandservers.xyz/discord) · [Report an issue](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/issues)

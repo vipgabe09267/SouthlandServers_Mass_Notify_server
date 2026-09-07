@@ -75,6 +75,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 		<li><?php echo _('Custom/local FreePBX module signatures normally show as Unknown. Altered means the module should be signed again on that PBX.'); ?></li>
 		<li><?php echo _('General Settings shows the installed package version and whether the known release status is LATEST or an update is available.'); ?></li>
 		<li><?php echo _('Version 0.1.2-beta adds background announcement jobs with sender attribution and per-channel results, saved local channel checks, per-device format overrides, reliable desktop reconnects with optional app acknowledgments, independent Weather observation and delivery, fresher Lightning state, and signed release verification.'); ?></li>
+		<li><?php echo _('Version 0.1.3-beta adds observable announcement worker startup and failures, a separate worker diagnostic check, protected configuration compatibility fixes, and accurate installer, repair, and SIP submission results. Existing phone payloads and paging behavior are preserved.'); ?></li>
 		<li><?php echo _('Local signing now uses the web account, module root, and GPG home reported by FreePBX. Install, update, repair, and uninstall share a maintenance lock; each candidate signature must return trusted status 129 before it replaces the previous module.sig.'); ?></li>
 		<li><?php echo _('After a Dashboard or Framework upgrade, Repair Installation restores the managed announcement widget and menu placement, rebuilds the stored Dashboard hook index, and verifies that the announcement controls render. Framework 17.0.30 and earlier Framework 17 menu comparator forms are supported.'); ?></li>
 	</ul>
@@ -227,6 +228,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 		<li><code><?php echo htmlspecialchars($settingsPath); ?></code> <?php echo _('central applied configuration file. This JSON .config file is the source of truth for local settings.'); ?></li>
 		<li><code>/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.pending.config</code> <?php echo _('staged settings waiting for Apply Config.'); ?></li>
 		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_weather_poll.sh</code> <?php echo _('one-minute multi-zone NWS and Xweather scheduler.'); ?></li>
+		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_announcement_worker.php --health-check</code> <?php echo _('checks the general announcement worker, FreePBX bootstrap, and protected job storage without sending notifications. Startup, bootstrap, and channel submission failures are reported separately.'); ?></li>
 		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php</code> <?php echo _('one-minute scheduled-announcement worker.'); ?></li>
 		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_nws_poll.sh</code> <?php echo _('single-zone NWS worker launched by the scheduler.'); ?></li>
 		<li><code>/usr/local/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py</code> <?php echo _('optional Xweather lightning worker.'); ?></li>

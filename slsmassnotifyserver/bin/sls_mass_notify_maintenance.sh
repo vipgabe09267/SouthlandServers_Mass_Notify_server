@@ -20,6 +20,62 @@ LOCK_FILE="/run/lock/sls-mass-notify-maintenance.lock"
 MODULE_DIR="/var/www/html/admin/modules/slsmassnotifyserver"
 DASHBOARD_DIR="/var/www/html/admin/modules/dashboard"
 MENU_FILE="/var/www/html/admin/views/menu_items.php"
+ACTIVE_ACTION=""
+FAILURE_RECORDED=0
+
+# Open only a root-owned regular file through trusted directories. Creation is
+# exclusive; an existing file is never truncated or written before fd identity
+# verification. Sticky root-owned /tmp and /run/lock are permitted.
+open_root_owned_file() {
+  local output_variable="$1" protected_path="$2"
+  local protected_identity opened_identity protected_fd
+  protected_identity="$(/usr/bin/python3 - "$protected_path" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+parts = path.split("/")[1:]
+if not path.startswith("/") or not parts or any(part in {"", ".", ".."} for part in parts):
+    raise SystemExit(1)
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+parent = os.open("/", directory_flags)
+try:
+    for component in parts[:-1]:
+        child = os.open(component, directory_flags, dir_fd=parent)
+        os.close(parent)
+        parent = child
+        metadata = os.fstat(parent)
+        if metadata.st_uid != 0 or (metadata.st_mode & 0o022 and not metadata.st_mode & stat.S_ISVTX):
+            raise SystemExit(1)
+    flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        descriptor = os.open(parts[-1], flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent)
+    except FileExistsError:
+        descriptor = os.open(parts[-1], flags, dir_fd=parent)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_nlink != 1 or metadata.st_mode & 0o022:
+            raise SystemExit(1)
+        print(f"{metadata.st_dev}:{metadata.st_ino}")
+    finally:
+        os.close(descriptor)
+finally:
+    os.close(parent)
+PY
+)" || return 1
+  exec {protected_fd}>>"$protected_path" || return 1
+  opened_identity="$(stat -Lc '%d:%i' "/proc/${BASHPID}/fd/$protected_fd" 2>/dev/null)" || opened_identity=""
+  if [ "$opened_identity" != "$protected_identity" ]; then
+    exec {protected_fd}>&-
+    return 1
+  fi
+  chmod 0600 "/proc/${BASHPID}/fd/$protected_fd" || {
+    exec {protected_fd}>&-
+    return 1
+  }
+  printf -v "$output_variable" '%s' "$protected_fd"
+}
 
 log() {
   printf '%s: %s\n' "$(date)" "$*" >> "$LOG_FILE" 2>/dev/null || true
@@ -51,7 +107,7 @@ run_without_maintenance_lock() (
 write_update_progress() {
   local state="$1"
   local message="$2"
-  UPDATE_PROGRESS_FILE="$UPDATE_PROGRESS_FILE" UPDATE_STATE="$state" UPDATE_MESSAGE="$message" /usr/bin/python3 - <<'PY'
+  UPDATE_PROGRESS_FILE="$UPDATE_PROGRESS_FILE" UPDATE_STATE="$state" UPDATE_MESSAGE="$message" UPDATE_ERROR_CATEGORY="${3:-}" UPDATE_EXIT_CODE="${4:-0}" /usr/bin/python3 - <<'PY'
 import json
 import os
 import pwd
@@ -65,6 +121,8 @@ payload = {
     "state": os.environ["UPDATE_STATE"],
     "message": os.environ["UPDATE_MESSAGE"][:300],
     "updated_at": datetime.now(timezone.utc).isoformat(),
+    "error_category": os.environ["UPDATE_ERROR_CATEGORY"],
+    "exit_code": int(os.environ["UPDATE_EXIT_CODE"]),
 }
 fd, temporary = tempfile.mkstemp(prefix=".update-progress.", dir=directory)
 with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -81,7 +139,7 @@ write_maintenance_progress() {
   local action="$1"
   local state="$2"
   local message="$3"
-  MAINTENANCE_PROGRESS_FILE="$MAINTENANCE_PROGRESS_FILE" MAINTENANCE_ACTION="$action" MAINTENANCE_STATE="$state" MAINTENANCE_MESSAGE="$message" /usr/bin/python3 - <<'PY'
+  MAINTENANCE_PROGRESS_FILE="$MAINTENANCE_PROGRESS_FILE" MAINTENANCE_ACTION="$action" MAINTENANCE_STATE="$state" MAINTENANCE_MESSAGE="$message" MAINTENANCE_ERROR_CATEGORY="${4:-}" MAINTENANCE_EXIT_CODE="${5:-0}" /usr/bin/python3 - <<'PY'
 import json
 import os
 import pwd
@@ -96,6 +154,8 @@ payload = {
     "state": os.environ["MAINTENANCE_STATE"],
     "message": os.environ["MAINTENANCE_MESSAGE"][:300],
     "updated_at": datetime.now(timezone.utc).isoformat(),
+    "error_category": os.environ["MAINTENANCE_ERROR_CATEGORY"],
+    "exit_code": int(os.environ["MAINTENANCE_EXIT_CODE"]),
 }
 fd, temporary = tempfile.mkstemp(prefix=".maintenance-progress.", dir=directory)
 with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -106,6 +166,41 @@ account = pwd.getpwnam("asterisk")
 os.chown(temporary, account.pw_uid, account.pw_gid)
 os.replace(temporary, path)
 PY
+}
+
+update_progress_is() {
+  /usr/bin/python3 - "$UPDATE_PROGRESS_FILE" "$1" <<'PY'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        progress = json.load(handle)
+    raise SystemExit(0 if isinstance(progress, dict) and progress.get("state") == sys.argv[2] else 1)
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
+fail_maintenance() {
+  local category="$1" message="$2" status="${3:-1}"
+  FAILURE_RECORDED=1
+  log "Maintenance failed [$category] (exit $status): $message"
+  if [ "$ACTIVE_ACTION" = "update" ]; then
+    # Preserve the child's more specific sanitized category when available.
+    update_progress_is failed || write_update_progress "failed" "$message" "$category" "$status" || true
+  elif [ -n "$ACTIVE_ACTION" ]; then
+    write_maintenance_progress "$ACTIVE_ACTION" "failed" "$message" "$category" "$status" || true
+  fi
+  exit "$status"
+}
+
+finish_maintenance() {
+  local status=$?
+  trap - EXIT
+  if [ "$status" -ne 0 ] && [ "$FAILURE_RECORDED" -ne 1 ] && [ -n "$ACTIVE_ACTION" ]; then
+    fail_maintenance "process_failed" "The maintenance process stopped unexpectedly. Review Notification Logs for details." "$status"
+  fi
+  exit "$status"
 }
 
 write_install_failure() {
@@ -262,14 +357,38 @@ PY
 }
 
 [ "${EUID:-$(id -u)}" -eq 0 ] || exit 1
+trap finish_maintenance EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 MAINTENANCE_LOCK_FD=""
-exec {MAINTENANCE_LOCK_FD}>"$LOCK_FILE"
-chmod 0600 "$LOCK_FILE"
+open_root_owned_file MAINTENANCE_LOCK_FD "$LOCK_FILE" || {
+  log "The protected maintenance lock could not be opened safely."
+  exit 1
+}
 flock -n "$MAINTENANCE_LOCK_FD" || exit 0
-secure_central_config
+if ! secure_central_config; then
+  ACTIVE_ACTION="config"
+  fail_maintenance "protected_config_validation_failed" "The protected central configuration could not be secured. Maintenance was stopped." 2
+fi
 
 # Generated speech and composite audio are short-lived delivery artifacts.
 /usr/bin/python3 "$RUNTIME_DIR/sls_storage_maintenance.py" >> "$LOG_FILE" 2>&1 || log "Storage retention could not complete; existing media was preserved."
+
+# Reconciliation never sends an announcement. Probe worker bootstrap/storage as
+# its service account, so a root-only success cannot mask delivery failures.
+announcement_worker="$RUNTIME_DIR/sls_mass_notify_announcement_worker.php"
+if [ -r "$announcement_worker" ]; then
+  run_without_maintenance_lock /usr/sbin/runuser -u asterisk -- /usr/bin/timeout 30 /usr/bin/php "$announcement_worker" --reconcile >> "$LOG_FILE" 2>&1 \
+    || log "Announcement job reconciliation failed; it will retry later."
+  worker_probe="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/announcement-jobs/worker-probe.json"
+  probe_modified="$(stat -c '%Y' "$worker_probe" 2>/dev/null || printf '0')"
+  [[ "$probe_modified" =~ ^[0-9]+$ ]] || probe_modified=0
+  probe_now="$(date +%s)"
+  if [ "$probe_modified" -gt "$probe_now" ] || [ "$((probe_now - probe_modified))" -ge 300 ]; then
+    run_without_maintenance_lock /usr/sbin/runuser -u asterisk -- /usr/bin/timeout 45 /usr/bin/php "$announcement_worker" --health-check --record-health >> "$LOG_FILE" 2>&1 \
+      || log "Announcement worker health probe failed; inspect the sanitized worker status."
+  fi
+fi
 
 # Dashboard and Framework upgrades can replace the two managed widget files or
 # the menu ordering hook. Detect that drift and restore only those integration
@@ -287,15 +406,20 @@ if [ -r "$MENU_FILE" ] && ! grep -Fq 'SLS Mass Notifications menu placement:' "$
 fi
 if [ "$integration_drift" -eq 1 ]; then
   log "FreePBX update drift detected; restoring Mass Notify dashboard/menu integration"
+  integration_ok=1
   if run_without_maintenance_lock /usr/bin/env SLS_MASS_NOTIFY_DEFER_SIGNING=1 /usr/bin/php -r 'require "/etc/freepbx.conf"; \FreePBX::Create()->Slsmassnotifyserver->repairUpdateSensitiveIntegration(); exit(0);' >> "$LOG_FILE" 2>&1; then
-    run_without_maintenance_lock /usr/sbin/fwconsole chown >> "$LOG_FILE" 2>&1 || true
-    repair_runtime_permissions || log "Unable to restore protected runtime permissions after fwconsole chown"
-    secure_central_config
+    run_without_maintenance_lock /usr/sbin/fwconsole chown >> "$LOG_FILE" 2>&1 || integration_ok=0
+    repair_runtime_permissions || { integration_ok=0; log "Unable to restore protected runtime permissions after fwconsole chown"; }
+    secure_central_config || integration_ok=0
     for module in dashboard framework; do
       [ -d "/var/www/html/admin/modules/$module" ] || continue
-      run_without_maintenance_lock "$SIGNER" "$module" >> "$LOG_FILE" 2>&1 || log "Unable to refresh local signature for $module"
+      run_without_maintenance_lock "$SIGNER" "$module" >> "$LOG_FILE" 2>&1 || { integration_ok=0; log "Unable to refresh local signature for $module"; }
     done
-    log "Mass Notify dashboard/menu integration restored after FreePBX update drift"
+    if [ "$integration_ok" -eq 1 ]; then
+      log "Mass Notify dashboard/menu integration restored after FreePBX update drift"
+    else
+      log "Automatic dashboard/menu integration repair failed; runtime permissions or signatures require attention"
+    fi
   else
     log "Automatic dashboard/menu integration repair failed; it will retry on the next maintenance run"
   fi
@@ -330,26 +454,39 @@ if [ -x "$RUNTIME_DIR/sls_system_notifications.py" ]; then
 fi
 
 if safe_request "$UNINSTALL_REQUEST_FILE" "uninstall"; then
+  ACTIVE_ACTION="uninstall"
   rm -f "$UNINSTALL_REQUEST_FILE"
   log "Starting queued complete uninstall"
   write_maintenance_progress "uninstall" "running" "Removing Mass Notify runtime, FreePBX integration, APIs, logs, and protected configuration."
   if SLS_MASS_NOTIFY_PURGE_CONFIG=1 "$RUNTIME_DIR/sls_mass_notify_uninstall.sh" >> "$LOG_FILE" 2>&1; then
     rm -f "$MAINTENANCE_PROGRESS_FILE"
   else
+    uninstall_status=$?
     log "Queued complete uninstall reported an error"
-    write_maintenance_progress "uninstall" "failed" "Complete uninstall reported an error. Review the PBX console and uninstall log before retrying."
+    fail_maintenance "process_failed" "Complete uninstall reported an error. Review the PBX console and uninstall log before retrying." "$uninstall_status"
   fi
   exit 0
 fi
 
 if safe_request "$UPDATE_REQUEST_FILE" "manual update"; then
+  ACTIVE_ACTION="update"
   rm -f "$UPDATE_REQUEST_FILE"
   log "Starting queued manual update"
   write_update_progress "checking" "Checking the verified release feed."
-  if ! SLS_MASS_NOTIFY_MANUAL_UPDATE=1 /usr/bin/timeout 1800 "$RUNTIME_DIR/sls_mass_notify_update.sh" >> "$LOG_FILE" 2>&1; then
-    write_update_progress "failed" "The update process failed. Review Notification Logs for details."
+  if ! /bin/bash -n "$RUNTIME_DIR/sls_mass_notify_update.sh" >> "$LOG_FILE" 2>&1; then
+    fail_maintenance "update_script_syntax_error" "The installed updater contains a shell syntax error. No updater was executed." 2
   fi
-  log "Queued manual update finished"
+  if SLS_MASS_NOTIFY_MANUAL_UPDATE=1 /usr/bin/timeout 1800 "$RUNTIME_DIR/sls_mass_notify_update.sh" >> "$LOG_FILE" 2>&1; then
+    if ! update_progress_is complete; then
+      fail_maintenance "process_failed" "The update process exited without confirming completion. Review Notification Logs for details."
+    fi
+  else
+    update_status=$?
+    update_category="process_failed"
+    [ "$update_status" -ne 124 ] || update_category="timeout"
+    fail_maintenance "$update_category" "The update process failed. Review Notification Logs for details." "$update_status"
+  fi
+  log "Queued manual update completed successfully"
   exit 0
 fi
 
@@ -368,30 +505,42 @@ fi
 rm -f "$REQUEST_FILE"
 
 log "Starting queued installation repair"
+ACTIVE_ACTION="repair"
 write_maintenance_progress "repair" "running" "Refreshing runtime files, permissions, dialplan, dashboard integration, and local signatures."
+if ! /usr/bin/python3 "$RUNTIME_DIR/sls_config.py" "$CONFIG_FILE" >/dev/null 2>>"$LOG_FILE"; then
+  fail_maintenance "protected_config_validation_failed" "The protected central configuration is invalid or unavailable. Repair was not started." 2
+fi
+# Validate every packaged shell script before the install hook copies it into
+# the active runtime. A broken updater must never be installed by a repair.
+while IFS= read -r -d '' script; do
+  if ! /bin/bash -n "$script" >> "$LOG_FILE" 2>&1; then
+    fail_maintenance "update_script_syntax_error" "A packaged runtime shell script contains a syntax error. Repair was not started." 2
+  fi
+done < <(find "$MODULE_DIR/bin" -type f -name '*.sh' -print0)
 repair_ok=1
+repair_status=0
 # Normalize the managed runtime before the module hook even when Piper is not
 # installed yet; secure runtime-tree validation must never depend on whether a
 # particular optional executable already exists.
-repair_runtime_permissions || repair_ok=0
+repair_runtime_permissions || { repair_status=$?; repair_ok=0; }
 if [ "$repair_ok" -eq 1 ]; then
-run_without_maintenance_lock /usr/bin/env SLS_MASS_NOTIFY_DEFER_SIGNING=1 /usr/bin/php -r 'require "/etc/freepbx.conf"; require_once "/var/www/html/admin/modules/slsmassnotifyserver/Slsmassnotifyserver.class.php"; $class = "\\FreePBX\\modules\\Slsmassnotifyserver"; $obj = new $class(\FreePBX::Create()); $obj->install(); exit(0);' >> "$LOG_FILE" 2>&1 || repair_ok=0
+run_without_maintenance_lock /usr/bin/env SLS_MASS_NOTIFY_DEFER_SIGNING=1 /usr/bin/php -r 'require "/etc/freepbx.conf"; require_once "/var/www/html/admin/modules/slsmassnotifyserver/Slsmassnotifyserver.class.php"; $class = "\\FreePBX\\modules\\Slsmassnotifyserver"; $obj = new $class(\FreePBX::Create()); $obj->install(); exit(0);' >> "$LOG_FILE" 2>&1 || { repair_status=$?; repair_ok=0; }
 fi
 if [ "$repair_ok" -eq 1 ]; then
-  run_without_maintenance_lock /usr/sbin/fwconsole chown >> "$LOG_FILE" 2>&1 || repair_ok=0
-  repair_runtime_permissions || repair_ok=0
+  run_without_maintenance_lock /usr/sbin/fwconsole chown >> "$LOG_FILE" 2>&1 || { repair_status=$?; repair_ok=0; }
+  repair_runtime_permissions || { repair_status=$?; repair_ok=0; }
 fi
 if [ "$repair_ok" -eq 1 ]; then
-  secure_central_config || repair_ok=0
+  secure_central_config || { repair_status=$?; repair_ok=0; }
 fi
 if [ "$repair_ok" -eq 1 ]; then
-  run_without_maintenance_lock /usr/sbin/fwconsole reload >> "$LOG_FILE" 2>&1 || repair_ok=0
-  asterisk -rx "dialplan reload" >> "$LOG_FILE" 2>&1 || repair_ok=0
+  run_without_maintenance_lock /usr/sbin/fwconsole reload >> "$LOG_FILE" 2>&1 || { repair_status=$?; repair_ok=0; }
+  asterisk -rx "dialplan reload" >> "$LOG_FILE" 2>&1 || { repair_status=$?; repair_ok=0; }
 fi
 if [ "$repair_ok" -eq 1 ]; then
   for module in slsmassnotifyserver dashboard framework; do
     [ -d "/var/www/html/admin/modules/$module" ] || continue
-    run_without_maintenance_lock "$SIGNER" "$module" >> "$LOG_FILE" 2>&1 || repair_ok=0
+    run_without_maintenance_lock "$SIGNER" "$module" >> "$LOG_FILE" 2>&1 || { repair_status=$?; repair_ok=0; }
   done
 fi
 if [ "$repair_ok" -eq 1 ]; then
@@ -406,7 +555,7 @@ $class = "\\FreePBX\\modules\\Slsmassnotifyserver";
 $obj = new $class(\FreePBX::Create());
 $obj->verifyProtectedRepairIntegration();
 exit(0);
-' >> "$LOG_FILE" 2>&1 || repair_ok=0
+' >> "$LOG_FILE" 2>&1 || { repair_status=$?; repair_ok=0; }
 fi
 if [ "$repair_ok" -eq 1 ]; then
   log "Queued installation repair completed"
@@ -415,6 +564,5 @@ if [ "$repair_ok" -eq 1 ]; then
 else
   log "Queued installation repair failed"
   write_install_failure "protected repair" "Check the failed dependency, Asterisk capability, local signer, or FreePBX reload step in the maintenance log, correct it, and run Repair Installation again."
-  write_maintenance_progress "repair" "failed" "Installation repair failed. Review Notification Logs before retrying."
-  exit 1
+  fail_maintenance "repair_failed" "Installation repair failed. Review Notification Logs before retrying." "$repair_status"
 fi

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.3-beta
+
+- Fixed hosted phone images behind custom HTTPS port forwarding: settings normalization and SIP image URLs retain the external port saved for that PBX. Shared defaults, local Apache listeners, API URLs, and SIP transports are unchanged.
+
+- Added observable general-announcement worker startup and claims: jobs move through queued, worker_starting, running, and a terminal complete, failed, or expired state. Bootstrap failures, early exits, timeouts, and abandoned jobs no longer remain queued indefinitely.
+- Added a bootstrap-independent job recorder and bounded worker supervision. Failures retain a safe category and channel receipts; uncertain submissions are never automatically replayed. Stale, corrupt, and orphan queue markers cannot block recovery of other jobs.
+- Added a separate general-announcement health check covering PHP CLI, the worker, FreePBX/SLS bootstrap, protected job storage, and latest state. Maintenance refreshes it without sending alerts; the installer verifies it before completion.
+- Added the announcement job recorder to native restore presence and byte-parity checks, so an incomplete runtime cannot pass restore verification.
+- Fixed protected-config and Control API schema drift for Lightning strike_type and all_clear_minutes. Compatibility migration precedes strict validation; valid existing configurations and native backup bytes are preserved. Invalid group flags and unknown announcement-group fields are rejected.
+- Fixed updater, repair, and installer failure propagation. Nonzero command statuses and sanitized failure categories reach progress reports; failed update checks are no longer labeled current. Release and installation checks reject shell syntax errors.
+- Hardened root-run installer log and maintenance-lock opening against symbolic links, hardlinks, and special files. Installation no longer changes permissions on the shared /run/lock directory.
+- Corrected SIP NOTIFY logs to record the actual Endpoint or URI target, requested route, selected format, AMI acceptance, and fallback outcome. Missing targets and partial contact submissions no longer appear fully successful. AMI acceptance is reported as submission, not handset display.
+- Coordinated general-announcement delivery with backup, restore, and active configuration replacement using shared/exclusive activity locks. Independent announcements remain asynchronous; protected changes wait only within a bounded deadline.
+- Added regression coverage for worker bootstrap and shutdown failures, queue recovery, activity locking, configuration compatibility, maintenance exit codes, root file safety, and actual SIP routing. Existing vendor payloads, transport handling, auto-answer rules, and Page/ConfBridge audio behavior are unchanged.
+- Fixed Weather.gov polling when the primary PBX DNS server is unavailable: the connection deadline now allows the configured fallback resolver to respond while retaining bounded retries and TLS verification.
+- Weather-zone health now distinguishes DNS, TLS, HTTP, timeout, and invalid-response failures. A successful poll clears the API fault without resetting alert history or unrelated delivery faults.
+
 ## 0.1.2-beta
 
 - Simplified the Dashboard announcement footer: one Send button, one busy indicator, a separate compact result, and expandable delivery details. Removed Review destinations, suppressed duplicate submits, retained expanded receipts across refreshes, and stopped displaying raw HTTP exception responses.

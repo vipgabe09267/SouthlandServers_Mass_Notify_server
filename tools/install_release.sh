@@ -10,12 +10,12 @@ if [ -n "${SLS_MASS_NOTIFY_MODULE:-}" ] \
     "SLS_MASS_NOTIFY_MODULE is fixed to the FreePBX raw module name '$MODULE'; refusing an alternate value." >&2
   exit 2
 fi
-TGZ="${SLS_MASS_NOTIFY_TGZ:-/tmp/slsmassnotifyserver-0.1.2-beta.tgz}"
+TGZ="${SLS_MASS_NOTIFY_TGZ:-/tmp/slsmassnotifyserver-0.1.3-beta.tgz}"
 URL="${SLS_MASS_NOTIFY_TGZ_URL:-${1:-}}"
 SHA256="${SLS_MASS_NOTIFY_SHA256:-}"
 TOKEN="${SLS_MASS_NOTIFY_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
 LOG_FILE="${SLS_MASS_NOTIFY_INSTALL_LOG:-/tmp/slsmassnotifyserver-install.log}"
-EXPECTED_TGZ_SHA256="c5e7f190f1e109393eed58d753e02958367b4382323ffa6355f2ef3a62e08aea"
+EXPECTED_TGZ_SHA256="c2c55de01068b2863b16a94c05f52d682aa38e8fbb6c538155d7e357a90d6299"
 DATA_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin"
 CONFIG_FILE="$DATA_DIR/mass-notifications.config"
 CONFIG_SNAPSHOT=""
@@ -44,6 +44,62 @@ INSTALL_NOTIFICATION_SIDE_EFFECTS=1
 INSTALL_STAGE="initialization"
 INSTALL_SOLUTION="Review /tmp/slsmassnotifyserver-install.log, correct the reported prerequisite, then run the same installer again."
 INSTALL_FAILURE_FILE="$DATA_DIR/install-failure.json"
+INSTALL_ERROR_CATEGORY="install_command_failed"
+INSTALL_EXIT_CODE=1
+
+# Open only a root-owned regular file through trusted directories. Creation is
+# exclusive; an existing file is never truncated or written before fd identity
+# verification. Sticky root-owned /tmp and /run/lock are permitted.
+open_root_owned_file() {
+  local output_variable="$1" protected_path="$2"
+  local protected_identity opened_identity protected_fd
+  protected_identity="$(/usr/bin/python3 - "$protected_path" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+parts = path.split("/")[1:]
+if not path.startswith("/") or not parts or any(part in {"", ".", ".."} for part in parts):
+    raise SystemExit(1)
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+parent = os.open("/", directory_flags)
+try:
+    for component in parts[:-1]:
+        child = os.open(component, directory_flags, dir_fd=parent)
+        os.close(parent)
+        parent = child
+        metadata = os.fstat(parent)
+        if metadata.st_uid != 0 or (metadata.st_mode & 0o022 and not metadata.st_mode & stat.S_ISVTX):
+            raise SystemExit(1)
+    flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        descriptor = os.open(parts[-1], flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent)
+    except FileExistsError:
+        descriptor = os.open(parts[-1], flags, dir_fd=parent)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_nlink != 1 or metadata.st_mode & 0o022:
+            raise SystemExit(1)
+        print(f"{metadata.st_dev}:{metadata.st_ino}")
+    finally:
+        os.close(descriptor)
+finally:
+    os.close(parent)
+PY
+)" || return 1
+  exec {protected_fd}>>"$protected_path" || return 1
+  opened_identity="$(stat -Lc '%d:%i' "/proc/${BASHPID}/fd/$protected_fd" 2>/dev/null)" || opened_identity=""
+  if [ "$opened_identity" != "$protected_identity" ]; then
+    exec {protected_fd}>&-
+    return 1
+  fi
+  chmod 0600 "/proc/${BASHPID}/fd/$protected_fd" || {
+    exec {protected_fd}>&-
+    return 1
+  }
+  printf -v "$output_variable" '%s' "$protected_fd"
+}
 
 log() {
   printf '%s\n' "$*"
@@ -103,12 +159,14 @@ $payload = [
     "message" => "SLS Mass Notify installation did not complete.",
     "solution" => substr(preg_replace("/[[:cntrl:]]/", " ", (string)$argv[2]), 0, 400),
     "log" => "/tmp/slsmassnotifyserver-install.log",
+    "error_category" => preg_match("/^[a-z][a-z0-9_]{0,63}$/", $argv[4]) ? $argv[4] : "install_command_failed",
+    "exit_code" => max(1, min(255, (int)$argv[5])),
 ];
 $json = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
 if (!is_string($json) || file_put_contents($argv[3], $json . PHP_EOL, LOCK_EX) === false) {
     exit(1);
 }
-' "$INSTALL_STAGE" "$INSTALL_SOLUTION" "$marker_tmp" 2>/dev/null; then
+' "$INSTALL_STAGE" "$INSTALL_SOLUTION" "$marker_tmp" "$INSTALL_ERROR_CATEGORY" "$INSTALL_EXIT_CODE" 2>/dev/null; then
     rm -f "$marker_tmp"
     return 0
   fi
@@ -193,6 +251,7 @@ if (preg_match("/^[a-z0-9.-]+$/", $host)) {
 
 guard_config_on_exit() {
   status=$?
+  INSTALL_EXIT_CODE="$status"
   trap - EXIT
 
   if [ "$status" -ne 0 ] && [ "$SYSTEM_TIMEZONE_CHANGED" -eq 1 ] && [ -n "$ORIGINAL_SYSTEM_TIMEZONE" ]; then
@@ -268,6 +327,7 @@ exit(0);
   fi
 
   if [ "$status" -ne 0 ]; then
+    INSTALL_EXIT_CODE="$status"
     record_install_failure
   fi
 
@@ -510,7 +570,7 @@ acquire_maintenance_coordination() {
     log "Unsafe maintenance lock path."
     exit 1
   }
-  install -d -m 0755 -o root -g root "$(dirname "$lock_file")"
+  mkdir -p "$(dirname "$lock_file")"
   [ ! -L "$lock_file" ] || {
     log "Refusing a symbolic-link maintenance lock: $lock_file"
     exit 1
@@ -531,9 +591,10 @@ acquire_maintenance_coordination() {
     fi
   done
 
-  exec {INSTALL_MAINTENANCE_LOCK_FD}>"$lock_file"
-  chown root:root "$lock_file"
-  chmod 0600 "$lock_file"
+  open_root_owned_file INSTALL_MAINTENANCE_LOCK_FD "$lock_file" || {
+    log "The protected maintenance lock could not be opened safely."
+    exit 1
+  }
   flock -w 120 "$INSTALL_MAINTENANCE_LOCK_FD" || {
     log "Another Mass Notify maintenance or update operation is still running."
     log "Wait for it to finish, then rerun the installer."
@@ -1476,8 +1537,8 @@ verify_tgz() {
   actual_sha="$(sha256sum "$TGZ" | awk '{print $1}')"
   if [ -n "$SHA256" ]; then
     echo "$SHA256  $TGZ" | sha256sum -c -
-  elif [ "$(basename "$TGZ")" = "slsmassnotifyserver-0.1.2-beta.tgz" ] && [ "$actual_sha" != "$EXPECTED_TGZ_SHA256" ]; then
-		log "$TGZ does not match the current slsmassnotifyserver-0.1.2-beta package."
+  elif [ "$(basename "$TGZ")" = "slsmassnotifyserver-0.1.3-beta.tgz" ] && [ "$actual_sha" != "$EXPECTED_TGZ_SHA256" ]; then
+		log "$TGZ does not match the current slsmassnotifyserver-0.1.3-beta package."
     log "Expected SHA256: $EXPECTED_TGZ_SHA256"
     log "Actual SHA256:   $actual_sha"
     log "Remove the stale local TGZ or install with SLS_MASS_NOTIFY_TGZ_URL so the current release is downloaded."
@@ -1527,8 +1588,8 @@ with tarfile.open(archive, "r:gz") as handle:
     root = ET.fromstring(module_xml.read())
     if (root.findtext("rawname") or "").strip() != module:
         raise SystemExit("module.xml rawname does not match the requested module")
-    if (root.findtext("version") or "").strip() != "0.1.2-beta":
-        raise SystemExit("module.xml does not contain the expected 0.1.2-beta version")
+    if (root.findtext("version") or "").strip() != "0.1.3-beta":
+        raise SystemExit("module.xml does not contain the expected 0.1.3-beta version")
 PY
 }
 
@@ -1855,6 +1916,7 @@ $settings = json_decode((string)@file_get_contents($path), true);
 if (!is_array($settings)) {
     exit(1);
 }
+
 $ami = $settings["ami"] ?? null;
 if (!is_array($ami)) {
     exit(2);
@@ -1871,6 +1933,18 @@ exit(0);
 '; then
     log "The preserved central config has invalid JSON or AMI credentials. Restore a valid mass-notifications.config before upgrading; the installer did not alter it."
     exit 1
+  fi
+}
+
+validate_staged_central_config() {
+  [ -n "$CONFIG_HASH_BEFORE" ] || return 0
+  if /usr/bin/python3 "$STAGING_DIR/$MODULE/bin/sls_mass_notify/sls_config.py" "$CONFIG_FILE" >/dev/null 2>>"$LOG_FILE"; then
+    return 0
+  else
+    local config_status=$?
+    INSTALL_ERROR_CATEGORY="protected_config_validation_failed"
+    log "The protected central configuration failed validation against the staged runtime. Module activation was not started."
+    return "$config_status"
   fi
 }
 
@@ -2025,7 +2099,7 @@ $module = getenv("SLS_MASS_NOTIFY_MODULE") ?: "slsmassnotifyserver";
 $stmt = \FreePBX::Database()->prepare("SELECT version FROM modules WHERE modulename = ? LIMIT 1");
 $stmt->execute([$module]);
 $version = $stmt->fetchColumn();
-exit(is_string($version) && trim($version) === "0.1.2-beta" ? 0 : 1);
+exit(is_string($version) && trim($version) === "0.1.3-beta" ? 0 : 1);
 ' >>"$LOG_FILE" 2>&1
 }
 
@@ -2124,6 +2198,28 @@ install_module_with_autoenable() {
 
   log "This fwconsole build requires global options before the module action; retrying compatible --autoenable syntax."
   run_without_install_maintenance_lock fwconsole ma --autoenable install "$MODULE" >>"$LOG_FILE" 2>&1
+}
+
+verify_runtime_shell_syntax() {
+  local runtime_dir="${1:-/usr/local/bin/sls_mass_notify}"
+  local script
+  for script in sls_mass_notify_nws_poll.sh sls_mass_notify_weather_poll.sh \
+    sls_mass_notify_test.sh sls_mass_notify_update.sh sls_mass_notify_maintenance.sh \
+    sls_mass_notify_uninstall.sh sls_mass_notify_install_piper_voices.sh; do
+    if [ ! -x "$runtime_dir/$script" ] || ! /bin/bash -n "$runtime_dir/$script" >>"$LOG_FILE" 2>&1; then
+      INSTALL_ERROR_CATEGORY="update_script_syntax_error"
+      log "Required runtime shell script is missing, not executable, or invalid: $script"
+      return 2
+    fi
+  done
+}
+
+verify_announcement_worker_health() {
+  local runtime_dir="${1:-/usr/local/bin/sls_mass_notify}"
+  /usr/bin/php -l "$runtime_dir/sls_announcement_jobs.php" >>"$LOG_FILE" 2>&1 || return $?
+  /usr/bin/php -l "$runtime_dir/sls_mass_notify_announcement_worker.php" >>"$LOG_FILE" 2>&1 || return $?
+  run_without_install_maintenance_lock /usr/sbin/runuser -u asterisk -- /usr/bin/timeout 45 \
+    /usr/bin/php "$runtime_dir/sls_mass_notify_announcement_worker.php" --health-check >>"$LOG_FILE" 2>&1
 }
 
 ensure_piper_runtime() {
@@ -3078,9 +3174,14 @@ for value in sys.argv[1:]:
     path = pathlib.Path(value)
     compile(path.read_text(encoding="utf-8"), str(path), "exec")
 PY
-  config_dump="$(mktemp /tmp/sls-mass-notify-config-check.XXXXXX)"
-  /usr/local/bin/sls_mass_notify/sls_config.py "$CONFIG_FILE" >"$config_dump"
-  rm -f "$config_dump"
+  if /usr/local/bin/sls_mass_notify/sls_config.py "$CONFIG_FILE" >/dev/null; then
+    :
+  else
+    config_status=$?
+    INSTALL_ERROR_CATEGORY="protected_config_validation_failed"
+    log "The protected central configuration failed validation after runtime integration."
+    exit "$config_status"
+  fi
   [ ! -e "$DATA_DIR/mass-notifications.conf" ] || {
     log "Obsolete executable shell configuration still exists at $DATA_DIR/mass-notifications.conf."
     exit 1
@@ -3313,7 +3414,12 @@ PY
 
 main() {
   cd /tmp
-  : >"$LOG_FILE"
+  INSTALL_LOG_FD=""
+  open_root_owned_file INSTALL_LOG_FD "$LOG_FILE" || {
+    printf 'The installer log could not be opened safely.\n' >&2
+    exit 1
+  }
+  : >"/proc/${BASHPID}/fd/$INSTALL_LOG_FD"
   trap guard_config_on_exit EXIT
   set_install_stage "platform validation" "Confirm this is a healthy FreePBX 17 host with working database, Asterisk, fwconsole, package repositories, and local AMI access, then rerun the installer."
   require_freepbx
@@ -3329,22 +3435,25 @@ main() {
   download_tgz
   verify_tgz
   acquire_settings_coordination
+  INSTALL_ERROR_CATEGORY="protected_config_validation_failed"
   snapshot_config
   validate_preserved_config_prerequisites
+  INSTALL_ERROR_CATEGORY="install_command_failed"
   set_install_stage "module activation" "Run fwconsole ma list and inspect the installer log for the rejected module or signature check, correct that condition, then rerun the installer."
   stage_module_directory
+  validate_staged_central_config
   activate_staged_module
   ensure_local_signer
   # A prior fwconsole chown can make the data-tree Piper compatibility path
   # asterisk-owned. Normalize the exact managed layout before the new module's
   # install hook performs its fail-closed runtime-tree inspection.
   repair_runtime_permissions
-  if ! SLS_MASS_NOTIFY_DEFER_SIGNING=1 install_module_with_autoenable; then
-    if ! module_registered_at_expected_version; then
-		log "FreePBX rejected the module installation before registering version 0.1.2-beta. See $LOG_FILE."
-      exit 1
-    fi
-	log "FreePBX registered version 0.1.2-beta but reported a nonfatal install status; runtime verification will continue."
+  if SLS_MASS_NOTIFY_DEFER_SIGNING=1 install_module_with_autoenable; then
+    :
+  else
+    install_status=$?
+    log "FreePBX module installation failed (exit $install_status). See $LOG_FILE."
+    exit "$install_status"
   fi
   SLS_MASS_NOTIFY_MODULE="$MODULE" sync_module_version
   repair_runtime_permissions
@@ -3367,6 +3476,8 @@ main() {
   repair_runtime_permissions
   asterisk -rx "dialplan reload" || true
   set_install_stage "post-install verification" "Review the failed verification in /tmp/slsmassnotifyserver-install.log, correct that PBX-specific prerequisite, and rerun the installer or Repair Installation."
+  verify_runtime_shell_syntax
+  verify_announcement_worker_health
   verify_piper_voices
   verify_install
   verify_confirmed_system_timezone

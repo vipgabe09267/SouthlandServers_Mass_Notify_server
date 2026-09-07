@@ -140,13 +140,19 @@ def test_mixed_channel_publication_is_atomic():
 
     # Live zone delivery remains best-effort: one temporarily offline phone
     # must not suppress the registered phone or explicitly targeted desktops.
-    notify.push_alert(
-        config,
-        alert_fixture(),
-        targets=["1000", "1001"],
-        desktop_targets=["desk.one"],
-        retries=False,
-    )
+    try:
+        notify.push_alert(
+            config,
+            alert_fixture(),
+            targets=["1000", "1001"],
+            desktop_targets=["desk.one"],
+            retries=False,
+        )
+    except RuntimeError as exc:
+        if "partial submission" not in str(exc):
+            raise
+    else:
+        fail("Best-effort live Weather delivery hid an unavailable requested phone")
     if not batch_state["accepted"] or len(published) != 1:
         fail("Best-effort live Weather delivery did not use its available phone and desktop targets")
     if published[0].get("recipients") != [] or published[0].get("desktop_recipients") != ["desk.one"]:

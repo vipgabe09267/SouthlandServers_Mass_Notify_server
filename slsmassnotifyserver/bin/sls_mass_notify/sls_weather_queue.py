@@ -187,14 +187,41 @@ def groups():
     return {row[0]: row for row in records}
 
 
+class WeatherPollError(RuntimeError):
+    """An operator-safe network failure; never include raw response bodies."""
+
+
 def fetch_zone(zone):
     if not re.fullmatch(r'[A-Z]{2}[CZ][0-9]{3}', zone):
         raise ValueError('Invalid Weather zone')
-    result = subprocess.run(['/usr/bin/curl', '-fsS', '--connect-timeout', '5', '--max-time', '20',
-        '--retry', '1', '--retry-max-time', '45', '--max-filesize', '10485760',
-        '-H', 'Accept: application/geo+json', '-H',
-        'User-Agent: SLS-Mass-Notify/0.1.2-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)',
-        'https://api.weather.gov/alerts/active?zone=' + zone + '&status=actual'], capture_output=True, timeout=50, check=True)
+    # The system resolver commonly waits five seconds before trying its next
+    # configured server. A five-second connection limit can defeat healthy DNS
+    # failover. Keep the overall request/worker deadlines bounded and preserve
+    # the administrator's DNS servers, proxy policy, and TLS verification.
+    try:
+        result = subprocess.run(['/usr/bin/curl', '-fsS', '--connect-timeout', '12', '--max-time', '20',
+            '--retry', '1', '--retry-max-time', '45', '--max-filesize', '10485760',
+            '-H', 'Accept: application/geo+json', '-H',
+            'User-Agent: SLS-Mass-Notify/0.1.3-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)',
+            'https://api.weather.gov/alerts/active?zone=' + zone + '&status=actual'], capture_output=True, timeout=50, check=False)
+    except subprocess.TimeoutExpired:
+        raise WeatherPollError('Weather.gov request exceeded its retry deadline; check PBX DNS and connectivity.') from None
+    if result.returncode:
+        error = (result.stderr or b'').decode('utf-8', errors='replace').lower()
+        if result.returncode in (5, 6) or (result.returncode == 28 and 'resolving timed out' in error):
+            message = 'Weather.gov DNS resolution failed or timed out; check the PBX DNS servers.'
+        elif result.returncode in (35, 51, 58, 60, 77, 83):
+            message = 'Weather.gov TLS verification/connection failed; check PBX time, CA certificates, and HTTPS access.'
+        elif result.returncode == 22:
+            code = re.search(r'returned error:\s*([1-5][0-9]{2})\b', error)
+            message = 'Weather.gov returned ' + ('HTTP ' + code[1] if code else 'an HTTP error') + '; retrying on the next poll.'
+        elif result.returncode == 28:
+            message = 'Weather.gov connection/request timed out; check PBX DNS and connectivity.'
+        elif result.returncode == 63:
+            message = 'Weather.gov response exceeded the permitted size.'
+        else:
+            message = 'Weather.gov request failed (curl code ' + str(int(result.returncode)) + '); check PBX connectivity.'
+        raise WeatherPollError(message)
     return validate_collection(json.loads(result.stdout))
 
 
@@ -202,20 +229,24 @@ def observe_nws():
     configured = groups()
     reconcile_status(DATA / 'status.json', configured)
     outcomes = {}
+    failures = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
         futures = {pool.submit(fetch_zone, zone): zone for zone in {row[2] for row in configured.values()}}
         for future in concurrent.futures.as_completed(futures):
             try:
                 outcomes[futures[future]] = future.result()
-            except Exception:
+            except Exception as error:
                 outcomes[futures[future]] = None
+                failures[futures[future]] = (str(error) if isinstance(error, WeatherPollError) else
+                    'Weather.gov returned invalid JSON or alert data.' if isinstance(error, (ValueError, UnicodeError)) else
+                    'Weather.gov observation could not complete; check the runtime and API connection.')
     now = time.time()
     iso = datetime.now(timezone.utc).isoformat()
     for group_id, row in configured.items():
         features = outcomes.get(row[2])
         if features is None:
             mutate_status(DATA / 'status.json', group_id, row[1], row[2],
-                          {'api_failure': {'at': iso, 'message': 'Weather.gov observation failed; queued alerts require a fresh observation.', 'threshold': 3}})
+                          {'api_failure': {'at': iso, 'message': failures.get(row[2], 'Weather.gov observation failed; queued alerts require a fresh observation.'), 'threshold': 3}})
             continue
         by_chain = {}
         for feature in features:
