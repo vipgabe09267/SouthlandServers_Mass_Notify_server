@@ -4,7 +4,7 @@
 
 # Southland Servers Mass Notifications Server
 
-Phone, desktop, weather, lightning, and scheduled notifications for FreePBX 17 / Debian 12. AGPL-3.0-or-later. Version `0.1.3-beta`.
+Phone, desktop, weather, lightning, and scheduled notifications for FreePBX 17 / Debian 12. AGPL-3.0-or-later. Version `0.1.4-beta`.
 
 ## Install or update
 
@@ -13,13 +13,15 @@ Run as `root` on the PBX:
 ```bash
 cd /tmp
 curl -fsSL -o sls-install.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.3-beta/tools/install_release.sh
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.4-beta/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.3-beta/slsmassnotifyserver-0.1.3-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.4-beta/slsmassnotifyserver-0.1.4-beta.tgz' \
 ./sls-install.sh
 ```
 
 Existing configuration and credentials are preserved. Fresh installations open a setup wizard in FreePBX. Check the displayed system timezone, complete setup under **Mass Notify**, and use FreePBX’s **Apply Config** button when it appears.
+
+An old Asterisk-owned installer log is handled automatically; there is no need to uninstall or disable Linux file protections. If installation still stops, keep `/tmp/slsmassnotifyserver-install.log` and see [installation troubleshooting](INSTALL.md#installer-log-and-runtime-errors).
 
 This is beta software, not a replacement for certified emergency-alert equipment. Test your phones, desktop clients, and external destinations before relying on them. The installer verifies supported PBX capabilities; it cannot enable a handset’s auto-answer or XML push policy.
 
@@ -83,7 +85,7 @@ Normal uninstall preserves the central configuration, backups, uploaded tones, a
 ```bash
 cd /tmp
 curl -fsSL -o sls-uninstall.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.3-beta/tools/uninstall_release.sh
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.4-beta/tools/uninstall_release.sh
 chmod +x sls-uninstall.sh
 ./sls-uninstall.sh
 ```
@@ -94,6 +96,6 @@ A complete purge is destructive and requires explicit confirmation. See [INSTALL
 
 [Installation and recovery](INSTALL.md) · [Phone formats](PHONE_FORMATS.md) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md)
 
-Run `./tools/build_tgz.sh` from the repository root to run the release checks and produce `dist/slsmassnotifyserver-0.1.3-beta.tgz`. Signing requires the publisher’s private Ed25519 key outside the repository; `SLS_RELEASE_SIGNING_KEY` selects it. Publish the archive, `release-manifest.json`, and `release-manifest.sig` together. No configuration, credentials, voice models, generated media, logs, or private signing keys belong in the package.
+Run `./tools/build_tgz.sh` from the repository root to run the release checks and produce `dist/slsmassnotifyserver-0.1.4-beta.tgz`. Signing requires the publisher’s private Ed25519 key outside the repository; `SLS_RELEASE_SIGNING_KEY` selects it. Publish the archive, `release-manifest.json`, and `release-manifest.sig` together. No configuration, credentials, voice models, generated media, logs, or private signing keys belong in the package.
 
 [Southland Servers](https://southlandservers.xyz) · [Discord](https://southlandservers.xyz/discord) · [Report an issue](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/issues)

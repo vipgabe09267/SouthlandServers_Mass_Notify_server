@@ -13,7 +13,7 @@ class Slsmassnotifyserver implements \BMO
 	use SlsAnnouncementDelivery;
 	use SlsTestProfiles;
 	use SlsSupportDiagnostics;
-	const MODULE_VERSION = '0.1.3-beta';
+	const MODULE_VERSION = '0.1.4-beta';
 	const EVENTS_LOG = '/var/log/sls_mass_notify_events.jsonl';
 	const LEGACY_EVENTS_LOG = '/var/log/nws_weather_alert_events.jsonl';
 	const PLUGIN_DATA_DIR = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin';

@@ -24,9 +24,9 @@ Run as `root` on the FreePBX server:
 ```bash
 cd /tmp
 curl -fsSL -o sls-install.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.3-beta/tools/install_release.sh
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.4-beta/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.3-beta/slsmassnotifyserver-0.1.3-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.4-beta/slsmassnotifyserver-0.1.4-beta.tgz' \
 ./sls-install.sh
 ```
 
@@ -34,7 +34,7 @@ The installer prints the PBX operating-system timezone before module activation.
 
 ```bash
 SLS_MASS_NOTIFY_TIMEZONE='America/Chicago' \
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.3-beta/slsmassnotifyserver-0.1.3-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.4-beta/slsmassnotifyserver-0.1.4-beta.tgz' \
 ./sls-install.sh
 ```
 
@@ -47,7 +47,7 @@ The updater resolves a release tag to its commit, verifies the publisher’s Ed2
 For an offline/local package, obtain its SHA-256 through a trusted channel and use the matching version’s installer:
 
 ```bash
-SLS_MASS_NOTIFY_TGZ='/tmp/slsmassnotifyserver-0.1.3-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ='/tmp/slsmassnotifyserver-0.1.4-beta.tgz' \
 SLS_MASS_NOTIFY_SHA256='<trusted 64-character SHA-256>' \
 ./sls-install.sh
 ```
@@ -157,6 +157,16 @@ Executable runtime, including Piper and the automatic updater, is root-owned. Mu
 
 ## FAQ
 
+### Installer log and runtime errors
+
+The installer accepts an existing root- or Asterisk-owned regular log at `/tmp/slsmassnotifyserver-install.log`, secures the verified file, and keeps writing through its open descriptor even if FreePBX changes ownership. It does not disable Linux `protected_regular` or follow links. The uninstaller uses the same safeguards for its two diagnostic logs before removing anything.
+
+On a minimal Debian 12 FreePBX host, missing Python is installed before opening the protected log. That initial package-manager output goes to the terminal. A broken existing interpreter is not replaced automatically. AMI, contact-inventory, and unauthenticated API probes use private temporary directories that are removed after the checks; failures retain their status and diagnostic summary in the installer log.
+
+If a log is refused, inspect it with `stat` and check its parent directories. A symlink, hardlink, special file, or unexpected owner requires administrator review; do not work around this with `chmod 777`, disabled kernel protections, or a complete uninstall. Use a new absolute `SLS_MASS_NOTIFY_INSTALL_LOG` path inside a root-owned, non-writable directory if the old path must be preserved untouched.
+
+For a runtime-integration failure, retain the installer log and the exact missing executable or mismatched file reported. For a Weather test where desktops succeed but the phone channel fails, check the matching `SIP_NOTIFY_TARGET` / `SIP_NOTIFY_RESULT` entries or sender error in `/var/log/sls_mass_notify.log`. The phone and desktop channels are independent; changing SIP transport or disabling TLS is not a general fix for that message.
+
 ### Why is there no terminal wizard?
 
 FreePBX module install hooks are expected to run non-interactively. The setup wizard is shown as a first-run modal when the Dashboard announcement widget or a Mass Notifications page is opened.
@@ -202,7 +212,7 @@ The default uninstall preserves the central config, config backups, uploaded ton
 ```bash
 cd /tmp
 curl -fsSL -o sls-uninstall.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.3-beta/tools/uninstall_release.sh
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.4-beta/tools/uninstall_release.sh
 chmod +x sls-uninstall.sh
 ./sls-uninstall.sh
 ```

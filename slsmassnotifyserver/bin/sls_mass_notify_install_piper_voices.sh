@@ -23,7 +23,7 @@ download_file() {
   tmp="$(mktemp /tmp/sls-piper-voice.XXXXXXXX)" || return 1
   if command -v curl >/dev/null 2>&1; then
     if ! curl -fL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 900 \
-      -A "SouthlandServers-Mass-Notifications-Server/0.1.3-beta" \
+      -A "SouthlandServers-Mass-Notifications-Server/0.1.4-beta" \
       -o "$tmp" "$url"; then
       rm -f "$tmp"
       return 1

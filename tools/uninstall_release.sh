@@ -19,7 +19,107 @@ KEEP_SIGNING_TRUST=0
 RECOVERY_SIGNER_DIR=""
 RECOVERY_SIGNER=""
 UNINSTALL_MAINTENANCE_LOCK_FD=""
-STOCK_RESTORE_LOG="/tmp/slsmassnotifyserver-uninstall-stock-modules.log"
+STOCK_RESTORE_LOG_PATH="/tmp/slsmassnotifyserver-uninstall-stock-modules.log"
+MODULE_UNINSTALL_LOG_PATH="/tmp/slsmassnotifyserver-uninstall-module.log"
+STOCK_RESTORE_LOG="$STOCK_RESTORE_LOG_PATH"
+MODULE_UNINSTALL_LOG="$MODULE_UNINSTALL_LOG_PATH"
+STOCK_RESTORE_LOG_FD=""
+MODULE_UNINSTALL_LOG_FD=""
+
+# Open only a root-owned regular file through trusted directories. Creation is
+# exclusive; an existing file is never truncated or written before fd identity
+# verification. Sticky root-owned /tmp and /run/lock are permitted. Only log
+# callers may adopt a legacy asterisk-owned regular file; locks remain strict.
+open_root_owned_file() {
+  local output_variable="$1" protected_path="$2" file_purpose="${3:-lock}"
+  local protected_identity opened_identity protected_fd
+  protected_identity="$(/usr/bin/python3 - "$protected_path" "$file_purpose" <<'PY'
+import os
+import pwd
+import stat
+import sys
+
+path = sys.argv[1]
+purpose = sys.argv[2]
+if purpose not in {"lock", "log"}:
+    raise SystemExit("Unknown protected file purpose.")
+parts = path.split("/")[1:]
+if not path.startswith("/") or not parts or any(part in {"", ".", ".."} for part in parts):
+    raise SystemExit(1)
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+parent = os.open("/", directory_flags)
+try:
+    for component in parts[:-1]:
+        child = os.open(component, directory_flags, dir_fd=parent)
+        os.close(parent)
+        parent = child
+        metadata = os.fstat(parent)
+        if metadata.st_uid != 0 or (metadata.st_mode & 0o022 and not metadata.st_mode & stat.S_ISVTX):
+            raise SystemExit(1)
+    flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        descriptor = os.open(parts[-1], flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent)
+    except FileExistsError:
+        descriptor = os.open(parts[-1], flags, dir_fd=parent)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise SystemExit("Refusing a linked or non-regular protected file.")
+        if purpose == "log":
+            allowed_owners = {0}
+            try:
+                allowed_owners.add(pwd.getpwnam("asterisk").pw_uid)
+            except KeyError:
+                pass
+            if metadata.st_uid not in allowed_owners:
+                raise SystemExit("Protected logs must be owned by root or the Asterisk service account.")
+            # Old installers/FreePBX chown can leave service-owned logs in
+            # sticky /tmp. O_CREAT would fail even as root on Debian. The
+            # existing file was opened without it; secure this exact inode
+            # before Bash reopens it, without following or replacing links.
+            os.fchown(descriptor, 0, 0)
+            os.fchmod(descriptor, 0o600)
+        elif metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            raise SystemExit(1)
+        current = os.fstat(descriptor)
+        entry = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (entry.st_dev, entry.st_ino) or current.st_nlink != 1 or current.st_uid != 0 or current.st_mode & 0o022:
+            raise SystemExit("Protected file changed while it was being opened.")
+        print(f"{metadata.st_dev}:{metadata.st_ino}")
+    finally:
+        os.close(descriptor)
+finally:
+    os.close(parent)
+PY
+)" || return 1
+  exec {protected_fd}>>"$protected_path" || return 1
+  opened_identity="$(stat -Lc '%d:%i' "/proc/${BASHPID}/fd/$protected_fd" 2>/dev/null)" || opened_identity=""
+  if [ "$opened_identity" != "$protected_identity" ]; then
+    exec {protected_fd}>&-
+    return 1
+  fi
+  chmod 0600 "/proc/${BASHPID}/fd/$protected_fd" || {
+    exec {protected_fd}>&-
+    return 1
+  }
+  printf -v "$output_variable" '%s' "$protected_fd"
+}
+
+prepare_uninstall_logs() {
+  open_root_owned_file MODULE_UNINSTALL_LOG_FD "$MODULE_UNINSTALL_LOG_PATH" log || {
+    log "The uninstall log could not be opened safely: $MODULE_UNINSTALL_LOG_PATH. No uninstall changes were made."
+    return 1
+  }
+  open_root_owned_file STOCK_RESTORE_LOG_FD "$STOCK_RESTORE_LOG_PATH" log || {
+    log "The stock-module restore log could not be opened safely: $STOCK_RESTORE_LOG_PATH. No uninstall changes were made."
+    return 1
+  }
+  # Keep writes attached to the checked inode even if FreePBX changes its
+  # ownership or a log rotation replaces the original pathname during removal.
+  MODULE_UNINSTALL_LOG="/proc/${BASHPID}/fd/$MODULE_UNINSTALL_LOG_FD"
+  STOCK_RESTORE_LOG="/proc/${BASHPID}/fd/$STOCK_RESTORE_LOG_FD"
+  : >"$MODULE_UNINSTALL_LOG"
+}
 
 log() {
   printf '%s\n' "$*"
@@ -64,7 +164,7 @@ acquire_maintenance_coordination() {
     log "Unsafe maintenance lock path."
     return 1
   }
-  install -d -m 0755 -o root -g root "$(dirname "$lock_file")"
+  mkdir -p "$(dirname "$lock_file")"
   [ ! -L "$lock_file" ] || {
     log "Refusing a symbolic-link maintenance lock: $lock_file"
     return 1
@@ -82,9 +182,10 @@ acquire_maintenance_coordination() {
     fi
   done
 
-  exec {UNINSTALL_MAINTENANCE_LOCK_FD}>"$lock_file"
-  chown root:root "$lock_file"
-  chmod 0600 "$lock_file"
+  open_root_owned_file UNINSTALL_MAINTENANCE_LOCK_FD "$lock_file" || {
+    log "The protected maintenance lock could not be opened safely."
+    return 1
+  }
   flock -w 120 "$UNINSTALL_MAINTENANCE_LOCK_FD" || {
     log "Another Mass Notify maintenance, update, repair, or uninstall operation is still running."
     return 1
@@ -179,13 +280,13 @@ exit((int)$statement->fetchColumn() > 0 ? 0 : 1);
 
 remove_module_registration() {
   if module_registry_exists; then
-    if ! run_fwconsole ma uninstall "$MODULE" >/tmp/slsmassnotifyserver-uninstall-module.log 2>&1; then
+    if ! run_fwconsole ma uninstall "$MODULE" >"$MODULE_UNINSTALL_LOG" 2>&1; then
       log "FreePBX reported an error while uninstalling $MODULE; checking whether its registry row was removed."
     fi
   fi
   if module_registry_exists; then
-    run_fwconsole ma disable "$MODULE" >>/tmp/slsmassnotifyserver-uninstall-module.log 2>&1 || true
-    run_fwconsole ma delete "$MODULE" >>/tmp/slsmassnotifyserver-uninstall-module.log 2>&1 || true
+    run_fwconsole ma disable "$MODULE" >>"$MODULE_UNINSTALL_LOG" 2>&1 || true
+    run_fwconsole ma delete "$MODULE" >>"$MODULE_UNINSTALL_LOG" 2>&1 || true
   fi
   if module_registry_exists; then
     log "FreePBX left the $MODULE registry row behind; removing that single stale row before deleting module files."
@@ -969,7 +1070,7 @@ restore_stock_modules() {
 	        log "Warning: the FreePBX repository was unavailable for $stock_module. The cleaned module was locally signed and verified so the FreePBX UI remains usable."
 	        log "When repository access returns, run: fwconsole ma --ignorecache -f downloadinstall $stock_module"
 	      else
-	        log "Unable to restore or locally verify the FreePBX $stock_module module. Details: $STOCK_RESTORE_LOG"
+	        log "Unable to restore or locally verify the FreePBX $stock_module module. Details: $STOCK_RESTORE_LOG_PATH"
 	        return 1
 	      fi
     fi
@@ -1039,6 +1140,7 @@ remove_trusted_signing_key() {
 main() {
   require_freepbx
   acquire_maintenance_coordination
+  prepare_uninstall_logs
   trap restore_user_data_on_exit EXIT
   snapshot_local_signer
   capture_signing_fingerprint

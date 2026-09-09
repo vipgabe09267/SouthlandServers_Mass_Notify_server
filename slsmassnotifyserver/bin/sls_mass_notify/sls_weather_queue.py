@@ -202,7 +202,7 @@ def fetch_zone(zone):
         result = subprocess.run(['/usr/bin/curl', '-fsS', '--connect-timeout', '12', '--max-time', '20',
             '--retry', '1', '--retry-max-time', '45', '--max-filesize', '10485760',
             '-H', 'Accept: application/geo+json', '-H',
-            'User-Agent: SLS-Mass-Notify/0.1.3-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)',
+            'User-Agent: SLS-Mass-Notify/0.1.4-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)',
             'https://api.weather.gov/alerts/active?zone=' + zone + '&status=actual'], capture_output=True, timeout=50, check=False)
     except subprocess.TimeoutExpired:
         raise WeatherPollError('Weather.gov request exceeded its retry deadline; check PBX DNS and connectivity.') from None

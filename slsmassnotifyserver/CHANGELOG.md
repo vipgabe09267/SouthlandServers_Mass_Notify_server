@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.4-beta
+
+- Fixed installer failures caused by old Asterisk-owned logs, including `Permission denied` when running as root. Logging continues through FreePBX ownership changes without disabling Linux file protections.
+- Installed missing Python before the protected log opener needs it on minimal Debian 12 FreePBX hosts. Broken existing interpreters are reported rather than replaced automatically.
+- Moved AMI, contact-inventory, and API checks to private temporary storage, with cleanup after each check.
+- Secured uninstall logs before any removal starts and stopped changing shared lock-directory permissions. Unsafe files and links are still rejected.
+- Made runtime-integration errors identify missing executables or files that differ from the package. Failure notices retain a custom installer-log path when one is supplied.
+- Refreshed the recorded announcement-worker health during final installation checks, preventing an earlier startup failure from remaining on the Dashboard after the worker passes verification.
+- Added regression tests for legacy log ownership, permission changes, unsafe files, missing Python, temporary-file cleanup, and uninstall failure handling. Existing configuration and alert-delivery behavior are unchanged.
+
 ## 0.1.3-beta
 
 - Fixed hosted phone images behind custom HTTPS port forwarding: settings normalization and SIP image URLs retain the external port saved for that PBX. Shared defaults, local Apache listeners, API URLs, and SIP transports are unchanged.

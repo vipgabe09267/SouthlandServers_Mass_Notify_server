@@ -10,12 +10,12 @@ if [ -n "${SLS_MASS_NOTIFY_MODULE:-}" ] \
     "SLS_MASS_NOTIFY_MODULE is fixed to the FreePBX raw module name '$MODULE'; refusing an alternate value." >&2
   exit 2
 fi
-TGZ="${SLS_MASS_NOTIFY_TGZ:-/tmp/slsmassnotifyserver-0.1.3-beta.tgz}"
+TGZ="${SLS_MASS_NOTIFY_TGZ:-/tmp/slsmassnotifyserver-0.1.4-beta.tgz}"
 URL="${SLS_MASS_NOTIFY_TGZ_URL:-${1:-}}"
 SHA256="${SLS_MASS_NOTIFY_SHA256:-}"
 TOKEN="${SLS_MASS_NOTIFY_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
 LOG_FILE="${SLS_MASS_NOTIFY_INSTALL_LOG:-/tmp/slsmassnotifyserver-install.log}"
-EXPECTED_TGZ_SHA256="c2c55de01068b2863b16a94c05f52d682aa38e8fbb6c538155d7e357a90d6299"
+EXPECTED_TGZ_SHA256="63400886ca43cf0235b9a38737151f7a1735b69f55359a10f578616b49f4ccd2"
 DATA_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin"
 CONFIG_FILE="$DATA_DIR/mass-notifications.config"
 CONFIG_SNAPSHOT=""
@@ -47,18 +47,75 @@ INSTALL_FAILURE_FILE="$DATA_DIR/install-failure.json"
 INSTALL_ERROR_CATEGORY="install_command_failed"
 INSTALL_EXIT_CODE=1
 
+# The protected log opener requires Python before the ordinary dependency pass.
+# Bootstrap only that missing package on an identified Debian 12 FreePBX host;
+# no log pathname is opened or written until the safe opener can run.
+ensure_installer_log_prerequisites() {
+  local python_probe='import os, pwd, stat, sys; assert all(hasattr(os, name) for name in ("O_NOFOLLOW", "O_DIRECTORY", "O_CLOEXEC", "O_NONBLOCK")); assert callable(os.fstat)'
+  local platform_id="" platform_version="" platform_key platform_value
+  if [ -x /usr/bin/python3 ]; then
+    if /usr/bin/python3 -I -c "$python_probe" >/dev/null 2>&1; then
+      return 0
+    fi
+    printf 'The existing /usr/bin/python3 cannot load the standard library required for secure installer logging. Repair the system Python installation, then retry; no binary was replaced.\n' >&2
+    return 1
+  fi
+  if [ -e /usr/bin/python3 ] || [ -L /usr/bin/python3 ]; then
+    printf '/usr/bin/python3 exists but is not executable or its link is broken. Repair the system Python installation, then retry; no binary was replaced.\n' >&2
+    return 1
+  fi
+  if [ -r /etc/os-release ]; then
+    while IFS='=' read -r platform_key platform_value; do
+      platform_value="${platform_value#\"}"
+      platform_value="${platform_value%\"}"
+      platform_value="${platform_value#\'}"
+      platform_value="${platform_value%\'}"
+      case "$platform_key" in
+        ID) platform_id="$platform_value" ;;
+        VERSION_ID) platform_version="$platform_value" ;;
+      esac
+    done </etc/os-release
+  fi
+  if [ "$platform_id" != "debian" ] || [ "$platform_version" != "12" ] \
+    || [ ! -x /usr/sbin/fwconsole ] || [ ! -x /usr/sbin/asterisk ] \
+    || [ ! -r /etc/freepbx.conf ] || [ ! -d /var/www/html/admin/modules ] \
+    || [ ! -x /usr/bin/apt-get ]; then
+    printf 'Python 3 is required for secure installer logging. Automatic bootstrap requires a recognized Debian 12 FreePBX host and apt-get; no packages were changed.\n' >&2
+    return 1
+  fi
+  printf 'Installing missing Python 3 for secure installer logging. Package-manager output follows on this console.\n'
+  if ! DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get update; then
+    printf 'Unable to refresh Debian package metadata for the missing Python prerequisite. Correct repository access, then retry.\n' >&2
+    return 1
+  fi
+  APT_METADATA_REFRESHED=1
+  if ! DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y --no-install-recommends --no-remove python3; then
+    printf 'Unable to install the missing Python prerequisite. Review the package-manager error above, then retry.\n' >&2
+    return 1
+  fi
+  if [ ! -x /usr/bin/python3 ] || ! /usr/bin/python3 -I -c "$python_probe" >/dev/null 2>&1; then
+    printf 'Python installation returned but its executable or required standard library is unavailable. Repair the system Python installation before retrying.\n' >&2
+    return 1
+  fi
+}
+
 # Open only a root-owned regular file through trusted directories. Creation is
 # exclusive; an existing file is never truncated or written before fd identity
-# verification. Sticky root-owned /tmp and /run/lock are permitted.
+# verification. Sticky root-owned /tmp and /run/lock are permitted. Only log
+# callers may adopt a legacy asterisk-owned regular file; locks remain strict.
 open_root_owned_file() {
-  local output_variable="$1" protected_path="$2"
+  local output_variable="$1" protected_path="$2" file_purpose="${3:-lock}"
   local protected_identity opened_identity protected_fd
-  protected_identity="$(/usr/bin/python3 - "$protected_path" <<'PY'
+  protected_identity="$(/usr/bin/python3 - "$protected_path" "$file_purpose" <<'PY'
 import os
+import pwd
 import stat
 import sys
 
 path = sys.argv[1]
+purpose = sys.argv[2]
+if purpose not in {"lock", "log"}:
+    raise SystemExit("Unknown protected file purpose.")
 parts = path.split("/")[1:]
 if not path.startswith("/") or not parts or any(part in {"", ".", ".."} for part in parts):
     raise SystemExit(1)
@@ -79,8 +136,28 @@ try:
         descriptor = os.open(parts[-1], flags, dir_fd=parent)
     try:
         metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_nlink != 1 or metadata.st_mode & 0o022:
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise SystemExit("Refusing a linked or non-regular protected file.")
+        if purpose == "log":
+            allowed_owners = {0}
+            try:
+                allowed_owners.add(pwd.getpwnam("asterisk").pw_uid)
+            except KeyError:
+                pass
+            if metadata.st_uid not in allowed_owners:
+                raise SystemExit("Protected logs must be owned by root or the Asterisk service account.")
+            # Old installers/FreePBX chown can leave service-owned logs in
+            # sticky /tmp. O_CREAT would fail even as root on Debian. The
+            # existing file was opened without it; secure this exact inode
+            # before Bash reopens it, without following or replacing links.
+            os.fchown(descriptor, 0, 0)
+            os.fchmod(descriptor, 0o600)
+        elif metadata.st_uid != 0 or metadata.st_mode & 0o022:
             raise SystemExit(1)
+        current = os.fstat(descriptor)
+        entry = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (entry.st_dev, entry.st_ino) or current.st_nlink != 1 or current.st_uid != 0 or current.st_mode & 0o022:
+            raise SystemExit("Protected file changed while it was being opened.")
         print(f"{metadata.st_dev}:{metadata.st_ino}")
     finally:
         os.close(descriptor)
@@ -158,7 +235,7 @@ $payload = [
     "stage" => substr(preg_replace("/[^A-Za-z0-9 ._\/-]/", "", (string)$argv[1]), 0, 80),
     "message" => "SLS Mass Notify installation did not complete.",
     "solution" => substr(preg_replace("/[[:cntrl:]]/", " ", (string)$argv[2]), 0, 400),
-    "log" => "/tmp/slsmassnotifyserver-install.log",
+    "log" => substr(preg_replace("/[[:cntrl:]]/", "", (string)$argv[6]), 0, 500),
     "error_category" => preg_match("/^[a-z][a-z0-9_]{0,63}$/", $argv[4]) ? $argv[4] : "install_command_failed",
     "exit_code" => max(1, min(255, (int)$argv[5])),
 ];
@@ -166,7 +243,7 @@ $json = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
 if (!is_string($json) || file_put_contents($argv[3], $json . PHP_EOL, LOCK_EX) === false) {
     exit(1);
 }
-' "$INSTALL_STAGE" "$INSTALL_SOLUTION" "$marker_tmp" "$INSTALL_ERROR_CATEGORY" "$INSTALL_EXIT_CODE" 2>/dev/null; then
+' "$INSTALL_STAGE" "$INSTALL_SOLUTION" "$marker_tmp" "$INSTALL_ERROR_CATEGORY" "$INSTALL_EXIT_CODE" "$LOG_FILE" 2>/dev/null; then
     rm -f "$marker_tmp"
     return 0
   fi
@@ -178,7 +255,7 @@ if (!is_string($json) || file_put_contents($argv[3], $json . PHP_EOL, LOCK_EX) =
   [ "${INSTALL_NOTIFICATION_SIDE_EFFECTS:-1}" -eq 1 ] || return 0
   /usr/bin/php -r '
 require "/etc/freepbx.conf";
-$detail = "Stage: " . $argv[1] . ". " . $argv[2] . " Installer log: /tmp/slsmassnotifyserver-install.log";
+$detail = "Stage: " . $argv[1] . ". " . $argv[2] . " Installer log: " . htmlspecialchars($argv[3], ENT_QUOTES, "UTF-8");
 \FreePBX::Notifications()->add_error(
     "slsmassnotifyserver",
     "INSTALLFAILED",
@@ -189,7 +266,7 @@ $detail = "Stage: " . $argv[1] . ". " . $argv[2] . " Installer log: /tmp/slsmass
     true
 );
 exit(0);
-' "$INSTALL_STAGE" "$INSTALL_SOLUTION" >/dev/null 2>&1 || true
+' "$INSTALL_STAGE" "$INSTALL_SOLUTION" "$LOG_FILE" >/dev/null 2>&1 || true
 }
 
 clear_install_failure() {
@@ -548,7 +625,7 @@ if ($managerPort < 1 || $managerPort > 65535) {
     exit(1);
 }
 exit(0);
-' >>"$LOG_FILE" 2>&1 || {
+' >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || {
     log "FreePBX bootstrap or database access failed. See $LOG_FILE."
     exit 1
   }
@@ -628,7 +705,7 @@ ensure_freepbx_prerequisites() {
   for prerequisite in framework dashboard backup recordings; do
     if ! printf '%s\n' "$module_list" | grep -Eq "\\|[[:space:]]*${prerequisite}[[:space:]]*\\|"; then
       log "Installing required FreePBX module: $prerequisite"
-      fwconsole ma --no-interaction --ignorecache downloadinstall "$prerequisite" >>"$LOG_FILE" 2>&1 || {
+      fwconsole ma --no-interaction --ignorecache downloadinstall "$prerequisite" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || {
         log "Required FreePBX module could not be installed: $prerequisite. See $LOG_FILE."
         exit 1
       }
@@ -636,7 +713,7 @@ ensure_freepbx_prerequisites() {
     module_list="$(fwconsole ma list 2>/dev/null)"
     if ! printf '%s\n' "$module_list" | grep -Eq "\\|[[:space:]]*${prerequisite}[[:space:]]*\\|[^|]*\\|[[:space:]]*Enabled[[:space:]]*\\|"; then
       log "Enabling required FreePBX module: $prerequisite"
-      fwconsole ma --no-interaction enable "$prerequisite" >>"$LOG_FILE" 2>&1 || {
+      fwconsole ma --no-interaction enable "$prerequisite" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || {
         log "Required FreePBX module could not be enabled without an administrator-managed upgrade: $prerequisite. See $LOG_FILE."
         exit 1
       }
@@ -725,7 +802,7 @@ refresh_apt_metadata() {
   fi
   command -v apt-get >/dev/null 2>&1 || return 1
   log "Refreshing Debian package metadata for dependency verification."
-  apt-get update >>"$LOG_FILE" 2>&1 || return 1
+  apt-get update >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || return 1
   APT_METADATA_REFRESHED=1
 }
 
@@ -763,7 +840,7 @@ asterisk_provider_package() {
 wait_for_asterisk_cli() {
   local attempt=1
   while [ "$attempt" -le 30 ]; do
-    if asterisk -rx "core show version" >>"$LOG_FILE" 2>&1; then
+    if asterisk -rx "core show version" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1; then
       return 0
     fi
     sleep 1
@@ -787,7 +864,7 @@ repair_asterisk_provider_package() {
       return 1
     }
   done
-  if ! asterisk -rx "core show version" >>"$LOG_FILE" 2>&1; then
+  if ! asterisk -rx "core show version" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1; then
     log "Asterisk is not reachable; refusing to start or alter its packages automatically."
     return 1
   fi
@@ -832,7 +909,7 @@ repair_asterisk_provider_package() {
 
   log "Repairing $provider_module from the exact installed Asterisk package $package_spec."
   DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall --no-install-recommends --no-remove \
-    "$package_spec" >>"$LOG_FILE" 2>&1 || {
+    "$package_spec" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || {
       log "Exact-version Asterisk package repair failed for $package_spec. See $LOG_FILE."
       log "Restore that exact package version or its matching repository before rerunning the installer."
       return 1
@@ -843,7 +920,7 @@ repair_asterisk_provider_package() {
   }
   if ! wait_for_asterisk_cli; then
     log "Asterisk stopped during package repair; attempting a normal FreePBX start."
-    fwconsole start >>"$LOG_FILE" 2>&1 || {
+    fwconsole start >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || {
       log "FreePBX could not start Asterisk after package repair. See $LOG_FILE."
       return 1
     }
@@ -892,10 +969,10 @@ ensure_asterisk_module_loaded() {
     return 0
   fi
   log "Loading required Asterisk module $module_name."
-  asterisk -rx "module load $module_name" >>"$LOG_FILE" 2>&1 || true
+  asterisk -rx "module load $module_name" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || true
   if ! asterisk_module_loaded "$module_name" \
     && repair_asterisk_provider_package "$module_name"; then
-    asterisk -rx "module load $module_name" >>"$LOG_FILE" 2>&1 || true
+    asterisk -rx "module load $module_name" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || true
   fi
   asterisk_module_loaded "$module_name" || {
     log "Required Asterisk module is unavailable after adaptive repair: $module_name. See $LOG_FILE."
@@ -914,15 +991,15 @@ ensure_asterisk_capability() {
   fi
 
   log "Asterisk $capability_type $capability_name is not registered; loading $provider_module."
-  asterisk -rx "module load $provider_module" >>"$LOG_FILE" 2>&1 || true
+  asterisk -rx "module load $provider_module" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || true
   if ! asterisk_capability_available "$capability_type" "$capability_name"; then
-    asterisk -rx "module reload $provider_module" >>"$LOG_FILE" 2>&1 || true
+    asterisk -rx "module reload $provider_module" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || true
   fi
   if ! asterisk_capability_available "$capability_type" "$capability_name" \
     && repair_asterisk_provider_package "$provider_module"; then
-    asterisk -rx "module load $provider_module" >>"$LOG_FILE" 2>&1 || true
+    asterisk -rx "module load $provider_module" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || true
     if ! asterisk_capability_available "$capability_type" "$capability_name"; then
-      asterisk -rx "module reload $provider_module" >>"$LOG_FILE" 2>&1 || true
+      asterisk -rx "module reload $provider_module" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || true
     fi
   fi
   if ! asterisk_capability_available "$capability_type" "$capability_name"; then
@@ -1283,7 +1360,7 @@ PHP
       exit 1
     }
   done
-  /usr/sbin/apache2ctl configtest >>"$LOG_FILE" 2>&1 || {
+  /usr/sbin/apache2ctl configtest >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || {
     log "Apache configuration validation failed before installation. See $LOG_FILE."
     exit 1
   }
@@ -1302,7 +1379,7 @@ PHP
       exit 1
     }
   done
-  asterisk -rx "core show version" >>"$LOG_FILE" 2>&1 || {
+  asterisk -rx "core show version" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || {
     log "The Asterisk control socket is unavailable. Start Asterisk before installing."
     exit 1
   }
@@ -1537,8 +1614,8 @@ verify_tgz() {
   actual_sha="$(sha256sum "$TGZ" | awk '{print $1}')"
   if [ -n "$SHA256" ]; then
     echo "$SHA256  $TGZ" | sha256sum -c -
-  elif [ "$(basename "$TGZ")" = "slsmassnotifyserver-0.1.3-beta.tgz" ] && [ "$actual_sha" != "$EXPECTED_TGZ_SHA256" ]; then
-		log "$TGZ does not match the current slsmassnotifyserver-0.1.3-beta package."
+  elif [ "$(basename "$TGZ")" = "slsmassnotifyserver-0.1.4-beta.tgz" ] && [ "$actual_sha" != "$EXPECTED_TGZ_SHA256" ]; then
+		log "$TGZ does not match the current slsmassnotifyserver-0.1.4-beta package."
     log "Expected SHA256: $EXPECTED_TGZ_SHA256"
     log "Actual SHA256:   $actual_sha"
     log "Remove the stale local TGZ or install with SLS_MASS_NOTIFY_TGZ_URL so the current release is downloaded."
@@ -1588,8 +1665,8 @@ with tarfile.open(archive, "r:gz") as handle:
     root = ET.fromstring(module_xml.read())
     if (root.findtext("rawname") or "").strip() != module:
         raise SystemExit("module.xml rawname does not match the requested module")
-    if (root.findtext("version") or "").strip() != "0.1.3-beta":
-        raise SystemExit("module.xml does not contain the expected 0.1.3-beta version")
+    if (root.findtext("version") or "").strip() != "0.1.4-beta":
+        raise SystemExit("module.xml does not contain the expected 0.1.4-beta version")
 PY
 }
 
@@ -1938,7 +2015,7 @@ exit(0);
 
 validate_staged_central_config() {
   [ -n "$CONFIG_HASH_BEFORE" ] || return 0
-  if /usr/bin/python3 "$STAGING_DIR/$MODULE/bin/sls_mass_notify/sls_config.py" "$CONFIG_FILE" >/dev/null 2>>"$LOG_FILE"; then
+  if /usr/bin/python3 "$STAGING_DIR/$MODULE/bin/sls_mass_notify/sls_config.py" "$CONFIG_FILE" >/dev/null 2>>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}"; then
     return 0
   else
     local config_status=$?
@@ -2089,7 +2166,7 @@ $db = \FreePBX::Database();
 $stmt = $db->prepare("UPDATE modules SET version = ? WHERE modulename = ?");
 $stmt->execute([$version, $module]);
 exit(0);
-' >>"$LOG_FILE" 2>&1 || true
+' >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || true
 }
 
 module_registered_at_expected_version() {
@@ -2099,26 +2176,33 @@ $module = getenv("SLS_MASS_NOTIFY_MODULE") ?: "slsmassnotifyserver";
 $stmt = \FreePBX::Database()->prepare("SELECT version FROM modules WHERE modulename = ? LIMIT 1");
 $stmt->execute([$module]);
 $version = $stmt->fetchColumn();
-exit(is_string($version) && trim($version) === "0.1.3-beta" ? 0 : 1);
-' >>"$LOG_FILE" 2>&1
+exit(is_string($version) && trim($version) === "0.1.4-beta" ? 0 : 1);
+' >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1
 }
 
 refresh_module_install() {
   log "Refreshing SLS Mass Notify runtime integration."
-  if ! SLS_MASS_NOTIFY_DEFER_SIGNING=1 php -r 'require "/etc/freepbx.conf"; require_once "/var/www/html/admin/modules/slsmassnotifyserver/Slsmassnotifyserver.class.php"; $class = "\\FreePBX\\modules\\Slsmassnotifyserver"; $obj = new $class(\FreePBX::Create()); $obj->install(); exit(0);' >>"$LOG_FILE" 2>&1; then
+  if ! SLS_MASS_NOTIFY_DEFER_SIGNING=1 php -r 'require "/etc/freepbx.conf"; require_once "/var/www/html/admin/modules/slsmassnotifyserver/Slsmassnotifyserver.class.php"; $class = "\\FreePBX\\modules\\Slsmassnotifyserver"; $obj = new $class(\FreePBX::Create()); $obj->install(); exit(0);' >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1; then
     log "Direct runtime refresh failed. See $LOG_FILE."
     return 1
   fi
 }
 
 runtime_install_postconditions_available() {
-  [ -x /usr/local/bin/sls_mass_notify/sls_mass_notify_install_piper_voices.sh ] \
-    && [ -x /usr/local/bin/sls_mass_notify/sls_notify.py ] \
-    && [ -x /usr/local/bin/sls_mass_notify/sls_config.py ] \
-    && [ -x /usr/local/bin/sls_mass_notify/piper/venv/bin/piper ] \
-    && [ -x /usr/local/bin/piper ] \
-    && [ -x "$DATA_DIR/piper/venv/bin/piper" ] \
-    && MODULE_ROOT="/var/www/html/admin/modules/$MODULE" python3 - <<'PY'
+  local executable
+  for executable in \
+    /usr/local/bin/sls_mass_notify/sls_mass_notify_install_piper_voices.sh \
+    /usr/local/bin/sls_mass_notify/sls_notify.py \
+    /usr/local/bin/sls_mass_notify/sls_config.py \
+    /usr/local/bin/sls_mass_notify/piper/venv/bin/piper \
+    /usr/local/bin/piper \
+    "$DATA_DIR/piper/venv/bin/piper"; do
+    if [ ! -x "$executable" ]; then
+      log "Runtime prerequisite is missing or not executable: $executable"
+      return 1
+    fi
+  done
+  MODULE_ROOT="/var/www/html/admin/modules/$MODULE" python3 - <<'PY'
 import filecmp
 import os
 import pathlib
@@ -2140,6 +2224,7 @@ for name in (
     expected[pathlib.PurePosixPath(name)] = module / "bin" / name
 source_root = module / "bin" / "sls_mass_notify"
 if not source_root.is_dir():
+    print("Runtime source directory is missing: bin/sls_mass_notify")
     raise SystemExit(1)
 for source in source_root.rglob("*"):
     if source.is_file() and "__pycache__" not in source.parts and source.suffix != ".pyc":
@@ -2153,10 +2238,14 @@ actual = {
     and path.suffix != ".pyc"
 }
 if actual != set(expected):
+    for label, paths in (("missing", set(expected) - actual), ("unexpected", actual - set(expected))):
+        for path in sorted(paths)[:12]:
+            print(f"Runtime inventory {label}: {str(path)!r}")
     raise SystemExit(1)
 for relative, source in expected.items():
     target = runtime / pathlib.Path(str(relative))
     if not target.is_file() or not filecmp.cmp(source, target, shallow=False):
+        print(f"Runtime file does not match the installed package: {str(relative)!r}")
         raise SystemExit(1)
 PY
 }
@@ -2184,12 +2273,12 @@ install_module_with_autoenable() {
   local install_output install_status
 
   if install_output="$(run_without_install_maintenance_lock fwconsole ma install --autoenable "$MODULE" 2>&1)"; then
-    printf '%s\n' "$install_output" >>"$LOG_FILE"
+    printf '%s\n' "$install_output" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}"
     return 0
   else
     install_status=$?
   fi
-  printf '%s\n' "$install_output" >>"$LOG_FILE"
+  printf '%s\n' "$install_output" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}"
 
   if ! printf '%s\n' "$install_output" | grep -Eqi \
     '(unknown|unrecognized|invalid|no such)[[:space:]-]+option[^[:cntrl:]]*autoenable|option[^[:cntrl:]]*autoenable[^[:cntrl:]]*(does not exist|is not defined|is unknown|is unrecognized)|autoenable[^[:cntrl:]]*option[^[:cntrl:]]*(does not exist|is not defined|is unknown|is unrecognized)'; then
@@ -2197,7 +2286,7 @@ install_module_with_autoenable() {
   fi
 
   log "This fwconsole build requires global options before the module action; retrying compatible --autoenable syntax."
-  run_without_install_maintenance_lock fwconsole ma --autoenable install "$MODULE" >>"$LOG_FILE" 2>&1
+  run_without_install_maintenance_lock fwconsole ma --autoenable install "$MODULE" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1
 }
 
 verify_runtime_shell_syntax() {
@@ -2206,7 +2295,7 @@ verify_runtime_shell_syntax() {
   for script in sls_mass_notify_nws_poll.sh sls_mass_notify_weather_poll.sh \
     sls_mass_notify_test.sh sls_mass_notify_update.sh sls_mass_notify_maintenance.sh \
     sls_mass_notify_uninstall.sh sls_mass_notify_install_piper_voices.sh; do
-    if [ ! -x "$runtime_dir/$script" ] || ! /bin/bash -n "$runtime_dir/$script" >>"$LOG_FILE" 2>&1; then
+    if [ ! -x "$runtime_dir/$script" ] || ! /bin/bash -n "$runtime_dir/$script" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1; then
       INSTALL_ERROR_CATEGORY="update_script_syntax_error"
       log "Required runtime shell script is missing, not executable, or invalid: $script"
       return 2
@@ -2216,10 +2305,10 @@ verify_runtime_shell_syntax() {
 
 verify_announcement_worker_health() {
   local runtime_dir="${1:-/usr/local/bin/sls_mass_notify}"
-  /usr/bin/php -l "$runtime_dir/sls_announcement_jobs.php" >>"$LOG_FILE" 2>&1 || return $?
-  /usr/bin/php -l "$runtime_dir/sls_mass_notify_announcement_worker.php" >>"$LOG_FILE" 2>&1 || return $?
+  /usr/bin/php -l "$runtime_dir/sls_announcement_jobs.php" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || return $?
+  /usr/bin/php -l "$runtime_dir/sls_mass_notify_announcement_worker.php" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || return $?
   run_without_install_maintenance_lock /usr/sbin/runuser -u asterisk -- /usr/bin/timeout 45 \
-    /usr/bin/php "$runtime_dir/sls_mass_notify_announcement_worker.php" --health-check >>"$LOG_FILE" 2>&1
+    /usr/bin/php "$runtime_dir/sls_mass_notify_announcement_worker.php" --health-check --record-health >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1
 }
 
 ensure_piper_runtime() {
@@ -2235,15 +2324,15 @@ ensure_piper_runtime() {
   fi
 
   rm -rf "$PIPER_DIR/venv"
-  python3 -m venv "$PIPER_DIR/venv" >>"$LOG_FILE" 2>&1 || {
+  python3 -m venv "$PIPER_DIR/venv" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || {
     log "Unable to create Piper virtualenv. See $LOG_FILE."
     exit 1
   }
-  "$PIPER_DIR/venv/bin/pip" install --upgrade 'pip==26.2.0' 'setuptools==83.0.0' 'wheel==0.47.0' >>"$LOG_FILE" 2>&1 || {
+  "$PIPER_DIR/venv/bin/pip" install --upgrade 'pip==26.2.0' 'setuptools==83.0.0' 'wheel==0.47.0' >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || {
     log "Unable to install the pinned Piper packaging runtime. See $LOG_FILE."
     exit 1
   }
-  "$PIPER_DIR/venv/bin/pip" install -r /usr/local/bin/sls_mass_notify/piper-requirements.txt >>"$LOG_FILE" 2>&1 || {
+  "$PIPER_DIR/venv/bin/pip" install -r /usr/local/bin/sls_mass_notify/piper-requirements.txt >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || {
     log "Unable to install piper-tts into the Piper virtualenv. See $LOG_FILE."
     exit 1
   }
@@ -2280,7 +2369,7 @@ EOF
     synthesis_file="$DATA_DIR/sounds/tts/installer-voice-check-${model%.onnx}-$$.wav"
     rm -f "$synthesis_file"
     if ! printf '%s\n' 'SLS voice check.' | runuser -u asterisk -- /usr/bin/timeout 90 /usr/local/bin/piper \
-      --model "$voice_dir/$model" --output-file "$synthesis_file" >>"$LOG_FILE" 2>&1; then
+      --model "$voice_dir/$model" --output-file "$synthesis_file" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1; then
       rm -f "$synthesis_file"
       log "Piper could not synthesize audio with $model. See $LOG_FILE."
       exit 1
@@ -2442,25 +2531,61 @@ if health.get("pjsip_notify") != "authorized":
 PY
 }
 
-verify_ami_with_repair() {
-  local attempt
+verify_ami_with_repair() (
+  local attempt probe_dir
+  probe_dir="$(mktemp -d /tmp/sls-mass-notify-ami-check.XXXXXX)" || {
+    log "Unable to create private AMI verification storage. Check free space and /tmp permissions."
+    return 1
+  }
+  trap 'rm -f -- "$probe_dir/health.json" "$probe_dir/health.err"; rmdir -- "$probe_dir" 2>/dev/null || true' EXIT
   for attempt in 1 2 3; do
     if /usr/bin/timeout 15 python3 /usr/local/bin/sls_mass_notify/sls_notify.py --ami-health-json \
-      >/tmp/sls-mass-notify-ami-health.json 2>/tmp/sls-mass-notify-ami-health.err; then
-      if validate_ami_health_file /tmp/sls-mass-notify-ami-health.json >>"$LOG_FILE" 2>&1
+      >"$probe_dir/health.json" 2>"$probe_dir/health.err"; then
+      if validate_ami_health_file "$probe_dir/health.json" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1
       then
         return 0
       fi
     fi
-    cat /tmp/sls-mass-notify-ami-health.err >>"$LOG_FILE" 2>/dev/null || true
+    cat "$probe_dir/health.err" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>/dev/null || true
     log "SLS AMI health check attempt $attempt failed; rebuilding the loopback manager integration."
-    refresh_module_install >>"$LOG_FILE" 2>&1 || true
-    asterisk -rx "manager reload" >>"$LOG_FILE" 2>&1 || true
+    refresh_module_install >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || true
+    asterisk -rx "manager reload" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || true
     sleep 2
   done
   log "SLS AMI authentication, Ping, PJSIPShowContacts, or PJSIPNotify authorization failed after automatic repair. See $LOG_FILE."
   return 1
-}
+)
+
+verify_pjsip_contact_inventory() (
+  local probe_dir
+  probe_dir="$(mktemp -d /tmp/sls-mass-notify-contact-check.XXXXXX)" || {
+    log "Unable to create private PJSIP verification storage. Check free space and /tmp permissions."
+    return 1
+  }
+  trap 'rm -f -- "$probe_dir/contacts.out"; rmdir -- "$probe_dir" 2>/dev/null || true' EXIT
+  if ! asterisk -rx "pjsip show contacts" >"$probe_dir/contacts.out" 2>&1; then
+    cat "$probe_dir/contacts.out" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>/dev/null || true
+    log "Asterisk could not return the PJSIP contact inventory. See $LOG_FILE."
+    return 1
+  fi
+)
+
+verify_local_api_route() (
+  local path="$1" expected_pattern="$2" expected_codes="$3" label="$4"
+  local probe_dir code
+  probe_dir="$(mktemp -d /tmp/sls-mass-notify-api-check.XXXXXX)" || {
+    log "Unable to create private API verification storage. Check free space and /tmp permissions."
+    return 1
+  }
+  trap 'rm -f -- "$probe_dir/response.out"; rmdir -- "$probe_dir" 2>/dev/null || true' EXIT
+  code="$(local_web_probe "$path" "$probe_dir/response.out" "$expected_pattern" || true)"
+  if [[ ! "$code" =~ $expected_pattern ]]; then
+    # A failed route may return a login page or PHP exception. Do not retain
+    # that potentially sensitive response body in a shared temporary file.
+    log "$label expected HTTP $expected_codes for $path, got $code. Check Apache routes and the application error log."
+    return 1
+  fi
+)
 
 verify_dashboard_integration() {
   local source_section="/var/www/html/admin/modules/$MODULE/dashboard/sections/SlsMassNotifyAnnouncement.class.php"
@@ -2505,7 +2630,7 @@ if (strpos($html, "dashboard-sls-mass-notify-announcement") === false
 }
 echo "Mass Notify Dashboard announcement panel verified (" . strlen($html) . " bytes).\n";
 exit(0);
-' >>"$LOG_FILE" 2>&1 || {
+' >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || {
     log "Dashboard announcement hook or panel rendering verification failed. See $LOG_FILE."
     exit 1
   }
@@ -2662,7 +2787,7 @@ foreach ($hosts as $host) {
     }
 }
 exit(1);
-' >>"$LOG_FILE" 2>&1 || desktop_status=$?
+' >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || desktop_status=$?
   if [ "$desktop_status" -eq 0 ]; then
     log "Desktop live SSE authentication handshake verified."
     return 0
@@ -2733,7 +2858,7 @@ foreach ($hosts as $host) {
     }
 }
 exit($lastError === "unauthorized" ? 2 : 1);
-' >>"$LOG_FILE" 2>&1 || control_status=$?
+' >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || control_status=$?
   case "$control_status" in
     0)
       log "Control API authenticated status request verified."
@@ -2860,7 +2985,7 @@ sign_and_verify_touched_modules() {
   for module_name in "${modules_to_sign[@]}"; do
     signed=0
     for attempt in 1 2; do
-      if run_without_install_maintenance_lock /usr/bin/timeout --signal=TERM 360 "$signer" "$module_name" >>"$LOG_FILE" 2>&1; then
+      if run_without_install_maintenance_lock /usr/bin/timeout --signal=TERM 360 "$signer" "$module_name" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1; then
         signed=1
         break
       fi
@@ -2891,7 +3016,7 @@ if (!$valid) {
     exit(1);
 }
 exit(0);
-' >>"$LOG_FILE" 2>&1 || {
+' >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || {
       log "FreePBX signature verification did not return trusted/good for $module_name. See $LOG_FILE."
       tail -60 "$LOG_FILE" 2>/dev/null || true
       exit 1
@@ -2954,7 +3079,7 @@ if ($jobs === 0) {
     echo "Native FreePBX backup adapter verified and enrolled in {$enrolled} module backup job(s).\n";
 }
 exit(0);
-' >>"$LOG_FILE" 2>&1; then
+' >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1; then
     log "Native FreePBX backup integration verification failed. See $LOG_FILE."
     exit 1
   fi
@@ -3094,7 +3219,7 @@ foreach ($required as $filename) {
     }
 }
 exit(0);
-' >>"$LOG_FILE" 2>&1 || {
+' >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || {
     log "Bundled sounds were not registered with FreePBX System Recordings. See $LOG_FILE."
     exit 1
   }
@@ -3117,7 +3242,7 @@ exit(0);
       notify_module_ready=1
       break
     fi
-    asterisk -rx "module load res_pjsip_notify.so" >>"$LOG_FILE" 2>&1 || true
+    asterisk -rx "module load res_pjsip_notify.so" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || true
     sleep 1
   done
   [ "$notify_module_ready" -eq 1 ] || {
@@ -3191,8 +3316,8 @@ PY
     exit 1
   }
   media_probe="/var/www/html/sls_mass_notify/installer-render-check-$$.png"
-  media_fetch="/tmp/sls-mass-notify-render-fetch-$$.png"
-  rm -f "$media_probe" "$media_fetch"
+  media_fetch="$(mktemp /tmp/sls-mass-notify-render-fetch.XXXXXX)"
+  rm -f "$media_probe"
   if ! runuser -u asterisk -- convert -size 480x272 xc:'#991b1b' -font DejaVu-Sans-Bold \
     -fill white -gravity center -pointsize 24 -annotate +0+0 'SLS render test' \
     -colorspace sRGB -depth 8 -interlace none -strip "PNG24:$media_probe"; then
@@ -3200,7 +3325,7 @@ PY
     log "The asterisk service account could not render an alert image in the public media directory."
     exit 1
   fi
-  /usr/sbin/apache2ctl configtest >>"$LOG_FILE" 2>&1 || {
+  /usr/sbin/apache2ctl configtest >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || {
     rm -f "$media_probe" "$media_fetch"
     log "Apache configuration validation failed after integration was installed. See $LOG_FILE."
     exit 1
@@ -3221,10 +3346,7 @@ PY
       ;;
   esac
   log "Verifying Asterisk PJSIP contact inventory and SLS AMI authentication."
-  if ! asterisk -rx "pjsip show contacts" >/tmp/sls-mass-notify-pjsip-contacts.out 2>&1; then
-    log "Asterisk could not return the PJSIP contact inventory. See /tmp/sls-mass-notify-pjsip-contacts.out."
-    exit 1
-  fi
+  verify_pjsip_contact_inventory || exit 1
   if ! verify_ami_with_repair; then
     exit 1
   fi
@@ -3248,7 +3370,7 @@ if mode not in {"endpoint_fanout", "contact_uri"}:
 print(mode)
 PY
 )" || {
-    cat "$notify_capabilities" >>"$LOG_FILE" 2>/dev/null || true
+    cat "$notify_capabilities" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>/dev/null || true
     rm -f "$notify_capabilities"
     log "Asterisk does not expose the required endpoint-targeted PJSIPNotify capability."
     exit 1
@@ -3267,14 +3389,14 @@ PY
   endpoint_inventory_err="$(mktemp /tmp/sls-mass-notify-endpoints-error.XXXXXX)"
   if ! /usr/bin/timeout 15 python3 /usr/local/bin/sls_mass_notify/sls_notify.py --list-endpoints-json \
     >"$endpoint_inventory" 2>"$endpoint_inventory_err"; then
-    cat "$endpoint_inventory_err" >>"$LOG_FILE" 2>/dev/null || true
+    cat "$endpoint_inventory_err" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>/dev/null || true
     rm -f "$endpoint_inventory" "$endpoint_inventory_err"
     log "SLS AMI PJSIP contact discovery failed. Confirm the loopback manager user has system-event read permission; see $LOG_FILE."
     exit 1
   fi
   endpoint_records=""
-  if ! endpoint_records="$(endpoint_inventory_records "$endpoint_inventory" 2>>"$LOG_FILE")"; then
-    cat "$endpoint_inventory" >>"$LOG_FILE" 2>/dev/null || true
+  if ! endpoint_records="$(endpoint_inventory_records "$endpoint_inventory" 2>>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}")"; then
+    cat "$endpoint_inventory" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>/dev/null || true
     rm -f "$endpoint_inventory" "$endpoint_inventory_err"
     log "SLS AMI PJSIP contact discovery returned invalid data; see $LOG_FILE."
     exit 1
@@ -3321,33 +3443,12 @@ PY
   fi
   rm -f "$endpoint_inventory" "$endpoint_inventory_err"
   php -l /var/www/html/admin/modules/slsmassnotifyserver/Slsmassnotifyserver.class.php >/dev/null
-  code="$(local_web_probe /api/sipnotify/desktop /tmp/sls-sipnotify-api.out '^(401|429)$' || true)"
-  case "$code" in
-    401|429) ;;
-    *)
-      log "Desktop notification API smoke test expected HTTP 401/429 for /api/sipnotify/desktop, got $code. See /tmp/sls-sipnotify-api.out."
-      exit 1
-      ;;
-  esac
-  stream_code="$(local_web_probe /api/sipnotify/desktop/stream /tmp/sls-sipnotify-stream-api.out '^(401|429)$' || true)"
-  case "$stream_code" in
-    401|429) ;;
-    *)
-      log "Desktop live-stream API expected HTTP 401/429 without credentials, got $stream_code. See /tmp/sls-sipnotify-stream-api.out."
-      exit 1
-      ;;
-  esac
+  verify_local_api_route /api/sipnotify/desktop '^(401|429)$' '401/429' 'Desktop notification API smoke test' || exit 1
+  verify_local_api_route /api/sipnotify/desktop/stream '^(401|429)$' '401/429' 'Desktop live-stream API without credentials' || exit 1
   verify_control_api_authentication || exit 1
   # Use the canonical directory URL. Apache otherwise returns its expected
   # DirectorySlash 301 before the protected API front controller runs.
-  control_code="$(local_web_probe /api/sls-mass-notify/ /tmp/sls-control-api.out '^(401|403|405|429)$' || true)"
-  case "$control_code" in
-    401|403|405|429) ;;
-    *)
-      log "Control API route smoke test expected HTTP 401/403/405/429 for /api/sls-mass-notify/, got $control_code. See /tmp/sls-control-api.out."
-      exit 1
-      ;;
-  esac
+  verify_local_api_route /api/sls-mass-notify/ '^(401|403|405|429)$' '401/403/405/429' 'Control API route smoke test' || exit 1
   verify_desktop_sse_handshake || exit 1
   [ "$(stat -c '%U:%G' /usr/local/bin/sls_mass_notify)" = "root:root" ] || {
     log "Executable runtime is not owned by root:root."
@@ -3385,7 +3486,7 @@ PY
     log "Expected exactly one canonical Asterisk announcement scheduler cron entry; found $schedule_count total and $schedule_canonical_count canonical."
     exit 1
   fi
-  if ! runuser -u asterisk -- /usr/bin/timeout 20 /usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php --self-test >>"$LOG_FILE" 2>&1; then
+  if ! runuser -u asterisk -- /usr/bin/timeout 20 /usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php --self-test >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1; then
     log "Scheduled-announcement worker failed its Asterisk-account self-test."
     exit 1
   fi
@@ -3414,12 +3515,20 @@ PY
 
 main() {
   cd /tmp
+  if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    printf 'Run this installer as root.\n' >&2
+    exit 1
+  fi
+  ensure_installer_log_prerequisites || exit 1
   INSTALL_LOG_FD=""
-  open_root_owned_file INSTALL_LOG_FD "$LOG_FILE" || {
-    printf 'The installer log could not be opened safely.\n' >&2
+  open_root_owned_file INSTALL_LOG_FD "$LOG_FILE" log || {
+    printf 'The installer log could not be opened safely: %s. Check for a symlink, hardlink, special file, or unexpected owner. No module files were changed.\n' "$LOG_FILE" >&2
     exit 1
   }
-  : >"/proc/${BASHPID}/fd/$INSTALL_LOG_FD"
+  # Use the held descriptor for every write, including after fwconsole chown.
+  # LOG_FILE remains the human-readable path for diagnostics and support.
+  INSTALL_LOG_OUTPUT="/proc/${BASHPID}/fd/$INSTALL_LOG_FD"
+  : >"$INSTALL_LOG_OUTPUT"
   trap guard_config_on_exit EXIT
   set_install_stage "platform validation" "Confirm this is a healthy FreePBX 17 host with working database, Asterisk, fwconsole, package repositories, and local AMI access, then rerun the installer."
   require_freepbx
@@ -3459,7 +3568,7 @@ main() {
   repair_runtime_permissions
   set_install_stage "runtime integration" "Use General Settings > Danger Zone > Repair Installation after correcting the reported Asterisk, Apache, cron, signer, or filesystem prerequisite."
   ensure_runtime_installed
-  asterisk -rx "module reload res_pjsip_notify.so" >>"$LOG_FILE" 2>&1 || true
+  asterisk -rx "module reload res_pjsip_notify.so" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || true
   ensure_piper_runtime
   /usr/local/bin/sls_mass_notify/sls_mass_notify_install_piper_voices.sh || {
     log "Packaged Piper voice installation failed. See $LOG_FILE."
@@ -3470,7 +3579,7 @@ main() {
   repair_runtime_permissions
   secure_central_config
   run_without_install_maintenance_lock fwconsole reload
-  asterisk -rx "module reload res_pjsip_notify.so" >>"$LOG_FILE" 2>&1 || true
+  asterisk -rx "module reload res_pjsip_notify.so" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || true
   repair_runtime_permissions
   run_without_install_maintenance_lock fwconsole reload
   repair_runtime_permissions

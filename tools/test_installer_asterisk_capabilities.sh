@@ -799,7 +799,7 @@ bootstrap_utility_line="$(grep -nFm1 'for bootstrap_utility in /usr/bin/flock' <
 
 main_body="$(declare -f main)"
 log_open_line="$(grep -nFm1 'open_root_owned_file INSTALL_LOG_FD "$LOG_FILE"' <<<"$main_body" | cut -d: -f1)"
-log_reset_line="$(grep -nFm1 ': > "/proc/${BASHPID}/fd/$INSTALL_LOG_FD"' <<<"$main_body" | cut -d: -f1)"
+log_reset_line="$(grep -nFm1 ': > "$INSTALL_LOG_OUTPUT"' <<<"$main_body" | cut -d: -f1)"
 failure_trap_line="$(grep -nFm1 'trap guard_config_on_exit EXIT' <<<"$main_body" | cut -d: -f1)"
 require_line="$(grep -nFm1 'require_freepbx' <<<"$main_body" | cut -d: -f1)"
 lock_line="$(grep -nFm1 'acquire_maintenance_coordination' <<<"$main_body" | cut -d: -f1)"

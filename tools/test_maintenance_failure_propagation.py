@@ -189,6 +189,59 @@ class MaintenanceFailures(unittest.TestCase):
 
 
 class InstallerFailures(unittest.TestCase):
+    @unittest.skipUnless(os.geteuid() == 0, "Service-account worker fixture requires root")
+    def test_worker_verification_records_fresh_health_and_preserves_failure(self):
+        import pwd
+
+        with tempfile.TemporaryDirectory(prefix="sls-worker-health-verifier-") as directory:
+            base = Path(directory)
+            base.chmod(0o755)
+            account = pwd.getpwnam("asterisk")
+            state = base / "fixture-state"
+            state.mkdir(mode=0o750)
+            os.chown(state, account.pw_uid, account.pw_gid)
+            probe = state / "worker-probe.json"
+            (base / "sls_announcement_jobs.php").write_text("<?php\n")
+            (base / "sls_mass_notify_announcement_worker.php").write_text('''<?php
+$arguments = array_slice($argv, 1);
+file_put_contents(__DIR__ . '/fixture-state/arguments.json', json_encode($arguments));
+if ($arguments !== ['--health-check', '--record-health']) {
+    exit(73);
+}
+$status = (int)trim(file_get_contents(__DIR__ . '/exit-code'));
+if ($status !== 0) {
+    exit($status);
+}
+file_put_contents(__DIR__ . '/fixture-state/worker-probe.json',
+    json_encode(['ok' => true, 'failure_category' => '']));
+exit(0);
+''')
+            # The release gate uses umask 027; these dummy scripts contain no
+            # secrets and must remain readable by the fixture service account.
+            for filename in ("sls_announcement_jobs.php", "sls_mass_notify_announcement_worker.php"):
+                (base / filename).chmod(0o644)
+            command = 'source "$1"; LOG_FILE="$2/log"; verify_announcement_worker_health "$2"'
+            for status in (0, 23):
+                with self.subTest(status=status):
+                    stale = {"ok": False, "failure_category": "worker_module_load_failed"}
+                    probe.write_text(json.dumps(stale))
+                    probe.chmod(0o640)
+                    os.chown(probe, account.pw_uid, account.pw_gid)
+                    (base / "exit-code").write_text(str(status))
+                    (base / "exit-code").chmod(0o644)
+                    result = subprocess.run(
+                        ["bash", "-c", command, "fixture",
+                         str(ROOT / "tools/install_release.sh"), str(base)],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(result.returncode, status, result.stderr)
+                    arguments = state / "arguments.json"
+                    self.assertEqual(json.loads(arguments.read_text()),
+                                     ["--health-check", "--record-health"])
+                    self.assertEqual(arguments.stat().st_uid, account.pw_uid)
+                    expected = {"ok": True, "failure_category": ""} if status == 0 else stale
+                    self.assertEqual(json.loads(probe.read_text()), expected)
+
     def test_registered_module_does_not_hide_failed_install_command(self):
         with tempfile.TemporaryDirectory(prefix="sls-installer-regression-") as directory:
             base = Path(directory)
@@ -264,7 +317,7 @@ main
 
     def test_apache_configtest_failure_block_is_fatal(self):
         source = (ROOT / "tools" / "install_release.sh").read_text()
-        block = re.search(r'  /usr/sbin/apache2ctl configtest >>"\$LOG_FILE" 2>&1 \|\| \{.*?\n  \}', source, re.S)
+        block = re.search(r'  /usr/sbin/apache2ctl configtest >>"\$\{INSTALL_LOG_OUTPUT:-\$LOG_FILE\}" 2>&1 \|\| \{.*?\n  \}', source, re.S)
         self.assertIsNotNone(block)
         command = 'log() { printf "%s\\n" "$*"; }; LOG_FILE=/dev/null;\n'
         command += block.group().replace("/usr/sbin/apache2ctl configtest", "false")
