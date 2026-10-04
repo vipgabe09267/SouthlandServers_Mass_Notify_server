@@ -22,7 +22,7 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates git curl gnupg openssl sudo cron util-linux iproute2 apache2 libapache2-mod-php8.2 nodejs sox libsox-fmt-all python3 python3-venv python3-cryptography python3-pil php-cli php-xml php-mbstring php-curl php-gd php-sqlite3 php-mysql php-intl php-zip
+          apt-get install -y --no-install-recommends ca-certificates git curl wget gnupg openssl sudo cron util-linux iproute2 systemd tzdata logrotate apache2 libapache2-mod-php8.2 nodejs sox libsox-fmt-all imagemagick fonts-dejavu-core postfix python3 python3-venv python3-pip python3-cryptography python3-pil php-cli php-xml php-mbstring php-curl php-gd php-sqlite3 php-mysql php-intl php-zip
           useradd --system --home-dir /var/lib/asterisk --create-home --user-group asterisk
           curl --proto '=https' --proto-redir '=https' --fail --silent --show-error --location -o /tmp/sangoma-key.asc https://deb.freepbx.org/gpg/aptly-pubkey.asc
           printf '%s\n' 'a34c0ec58e9f03b49ea6e36a914ee5b3a6f4063752945140ceb3c758029a5b14  /tmp/sangoma-key.asc' | sha256sum --check
@@ -31,7 +31,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends libedit2 libxslt1.1 liburiparser1 asterisk22-core=22.10.1-1.sng12 asterisk22-doc=22.10.1-1.sng12
           asterisk -V
-          mkdir -p /var/lib/asterisk /var/spool/asterisk /etc/asterisk /etc/sls-mass-notify /usr/local/bin/sls_mass_notify
+          mkdir -p /var/lib/asterisk /var/spool/asterisk /etc/asterisk /etc/sls-mass-notify /usr/local/bin/sls_mass_notify /var/www/html/admin/modules/slsmassnotifyserver
           touch /etc/freepbx.conf
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7, pinned
         with:
