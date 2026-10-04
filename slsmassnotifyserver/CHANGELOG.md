@@ -1,5 +1,83 @@
 # Changelog
 
+## 0.1.5-beta — 2026-10-04
+
+New enterprise features start disabled. Existing production settings and notification/API contracts are preserved.
+
+- Add `slsconsole start`, `stop`, `reboot`, `status` and help. Persist admission state in encrypted configuration; preserve staged edits, feature switches, existing calls and receipt tracking. Restart only the SLS collector; failed restarts leave notifications paused.
+- Prevent isolated phone-health commands from creating root-only Python caches that incorrectly fail storage readiness checks.
+- Treat one-way webhook response uncertainty as a neutral receipt, preserve HTTP status and failure codes, and clear historical dashboard warnings through read-only projections. Keep explicit transport/HTTP failures visible and suppress automatic replay.
+- Open the exact danger notice automatically on the first Enterprise Labs visit. Remove manual review buttons, enforce the five-second wait, and save one revision-bound acknowledgment for the page without enabling features. Group continuity fields and improve responsive control spacing.
+- Serve the legacy Sysadmin disk-chart dependency from the signed module instead of an external CDN request. Bundle the compatible Chart.js 2.9.4 security fix, retain upstream license and hashes in the dependency inventory, and register through FreePBX page hooks without changing core or commercial module files.
+
+- Add mutually authenticated notification peers, independent witness leases, per-delivery fencing, immutable intent replication and owned-site delivery. Configuration mirroring excludes host identities, AMI credentials, trunks, keys and capacity. Uncertain deliveries never replay automatically. This is not full FreePBX or telephone-service failover.
+- Add standalone, site-PBX and Linux/Raspberry Pi edge options. Disconnected sites can use reachable local devices and approved cached assets; cloud channels and new weather data require connectivity.
+- Add optional operator OIDC/SAML adapters for Entra ID, Okta, Google Workspace, Keycloak and OneLogin; explicit local account grants; reviewed CSV/LDAP-TLS/SCIM directory synchronization; and verified browser subscribers. Existing local password, TOTP and recovery controls remain available.
+- Add representative SIP-speaker profiles for Algo, CyberData, Axis, Valcom and AtlasIED, signed Pi/ESP32/Arduino sensor examples, heartbeat supervision and scoped Axis VAPIX door controls.
+- Add private PNG/JPEG incident overlays, central drill assignments/reviews, timezone-aware shift audiences and two-person approval tied to exact frozen content, recipients and current human identities.
+- Add opt-in Zoom, Google Meet and Webex meeting creation, verified inbound SMS and post-playback voice responses, CAP export and bounded authority-configured public-warning submission.
+- Add administrator-only Enterprise Labs navigation, typed editors and the requested five-second dangerous-feature acknowledgment. Failover/mirroring, enterprise login, physical door actuation and public-warning origination require the saved page acknowledgment; acceptance does not enable a feature.
+- Extend native backup evidence capture. Recovery disables new Labs features and restores only passive private floor-plan assets and replay-loss guards into live use; bearer sessions, peer leases and delivery intents remain archived evidence.
+- Extend additive Control API/operator capabilities and isolated security, protocol, delivery, backup, UI and compatibility checks.
+- Separate API-key use in Help from operator authentication, recovery and administrator security activity in Operator Access. Preserve historical records through an explicit recoverable migration; fence interrupted moves and unfinished log writes, and coordinate migration with backup capture.
+- Use the bundled Discord artwork as a small footer icon, and repair the GitHub README logo link.
+- Repair corrupt or truncated announcement and imported-recording audio caches, reject linked/shared/special files and verify complete telephone PCM before atomic promotion. Preserve valid cache reuse and the existing speech-duration limit.
+- Separate WAV import input/output temporary files to prevent successful conversions with empty audio. Validate nonempty PCM samples for all imported recordings.
+- Capture System Recordings through bounded, nonblocking, read-only descriptors. Reject FIFO/link races and changed source files; retain administrator-owned read-only recordings and escalate decoder timeouts.
+
+Provider accounts, real speakers/doors, genuine multi-host outages, public-warning authority onboarding and independent external penetration testing are not qualified by simulated fixtures. Dangerous features are for non-production labs only. Minor fixes are included below and in the commit history.
+
+
+### Configuration, security and recovery
+
+- Encrypt active, staged and retained configuration with AES-256-GCM by default. Keep keys in a root-controlled keyring and rotate the active key after 365 days through existing maintenance. Preserve older keys and logical settings during migration; reject unreadable, unsafe or damaged configuration.
+- Integrate encrypted configuration and its required recovery key with native FreePBX Backup/Restore. Verify inventories, hashes and authenticated ciphertext; encrypt restored settings with the destination key. Preserve delivery evidence without replaying old jobs. Retain recovery paths after incomplete rollback.
+- Add audited password-protected portable exports using Argon2id and XChaCha20-Poly1305, preserve legacy imports and remind administrators to export backups after 90 days. Native backup archives still require protected storage or backup-level encryption.
+- Add individually revocable, hashed Control API credentials with explicit action and recipient scopes. Recheck queued authority before transmission; preserve immediate revocation and staged edits. Restrict trusted proxies to reviewed CIDRs and redact credentials from API projections.
+- Harden protected files, command admission, archive extraction, journals and status storage against links, special files, unsafe ownership, oversized input, corruption, contention and incomplete writes. Preserve evidence and expose specific retryable errors.
+- Require administrator authority for automation configuration and script inspection. Correct descendant-location permissions for building/floor/room operators. Preserve permanent accepted SMS STOP replay identities within bounded storage.
+- Separate authenticated root installation phases from unprivileged FreePBX hooks. Authenticate SLS, Framework and Dashboard integration inventories; preserve protected configuration and operational history. Retain the existing signing key and add reviewed publisher-key overlap/revocation.
+- Pin speech dependencies and verified binary wheels, generate a CycloneDX inventory and qualify isolated environment repair. Preserve the PBX interpreter and saved voice choices. Automatic updates remain opt-in, with release channels, pins and installation windows.
+
+### Announcements and delivery
+
+- Add exact event-ID/desktop-identity receipts, duplicate-safe acknowledgements and retryable receipt-storage failures. Show **Received by desktop app** separately from human responses. Refresh dashboard and operator results after publication, including late receipts.
+- Preserve desktop schema 1 and SSE protocol 2. Add approximately 15-second flushed heartbeats, stream-slot cleanup, cursor polling, gap reporting, stable publication timestamps, absolute expiry and explicit boolean test metadata.
+- Render unique 1440×816 desktop images within the 5 MiB client limit. Keep complete fallback text and compatible anonymous same-origin HTTPS image downloads. Preserve 480×272 phone images and installation-specific forwarded ports.
+- Separate authenticated per-desktop traffic limits from failed sign-ins; return Retry-After and bound event scans. Keep the 32-stream limit and five-second polling fallback explicit. Synthetic fleet checks do not certify production throughput.
+- Add answer-triggered external-call playback for each recipient, an independent external voice, optional keypad acknowledgement and daily call budgets. Preserve internal delivery when another external route fails; reject unreviewed route hooks.
+- Add opt-in announcement email through the local PBX mail service, saved recipients, frozen addresses, bounded handoff and explicit uncertain outcomes. Enrich weather emails with affected places, complete instructions, validity and spoken content.
+- Add disabled-by-default Labs SMS/MMS adapters for Twilio, Telnyx and BulkVS, consented saved recipients, previews, spending reservations and exact-message evidence. Twilio/Telnyx enforce verified STOP callbacks; BulkVS currently reports API acceptance and does not support authenticated inbound STOP or delivery callbacks.
+- Add native, Slack and Teams Workflows webhook formats, typed incident context and per-attempt authorization. Package current Discord artwork and use it as a small footer icon from the PBX.
+- Reject over-duration speech without cutting it. Add phone/internal/external previews, literal pronunciation rules and English, Spanish, French, German and Portuguese voices. Supplied text is not translated.
+- Correct System Recording discovery/conversion, including supported GSM and raw audio formats. Preserve custom recordings and reject unsafe cached files.
+- Add finite live-page text cleanup with per-extension ownership, phone-call evidence and current-health warnings that clear after recovery or expiry without deleting delivery history.
+
+### Sites, paging, operators and workflows
+
+- Add sites, buildings, floors and rooms; searchable device assignments; reviewed saved audiences; and fixed-coordinate geographic selection with visible missing/stale positions. Existing groups and submitted jobs keep their original recipients.
+- Add disabled-by-default Labs dial-in paging with one configurable extension, up to ten saved groups, authorized internal callers, individual 4–8-digit PINs, live audio and per-group SIP text. New PINs are random and required by default.
+- Add selected existing-IVR access, per-group external caller whitelists and mandatory external PINs. Recheck authority before delivery; rejected callers receive an explanation and return to the originating IVR. Correct extension conflict checks and staged activation.
+- Add scoped PBX Operations roles and dedicated operator accounts with strong password hashing, mandatory TOTP, single-use recovery codes, session revocation and audited sender attribution. The separate dark-mode portal is disabled by default and opens in a new tab.
+- Add two-attempt self-service password recovery and revocable administrator-issued 24-hour links. Require the enrolled TOTP to save a new password. Enforce durable failed-password windows of 6/5 minutes, 12/10 minutes and 20/24 hours with a fixed 24-hour lock at the final threshold.
+- Add Labs incident templates, required fields, immutable updates/all-clear, human responses, rosters, roll call, checklists, drill scheduling, reviewed resources and language variants. Add five frozen supervisor follow-ups and optional replay-safe incident archival.
+- Add disabled-by-default confirmed panic sources, emergency-call observation, signed sensors, trusted CAP feeds, reviewed BrightSign/PATLITE actions and hash-approved shell/JavaScript actions. These integrations require physical/provider acceptance.
+- Add durable scheduled jobs, maximum start delays, recipient-aware admission, weekday patterns, holidays, late starts and reviewed CSV/iCalendar imports. Preserve timezones, original deadlines and uncertain outcomes without automatic replay.
+- Apply current quiet-hour policies to delayed weather delivery, except configured critical exemptions. Cancel expired, superseded, revoked or changed destinations and retain historical evidence.
+- Expand lightning to Xweather, Tempest and Meteomatics, with provider-specific limits, area routing, bounded adaptive polling and outage allowances. Provider qualification remains deployment-specific.
+
+### Performance, administration and API
+
+- Reduce idle dashboard health polling from ten to sixty seconds, pause hidden-tab polling and prevent overlapping requests. Keep active job/receipt refresh and focus recovery responsive.
+- Avoid repeated whole-model checksum reads on page loads; retain complete verification before synthesis. Bound log/queue inspection and media cleanup while protecting active references and custom content.
+- Default capacities to 25 desktops and 25 phone contacts. Check combined CPU, RAM, dedicated additional free space and temporary workspace; show green/red resource indicators and reject unsupported increases. Fresh phone inventories above 25 round up to the next 50; upgrades retain saved limits.
+- Reorganize General Settings, paging, locations, operators and Help into responsive sections with consistent SLS branding and Labs badges. Preserve all hidden-panel values and reject truncated/stale form submissions.
+- Extend the setup wizard with timezone review, capacity checks and an optional advertised-address/forwarded-port editor. Keep HTTPS defaults and preserve existing installation-specific addresses.
+- Add deployment readiness reports, device-acceptance observations, redacted diagnostics and a separate-host HTTPS monitor. Software receipts, local health and administrator observations remain distinct evidence.
+- Add Control API capability discovery, authorized saved-audience discovery and dispatch-free announcement previews. Document administration, delivery, incident, fleet and trigger contracts in [CONTROL_API.md](docs/CONTROL_API.md); schedule administration remains in the FreePBX UI. Keep existing endpoint paths and authentication compatible.
+
+Isolated fixtures and synthetic load checks do not establish handset display, human receipt, carrier/inbox delivery, every public forwarding path, or full deployment recovery. Mobile push and visitor enrollment remain excluded. Enterprise identity, directory provisioning, SIP-speaker profiles and notification failover remain Labs features requiring deployment qualification. Minor corrections and detailed validation belong in the commit history and release notes.
+
 ## 0.1.4-beta
 
 - Fixed installer failures caused by old Asterisk-owned logs, including `Permission denied` when running as root. Logging continues through FreePBX ownership changes without disabling Linux file protections.

@@ -14,7 +14,7 @@ import sls_audio_queue as queue
 import sls_storage_maintenance as storage
 
 sound = 'SLS_Mass_Notifications_Plugin/tts/fixture'
-with tempfile.TemporaryDirectory() as temporary, mock.patch.object(queue.os, 'geteuid', return_value=1000):
+with tempfile.TemporaryDirectory() as temporary:
     root = Path(temporary)
     normal = queue.request_ticket(['1000'], 10, sound, directory=root, now=1000)
     urgent = queue.request_ticket(['1000'], 10, sound, 'urgent', directory=root, now=1001)
@@ -52,12 +52,16 @@ with tempfile.TemporaryDirectory() as temporary, mock.patch.object(queue.os, 'ge
     assert ticket in json.loads((root / 'audio-reservations.json').read_text())['waiting']
     assert queue.claim_ticket(ticket, directory=root, now=1715)
 
-with tempfile.TemporaryDirectory() as temporary, mock.patch.object(queue.os, 'geteuid', return_value=1000):
+with tempfile.TemporaryDirectory() as temporary:
     root = Path(temporary); audio = root / 'sounds/tts'; audio.mkdir(parents=True)
-    path = audio / 'fixture.wav'; path.write_bytes(b'fixture'); now = time.time()
+    config = root / 'mass-notifications.config'
+    config.write_text('{"enabled":"1"}')
+    config.chmod(0o640)
+    sound = 'SLS_Mass_Notifications_Plugin/tts/announcement_tts_fixture'
+    path = audio / 'announcement_tts_fixture.wav'; path.write_bytes(b'fixture'); now = time.time()
     os.utime(path, (now - 3600, now - 3600))
     ticket = queue.request_ticket(['1000'], 10, sound, directory=root, now=now)
-    with mock.patch.object(storage, 'DATA', root), mock.patch.object(storage, 'storage_summary'), mock.patch.object(storage, 'pending_audio_names', side_effect=set):
+    with mock.patch.object(storage, 'DATA', root), mock.patch.object(storage, 'storage_summary'), mock.patch.object(storage, 'WEB', root / 'web'), mock.patch.object(storage, 'OUTGOING', root / 'outgoing'), mock.patch.object(storage, 'EVENT_LOGS', ()):
         storage.main()
         assert path.exists(), 'Waiting audio was deleted'
         queue.claim_ticket(ticket, directory=root, now=now)

@@ -4,19 +4,95 @@
 namespace FreePBX\modules;
 
 require_once __DIR__ . '/AnnouncementDelivery.php';
+require_once __DIR__ . '/AnnouncementPreview.php';
+require_once __DIR__ . '/SpeechRules.php';
+require_once __DIR__ . '/SystemRecordings.php';
+require_once __DIR__ . '/StatusHealth.php';
+require_once __DIR__ . '/AnnouncementAdmission.php';
+require_once __DIR__ . '/ScheduledDelivery.php';
+require_once __DIR__ . '/SchedulePresentation.php';
+require_once __DIR__ . '/ScheduleCalendar.php';
+require_once __DIR__ . '/UpdatePolicy.php';
 require_once __DIR__ . '/TestProfiles.php';
 require_once __DIR__ . '/SupportDiagnostics.php';
+require_once __DIR__ . '/DeploymentAcceptance.php';
+require_once __DIR__ . '/DesktopCapacity.php';
+require_once __DIR__ . '/DesktopFleet.php';
+require_once __DIR__ . '/PhoneEventService.php';
+require_once __DIR__ . '/OutboundVoice.php';
+require_once __DIR__ . '/AnnouncementEmail.php';
+require_once __DIR__ . '/AnnouncementSms.php';
+require_once __DIR__ . '/Paging.php';
+require_once __DIR__ . '/LocalWebProbe.php';
+require_once __DIR__ . '/AdvertisedAddress.php';
+require_once __DIR__ . '/EncryptedConfig.php';
+require_once __DIR__ . '/ConfigCrypto.php';
+require_once __DIR__ . '/AdminAudit.php';
+require_once __DIR__ . '/OperationalBackup.php';
+require_once __DIR__ . '/Incidents.php';
+require_once __DIR__ . '/Locations.php';
+require_once __DIR__ . '/Automations.php';
+require_once __DIR__ . '/Operators.php';
+require_once __DIR__ . '/WeatherDeliveryReceipts.php';
+require_once __DIR__ . '/WeatherChannels.php';
+require_once __DIR__ . '/ApiCredentialManagement.php';
+require_once __DIR__ . '/ApiPermissionGuards.php';
+require_once __DIR__ . '/api/sls-mass-notify/media-policy.php';
+require_once __DIR__ . '/EnterpriseAdministration.php';
+require_once __DIR__ . '/EnterpriseOperations.php';
+require_once __DIR__ . '/EnterpriseCluster.php';
+require_once __DIR__ . '/EnterpriseIdentityManagement.php';
+require_once __DIR__ . '/EnterpriseIntegrations.php';
+
+/** Only controlled operator-safe messages from protected configuration writes. */
+final class SlsConfigurationWriteException extends \RuntimeException
+{
+	private $replaced;
+	public function __construct($message, $replaced = false)
+	{
+		parent::__construct($message);
+		$this->replaced = (bool)$replaced;
+	}
+	public function settingsWereReplaced() { return $this->replaced; }
+}
 
 #[\AllowDynamicProperties]
 class Slsmassnotifyserver implements \BMO
 {
 	use SlsAnnouncementDelivery;
+	use SlsWeatherChannels;
+	use SlsAnnouncementPreview;
+	use SlsAnnouncementAdmission;
+	use SlsScheduledDelivery;
 	use SlsTestProfiles;
 	use SlsSupportDiagnostics;
-	const MODULE_VERSION = '0.1.4-beta';
+	use SlsDeploymentAcceptance;
+	use SlsDesktopCapacity;
+	use SlsPhoneEventService;
+	use SlsOutboundVoice;
+	use SlsAnnouncementEmail;
+	use SlsAnnouncementSms;
+	use SlsLivePaging;
+	use SlsAdvertisedAddressEditor;
+	use SlsAdminAudit;
+	use SlsOperationalBackup;
+	use SlsIncidents;
+	use SlsLocations;
+	use SlsAutomations;
+	use SlsOperators;
+	use SlsApiCredentialManagement;
+	use SlsApiPermissionGuards;
+	use SlsEnterpriseAdministration;
+	use SlsEnterpriseOperations;
+	use SlsEnterpriseCluster;
+	use SlsEnterpriseLabs;
+	use SlsEnterpriseIntegrations;
+	const MODULE_VERSION = '0.1.5-beta';
+	const INCIDENT_JOB_CONTRACT = 1;
 	const EVENTS_LOG = '/var/log/sls_mass_notify_events.jsonl';
 	const LEGACY_EVENTS_LOG = '/var/log/nws_weather_alert_events.jsonl';
 	const PLUGIN_DATA_DIR = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin';
+	const PHONE_EVENT_SERVICE_FILE = '/etc/systemd/system/sls-mass-notify-phone-events.service';
 	const SETTINGS_JSON = self::PLUGIN_DATA_DIR . '/mass-notifications.config';
 	const PENDING_SETTINGS_JSON = self::PLUGIN_DATA_DIR . '/mass-notifications.pending.config';
 	const SETTINGS_LOCK = self::PLUGIN_DATA_DIR . '/mass-notifications.config.lock';
@@ -83,6 +159,10 @@ class Slsmassnotifyserver implements \BMO
 	const HERO_IMAGE = 'modules/slsmassnotifyserver/assets/SLS_Mass_Notif_Plugin.png';
 	const MAX_LIMIT = 500;
 	const DEFAULT_LIMIT = 100;
+	const UI_LOG_SCAN_BYTES = 16 * 1024 * 1024;
+	const UI_LOG_LINE_BYTES = 256 * 1024;
+	const UI_LOG_RESULT_BYTES = 2 * 1024 * 1024;
+	const UI_LOG_SCAN_LINES = 50000;
 	const CSRF_SESSION_KEY = 'slsmassnotifyserver_csrf_token';
 
 	/** File fingerprints captured while a request builds a settings update. */
@@ -97,6 +177,8 @@ class Slsmassnotifyserver implements \BMO
 	private $allPjsipExtensionsCache = null;
 	private $sipNotifyTargetsCache = null;
 	private $deviceInventoryError = '';
+	/** Read limits/errors for the current log view; never persisted to the log. */
+	private $uiLogNotices = [];
 
 	public function __construct($freepbx = null)
 	{
@@ -109,61 +191,102 @@ class Slsmassnotifyserver implements \BMO
 
 	public function install()
 	{
-		if (is_link(self::SETTINGS_JSON)) {
-			throw new \RuntimeException(_('Protected central configuration must not be a symbolic link.'));
+		return $this->installUnprivilegedPhase();
+	}
+
+	/** Initialize only absent configuration while the installer owns activity. */
+	public function initializeFreshInstallerConfiguration(int $phoneCapacity = 25)
+	{
+		$this->requireRuntimeAccount();
+		$this->ensurePluginDataDir();
+		// The installer already excludes notification activity. Take only the
+		// settings mutex here; never reacquire its parent's exclusive activity lock.
+		$lock = $this->acquireSettingsLock(false);
+		try {
+			clearstatcache(true, self::SETTINGS_JSON);
+			$existing = @lstat(self::SETTINGS_JSON);
+			if ($existing !== false) {
+				if (($existing['mode'] & 0170000) !== 0100000 || $existing['nlink'] !== 1
+					|| $existing['size'] > SlsConfigCrypto::MAX_FILE_BYTES || !is_readable(self::SETTINGS_JSON)) {
+					throw new \RuntimeException(_('An existing configuration is unreadable, oversized, or an unsafe file. Preserve it and resolve that condition before installation.'));
+				}
+				// Do not open a path that appeared during initialization. The
+				// installer validates its contents with the protected snapshot reader.
+				return false;
+			}
+			clearstatcache(true, self::PENDING_SETTINGS_JSON);
+			if (@lstat(self::PENDING_SETTINGS_JSON) !== false) {
+				throw new \RuntimeException(_('Staged settings exist without an active configuration. Preserve both recovery files and restore the active configuration before installation.'));
+			}
+			if ($phoneCapacity < 25 || $phoneCapacity > 1000) {
+				throw new \DomainException(_('The detected initial phone capacity must be between 25 and 1000.'));
+			}
+			$active = $this->getActiveSettings();
+			$settings = $this->normalizeSettings($active);
+			$settings['phone_device_limit'] = $phoneCapacity;
+			$this->assertDesktopCapacityChange($settings, $active);
+			$this->writeSettingsFileUnlocked(self::SETTINGS_JSON, $settings, false);
+			$this->rememberSettingsFingerprint(self::SETTINGS_JSON);
+			return true;
+		} finally {
+			$this->releaseSettingsLock($lock);
+		}
+	}
+
+	/** The signed installer performs fixed root operations before this phase. */
+	public function installUnprivilegedPhase()
+	{
+		$this->requireRuntimeAccount();
+		$existing = $this->configurationPathMetadata(self::SETTINGS_JSON);
+		if ($existing !== null) {
+			// Validate before repair can change permissions or create a new file.
+			$this->loadSettingsFile(self::SETTINGS_JSON);
 		}
 		$this->ensurePluginDataDir();
 		$this->migrateLegacyTestStatus();
-		$this->ensureSystemDependencies();
-		if (!is_readable(self::SETTINGS_JSON)) {
+		if ($existing === null && $this->configurationPathMetadata(self::SETTINGS_JSON) === null) {
 			$this->persistAppliedSettings($this->getActiveSettings());
 		} else {
-			// Updates and repair operations must never rewrite an existing central config.
+			// Reading an existing deployment must not rewrite its protected settings.
 			$this->getActiveSettings();
-			$this->setPrivateOwnership(self::SETTINGS_JSON);
 		}
-		$this->installRuntimeFiles();
 		$this->ensureBundledSystemRecordings();
-		$this->ensurePiperRuntime();
-		// Older releases created a small, named compatibility-link inventory
-		// inside the protected data directory. Remove only those module-owned
-		// link names before the fail-closed runtime-tree scan; an unexpected
-		// symlink still stops installation or repair.
-		$this->cleanupLegacyRuntimeArtifacts();
-		// FreePBX ownership repair can change the deliberately root-owned Piper
-		// compatibility directory. Rebuild that boundary before the fail-closed
-		// data-tree scan runs.
-		$this->ensureRuntimePermissions();
 		$this->ensureAmiUser();
 		$this->ensureDialplan();
 		$this->ensureSipNotifyTemplates();
-		$this->ensureApacheConfig();
 		$this->ensureMenuPlacement();
 		$this->ensureDashboardWidget();
 		$this->ensureCronJob();
-		$this->ensureOperationalLogRotation();
 		$backupEnrollment = $this->ensureFreePbxBackupEnrollment();
 		if (empty($backupEnrollment['success'])) {
 			throw new \RuntimeException(_('FreePBX backup enrollment could not be verified.'));
 		}
-		if (getenv('SLS_MASS_NOTIFY_DEFER_SIGNING') !== '1') {
-			$this->signLocalModulesIfAvailable(true);
+		return true;
+	}
+
+	private function requireRuntimeAccount()
+	{
+		$account = function_exists('posix_getpwnam') ? posix_getpwnam('asterisk') : false;
+		$uid = function_exists('posix_geteuid') ? posix_geteuid() : -1;
+		if (!is_array($account) || !is_int($account['uid'] ?? null) || $account['uid'] <= 0 || $uid !== $account['uid']) {
+			throw new \RuntimeException(_('FreePBX integration must run as the asterisk service account. Use the signed SLS release installer or General Settings > Repair Installation; do not execute module PHP as root.'));
 		}
-		// Failure state is cleared only by the release installer, the protected
-		// maintenance verifier, or the post-restore verifier after every required
-		// integration postcondition has passed. A successful install() return alone
-		// is deliberately insufficient.
 	}
 
 	public function uninstall()
 	{
+		return $this->uninstallUnprivilegedPhase();
+	}
+
+	/** Fixed root teardown is performed separately by the signed uninstaller. */
+	public function uninstallUnprivilegedPhase()
+	{
+		$this->requireRuntimeAccount();
 		$this->removeFreePbxBackupEnrollment();
 		$this->removeCronJob();
 		$this->removeAmiUsers();
 		$this->removeDashboardWidget();
 		$this->removeMenuPlacement();
-		$this->removePiperWrapper();
-		$this->removeApacheConfig();
 		$this->removeManagedBlock('/etc/asterisk/sip_notify_custom.conf', 'SLS Mass Notifications SIP NOTIFY Templates');
 		$this->removeManagedBlock('/etc/asterisk/extensions_custom.conf', 'SLS Mass Notifications Dialplan');
 		$this->removeManagedBlock('/etc/asterisk/manager_custom.conf', 'SLS Mass Notifications AMI');
@@ -171,9 +294,8 @@ class Slsmassnotifyserver implements \BMO
 		$this->runCommand('/usr/sbin/asterisk -rx ' . escapeshellarg('dialplan reload'));
 		$this->runCommand('/usr/sbin/asterisk -rx ' . escapeshellarg('module reload res_pjsip_notify.so'));
 		$this->runCommand('/usr/sbin/asterisk -rx ' . escapeshellarg('manager reload'));
-		$this->repairPostUninstallSignatures();
-		$this->removeRuntimeIntegrationFiles();
 		$this->deleteInstallFailureNotification();
+		return true;
 	}
 	public function backup()
 	{
@@ -191,7 +313,12 @@ class Slsmassnotifyserver implements \BMO
 	public function restore($backup)
 	{
 		if (is_array($backup) && is_array($backup['settings'] ?? null)) {
+			$errors = $this->validateConfigValueTypes($backup['settings']);
+			if ($errors) { throw new \DomainException(implode(' ', $errors)); }
 			$settings = $this->normalizeSettings($backup['settings']);
+			$this->disableEnterpriseAfterRecovery($settings);
+			foreach ($settings['operator_access']['accounts'] ?? [] as $index => $account) { $settings['operator_access']['accounts'][$index]['enabled'] = false; }
+			foreach ($settings['automations']['rules'] ?? [] as $index => $rule) { $settings['automations']['rules'][$index]['enabled'] = false; }
 			foreach ((array)($settings['scheduled_announcements'] ?? []) as $index => $schedule) {
 				$settings['scheduled_announcements'][$index]['enabled'] = '0';
 			}
@@ -235,24 +362,33 @@ class Slsmassnotifyserver implements \BMO
 				self::SCHEDULE_LOCK_FILE,
 				_('The scheduled-announcement worker did not become idle in time for backup.')
 			);
+			$configLock = $this->acquireSettingsLock(true);
 			$announcementLock = $this->acquireNativeBackupFileLock(
 				self::ANNOUNCEMENT_LOCK_FILE,
 				_('An active announcement did not complete in time for backup.')
 			);
-			$configLock = $this->acquireSettingsLock(true);
 
 			$configRaw = $this->readNativeBackupFile(
 				self::SETTINGS_JSON,
-				self::NATIVE_BACKUP_MAX_CONFIG_BYTES,
+				SlsConfigCrypto::MAX_FILE_BYTES,
 				_('The protected central configuration is unavailable for backup.')
 			);
-			$this->validateNativeBackupConfig($configRaw);
+			$backupSettings = $this->validateNativeBackupConfig($configRaw);
+			if (!SlsConfigCrypto::isEncrypted(json_decode($configRaw, true))) {
+				$configRaw = SlsConfigCrypto::encode($backupSettings);
+			}
 			$configSnapshot = $snapshotDir . '/protected-config.json';
 			$this->writeNativeSnapshotFile($configSnapshot, $configRaw, 0600);
+			$keySnapshot = $snapshotDir . '/protected-config-key.json';
+			$this->writeNativeSnapshotFile($keySnapshot, SlsConfigCrypto::backupKeyring($configRaw), 0600);
 
 			$files = [[
 				'type' => 'slsmassnotify-config',
 				'filename' => basename($configSnapshot),
+				'path' => $snapshotDir,
+			], [
+				'type' => 'slsmassnotify-config-key',
+				'filename' => basename($keySnapshot),
 				'path' => $snapshotDir,
 			]];
 			$manifestFiles = [
@@ -261,6 +397,9 @@ class Slsmassnotifyserver implements \BMO
 					basename($configSnapshot),
 					basename(self::SETTINGS_JSON),
 					$configSnapshot
+				),
+				'key' => $this->nativeBackupFileManifest(
+					'slsmassnotify-config-key', basename($keySnapshot), 'protected-config-key.json', $keySnapshot
 				),
 				'schedule' => null,
 				'tones' => [],
@@ -287,6 +426,18 @@ class Slsmassnotifyserver implements \BMO
 					$ledgerSnapshot
 				);
 			}
+
+            if (file_exists(self::PLUGIN_DATA_DIR.'/sms') || is_link(self::PLUGIN_DATA_DIR.'/sms')) {
+                $smsSnapshot=$snapshotDir.'/sms-ledger.jsonl';
+                $this->announcementSmsStore()->exportSnapshot($smsSnapshot);
+                $files[]=['type'=>'slsmassnotify-sms','filename'=>'sms-ledger.jsonl','path'=>$snapshotDir];
+                $manifestFiles['sms']=$this->nativeBackupFileManifest('slsmassnotify-sms','sms-ledger.jsonl','sms-ledger.jsonl',$smsSnapshot);
+            }
+
+			$operationalSnapshot = $snapshotDir . '/operational-evidence.jsonl';
+			$this->operationalBackupCommand('snapshot', $operationalSnapshot);
+			$files[] = ['type' => 'slsmassnotify-operational', 'filename' => 'operational-evidence.jsonl', 'path' => $snapshotDir];
+			$manifestFiles['operational'] = $this->nativeBackupFileManifest('slsmassnotify-operational', 'operational-evidence.jsonl', 'operational-evidence.jsonl', $operationalSnapshot);
 
 			$bundledTones = array_fill_keys([
 				self::DEFAULT_ANNOUNCEMENT_OPENING_TONE,
@@ -341,12 +492,15 @@ class Slsmassnotifyserver implements \BMO
 					'past_occurrences' => 'mark_uncertain',
 					'missing_ledger' => 'disable_schedules',
 					'timezone_change' => 'disable_schedules',
+					'operational_history' => 'archive_only_no_replay',
+					'weather_automation' => 'disable_for_review',
 				],
 			];
+			$this->auditSensitiveExport('native', $backupSettings);
 			$this->updateStatusData([
 				'last_native_backup_at' => gmdate('c'),
 				'last_native_backup_status' => 'ok',
-				'last_native_backup_message' => _('Protected configuration, scheduling state, and custom tones were snapshotted for FreePBX Backup.'),
+				'last_native_backup_message' => _('Encrypted configuration, its recovery key, scheduling state, custom tones and operational evidence were snapshotted for FreePBX Backup.'),
 			]);
 			return [
 				'manifest' => $manifest,
@@ -386,24 +540,26 @@ class Slsmassnotifyserver implements \BMO
 			(string)($validatedManifest['source_timezone'] ?? ''),
 			time()
 		);
-		$this->commitNativeRestorePayload(
+		$restoreWarnings = $this->commitNativeRestorePayload(
 			$prepared['config_raw'],
 			$prepared['schedule_raw'],
 			$prepared['schedule_present'],
 			$payload['tones'],
 			$transactionId,
-			$prepared['warnings']
+			$prepared['warnings'],
+            $payload['sms']??null,
+			$payload['operational'] ?? null
 		);
 		$this->updateStatusData([
 			'last_native_restore_at' => gmdate('c'),
-			'last_native_restore_status' => empty($prepared['warnings']) ? 'ok' : 'warning',
-			'last_native_restore_message' => empty($prepared['warnings'])
+			'last_native_restore_status' => empty($restoreWarnings) ? 'ok' : 'warning',
+			'last_native_restore_message' => empty($restoreWarnings)
 				? _('FreePBX restored the protected Mass Notifications data. Integration repair is pending.')
-				: implode(' ', $prepared['warnings']),
+				: implode(' ', $restoreWarnings),
 		]);
 		return [
 			'success' => true,
-			'warnings' => $prepared['warnings'],
+			'warnings' => $restoreWarnings,
 		];
 	}
 
@@ -424,23 +580,10 @@ class Slsmassnotifyserver implements \BMO
 			throw new \RuntimeException(_('Mass Notifications restore integration repair failed.'));
 		}
 
-		$effectiveUid = function_exists('posix_geteuid') ? (int)posix_geteuid() : -1;
-		if ($effectiveUid === 0) {
-			try {
-				$this->verifyProtectedRepairIntegration();
-			} catch (\Throwable $e) {
-				$this->updateStatusData([
-					'last_native_restore_status' => 'fault',
-					'last_native_restore_message' => $this->sanitizeScheduleText($e->getMessage(), 300, true),
-				]);
-				throw $e;
-			}
-		} else {
-			$this->updateStatusData([
-				'last_native_restore_status' => 'warning',
-				'last_native_restore_message' => _('Protected data was restored; root integration repair was queued.'),
-			]);
-		}
+		$this->updateStatusData([
+			'last_native_restore_status' => 'warning',
+			'last_native_restore_message' => _('Protected data was restored; authenticated integration repair was queued.'),
+		]);
 		return true;
 	}
 
@@ -448,6 +591,19 @@ class Slsmassnotifyserver implements \BMO
 	 * Verify every safety-critical postcondition before a protected repair may
 	 * clear the persistent install-failure warning.
 	 */
+	public function verifyUnprivilegedIntegration()
+	{
+		$this->requireRuntimeAccount();
+		return $this->verifyNativePostRestoreIntegration(false);
+	}
+
+	/** Called after the root helper and unprivileged verifier both succeed. */
+	public function finalizeVerifiedUnprivilegedRestore()
+	{
+		$this->requireRuntimeAccount();
+		return $this->finalizeNativeRestoreAfterVerifiedRepair();
+	}
+
 	public function verifyProtectedRepairIntegration()
 	{
 		$effectiveUid = function_exists('posix_geteuid') ? (int)posix_geteuid() : -1;
@@ -635,13 +791,29 @@ class Slsmassnotifyserver implements \BMO
 		}
 		return $health;
 	}
-	public function doConfigPageInit($page) {}
+	public function myConfigPageInits() { return ['index']; }
+	public function doConfigPageInit($page)
+	{
+		if ($page === 'index') {
+			// Register before Dashboard inserts widgets containing external CDN scripts.
+			$revision = substr(hash_file('sha256', __DIR__ . '/views/dashboard_assets.js'), 0, 16);
+			echo '<script src="modules/slsmassnotifyserver/views/dashboard_assets.js?v=' . $revision . '"></script>';
+		} elseif (is_string($page) && str_starts_with($page, 'slsmassnotifyserver')) {
+			$this->enforceOperatorPageAccess($page);
+		}
+	}
 	public function getRightNav($request) {}
 	public function getActionBar($request) {}
 
 	/** Apply staged settings as part of FreePBX's native Apply Config/reload. */
 	public function genConfig()
 	{
+		// A release reload regenerates PBX integration from active settings. It
+		// must preserve the administrator's staged changes for their own Apply.
+		if (PHP_SAPI === 'cli' && getenv('SLS_MASS_NOTIFY_PRESERVE_PENDING') === '1') {
+			$this->requireRuntimeAccount();
+			return [];
+		}
 		if ($this->getPendingSettings() === null) {
 			return [];
 		}
@@ -697,11 +869,16 @@ class Slsmassnotifyserver implements \BMO
 		}
 
 		switch ($page) {
+			case 'paging':
+				return $this->renderLivePagingPage($params);
 			case 'setup':
 				return $this->renderSetupWizard($pendingSettings ?? $activeSettings, $activeSettings, $params['save_result'] ?? null, false);
 			case 'detail':
+					$event = $this->getEventById($params['id'] ?? '');
 					return load_view(__DIR__ . '/views/detail.php', [
-						'event' => $this->getEventById($params['id'] ?? ''),
+						'event' => $event,
+						'weather_delivery' => $event ? \SLS\MassNotify\WeatherDeliveryReceipts::forEvent(self::PLUGIN_DATA_DIR, $event, $activeSettings) : [],
+						'log_notices' => $this->getUiLogNotices('events'),
 						'hero_image' => self::HERO_IMAGE,
 				]);
 			case 'settings':
@@ -711,6 +888,8 @@ class Slsmassnotifyserver implements \BMO
 					'available_voices' => $this->getAvailablePiperVoices(),
 					'available_extensions' => $this->getAllPjsipExtensions(),
 					'available_desktop_clients' => $this->getDesktopClients($pendingSettings ?? $activeSettings),
+					'weather_voice_recipients' => $this->getOutboundVoiceRecipients($pendingSettings ?? $activeSettings),
+					'weather_sms_recipients' => $this->getAnnouncementSmsRecipients($pendingSettings ?? $activeSettings),
 					'settings' => $pendingSettings ?? $activeSettings,
 					'active_settings' => $activeSettings,
 					'has_pending_changes' => $pendingSettings !== null,
@@ -729,6 +908,8 @@ class Slsmassnotifyserver implements \BMO
 					'available_voices' => $this->getAvailablePiperVoices(),
 					'available_extensions' => $this->getAllPjsipExtensions(),
 					'available_desktop_clients' => $this->getDesktopClients($pendingSettings ?? $activeSettings),
+					'weather_voice_recipients' => $this->getOutboundVoiceRecipients($pendingSettings ?? $activeSettings),
+					'weather_sms_recipients' => $this->getAnnouncementSmsRecipients($pendingSettings ?? $activeSettings),
 					'settings' => $pendingSettings ?? $activeSettings,
 					'active_settings' => $activeSettings,
 					'has_pending_changes' => $pendingSettings !== null,
@@ -750,6 +931,8 @@ class Slsmassnotifyserver implements \BMO
 					'has_pending_changes' => $pendingSettings !== null,
 					'available_extensions' => $this->getAllPjsipExtensions(),
 					'available_desktop_clients' => $this->getDesktopClients($pendingSettings ?? $activeSettings),
+					'weather_voice_recipients' => $this->getOutboundVoiceRecipients($pendingSettings ?? $activeSettings),
+					'weather_sms_recipients' => $this->getAnnouncementSmsRecipients($pendingSettings ?? $activeSettings),
 					'available_tones' => $this->getAvailableTones(),
 					'available_system_sounds' => $this->getAvailableSystemSounds(),
 					'save_result' => $params['save_result'] ?? null,
@@ -770,8 +953,12 @@ class Slsmassnotifyserver implements \BMO
 					'available_extensions' => $this->getAllPjsipExtensions(),
 					'announcement_groups' => $this->getAnnouncementGroups(),
 					'desktop_clients' => $this->getDesktopClients($activeSettings),
+					'outbound_voice_recipients' => $this->getOutboundVoiceRecipients($activeSettings),
+					'announcement_email_recipients' => $this->getAnnouncementEmailRecipients($activeSettings),
+					'announcement_sms_recipients' => $this->getAnnouncementSmsRecipients($activeSettings),
 					'available_voices' => $this->getAvailablePiperVoices(),
 					'available_tones' => $this->getAvailableTones(),
+					'available_system_sounds' => $this->getAvailableSystemSounds(),
 					'pbx_timezone' => $this->getPbxDateTimeZone()->getName(),
 					'save_result' => $params['save_result'] ?? null,
 					'hero_image' => self::HERO_IMAGE,
@@ -779,8 +966,11 @@ class Slsmassnotifyserver implements \BMO
 				]);
 			case 'other_settings':
 				return load_view(__DIR__ . '/views/other_settings.php', [
+					'configuration_backup_reminder' => $this->getConfigurationBackupReminder(),
 					'settings' => $pendingSettings ?? $activeSettings,
 					'active_settings' => $activeSettings,
+					'api_credentials' => $this->apiCredentialMetadata(),
+					'announcement_sms_usage' => $this->getAnnouncementSmsUsage(),
 					'has_pending_changes' => $pendingSettings !== null,
 					'save_result' => $params['save_result'] ?? null,
 					'apply_result' => $params['apply_result'] ?? null,
@@ -790,6 +980,8 @@ class Slsmassnotifyserver implements \BMO
 					'available_tones' => $this->getAvailableTones(),
 					'available_system_sounds' => $this->getAvailableSystemSounds(),
 					'desktop_clients' => $this->getDesktopClients($pendingSettings ?? $activeSettings, true),
+					'outbound_voice_trunks' => $this->getOutboundVoiceTrunks(),
+					'outbound_voice_dids' => $this->getOutboundVoiceDids(),
 					'control_api_url' => $this->getControlApiUrl($pendingSettings ?? $activeSettings),
 						'package_version' => self::MODULE_VERSION,
 						'package_update_status' => $this->getPackageUpdateStatus(),
@@ -814,6 +1006,7 @@ class Slsmassnotifyserver implements \BMO
 				$date = $this->sanitizeLogDate($params['log_date'] ?? '');
 				return load_view(__DIR__ . '/views/main.php', [
 					'events' => $this->getEvents($limit, $type, $date),
+					'log_notices' => $this->getUiLogNotices('events'),
 					'status_summary' => $this->getStatusSummary(),
 					'announcement_targets' => $this->getSipNotifyTargets(),
 					'announcement_cooldown_remaining' => $this->getAnnouncementCooldownState()['remaining'],
@@ -864,6 +1057,7 @@ class Slsmassnotifyserver implements \BMO
 			'available_tones' => $this->getAvailableTones(),
 			'available_system_sounds' => $this->getAvailableSystemSounds(),
 			'project_url' => 'https://southlandservers.xyz/projects',
+			'pbx_timezone' => $this->getPbxDateTimeZone()->getName(),
 			'discord_url' => 'https://southlandservers.xyz/discord',
 			'github_url' => 'https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server',
 			'eula_text' => $this->getEulaText(),
@@ -882,9 +1076,33 @@ class Slsmassnotifyserver implements \BMO
 		return 'Southland Servers Mass Notifications Server is provided as-is, without warranty, and at your own risk.';
 	}
 
+	/** Parse only explicit setup address/capacity edits; saved credentials and routes are untouched. */
+	private function readSetupConnectionPreferences(array $settings, array $input): array
+	{
+		if (array_key_exists('pbx_timezone', $input)) {
+			$zone = $input['pbx_timezone'];
+			if (!is_string($zone) || !in_array($zone, \DateTimeZone::listIdentifiers(\DateTimeZone::ALL_WITH_BC), true)) { throw new \DomainException(_('Select a valid IANA PBX timezone.')); }
+			$settings['pbx_timezone'] = $zone;
+		}
+		if (($input['sls_address_change'] ?? '') === '1') {
+			$settings = SlsAdvertisedAddress::migrate($settings, $input);
+		}
+		foreach (['desktop_client_limit'=>_('Desktop capacity'), 'phone_device_limit'=>_('Phone capacity')] as $field=>$label) {
+			if (!array_key_exists($field, $input)) { continue; }
+			if (!is_string($input[$field]) || !preg_match('/^[1-9][0-9]{0,3}$/D', $input[$field]) || (int)$input[$field] > 1000) {
+				throw new \DomainException(sprintf(_('%s must be a whole number from 1 to 1000.'), $label));
+			}
+			$settings[$field] = (int)$input[$field];
+		}
+		return $settings;
+	}
+
 	public function saveSetupWizard(array $input)
 	{
 		$errors = [];
+		if (isset($input['sls_setup_form_present']) && ($input['sls_setup_form_complete'] ?? '') !== '1') {
+			return ['success'=>false, 'message'=>_('The setup form was incomplete. Reload the page before saving; no settings were changed.'), 'errors'=>[]];
+		}
 		// Setup replaces any stale staged settings. Capture their revision now so
 		// a concurrent authenticated save cannot be deleted after this request has
 		// finished building its active configuration.
@@ -917,6 +1135,8 @@ class Slsmassnotifyserver implements \BMO
 			$currentPbxHost = $browserPbxHost;
 		}
 		$settings['public_pbx_host'] = $currentPbxHost ?: $this->detectPbxHost();
+		try { $settings = $this->readSetupConnectionPreferences($settings, $input); }
+		catch (\DomainException $error) { return ['success'=>false, 'message'=>$error->getMessage(), 'errors'=>[]]; }
 		if ($settings['enabled'] === '1') {
 			$settings['nws_api_base_url'] = $this->normalizeNwsApiBaseUrl((string)($input['nws_api_base_url'] ?? $settings['nws_api_base_url'] ?? 'https://api.weather.gov')) ?: 'https://api.weather.gov';
 			$settings['nws_zone'] = $this->normalizeNwsZone((string)($input['nws_zone'] ?? ''));
@@ -1014,6 +1234,7 @@ class Slsmassnotifyserver implements \BMO
 		$currentXweather = is_array($settings['xweather'] ?? null) ? $settings['xweather'] : [];
 		$currentXweather = $this->normalizeXweatherSettings($currentXweather, $settings['nws_tts_volume'] ?? 25);
 		$submittedXweather = is_array($input['xweather'] ?? null) ? $input['xweather'] : [];
+		$errors = array_merge($errors, $this->validateXweatherAdaptivePolicyInput($submittedXweather));
 		if (empty($submittedXweather['enabled'])) {
 			// Hidden optional fields are disabled in the browser. Preserve their saved values when Lightning is declined.
 			$setupXweather = $currentXweather;
@@ -1061,14 +1282,14 @@ class Slsmassnotifyserver implements \BMO
 				}
 			}
 		}
-		if (trim((string)($setupXweather['client_secret'] ?? '')) === '') {
+		if (trim((string)($setupXweather['client_secret'] ?? '')) === '' && ($setupXweather['provider']??'xweather') === ($currentXweather['provider']??'xweather')) {
 			$setupXweather['client_secret'] = $currentXweather['client_secret'] ?? '';
 		}
 		$lightningDefaultVolume = $this->normalizeTtsVolume($input['nws_tts_volume'] ?? $settings['nws_tts_volume'] ?? 25, 25);
 		$settings['xweather'] = $this->normalizeXweatherSettings($setupXweather, $lightningDefaultVolume);
 		if ($settings['xweather']['enabled'] === '1') {
-			if ($settings['xweather']['client_id'] === '' || $settings['xweather']['client_secret'] === '') {
-				$errors[] = _('Enabled lightning alerts require Xweather credentials.');
+			if ($settings['xweather']['client_id'] === '' || ($settings['xweather']['provider'] !== 'tempest' && $settings['xweather']['client_secret'] === '')) {
+				$errors[] = _('Enabled lightning alerts require the selected provider’s credentials.');
 			}
 			if ($settings['xweather']['adaptive_free_tier'] === '1' && empty($settings['enabled'])) {
 				$errors[] = _('Free-tier adaptive lightning polling requires Weather Alerts to be enabled with at least one weather zone.');
@@ -1078,7 +1299,8 @@ class Slsmassnotifyserver implements \BMO
 			foreach ($settings['xweather']['groups'] as $group) {
 				if (($group['enabled'] ?? '0') !== '1') continue;
 				$enabledLightningGroups++;
-				if (($group['location'] ?? '') === '' || (empty($group['extensions']) && empty($group['desktop_clients']))) {
+                if (($settings['xweather']['provider']??'xweather')!=='xweather' && !preg_match('/^-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?$/D', (string)($group['location']??''))) { $errors[]=_('Tempest and Meteomatics need latitude,longitude coordinates for each area.'); }
+				if (($group['location'] ?? '') === '' || !$this->xweatherGroupHasDeliveryDestination($group, $settings)) {
 					$errors[] = sprintf(_('Lightning group "%s" requires a location and at least one phone or desktop recipient.'), $group['name'] ?? '');
 				}
 				if ($settings['xweather']['adaptive_free_tier'] === '1' && !in_array($group['adaptive_nws_zone_id'], $validZoneIds, true)) {
@@ -1101,7 +1323,7 @@ class Slsmassnotifyserver implements \BMO
 
 		$sipnotify = is_array($settings['sipnotify'] ?? null) ? $settings['sipnotify'] : [];
 		$sipnotify['pbx_host'] = $settings['public_pbx_host'];
-		$sipnotify['media_scheme'] = $this->normalizePhoneMediaScheme((string)($input['sipnotify_media_scheme'] ?? $sipnotify['media_scheme'] ?? 'http'));
+		$sipnotify['media_scheme'] = $this->normalizePhoneMediaScheme((string)($input['sipnotify_media_scheme'] ?? $sipnotify['media_scheme'] ?? 'https'));
 		$settings['sipnotify'] = $this->normalizeSipNotifySettings($sipnotify);
 
 		$voices = array_fill_keys(array_column($this->getAvailablePiperVoices(), 'path'), true);
@@ -1119,6 +1341,11 @@ class Slsmassnotifyserver implements \BMO
 		$settings['tts_max_seconds'] = $this->normalizeTtsMaxSeconds($input['tts_max_seconds'] ?? $settings['tts_max_seconds'] ?? 30);
 		$settings['announcement_cooldown_seconds'] = $this->normalizeAnnouncementCooldownSeconds($input['announcement_cooldown_seconds'] ?? $settings['announcement_cooldown_seconds'] ?? self::ANNOUNCEMENT_COOLDOWN_SECONDS);
 		$settings['log_retention_days'] = $this->normalizeRetentionDays($input['log_retention_days'] ?? $settings['log_retention_days'] ?? 90);
+		$mediaLimit = $input['generated_media_cache_mib'] ?? $settings['generated_media_cache_mib'] ?? 512;
+		if (filter_var($mediaLimit, FILTER_VALIDATE_INT, ['options'=>['min_range'=>64, 'max_range'=>4096]]) === false) {
+			return ['success'=>false, 'message'=>_('Generated-media cache target must be a whole number from 64 through 4096 MiB.')];
+		}
+		$settings['generated_media_cache_mib'] = (int)$mediaLimit;
 		$settings['setup'] = [
 			'completed' => empty($errors) ? '1' : '0',
 			'beta_accepted' => empty($input['beta_agree']) ? '0' : '1',
@@ -1137,6 +1364,15 @@ class Slsmassnotifyserver implements \BMO
 
 		try {
 			$this->persistAppliedSettings($this->normalizeSettings($settings), true, true);
+			if (!empty($settings['pbx_timezone']) && $settings['pbx_timezone'] !== $this->getPbxDateTimeZone()->getName()) {
+				$marker = self::PLUGIN_DATA_DIR . '/timezone.request';
+				if (is_link($marker)) { throw new \RuntimeException(_('Timezone apply request is unsafe. Run Repair Installation.')); }
+				if (!file_exists($marker)) {
+					$handle = @fopen($marker, 'x');
+					if (!$handle) { throw new \RuntimeException(_('Setup was saved, but the timezone could not be queued. Check protected data permissions.')); }
+					fwrite($handle, "1\n"); fclose($handle); chmod($marker, 0640);
+				}
+			}
 		} catch (\Throwable $e) {
 			return [
 				'success' => false,
@@ -1329,6 +1565,11 @@ class Slsmassnotifyserver implements \BMO
 		$settings = $this->getPendingSettings() ?? $this->getActiveSettings();
 		$current = is_array($settings['xweather'] ?? null) ? $settings['xweather'] : [];
 		$incoming = is_array($input['xweather'] ?? null) ? $input['xweather'] : [];
+		foreach (['adaptive_gate_failure_policy' => 'standby', 'adaptive_fallback_minutes' => 30] as $field => $default) {
+			if (!array_key_exists($field, $incoming)) { $incoming[$field] = $current[$field] ?? $default; }
+		}
+		$policyErrors = $this->validateXweatherAdaptivePolicyInput($incoming);
+		if ($policyErrors) { return ['success' => false, 'message' => _('Lightning settings were not saved.'), 'errors' => $policyErrors]; }
 		if (!empty($incoming['groups_present']) && !array_key_exists('groups', $incoming)) {
 			$incoming['groups'] = [];
 		}
@@ -1344,7 +1585,7 @@ class Slsmassnotifyserver implements \BMO
 			}
 		}
 		if (trim((string)($incoming['client_secret'] ?? '')) === '') {
-			$incoming['client_secret'] = $current['client_secret'] ?? '';
+			$incoming['client_secret'] = ($incoming['provider'] ?? 'xweather') === ($current['provider'] ?? 'xweather') ? ($current['client_secret'] ?? '') : '';
 		}
 		$errors = array_merge($errors, $this->validateXweatherGroupsInput($incoming['groups'] ?? []));
 		$xweather = $this->normalizeXweatherSettings($incoming, $settings['nws_tts_volume'] ?? 25);
@@ -1356,8 +1597,8 @@ class Slsmassnotifyserver implements \BMO
 			}
 		}
 		if ($xweather['enabled'] === '1') {
-			if ($xweather['client_id'] === '' || $xweather['client_secret'] === '') {
-				$errors[] = _('Enabled lightning alerts require an Xweather client ID and client secret.');
+			if ($xweather['client_id'] === '' || ($xweather['provider'] !== 'tempest' && $xweather['client_secret'] === '')) {
+				$errors[] = _('Enabled lightning alerts require the selected provider’s credentials. Tempest needs an API key; Xweather and Meteomatics also need the secret/password.');
 			}
 			if ($xweather['adaptive_free_tier'] === '1' && empty($settings['enabled'])) {
 				$errors[] = _('Free-tier adaptive lightning polling requires Weather Alerts to be enabled with at least one weather zone.');
@@ -1370,6 +1611,7 @@ class Slsmassnotifyserver implements \BMO
 				}
 				$enabledGroups++;
 				$label = (string)($group['name'] ?? _('Lightning group'));
+                if ($xweather['provider']!=='xweather' && !preg_match('/^-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?$/D', (string)($group['location']??''))) { $errors[]=_('Tempest and Meteomatics need latitude,longitude coordinates for each area.'); }
 				if (($group['location'] ?? '') === '') {
 					$errors[] = sprintf(_('Lightning group "%s" requires an Xweather location.'), $label);
 				}
@@ -1405,6 +1647,9 @@ class Slsmassnotifyserver implements \BMO
 
 	public function saveOtherSettings(array $input, array $files = [])
 	{
+		if ((!empty($input['sls_general_form_present']) || !empty($input['desktop_clients_present'])) && empty($input['sls_general_form_complete'])) {
+			return ['success' => false, 'message' => _('The server received an incomplete settings form. Enable JavaScript and reload this page. No settings were saved.'), 'errors' => []];
+		}
 		if (!$this->isSetupComplete($this->getActiveSettings())) {
 			return [
 				'success' => false,
@@ -1443,10 +1688,25 @@ class Slsmassnotifyserver implements \BMO
 		$settings['opening_tone'] = $openingTone === '' || isset($availableToneLookup[$openingTone]) ? $openingTone : $defaults['opening_tone'];
 		$settings['closing_tone'] = $closingTone === '' || isset($availableToneLookup[$closingTone]) ? $closingTone : $defaults['closing_tone'];
 
-		// Public PBX Hostname is automatically detected and cannot be edited here.
+		// Address migration is explicit; routine saves preserve the advertised host and ports.
 		$settings['public_pbx_host'] = $this->normalizePbxHost((string)($settings['public_pbx_host'] ?? '')) ?: $this->detectPbxHost();
+		if (($input['sls_address_change'] ?? '') === '1') {
+			try { $settings = SlsAdvertisedAddress::migrate($settings, $input); }
+			catch (\DomainException $error) { return ['success' => false, 'message' => $error->getMessage(), 'errors' => []]; }
+		}
 		$control = is_array($input['control_api'] ?? null) ? $input['control_api'] : [];
 		$currentControl = is_array($settings['control_api'] ?? null) ? $settings['control_api'] : $defaults['control_api'];
+		try {
+			$credentials = \SLS\MassNotify\ApiSecurity::credentials($currentControl['credentials'] ?? []);
+			if (array_key_exists('trusted_proxy_cidrs', $input)) {
+				if (!is_string($input['trusted_proxy_cidrs'])) { throw new \DomainException(_('Trusted proxies must be entered as one CIDR network per line.')); }
+				$settings['api_network'] = \SLS\MassNotify\ApiSecurity::network(['trusted_proxy_cidrs' => preg_split('/[\s,]+/', trim($input['trusted_proxy_cidrs']), -1, PREG_SPLIT_NO_EMPTY)]);
+			}
+			if (array_key_exists('media_access', $input)) {
+				if (!is_array($input['media_access'])) { throw new \DomainException(_('Media access settings must be an object.')); }
+				$settings['media_access'] = \SLS\MassNotify\MediaAccess::form($input['media_access']);
+			}
+		} catch (\DomainException $error) { return ['success' => false, 'message' => $error->getMessage(), 'errors' => []]; }
 		$apiKey = trim((string)($control['api_key'] ?? $currentControl['api_key'] ?? ''));
 		if ($apiKey === '' || !preg_match('/^[A-Za-z0-9_-]{24,128}$/', $apiKey)) {
 			$apiKey = $this->generateApiKey();
@@ -1454,16 +1714,18 @@ class Slsmassnotifyserver implements \BMO
 		$settings['control_api'] = [
 			'enabled' => empty($control['enabled']) ? '0' : '1',
 			'api_key' => $apiKey,
+			'credentials' => $credentials,
 			'base_url' => $this->getControlApiUrl($settings),
 			'ip_allowlist_enabled' => empty($control['ip_allowlist_enabled']) ? '0' : '1',
 			'ip_allowlist' => $this->normalizeIpAllowlist((string)($control['ip_allowlist'] ?? $currentControl['ip_allowlist'] ?? '')),
 			'rate_limit_enabled' => empty($control['rate_limit_enabled']) ? '0' : '1',
+			'audit_syslog' => ($control['audit_syslog'] ?? $currentControl['audit_syslog'] ?? '0') === '1' ? '1' : '0',
 			'rate_limit_per_minute' => $this->normalizeInt($control['rate_limit_per_minute'] ?? $currentControl['rate_limit_per_minute'] ?? 60, 1, 600, 60),
 			'audit_retention_days' => 30,
 		];
 		$sipnotifySettings = is_array($settings['sipnotify'] ?? null) ? $settings['sipnotify'] : [];
 		$sipnotifySettings['pbx_host'] = $settings['public_pbx_host'];
-		$sipnotifySettings['media_scheme'] = $this->normalizePhoneMediaScheme((string)($input['sipnotify_media_scheme'] ?? $sipnotifySettings['media_scheme'] ?? 'http'));
+		$sipnotifySettings['media_scheme'] = $this->normalizePhoneMediaScheme((string)($input['sipnotify_media_scheme'] ?? $sipnotifySettings['media_scheme'] ?? 'https'));
 		$formatOverrideInput = $input['sipnotify_format_overrides'] ?? (!empty($input['sipnotify_format_overrides_present']) ? [] : ($sipnotifySettings['format_overrides'] ?? []));
 		$sipnotifySettings['format_overrides'] = $this->normalizeEndpointFormatOverrides($formatOverrideInput);
 		$deviceOverrideInput = $input['sipnotify_device_overrides'] ?? (!empty($input['sipnotify_device_overrides_present']) ? [] : ($sipnotifySettings['device_format_overrides'] ?? []));
@@ -1547,15 +1809,61 @@ class Slsmassnotifyserver implements \BMO
 			$settings['test_profiles'] = $this->normalizeTestProfiles($input['test_profiles'] ?? []);
 		}
 		$settings['log_retention_days'] = $this->normalizeRetentionDays($input['log_retention_days'] ?? $settings['log_retention_days'] ?? 90);
+		$mediaLimit = $input['generated_media_cache_mib'] ?? $settings['generated_media_cache_mib'] ?? 512;
+		if (filter_var($mediaLimit, FILTER_VALIDATE_INT, ['options'=>['min_range'=>64, 'max_range'=>4096]]) === false) {
+			return ['success'=>false, 'message'=>_('Generated-media cache target must be a whole number from 64 through 4096 MiB.')];
+		}
+		$settings['generated_media_cache_mib'] = (int)$mediaLimit;
 		$updates = is_array($input['updates'] ?? null) ? $input['updates'] : [];
-		$settings['updates'] = [
-			'github_enabled' => empty($updates['github_enabled']) ? '0' : '1',
-			'repository' => 'vipgabe09267/SouthlandServers_Mass_Notify_server',
-			'channel' => 'beta',
-		];
+		try { $settings['updates'] = \SLS\MassNotify\UpdatePolicy::form($updates, (array)($settings['updates'] ?? [])); }
+		catch (\DomainException $error) { return ['success'=>false, 'message'=>$error->getMessage(), 'errors'=>[$error->getMessage()]]; }
 		$settings['announcement_groups'] = $settings['announcement_groups'] ?? [];
 		$settings['desktop_auth_key'] = $this->normalizeDesktopAuthKey($settings['desktop_auth_key'] ?? '');
+		$limitInput = $input['desktop_client_limit'] ?? $settings['desktop_client_limit'] ?? 25;
+		if (filter_var($limitInput, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1, 'max_range' => 1000]]) === false) {
+			return ['success' => false, 'message' => _('Desktop Capacity must be a whole number from 1 to 1000.'), 'errors' => []];
+		}
+		$settings['desktop_client_limit'] = (int)$limitInput;
+		$minimumVersion = $input['desktop_minimum_version'] ?? $settings['desktop_minimum_version'] ?? '';
+		if (!\SLS\MassNotify\DesktopFleet::validMinimum($minimumVersion)) {
+			return ['success'=>false, 'message'=>_('Minimum desktop version must be empty or a version such as 1.2.3 or 1.2.3-beta.1.'), 'errors'=>[]];
+		}
+		$settings['desktop_minimum_version'] = $minimumVersion;
+		try {
+			if (array_key_exists('announcement_pronunciation_text', $input)) {
+				$settings['announcement_pronunciation'] = \SLS\MassNotify\SpeechRules::fromText($input['announcement_pronunciation_text']);
+			}
+		} catch (\DomainException $error) { return ['success'=>false, 'message'=>$error->getMessage(), 'errors'=>[]]; }
+		$phoneLimitInput = $input['phone_device_limit'] ?? $settings['phone_device_limit'] ?? 25;
+		if (filter_var($phoneLimitInput, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1, 'max_range' => 1000]]) === false) {
+			return ['success' => false, 'message' => _('Phone Capacity must be a whole number from 1 to 1000 registered device contacts.'), 'errors' => []];
+		}
+		$settings['phone_device_limit'] = (int)$phoneLimitInput;
+		// Recipient edits live in the directory. A provider form opened earlier
+		// must not replace a more recent saved recipient or renewed SMS consent.
+		if (($input['recipient_directory_managed'] ?? '') === '1') {
+			foreach (['outbound_voice', 'announcement_email', 'announcement_sms'] as $channel) {
+				$input[$channel . '_recipients_json'] = json_encode($settings[$channel]['recipients'] ?? [], JSON_THROW_ON_ERROR);
+				$input[$channel . '_complete'] = '1';
+			}
+		}
+		try { $settings['outbound_voice'] = $this->readOutboundVoiceForm($input, $settings['outbound_voice'] ?? $this->defaultOutboundVoice()); }
+		catch (\DomainException $error) { return ['success' => false, 'message' => $error->getMessage(), 'errors' => []]; }
+		try { $settings['announcement_email'] = $this->readAnnouncementEmailForm($input, $settings['announcement_email'] ?? $this->defaultAnnouncementEmail()); }
+		catch (\DomainException $error) { return ['success' => false, 'message' => $error->getMessage(), 'errors' => []]; }
+		try { $settings['announcement_sms'] = $this->readAnnouncementSmsForm($input, $settings['announcement_sms'] ?? $this->defaultAnnouncementSms()); }
+		catch (\DomainException $error) { return ['success' => false, 'message' => $error->getMessage(), 'errors' => []]; }
 		$desktopClientInput = $input['desktop_clients'] ?? $settings['desktop_clients'] ?? [];
+		if (!empty($input['desktop_clients_json'])) {
+			$clientJson = $input['desktop_clients_json'];
+			$decodedClients = is_string($clientJson) && strlen($clientJson) <= 1024 * 1024 ? json_decode($clientJson, true, 16) : null;
+			if (!is_array($decodedClients) || !array_is_list($decodedClients) || count($decodedClients) > 1000) {
+				return ['success' => false, 'message' => _('Desktop client data is invalid or exceeds the 1000-client limit. Reload the page before saving.'), 'errors' => []];
+			}
+			$desktopClientInput = $decodedClients;
+		} elseif (!empty($input['desktop_clients_present']) && empty($input['desktop_clients_complete'])) {
+			return ['success' => false, 'message' => _('The server received an incomplete desktop client form. Enable JavaScript and reload the page; no clients were changed.'), 'errors' => []];
+		}
 		$existingClientIds = [];
 		$existingClientUsernames = [];
 		foreach ((array)($settings['desktop_clients'] ?? []) as $existingClient) {
@@ -1576,7 +1884,8 @@ class Slsmassnotifyserver implements \BMO
 				$desktopClientInput[$index]['client_id'] = '';
 			}
 		}
-		$desktopIdentifierErrors = $this->validateDesktopClientIdentifiers($desktopClientInput);
+		$desktopIdentifierErrors = array_merge($this->validateDesktopClientIdentifiers($desktopClientInput),
+			$this->validateDesktopCapacityConfig(['desktop_client_limit' => $settings['desktop_client_limit'], 'desktop_clients' => $desktopClientInput]));
 		if (!empty($desktopIdentifierErrors)) {
 			return [
 				'success' => false,
@@ -1585,6 +1894,10 @@ class Slsmassnotifyserver implements \BMO
 			];
 		}
 		$settings['desktop_clients'] = $this->normalizeDesktopClients($desktopClientInput, $settings);
+		$normalizedClientErrors = $this->validateDesktopClientIdentifiers($settings['desktop_clients']);
+		if ($normalizedClientErrors) {
+			return ['success' => false, 'message' => _('Desktop identifiers conflict. Reload the client list and save again.'), 'errors' => $normalizedClientErrors];
+		}
 		$newClientUsernames = [];
 		foreach ($settings['desktop_clients'] as $desktopClient) {
 			$desktopId = preg_replace('/[^A-Za-z0-9_-]/', '', (string)($desktopClient['id'] ?? ''));
@@ -1632,7 +1945,7 @@ class Slsmassnotifyserver implements \BMO
 		} catch (\Throwable $e) {
 			return [
 				'success' => false,
-				'message' => _('Other settings were saved with warnings.'),
+				'message' => _('General settings were not saved. Review the specific error below; your active configuration is unchanged.'),
 				'errors' => [$e->getMessage()],
 			];
 		}
@@ -1677,16 +1990,46 @@ class Slsmassnotifyserver implements \BMO
 	public function exportConfig()
 	{
 		$settings = $this->getActiveSettings();
+		$encoded = $this->encodeConfigExport($settings);
+		$this->auditSensitiveExport('plain', $settings);
+		$this->updateStatusData(['last_config_export_at' => time(), 'last_config_export_kind' => 'plain']);
+		return $encoded;
+	}
+
+	private function encodeConfigExport(array $settings)
+	{
 		$payload = [
 			'product' => 'Southland Servers Mass Notifications Server',
 			'format' => 'sls-mass-notify-config-v1',
 			'exported_at' => gmdate('c'),
 			'settings' => $settings,
 		];
-		return json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+		return json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n";
 	}
 
-	public function importConfigUpload(array $upload)
+	public function exportEncryptedConfig($passphrase, $confirmation)
+	{
+		if (!is_string($passphrase) || !is_string($confirmation) || !hash_equals($passphrase, $confirmation)) {
+			throw new \DomainException(_('The backup passphrases do not match. Enter the same passphrase twice.'));
+		}
+		$settings = $this->getActiveSettings();
+		$encrypted = SlsEncryptedConfig::encrypt($this->encodeConfigExport($settings), $passphrase);
+		$this->auditSensitiveExport('encrypted', $settings);
+		$this->updateStatusData(['last_config_export_at' => time(), 'last_config_export_kind' => 'encrypted']);
+		return $encrypted;
+	}
+
+	public function getConfigurationBackupReminder()
+	{
+		$status = $this->loadStatusData();
+		$last = $status['last_config_export_at'] ?? 0;
+		$now = time();
+		$last = is_int($last) && $last > 0 && $last <= $now ? $last : 0;
+		return ['due' => $last === 0 || $now - $last >= 90 * 86400,
+			'last_export_at' => $last > 0 ? gmdate('c', $last) : '', 'interval_days' => 90];
+	}
+
+	public function importConfigUpload(array $upload, $passphrase = '')
 	{
 		$this->writeMaintenanceProgress('config', 'running', _('Validating the replacement configuration.'));
 		if (($upload['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
@@ -1697,11 +2040,11 @@ class Slsmassnotifyserver implements \BMO
 				'errors' => [],
 			];
 		}
-		if ((int)($upload['size'] ?? 0) <= 0 || (int)($upload['size'] ?? 0) > 1024 * 1024) {
+		if ((int)($upload['size'] ?? 0) <= 0 || (int)($upload['size'] ?? 0) > SlsEncryptedConfig::MAX_FILE_BYTES) {
 			$this->writeMaintenanceProgress('config', 'failed', _('The replacement configuration did not pass the size limit.'));
 			return [
 				'success' => false,
-				'message' => _('Config import must be smaller than 1 MB.'),
+				'message' => _('The configuration upload must be no larger than 6 MiB, including encryption overhead.'),
 				'errors' => [],
 			];
 		}
@@ -1714,14 +2057,13 @@ class Slsmassnotifyserver implements \BMO
 				'errors' => [],
 			];
 		}
-		$decoded = json_decode((string)file_get_contents($tmpName), true);
-		if (!is_array($decoded)) {
-			$this->writeMaintenanceProgress('config', 'failed', _('The uploaded configuration is not valid JSON.'));
-			return [
-				'success' => false,
-				'message' => _('Uploaded config is not valid JSON.'),
-				'errors' => [],
-			];
+		try {
+			$raw = file_get_contents($tmpName, false, null, 0, SlsEncryptedConfig::MAX_FILE_BYTES + 1);
+			if (!is_string($raw)) { throw new \RuntimeException(_('The uploaded configuration could not be read.')); }
+			$decoded = SlsEncryptedConfig::decode($raw, $passphrase);
+		} catch (\Throwable $error) {
+			$this->writeMaintenanceProgress('config', 'failed', _('The uploaded configuration could not be validated or decrypted.'));
+			return ['success' => false, 'message' => $error->getMessage(), 'errors' => []];
 		}
 		$settings = is_array($decoded['settings'] ?? null) ? $decoded['settings'] : $decoded;
 		$settings = $this->migrateConfigCompatibility($settings);
@@ -1752,6 +2094,9 @@ class Slsmassnotifyserver implements \BMO
 				$settings['_legacy_live_email_recipients'] = $legacyMailRecipients;
 			}
 			$replacement = $this->normalizeSettings(array_replace($this->getDefaultSettings(), $settings));
+			$this->disableEnterpriseAfterRecovery($replacement);
+			foreach ($replacement['operator_access']['accounts'] ?? [] as $index => $account) { $replacement['operator_access']['accounts'][$index]['enabled'] = false; }
+			foreach ($replacement['automations']['rules'] ?? [] as $index => $rule) { $replacement['automations']['rules'][$index]['enabled'] = false; }
 			foreach ((array)($replacement['scheduled_announcements'] ?? []) as $index => $schedule) {
 				$replacement['scheduled_announcements'][$index]['enabled'] = '0';
 			}
@@ -1794,7 +2139,7 @@ class Slsmassnotifyserver implements \BMO
 	{
 		$settings = $this->migrateConfigCompatibility($settings);
 		$errors = $this->validateConfigValueTypes($settings);
-		$known = array_merge(array_keys($this->getDefaultSettings()), ['sound_map', 'test_sound_pool']);
+		$known = array_merge(array_keys($this->getDefaultSettings()), ['sound_map', 'test_sound_pool', 'automations', 'operator_access']);
 		$knownLookup = array_fill_keys($known, true);
 		$recognized = 0;
 		foreach (array_keys($settings) as $key) {
@@ -1812,7 +2157,7 @@ class Slsmassnotifyserver implements \BMO
 				$errors[] = sprintf(_('Config is missing required key: %s.'), $requiredKey);
 			}
 		}
-		foreach (['control_api', 'updates', 'setup', 'sipnotify', 'ami', 'xweather'] as $key) {
+		foreach (['control_api', 'updates', 'setup', 'sipnotify', 'ami', 'xweather', 'live_paging'] as $key) {
 			if (isset($settings[$key]) && !is_array($settings[$key])) {
 				$errors[] = sprintf(_('%s must be an object.'), $key);
 			}
@@ -1868,7 +2213,7 @@ class Slsmassnotifyserver implements \BMO
 			$this->validateXweatherGroupEmailCapacity($xweather['groups'], $settings['mail_to'] ?? '')
 		);
 		if ($xweather['enabled'] === '1') {
-			if ($xweather['client_id'] === '' || $xweather['client_secret'] === '') {
+			if ($xweather['client_id'] === '' || ($xweather['provider'] !== 'tempest' && $xweather['client_secret'] === '')) {
 				$errors[] = _('Enabled Xweather config requires valid credentials.');
 			}
 			$enabledXweatherGroups = array_values(array_filter($xweather['groups'], static function ($group) {
@@ -1893,7 +2238,8 @@ class Slsmassnotifyserver implements \BMO
 			$errors[] = _('NWS API base URL must be exactly https://api.weather.gov.');
 		}
 		$errors = array_merge($errors, $this->validateScheduledAnnouncementRecurrences(
-			is_array($settings['scheduled_announcements'] ?? null) ? $settings['scheduled_announcements'] : []
+			is_array($settings['scheduled_announcements'] ?? null) ? $settings['scheduled_announcements'] : [],
+			is_array($settings['announcement_groups'] ?? null) ? $settings['announcement_groups'] : []
 		));
 		if (array_key_exists('mail_from_domain', $settings)) {
 			$mailFromDomain = $this->normalizeEmailSenderDomain((string)$settings['mail_from_domain']);
@@ -1914,6 +2260,8 @@ class Slsmassnotifyserver implements \BMO
 			$this->validateWebhookDestinations($settings['generic_webhooks'] ?? [], 'generic'),
 			$this->validateWebhookDestinations($settings['announcement_webhooks'] ?? [], 'announcement')
 		);
+		try { $this->announcementEmailTargets($settings); }
+		catch (\DomainException $error) { $errors[] = $error->getMessage(); }
 		$errors = array_merge($errors, $this->validateNwsZoneDestinationAssignments(
 			$settings['nws_zones'] ?? [],
 			$settings
@@ -1923,25 +2271,75 @@ class Slsmassnotifyserver implements \BMO
 
 	private function validateConfigValueTypes(array $settings)
 	{
-		$errors = [];
+		$errors = $this->validateDesktopCapacityConfig($settings);
+		if (isset($settings['xweather']['provider']) && !in_array($settings['xweather']['provider'], ['xweather', 'tempest', 'meteomatics'], true)) { $errors[] = _('Select Xweather, Tempest or Meteomatics for Lightning.'); }
+		if (isset($settings['pbx_timezone']) && $settings['pbx_timezone'] !== '' && (!is_string($settings['pbx_timezone']) || !in_array($settings['pbx_timezone'], \DateTimeZone::listIdentifiers(\DateTimeZone::ALL_WITH_BC), true))) { $errors[] = _('PBX timezone must be a valid IANA timezone.'); }
+		if (array_key_exists('generated_media_cache_mib', $settings) && (!is_int($settings['generated_media_cache_mib']) || $settings['generated_media_cache_mib'] < 64 || $settings['generated_media_cache_mib'] > 4096)) {
+			$errors[] = _('Generated-media cache target must be an integer from 64 through 4096 MiB.');
+		}
+		try { \SLS\MassNotify\SpeechRules::normalize($settings['announcement_pronunciation'] ?? []); }
+		catch (\DomainException $error) { $errors[] = $error->getMessage(); }
+		if (!\SLS\MassNotify\DesktopFleet::validMinimum($settings['desktop_minimum_version'] ?? '')) {
+			$errors[] = _('Minimum desktop version must be empty or a version such as 1.2.3 or 1.2.3-beta.1.');
+		}
+		try {
+			\SLS\MassNotify\ApiSecurity::credentials($settings['control_api']['credentials'] ?? []);
+			\SLS\MassNotify\ApiSecurity::network($settings['api_network'] ?? []);
+			\SLS\MassNotify\MediaAccess::normalize(array_key_exists('media_access', $settings) ? $settings['media_access'] : []);
+		} catch (\DomainException $error) { $errors[] = $error->getMessage(); }
+		if (array_key_exists('operator_access', $settings)) {
+			try {
+				$access = \SLS\MassNotify\OperatorAccess::normalize($settings['operator_access']);
+				if (array_intersect(array_column($access['accounts'], 'id'), array_column($settings['control_api']['credentials'] ?? [], 'id'))) { throw new \DomainException('Operator and Control API identifiers must be distinct.'); }
+			} catch (\Throwable $error) { $errors[] = $error->getMessage(); }
+		}
+		if (array_key_exists('device_acceptance', $settings)) {
+			try { \SLS\MassNotify\DeviceAcceptance::normalize($settings['device_acceptance']); }
+			catch (\DomainException $error) { $errors[] = $error->getMessage(); }
+		}
+		if (array_key_exists('automations', $settings)) {
+			try { \SLS\MassNotify\AutomationConfig::normalize($settings['automations']); }
+			catch (\Throwable $error) { $errors[] = $error->getMessage(); }
+		}
+		if (array_key_exists('location_directory', $settings)) {
+			try { \SLS\MassNotify\LocationDirectory::normalize($settings['location_directory']); }
+			catch (\InvalidArgumentException $error) { $errors[] = $error->getMessage(); }
+		}
+		if (array_key_exists('incident_workflows', $settings)) {
+			try { \SLS\MassNotify\IncidentConfig::normalize($settings['incident_workflows']); }
+			catch (\InvalidArgumentException $error) { $errors[] = $error->getMessage(); }
+		}
+		foreach (['labs_safety'=>\SLS\MassNotify\LabsSafety::class,'enterprise_operations'=>\SLS\MassNotify\EnterpriseOperationsConfig::class,
+			'enterprise_cluster'=>\SLS\MassNotify\EnterpriseClusterConfig::class,'enterprise_identity'=>\SLS\MassNotify\EnterpriseIdentityConfig::class,
+			'directory_sync'=>\SLS\MassNotify\DirectoryConfig::class,'subscriber_browser'=>\SLS\MassNotify\SubscriberConfig::class,
+			'enterprise_integrations'=>\SLS\MassNotify\EnterpriseIntegrationsConfig::class] as $key=>$class) {
+			if(array_key_exists($key,$settings)){try{$class::normalize($settings[$key]);}catch(\Throwable $error){$errors[]=$error->getMessage();}}
+		}
+		if (array_key_exists('announcement_email', $settings)) { $errors = array_merge($errors, $this->validateAnnouncementEmail($settings['announcement_email'])); }
+		if (array_key_exists('announcement_sms', $settings)) { $errors = array_merge($errors, $this->validateAnnouncementSms($settings['announcement_sms'])); }
+		$errors = array_merge($errors, \SLS\MassNotify\UpdatePolicy::errors(is_array($settings['updates'] ?? null) ? $settings['updates'] : []));
+		if (array_key_exists('outbound_voice', $settings)) { $errors = array_merge($errors, $this->validateOutboundVoice($settings['outbound_voice'])); }
+		if (array_key_exists('live_paging', $settings)) {
+			$errors = array_merge($errors, $this->validateLivePagingFields($settings['live_paging']));
+		}
 		$stringFields = [
-			'enabled', 'public_pbx_host', 'page_group', 'system_notification_emails', 'mail_to', 'discord_webhook_url',
+			'enabled', 'public_pbx_host', 'pbx_timezone', 'page_group', 'system_notification_emails', 'mail_to', 'discord_webhook_url',
 			'nws_api_base_url', 'nws_zone', 'quiet_hours_enabled', 'quiet_hours_start', 'quiet_hours_end',
 			'mail_from_name', 'mail_from_local_part', 'mail_from_domain', 'mail_from_addr',
 			'alert_email_subject', 'alert_email_body', 'test_email_subject', 'test_email_body',
 			'opening_tone', 'closing_tone', 'nws_opening_tone', 'nws_closing_tone', 'email_html_enabled',
 			'piper_bin', 'piper_voice', 'nws_piper_voice', 'announcement_piper_voice',
-			'announcement_timeout_mode', 'desktop_auth_key', 'sound_dir', 'asterisk_sound_prefix',
+			'announcement_timeout_mode', 'desktop_auth_key', 'desktop_minimum_version', 'sound_dir', 'asterisk_sound_prefix',
 		];
 		$integerFields = [
 			'tts_max_seconds', 'nws_tts_volume', 'announcement_tts_volume', 'announcement_cooldown_seconds',
-			'announcement_timeout_seconds', 'log_retention_days', 'paging_answer_timeout',
+			'announcement_timeout_seconds', 'log_retention_days', 'generated_media_cache_mib', 'paging_answer_timeout', 'desktop_client_limit', 'phone_device_limit',
 		];
 		$listFields = [
 			'alert_recipients', 'nws_zones', 'quiet_critical_events', 'announcement_groups', 'desktop_clients',
 			'scheduled_announcements', 'discord_webhooks', 'generic_webhooks', 'announcement_webhooks', 'test_profiles',
 		];
-		$objectFields = ['control_api', 'updates', 'setup', 'sipnotify', 'ami', 'xweather'];
+		$objectFields = ['operator_access', 'device_acceptance', 'automations', 'control_api', 'updates', 'setup', 'sipnotify', 'ami', 'xweather', 'live_paging', 'outbound_voice', 'announcement_email', 'announcement_sms', 'labs_safety', 'enterprise_operations', 'enterprise_cluster', 'enterprise_identity', 'directory_sync', 'subscriber_browser', 'enterprise_integrations'];
 		foreach ($stringFields as $field) {
 			if (array_key_exists($field, $settings) && !is_string($settings[$field])) {
 				$errors[] = sprintf(_('%s must be a string.'), $field);
@@ -1974,11 +2372,11 @@ class Slsmassnotifyserver implements \BMO
 				'string' => ['username', 'password', 'host'], 'integer' => ['port'], 'flag' => [], 'array' => [],
 			],
 			'control_api' => [
-				'string' => ['enabled', 'api_key', 'base_url', 'ip_allowlist_enabled', 'ip_allowlist', 'rate_limit_enabled'],
-				'integer' => ['rate_limit_per_minute', 'audit_retention_days'], 'flag' => ['enabled', 'ip_allowlist_enabled', 'rate_limit_enabled'], 'array' => [],
+				'string' => ['enabled', 'api_key', 'base_url', 'ip_allowlist_enabled', 'ip_allowlist', 'rate_limit_enabled', 'audit_syslog'],
+				'integer' => ['rate_limit_per_minute', 'audit_retention_days'], 'flag' => ['enabled', 'ip_allowlist_enabled', 'rate_limit_enabled', 'audit_syslog'], 'array' => ['credentials'],
 			],
 			'updates' => [
-				'string' => ['github_enabled', 'repository', 'channel'], 'integer' => [], 'flag' => ['github_enabled'], 'array' => [],
+				'string' => ['github_enabled', 'repository', 'channel', 'pinned_version', 'window_start', 'window_end'], 'integer' => ['rollout_delay_hours'], 'flag' => ['github_enabled'], 'array' => [],
 			],
 			'setup' => [
 				'string' => ['completed', 'beta_accepted', 'agpl_accepted', 'eula_accepted', 'completed_at'], 'integer' => [],
@@ -1988,8 +2386,8 @@ class Slsmassnotifyserver implements \BMO
 				'string' => ['pbx_host', 'base_url', 'media_scheme', 'media_base_url'], 'integer' => [], 'flag' => [], 'array' => ['format_overrides', 'device_format_overrides'],
 			],
 			'xweather' => [
-				'string' => ['enabled', 'client_id', 'client_secret', 'location', 'adaptive_free_tier', 'adaptive_nws_zone_id', 'opening_tone', 'closing_tone', 'all_clear', 'strike_type', 'quiet_hours_enabled', 'quiet_hours_start', 'quiet_hours_end'],
-				'integer' => ['radius_miles', 'query_interval_minutes', 'adaptive_grace_minutes', 'tts_volume'],
+				'string' => ['enabled', 'provider', 'client_id', 'client_secret', 'location', 'adaptive_free_tier', 'adaptive_gate_failure_policy', 'adaptive_nws_zone_id', 'opening_tone', 'closing_tone', 'all_clear', 'strike_type', 'quiet_hours_enabled', 'quiet_hours_start', 'quiet_hours_end'],
+				'integer' => ['radius_miles', 'query_interval_minutes', 'adaptive_grace_minutes', 'adaptive_fallback_minutes', 'tts_volume'],
 				'flag' => ['enabled', 'adaptive_free_tier', 'quiet_hours_enabled'], 'array' => ['recipients', 'groups'],
 			],
 		];
@@ -2026,6 +2424,7 @@ class Slsmassnotifyserver implements \BMO
 				}
 			}
 		}
+		$errors = array_merge($errors, $this->validateXweatherAdaptivePolicyInput(is_array($settings['xweather'] ?? null) ? $settings['xweather'] : []));
 		if (is_string($settings['xweather']['strike_type'] ?? null)
 			&& !in_array($settings['xweather']['strike_type'], ['cloud_to_ground', 'cloud_to_cloud', 'both'], true)) {
 			$errors[] = _('xweather.strike_type must be cloud_to_ground, cloud_to_cloud, or both.');
@@ -2036,7 +2435,7 @@ class Slsmassnotifyserver implements \BMO
 					continue;
 				}
 				$zoneAllowed = [
-					'id', 'name', 'zone', 'extensions', 'recipients', 'desktop_clients', 'email_recipients',
+					'id', 'name', 'site_id', 'zone', 'extensions', 'recipients', 'desktop_clients', 'email_recipients', 'voice_recipient_ids', 'sms_recipient_ids',
 					'quiet_hours_enabled', 'quiet_hours_start', 'quiet_hours_end', 'quiet_critical_events',
 					'discord_webhook_ids', 'generic_webhook_ids',
 				];
@@ -2045,12 +2444,12 @@ class Slsmassnotifyserver implements \BMO
 						$errors[] = sprintf(_('Unknown config key: nws_zones[%d].%s.'), $index, (string)$field);
 					}
 				}
-				foreach (['id', 'name', 'zone', 'quiet_hours_enabled', 'quiet_hours_start', 'quiet_hours_end'] as $field) {
+				foreach (['id', 'name', 'site_id', 'zone', 'quiet_hours_enabled', 'quiet_hours_start', 'quiet_hours_end'] as $field) {
 					if (array_key_exists($field, $zone) && !is_string($zone[$field])) {
 						$errors[] = sprintf(_('nws_zones[%d].%s must be a string.'), $index, $field);
 					}
 				}
-				foreach (['extensions', 'recipients', 'desktop_clients', 'email_recipients', 'quiet_critical_events', 'discord_webhook_ids', 'generic_webhook_ids'] as $field) {
+				foreach (['extensions', 'recipients', 'desktop_clients', 'email_recipients', 'voice_recipient_ids', 'sms_recipient_ids', 'quiet_critical_events', 'discord_webhook_ids', 'generic_webhook_ids'] as $field) {
 					if (array_key_exists($field, $zone) && (!is_array($zone[$field]) || !array_is_list($zone[$field]))) {
 						$errors[] = sprintf(_('nws_zones[%d].%s must be an array.'), $index, $field);
 					} elseif (is_array($zone[$field] ?? null)) {
@@ -2085,6 +2484,20 @@ class Slsmassnotifyserver implements \BMO
 		}
 		if (is_array($settings['scheduled_announcements'] ?? null)) {
 			foreach ($settings['scheduled_announcements'] as $index => $schedule) {
+				if (is_array($schedule) && array_key_exists('operator_credential_id', $schedule) && (!is_string($schedule['operator_credential_id']) || !preg_match('/^api_[a-f0-9]{24}$/D', $schedule['operator_credential_id']))) { $errors[] = _('A schedule has invalid originating operator authorization.'); }
+				if (is_array($schedule)) { $errors = array_merge($errors, array_map('_', \SLS\MassNotify\SchedulePresentation::latenessErrors($schedule))); }
+				if (is_array($schedule) && is_array($schedule['targets'] ?? null) && array_key_exists('email_recipient_ids', $schedule['targets'])) {
+					$errors = array_merge($errors, $this->validateAnnouncementEmailRecipientIds($schedule['targets']['email_recipient_ids']));
+				}
+				if (is_array($schedule) && is_array($schedule['targets'] ?? null) && array_key_exists('webhook_ids', $schedule['targets'])) {
+				$errors = array_merge($errors, $this->validateAudienceWebhookIds($schedule['targets']['webhook_ids']));
+			}
+			if (is_array($schedule) && is_array($schedule['targets'] ?? null) && array_key_exists('sms_recipient_ids', $schedule['targets'])) {
+					$errors = array_merge($errors, $this->validateSmsRecipientIds($schedule['targets']['sms_recipient_ids']));
+				}
+				if (is_array($schedule) && is_array($schedule['targets'] ?? null) && array_key_exists('voice_recipient_ids', $schedule['targets'])) {
+					$errors = array_merge($errors, $this->validateVoiceRecipientIds($schedule['targets']['voice_recipient_ids']));
+				}
 				if (!is_array($schedule) || !array_key_exists('recurrence', $schedule)) {
 					continue;
 				}
@@ -2143,13 +2556,21 @@ class Slsmassnotifyserver implements \BMO
 		$lock = $this->acquireSettingsLock(true);
 		try {
 			$activeSettings = $this->normalizeSettings($this->loadSettingsFile(self::SETTINGS_JSON));
-			if (is_readable(self::PENDING_SETTINGS_JSON)) {
+			if ($this->configurationPathMetadata(self::PENDING_SETTINGS_JSON) !== null) {
 				$settings = $this->normalizeSettings($this->loadSettingsFile(self::PENDING_SETTINGS_JSON));
 			} else {
 				$settings = $activeSettings;
 			}
 			if ($this->isSetupComplete($activeSettings)) {
 				$settings['setup'] = $activeSettings['setup'];
+			}
+			foreach ($this->automationDependencyChecks($settings) as $check) { if ($check['state'] !== 'ok') { throw new \DomainException($check['detail']); } }
+			if ($this->getPanicExtensionUsage(true,$settings)) { $this->validatePanicExtensions($settings); $this->ensureLivePagingPrompts($settings); }
+			$paging = $this->normalizeLivePagingSettings($settings['live_paging'] ?? []);
+			if ($paging['enabled'] === '1') {
+				$this->validateLivePagingSelection($paging, $settings);
+				$this->assertLivePagingExtensionAvailable($paging['extension']);
+				$this->ensureLivePagingPrompts($settings);
 			}
 			$this->writeSettingsFileUnlocked(self::SETTINGS_JSON, $this->normalizeSettings($settings), true);
 			if (is_file(self::PENDING_SETTINGS_JSON) && !@unlink(self::PENDING_SETTINGS_JSON)) {
@@ -2252,12 +2673,23 @@ class Slsmassnotifyserver implements \BMO
 			];
 		}
 
+		try {
+			$apiEnvironment = $this->apiWeatherTestEnvironment($settings, array_keys($selectedIds ?: $availableZoneIds),
+				array_values($recipients), array_values($desktopRecipients));
+		} catch (\DomainException $error) {
+			return ['success' => false, 'message' => $error->getMessage(), 'error' => 'api_permission_revoked', 'delivery_started' => false, 'retryable' => false];
+		}
+		$permissionEnvironment = '';
+		foreach ($apiEnvironment as $key => $value) { $permissionEnvironment .= ' ' . $key . '=' . escapeshellarg($value); }
 		$ttsMaximum = max(1, min(600, (int)($settings['tts_max_seconds'] ?? 30)));
 		$testTimeout = min(960, max(180, ($ttsMaximum * 2) + 120));
+		$testDeliveryId = 'test_' . bin2hex(random_bytes(16));
 		$cmd = '/usr/bin/timeout --signal=TERM --kill-after=10 ' . $testTimeout
 			. ' /usr/bin/env NWS_ZONE_OVERRIDE=' . escapeshellarg(implode(',', $zones))
+			. ' SLS_TEST_DELIVERY_ID=' . escapeshellarg($testDeliveryId)
 			. ' NWS_RECIPIENTS_OVERRIDE=' . escapeshellarg(implode(',', array_values($recipients)))
 			. ' NWS_DESKTOP_CLIENTS_OVERRIDE=' . escapeshellarg(implode(',', array_values($desktopRecipients)))
+			. $permissionEnvironment
 			. ' ' . escapeshellarg(self::TEST_SCRIPT)
 			. ' '
 			. escapeshellarg('GUI')
@@ -2276,39 +2708,39 @@ class Slsmassnotifyserver implements \BMO
 			if (!empty($desktopRecipients)) {
 				$requestedChannels[] = _('targeted live desktop publication');
 			}
-			return [
+			return $this->withTestDeliveryReport([
 				'success' => false,
 				'message' => sprintf(
 					_('Weather test completed with one or more channel failures after attempting: %s. Successful channel submissions are not replayed.'),
 					implode('; ', $requestedChannels)
 				),
 				'errors' => $detail !== '' ? [$detail] : [_('Review Notification Logs for the delivery stage that failed.')],
-			];
+			], $testDeliveryId, array_values($recipients), $this->testDesktopPublications($output, array_values($desktopRecipients), $settings), $settings);
 		}
 
 		if (!empty($recipients) && !empty($desktopRecipients)) {
 			$message = sprintf(
-				_('Weather test submitted locally for %d phone recipient(s) and %d desktop recipient(s). Asterisk picked up the audio jobs and accepted SIP NOTIFY; the targeted desktop event was published. Handset answer, visual display, and desktop-app display are not confirmed.'),
+				_('Weather test submitted to %d phone recipient(s) and %d desktop recipient(s). Delivery receipts are shown below.'),
 				count($recipients),
 				count($desktopRecipients)
 			);
 		} elseif (!empty($recipients)) {
 			$message = sprintf(
-				_('Weather test submitted locally for %d phone recipient(s). Asterisk picked up the audio jobs and accepted SIP NOTIFY. Handset answer and visual display are not confirmed.'),
+				_('Weather test submitted to %d phone recipient(s). Phone answer evidence is shown below.'),
 				count($recipients)
 			);
 		} else {
 			$message = sprintf(
-				_('Weather test published to %d targeted desktop recipient(s). Desktop-app display is not confirmed.'),
+				_('Weather test published to %d desktop recipient(s). Application receipts are shown below.'),
 				count($desktopRecipients)
 			);
 		}
 		$message .= ' ' . _('Manual tests do not send global or per-zone email, Discord, or generic webhook notifications.');
-		return [
+		return $this->withTestDeliveryReport([
 			'success' => true,
 			'message' => $message,
 			'errors' => [],
-		];
+		], $testDeliveryId, array_values($recipients), $this->testDesktopPublications($output, array_values($desktopRecipients), $settings), $settings);
 	}
 
 	public function verifyLightningConnection()
@@ -2445,15 +2877,16 @@ class Slsmassnotifyserver implements \BMO
 			}
 			return ['success' => false, 'message' => _('Unable to claim the protected Lightning test cooldown. Check Dashboard health and try again.')];
 		}
-		$command = '/usr/bin/timeout 600 /usr/bin/env XWEATHER_TEST_EVENT=entry XWEATHER_GROUP_IDS=' . escapeshellarg(implode(',', $selectedIds))
+		$testDeliveryId = 'test_' . bin2hex(random_bytes(16));
+		$command = '/usr/bin/timeout 600 /usr/bin/env XWEATHER_TEST_EVENT=entry SLS_TEST_DELIVERY_ID=' . escapeshellarg($testDeliveryId) . ' XWEATHER_GROUP_IDS=' . escapeshellarg(implode(',', $selectedIds))
 			. ' XWEATHER_TEST_TRIGGER_NAME=' . escapeshellarg(substr(trim((string)$triggerName), 0, 80))
 			. ' /usr/bin/python3 /usr/local/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py 2>&1';
 		exec($command, $output, $exitCode);
-		return $exitCode === 0
+		$result = $exitCode === 0
 			? [
 				'success' => true,
 				'message' => sprintf(
-					_('Lightning test completed for %d selected trigger area(s). Configured phone routes passed the Asterisk page-job and SIP NOTIFY submission checks, and configured desktop routes were published. Handset and desktop-app display are not confirmed. Email, Discord, and generic webhooks were skipped.'),
+					_('Lightning test submitted for %d selected trigger area(s). Phone answer evidence and desktop application receipts are shown below. Email, Discord, and generic webhooks were skipped.'),
 					count($selectedIds)
 				),
 				'errors' => [],
@@ -2463,6 +2896,12 @@ class Slsmassnotifyserver implements \BMO
 				'message' => _('Lightning test failed. No success is reported unless Asterisk completes the audio page job and accepts the SIP NOTIFY submission.'),
 				'errors' => ($detail = $this->sanitizeTestCommandOutput($output)) !== '' ? [$detail] : [_('Review Notification Logs for the delivery stage that failed.')],
 			];
+		$phones = []; $desktops = [];
+		foreach ($selectedIds as $id) {
+			$phones = array_merge($phones, (array)($enabledGroups[$id]['extensions'] ?? []));
+			$desktops = array_merge($desktops, (array)($enabledGroups[$id]['desktop_clients'] ?? []));
+		}
+		return $this->withTestDeliveryReport($result, $testDeliveryId, $phones, $this->testDesktopPublications($output, $desktops, $settings), $settings);
 	}
 
 	private function sanitizeTestCommandOutput(array $lines)
@@ -2476,42 +2915,49 @@ class Slsmassnotifyserver implements \BMO
 
 	public function sendSipNotifyAnnouncement($extensions, $message, $massNotify = true, $ttsAudio = false, $groups = [], array $options = [])
 	{
-		if (!$this->isSetupComplete($this->getActiveSettings())) {
-			return [
-				'success' => false,
-				'message' => $this->getSetupRequiredMessage(),
-				'cooldown_remaining' => 0,
-				'error_code' => 'setup_incomplete',
-				'delivery_started' => false,
-			];
-		}
 		$this->ensurePluginDataDir();
-		$announcementLock = @fopen(self::ANNOUNCEMENT_LOCK_FILE, 'c');
-		if ($announcementLock === false || !flock($announcementLock, LOCK_EX | LOCK_NB)) {
-			if (is_resource($announcementLock)) {
-				fclose($announcementLock);
+		try { $activity = $this->acquireAnnouncementActivityLock(false, 30); }
+		catch (\Throwable $error) {
+			return ['success' => false, 'error_code' => 'delivery_busy', 'delivery_started' => false,
+				'message' => _('Protected configuration maintenance is active. No announcement was submitted. Try again when maintenance finishes.')];
+		}
+		$announcementLock = null;
+		try {
+			$settings = $this->getActiveSettings();
+			if (!\SLS\MassNotify\RuntimeState::running($settings)) {
+				return ['success' => false, 'error_code' => 'runtime_stopped', 'delivery_started' => false,
+					'message' => _('SLS notifications are stopped. Run sudo slsconsole start to resume.')];
 			}
-			return [
-				'success' => false,
-				'message' => _('Another announcement is already being delivered. Wait for it to finish and try again.'),
-				'cooldown_remaining' => 0,
-				'error_code' => 'delivery_busy',
-				'delivery_started' => false,
-			];
+			if (!$this->isSetupComplete($settings)) {
+				return ['success' => false, 'message' => $this->getSetupRequiredMessage(),
+					'cooldown_remaining' => 0, 'error_code' => 'setup_incomplete', 'delivery_started' => false];
+			}
+			$announcementLock = (new \SlsAnnouncementJobStore(self::PLUGIN_DATA_DIR))->admissionLock();
+			if (!$announcementLock) {
+				return ['success' => false, 'message' => _('Another announcement is being admitted. Try again shortly.'),
+					'cooldown_remaining' => 0, 'error_code' => 'delivery_busy', 'delivery_started' => false];
+			}
+			$this->announcementAdmissionLock = $announcementLock;
+			$cooldown = $this->getAnnouncementCooldownState();
+			if ($cooldown['remaining'] > 0 && empty($options['preview'])) {
+				return ['success' => false, 'message' => sprintf(_('SIP NOTIFY announcements are on cooldown. Wait %s seconds and try again.'), $cooldown['remaining']),
+					'cooldown_remaining' => $cooldown['remaining'], 'error_code' => 'cooldown', 'delivery_started' => false];
+			}
+			$resolved = $this->resolveAnnouncementRequest($extensions, $message, $massNotify, $ttsAudio, $groups, $options, $settings);
+			if (empty($resolved['success'])) { return $resolved; }
+			$review = $this->enterpriseReviewAnnouncement($resolved['request']);
+			if ($review !== null) { return $review; }
+			return $this->deliverResolvedAnnouncement($resolved['request']);
+		} finally {
+			$this->announcementAdmissionLock = null;
+			if (is_resource($announcementLock)) { flock($announcementLock, LOCK_UN); fclose($announcementLock); }
+			$this->releaseNativeBackupFileLock($activity);
 		}
-		$this->setOwnership(self::ANNOUNCEMENT_LOCK_FILE);
+	}
 
-		$cooldown = $this->getAnnouncementCooldownState();
-		if ($cooldown['remaining'] > 0 && empty($options['preview'])) {
-			return [
-				'success' => false,
-				'message' => sprintf(_('SIP NOTIFY announcements are on cooldown. Wait %s seconds and try again.'), $cooldown['remaining']),
-				'cooldown_remaining' => $cooldown['remaining'],
-				'error_code' => 'cooldown',
-				'delivery_started' => false,
-			];
-		}
-
+	/** Resolve one protected settings snapshot without queuing or submitting it. */
+	private function resolveAnnouncementRequest($extensions, $message, $massNotify, $ttsAudio, $groups, array $options, array $activeSettings): array
+	{
 		$message = trim((string)$message);
 		$message = preg_replace('/[^\P{C}\r\n\t]/u', '', $message);
 		if ($message === '') {
@@ -2525,10 +2971,10 @@ class Slsmassnotifyserver implements \BMO
 		}
 		$length = function_exists('mb_strlen') ? mb_strlen($message) : strlen($message);
 		if ($length > 500) {
-			$message = function_exists('mb_substr') ? mb_substr($message, 0, 500) : substr($message, 0, 500);
+			return ['success' => false, 'message' => _('Announcement messages must contain no more than 500 characters. Shorten the message before sending.'),
+				'cooldown_remaining' => 0, 'error_code' => 'message_too_long', 'delivery_started' => false];
 		}
 
-		$activeSettings = $this->getActiveSettings();
 		$allowedTargets = $this->getSipNotifyTargets();
 		$unavailableTargets = [];
 		$allowed = [];
@@ -2583,9 +3029,27 @@ class Slsmassnotifyserver implements \BMO
 				];
 			}
 
+			foreach (['emails', 'email_recipients'] as $rawEmailField) {
+				if (array_key_exists($rawEmailField, $options)) { return ['success' => false, 'message' => _('Choose saved email recipient IDs; raw email addresses are not accepted.'), 'delivery_started' => false]; }
+			}
+			$emailIds = array_key_exists('email_recipient_ids', $options) ? $options['email_recipient_ids'] : [];
+			$emailErrors = $this->validateAnnouncementEmailRecipientIds($emailIds);
+			if ($emailErrors) { return ['success' => false, 'message' => implode(' ', $emailErrors), 'delivery_started' => false]; }
+			$selectedEmailIds = array_fill_keys($emailIds, true);
+			$smsIds = array_key_exists('sms_recipient_ids', $options) ? $options['sms_recipient_ids'] : [];
+			$smsErrors = $this->validateSmsRecipientIds($smsIds);
+			if ($smsErrors) { return ['success' => false, 'message' => implode(' ', $smsErrors), 'delivery_started' => false]; }
+			$selectedSmsIds = array_fill_keys($smsIds, true);
+			foreach (['sms', 'sms_recipients', 'sms_numbers'] as $rawSmsField) {
+				if (array_key_exists($rawSmsField, $options)) { return ['success' => false, 'message' => _('Choose saved SMS recipient IDs; raw numbers are not accepted.'), 'delivery_started' => false]; }
+			}
+			$voiceIds = $options['voice_recipient_ids'] ?? [];
+			$voiceErrors = $this->validateVoiceRecipientIds($voiceIds);
+			if ($voiceErrors) { return ['success' => false, 'message' => implode(' ', $voiceErrors), 'delivery_started' => false]; }
+			$selectedVoiceIds = array_fill_keys($voiceIds, true);
 			$selected = [];
 			$groupLookup = [];
-			foreach ($this->getAnnouncementGroups() as $group) {
+			foreach (($activeSettings['announcement_groups'] ?? []) as $group) {
 				$groupLookup[$group['id']] = $group;
 			}
 		foreach ((array)$groups as $groupId) {
@@ -2593,6 +3057,22 @@ class Slsmassnotifyserver implements \BMO
 			if ($groupId === '' || empty($groupLookup[$groupId])) {
 				continue;
 			}
+			if (!\SLS\MassNotify\ApiSecurity::groupDesktopBindingsValid($groupLookup[$groupId], $activeSettings)) {
+				return ['success' => false, 'error_code' => 'location_desktop_identity_changed', 'delivery_started' => false,
+					'message' => _('A desktop in this location audience was removed, renamed, disabled, or replaced. Create a new reviewed audience from Locations before sending.')];
+			}
+			$webhookErrors = $this->validateAudienceWebhookIds($groupLookup[$groupId]['webhook_ids'] ?? [], $activeSettings);
+			if ($webhookErrors) { return ['success' => false, 'message' => implode(' ', $webhookErrors), 'delivery_started' => false]; }
+			foreach ($groupLookup[$groupId]['webhook_ids'] ?? [] as $webhookId) { $selectedAnnouncementWebhooks[$webhookId] = $announcementWebhookLookup[$webhookId]; }
+			foreach ((array)($groupLookup[$groupId]['voice_recipient_ids'] ?? []) as $voiceId) { $selectedVoiceIds[$voiceId] = true; }
+			$groupEmailIds = array_key_exists('email_recipient_ids', $groupLookup[$groupId]) ? $groupLookup[$groupId]['email_recipient_ids'] : [];
+			$emailErrors = $this->validateAnnouncementEmailRecipientIds($groupEmailIds);
+			if ($emailErrors) { return ['success' => false, 'message' => implode(' ', $emailErrors), 'delivery_started' => false]; }
+			foreach ($groupEmailIds as $emailId) { $selectedEmailIds[$emailId] = true; }
+			$groupSmsIds = array_key_exists('sms_recipient_ids', $groupLookup[$groupId]) ? $groupLookup[$groupId]['sms_recipient_ids'] : [];
+			$smsErrors = $this->validateSmsRecipientIds($groupSmsIds);
+			if ($smsErrors) { return ['success' => false, 'message' => implode(' ', $smsErrors), 'delivery_started' => false]; }
+			foreach ($groupSmsIds as $smsId) { $selectedSmsIds[$smsId] = true; }
 			foreach ((array)$groupLookup[$groupId]['extensions'] as $extension) {
 				if (!isset($allowed[$extension])) { $unavailableTargets[(string)$extension] = (string)$extension; }
 				if (isset($allowed[$extension])) {
@@ -2627,26 +3107,51 @@ class Slsmassnotifyserver implements \BMO
 			$audioMode = $this->normalizeAnnouncementAudioMode($options['audio_mode'] ?? ((bool)$ttsAudio ? 'tones_tts' : 'none'));
 			$ttsAudio = in_array($audioMode, ['tts', 'tones_tts'], true);
 			$audioEnabled = $audioMode !== 'none';
+			try { $emailTargets = $selectedEmailIds ? $this->announcementEmailTargets($activeSettings) : []; }
+			catch (\DomainException $error) { return ['success' => false, 'message' => $error->getMessage(), 'delivery_started' => false]; }
+			if (count($selectedEmailIds) > 50 || array_diff_key($selectedEmailIds, $emailTargets)) {
+				return ['success' => false, 'message' => _('Select at most 50 enabled saved email recipients. Review the selection, saved groups, and Announcement Email settings.'), 'delivery_started' => false];
+			}
+			$voiceTargets = $this->outboundVoiceTargets($activeSettings);
+			try { $smsTargets = $selectedSmsIds ? \SLS\MassNotify\Sms\Service::targets($activeSettings) : []; }
+			catch (\DomainException $error) { return ['success' => false, 'message' => $error->getMessage(), 'delivery_started' => false]; }
+			if (count($selectedSmsIds) > 50 || array_diff_key($selectedSmsIds, $smsTargets)) {
+				return ['success' => false, 'message' => _('Select at most 50 enabled saved SMS recipients with recorded consent. Review the selection and SMS settings.'), 'delivery_started' => false];
+			}
+			if (array_diff_key($selectedVoiceIds, $voiceTargets)) {
+				return ['success' => false, 'message' => _('A selected external voice recipient is no longer enabled. Review the selection or saved group.'), 'delivery_started' => false];
+			}
+			if ($selectedVoiceIds && !$audioEnabled) {
+				return ['success' => false, 'message' => _('External voice recipients require TTS or tone audio. Enable announcement audio before sending.'), 'delivery_started' => false];
+			}
+			$toneErrors = [];
+			$openingTone = $this->announcementTone($options['opening_tone'] ?? $activeSettings['opening_tone'] ?? '', 'opening', $toneErrors);
+			$closingTone = $this->announcementTone($options['closing_tone'] ?? $activeSettings['closing_tone'] ?? '', 'closing', $toneErrors);
+			if ($toneErrors) { return ['success'=>false, 'message'=>implode(' ', $toneErrors), 'error_code'=>'invalid_tone', 'delivery_started'=>false]; }
 			$availableToneLookup = array_fill_keys($this->getAvailableTones(), true);
-			$openingTone = $this->normalizeToneName((string)($options['opening_tone'] ?? $activeSettings['opening_tone'] ?? ''));
-			$closingTone = $this->normalizeToneName((string)($options['closing_tone'] ?? $activeSettings['closing_tone'] ?? ''));
 			foreach ([$openingTone, $closingTone] as $selectedTone) {
 				if ($selectedTone !== '' && !isset($availableToneLookup[$selectedTone])) {
 					return ['success' => false, 'message' => _('A selected announcement tone is unavailable.'), 'cooldown_remaining' => 0, 'error_code' => 'invalid_tone', 'delivery_started' => false];
 				}
 			}
 
-			if (empty($selected) && !$desktopRequested && !$webhookRequested) {
+			if (empty($selected) && !$desktopRequested && !$webhookRequested && !$selectedVoiceIds && !$selectedEmailIds && !$selectedSmsIds) {
+				if ($unavailableTargets) {
+					return ['success' => false,
+						'message' => sprintf(_('None of the %d selected phone(s) is registered or available. No channels were submitted. Check phone registration before sending again.'), count($unavailableTargets)),
+						'cooldown_remaining' => 0, 'error_code' => 'selected_phones_unavailable', 'delivery_started' => false,
+						'unavailable_phones' => array_values($unavailableTargets)];
+				}
 				return [
 					'success' => false,
-					'message' => _('Select at least one phone, SLS Mass Notify App client, or Dashboard webhook destination.'),
+					'message' => _('Select at least one phone, desktop app, saved email or SMS recipient, external voice recipient, or Dashboard webhook destination.'),
 					'cooldown_remaining' => 0,
 					'error_code' => 'no_targets',
 					'delivery_started' => false,
 				];
 			}
 
-			if ($audioEnabled && empty($selected)) {
+			if ($audioEnabled && empty($selected) && !$selectedVoiceIds) {
 				return [
 					'success' => false,
 					'message' => _('Select at least one extension before enabling announcement audio.'),
@@ -2688,13 +3193,24 @@ class Slsmassnotifyserver implements \BMO
 			if (!is_string($priority) || !in_array($priority, ['normal', 'urgent'], true)) {
 				return ['success' => false, 'message' => _('Announcement priority must be normal or urgent.')];
 			}
-			return $this->deliverResolvedAnnouncement([
+			// Only the internal incident facade can establish this context. Generic
+			// announcement option names and request-body metadata cannot create it.
+			$incidentContext = $this->currentIncidentAnnouncementContext();
+			if ($incidentContext !== null) { $incidentContext = self::validateIncidentContext($incidentContext); }
+			return ['success' => true, 'request' => $this->snapshotAnnouncementRequest([
+                'automation_context' => $this->automationSubmissionContext ?? null,
+                'incident_context' => $incidentContext, 'force_queue' => $incidentContext !== null || !empty($selectedEmailIds) || !empty($selectedSmsIds),
+                'email_severity' => ($incidentContext['severity'] ?? 'information') === 'information' ? 'info' : $incidentContext['severity'],
+                'email_recipient_ids' => array_keys($selectedEmailIds),
+                'sms_recipient_ids' => array_keys($selectedSmsIds),
                 'priority' => $priority,
                 'message' => $message, 'sender' => $this->announcementSender($options),
                 'only_channels' => $options['_test_channels'] ?? null,
+                'is_test' => ($options['_is_test'] ?? false) === true,
                 'phones' => array_values($selected),
                 'desktops' => $desktopAll ? array_keys($desktopClients) : array_values($selectedDesktopClients),
                 'webhooks' => array_keys($selectedAnnouncementWebhooks),
+                'voice_recipient_ids' => array_keys($selectedVoiceIds),
                 'audio_mode' => $audioMode, 'opening_tone' => $openingTone, 'closing_tone' => $closingTone,
                 'voice' => (string)($options['piper_voice'] ?? ''),
                 'volume' => $options['tts_volume'] ?? ($settings['announcement_tts_volume'] ?? 25),
@@ -2702,25 +3218,53 @@ class Slsmassnotifyserver implements \BMO
                 'image' => $image, 'title' => $title, 'background_color' => $backgroundColor,
                 'trigger_source' => $triggerSource, 'preview' => !empty($options['preview']),
                 'unavailable_phones' => array_values($unavailableTargets),
-            ]);
+            ], $settings)];
 	}
 
-	private function dispatchAnnouncementWebhooks(array $destinationIds, $message, $title, $backgroundColor, array $fields = [])
+	private function dispatchAnnouncementWebhooks(array $destinationIds, $message, $title, $backgroundColor, array $fields = [], $deliveryId = '', array $expectedFingerprints = [], $deliveryTimestamp = '', ?int $submissionDeadlineAt = null, $incidentContext = null, array $authorization = [])
 	{
 		$configured = [];
 		foreach ($this->normalizeWebhookDestinations($this->getActiveSettings()['announcement_webhooks'] ?? [], 'announcement') as $destination) {
 			if (!empty($destination['enabled'])) {
-				$configured[(string)$destination['id']] = (string)$destination['name'];
+				$configured[(string)$destination['id']] = $destination;
 			}
 		}
 		$requested = [];
+		$outcome = ['requested' => [], 'accepted' => [], 'failed' => []];
 		foreach (array_slice(array_values(array_unique(array_map('strval', $destinationIds))), 0, self::MAX_WEBHOOK_DESTINATIONS) as $destinationId) {
-			if (isset($configured[$destinationId])) {
-				$requested[$destinationId] = $configured[$destinationId];
+			$outcome['requested'][] = $destinationId;
+			$name = (string)($configured[$destinationId]['name'] ?? $destinationId);
+			$expected = $expectedFingerprints[$destinationId] ?? '';
+			$error = '';
+			if (!is_string($expected) || !preg_match('/^[a-f0-9]{64}$/D', $expected)) {
+				$error = 'legacy_route_snapshot_missing';
+			} elseif (!isset($configured[$destinationId])) {
+				$error = 'destination_unavailable';
+			} elseif (!hash_equals($expected, $this->webhookDestinationFingerprint($configured[$destinationId]))) {
+				$error = 'destination_changed';
+			}
+			if ($error !== '') {
+				$outcome['failed'][] = ['id' => $destinationId, 'name' => $name, 'error' => $error,
+					'status' => $error === 'legacy_route_snapshot_missing' ? 'failed' : 'cancelled', 'retryable' => false];
+			} else {
+				$requested[$destinationId] = $name;
 			}
 		}
-		$outcome = ['requested' => array_keys($requested), 'accepted' => [], 'failed' => []];
 		if (empty($requested)) {
+			return $outcome;
+		}
+		if ($submissionDeadlineAt !== null && time() >= $submissionDeadlineAt) {
+			foreach ($requested as $id => $name) {
+				$outcome['failed'][] = ['id' => $id, 'name' => $name, 'error' => 'schedule_deadline_expired', 'retryable' => false];
+			}
+			return $outcome;
+		}
+		if (!is_string($deliveryId) || !preg_match('/^[A-Za-z0-9_-]{1,100}$/D', $deliveryId)
+			|| !is_string($deliveryTimestamp) || !preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/D', $deliveryTimestamp)
+			|| strtotime($deliveryTimestamp) === false) {
+			foreach ($requested as $id => $name) {
+				$outcome['failed'][] = ['id' => $id, 'name' => $name, 'error' => 'legacy_payload_snapshot_missing', 'retryable' => false];
+			}
 			return $outcome;
 		}
 		if (!function_exists('proc_open') || !is_executable('/usr/bin/python3') || !is_executable('/usr/bin/timeout') || !is_executable(self::RUNTIME_DIR . '/sls_notification_destinations.py')) {
@@ -2741,9 +3285,15 @@ class Slsmassnotifyserver implements \BMO
 		$environment['SLS_DESTINATION_SUBJECT'] = (string)$title;
 		$environment['SLS_DESTINATION_BODY'] = (string)$message;
 		$environment['SLS_DESTINATION_COLOR'] = (string)$backgroundColor;
-		$environment['SLS_DESTINATION_TIME'] = gmdate('c');
-		$environment['SLS_DESTINATION_EVENT_ID'] = 'dashboard-announcement-' . gmdate('YmdHis') . '-' . bin2hex(random_bytes(12));
+		$environment['SLS_DESTINATION_TIME'] = $deliveryTimestamp;
+		$environment['SLS_DESTINATION_EVENT_ID'] = $deliveryId;
+		$validatedIncident = $incidentContext === null ? null : \SLS\MassNotify\IncidentConfig::context($incidentContext);
+		$environment['SLS_DESTINATION_INCIDENT_ID'] = $validatedIncident['incident_id'] ?? '';
+		$environment['SLS_DESTINATION_INCIDENT_JSON'] = $validatedIncident === null ? '' : json_encode($validatedIncident, JSON_THROW_ON_ERROR);
+		$environment['SLS_DESTINATION_AUTHORIZATION_JSON'] = $authorization ? json_encode($authorization + ['webhook_ids'=>array_keys($requested)], JSON_THROW_ON_ERROR) : '';
+		$environment['SLS_DESTINATION_FINGERPRINTS_JSON'] = json_encode((object)array_intersect_key($expectedFingerprints, $requested), JSON_UNESCAPED_SLASHES);
 		$environment['SLS_DESTINATION_BUDGET_SECONDS'] = '6';
+		$environment['SLS_DESTINATION_LATEST_START'] = $submissionDeadlineAt === null ? '' : (string)$submissionDeadlineAt;
 		$environment['SLS_DESTINATION_FIELDS_JSON'] = json_encode(array_slice($fields, 0, 6), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
 		$command = [
 			'/usr/bin/timeout', '--signal=TERM', '--kill-after=1', '10',
@@ -2784,10 +3334,15 @@ class Slsmassnotifyserver implements \BMO
 			}
 			$seen[$id] = true;
 			if (($result['status'] ?? '') === 'accepted') {
-				$outcome['accepted'][] = ['id' => $id, 'name' => $requested[$id]];
+				$outcome['accepted'][] = ['id' => $id, 'name' => $requested[$id], 'http_status' => (int)($result['http_status'] ?? 0)];
 			} else {
 				$error = substr(preg_replace('/[^a-z0-9_-]/', '', strtolower((string)($result['error'] ?? 'delivery_failed'))), 0, 64) ?: 'delivery_failed';
-				$outcome['failed'][] = ['id' => $id, 'name' => $requested[$id], 'error' => $error];
+				if (($result['status'] ?? '') === 'uncertain') { $error = 'delivery_unconfirmed'; }
+				$outcome['failed'][] = ['id' => $id, 'name' => $requested[$id], 'error' => $error,
+					'status' => in_array($result['status'] ?? '', ['cancelled', 'uncertain'], true) ? $result['status'] : 'failed',
+					'http_status' => max(0, min(599, (int)($result['http_status'] ?? 0))),
+					'failure_reason' => substr(preg_replace('/[^a-z0-9_]/', '', (string)($result['failure_reason'] ?? $error)), 0, 96),
+					'retryable' => !in_array($error, ['legacy_route_snapshot_missing', 'destination_changed', 'destination_unavailable', 'schedule_deadline_expired'], true)];
 			}
 		}
 		foreach ($requested as $id => $name) {
@@ -2805,10 +3360,24 @@ class Slsmassnotifyserver implements \BMO
 	private function buildAnnouncementVisualPushCommand($message, array $targets, $displayTimeout, array $options = [])
 	{
 		$mode = ($options['mode'] ?? 'phone_only') === 'api_only' ? 'api_only' : 'phone_only';
-		$command = '/usr/bin/timeout --signal=TERM 90 /usr/bin/python3 '
+		$command = '/usr/bin/timeout ' . (!empty($options['managed_deadline']) ? '--foreground ' : '') . '--signal=TERM --kill-after=1 90 /usr/bin/python3 -I '
 			. escapeshellarg(self::VISUAL_PUSH_SCRIPT)
-			. ' --announcement ' . escapeshellarg((string)$message)
+			. ' --announcement=' . escapeshellarg((string)$message)
 			. ' --announcement-timeout-seconds ' . max(0, (int)$displayTimeout);
+		if (($options['is_test'] ?? false) === true) { $command .= ' --is-test'; }
+		if ($mode === 'api_only' && isset($options['schedule_deadline_at'])) {
+			if (!is_int($options['schedule_deadline_at']) || $options['schedule_deadline_at'] < 1) {
+				throw new \DomainException('Invalid scheduled desktop publication deadline.');
+			}
+			$command .= ' --latest-start ' . $options['schedule_deadline_at'];
+		}
+		if ($mode === 'api_only' && isset($options['incident_context'])) {
+			$context = self::validateIncidentContext($options['incident_context']);
+			if ($context['is_test'] !== (($options['is_test'] ?? false) === true)) {
+				throw new \DomainException(_('Incident test metadata does not match the announcement.'));
+			}
+			$command .= ' --incident-json=' . escapeshellarg(json_encode($context, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES));
+		}
 		if (!empty($options['sender'])) {
 			$command = '/usr/bin/env ' . escapeshellarg('SLS_ANNOUNCEMENT_SENDER=' . $this->sanitizeScheduleText($options['sender'], 80, true)) . ' ' . $command;
 		}
@@ -2856,18 +3425,34 @@ class Slsmassnotifyserver implements \BMO
 
 	private function sendAnnouncementTtsAudio(array $extensions, $message, array $context = [])
 	{
+		$outboundTargets = is_array($context['outbound_targets'] ?? null) ? $context['outbound_targets'] : [];
+		$this->lastPhoneAdmission = [];
+		$deadline = $context['schedule_deadline_at'] ?? null;
+		if ($deadline !== null && (!is_int($deadline) || $deadline <= time())) {
+			return ['success' => false, 'message' => _('The scheduled start deadline elapsed before audio preparation. No audio was submitted.'),
+				'error' => 'schedule_deadline_expired', 'retryable' => false];
+		}
 		$settings = $this->getActiveSettings();
+		$audioMode = $this->normalizeAnnouncementAudioMode($context['audio_mode'] ?? 'tones_tts');
+		$includeTts = in_array($audioMode, ['tts', 'tones_tts'], true);
+		$includeTones = in_array($audioMode, ['tones', 'tones_tts'], true);
+		$settings['announcement_pronunciation'] = $context['pronunciation_rules'] ?? [];
 		$requestedVoice = (string)($context['piper_voice'] ?? '');
 		$voiceLookup = array_fill_keys(array_column($this->getAvailablePiperVoices(), 'path'), true);
-		if ($requestedVoice !== '' && isset($voiceLookup[$requestedVoice])) {
+		if ($includeTts && $requestedVoice === '') {
+			return ['success' => false, 'message' => _('The original announcement voice was not recorded. No audio was submitted. Review the announcement and submit a new request.'),
+				'error' => 'legacy_voice_snapshot_missing', 'retryable' => false];
+		}
+		if ($includeTts && (!isset($voiceLookup[$requestedVoice]) || !$this->isValidPiperVoiceFile($requestedVoice))) {
+			return ['success' => false, 'message' => _('The selected announcement voice is no longer available. No audio was submitted. Restore that voice or submit a new announcement with an available voice.'),
+				'error' => 'selected_voice_unavailable'];
+		}
+		if ($includeTts) {
 			$settings['announcement_piper_voice'] = $requestedVoice;
 		}
 		if (array_key_exists('tts_volume', $context)) {
 			$settings['announcement_tts_volume'] = $this->normalizeTtsVolume($context['tts_volume'], $settings['announcement_tts_volume'] ?? 25);
 		}
-		$audioMode = $this->normalizeAnnouncementAudioMode($context['audio_mode'] ?? 'tones_tts');
-		$includeTts = in_array($audioMode, ['tts', 'tones_tts'], true);
-		$includeTones = in_array($audioMode, ['tones', 'tones_tts'], true);
 		$settings['opening_tone'] = $includeTones ? $this->normalizeToneName((string)($context['opening_tone'] ?? $settings['opening_tone'] ?? '')) : '';
 		$settings['closing_tone'] = $includeTones ? $this->normalizeToneName((string)($context['closing_tone'] ?? $settings['closing_tone'] ?? '')) : '';
 		// Announcement requests run as the Asterisk web account. They must not
@@ -2878,7 +3463,7 @@ class Slsmassnotifyserver implements \BMO
 		}
 		$this->pruneTtsCache();
 
-		if (empty($extensions)) {
+		if (empty($extensions) && empty($outboundTargets)) {
 			return ['success' => false, 'message' => _('No announcement audio recipients were selected.')];
 		}
 		if ($includeTts && !is_executable($settings['piper_bin'] ?? self::PIPER_BIN)) {
@@ -2891,7 +3476,11 @@ class Slsmassnotifyserver implements \BMO
 
 		$ttsBase = '';
 		if ($includeTts) {
-			$ttsBase = $this->generateAnnouncementTtsFile($message, $settings);
+			try {
+				$ttsBase = $this->generateAnnouncementTtsFile($message, $settings);
+			} catch (\DomainException $error) {
+				return ['success' => false, 'message' => $error->getMessage(), 'error' => 'audio_preparation_rejected'];
+			}
 			if ($ttsBase === '') {
 				return ['success' => false, 'message' => _('Piper TTS audio could not be generated.')];
 			}
@@ -2903,9 +3492,20 @@ class Slsmassnotifyserver implements \BMO
 		}
 
 		$audioDuration = $this->getAnnouncementSequenceDuration($sequence);
-		$queued = $this->queueAnnouncementAudioCalls($extensions, $sequence, $audioDuration, $context['priority'] ?? 'normal');
+		$guard = $this->guardPreparedApiAudio($context, $extensions, $outboundTargets);
+		if (!$guard['success']) { return $guard; }
+		$extensions = $guard['extensions'];
+		$outboundTargets = $guard['outbound_targets'];
+		$queued = $this->queueAnnouncementAudioCalls($extensions, $sequence, $audioDuration, $context['priority'] ?? 'normal', $outboundTargets, $context['correlation'] ?? '', $context);
+		$permissionDenied = $guard['permission_denied_targets'];
+		foreach (['phones', 'voice_recipient_ids'] as $channel) {
+			$permissionDenied[$channel] = array_values(array_unique(array_merge($permissionDenied[$channel], $this->lastPhoneAdmission['permission_denied_targets'][$channel] ?? [])));
+		}
 		if ($queued < 1) {
-			return ['success' => false, 'message' => _('Unable to queue announcement audio calls.')];
+			return ['success' => false, 'message' => $this->lastPhoneAdmission['detail'] ?? _('Unable to queue announcement audio calls.'),
+				'error' => $this->lastPhoneAdmission['failure_code'] ?? 'phone_queue_failed', 'retryable' => false,
+				'permission_denied_targets' => $permissionDenied,
+				'submission_uncertain' => !empty($this->lastPhoneAdmission['submission_uncertain'])];
 		}
 
 		$this->updateStatusData([
@@ -2921,12 +3521,18 @@ class Slsmassnotifyserver implements \BMO
 		$this->appendAnnouncementAudioLog($message, $sequence, $extensions, $context);
 
 		return [
-			'success' => $queued === count($extensions),
-			'message' => sprintf(_('Queued announcement audio to %s of %s extension(s).'), $queued, count($extensions)),
+			'success' => $queued === count($extensions) + count($outboundTargets) && empty($this->lastPhoneAdmission['submission_uncertain']),
+			'message' => sprintf(_('Queued announcement audio to %s of %s phone destination(s). Answer and playback remain unverified.'), $queued, count($extensions) + count($outboundTargets))
+				. (($this->lastPhoneAdmission['failure_code'] ?? '') === 'schedule_deadline_expired' ? ' ' . $this->lastPhoneAdmission['detail'] : ''),
+			'error' => $this->lastPhoneAdmission['failure_code'] ?? '',
 			'audio_sequence' => $sequence,
 			'notify_delay_seconds' => 1,
 			'audio_duration_seconds' => $audioDuration,
 			'delivery_started' => true,
+			'retryable' => false,
+			'submission_uncertain' => !empty($this->lastPhoneAdmission['submission_uncertain']),
+			'admission_id' => $this->lastPhoneAdmission['token'] ?? '',
+			'permission_denied_targets' => $permissionDenied,
 		];
 	}
 
@@ -2947,101 +3553,90 @@ class Slsmassnotifyserver implements \BMO
 		}
 		$output = [];
 		$exitCode = 0;
-		exec('LC_ALL=C /usr/bin/soxi -D ' . escapeshellarg($file) . ' 2>/dev/null', $output, $exitCode);
+		exec('LC_ALL=C /usr/bin/timeout --kill-after=1 5 /usr/bin/soxi -D ' . escapeshellarg($file) . ' 2>/dev/null', $output, $exitCode);
 		$duration = $exitCode === 0 ? (float)($output[0] ?? 0) : 0.0;
 		return $duration > 0 && is_finite($duration) ? $duration : 0.0;
 	}
 
 	private function generateAnnouncementTtsFile($message, array $settings)
 	{
+		$voice = (string)($settings['announcement_piper_voice'] ?? $settings['piper_voice'] ?? self::PIPER_VOICE);
+		if (!$this->isValidPiperVoiceFile($voice) || !$this->isValidPiperVoiceFile($voice . '.json')) {
+			throw new \DomainException(_('The selected speech model or its configuration failed checksum verification. Run Repair Installation before generating speech.'));
+		}
 		$maxSeconds = $this->normalizeTtsMaxSeconds($settings['tts_max_seconds'] ?? 30);
-		$ttsText = $this->buildAnnouncementTtsText($message, $maxSeconds);
+        $ttsText = $this->buildAnnouncementTtsText($message, $maxSeconds, $settings['announcement_pronunciation'] ?? [], (string)($settings['announcement_piper_voice'] ?? $settings['piper_voice'] ?? self::PIPER_VOICE));
+		if (!empty($settings['_tts_prompt_only'])) {
+			$ttsText = trim(preg_replace('/\s+/', ' ', (string)$message));
+		}
 		if ($ttsText === '') {
-			return '';
+			throw new \DomainException(_('Speech cannot be generated from an empty announcement. Enter the message before sending.'));
 		}
-
-		$baseName = 'announcement_tts_' . date('YmdHis') . '_' . bin2hex(random_bytes(4));
-		$tmpFile = tempnam('/tmp', 'sls_announcement_tts_');
-		$textFile = tempnam('/tmp', 'sls_announcement_text_');
-		if ($tmpFile === false || $textFile === false) {
-			return '';
+		if (!is_executable('/usr/bin/sox') || !is_executable('/usr/bin/soxi')) {
+			throw new \DomainException(_('Speech conversion and duration checks require SoX and soxi. Run Repair Installation from General Settings.'));
 		}
-		$tmpWav = $tmpFile . '.wav';
+		$baseName = 'announcement_tts_' . date('YmdHis') . '_' . bin2hex(random_bytes(16));
+		$tmpDir = '/tmp/sls_announcement_' . bin2hex(random_bytes(16));
+		if (!@mkdir($tmpDir, 0700)) {
+			throw new \DomainException(_('Cannot create the private speech workspace in /tmp. Check free disk space and directory permissions.'));
+		}
+		$textFile = $tmpDir . '/message.txt';
+		$tmpWav = $tmpDir . '/speech.wav';
 		$outputFile = self::TTS_DIR . '/' . $baseName . '.wav';
-		@unlink($tmpFile);
-		file_put_contents($textFile, $ttsText . "\n");
-
-		$generationTimeout = min(900, max(25, ($maxSeconds * 2) + 30));
+		$complete = false;
+		try {
+			if (@file_put_contents($textFile, $ttsText . "\n", LOCK_EX) !== strlen($ttsText) + 1) {
+				throw new \DomainException(_('Cannot write the speech input file. Check free disk space in /tmp.'));
+			}
+			$generationTimeout = min(900, max(25, ($maxSeconds * 2) + 30));
+			if (!empty($settings['_tts_preview'])) { $generationTimeout = min(30, $generationTimeout); }
 			$cmd = '/usr/bin/timeout ' . (int)$generationTimeout . ' '
 				. escapeshellarg($settings['piper_bin'] ?? self::PIPER_BIN)
-				. ' --model '
-				. escapeshellarg($settings['announcement_piper_voice'] ?? $settings['piper_voice'] ?? self::PIPER_VOICE)
-				. ' --volume '
-				. escapeshellarg('1.00')
-			. ' --input-file '
-			. escapeshellarg($textFile)
-			. ' --output-file '
-			. escapeshellarg($tmpWav)
-			. ' 2>&1';
-		exec($cmd, $output, $exitCode);
-		@unlink($textFile);
-		if ($exitCode !== 0 || !is_file($tmpWav)) {
-			@unlink($tmpWav);
-			return '';
-		}
-
-			if (is_executable('/usr/bin/sox')) {
-				$cmd = '/usr/bin/sox -v '
-					. escapeshellarg($this->volumePercentToScalar($settings['announcement_tts_volume'] ?? 25, 25))
-					. ' '
-					. escapeshellarg($tmpWav)
-					. ' -r 8000 -c 1 -b 16 '
-				. escapeshellarg($outputFile)
-				. ' 2>&1';
+				. ' --model ' . escapeshellarg($settings['announcement_piper_voice'] ?? $settings['piper_voice'] ?? self::PIPER_VOICE)
+				. ' --volume 1.00 --input-file ' . escapeshellarg($textFile)
+				. ' --output-file ' . escapeshellarg($tmpWav) . ' 2>&1';
+			$output = [];
 			exec($cmd, $output, $exitCode);
-			@unlink($tmpWav);
-			if ($exitCode !== 0 || !is_file($outputFile)) {
-				@unlink($outputFile);
-				return '';
+			if ($exitCode === 124) {
+				throw new \DomainException(sprintf(_('Speech generation exceeded its %d-second processing timeout. Check PBX load or shorten the message.'), $generationTimeout));
 			}
-		} else {
-			@rename($tmpWav, $outputFile);
-		}
-
-		if (is_executable('/usr/bin/soxi') && is_executable('/usr/bin/sox')) {
+			if ($exitCode !== 0 || !is_file($tmpWav)) {
+				throw new \DomainException(sprintf(_('Piper did not produce speech audio (exit code %d). Check the selected voice and run Repair Installation.'), $exitCode));
+			}
 			$durationOutput = [];
-			exec('/usr/bin/soxi -D ' . escapeshellarg($outputFile) . ' 2>/dev/null', $durationOutput, $durationExit);
+			exec('LC_ALL=C /usr/bin/timeout --kill-after=1 5 /usr/bin/soxi -D ' . escapeshellarg($tmpWav) . ' 2>/dev/null', $durationOutput, $durationExit);
 			$duration = $durationExit === 0 ? (float)($durationOutput[0] ?? 0) : 0.0;
-			if ($duration > $maxSeconds) {
-					$trimmed = $outputFile . '.trimmed.wav';
-				exec('/usr/bin/sox ' . escapeshellarg($outputFile) . ' ' . escapeshellarg($trimmed) . ' trim 0 ' . escapeshellarg((string)$maxSeconds) . ' 2>&1', $trimOutput, $trimExit);
-				if ($trimExit === 0 && is_file($trimmed)) {
-					@rename($trimmed, $outputFile);
-				} else {
-					@unlink($trimmed);
-				}
+			if (!is_finite($duration) || $duration <= 0) {
+				throw new \DomainException(_('Piper produced audio with an unreadable or empty duration. Check the selected voice and run Repair Installation.'));
 			}
+			if ($duration > $maxSeconds) {
+				throw new \DomainException(sprintf(_('Generated speech is %.2f seconds; the configured maximum is %d seconds. Audio was rejected. Shorten the message or increase Maximum Speech Duration in General Settings.'), $duration, $maxSeconds));
+			}
+			$output = [];
+			exec('/usr/bin/timeout --kill-after=2 30 /usr/bin/sox -v ' . escapeshellarg($this->volumePercentToScalar($settings['announcement_tts_volume'] ?? 25, 25))
+				. ' ' . escapeshellarg($tmpWav) . ' -r 8000 -c 1 -b 16 ' . escapeshellarg($outputFile) . ' 2>&1', $output, $exitCode);
+			if ($exitCode !== 0 || !is_file($outputFile) || filesize($outputFile) < 44) {
+				throw new \DomainException(sprintf(_('Speech conversion to telephone audio failed (exit code %d). Check free disk space and SoX availability.'), $exitCode));
+			}
+			@chmod($outputFile, 0644);
+			@chown($outputFile, 'asterisk');
+			@chgrp($outputFile, 'asterisk');
+			$complete = true;
+			return $baseName;
+		} finally {
+			@unlink($textFile);
+			@unlink($tmpWav);
+			@rmdir($tmpDir);
+			if (!$complete) { @unlink($outputFile); }
 		}
-
-		@chmod($outputFile, 0644);
-		@chown($outputFile, 'asterisk');
-		@chgrp($outputFile, 'asterisk');
-		return $baseName;
 	}
 
-	private function buildAnnouncementTtsText($message, $maxSeconds)
-	{
-		$message = trim(preg_replace('/\s+/', ' ', (string)$message));
-		if ($message === '') {
-			return '';
-		}
-		$wordLimit = max(18, min(1200, max(1, (int)$maxSeconds) * 2));
-		$words = preg_split('/\s+/', $message, -1, PREG_SPLIT_NO_EMPTY) ?: [];
-		if (count($words) > $wordLimit) {
-			$message = implode(' ', array_slice($words, 0, $wordLimit));
-			$message = rtrim($message, " \t\n\r\0\x0B,;:") . '.';
-		}
-		return 'Announcement. ' . $message;
+    private function buildAnnouncementTtsText($message, $maxSeconds, array $pronunciation = [], string $voice = '')
+    {
+        $message = trim(preg_replace('/\s+/', ' ', (string)$message));
+        $prefixes = ['es' => 'Aviso. ', 'fr' => 'Annonce. ', 'de' => 'Durchsage. ', 'pt' => 'Comunicado. '];
+        $language = substr(basename($voice), 0, 2);
+        return $message === '' ? '' : ($prefixes[$language] ?? 'Announcement. ') . \SLS\MassNotify\SpeechRules::apply($message, $pronunciation);
 	}
 
 	private function buildAnnouncementAudioSequence($ttsBase, array $settings)
@@ -3089,12 +3684,53 @@ class Slsmassnotifyserver implements \BMO
 		return '';
 	}
 
+	private function announcementAudioFileMetadata($path, $allowMissing = false)
+	{
+		clearstatcache(true, $path);
+		$metadata = @lstat($path);
+		if ($metadata === false && $allowMissing) { return null; }
+		if (!is_array($metadata) || ($metadata['mode'] & 0170000) !== 0100000
+			|| $metadata['nlink'] !== 1 || ($metadata['mode'] & 0022) || realpath($path) !== $path
+			|| $metadata['size'] > 64 * 1024 * 1024) {
+			throw new \DomainException(sprintf(_('Announcement audio file %s is unsafe or exceeds 64 MiB. Check its permissions and replace linked or damaged files.'), basename($path)));
+		}
+		return $metadata;
+	}
+
+	private function isValidAnnouncementAudioCache($path)
+	{
+		$metadata = $this->announcementAudioFileMetadata($path, true);
+		if ($metadata === null || $metadata['size'] < 44) { return false; }
+		$raw = $this->readNativeBackupFile($path, 64 * 1024 * 1024, _('The announcement audio cache could not be read safely. Retry after checking its storage.'));
+		$length = strlen($raw);
+		if (substr($raw, 0, 4) !== 'RIFF' || substr($raw, 8, 4) !== 'WAVE'
+			|| unpack('V', substr($raw, 4, 4))[1] + 8 !== $length) { return false; }
+		$offset = 12; $format = false; $data = false; $chunks = 0;
+		while ($offset + 8 <= $length && ++$chunks <= 64) {
+			$kind = substr($raw, $offset, 4); $size = unpack('V', substr($raw, $offset + 4, 4))[1];
+			$start = $offset + 8; $end = $start + $size;
+			if ($end > $length) { return false; }
+			if ($kind === 'fmt ') {
+				if ($format || $size < 16) { return false; }
+				$pcm = unpack('vformat/vchannels/Vrate/Vbytes/vblock/vbits', substr($raw, $start, 16));
+				if ($pcm !== ['format'=>1, 'channels'=>1, 'rate'=>8000, 'bytes'=>16000, 'block'=>2, 'bits'=>16]) { return false; }
+				$format = true;
+			} elseif ($kind === 'data') {
+				if ($data || $size < 2 || $size % 2 !== 0) { return false; }
+				$data = true;
+			}
+			$offset = $end + ($size % 2);
+		}
+		return $format && $data && $offset === $length;
+	}
+
 	private function combineAudioParts($baseName, array $files, $prefix)
 	{
 		if (!is_executable('/usr/bin/sox') || count($files) < 1) {
 			return '';
 		}
 		foreach ($files as $file) {
+			$this->announcementAudioFileMetadata($file);
 			if (!is_readable($file)) {
 				return '';
 			}
@@ -3108,18 +3744,18 @@ class Slsmassnotifyserver implements \BMO
 		foreach ($files as $file) {
 			$sourceMtime = max($sourceMtime, (int)@filemtime($file));
 		}
-		if (is_readable($target) && (int)@filemtime($target) >= $sourceMtime) {
+		if ($this->isValidAnnouncementAudioCache($target) && (int)@filemtime($target) >= $sourceMtime) {
 			return $name;
 		}
 		$tmp = $target . '.tmp.' . bin2hex(random_bytes(3)) . '.wav';
 		$silence = $target . '.silence.' . bin2hex(random_bytes(3)) . '.wav';
-		$silenceCmd = '/usr/bin/sox -n -r 8000 -c 1 -b 16 ' . escapeshellarg($silence) . ' trim 0.0 1.0 2>&1';
+		$silenceCmd = '/usr/bin/timeout --kill-after=2 30 /usr/bin/sox -n -r 8000 -c 1 -b 16 ' . escapeshellarg($silence) . ' trim 0.0 1.0 2>&1';
 		exec($silenceCmd, $silenceOutput, $silenceExit);
 		if ($silenceExit !== 0 || !is_file($silence)) {
 			@unlink($silence);
 			return '';
 		}
-		$cmd = '/usr/bin/sox';
+		$cmd = '/usr/bin/timeout --kill-after=2 30 /usr/bin/sox';
 		$cmd .= ' ' . escapeshellarg($silence);
 		foreach ($files as $file) {
 			$cmd .= ' ' . escapeshellarg($file);
@@ -3127,11 +3763,11 @@ class Slsmassnotifyserver implements \BMO
 		$cmd .= ' -r 8000 -c 1 -b 16 ' . escapeshellarg($tmp) . ' 2>&1';
 		exec($cmd, $output, $exitCode);
 		@unlink($silence);
-		if ($exitCode !== 0 || !is_file($tmp)) {
+		if ($exitCode !== 0 || !$this->isValidAnnouncementAudioCache($tmp)) {
 			@unlink($tmp);
 			return '';
 		}
-		@rename($tmp, $target);
+		if (!@rename($tmp, $target)) { @unlink($tmp); return ''; }
 		@chmod($target, 0644);
 		@chown($target, 'asterisk');
 		@chgrp($target, 'asterisk');
@@ -3146,6 +3782,7 @@ class Slsmassnotifyserver implements \BMO
 		}
 
 		$source = self::TONES_DIR . '/' . $toneName . '.wav';
+		$this->announcementAudioFileMetadata($source);
 		if (!is_readable($source)) {
 			return '';
 		}
@@ -3154,23 +3791,23 @@ class Slsmassnotifyserver implements \BMO
 		$quietBase = 'announcement_tone_' . $toneName . '_v' . $volumePercent;
 		$quietBase = $this->normalizeToneName($quietBase);
 		$target = self::TTS_DIR . '/' . $quietBase . '.wav';
-		if (is_readable($target) && filemtime($target) !== false && filemtime($source) !== false && filemtime($target) >= filemtime($source)) {
+		if ($this->isValidAnnouncementAudioCache($target) && filemtime($target) !== false && filemtime($source) !== false && filemtime($target) >= filemtime($source)) {
 			return $quietBase;
 		}
 
 			$tmp = $target . '.tmp.' . bin2hex(random_bytes(3)) . '.wav';
-		$cmd = '/usr/bin/sox -v ' . escapeshellarg($this->volumePercentToScalar($volumePercent, 25)) . ' '
+		$cmd = '/usr/bin/timeout --kill-after=2 30 /usr/bin/sox -v ' . escapeshellarg($this->volumePercentToScalar($volumePercent, 25)) . ' '
 			. escapeshellarg($source)
 			. ' -r 8000 -c 1 -b 16 '
 			. escapeshellarg($tmp)
 			. ' 2>&1';
 		exec($cmd, $output, $exitCode);
-		if ($exitCode !== 0 || !is_file($tmp)) {
+		if ($exitCode !== 0 || !$this->isValidAnnouncementAudioCache($tmp)) {
 			@unlink($tmp);
 			return '';
 		}
 
-		@rename($tmp, $target);
+		if (!@rename($tmp, $target)) { @unlink($tmp); return ''; }
 		@chmod($target, 0644);
 		@chown($target, 'asterisk');
 		@chgrp($target, 'asterisk');
@@ -3190,8 +3827,60 @@ class Slsmassnotifyserver implements \BMO
 		return (int)ceil($duration) + 2;
 	}
 
-	private function queueAnnouncementAudioCalls(array $extensions, $sequence, $audioDuration, $priority = 'normal')
+	protected function requestPhoneAdmission(array $request)
 	{
+		$encoded = json_encode($request, JSON_UNESCAPED_SLASHES);
+		$failure = ['ok' => false, 'failure_code' => 'phone_admission_unavailable', 'retryable' => false,
+			'detail' => _('Phone admission could not be confirmed. Check the SLS phone-events service and local Asterisk connection. No additional call files were authorized.')];
+		if (!is_string($encoded) || strlen($encoded) > 1048576) { return $failure; }
+		$command = ['/usr/bin/timeout', '--signal=TERM', '--kill-after=2', '75', '/usr/bin/python3', '-I',
+			self::RUNTIME_DIR . '/sls_phone_admission.py', '--request-stdin'];
+		$pipes = [];
+		$process = proc_open($command, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']], $pipes, null, null, ['bypass_shell' => true]);
+		if (!is_resource($process)) { return $failure; }
+		$sent = fwrite($pipes[0], $encoded); fclose($pipes[0]);
+		$raw = stream_get_contents($pipes[1], 131073); fclose($pipes[1]);
+		if (!is_string($raw) || strlen($raw) > 131072) { proc_terminate($process); }
+		$exit = proc_close($process);
+		$result = is_string($raw) && strlen($raw) <= 131072 ? json_decode($raw, true) : null;
+		if ($sent !== strlen($encoded) || !is_array($result)) { return $failure; }
+		if ($exit !== 0 || empty($result['ok'])) {
+			return is_string($result['failure_code'] ?? null) && is_string($result['detail'] ?? null)
+				? ['ok' => false, 'failure_code' => $result['failure_code'], 'detail' => $result['detail'], 'retryable' => false] : $failure;
+		}
+		if (!preg_match('/^[a-f0-9]{32}$/D', (string)($result['token'] ?? '')) || !is_array($result['targets'] ?? null)
+			|| !is_array($result['outbound_targets'] ?? null) || !is_array($result['unavailable'] ?? null)) { return $failure; }
+		$phones = array_map('strval', (array)($request['internal'] ?? []));
+		$voice = array_column((array)($request['outbound'] ?? []), 'id');
+		if (array_diff($result['targets'], $phones) || array_diff($result['unavailable'], $phones) || array_diff($result['outbound_targets'], $voice)) { return $failure; }
+		$rejected = $result['outbound_failures'] ?? [];
+		if (!is_array($rejected) || !array_is_list($rejected) || count($rejected) > count($voice)) { return $failure; }
+		$seen = [];
+		foreach ($rejected as $row) {
+			if (!is_array($row) || !is_string($row['id'] ?? null) || !in_array($row['id'], $voice, true)
+				|| in_array($row['id'], $result['outbound_targets'], true) || isset($seen[$row['id']])
+				|| !is_string($row['failure_code'] ?? null) || !preg_match('/^[a-z_]{1,100}$/D', $row['failure_code'])
+				|| !is_string($row['detail'] ?? null) || strlen($row['detail']) > 1024) { return $failure; }
+			$seen[$row['id']] = true;
+		}
+		return $result;
+	}
+
+	private function queueAnnouncementAudioCalls(array $extensions, $sequence, $audioDuration, $priority = 'normal', array $outboundTargets = [], $correlation = '', array $apiContext = [])
+	{
+		$settings = $this->getActiveSettings();
+		$deadline = $apiContext['schedule_deadline_at'] ?? null;
+		if ($deadline !== null && (!is_int($deadline) || $deadline < 1 || $deadline > 253402300799)) {
+			throw new \DomainException('Invalid scheduled audio start deadline.');
+		}
+		$latestTick = $deadline === null ? null : hrtime(true) / 1000000000 + max(0, $deadline - time());
+		$expired = function () use ($deadline, $latestTick) {
+			if ($deadline === null || (time() < $deadline && hrtime(true) / 1000000000 < $latestTick)) { return false; }
+			$this->lastPhoneAdmission['failure_code'] = 'schedule_deadline_expired';
+			$this->lastPhoneAdmission['detail'] = _('The scheduled start deadline elapsed before this phone submission. Unstarted calls were rejected; calls already in progress were not interrupted.');
+			return true;
+		};
+		if ($expired()) { return 0; }
 		if (!in_array($priority, ['normal', 'urgent'], true)) { return 0; }
 		if ($sequence === '' || !is_dir(self::ASTERISK_OUTGOING_SPOOL) || !is_dir(self::ASTERISK_SPOOL_TMP)) {
 			return 0;
@@ -3201,23 +3890,59 @@ class Slsmassnotifyserver implements \BMO
 			return 0;
 		}
 		$callWaitSeconds = $pageHoldSeconds + 30;
+		$extensions = array_values(array_unique(array_map('strval', $extensions)));
+		foreach ($extensions as $extension) {
+			$this->lastAudioQueueResults[$extension] = false;
+			if (!preg_match('/^[0-9]{1,20}$/D', $extension)) { return 0; }
+		}
+		foreach ($outboundTargets as $target) {
+			$this->lastOutboundQueueResults[$target['id']] = ['state' => 'rejected', 'retryable' => false];
+		}
 		$reservation = [
 			'/usr/bin/python3', self::RUNTIME_DIR . '/sls_audio_queue.py',
 			'--recipients', implode(',', $extensions), '--duration', (string)$pageHoldSeconds, '--sound', $sequence,
 			'--priority', $priority,
 		];
-		$pipes = [];
-		$process = proc_open($reservation, [0 => ['file', '/dev/null', 'r'], 1 => ['file', '/dev/null', 'w'], 2 => ['pipe', 'w']], $pipes, null, null, ['bypass_shell' => true]);
-		if (!is_resource($process)) { return 0; }
-		stream_get_contents($pipes[2]); fclose($pipes[2]);
-		if (proc_close($process) !== 0) { return 0; }
+		if ($deadline !== null) { $reservation[] = '--latest-start'; $reservation[] = (string)$deadline; }
+		if ($extensions) {
+			$pipes = [];
+			$process = proc_open($reservation, [0 => ['file', '/dev/null', 'r'], 1 => ['file', '/dev/null', 'w'], 2 => ['pipe', 'w']], $pipes, null, null, ['bypass_shell' => true]);
+			if (!is_resource($process)) { return 0; }
+			stream_get_contents($pipes[2]); fclose($pipes[2]);
+			if (proc_close($process) !== 0) { $expired(); return 0; }
+		}
+		if ($expired()) { return 0; }
+		$this->lastPhoneAdmission = $this->requestPhoneAdmission(['internal' => $extensions, 'outbound' => $outboundTargets,
+			'service' => 'announcement', 'correlation' => (string)$correlation, 'wait_seconds' => 30,
+			'duration' => $pageHoldSeconds, 'sound' => $sequence] + ($deadline === null ? [] : ['latest_start' => $deadline]));
+		if (empty($this->lastPhoneAdmission['ok'])) { return 0; }
+		if ($expired()) { return 0; }
+		foreach ($this->lastPhoneAdmission['outbound_failures'] ?? [] as $row) {
+			$this->lastOutboundQueueResults[$row['id']] = ['state' => 'rejected', 'retryable' => false,
+				'failure_code' => $row['failure_code'], 'detail' => $row['detail']];
+		}
+		$token = $this->lastPhoneAdmission['token'];
+		$targets = [];
+		foreach ($this->lastPhoneAdmission['targets'] as $recipient) { $targets[] = ['id' => $recipient, 'external' => false]; }
+		foreach ($this->lastPhoneAdmission['outbound_targets'] as $recipient) { $targets[] = ['id' => $recipient, 'external' => true]; }
 
 		$queued = 0;
-		foreach ($extensions as $extension) {
-			$this->lastAudioQueueResults[(string)$extension] = false;
-			$recipient = preg_replace('/[^0-9]/', '', (string)$extension);
-			if ($recipient === '') {
-				continue;
+		foreach ($targets as $targetRow) {
+			$recipient = $targetRow['id'];
+			$external = $targetRow['external'];
+			if ($expired()) { break; }
+			// Admission can wait for capacity. Recheck a revocable credential at
+			// the actual submission boundary, preserving only its frozen targets.
+			if (!empty($apiContext['api_credential_id']) || !empty($apiContext['automation_context'])) {
+				$voice = $external ? array_values(array_filter($outboundTargets, static function ($row) use ($recipient) { return ($row['id'] ?? '') === $recipient; })) : [];
+				$permitted = $this->guardPreparedApiAudio($apiContext, $external ? [] : [(string)$recipient], $voice);
+				if (!$permitted['success']) {
+					$channel = $external ? 'voice_recipient_ids' : 'phones';
+					$this->lastPhoneAdmission['permission_denied_targets'][$channel][] = (string)$recipient;
+					$this->lastPhoneAdmission['failure_code'] = 'api_permission_revoked';
+					$this->lastPhoneAdmission['detail'] = $permitted['message'];
+					continue;
+				}
 			}
 			$callFile = @tempnam(self::ASTERISK_SPOOL_TMP, 'sls_announcement_');
 			if ($callFile === false || dirname($callFile) !== self::ASTERISK_SPOOL_TMP) {
@@ -3226,17 +3951,24 @@ class Slsmassnotifyserver implements \BMO
 				}
 				continue;
 			}
-			$body = "Channel: Local/{$recipient}@sls-alert-audio\n"
+			$audioContext = $external ? 'sls-outbound-voice' : 'sls-alert-audio';
+			$body = "Channel: Local/{$recipient}@{$audioContext}/n\n"
+				. "Account: slsphone_{$token}\n"
 				. "CallerID: \"SLS Mass Notify System\" <SLS>\n"
+				. "Setvar: __SLS_PHONE_TOKEN={$token}\n"
+				. "Setvar: __SLS_PHONE_RECIPIENT={$recipient}\n"
 				. "Setvar: SLS_SOUND={$sequence}\n"
 				. "Setvar: SLS_CALLERID_NAME=SLS Mass Notify System\n"
 				. "Setvar: SLS_CALLERID_NUM=SLS\n"
 				. "MaxRetries: 0\n"
 				. "RetryTime: 5\n"
 				. "WaitTime: {$callWaitSeconds}\n"
-				. "Application: Wait\n"
-				. "Data: {$pageHoldSeconds}\n";
-			if (file_put_contents($callFile, $body, LOCK_EX) === false) {
+				. ($external ? "Context: sls-outbound-playback\nExtension: s\nPriority: 1\n" : "Application: Wait\nData: {$pageHoldSeconds}\n");
+			$handle = @fopen($callFile, 'wb');
+			$written = is_resource($handle) && fwrite($handle, $body) === strlen($body) && fflush($handle)
+				&& (!function_exists('fsync') || fsync($handle));
+			if (is_resource($handle)) { fclose($handle); }
+			if (!$written) {
 				@unlink($callFile);
 				continue;
 			}
@@ -3244,9 +3976,32 @@ class Slsmassnotifyserver implements \BMO
 			@chgrp($callFile, 'asterisk');
 			@chmod($callFile, 0640);
 			$target = self::ASTERISK_OUTGOING_SPOOL . '/' . basename($callFile) . '.call';
-			if (@rename($callFile, $target)) {
+			if ($expired()) { @unlink($callFile); break; }
+			$clusterRequest = $this->enterpriseClusterRequest ?? ['delivery_id'=>(string)$correlation,
+				'message'=>(string)$sequence,'delivery_timestamp'=>(string)($apiContext['delivery_timestamp']??''),
+				'schedule_deadline_at'=>$deadline];
+			try {
+				$submitted = \SLS\MassNotify\EnterpriseClusterIntegration::effect($settings,$clusterRequest,
+					$external?'external_voice':'audio',(string)$recipient,static fn()=>@rename($callFile,$target));
+			} catch (\Throwable $error) {
+				$submitted=false;
+				if ($external) { $this->lastOutboundQueueResults[$recipient]=['state'=>'failed','retryable'=>false,'detail'=>'Cluster authority could not authorize this call. No call file was submitted; review the witness, lease and immutable delivery identity.','failure_code'=>'cluster_delivery_fenced']; }
+				else { $this->lastAudioQueueResults[$recipient]=false; }
+			}
+			if ($submitted) {
 				$queued++;
-				$this->lastAudioQueueResults[(string)$extension] = true;
+				if ($external) {
+					$this->lastOutboundQueueResults[$recipient] = ['state' => 'queued', 'retryable' => false,
+						'admission_id' => $token, 'detail' => _('Queued through FreePBX; remote answer and playback are unverified.')];
+				} else { $this->lastAudioQueueResults[$recipient] = true; }
+				$directory = @fopen(self::ASTERISK_OUTGOING_SPOOL, 'r');
+				$synced = is_resource($directory) && function_exists('fsync') && @fsync($directory);
+				if (is_resource($directory)) { fclose($directory); }
+				if (!$synced) {
+					$this->lastPhoneAdmission['submission_uncertain'] = true;
+					if ($external) { $this->lastOutboundQueueResults[$recipient]['state'] = 'submission_uncertain';
+						$this->lastOutboundQueueResults[$recipient]['detail'] = _('A call file was submitted, but durable spool confirmation failed. Review its outcome before resubmitting.'); }
+				}
 			} else {
 				@unlink($callFile);
 			}
@@ -3257,29 +4012,60 @@ class Slsmassnotifyserver implements \BMO
 	private function updateStatusData(array $patch)
 	{
 		$this->ensurePluginDataDir();
-		$handle = @fopen(self::STATUS_JSON, 'c+');
-		if ($handle === false || !flock($handle, LOCK_EX)) {
-			if (is_resource($handle)) {
-				fclose($handle);
+		$path = self::STATUS_JSON; $limit = 1048576;
+		$parent = @lstat(dirname($path)); $account = posix_getpwnam('asterisk');
+		$owners = array_unique([0, posix_geteuid(), $account['uid'] ?? -1]);
+		if (!$parent || ($parent['mode'] & 0170000) !== 0040000 || ($parent['mode'] & 0022)
+			|| !in_array($parent['uid'], $owners, true) || realpath(dirname($path)) !== dirname($path)) {
+			throw new \RuntimeException(_('Status storage has an unsafe directory. Run Repair Installation.'));
+		}
+		$regular = static function ($meta) use ($owners, $limit): bool {
+			return is_array($meta) && ($meta['mode'] & 0170000) === 0100000 && $meta['nlink'] === 1
+				&& in_array($meta['uid'], $owners, true) && ($meta['mode'] & 0027) === 0 && $meta['size'] <= $limit;
+		};
+		clearstatcache(true, $path); $before = @lstat($path);
+		if ($before !== false && !$regular($before)) { throw new \RuntimeException(_('Status storage is unsafe or exceeds 1 MiB. Preserve it and run Repair Installation.')); }
+		$mask = umask(0037);
+		try {
+			$handle = @fopen($path, $before === false ? 'x+b' : 'r+b'); $created = $before === false && is_resource($handle);
+			if (!$handle && $before === false) {
+				clearstatcache(true, $path); $before = @lstat($path);
+				if ($regular($before)) { $handle = @fopen($path, 'r+b'); }
 			}
-			return;
-		}
-		rewind($handle);
-		$decoded = json_decode((string)stream_get_contents($handle), true);
-		$data = is_array($decoded) ? $decoded : [];
-		foreach ($patch as $key => $value) {
-			$data[$key] = $value;
-		}
-		$json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
-		if ($json !== false) {
+		} finally { umask($mask); }
+		if (!is_resource($handle)) { throw new \RuntimeException(_('Status storage could not be opened. Check permissions and free space.')); }
+		try {
+			$identity = static function () use ($path, $handle, $before, $regular): bool {
+				clearstatcache(true, $path); $named = @lstat($path); $opened = fstat($handle);
+				return $regular($named) && $regular($opened) && $named['dev'] === $opened['dev'] && $named['ino'] === $opened['ino']
+					&& ($before === false || ($before['dev'] === $opened['dev'] && $before['ino'] === $opened['ino']));
+			};
+			if (!$identity()) { throw new \RuntimeException(_('Status storage changed during access. Preserve the existing file.')); }
+			if ($created) { $this->setPrivateOwnership($path); }
+			$deadline = hrtime(true) + 2000000000;
+			while (!flock($handle, LOCK_EX | LOCK_NB)) {
+				if (hrtime(true) >= $deadline) { throw new \RuntimeException(_('Status storage is busy. Its existing evidence was preserved.')); }
+				usleep(10000);
+			}
+			if (!$identity()) { throw new \RuntimeException(_('Status storage changed while waiting for its lock.')); }
+			rewind($handle); $raw = stream_get_contents($handle, $limit + 1);
+			if (!is_string($raw) || strlen($raw) > $limit || ($raw === '' && !$created)) { throw new \RuntimeException(_('Status evidence is incomplete or exceeds 1 MiB. Preserve it for recovery.')); }
+			$data = $raw === '' ? [] : json_decode($raw, true, 32, JSON_THROW_ON_ERROR);
+			if (!is_array($data) || ($raw !== '' && (substr(ltrim($raw), 0, 1) !== '{' || ($data && array_is_list($data))))) {
+				throw new \RuntimeException(_('Status evidence is invalid. Preserve it for recovery.'));
+			}
+			foreach ($patch as $key => $value) { $data[$key] = $value; }
+			$bytes = json_encode((object)$data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n";
+			if (strlen($bytes) > $limit || !$identity()) { throw new \RuntimeException(_('Status update exceeded its safe storage limit. Existing evidence was preserved.')); }
+			// PHP and Python status writers coordinate on this existing inode.
 			rewind($handle);
-			ftruncate($handle, 0);
-			fwrite($handle, $json . "\n");
-			fflush($handle);
-		}
-		flock($handle, LOCK_UN);
-		fclose($handle);
-		$this->setOwnership(self::STATUS_JSON);
+			if (!ftruncate($handle, 0)) { throw new \RuntimeException(_('Status storage could not be updated. Check free space.')); }
+			for ($offset = 0; $offset < strlen($bytes); $offset += $written) {
+				$written = fwrite($handle, substr($bytes, $offset));
+				if (!is_int($written) || $written < 1) { throw new \RuntimeException(_('Status storage write was incomplete. Preserve the file for recovery.')); }
+			}
+			if (!fflush($handle) || !fsync($handle) || !$identity()) { throw new \RuntimeException(_('Status storage completion could not be confirmed. Inspect its protected file.')); }
+		} finally { fclose($handle); }
 	}
 
 	private function appendAnnouncementAudioLog($message, $sequence, array $extensions, array $context = [])
@@ -3413,53 +4199,33 @@ class Slsmassnotifyserver implements \BMO
 
 	public function repairInstallation()
 	{
-		$effectiveUid = function_exists('posix_geteuid') ? (int)posix_geteuid() : -1;
-		if ($effectiveUid !== 0) {
-			$this->ensurePluginDataDir();
-			$temporary = self::REPAIR_REQUEST_FILE . '.tmp.' . bin2hex(random_bytes(4));
-			if (@file_put_contents($temporary, gmdate('c') . "\n", LOCK_EX) === false) {
-				return [
-					'success' => false,
-					'message' => _('Installation repair could not be queued.'),
-					'errors' => [_('Unable to write the protected maintenance request marker.')],
-				];
-			}
-			$this->setPrivateOwnership($temporary);
-			if (!@rename($temporary, self::REPAIR_REQUEST_FILE)) {
-				@unlink($temporary);
-				return [
-					'success' => false,
-					'message' => _('Installation repair could not be queued.'),
-					'errors' => [_('Unable to activate the maintenance request marker.')],
-				];
-			}
-			$this->setPrivateOwnership(self::REPAIR_REQUEST_FILE);
-			$this->writeMaintenanceProgress('repair', 'queued', _('Repair queued. Waiting for the protected maintenance worker.'));
-			return [
-				'success' => true,
-				'message' => _('Installation repair was queued. The protected maintenance worker will run it within one minute.'),
-				'errors' => [],
-			];
-		}
-		try {
-			$this->writeMaintenanceProgress('repair', 'running', _('Repairing runtime files and FreePBX integration.'));
-			$this->install();
-			$this->runCommand('/usr/sbin/fwconsole reload');
-			$this->runCommand('/usr/sbin/asterisk -rx ' . escapeshellarg('dialplan reload'));
-			$this->writeMaintenanceProgress('repair', 'complete', _('Installation repair completed successfully.'));
-			return [
-				'success' => true,
-				'message' => _('Installation repair completed. Runtime files, permissions, dialplan, dashboard widget, cron, and signatures were refreshed.'),
-				'errors' => [],
-			];
-		} catch (\Throwable $e) {
-			$this->writeMaintenanceProgress('repair', 'failed', _('Installation repair failed. Review Notification Logs for details.'));
+		// Even a root-initiated restore queues the authenticated worker. No web
+		// module or FreePBX bootstrap is promoted to root for a repair request.
+		$this->ensurePluginDataDir();
+		$temporary = self::REPAIR_REQUEST_FILE . '.tmp.' . bin2hex(random_bytes(4));
+		if (@file_put_contents($temporary, gmdate('c') . "\n", LOCK_EX) === false) {
 			return [
 				'success' => false,
-				'message' => _('Installation repair failed.'),
-				'errors' => [$e->getMessage()],
+				'message' => _('Installation repair could not be queued.'),
+				'errors' => [_('Unable to write the protected maintenance request marker.')],
 			];
 		}
+		$this->setPrivateOwnership($temporary);
+		if (!@rename($temporary, self::REPAIR_REQUEST_FILE)) {
+			@unlink($temporary);
+			return [
+				'success' => false,
+				'message' => _('Installation repair could not be queued.'),
+				'errors' => [_('Unable to activate the maintenance request marker.')],
+			];
+		}
+		$this->setPrivateOwnership(self::REPAIR_REQUEST_FILE);
+		$this->writeMaintenanceProgress('repair', 'queued', _('Repair queued. Waiting for the protected maintenance worker.'));
+		return [
+			'success' => true,
+			'message' => _('Installation repair was queued. The protected maintenance worker will run it within one minute.'),
+			'errors' => [],
+		];
 	}
 
 	/** Restore only files that FreePBX Dashboard/Framework upgrades can replace. */
@@ -3656,7 +4422,7 @@ class Slsmassnotifyserver implements \BMO
 		return ['success' => true, 'message' => $successMessage, 'errors' => []];
 	}
 
-	public function getDiagnosticsSummary()
+	public function getDiagnosticsSummary($includeDevices = true)
 	{
 		$settings = $this->getActiveSettings();
 		$checks = [];
@@ -3668,6 +4434,8 @@ class Slsmassnotifyserver implements \BMO
 		$checks[] = $this->diagnosticCheck(_('Weather delivery worker'), is_executable(self::RUNTIME_DIR . '/sls_weather_queue.py'), self::RUNTIME_DIR . '/sls_weather_queue.py');
 		$checks[] = $this->diagnosticCheck(_('Announcement scheduler'), is_executable('/usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php'), '/usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php');
 		$announcementWorker = $this->getAnnouncementWorkerHealth();
+		$phoneCollector = $this->getPhoneEventCollectorHealth();
+		$checks[] = $this->diagnosticCheck(_('Phone admission and outcome collector'), $phoneCollector['ok'], $phoneCollector['message']);
 		$checks[] = $this->diagnosticCheck(_('General announcement worker'), $announcementWorker['ok'],
 			sprintf(_('Latest state: %s. '), $announcementWorker['latest_state']) . ($announcementWorker['failure_reason'] !== '' ? $announcementWorker['failure_reason']
 				: ($announcementWorker['ok'] ? _('FreePBX/SLS bootstrap and protected job storage verified.') : _('Worker health check is missing, stale, or failed. Run protected repair.'))));
@@ -3691,20 +4459,27 @@ class Slsmassnotifyserver implements \BMO
 		$checks[] = $this->diagnosticCheck(_('Control API'), !$controlEnabled || $controlKeyValid, $controlEnabled ? _('Enabled') : _('Disabled (optional)'));
 		$storage = $this->loadJsonFile(self::PLUGIN_DATA_DIR . '/storage-summary.json');
 		if ($storage) {
-			$checks[] = $this->diagnosticCheck(_('Storage available'), (int)($storage['free_bytes'] ?? 0) >= 1024 * 1024 * 1024,
-				sprintf(_('%s MiB free'), number_format((int)($storage['free_bytes'] ?? 0) / 1048576)));
-			$checks[] = $this->diagnosticCheck(_('External delivery queue'), empty($storage['queue_errors']) && empty($storage['expired_external']),
-				sprintf(_('%d pending; %d expired; %d unreadable queues'), (int)($storage['pending_external'] ?? 0), (int)($storage['expired_external'] ?? 0), (int)($storage['queue_errors'] ?? 0)));
-			$checks[] = $this->diagnosticCheck(_('Weather delivery queue'), empty($storage['failed_weather']) && empty($storage['uncertain_weather']) && empty($storage['expired_weather']),
-				sprintf(_('%d pending; %d failed; %d uncertain; %d expired'), (int)($storage['pending_weather'] ?? 0), (int)($storage['failed_weather'] ?? 0), (int)($storage['uncertain_weather'] ?? 0), (int)($storage['expired_weather'] ?? 0)));
+			$queueFaults = SlsStatusHealth::queueFaults($storage);
+			$checks[] = $this->diagnosticCheck(_('Storage free-space measurement'), is_int($storage['free_bytes'] ?? null) && $storage['free_bytes'] >= 0,
+				sprintf(_('%s MiB free on the PBX data filesystem. This reports the measurement only; installation/capacity checks calculate SLS workspace separately, and retention requires additional provisioning.'), number_format((int)($storage['free_bytes'] ?? 0) / 1048576)));
+			$checks[] = $this->diagnosticCheck(_('External delivery queue'), !$queueFaults['external'],
+				sprintf(_('%d pending; %d unreadable queues; %d expired in retained history. Only failures in the last 15 minutes affect current delivery health.'), (int)($storage['pending_external'] ?? 0), (int)($storage['queue_errors'] ?? 0), (int)($storage['expired_external'] ?? 0))
+				. (!empty($storage['queue_scan_incomplete']) ? ' ' . sprintf(_('Inventory incomplete after %d queue files; displayed counts are lower bounds. Inspect the maintenance log.'), (int)($storage['queue_files_scanned'] ?? 0)) : ''));
+			$checks[] = $this->diagnosticCheck(_('Weather delivery queue'), !$queueFaults['weather'],
+				sprintf(_('%d pending; %d running; %d failed; %d uncertain; %d expired. Oldest queued: %d seconds; oldest running: %d seconds; %d missed deadlines in the last seven days. Only failures in the last 15 minutes affect current delivery health.'),
+					(int)($storage['pending_weather'] ?? 0), (int)($storage['weather_running'] ?? 0), (int)($storage['failed_weather'] ?? 0),
+					(int)($storage['uncertain_weather'] ?? 0), (int)($storage['expired_weather'] ?? 0),
+					(int)($storage['weather_oldest_queued_age_seconds'] ?? 0), (int)($storage['weather_oldest_running_age_seconds'] ?? 0), (int)($storage['weather_deadline_misses'] ?? 0)));
 		}
 
 		return [
 			'checks' => $checks,
 			'announcement_worker' => $announcementWorker,
-			'endpoints' => $this->getDetectedEndpointFormats(),
-			'desktop_clients' => $this->getDesktopClientDiagnostics($settings),
-			'control_api_audit' => $this->getControlApiAuditSummary(),
+			'phone_collector' => $phoneCollector,
+			'endpoints' => $includeDevices ? $this->getDetectedEndpointFormats() : [],
+			'desktop_clients' => $includeDevices ? $this->getDesktopClientDiagnostics($settings) : [],
+			'control_api_audit' => $includeDevices ? $this->getControlApiAuditSummary() : [],
+			'control_api_audit_notices' => $includeDevices ? $this->getUiLogNotices('audit') : [],
 		];
 	}
 
@@ -3763,11 +4538,12 @@ class Slsmassnotifyserver implements \BMO
 
 	private function getDesktopClientDiagnostics(array $settings)
 	{
-		$lastSeen = $this->loadJsonFile(self::PLUGIN_DATA_DIR . '/desktop-last-seen.json');
+		$lastSeen = $this->announcementDesktopPresence();
 		$clients = [];
 		foreach ($this->getDesktopClients($settings, false) as $client) {
 			$username = (string)($client['username'] ?? '');
 			$seen = is_array($lastSeen[$username] ?? null) ? $lastSeen[$username] : [];
+			if (($seen['client_id'] ?? '') !== ($client['client_id'] ?? '')) { $seen = []; }
 			$seenAt = (string)($seen['seen_at'] ?? '');
 			$age = $seenAt !== '' ? time() - (strtotime($seenAt) ?: 0) : null;
 			$state = $age === null ? 'never' : ($age <= 12 * 3600 ? 'recent' : ($age <= 24 * 3600 ? 'stale' : 'old'));
@@ -3782,47 +4558,180 @@ class Slsmassnotifyserver implements \BMO
 				'last_acknowledged_event' => (string)($seen['ack_event_id'] ?? ''),
 				'last_acknowledged_at' => (string)($seen['ack_at'] ?? ''),
 				'state' => $state,
-			];
+			] + \SLS\MassNotify\DesktopFleet::readiness($client, $seen, $settings['desktop_minimum_version'] ?? '');
 		}
 		return $clients;
 	}
 
+	public function getDesktopFleet(): array
+	{
+		$settings = $this->getActiveSettings();
+		return ['schema'=>1, 'generated_at'=>gmdate('c'), 'minimum_version'=>$settings['desktop_minimum_version'] ?? '',
+			'clients'=>$this->getDesktopClientDiagnostics($settings)];
+	}
+
 	private function getControlApiAuditSummary()
 	{
-		if (!is_readable(self::CONTROL_API_AUDIT_LOG)) {
-			return [];
-		}
-		$lines = array_slice(file(self::CONTROL_API_AUDIT_LOG, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [], -20);
+		$this->uiLogNotices['audit'] = [];
 		$events = [];
-		foreach ($lines as $line) {
-			$decoded = json_decode($line, true);
-			if (is_array($decoded)) {
+		$bytes = 2;
+		foreach ($this->readUiLogLines(self::CONTROL_API_AUDIT_LOG, 'audit') as $line) {
+			$decoded = $this->decodeUiLogRecord($line, 'audit');
+			if ($decoded !== null) {
+				if (!\SLS\MassNotify\SecurityAudit::keyUsage($decoded)) { continue; }
 				$loopback = in_array((string)($decoded['ip'] ?? ''), ['127.0.0.1', '::1'], true);
-				if ($loopback && in_array((string)($decoded['action'] ?? ''), ['disabled', 'unauthorized', 'get_config', 'get_status'], true)) {
-					// Local health/validation probes are not remote Control API usage.
-					continue;
-				}
 				if ($loopback) {
 					$decoded['ip'] = _('PBX internal');
 				}
+				if (!$this->admitUiLogResult($decoded, $bytes, 'audit')) { break; }
 				$events[] = $decoded;
+				if (count($events) >= 20) { break; }
 			}
 		}
-		return array_reverse($events);
+		return $events;
+	}
+
+	private function getUiLogNotices($channel)
+	{
+		return array_values($this->uiLogNotices[$channel] ?? []);
+	}
+
+	private function noteUiLogRead($channel, $reason, $message)
+	{
+		$this->uiLogNotices[$channel][$reason] = $message;
+	}
+
+	/** Newest-first lines from a fixed-size snapshot, with bounded memory and I/O. */
+	private function readUiLogLines($path, $channel)
+	{
+		clearstatcache(true, $path);
+		$named = @lstat($path);
+		if ($named === false && !file_exists($path)) { return; }
+		if (!is_array($named) || ($named['mode'] & 0170000) !== 0100000 || $named['nlink'] !== 1) {
+			$this->noteUiLogRead($channel, 'unsafe', _('The log path is unsafe or is not a regular file. Run Repair Installation.'));
+			return;
+		}
+		$handle = @fopen($path, 'rb');
+		if ($handle === false) {
+			$this->noteUiLogRead($channel, 'unavailable', _('The log could not be opened. Check its permissions or run Repair Installation.'));
+			return;
+		}
+		try {
+			$opened = fstat($handle);
+			if (!is_array($opened) || ($opened['mode'] & 0170000) !== 0100000 || $opened['nlink'] !== 1
+				|| $opened['ino'] !== $named['ino'] || $opened['dev'] !== $named['dev']) {
+				$this->noteUiLogRead($channel, 'changed', _('The log changed while it was being opened. Refresh the view.'));
+				return;
+			}
+			// Never wait behind a stalled writer or maintenance operation in a web request.
+			if (!flock($handle, LOCK_SH | LOCK_NB)) {
+				$this->noteUiLogRead($channel, 'busy', _('The log is busy being updated. Refresh the view shortly.'));
+				return;
+			}
+			$position = (int)fstat($handle)['size'];
+			$floor = max(0, $position - self::UI_LOG_SCAN_BYTES);
+			if ($floor > 0) {
+				$this->noteUiLogRead($channel, 'window', _('This view searches only the newest 16 MiB of the log. Older entries, including older date matches, remain in the log file.'));
+			}
+			$pending = '';
+			$discard = false;
+			$scanned = 0;
+			$started = hrtime(true);
+			while ($position > $floor) {
+				if (hrtime(true) - $started > 2000000000) {
+					$this->noteUiLogRead($channel, 'processing_limit', _('This log search reached its processing limit. Older matches may remain in the log file.'));
+					return;
+				}
+				$length = min(8192, $position - $floor);
+				$position -= $length;
+				if (fseek($handle, $position, SEEK_SET) !== 0 || ($chunk = fread($handle, $length)) === false || strlen($chunk) !== $length) {
+					$this->noteUiLogRead($channel, 'read_failed', _('The log could not be read completely. Refresh the view; check the log file if this continues.'));
+					return;
+				}
+				$parts = explode("\n", $chunk);
+				for ($index = count($parts) - 1; $index >= 0; $index--) {
+					if (!$discard) {
+						if (strlen($parts[$index]) + strlen($pending) > self::UI_LOG_LINE_BYTES) {
+							$discard = true;
+							$pending = '';
+							$this->noteUiLogRead($channel, 'oversized', _('One or more log records exceed 256 KiB and were omitted from this view. The original log is unchanged.'));
+						} else { $pending = $parts[$index] . $pending; }
+					}
+					if ($index > 0) {
+						if (++$scanned > self::UI_LOG_SCAN_LINES || hrtime(true) - $started > 2000000000) {
+							$this->noteUiLogRead($channel, 'processing_limit', _('This log search reached its processing limit. Older matches may remain in the log file.'));
+							return;
+						}
+						if (!$discard && trim($pending) !== '') { yield trim($pending); }
+						$pending = '';
+						$discard = false;
+					}
+				}
+			}
+			// A tail window may begin inside a record; never decode that fragment.
+			if ($floor === 0 && !$discard && trim($pending) !== '') { yield trim($pending); }
+		} finally { flock($handle, LOCK_UN); fclose($handle); }
+	}
+
+	private function decodeUiLogRecord($line, $channel)
+	{
+		$record = json_decode($line, true, 32);
+		$valid = is_array($record) && isset($line[0]) && $line[0] === '{' && json_encode($record) !== false;
+		$scalarFields = ['event_id', 'logged_at', 'created_at', 'type', 'status', 'event', 'severity', 'message_type',
+			'trigger_source', 'trigger_extension', 'trigger_name', 'source_extension', 'source_name', 'page_group',
+			'audio', 'alert_id', 'zone', 'system_name', 'mail_subject', 'mail_body', 'body', 'announcement_style',
+			'desktop_all', 'notify_delay_seconds', 'background_color', 'title', 'ip', 'action'];
+		if ($valid) {
+			foreach ($scalarFields as $field) {
+				if (isset($record[$field]) && !is_scalar($record[$field])) { $valid = false; break; }
+			}
+			foreach (['desktop_clients', 'audio_sequence'] as $field) {
+				foreach (is_array($record[$field] ?? null) ? $record[$field] : [] as $value) {
+					if (!is_scalar($value)) { $valid = false; break; }
+				}
+			}
+			if ($valid && strlen((string)($record['event_id'] ?? '')) > 256) { $valid = false; }
+		}
+		if (!$valid) {
+			$this->noteUiLogRead($channel, 'malformed', _('One or more malformed log records were omitted from this view. The original log is unchanged.'));
+			return null;
+		}
+		return $record;
+	}
+
+	private function admitUiLogResult(array $record, &$bytes, $channel)
+	{
+		$size = strlen((string)json_encode($record)) + 1;
+		if ($bytes + $size > self::UI_LOG_RESULT_BYTES) {
+			$this->noteUiLogRead($channel, 'result_limit', _('The displayed log data reached its 2 MiB limit. Fewer rows are shown; narrow the filters to inspect other entries.'));
+			return false;
+		}
+		$bytes += $size;
+		return true;
 	}
 
 	private function loadJsonFile($path)
 	{
-		if (!is_readable($path) || is_link($path)) {
-			return [];
-		}
-		$handle = @fopen($path, 'r');
+		$path = (string)$path; $limit = 8 * 1024 * 1024;
+		clearstatcache(true, $path); $before = @lstat($path);
+		if (!$before || ($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1
+			|| $before['size'] < 1 || $before['size'] > $limit || realpath($path) !== $path) { return []; }
+		// Read/write opening does not block if a FIFO replaces the named file.
+		$handle = @fopen($path, 'r+b');
 		if (!$handle) { return []; }
 		try {
-			if (!flock($handle, LOCK_SH)) { return []; }
-			$metadata = fstat($handle);
-			if (!$metadata || ($metadata['mode'] & 0170000) !== 0100000 || $metadata['size'] > 8 * 1024 * 1024) { return []; }
-			$decoded = json_decode((string)stream_get_contents($handle, 8 * 1024 * 1024), true);
+			$matches = static function ($meta) use ($before): bool {
+				if (!is_array($meta) || ($meta['mode'] & 0170000) !== 0100000 || $meta['nlink'] !== 1) { return false; }
+				foreach (['dev', 'ino', 'size', 'mtime', 'ctime'] as $field) {
+					if ($meta[$field] !== $before[$field]) { return false; }
+				}
+				return true;
+			};
+			if (!$matches(fstat($handle)) || !flock($handle, LOCK_SH | LOCK_NB)) { return []; }
+			$raw = stream_get_contents($handle, $limit + 1);
+			clearstatcache(true, $path);
+			if (!is_string($raw) || strlen($raw) !== $before['size'] || !$matches(fstat($handle)) || !$matches(@lstat($path))) { return []; }
+			$decoded = json_decode($raw, true, 64);
 			return is_array($decoded) ? $decoded : [];
 		} finally { flock($handle, LOCK_UN); fclose($handle); }
 	}
@@ -3906,15 +4815,12 @@ class Slsmassnotifyserver implements \BMO
 	private function getPbxDateTimeZone()
 	{
 		$candidates = [];
-		if (is_readable('/etc/timezone')) {
-			$candidates[] = trim((string)file_get_contents('/etc/timezone'));
-		}
-
 		$localtime = @readlink('/etc/localtime');
 		if (is_string($localtime) && preg_match('#/usr/share/zoneinfo/(.+)$#', $localtime, $matches)) {
 			$candidates[] = $matches[1];
 		}
 
+		if (is_readable('/etc/timezone')) { $candidates[] = trim((string)file_get_contents('/etc/timezone')); }
 		$candidates[] = date_default_timezone_get();
 		foreach ($candidates as $timezone) {
 			$timezone = trim((string)$timezone);
@@ -4020,14 +4926,16 @@ class Slsmassnotifyserver implements \BMO
 
 		$critical = [];
 		$warnings = [];
+		$phoneCollector = $this->getPhoneEventCollectorHealth();
+		if (!$phoneCollector['ok']) { $critical[] = $phoneCollector['message']; }
 		$announcementWorker = $this->getAnnouncementWorkerHealth();
 		if (!$announcementWorker['ok']) {
 			$critical[] = _('General announcement worker health check is missing, stale, or failed. Run protected repair.');
-		} elseif (in_array($announcementWorker['latest_state'], ['failed', 'expired'], true) && $announcementWorker['failure_reason'] !== '') {
+		} elseif (!empty($announcementWorker['active_delivery_failure']) && $announcementWorker['failure_reason'] !== '') {
 			$warnings[] = $announcementWorker['failure_reason'];
 		}
-		$statusData = $this->loadStatusData();
 		$now = time();
+		$statusData = SlsStatusHealth::project($this->loadStatusData(), $settings, $now);
 		$nwsEnabled = ($settings['enabled'] ?? '0') === '1';
 		$xweatherEnabled = !empty($settings['xweather']['enabled']);
 		$enabledSchedules = array_values(array_filter((array)($settings['scheduled_announcements'] ?? []), static function ($schedule) {
@@ -4245,11 +5153,17 @@ class Slsmassnotifyserver implements \BMO
 				$critical[] = _('Xweather lightning poller is missing or not executable');
 			}
 			$groupStatusMap = is_array($statusData['xweather_groups'] ?? null) ? $statusData['xweather_groups'] : [];
+			if (in_array(strtolower((string)($statusData['last_xweather_external_status'] ?? '')), ['fault', 'uncertain'], true)) {
+				$warnings[] = $this->normalizeStatusMessage($statusData['last_xweather_external_message'] ?? '', _('Lightning external delivery remains unconfirmed; review its destination receipts before retrying.'));
+			}
 			if (!empty($groupStatusMap)) {
 				foreach ($enabledLightningGroups as $group) {
 					$groupId = (string)($group['id'] ?? '');
 					$groupName = trim((string)($group['name'] ?? '')) ?: $groupId;
 					$groupStatus = is_array($groupStatusMap[$groupId] ?? null) ? $groupStatusMap[$groupId] : [];
+					if (in_array(strtolower((string)($groupStatus['last_xweather_external_status'] ?? '')), ['fault', 'uncertain'], true)) {
+						$warnings[] = sprintf('%s: %s', $groupName, $this->normalizeStatusMessage($groupStatus['last_xweather_external_message'] ?? '', _('External delivery remains unconfirmed.')));
+					}
 					$xweatherPollTimestamp = $this->parseTimestamp($groupStatus['last_xweather_poll_at'] ?? '');
 					$pollState = strtolower(trim((string)($groupStatus['last_xweather_poll_status'] ?? '')));
 					if ($xweatherPollTimestamp === null) {
@@ -4298,12 +5212,24 @@ class Slsmassnotifyserver implements \BMO
 		$storage = $this->loadJsonFile(self::PLUGIN_DATA_DIR . '/storage-summary.json');
 		if ($storage) {
 			if ((int)($storage['checked_at'] ?? 0) < $now - 300) { $warnings[] = _('Storage and delivery-queue health checks are stale'); }
-			if ((int)($storage['free_bytes'] ?? 0) < 1024 * 1024 * 1024) { $warnings[] = _('Less than 1 GiB is available for PBX data'); }
+			if (isset($storage['free_bytes']) && (int)$storage['free_bytes'] <= 0) { $warnings[] = _('No free space is reported for PBX data; free space before sending notifications.'); }
 			if (!empty($storage['queue_errors'])) { $warnings[] = _('An external delivery queue is unreadable; inspect the maintenance log'); }
-			if (!empty($storage['expired_external'])) { $warnings[] = sprintf(_('%d external deliveries expired without acceptance in the last seven days'), (int)$storage['expired_external']); }
+			if (!empty($storage['queue_scan_incomplete'])) { $warnings[] = _('The external delivery queue scan reached its time or size limit; displayed counts may omit deliveries. Inspect the maintenance log.'); }
+			if (!empty($storage['recent_expired_external'])) { $warnings[] = sprintf(_('%d external deliveries recently expired without acceptance; historical results remain in Delivery details'), (int)$storage['recent_expired_external']); }
+			if (!empty($storage['security_audit_at_capacity'])) { $warnings[] = _('Authentication and administrator security audit storage reached its limit; recent security events may be missing.'); }
+			if (!empty($storage['security_audit_fault_active'])) { $warnings[] = _('Security audit storage has an unresolved write failure. Review security-audit-fault.json and the maintenance log before security changes. Missing-record evidence is preserved.'); }
+			if (!empty($storage['security_audit_forwarding_active'])) { $warnings[] = _('Security audit forwarding cannot confirm local system-logger acceptance. Check logger health and verify remote collection separately.'); }
+			if (!empty($storage['audit_separation_recovery_required'])) { $warnings[] = _('Audit separation is incomplete. Audit append and retention remain suspended until the protected migration evidence has been reviewed and completed.'); }
 			if (!empty($storage['audit_at_capacity'])) { $warnings[] = _('Control API audit storage reached its limit; recent events may be missing'); }
-			if (!empty($storage['failed_weather']) || !empty($storage['uncertain_weather']) || !empty($storage['expired_weather'])) {
-				$warnings[] = _('A queued Weather or Lightning delivery failed, expired, or has an uncertain outcome. Review Help diagnostics and Notification Logs; do not blindly replay it.');
+			if ($storage['audit_fault_active'] ?? (!empty($storage['audit_failed_records']) || !empty($storage['audit_failure_code']))) { $warnings[] = _('Control API audit storage has an unresolved write failure. Review control-api-audit-fault.json and the maintenance log. A verified successful write clears the warning while preserving missing-record counts. Do not replay accepted actions.'); }
+			if (!empty($storage['media_scan_incomplete'])) { $warnings[] = _('Generated-media storage could not be fully inspected. Review the storage maintenance log; cleanup preserves files when reference or inventory checks fail.'); }
+			if (!empty($storage['media_over_budget'])) { $warnings[] = _('Generated media exceeds its configured cache target. Active and recently generated files are preserved. Review queued alerts and available disk space; maintenance retries bounded cleanup automatically.'); }
+			if (!empty($storage['audit_forwarding_active'])) { $warnings[] = _('Control API audit forwarding cannot confirm local system-logger acceptance. Check /dev/log and logger health; verify remote collection separately. Accepted API actions must not be replayed.'); }
+			if (!empty($storage['recent_failed_weather']) || !empty($storage['recent_uncertain_weather']) || !empty($storage['recent_expired_weather'])) {
+				$warnings[] = _('A recent Weather or Lightning delivery failed, expired, or has an uncertain outcome. Review Help diagnostics and Notification Logs; do not blindly replay it.');
+			}
+			if (!empty($storage['recent_weather_deadline_misses'])) {
+				$warnings[] = sprintf(_('%d Weather or Lightning deliveries recently missed their execution deadline. Review queue ages and results in Help diagnostics.'), (int)$storage['recent_weather_deadline_misses']);
 			}
 		}
 		if (!empty($enabledSchedules)) {
@@ -4317,8 +5243,11 @@ class Slsmassnotifyserver implements \BMO
 			} elseif ($scheduleWorkerStatus === 'fault') {
 				$warnings[] = $this->normalizeStatusMessage($statusData['last_schedule_worker_message'] ?? '', _('Scheduled-announcement worker reported a fault'));
 			}
-			$attentionStates = array_filter($this->getScheduleExecutionState(), static function ($record) {
-				return in_array(strtolower((string)($record['state'] ?? '')), ['failed', 'missed', 'uncertain'], true);
+			$enabledScheduleIds = array_column($enabledSchedules, 'id');
+			$attentionStates = array_filter($this->getScheduleExecutionState(), static function ($record) use ($now, $enabledScheduleIds) {
+				return in_array($record['schedule_id'] ?? '', $enabledScheduleIds, true)
+					&& SlsStatusHealth::recent($record['completed_at'] ?? $record['updated_at'] ?? '', $now)
+					&& in_array(strtolower((string)($record['state'] ?? '')), ['failed', 'missed', 'uncertain'], true);
 			});
 			if (!empty($attentionStates)) {
 				$warnings[] = sprintf(_('%d scheduled announcement(s) need review'), count($attentionStates));
@@ -4357,29 +5286,18 @@ class Slsmassnotifyserver implements \BMO
 
 	public function getEvents($limit = self::DEFAULT_LIMIT, $type = '', $date = '')
 	{
+		$this->uiLogNotices['events'] = [];
 		$limit = $this->sanitizeLimit($limit);
 		$type = $this->sanitizeType($type);
 		$date = $this->sanitizeLogDate($date);
-		$this->pruneEventLog();
-
-		if (!is_readable(self::EVENTS_LOG)) {
-			return [];
-		}
-
+		$cutoff = time() - $this->normalizeRetentionDays($this->getActiveSettings()['log_retention_days'] ?? 90) * 86400;
 		$buffer = [];
-		$file = new \SplFileObject(self::EVENTS_LOG, 'r');
-
-		while (!$file->eof()) {
-			$line = trim((string)$file->fgets());
-			if ($line === '') {
-				continue;
-			}
-
-			$decoded = json_decode($line, true);
-			if (!is_array($decoded)) {
-				continue;
-			}
-
+		$bytes = 2;
+		foreach ($this->readUiLogLines(self::EVENTS_LOG, 'events') as $line) {
+			$decoded = $this->decodeUiLogRecord($line, 'events');
+			if ($decoded === null) { continue; }
+			$loggedAt = strtotime((string)($decoded['logged_at'] ?? $decoded['created_at'] ?? ''));
+			if ($loggedAt !== false && $loggedAt < $cutoff) { continue; }
 			$event = $this->normalizeEvent($decoded);
 			if ($type !== '' && $event['notification_type'] !== $type) {
 				continue;
@@ -4388,34 +5306,26 @@ class Slsmassnotifyserver implements \BMO
 				continue;
 			}
 
+			if (!$this->admitUiLogResult($event, $bytes, 'events')) { break; }
 			$buffer[] = $event;
-			if (count($buffer) > $limit) {
-				array_shift($buffer);
-			}
+			if (count($buffer) >= $limit) { break; }
 		}
-
-		return array_reverse($buffer);
+		return $buffer;
 	}
 
 	public function getEventById($id)
 	{
+		$this->uiLogNotices['events'] = [];
 		$id = trim((string)$id);
-		if ($id === '' || !is_readable(self::EVENTS_LOG)) {
+		if ($id === '' || strlen($id) > 256) {
 			return null;
 		}
-
-		$file = new \SplFileObject(self::EVENTS_LOG, 'r');
-		while (!$file->eof()) {
-			$line = trim((string)$file->fgets());
-			if ($line === '') {
-				continue;
-			}
-
-			$decoded = json_decode($line, true);
-			if (!is_array($decoded)) {
-				continue;
-			}
-
+		$cutoff = time() - $this->normalizeRetentionDays($this->getActiveSettings()['log_retention_days'] ?? 90) * 86400;
+		foreach ($this->readUiLogLines(self::EVENTS_LOG, 'events') as $line) {
+			$decoded = $this->decodeUiLogRecord($line, 'events');
+			if ($decoded === null) { continue; }
+			$loggedAt = strtotime((string)($decoded['logged_at'] ?? $decoded['created_at'] ?? ''));
+			if ($loggedAt !== false && $loggedAt < $cutoff) { continue; }
 			$event = $this->normalizeEvent($decoded);
 			if ($event['event_id'] === $id) {
 				return $event;
@@ -4440,103 +5350,48 @@ class Slsmassnotifyserver implements \BMO
 
 	public function getAvailableSystemSounds()
 	{
-		$root = realpath('/var/lib/asterisk/sounds');
-		if ($root === false) {
-			return [];
-		}
-		$root = rtrim($root, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
-		$sounds = [];
-		$seen = [];
-		$customDirectories = array_merge(glob($root . 'custom', GLOB_ONLYDIR) ?: [], glob($root . '*/custom', GLOB_ONLYDIR) ?: []);
-		foreach ($customDirectories as $customDirectory) {
-			foreach (new \DirectoryIterator($customDirectory) as $file) {
-				if (count($sounds) >= 500 || $file->isDot() || !$file->isFile() || !$file->isReadable()) {
-					continue;
-				}
-				$relative = str_replace(DIRECTORY_SEPARATOR, '/', substr($file->getPathname(), strlen($root)));
-				if (!preg_match('#^(?:[A-Za-z0-9_-]+/)?custom/[A-Za-z0-9_. -]+\.(wav|ulaw|gsm|sln|sln16)$#i', $relative)) {
-					continue;
-				}
-				$label = preg_replace('/\.(wav|ulaw|gsm|sln|sln16)$/i', '', $relative);
-				$key = strtolower((string)$label);
-				if (isset($seen[$key])) {
-					continue;
-				}
-				$seen[$key] = true;
-				$sounds[] = ['value' => 'system:' . $relative, 'label' => $label];
-			}
-		}
-		usort($sounds, static function ($left, $right) {
-			return strnatcasecmp((string)$left['label'], (string)$right['label']);
-		});
-		return $sounds;
+		$labels = [];
+		try {
+			$rows = $this->FreePBX->Database()->query('SELECT displayname, filename FROM recordings LIMIT 501')->fetchAll(\PDO::FETCH_ASSOC);
+			foreach ($rows as $row) { foreach (explode('&', (string)$row['filename']) as $file) { $labels[$file] = (string)$row['displayname']; } }
+		} catch (\Throwable $error) { /* Files remain available without recording metadata. */ }
+		return \SLS\MassNotify\SystemRecordings::catalogue('/var/lib/asterisk/sounds', $labels);
 	}
 
 	private function importSystemSoundAsTone($selection, $prefix, array &$errors)
 	{
-		$relative = substr((string)$selection, strlen('system:'));
-		if (!preg_match('#^(?:[A-Za-z0-9_-]+/)?custom/[A-Za-z0-9_. -]+\.(wav|ulaw|gsm|sln|sln16)$#i', $relative)) {
-			$errors[] = sprintf(_('The selected %s system recording is invalid.'), $prefix);
-			return '';
-		}
-		$root = realpath('/var/lib/asterisk/sounds');
-		$source = realpath('/var/lib/asterisk/sounds/' . $relative);
-		if ($root === false || $source === false || strpos($source, rtrim($root, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR) !== 0 || !is_readable($source)) {
-			$errors[] = sprintf(_('The selected %s system recording is not readable.'), $prefix);
-			return '';
-		}
-		if ((int)@filesize($source) <= 0 || (int)@filesize($source) > 20 * 1024 * 1024 || !is_executable('/usr/bin/sox')) {
-			$errors[] = sprintf(_('The selected %s system recording cannot be converted.'), $prefix);
-			return '';
-		}
-		$this->ensurePluginDataDir();
-		$name = $this->normalizeToneName($prefix . '_system_' . pathinfo($source, PATHINFO_FILENAME) . '_' . substr(hash('sha256', $relative), 0, 8));
-		$target = self::TONES_DIR . '/' . $name . '.wav';
-		$tmp = $target . '.tmp.' . bin2hex(random_bytes(4)) . '.wav';
-		$command = '/usr/bin/timeout 30 /usr/bin/sox ' . escapeshellarg($source)
-			. ' -r 8000 -c 1 -b 16 ' . escapeshellarg($tmp) . ' 2>&1';
-		exec($command, $output, $exitCode);
-		if ($exitCode !== 0 || !is_file($tmp) || (int)@filesize($tmp) < 44 || !@rename($tmp, $target)) {
-			@unlink($tmp);
-			$errors[] = sprintf(_('Unable to import the selected %s system recording.'), $prefix);
-			return '';
-		}
-		@chmod($target, 0644);
-		@chown($target, 'asterisk');
-		@chgrp($target, 'asterisk');
-		return $name;
+		try { $this->ensurePluginDataDir(); return \SLS\MassNotify\SystemRecordings::import((string)$selection, '/var/lib/asterisk/sounds', self::TONES_DIR); }
+		catch (\Throwable $error) { $errors[] = sprintf(_('The selected %s System Recording could not be imported: %s'), $prefix, $error->getMessage()); return ''; }
+	}
+
+	private function announcementTone($selection, $label, array &$errors): string
+	{
+		$selection = (string)$selection;
+		return str_starts_with($selection, 'system:') ? $this->importSystemSoundAsTone($selection, $label, $errors) : $this->normalizeToneName($selection);
 	}
 
 	public function getAvailablePiperVoices()
 	{
 		$voices = [];
-		$seen = [];
-		foreach (glob(self::PIPER_VOICE_DIR . '/*.onnx') ?: [] as $path) {
-			if (!is_readable($path)) {
-				continue;
-			}
-			$name = basename($path, '.onnx');
-			$voices[] = [
-				'name' => $name,
-				'path' => $path,
-				'available' => true,
-			];
-			$seen[$path] = true;
-		}
+		$label = static function (string $name): string {
+			$languages = ['en_US'=>'English (US)', 'es_ES'=>'Spanish', 'fr_FR'=>'French', 'de_DE'=>'German', 'pt_BR'=>'Portuguese (Brazil)'];
+			$locale = substr($name, 0, 5);
+			return ($languages[$locale] ?? $locale) . ' · ' . str_replace('-', ' · ', substr($name, 6));
+		};
 		foreach ($this->getPiperVoiceDownloads() as $file => $url) {
 			if (substr($file, -5) !== '.onnx') {
 				continue;
 			}
 			$path = self::PIPER_VOICE_DIR . '/' . $file;
-			if (isset($seen[$path])) {
-				continue;
-			}
+			// Listing a fixed catalogue must not hash hundreds of MB on every
+			// page load. The small configuration remains checksum-verified here;
+			// synthesis and installation verify the complete model as well.
+			$available = $this->isPresentPiperVoiceFile($path) && $this->isValidPiperVoiceFile($path . '.json');
 			$voices[] = [
-				'name' => basename($file, '.onnx') . (is_readable($path) ? '' : ' (download pending)'),
+				'name' => $label(basename($file, '.onnx')) . ($available ? '' : ' (repair required)'),
 				'path' => $path,
-				'available' => is_readable($path),
+				'available' => $available,
 			];
-			$seen[$path] = true;
 		}
 		usort($voices, static function ($a, $b) {
 			return strnatcasecmp($a['name'], $b['name']);
@@ -4564,6 +5419,27 @@ class Slsmassnotifyserver implements \BMO
 			}
 		}
 		return $schedules;
+	}
+
+	public function previewScheduleCalendar(array $input): array
+	{
+		$calendar = \SLS\MassNotify\ScheduleCalendar::fromForm($input);
+		$id = $input['schedule_id'] ?? '';
+		if (!is_string($id) || ($id !== '' && !preg_match('/^[A-Za-z0-9_-]{1,64}$/D', $id))) {
+			throw new \DomainException(_('The selected schedule identity is invalid.'));
+		}
+		$existing = []; $found = $id === ''; $timezone = $this->getPbxDateTimeZone();
+		foreach ($this->getScheduledAnnouncements() as $schedule) {
+			if (($schedule['id'] ?? '') === $id) {
+				$found = true; $existing = array_fill_keys(array_column($schedule['occurrences'], 'run_at_utc'), true);
+				if (($schedule['recurrence']['mode'] ?? '') === 'calendar') { $timezone = new \DateTimeZone($schedule['timezone']); }
+				break;
+			}
+		}
+		if (!$found) { throw new \DomainException(_('The selected schedule no longer exists.')); }
+		$plan = $this->buildScheduledOccurrences($id ?: 'calendar_preview', array_values((array)($input['schedule_occurrences'] ?? [])),
+			'calendar', $timezone, $existing, time() - 60, time() + self::MAX_SCHEDULE_YEARS * 366 * 86400, $calendar);
+		return ['success'=>!$plan['errors'], 'errors'=>$plan['errors'], 'timezone'=>$timezone->getName(), 'occurrences'=>$plan['occurrences']];
 	}
 
 	public function saveScheduledAnnouncement(array $input)
@@ -4596,6 +5472,12 @@ class Slsmassnotifyserver implements \BMO
 		}
 
 		$errors = [];
+		$errors = array_merge($errors, \SLS\MassNotify\SchedulePresentation::textErrors([
+			'name'=>$input['schedule_name'] ?? '', 'message'=>$input['schedule_message'] ?? '',
+			'delivery'=>['title'=>$input['schedule_title'] ?? 'Announcement'],
+		]));
+		try { $maxLateness = \SLS\MassNotify\SchedulePresentation::formLateness($input, $existing); }
+		catch (\DomainException $error) { $maxLateness = 15; $errors[] = _($error->getMessage()); }
 		$name = $this->sanitizeScheduleText($input['schedule_name'] ?? '', 80, true);
 		$message = $this->sanitizeScheduleText($input['schedule_message'] ?? '', 500, false);
 		if ($name === '') {
@@ -4615,10 +5497,16 @@ class Slsmassnotifyserver implements \BMO
 		}
 		$occurrenceInputs = array_values((array)($input['schedule_occurrences'] ?? []));
 		$requestedRecurrenceMode = strtolower(trim((string)($input['schedule_recurrence_mode'] ?? 'none')));
-		if (!in_array($requestedRecurrenceMode, ['none', 'every_7_days', 'every_14_days'], true)) {
+		if (!in_array($requestedRecurrenceMode, ['none', 'every_7_days', 'every_14_days', 'calendar'], true)) {
 			$errors[] = _('Select a supported repeat interval.');
 		}
 		$recurrenceMode = $this->normalizeScheduleRecurrenceMode($requestedRecurrenceMode);
+		$calendar = [];
+		if ($recurrenceMode === 'calendar') {
+			try { $calendar = \SLS\MassNotify\ScheduleCalendar::fromForm($input); }
+			catch (\DomainException $error) { $errors[] = $error->getMessage(); }
+			if (($existing['recurrence']['mode'] ?? '') === 'calendar') { $timezone = new \DateTimeZone($existing['timezone']); }
+		}
 		$occurrenceBuild = $this->buildScheduledOccurrences(
 			$id,
 			$occurrenceInputs,
@@ -4626,7 +5514,8 @@ class Slsmassnotifyserver implements \BMO
 			$timezone,
 			$existingRunTimes,
 			time() - 60,
-			time() + (self::MAX_SCHEDULE_YEARS * 366 * 86400)
+			time() + (self::MAX_SCHEDULE_YEARS * 366 * 86400),
+			$calendar
 		);
 		$occurrences = $occurrenceBuild['occurrences'];
 		$recurrence = $occurrenceBuild['recurrence'];
@@ -4680,20 +5569,81 @@ class Slsmassnotifyserver implements \BMO
 		}
 		$phonesAll = !empty($input['schedule_all_phones']);
 		$desktopAll = !empty($input['schedule_all_desktops']);
+		$emailIds = array_key_exists('schedule_email_recipient_ids', $input) ? $input['schedule_email_recipient_ids'] : [];
+		$emailErrors = $this->validateAnnouncementEmailRecipientIds($emailIds);
+		$errors = array_merge($errors, $emailErrors);
+		$selectedEmailIds = $emailErrors ? [] : $emailIds;
+		$knownEmailIds = array_fill_keys(array_column($this->getAnnouncementEmailRecipients($settings), 'id'), true);
+		$effectiveEmailIds = $selectedEmailIds;
+		foreach ((array)($settings['announcement_groups'] ?? []) as $group) {
+			if (isset($selectedGroups[(string)($group['id'] ?? '')])) {
+				$groupEmailIds = array_key_exists('email_recipient_ids', $group) ? $group['email_recipient_ids'] : [];
+				$groupEmailErrors = $this->validateAnnouncementEmailRecipientIds($groupEmailIds);
+				$errors = array_merge($errors, $groupEmailErrors);
+				if (!$groupEmailErrors) { $effectiveEmailIds = array_merge($effectiveEmailIds, $groupEmailIds); }
+			}
+		}
+		if (count(array_unique($effectiveEmailIds)) > 50 || array_diff($effectiveEmailIds, array_keys($knownEmailIds))) {
+			$errors[] = _('Select at most 50 enabled saved email recipients. Review Announcement Email settings and selected groups.');
+		}
+		$smsIds = array_key_exists('schedule_sms_recipient_ids', $input) ? $input['schedule_sms_recipient_ids'] : [];
+		$smsErrors = $this->validateSmsRecipientIds($smsIds);
+		$errors = array_merge($errors, $smsErrors);
+		$selectedSmsIds = $smsErrors ? [] : $smsIds;
+		$knownSmsIds = array_fill_keys(array_column($this->getAnnouncementSmsRecipients($settings), 'id'), true);
+		$effectiveSmsIds = $selectedSmsIds;
+		foreach ((array)($settings['announcement_groups'] ?? []) as $group) {
+			if (isset($selectedGroups[(string)($group['id'] ?? '')])) {
+				$groupSmsIds = array_key_exists('sms_recipient_ids', $group) ? $group['sms_recipient_ids'] : [];
+				$groupSmsErrors = $this->validateSmsRecipientIds($groupSmsIds);
+				$errors = array_merge($errors, $groupSmsErrors);
+				if (!$groupSmsErrors) { $effectiveSmsIds = array_merge($effectiveSmsIds, $groupSmsIds); }
+			}
+		}
+		if (count(array_unique($effectiveSmsIds)) > 50 || array_diff($effectiveSmsIds, array_keys($knownSmsIds))) {
+			$errors[] = _('Select at most 50 enabled saved SMS recipients. Review SMS settings and selected groups.');
+		}
+		$voiceIds = array_key_exists('schedule_voice_recipient_ids', $input) ? $input['schedule_voice_recipient_ids'] : [];
+		$voiceErrors = $this->validateVoiceRecipientIds($voiceIds);
+		$errors = array_merge($errors, $voiceErrors);
+		$selectedVoiceIds = empty($voiceErrors) ? array_values(array_unique($voiceIds)) : [];
+		$knownVoiceIds = array_fill_keys(array_column($this->getOutboundVoiceRecipients($settings), 'id'), true);
+		$effectiveVoiceIds = $selectedVoiceIds;
+		foreach ((array)($settings['announcement_groups'] ?? []) as $group) {
+			if (isset($selectedGroups[(string)($group['id'] ?? '')])) {
+				$groupVoiceIds = $group['voice_recipient_ids'] ?? [];
+				$groupVoiceErrors = $this->validateVoiceRecipientIds($groupVoiceIds);
+				$errors = array_merge($errors, $groupVoiceErrors);
+				if (empty($groupVoiceErrors)) { $effectiveVoiceIds = array_merge($effectiveVoiceIds, $groupVoiceIds); }
+			}
+		}
+		foreach (array_unique($effectiveVoiceIds) as $voiceId) {
+			if (!isset($knownVoiceIds[$voiceId])) {
+				$errors[] = _('A selected external voice recipient is removed or disabled. Enable outbound voice and select current saved recipients.');
+			}
+		}
 		if ($phonesAll) {
 			$selectedExtensions = [];
 		}
 		if ($desktopAll) {
 			$selectedDesktops = [];
 		}
-		if (!$phonesAll && !$desktopAll && empty($selectedExtensions) && empty($selectedGroups) && empty($selectedDesktops)) {
-			$errors[] = _('Select at least one phone, announcement group, or desktop recipient.');
+		$selectedWebhookIds = $input['schedule_webhook_ids'] ?? [];
+		$errors = array_merge($errors, $this->validateAudienceWebhookIds($selectedWebhookIds, $settings));
+		foreach ($settings['announcement_groups'] ?? [] as $group) {
+			if (isset($selectedGroups[$group['id']])) { $errors = array_merge($errors, $this->validateAudienceWebhookIds($group['webhook_ids'] ?? [], $settings)); }
+		}
+		if (!$phonesAll && !$desktopAll && empty($selectedExtensions) && empty($selectedGroups) && empty($selectedDesktops) && empty($selectedVoiceIds) && empty($selectedEmailIds) && empty($selectedSmsIds) && empty($selectedWebhookIds)) {
+			$errors[] = _('Select at least one phone, announcement group, desktop, external voice, or saved email or SMS recipient.');
 		}
 
 		$audioMode = $this->normalizeAnnouncementAudioMode($input['schedule_audio_mode'] ?? 'none');
+		if ($audioMode === 'none' && !empty($effectiveVoiceIds)) {
+			$errors[] = _('External voice recipients require scheduled audio. Select TTS or tone audio, or remove those recipients.');
+		}
+		$openingTone = $this->announcementTone($input['schedule_opening_tone'] ?? '', 'opening', $errors);
+		$closingTone = $this->announcementTone($input['schedule_closing_tone'] ?? '', 'closing', $errors);
 		$availableTones = array_fill_keys($this->getAvailableTones(), true);
-		$openingTone = $this->normalizeToneName($input['schedule_opening_tone'] ?? '');
-		$closingTone = $this->normalizeToneName($input['schedule_closing_tone'] ?? '');
 		if (!in_array($audioMode, ['tones', 'tones_tts'], true)) {
 			$openingTone = '';
 			$closingTone = '';
@@ -4722,7 +5672,7 @@ class Slsmassnotifyserver implements \BMO
 			$voice = '';
 		}
 
-		$hasPhoneTarget = $phonesAll || !empty($selectedExtensions);
+		$hasPhoneTarget = $phonesAll || !empty($selectedExtensions) || !empty($effectiveVoiceIds);
 		if (!$hasPhoneTarget && !empty($selectedGroups)) {
 			foreach ((array)($settings['announcement_groups'] ?? []) as $group) {
 				$groupId = (string)($group['id'] ?? '');
@@ -4733,7 +5683,7 @@ class Slsmassnotifyserver implements \BMO
 			}
 		}
 		if ($audioMode !== 'none' && !$hasPhoneTarget) {
-			$errors[] = _('Scheduled audio requires at least one phone target. Desktop-only schedules must use text-only delivery.');
+			$errors[] = _('Scheduled audio requires at least one phone or external voice target. Schedules containing only desktops or email recipients must use text-only delivery.');
 		}
 
 		if (!empty($errors)) {
@@ -4747,6 +5697,7 @@ class Slsmassnotifyserver implements \BMO
 			'updated_by' => $this->announcementSender(),
 			'name' => $name,
 			'enabled' => empty($input['schedule_enabled']) ? '0' : '1',
+			'max_lateness_minutes' => $maxLateness,
 			'timezone' => $timezone->getName(),
 			'recurrence' => $recurrence,
 			'occurrences' => $occurrences,
@@ -4757,6 +5708,10 @@ class Slsmassnotifyserver implements \BMO
 				'phones_all' => $phonesAll ? '1' : '0',
 				'desktop_clients' => array_values($selectedDesktops),
 				'desktop_all' => $desktopAll ? '1' : '0',
+				'voice_recipient_ids' => $selectedVoiceIds,
+				'email_recipient_ids' => $selectedEmailIds,
+				'sms_recipient_ids' => $selectedSmsIds,
+				'webhook_ids' => $selectedWebhookIds,
 			],
 			'delivery' => [
 				'audio_mode' => $audioMode,
@@ -4772,6 +5727,9 @@ class Slsmassnotifyserver implements \BMO
 			'updated_at' => $now,
 		];
 
+		$origin = $this->operatorScheduleOrigin ?? ($existing['operator_credential_id'] ?? null);
+		if ($origin !== null) { $schedule['operator_credential_id'] = $origin; }
+
 		if ($existingIndex === null) {
 			$schedules[] = $schedule;
 		} else {
@@ -4782,7 +5740,18 @@ class Slsmassnotifyserver implements \BMO
 		} catch (\Throwable $e) {
 			return ['success' => false, 'message' => $this->sanitizeScheduleText($e->getMessage(), 300, true), 'errors' => []];
 		}
-		return ['success' => true, 'message' => $existingIndex === null ? _('Scheduled announcement created.') : _('Scheduled announcement updated.'), 'errors' => []];
+		$settings['scheduled_announcements'] = $schedules;
+        $conflicts = \SLS\MassNotify\SchedulePresentation::conflicts($settings, time());
+        $warnings = [];
+        foreach ($conflicts['rows'] as $conflict) {
+            if ($conflict['schedule_id'] !== $id && $conflict['other_schedule_id'] !== $id) { continue; }
+            $warnings[] = sprintf(_('Potential overlap: %s (%s UTC) and %s (%s UTC), %d shared configured recipient(s). Actual capacity is checked at delivery.'),
+                $conflict['name'], $conflict['run_at_utc'], $conflict['other_name'], $conflict['other_run_at_utc'], $conflict['shared_recipients'])
+                . ($conflict['dynamic_audience'] ? ' ' . _('An all-recipients selection may add overlap.') : '');
+            if (count($warnings) >= 10) { break; }
+        }
+        if ($conflicts['incomplete']) { $warnings[] = _('Schedule conflict analysis reached its limit. Review other nearby dates and recipients.'); }
+        return ['success' => true, 'message' => $existingIndex === null ? _('Scheduled announcement created.') : _('Scheduled announcement updated.'), 'errors' => [], 'warnings' => $warnings];
 	}
 
 	public function deleteScheduledAnnouncement($scheduleId)
@@ -4831,189 +5800,7 @@ class Slsmassnotifyserver implements \BMO
 
 	public function processScheduledAnnouncements()
 	{
-		$this->ensurePluginDataDir();
-		$workerLock = @fopen(self::SCHEDULE_LOCK_FILE, 'c');
-		if ($workerLock === false) {
-			$this->updateStatusData([
-				'last_schedule_worker_at' => gmdate('c'),
-				'last_schedule_worker_status' => 'fault',
-				'last_schedule_worker_message' => _('The scheduler could not open its worker lock file.'),
-			]);
-			throw new \RuntimeException(_('The scheduler could not open its worker lock file.'));
-		}
-		if (!flock($workerLock, LOCK_EX | LOCK_NB)) {
-			fclose($workerLock);
-			return ['success' => true, 'message' => _('Another scheduling worker is already active.')];
-		}
-		$this->setOwnership(self::SCHEDULE_LOCK_FILE);
-
-		$processed = 0;
-		$attention = 0;
-		try {
-			// A corrupt existing execution journal must fail closed. Treating it as an
-			// empty journal could replay an announcement whose successful result was
-			// already recorded before the file was damaged.
-			$store = $this->loadScheduleExecutionStore(true);
-			$store['occurrences'] = is_array($store['occurrences'] ?? null) ? $store['occurrences'] : [];
-			$schedules = $this->getActiveSettings()['scheduled_announcements'] ?? [];
-			$due = [];
-			$knownOccurrenceIds = [];
-			$scanNow = time();
-			foreach ($schedules as $schedule) {
-				foreach ((array)($schedule['occurrences'] ?? []) as $occurrence) {
-					$occurrenceId = (string)($occurrence['id'] ?? '');
-					$runAt = $this->parseScheduleUtcTimestamp((string)($occurrence['run_at_utc'] ?? ''));
-					if ($occurrenceId === '' || $runAt === false) {
-						continue;
-					}
-					$knownOccurrenceIds[$occurrenceId] = true;
-					if (empty($schedule['enabled'])) {
-						continue;
-					}
-					$current = is_array($store['occurrences'][$occurrenceId] ?? null) ? $store['occurrences'][$occurrenceId] : [];
-					$currentState = strtolower((string)($current['state'] ?? 'pending'));
-					if (in_array($currentState, ['success', 'failed', 'missed', 'uncertain'], true)) {
-						continue;
-					}
-					if ($runAt <= $scanNow) {
-						$due[] = ['run_at' => $runAt, 'schedule' => $schedule, 'occurrence' => $occurrence];
-					}
-				}
-			}
-			usort($due, static function ($left, $right) {
-				return ((int)$left['run_at']) <=> ((int)$right['run_at']);
-			});
-
-			foreach ($due as $item) {
-				$schedule = $item['schedule'];
-				$occurrence = $item['occurrence'];
-				$occurrenceId = (string)$occurrence['id'];
-				$runAt = (int)$item['run_at'];
-				$currentNow = time();
-				$current = is_array($store['occurrences'][$occurrenceId] ?? null) ? $store['occurrences'][$occurrenceId] : [];
-				$currentState = strtolower((string)($current['state'] ?? 'pending'));
-				if (in_array($currentState, ['success', 'failed', 'missed', 'uncertain'], true)) {
-					continue;
-				}
-				if ($currentState === 'claimed') {
-					$claimedAt = strtotime((string)($current['claimed_at'] ?? '')) ?: 0;
-					if ($claimedAt > 0 && ($currentNow - $claimedAt) <= 300) {
-						continue;
-					}
-					$store['occurrences'][$occurrenceId] = $this->scheduleExecutionRecord($schedule, $occurrence, 'uncertain', _('The previous worker stopped after claiming this delivery; it was not replayed to prevent a duplicate announcement.'), $current);
-					$this->writeScheduleExecutionStore($store);
-					$attention++;
-					continue;
-				}
-				if (($currentNow - $runAt) > self::SCHEDULE_GRACE_SECONDS) {
-					$store['occurrences'][$occurrenceId] = $this->scheduleExecutionRecord($schedule, $occurrence, 'missed', _('The PBX was unable to start this announcement within the protected 15-minute delivery window. Add a new future date and time to re-arm it.'), $current);
-					$this->writeScheduleExecutionStore($store);
-					$attention++;
-					continue;
-				}
-
-				// Coordinate with schedule edits and re-read the live definition immediately
-				// before claiming it. Once claimed, later UI edits apply to future runs and
-				// cannot safely cancel a delivery that may already be entering Asterisk.
-				$configLock = $this->acquireSettingsLock();
-				try {
-					$liveMatch = $this->findLiveScheduledOccurrence(
-						(string)($schedule['id'] ?? ''),
-						$occurrenceId,
-						(string)($occurrence['run_at_utc'] ?? '')
-					);
-					if ($liveMatch === null) {
-						continue;
-					}
-					$schedule = $liveMatch['schedule'];
-					$occurrence = $liveMatch['occurrence'];
-					$current['attempts'] = max(0, (int)($current['attempts'] ?? 0)) + 1;
-					$current['claimed_at'] = gmdate('c');
-					$store['occurrences'][$occurrenceId] = $this->scheduleExecutionRecord($schedule, $occurrence, 'claimed', _('Delivery is being submitted.'), $current);
-					$this->writeScheduleExecutionStore($store);
-				} finally {
-					$this->releaseSettingsLock($configLock);
-				}
-
-				$targets = is_array($schedule['targets'] ?? null) ? $schedule['targets'] : [];
-				$delivery = is_array($schedule['delivery'] ?? null) ? $schedule['delivery'] : [];
-				$audioMode = $this->normalizeAnnouncementAudioMode($delivery['audio_mode'] ?? 'none');
-				$result = $this->sendSipNotifyAnnouncement(
-					(array)($targets['extensions'] ?? []),
-					(string)($schedule['message'] ?? ''),
-					false,
-					in_array($audioMode, ['tts', 'tones_tts'], true),
-					(array)($targets['groups'] ?? []),
-					[
-						'phones_all' => !empty($targets['phones_all']),
-						'desktop_all' => !empty($targets['desktop_all']),
-						'desktop_clients' => (array)($targets['desktop_clients'] ?? []),
-						'style' => (string)($delivery['style'] ?? 'standard'),
-						'title' => (string)($delivery['title'] ?? 'Announcement'),
-						'background_color' => (string)($delivery['background_color'] ?? '#1f2937'),
-						'audio_mode' => $audioMode,
-						'opening_tone' => (string)($delivery['opening_tone'] ?? ''),
-						'closing_tone' => (string)($delivery['closing_tone'] ?? ''),
-						'piper_voice' => (string)($delivery['voice'] ?? ''),
-						'tts_volume' => $delivery['tts_volume'] ?? 25,
-						'trigger_source' => 'Scheduled: ' . (string)($schedule['name'] ?? 'Announcement'),
-						'sender' => (string)($schedule['created_by'] ?? 'Scheduled announcement'),
-					]
-				);
-				$processed++;
-				if (!empty($result['success'])) {
-					$store['occurrences'][$occurrenceId] = $this->scheduleExecutionRecord($schedule, $occurrence, 'success', (string)($result['message'] ?? _('Announcement submitted.')), $current);
-					$this->writeScheduleExecutionStore($store);
-					continue;
-				}
-
-				$errorCode = strtolower((string)($result['error_code'] ?? ''));
-				$deliveryStarted = !empty($result['delivery_started']);
-				$message = $this->sanitizeScheduleText($result['message'] ?? _('Scheduled announcement failed.'), 300, true);
-				if ($deliveryStarted) {
-					$store['occurrences'][$occurrenceId] = $this->scheduleExecutionRecord($schedule, $occurrence, 'uncertain', $message . ' ' . _('It was not replayed because delivery may have started.'), $current);
-					$attention++;
-				} elseif (in_array($errorCode, ['cooldown', 'delivery_busy', 'no_targets', 'no_audio_targets'], true) && ($currentNow - $runAt) <= self::SCHEDULE_GRACE_SECONDS) {
-					$store['occurrences'][$occurrenceId] = $this->scheduleExecutionRecord($schedule, $occurrence, 'pending', $message . ' ' . _('The scheduler will retry within the delivery window.'), $current);
-				} elseif ((int)$current['attempts'] < 3 && ($currentNow - $runAt) <= self::SCHEDULE_GRACE_SECONDS && in_array($errorCode, ['audio_failed', 'sender_unavailable'], true)) {
-					$store['occurrences'][$occurrenceId] = $this->scheduleExecutionRecord($schedule, $occurrence, 'pending', $message . ' ' . _('The scheduler will retry automatically.'), $current);
-				} else {
-					$store['occurrences'][$occurrenceId] = $this->scheduleExecutionRecord($schedule, $occurrence, 'failed', $message . ' ' . _('Add a new future date and time to re-arm this schedule.'), $current);
-					$attention++;
-				}
-				$this->writeScheduleExecutionStore($store);
-			}
-
-			$cutoff = time() - (90 * 86400);
-			$storeChanged = false;
-			foreach ($store['occurrences'] as $occurrenceId => $record) {
-				$recordTime = strtotime((string)($record['run_at_utc'] ?? $record['updated_at'] ?? '')) ?: 0;
-				if (!isset($knownOccurrenceIds[$occurrenceId]) && $recordTime > 0 && $recordTime < $cutoff) {
-					unset($store['occurrences'][$occurrenceId]);
-					$storeChanged = true;
-				}
-			}
-			if ($storeChanged) {
-				$this->writeScheduleExecutionStore($store);
-			}
-			$workerMessage = sprintf(_('Scheduler checked due announcements; %d delivery attempt(s), %d item(s) need attention.'), $processed, $attention);
-			$this->updateStatusData([
-				'last_schedule_worker_at' => gmdate('c'),
-				'last_schedule_worker_status' => $attention > 0 ? 'warning' : 'ok',
-				'last_schedule_worker_message' => $workerMessage,
-			]);
-			return ['success' => true, 'processed' => $processed, 'attention' => $attention];
-		} catch (\Throwable $e) {
-			$this->updateStatusData([
-				'last_schedule_worker_at' => gmdate('c'),
-				'last_schedule_worker_status' => 'fault',
-				'last_schedule_worker_message' => $this->sanitizeScheduleText($e->getMessage(), 300, true),
-			]);
-			throw $e;
-		} finally {
-			flock($workerLock, LOCK_UN);
-			fclose($workerLock);
-		}
+		return $this->runDurableScheduledAnnouncements();
 	}
 
 	public function getAvailableAnnouncementGroups()
@@ -5044,7 +5831,7 @@ class Slsmassnotifyserver implements \BMO
 					$desktopClients[] = $username;
 				}
 			}
-			if (empty($extensions) && empty($desktopClients)) {
+			if (empty($extensions) && empty($desktopClients) && empty($group['voice_recipient_ids']) && empty($group['email_recipient_ids']) && empty($group['sms_recipient_ids']) && empty($group['webhook_ids'])) {
 				continue;
 			}
 			$group['extensions'] = $extensions;
@@ -5054,7 +5841,7 @@ class Slsmassnotifyserver implements \BMO
 		return $groups;
 	}
 
-	public function saveAnnouncementGroup($groupId, $name, $extensions, $desktopClients = [])
+	public function saveAnnouncementGroup($groupId, $name, $extensions, $desktopClients = [], $voiceRecipientIds = [], $emailRecipientIds = [], $smsRecipientIds = [], $webhookIds = [])
 	{
 		if (!$this->isSetupComplete($this->getActiveSettings())) {
 			return [
@@ -5074,17 +5861,52 @@ class Slsmassnotifyserver implements \BMO
 		}
 
 		$settings = $this->getActiveSettings();
+		$emailErrors = $this->validateAnnouncementEmailRecipientIds($emailRecipientIds);
+		$knownEmailIds = array_column($this->getAnnouncementEmailRecipients($settings), 'id');
+		if ($emailErrors || array_diff($emailRecipientIds, $knownEmailIds)) {
+			return ['success' => false, 'message' => $emailErrors ? implode(' ', $emailErrors) : _('A saved email recipient is removed or disabled. Review Announcement Email settings.'), 'groups' => $this->getAnnouncementGroups()];
+		}
+		$smsErrors = $this->validateSmsRecipientIds($smsRecipientIds);
+		$knownSmsIds = array_column($this->getAnnouncementSmsRecipients($settings), 'id');
+		if ($smsErrors || array_diff($smsRecipientIds, $knownSmsIds)) {
+			return ['success' => false, 'message' => $smsErrors ? implode(' ', $smsErrors) : _('A saved SMS recipient is removed or disabled. Review SMS settings.'), 'groups' => $this->getAnnouncementGroups()];
+		}
+		$voiceErrors = $this->validateVoiceRecipientIds($voiceRecipientIds);
+		if ($voiceErrors || array_diff($voiceRecipientIds, array_keys($this->outboundVoiceTargets($settings)))) {
+			return ['success' => false, 'message' => $voiceErrors ? implode(' ', $voiceErrors) : _('An external voice recipient is no longer enabled.'), 'groups' => $this->getAnnouncementGroups()];
+		}
+		$webhookErrors = $this->validateAudienceWebhookIds($webhookIds, $settings);
+		if ($webhookErrors) { return ['success' => false, 'message' => implode(' ', $webhookErrors), 'groups' => $this->getAnnouncementGroups()]; }
 		$groups = $settings['announcement_groups'] ?? [];
+		foreach ($groups as $group) {
+			if (($group['id'] ?? '') === $groupId && array_key_exists('location_snapshot', $group)) {
+				return ['success' => false, 'message' => _('This is a reviewed location audience. Create a new audience from Locations to change its recipients; existing schedules and incidents keep this snapshot.'), 'groups' => $groups];
+			}
+		}
 		$groupId = preg_replace('/[^A-Za-z0-9_-]/', '', (string)$groupId);
 		$updated = false;
 		$candidate = [
 			'name' => $name,
 			'extensions' => (array)$extensions,
 			'desktop_clients' => (array)$desktopClients,
+			'voice_recipient_ids' => array_values(array_unique($voiceRecipientIds)),
+			'email_recipient_ids' => array_values($emailRecipientIds),
+			'sms_recipient_ids' => array_values($smsRecipientIds),
+			'webhook_ids' => array_values($webhookIds),
 		];
+
+		$bindings = [];
+		foreach ($settings['desktop_clients'] ?? [] as $client) {
+			if (in_array($client['username'], $candidate['desktop_clients'], true) && !empty($client['enabled'])) {
+				$bindings[] = ['username' => $client['username'], 'client_id' => $client['client_id']];
+			}
+		}
+		try { $candidate['desktop_bindings'] = \SLS\MassNotify\LocationDirectory::bindings($bindings, $candidate['desktop_clients']); }
+		catch (\InvalidArgumentException $error) { return ['success' => false, 'message' => _('A selected desktop was disabled or removed. Review the saved audience.'), 'groups' => $groups]; }
 
 		foreach ($groups as $index => $group) {
 			if (($group['id'] ?? '') === $groupId && $groupId !== '') {
+				$candidate['id'] = $groupId;
 				$groups[$index] = $candidate;
 				$updated = true;
 				break;
@@ -5102,23 +5924,62 @@ class Slsmassnotifyserver implements \BMO
 		}
 
 		$allowedDesktopUsernames = array_column($this->getDesktopClients($settings), 'username');
-		$normalized = $this->normalizeAnnouncementGroupsForExtensions($groups, array_column($this->getAllPjsipExtensions(), 'extension'), $allowedDesktopUsernames);
-		if (empty($normalized)) {
+		$allowedExtensions = array_column($this->getAllPjsipExtensions(), 'extension');
+		$normalizedCandidate = $this->normalizeAnnouncementGroupsForExtensions([$candidate], $allowedExtensions, $allowedDesktopUsernames);
+		$normalized = $this->normalizeAnnouncementGroupsForExtensions($groups, $allowedExtensions, $allowedDesktopUsernames);
+		if (empty($normalizedCandidate) || empty($normalized)) {
 					return [
 						'success' => false,
-						'message' => _('Select at least one extension or desktop client for the announcement group.'),
+						'message' => _('Select at least one phone, desktop, external voice, or saved email recipient for the announcement group.'),
 						'groups' => $this->getAnnouncementGroups(),
 					];
 		}
 
 		$settings['announcement_groups'] = $normalized;
 		try {
+			$paging = $this->normalizeLivePagingSettings($settings['live_paging'] ?? []);
+			\SLS\MassNotify\LivePagingConfig::resolvedGroups($paging, $normalized);
+			$legacyPagingGroups = array_filter($paging['groups'], static function (array $row): bool {
+				return !\SLS\MassNotify\LivePagingConfig::isStandalone($row);
+			});
+			$requiresApply = $updated && $paging['enabled'] === '1'
+				&& in_array($groupId, array_column($legacyPagingGroups, 'group_id'), true);
+			$pending = $this->getPendingSettings();
+			$staged = $pending ?? $settings;
+			// Merge only this group so a second edit cannot erase a previously
+			// staged paging group or unrelated pending configuration changes.
+			$stagedGroups = $staged['announcement_groups'] ?? [];
+			$replacement = $normalizedCandidate[0];
+			$replaced = false;
+			foreach ($stagedGroups as $index => $group) {
+				if (($group['id'] ?? '') === $replacement['id']) {
+					$stagedGroups[$index] = $replacement;
+					$replaced = true;
+					break;
+				}
+			}
+			if (!$replaced) {
+				if (count($stagedGroups) >= 20) { throw new \InvalidArgumentException(_('Announcement groups are limited to 20.')); }
+				$stagedGroups[] = $replacement;
+			}
+			$staged['announcement_groups'] = $stagedGroups;
+			\SLS\MassNotify\LivePagingConfig::resolvedGroups($this->normalizeLivePagingSettings($staged['live_paging'] ?? []), $stagedGroups);
+			if ($requiresApply) {
+				$this->persistPendingSettings($staged);
+				return [
+					'success' => true,
+					'apply_required' => true,
+					'message' => _('Announcement group changes are staged. Use Apply Config to prepare the updated paging prompts and activate the changes. Announcement targets continue to use the active group until then.'),
+					'groups' => $this->getAnnouncementGroups(),
+				];
+			}
 			$this->persistAppliedSettings($settings);
-			$this->syncPendingAnnouncementGroups($normalized);
+			if ($pending !== null) { $this->persistPendingSettings($staged); }
 		} catch (\Throwable $e) {
 					return [
 						'success' => false,
-						'message' => _('Unable to save announcement group.'),
+						'message' => ($e instanceof \InvalidArgumentException || $e instanceof \DomainException || $e instanceof \FreePBX\modules\SlsConfigurationWriteException) ? $e->getMessage() : _('Unable to save the announcement group. Reload settings and check protected configuration permissions.'),
+						'settings_replaced' => $e instanceof \FreePBX\modules\SlsConfigurationWriteException && $e->settingsWereReplaced(),
 						'groups' => $this->getAnnouncementGroups(),
 					];
 		}
@@ -5142,8 +6003,16 @@ class Slsmassnotifyserver implements \BMO
 
 		$settings = $this->getActiveSettings();
 		$groupId = preg_replace('/[^A-Za-z0-9_-]/', '', (string)$groupId);
+		foreach ([$settings, $this->getPendingSettings() ?? []] as $configured) {
+			foreach ((array)($configured['live_paging']['groups'] ?? []) as $pagingGroup) {
+				if (($pagingGroup['group_id'] ?? '') === $groupId && !\SLS\MassNotify\LivePagingConfig::isStandalone($pagingGroup)) {
+					return ['success' => false, 'message' => _('This group is used by Dial-in Paging. Remove it from the paging menu and apply that change before deleting the group.'), 'groups' => $this->getAnnouncementGroups()];
+				}
+			}
+		}
 		$groups = [];
-		foreach ((array)($settings['announcement_groups'] ?? []) as $group) {
+		$previousGroups = (array)($settings['announcement_groups'] ?? []);
+		foreach ($previousGroups as $group) {
 			if (($group['id'] ?? '') !== $groupId) {
 				$groups[] = $group;
 			}
@@ -5151,11 +6020,12 @@ class Slsmassnotifyserver implements \BMO
 		$settings['announcement_groups'] = $this->normalizeAnnouncementGroups($groups);
 		try {
 			$this->persistAppliedSettings($settings);
-			$this->syncPendingAnnouncementGroups($settings['announcement_groups']);
+			$this->syncPendingAnnouncementGroups($settings['announcement_groups'], $previousGroups);
 		} catch (\Throwable $e) {
 			return [
 				'success' => false,
-				'message' => _('Unable to delete announcement group.'),
+				'message' => ($e instanceof \InvalidArgumentException || $e instanceof \DomainException || $e instanceof \FreePBX\modules\SlsConfigurationWriteException) ? $e->getMessage() : _('Unable to delete the announcement group. Reload settings and check protected configuration permissions.'),
+				'settings_replaced' => $e instanceof \FreePBX\modules\SlsConfigurationWriteException && $e->settingsWereReplaced(),
 				'groups' => $this->getAnnouncementGroups(),
 			];
 		}
@@ -5190,6 +6060,9 @@ class Slsmassnotifyserver implements \BMO
 		if (array_key_exists('desktop_all', $payload) || array_key_exists('all_desktops', $payload)) {
 			$options['desktop_all'] = ($payload['desktop_all'] ?? false) === true || ($payload['all_desktops'] ?? false) === true;
 		}
+		if (array_key_exists('voice_recipient_ids', $payload)) { $options['voice_recipient_ids'] = $payload['voice_recipient_ids']; }
+		if (array_key_exists('email_recipient_ids', $payload)) { $options['email_recipient_ids'] = $payload['email_recipient_ids']; }
+		if (array_key_exists('sms_recipient_ids', $payload)) { $options['sms_recipient_ids'] = $payload['sms_recipient_ids']; }
 		if (array_key_exists('desktop_clients', $payload) || array_key_exists('desktop_targets', $payload)) {
 			$options['desktop_clients'] = $payload['desktop_clients'] ?? $payload['desktop_targets'];
 		}
@@ -5259,6 +6132,9 @@ class Slsmassnotifyserver implements \BMO
 			];
 		}
 		$settingsPatch = is_array($payload['settings'] ?? null) ? $payload['settings'] : (is_array($payload['config'] ?? null) ? $payload['config'] : []);
+		if (array_intersect(array_keys($settingsPatch), ['labs_safety','enterprise_cluster','enterprise_identity','directory_sync','subscriber_browser','enterprise_integrations','enterprise_operations'])) {
+			return ['success'=>false,'message'=>'Configure Enterprise Labs in the FreePBX administrator panel. Control API keys cannot activate or acknowledge experimental security features.', 'errors'=>['Enterprise Labs configuration is administrator-only.']];
+		}
 		if (empty($settingsPatch)) {
 			return [
 				'success' => false,
@@ -5409,7 +6285,8 @@ class Slsmassnotifyserver implements \BMO
 		} catch (\Throwable $e) {
 			return [
 				'success' => false,
-				'message' => _('Unable to update config.'),
+				'message' => ($e instanceof \InvalidArgumentException || $e instanceof \DomainException || $e instanceof \FreePBX\modules\SlsConfigurationWriteException) ? $e->getMessage() : _('Unable to update config.'),
+				'settings_replaced' => $e instanceof \FreePBX\modules\SlsConfigurationWriteException && $e->settingsWereReplaced(),
 				'errors' => [$e->getMessage()],
 			];
 		}
@@ -5419,6 +6296,15 @@ class Slsmassnotifyserver implements \BMO
 	{
 		$errors = [];
 		foreach ([$payload, is_array($payload['options'] ?? null) ? $payload['options'] : []] as $fields) {
+			if (array_key_exists('voice_recipient_ids', $fields)) { $errors = array_merge($errors, $this->validateVoiceRecipientIds($fields['voice_recipient_ids'])); }
+			if (array_key_exists('email_recipient_ids', $fields)) { $errors = array_merge($errors, $this->validateAnnouncementEmailRecipientIds($fields['email_recipient_ids'])); }
+			if (array_key_exists('sms_recipient_ids', $fields)) { $errors = array_merge($errors, $this->validateSmsRecipientIds($fields['sms_recipient_ids'])); }
+			foreach (['sms', 'sms_recipients', 'sms_numbers'] as $rawSmsField) {
+				if (array_key_exists($rawSmsField, $fields)) { $errors[] = _('Use sms_recipient_ids with saved destinations; raw SMS numbers are not accepted.'); }
+			}
+			foreach (['emails', 'email_recipients'] as $rawEmailField) {
+				if (array_key_exists($rawEmailField, $fields)) { $errors[] = _('Use email_recipient_ids with saved destinations; raw email addresses are not accepted.'); }
+			}
 			if (array_key_exists('priority', $fields) && !in_array($fields['priority'], ['normal', 'urgent'], true)) {
 				$errors[] = _('priority must be "normal" or "urgent".');
 			}
@@ -5593,6 +6479,28 @@ class Slsmassnotifyserver implements \BMO
 
 	private function redactConfigSecrets(array $settings)
 	{
+		if (isset($settings['enterprise_identity'])) { $settings['enterprise_identity'] = \SLS\MassNotify\EnterpriseIdentityConfig::publicConfig($settings['enterprise_identity']); }
+		if (isset($settings['directory_sync'])) { $settings['directory_sync'] = \SLS\MassNotify\DirectoryConfig::publicConfig($settings['directory_sync']); }
+		if (isset($settings['enterprise_integrations'])) { $settings['enterprise_integrations'] = \SLS\MassNotify\EnterpriseIntegrationsConfig::redacted($settings['enterprise_integrations']); }
+		foreach ($settings['enterprise_cluster']['peers'] ?? [] as $index=>$peer) { $settings['enterprise_cluster']['peers'][$index]['hmac_secret']='[redacted]'; }
+		foreach ($settings['operator_access']['accounts'] ?? [] as $index => $account) {
+			$settings['operator_access']['accounts'][$index]['identity'] = '[redacted]';
+			if (isset($account['auth'])) { $settings['operator_access']['accounts'][$index]['auth'] = '[redacted]'; }
+		}
+        foreach (['twilio_key_secret','twilio_auth_token','telnyx_api_key','bulkvs_api_password'] as $secretField) {
+            if (array_key_exists($secretField,$settings['announcement_sms']??[])) { $settings['announcement_sms'][$secretField]='[redacted]'; }
+        }
+		foreach ($settings['automations']['rules'] ?? [] as $index => $rule) {
+			if (isset($rule['secret'])) { $settings['automations']['rules'][$index]['secret'] = '[redacted]'; }
+		}
+		foreach ((array)($settings['live_paging']['groups'] ?? []) as $index => $group) {
+			if (is_array($group) && array_key_exists('pin_hash', $group)) {
+				$settings['live_paging']['groups'][$index]['pin_hash'] = '[redacted]';
+			}
+			if (is_array($group) && isset($group['external_callers'])) {
+				$settings['live_paging']['groups'][$index]['external_callers'] = array_fill(0, count((array)$group['external_callers']), '[redacted]');
+			}
+		}
 		foreach (['desktop_api_token', 'desktop_auth_key', 'discord_webhook_url'] as $key) {
 			if (array_key_exists($key, $settings)) {
 				$settings[$key] = '[redacted]';
@@ -5623,6 +6531,9 @@ class Slsmassnotifyserver implements \BMO
 		if (is_array($settings['control_api'] ?? null) && array_key_exists('api_key', $settings['control_api'])) {
 			$settings['control_api']['api_key'] = '[redacted]';
 		}
+		foreach ((array)($settings['control_api']['credentials'] ?? []) as $index => $credential) {
+			if (is_array($credential) && array_key_exists('secret_hash', $credential)) { $settings['control_api']['credentials'][$index]['secret_hash'] = '[redacted]'; }
+		}
 		if (is_array($settings['ami'] ?? null) && array_key_exists('password', $settings['ami'])) {
 			$settings['ami']['password'] = '[redacted]';
 		}
@@ -5650,7 +6561,7 @@ class Slsmassnotifyserver implements \BMO
 					$current[$key] ?? [],
 					$key === 'generic_webhooks' ? 'generic' : ($key === 'announcement_webhooks' ? 'announcement' : 'discord')
 				);
-			} elseif (is_array($patch[$key]) && is_array($current[$key] ?? null) && in_array($key, ['control_api', 'sipnotify', 'updates', 'xweather'], true)) {
+			} elseif (is_array($patch[$key]) && is_array($current[$key] ?? null) && in_array($key, ['control_api', 'sipnotify', 'updates', 'xweather', 'outbound_voice', 'announcement_email', 'announcement_sms'], true)) {
 				$current[$key] = array_replace($current[$key], $patch[$key]);
 			} else {
 				$current[$key] = $patch[$key];
@@ -5671,14 +6582,53 @@ class Slsmassnotifyserver implements \BMO
 			'email_html_enabled', 'xweather',
 			'nws_piper_voice', 'announcement_piper_voice', 'nws_tts_volume',
 				'announcement_tts_volume', 'tts_max_seconds', 'announcement_timeout_mode',
-				'announcement_timeout_seconds', 'log_retention_days', 'control_api',
-				'sipnotify', 'announcement_groups', 'updates', 'test_profiles', 'paging_answer_timeout',
+				'announcement_timeout_seconds', 'log_retention_days', 'generated_media_cache_mib', 'control_api',
+				'sipnotify', 'announcement_groups', 'updates', 'test_profiles', 'paging_answer_timeout', 'desktop_client_limit', 'desktop_minimum_version', 'phone_device_limit', 'outbound_voice', 'announcement_email', 'announcement_sms', 'announcement_pronunciation',
 		];
 	}
 
 	private function validateAndNormalizeControlConfigPatch(array $patch)
 	{
 		$errors = [];
+		if (array_key_exists('generated_media_cache_mib', $patch) && (!is_int($patch['generated_media_cache_mib']) || $patch['generated_media_cache_mib'] < 64 || $patch['generated_media_cache_mib'] > 4096)) {
+			$errors[] = _('Generated-media cache target must be an integer from 64 through 4096 MiB.');
+		}
+		if (array_key_exists('announcement_pronunciation', $patch)) {
+			try { $patch['announcement_pronunciation'] = \SLS\MassNotify\SpeechRules::normalize($patch['announcement_pronunciation']); }
+			catch (\DomainException $error) { $errors[] = $error->getMessage(); }
+		}
+		if (array_key_exists('desktop_minimum_version', $patch) && !\SLS\MassNotify\DesktopFleet::validMinimum($patch['desktop_minimum_version'])) {
+			$errors[] = _('Minimum desktop version must be empty or a version such as 1.2.3 or 1.2.3-beta.1.');
+		}
+		if (array_key_exists('desktop_client_limit', $patch)
+			&& (!is_int($patch['desktop_client_limit']) || $patch['desktop_client_limit'] < 1 || $patch['desktop_client_limit'] > 1000)) {
+			$errors[] = _('Desktop capacity must be a whole number from 1 to 1000.');
+		}
+		if (array_key_exists('announcement_email', $patch)) {
+			$emailErrors = $this->validateAnnouncementEmail($patch['announcement_email']);
+			$errors = array_merge($errors, $emailErrors);
+			if (!$emailErrors) {
+				$normalizedEmail = $this->normalizeAnnouncementEmail($patch['announcement_email']);
+				$patch['announcement_email'] = array_intersect_key($normalizedEmail, $patch['announcement_email']);
+			}
+		}
+		if (array_key_exists('announcement_sms', $patch)) {
+			$errors = array_merge($errors, $this->validateAnnouncementSms($patch['announcement_sms'], true));
+		}
+		if (array_key_exists('outbound_voice', $patch)) {
+			$voiceErrors = $this->validateOutboundVoice($patch['outbound_voice'], true);
+			$errors = array_merge($errors, $voiceErrors);
+			if (empty($voiceErrors)) {
+				// Allocate identities only at an explicit creation boundary. Retain
+				// patch semantics: changing Enabled must not clear saved recipients.
+				$normalizedVoice = $this->normalizeOutboundVoice($patch['outbound_voice'], true);
+				$patch['outbound_voice'] = array_intersect_key($normalizedVoice, $patch['outbound_voice']);
+			}
+		}
+		if (array_key_exists('phone_device_limit', $patch)
+			&& (!is_int($patch['phone_device_limit']) || $patch['phone_device_limit'] < 1 || $patch['phone_device_limit'] > 1000)) {
+			$errors[] = _('Phone capacity must be a whole number from 1 to 1000 registered device contacts.');
+		}
 		if (!empty($patch) && array_is_list($patch)) {
 			return ['patch' => $patch, 'errors' => [_('settings must be a JSON object, not an array.')]];
 		}
@@ -5693,15 +6643,15 @@ class Slsmassnotifyserver implements \BMO
 		}
 
 		$booleanFields = ['enabled', 'quiet_hours_enabled', 'email_html_enabled'];
-		$integerFields = ['nws_tts_volume', 'announcement_tts_volume', 'tts_max_seconds', 'announcement_timeout_seconds', 'log_retention_days', 'paging_answer_timeout'];
+		$integerFields = ['nws_tts_volume', 'announcement_tts_volume', 'tts_max_seconds', 'announcement_timeout_seconds', 'log_retention_days', 'generated_media_cache_mib', 'paging_answer_timeout', 'desktop_client_limit', 'phone_device_limit'];
 		$stringFields = [
 			'system_notification_emails', 'mail_to', 'mail_from_local_part', 'mail_from_domain', 'quiet_hours_start', 'quiet_hours_end',
 			'nws_api_base_url', 'nws_zone', 'alert_email_subject', 'alert_email_body', 'test_email_subject',
 			'test_email_body', 'opening_tone', 'closing_tone', 'nws_opening_tone', 'nws_closing_tone',
-			'nws_piper_voice', 'announcement_piper_voice', 'announcement_timeout_mode',
+			'nws_piper_voice', 'announcement_piper_voice', 'announcement_timeout_mode', 'desktop_minimum_version',
 		];
 		$listFields = ['alert_recipients', 'quiet_critical_events', 'nws_zones', 'discord_webhooks', 'generic_webhooks', 'announcement_webhooks', 'announcement_groups', 'test_profiles'];
-		$objectFields = ['xweather', 'control_api', 'sipnotify', 'updates'];
+		$objectFields = ['xweather', 'control_api', 'sipnotify', 'updates', 'outbound_voice', 'announcement_email', 'announcement_sms'];
 
 		foreach ($booleanFields as $field) {
 			if (!array_key_exists($field, $patch)) {
@@ -5742,12 +6692,12 @@ class Slsmassnotifyserver implements \BMO
 		$nestedSchemas = [
 			'xweather' => [
 				'boolean' => ['enabled', 'adaptive_free_tier', 'quiet_hours_enabled'],
-				'integer' => ['radius_miles', 'query_interval_minutes', 'adaptive_grace_minutes', 'tts_volume'],
+				'integer' => ['radius_miles', 'query_interval_minutes', 'adaptive_grace_minutes', 'adaptive_fallback_minutes', 'tts_volume'],
 				'array' => ['recipients', 'groups'],
-				'string' => ['client_id', 'client_secret', 'location', 'adaptive_nws_zone_id', 'opening_tone', 'closing_tone', 'all_clear', 'strike_type', 'quiet_hours_start', 'quiet_hours_end'],
+				'string' => ['provider', 'client_id', 'client_secret', 'location', 'adaptive_gate_failure_policy', 'adaptive_nws_zone_id', 'opening_tone', 'closing_tone', 'all_clear', 'strike_type', 'quiet_hours_start', 'quiet_hours_end'],
 			],
 			'control_api' => [
-				'boolean' => ['enabled', 'ip_allowlist_enabled', 'rate_limit_enabled'],
+				'boolean' => ['enabled', 'ip_allowlist_enabled', 'rate_limit_enabled', 'audit_syslog'],
 				'integer' => ['rate_limit_per_minute', 'audit_retention_days'],
 				'array' => [],
 				'string' => ['api_key', 'base_url', 'ip_allowlist'],
@@ -5760,9 +6710,9 @@ class Slsmassnotifyserver implements \BMO
 			],
 			'updates' => [
 				'boolean' => ['github_enabled'],
-				'integer' => [],
+				'integer' => ['rollout_delay_hours'],
 				'array' => [],
-				'string' => ['repository', 'channel'],
+				'string' => ['repository', 'channel', 'pinned_version', 'window_start', 'window_end'],
 			],
 		];
 		foreach ($nestedSchemas as $objectField => $schema) {
@@ -5815,7 +6765,7 @@ class Slsmassnotifyserver implements \BMO
 					continue;
 				}
 				$zoneAllowed = [
-					'id', 'name', 'zone', 'extensions', 'recipients', 'desktop_clients', 'email_recipients',
+					'id', 'name', 'site_id', 'zone', 'extensions', 'recipients', 'desktop_clients', 'email_recipients', 'voice_recipient_ids', 'sms_recipient_ids',
 					'quiet_hours_enabled', 'quiet_hours_start', 'quiet_hours_end', 'quiet_critical_events',
 					'discord_webhook_ids', 'generic_webhook_ids',
 				];
@@ -5836,7 +6786,7 @@ class Slsmassnotifyserver implements \BMO
 						$patch['nws_zones'][$index]['quiet_hours_enabled'] = $zone['quiet_hours_enabled'] ? '1' : '0';
 					}
 				}
-				foreach (['extensions', 'recipients', 'desktop_clients', 'email_recipients', 'quiet_critical_events', 'discord_webhook_ids', 'generic_webhook_ids'] as $key) {
+				foreach (['extensions', 'recipients', 'desktop_clients', 'email_recipients', 'voice_recipient_ids', 'sms_recipient_ids', 'quiet_critical_events', 'discord_webhook_ids', 'generic_webhook_ids'] as $key) {
 					if (array_key_exists($key, $zone) && (!is_array($zone[$key]) || !array_is_list($zone[$key]))) {
 						$errors[] = sprintf(_('nws_zones[%d].%s must be a JSON array.'), $index, $key);
 					}
@@ -5846,6 +6796,7 @@ class Slsmassnotifyserver implements \BMO
 		if (is_array($patch['announcement_groups'] ?? null)) {
 			$errors = array_merge($errors, $this->validateAnnouncementGroupFields($patch['announcement_groups']));
 		}
+		$errors = array_merge($errors, $this->validateXweatherAdaptivePolicyInput(is_array($patch['xweather'] ?? null) ? $patch['xweather'] : []));
 		if (is_array($patch['xweather']['groups'] ?? null) && array_is_list($patch['xweather']['groups'])) {
 			if (count($patch['xweather']['groups']) > 5) {
 				$errors[] = _('xweather.groups is limited to five entries.');
@@ -5856,8 +6807,8 @@ class Slsmassnotifyserver implements \BMO
 					continue;
 				}
 				$groupAllowed = [
-					'id', 'name', 'enabled', 'adaptive_nws_zone_id', 'location', 'radius_miles',
-					'extensions', 'recipients', 'desktop_clients', 'email_recipients', 'all_clear', 'all_clear_minutes',
+					'id', 'name', 'site_id', 'enabled', 'adaptive_nws_zone_id', 'location', 'radius_miles',
+					'extensions', 'recipients', 'desktop_clients', 'email_recipients', 'voice_recipient_ids', 'sms_recipient_ids', 'all_clear', 'all_clear_minutes',
 					'strike_type', 'quiet_hours_enabled', 'quiet_hours_start', 'quiet_hours_end',
 				];
 				foreach (array_keys($group) as $key) {
@@ -5929,7 +6880,9 @@ class Slsmassnotifyserver implements \BMO
 	private function getControlApiUrl(array $settings)
 	{
 		$host = $this->getPublicPbxHost($settings);
-		return 'https://' . $host . '/api/sls-mass-notify';
+		$url = $settings['control_api']['base_url'] ?? '';
+		$port = SlsAdvertisedAddress::savedPort(is_string($url) && stripos($url, 'https://') === 0 ? $url : '', $host, '/api/sls-mass-notify', 443);
+		return SlsAdvertisedAddress::url('https', $host, $port, '/api/sls-mass-notify');
 	}
 
 	private function getPublicPbxHost(array $settings = null)
@@ -5951,6 +6904,7 @@ class Slsmassnotifyserver implements \BMO
 		return [
 			'enabled' => '0',
 			'public_pbx_host' => $defaultHost,
+			'pbx_timezone' => '',
 			'page_group' => '',
 			'alert_recipients' => [],
 			'system_notification_emails' => '',
@@ -5984,39 +6938,58 @@ class Slsmassnotifyserver implements \BMO
 			'piper_voice' => self::PIPER_VOICE,
 			'nws_piper_voice' => self::PIPER_AMY_VOICE,
 			'announcement_piper_voice' => self::PIPER_VOICE,
+			'announcement_pronunciation' => [],
 			'nws_tts_volume' => 25,
 			'announcement_tts_volume' => 25,
 			'announcement_cooldown_seconds' => self::ANNOUNCEMENT_COOLDOWN_SECONDS,
 			'announcement_timeout_mode' => 'none',
 			'announcement_timeout_seconds' => 300,
 			'paging_answer_timeout' => 5,
+			'live_paging' => \SLS\MassNotify\LivePagingConfig::defaults(),
+			'incident_workflows' => \SLS\MassNotify\IncidentConfig::defaults(),
+			'labs_safety' => \SLS\MassNotify\LabsSafety::defaults(),
+			'enterprise_operations' => \SLS\MassNotify\EnterpriseOperationsConfig::defaults(),
+			'enterprise_cluster' => \SLS\MassNotify\EnterpriseClusterConfig::defaults(),
+			'enterprise_identity' => \SLS\MassNotify\EnterpriseIdentityConfig::defaults(),
+			'directory_sync' => \SLS\MassNotify\DirectoryConfig::defaults(),
+			'subscriber_browser' => \SLS\MassNotify\SubscriberConfig::defaults(),
+			'enterprise_integrations' => \SLS\MassNotify\EnterpriseIntegrationsConfig::defaults(),
+			'location_directory' => \SLS\MassNotify\LocationDirectory::defaults(),
+			'device_acceptance' => \SLS\MassNotify\DeviceAcceptance::normalize([]),
 			'test_profiles' => [],
 			'log_retention_days' => 90,
+			'generated_media_cache_mib' => 512,
 			'desktop_auth_key' => $this->generateDesktopAuthKey(),
+			'desktop_client_limit' => 25,
+			'desktop_minimum_version' => '1.10.0',
+			'phone_device_limit' => 25,
+			'outbound_voice' => $this->defaultOutboundVoice(),
+			'announcement_email' => $this->defaultAnnouncementEmail(),
+			'announcement_sms' => $this->defaultAnnouncementSms(),
 			'desktop_clients' => [
 				$this->defaultDesktopClient('SLS Desktop App'),
 			],
 			'ami' => [
 				'username' => 'slsmassnotify',
 				'password' => $this->generateApiKey(),
-				'host' => '127.0.0.1',
+				'host' => $this->detectAmiHost(),
 				'port' => $this->detectAmiPort(),
 			],
-			'updates' => [
-				'github_enabled' => '0',
-				'repository' => 'vipgabe09267/SouthlandServers_Mass_Notify_server',
-				'channel' => 'beta',
-			],
+			'updates' => \SLS\MassNotify\UpdatePolicy::defaults(),
 			'control_api' => [
 				'enabled' => '0',
 				'api_key' => $this->generateApiKey(),
+				'credentials' => [],
 				'base_url' => 'https://' . $this->detectPbxHost() . '/api/sls-mass-notify',
 				'ip_allowlist_enabled' => '0',
 				'ip_allowlist' => '',
 				'rate_limit_enabled' => '0',
+				'audit_syslog' => '0',
 				'rate_limit_per_minute' => 60,
 				'audit_retention_days' => 30,
 			],
+			'api_network' => ['trusted_proxy_cidrs' => []],
+			'media_access' => \SLS\MassNotify\MediaAccess::defaults(),
 			'setup' => [
 				'completed' => '0',
 				'beta_accepted' => '0',
@@ -6035,6 +7008,8 @@ class Slsmassnotifyserver implements \BMO
 				'query_interval_minutes' => 5,
 				'adaptive_free_tier' => '1',
 				'adaptive_grace_minutes' => 60,
+				'adaptive_gate_failure_policy' => 'standby',
+				'adaptive_fallback_minutes' => 30,
 				'adaptive_nws_zone_id' => '',
 				'tts_volume' => 25,
 				'opening_tone' => self::DEFAULT_LIGHTNING_OPENING_TONE,
@@ -6153,7 +7128,7 @@ class Slsmassnotifyserver implements \BMO
 				}
 			}
 			if (!$replaceSchedules) {
-				if (is_readable(self::PENDING_SETTINGS_JSON)) {
+				if ($this->configurationPathMetadata(self::PENDING_SETTINGS_JSON) !== null) {
 					$latestSettings = $this->normalizeSettings($this->loadSettingsFile(self::PENDING_SETTINGS_JSON));
 				} else {
 					$latestSettings = $this->normalizeSettings($this->loadSettingsFile(self::SETTINGS_JSON));
@@ -6172,6 +7147,7 @@ class Slsmassnotifyserver implements \BMO
 
 	private function persistAppliedSettings(array $settings, $replaceSchedules = false, $clearPending = false)
 	{
+		if (method_exists($this, 'automationDependencyChecks')) { foreach ($this->automationDependencyChecks($settings) as $check) { if ($check['state'] !== 'ok') { throw new \DomainException($check['detail']); } } }
 		$this->ensurePluginDataDir();
 		$lock = $this->acquireSettingsLock(true);
 		try {
@@ -6186,8 +7162,11 @@ class Slsmassnotifyserver implements \BMO
 				if ($expectedPendingFingerprint !== null && !hash_equals($expectedPendingFingerprint, $currentPendingFingerprint)) {
 					throw new \RuntimeException(_('Another request changed the staged Mass Notifications settings. Reload this page and try again.'));
 				}
+				if ($this->configurationPathMetadata(self::PENDING_SETTINGS_JSON) !== null) {
+					$this->loadSettingsFile(self::PENDING_SETTINGS_JSON);
+				}
 			}
-			if (!$replaceSchedules && is_readable(self::SETTINGS_JSON)) {
+			if (!$replaceSchedules && $this->configurationPathMetadata(self::SETTINGS_JSON) !== null) {
 				$latestActive = $this->normalizeSettings($this->loadSettingsFile(self::SETTINGS_JSON));
 				$settings['scheduled_announcements'] = $latestActive['scheduled_announcements'] ?? [];
 			}
@@ -6206,28 +7185,78 @@ class Slsmassnotifyserver implements \BMO
 
 	private function writeSettingsFileUnlocked($path, array $settings, $backupApplied)
 	{
+		$this->assertEnterpriseActivationSafe($settings);
+		$previous = $this->configurationPathMetadata($path);
+		if ($previous !== null && (($previous['mode'] & 0170000) !== 0100000 || $previous['nlink'] !== 1)) {
+			throw new \FreePBX\modules\SlsConfigurationWriteException(_('The configuration destination is not a safe regular file. Run protected repair before saving settings.'));
+		}
+		$active = $this->loadSettingsFile(self::SETTINGS_JSON);
+		if ($path !== self::SETTINGS_JSON && $previous !== null) {
+			$this->loadSettingsFile($path);
+		}
+		$this->assertDesktopCapacityChange($settings, $active);
+		if ($path === self::SETTINGS_JSON) {
+			$this->assertLivePagingPromptsReady($settings);
+		}
 		$json = json_encode($settings, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
 		if ($json === false) {
-			throw new \RuntimeException(_('Unable to encode Mass Notifications settings.'));
+			throw new \FreePBX\modules\SlsConfigurationWriteException(_('Unable to encode Mass Notifications settings.'));
 		}
+		if (strlen($json) + 1 > self::NATIVE_BACKUP_MAX_CONFIG_BYTES) {
+			throw new \DomainException(sprintf(_('The configuration is %.2f MiB, exceeding the %.0f MiB runtime and backup limit. Use saved groups instead of repeating large recipient lists in schedules, then save again. No settings were written.'), (strlen($json) + 1) / 1048576, self::NATIVE_BACKUP_MAX_CONFIG_BYTES / 1048576));
+		}
+		$encrypted = SlsConfigCrypto::encode($settings);
 		if ($backupApplied) {
 			$this->backupAppliedSettings();
 		}
-		$tmpSettings = $path . '.tmp.' . bin2hex(random_bytes(4));
-		if (file_put_contents($tmpSettings, $json . "\n", LOCK_EX) === false) {
-			@unlink($tmpSettings);
-			throw new \RuntimeException(sprintf(_('Unable to write %s.'), $path));
+		$tmpSettings = $path . '.tmp.' . bin2hex(random_bytes(16));
+		$oldMask = umask(0077);
+		try { $handle = @fopen($tmpSettings, 'x+b'); }
+		finally { umask($oldMask); }
+		if ($handle === false) {
+			throw new \FreePBX\modules\SlsConfigurationWriteException(_('Unable to create a private configuration staging file. Check data-directory permissions and free space; existing settings were preserved.'));
 		}
-		$this->setPrivateOwnership($tmpSettings);
-		if (!@rename($tmpSettings, $path)) {
-			@unlink($tmpSettings);
-			throw new \RuntimeException(sprintf(_('Unable to replace %s.'), $path));
+		try {
+			$contents = $encrypted;
+			$written = 0;
+			while ($written < strlen($contents)) {
+				$count = fwrite($handle, substr($contents, $written));
+				if ($count === false || $count === 0) {
+					throw new \FreePBX\modules\SlsConfigurationWriteException(_('Configuration write was incomplete. Check free space and filesystem errors; existing settings were preserved.'));
+				}
+				$written += $count;
+			}
+			$this->setPrivateOwnership($tmpSettings);
+			if (!fflush($handle) || !fsync($handle)) {
+				throw new \FreePBX\modules\SlsConfigurationWriteException(_('The filesystem could not synchronize the new configuration. Existing settings were preserved; check storage health.'));
+			}
+			$opened = fstat($handle);
+			clearstatcache(true, $tmpSettings);
+			$staged = @lstat($tmpSettings);
+			if (!is_array($staged) || ($staged['mode'] & 0170000) !== 0100000 || $staged['nlink'] !== 1
+				|| $staged['dev'] !== $opened['dev'] || $staged['ino'] !== $opened['ino']) {
+				throw new \FreePBX\modules\SlsConfigurationWriteException(_('The configuration staging file changed unexpectedly. Existing settings were preserved; check protected storage permissions.'));
+			}
+			if (!@rename($tmpSettings, $path)) {
+				throw new \FreePBX\modules\SlsConfigurationWriteException(_('Unable to replace the protected configuration. Existing settings were preserved; check data-directory permissions and filesystem errors.'));
+			}
+			// Replacement has happened even if directory synchronization fails.
+			// Never retain an optimistic-concurrency fingerprint of the old file.
+			unset($this->normalizedSettingsCache[$path]);
+			$this->rememberSettingsFingerprint($path);
+			$directory = @fopen(dirname($path), 'r');
+			if ($directory === false) {
+				throw new \FreePBX\modules\SlsConfigurationWriteException(_('Settings were replaced, but the configuration directory could not be opened for synchronization. Check storage health before making another change.'), true);
+			}
+			try {
+				if (!fsync($directory)) {
+					throw new \FreePBX\modules\SlsConfigurationWriteException(_('Settings were replaced, but the filesystem could not confirm durable directory storage. Check storage health before making another change.'), true);
+				}
+			} finally { fclose($directory); }
+		} finally {
+			fclose($handle);
+			if (is_file($tmpSettings) || is_link($tmpSettings)) { @unlink($tmpSettings); }
 		}
-		$this->setPrivateOwnership($path);
-		// A successful in-request write must never leave a normalized snapshot or
-		// optimistic-concurrency fingerprint pointing at the previous contents.
-		unset($this->normalizedSettingsCache[$path]);
-		$this->rememberSettingsFingerprint($path);
 	}
 
 	private function acquireSettingsLock($quiesceAnnouncements = false)
@@ -6269,10 +7298,7 @@ class Slsmassnotifyserver implements \BMO
 		if (!is_readable(self::SETTINGS_JSON)) {
 			return;
 		}
-		$current = (string)file_get_contents(self::SETTINGS_JSON);
-		if ($current === '' || !is_array(json_decode($current, true))) {
-			return;
-		}
+		$current = SlsConfigCrypto::encode(SlsConfigCrypto::readFile(self::SETTINGS_JSON));
 		$backupDir = self::PLUGIN_DATA_DIR . '/config-backups';
 		try {
 			$this->ensureOwnedDirectory($backupDir, 0750);
@@ -6326,7 +7352,7 @@ try:
     file_fd = os.open(parts[-1], flags, dir_fd=parent_fd)
     try:
         metadata = os.fstat(file_fd)
-        if not stat.S_ISREG(metadata.st_mode):
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
             raise SystemExit(3)
         account = pwd.getpwnam('asterisk')
         os.fchmod(file_fd, 0o640)
@@ -6341,7 +7367,7 @@ finally:
 PY;
 		$output = [];
 		$status = 1;
-		@exec('/usr/bin/python3 -c ' . escapeshellarg($program) . ' ' . escapeshellarg($file) . ' 2>/dev/null', $output, $status);
+		@exec('/usr/bin/python3 -I -c ' . escapeshellarg($program) . ' ' . escapeshellarg($file) . ' 2>/dev/null', $output, $status);
 		if ($status !== 0) {
 			throw new \RuntimeException(_('Unable to secure a protected Mass Notifications file without following symbolic links.'));
 		}
@@ -6366,7 +7392,7 @@ parts = [part for part in path.split('/') if part]
 if not parts:
     raise SystemExit(2)
 directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, 'O_NOFOLLOW', 0)
-file_flags = os.O_RDWR | os.O_CLOEXEC | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0)
+file_flags = os.O_RDWR | os.O_CLOEXEC | os.O_CREAT | os.O_NONBLOCK | getattr(os, 'O_NOFOLLOW', 0)
 parent_fd = os.open('/', directory_flags)
 try:
     for component in parts[:-1]:
@@ -6376,7 +7402,7 @@ try:
     file_fd = os.open(parts[-1], file_flags, 0o640, dir_fd=parent_fd)
     try:
         metadata = os.fstat(file_fd)
-        if not stat.S_ISREG(metadata.st_mode):
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
             raise SystemExit(3)
         account = pwd.getpwnam('asterisk')
         os.fchmod(file_fd, 0o640)
@@ -6388,7 +7414,7 @@ finally:
 PY;
 		$output = [];
 		$status = 1;
-		@exec('/usr/bin/python3 -c ' . escapeshellarg($program) . ' ' . escapeshellarg($file) . ' 2>/dev/null', $output, $status);
+		@exec('/usr/bin/python3 -I -c ' . escapeshellarg($program) . ' ' . escapeshellarg($file) . ' 2>/dev/null', $output, $status);
 		if ($status !== 0) {
 			throw new \RuntimeException(_('Unable to create a protected Mass Notifications file without following symbolic links.'));
 		}
@@ -6444,7 +7470,7 @@ finally:
 PY;
 		$output = [];
 		$status = 1;
-		@exec('/usr/bin/python3 -c ' . escapeshellarg($program) . ' ' . escapeshellarg($directory) . ' ' . escapeshellarg(sprintf('%o', $mode)) . ' 2>/dev/null', $output, $status);
+		@exec('/usr/bin/python3 -I -c ' . escapeshellarg($program) . ' ' . escapeshellarg($directory) . ' ' . escapeshellarg(sprintf('%o', $mode)) . ' 2>/dev/null', $output, $status);
 		if ($status !== 0) {
 			throw new \RuntimeException(_('Unable to secure a Mass Notifications data directory without following symbolic links.'));
 		}
@@ -6488,6 +7514,8 @@ visited = 0
 def directory_mode(relative):
     if profile == 'web':
         return 0o755
+    if relative in ('event-log-recovery', 'sms', 'recovery-archives') or relative.startswith(('event-log-recovery/', 'sms/', 'recovery-archives/', '.freepbx-restore-stage-')):
+        return 0o700
     if relative in ('', 'sipnotify', 'config-backups', 'piper'):
         return 0o750
     return 0o755
@@ -6495,6 +7523,8 @@ def directory_mode(relative):
 def file_mode(relative):
     if profile == 'web':
         return 0o644
+    if relative.startswith(('event-log-recovery/', 'sms/', 'recovery-archives/', '.freepbx-restore-stage-')):
+        return 0o600
     if relative.startswith('sounds/') or relative.startswith('piper/voices/'):
         return 0o644
     return 0o640
@@ -6554,7 +7584,7 @@ finally:
 PY;
 		$output = [];
 		$status = 1;
-		@exec('/usr/bin/python3 -c ' . escapeshellarg($program) . ' ' . escapeshellarg($root) . ' ' . escapeshellarg($profile) . ' 2>&1', $output, $status);
+		@exec('/usr/bin/python3 -I -c ' . escapeshellarg($program) . ' ' . escapeshellarg($root) . ' ' . escapeshellarg($profile) . ' 2>&1', $output, $status);
 		if ($status !== 0) {
 			$reason = 'Runtime tree could not be opened or inspected; check the managed path and its parent permissions.';
 			foreach ($output as $line) {
@@ -6575,7 +7605,6 @@ PY;
 		$this->ensureOwnedDirectory('/var/lib/asterisk/sounds/en', 0755);
 		$this->ensureAsteriskSoundLink('/var/lib/asterisk/sounds/en/' . self::ASTERISK_SOUND_PREFIX);
 		$this->ensureAsteriskSoundLink('/var/lib/asterisk/sounds/' . self::ASTERISK_SOUND_PREFIX);
-		$this->ensureDefaultTones();
 	}
 
 	private function ensureSystemDependencies()
@@ -6609,10 +7638,12 @@ PY;
 		$mbstringMissing = !extension_loaded('mbstring') || !function_exists('mb_strlen') || !function_exists('mb_substr');
 		$posixMissing = !function_exists('posix_getpwnam');
 		$opensslMissing = !extension_loaded('openssl') || !function_exists('openssl_encrypt') || !function_exists('openssl_decrypt');
+		$smsDependenciesMissing = !extension_loaded('pdo_sqlite') || !function_exists('curl_init');
+		$sodiumMissing = !function_exists('sodium_crypto_pwhash') || !function_exists('sodium_crypto_aead_xchacha20poly1305_ietf_encrypt');
 		$fontMissing = !is_readable('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf');
-		if ((!empty($missing) || $mbstringMissing || $posixMissing || $opensslMissing || $fontMissing) && is_executable('/usr/bin/apt-get')) {
+		if ((!empty($missing) || $mbstringMissing || $posixMissing || $opensslMissing || $sodiumMissing || $smsDependenciesMissing || $fontMissing) && is_executable('/usr/bin/apt-get')) {
 			$this->runCommand('DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get update');
-			$this->runCommand('DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y curl wget ca-certificates gnupg python3 python3-venv python3-pip sox imagemagick fonts-dejavu-core tar php-cli php-common php-mbstring cron util-linux coreutils apache2');
+			$this->runCommand('DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y curl wget ca-certificates gnupg python3 python3-venv python3-pip sox imagemagick fonts-dejavu-core tar php-cli php-common php-mbstring php-sqlite3 php-curl cron util-linux coreutils apache2');
 		}
 
 		$missing = array_values(array_filter($required, static function ($path) {
@@ -6621,13 +7652,17 @@ PY;
 		$mbstringMissing = !extension_loaded('mbstring') || !function_exists('mb_strlen') || !function_exists('mb_substr');
 		$posixMissing = !function_exists('posix_getpwnam');
 		$opensslMissing = !extension_loaded('openssl') || !function_exists('openssl_encrypt') || !function_exists('openssl_decrypt');
+		$smsDependenciesMissing = !extension_loaded('pdo_sqlite') || !function_exists('curl_init');
+		$sodiumMissing = !function_exists('sodium_crypto_pwhash') || !function_exists('sodium_crypto_aead_xchacha20poly1305_ietf_encrypt');
 		$fontMissing = !is_readable('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf');
-		if (!empty($missing) || $mbstringMissing || $posixMissing || $opensslMissing || $fontMissing) {
+		if (!empty($missing) || $mbstringMissing || $posixMissing || $opensslMissing || $sodiumMissing || $smsDependenciesMissing || $fontMissing) {
 			$missingLabels = array_unique(array_merge(
 				$missing,
 				$mbstringMissing ? ['PHP mbstring'] : [],
 				$posixMissing ? ['PHP POSIX'] : [],
 				$opensslMissing ? ['PHP OpenSSL'] : [],
+				$sodiumMissing ? ['PHP Sodium (encrypted backups)'] : [],
+				$smsDependenciesMissing ? ['PHP PDO SQLite and cURL (SMS delivery)'] : [],
 				$fontMissing ? ['DejaVu Sans Bold font'] : []
 			));
 			$message = 'Required runtime dependencies are missing: ' . implode(', ', $missingLabels);
@@ -6685,31 +7720,12 @@ finally:
 PY;
 		$output = [];
 		$status = 1;
-		@exec('/usr/bin/python3 -c ' . escapeshellarg($program) . ' ' . escapeshellarg($link) . ' ' . escapeshellarg(self::SOUNDS_DIR) . ' 2>/dev/null', $output, $status);
+		@exec('/usr/bin/python3 -I -c ' . escapeshellarg($program) . ' ' . escapeshellarg($link) . ' ' . escapeshellarg(self::SOUNDS_DIR) . ' 2>/dev/null', $output, $status);
 		if ($status !== 0) {
 			throw new \RuntimeException(_('The Asterisk sound path exists but is not the expected Mass Notifications link. Remove or relocate the conflicting path, then run Repair Installation.'));
 		}
 	}
 
-	private function ensureDefaultTones()
-	{
-		if (!is_executable('/usr/bin/sox')) {
-			return;
-		}
-		$tones = [];
-		foreach ($tones as $path => $synth) {
-			if (is_file($path)) {
-				continue;
-			}
-			$cmd = '/usr/bin/sox -n -r 8000 -c 1 -b 16 ' . escapeshellarg($path) . ' synth ' . $synth . ' 2>/dev/null';
-			exec($cmd);
-			if (is_file($path)) {
-				@chmod($path, 0644);
-				@chown($path, 'asterisk');
-				@chgrp($path, 'asterisk');
-			}
-		}
-	}
 
 	private function getTestCooldownState()
 	{
@@ -6741,10 +7757,7 @@ PY;
 
 	private function getAnnouncementCooldownState()
 	{
-		$lastRun = 0;
-		if (is_readable(self::ANNOUNCEMENT_COOLDOWN_FILE)) {
-			$lastRun = (int)trim((string)file_get_contents(self::ANNOUNCEMENT_COOLDOWN_FILE));
-		}
+		$lastRun = (new \SlsAnnouncementJobStore(self::PLUGIN_DATA_DIR))->admissionCooldown();
 
 		$duration = $this->normalizeAnnouncementCooldownSeconds($this->getActiveSettings()['announcement_cooldown_seconds'] ?? self::ANNOUNCEMENT_COOLDOWN_SECONDS);
 		$remaining = max(0, $duration - (time() - $lastRun));
@@ -6799,8 +7812,7 @@ PY;
 
 	private function setAnnouncementCooldown()
 	{
-		file_put_contents(self::ANNOUNCEMENT_COOLDOWN_FILE, (string)time() . "\n", LOCK_EX);
-		$this->setOwnership(self::ANNOUNCEMENT_COOLDOWN_FILE);
+		$this->writeAnnouncementCooldownTimestamp(time());
 	}
 
 	private function getRegisteredPjsipExtensions()
@@ -6831,7 +7843,7 @@ PY;
 		}
 
 		$output = [];
-		exec("asterisk -rx 'pjsip show contacts' 2>/dev/null", $output);
+		exec("/usr/bin/timeout --kill-after=1 5 /usr/sbin/asterisk -rx 'pjsip show contacts' 2>/dev/null", $output);
 		$registered = [];
 		foreach ($output as $line) {
 			if (!preg_match('/Contact:\s+([0-9]+)\/.*\s(Avail|Available|NonQual|Reachable|Unknown)\s+[-0-9na.]+$/i', $line, $matches)) {
@@ -6897,12 +7909,11 @@ PY;
 			return $cached['settings'];
 		}
 		$settings = null;
-		if (!is_readable(self::PENDING_SETTINGS_JSON) && is_readable(self::LEGACY_PENDING_SETTINGS_JSON)) {
-			$settings = $this->normalizeSettings($this->loadSettingsFile(self::LEGACY_PENDING_SETTINGS_JSON));
-		} elseif (!is_readable(self::PENDING_SETTINGS_JSON) && is_readable(self::LEGACY_OLD_PENDING_SETTINGS_JSON)) {
-			$settings = $this->normalizeSettings($this->loadSettingsFile(self::LEGACY_OLD_PENDING_SETTINGS_JSON));
-		} elseif (is_readable(self::PENDING_SETTINGS_JSON)) {
-			$settings = $this->normalizeSettings($this->loadSettingsFile(self::PENDING_SETTINGS_JSON));
+		foreach ([self::PENDING_SETTINGS_JSON, self::LEGACY_PENDING_SETTINGS_JSON, self::LEGACY_OLD_PENDING_SETTINGS_JSON] as $candidate) {
+			if ($this->configurationPathMetadata($candidate) !== null) {
+				$settings = $this->normalizeSettings($this->loadSettingsFile($candidate));
+				break;
+			}
 		}
 		$this->rememberSettingsFingerprint(self::PENDING_SETTINGS_JSON);
 		$this->normalizedSettingsCache[self::PENDING_SETTINGS_JSON] = [
@@ -6931,11 +7942,13 @@ PY;
 
 	private function settingsFileFingerprint($path)
 	{
-		if (!is_file($path) || !is_readable($path)) {
+		if ($this->configurationPathMetadata($path) === null) {
 			return 'missing';
 		}
-		$fingerprint = @hash_file('sha256', $path);
-		return is_string($fingerprint) && $fingerprint !== '' ? $fingerprint : 'unreadable';
+		try {
+			return hash('sha256', $this->readNativeBackupFile($path, SlsConfigCrypto::MAX_FILE_BYTES,
+				_('The protected configuration could not be read safely.')));
+		} catch (\Throwable $error) { return 'unreadable'; }
 	}
 
 	private function rememberSettingsFingerprint($path)
@@ -6943,17 +7956,49 @@ PY;
 		$this->settingsReadFingerprints[$path] = $this->settingsFileFingerprint($path);
 	}
 
+	/** Missing paths are safe only after their existing ancestors are searchable. */
+	private function configurationPathMetadata($path)
+	{
+		if (!is_string($path) || $path === '' || $path[0] !== '/' || strlen($path) > 4096) {
+			throw new \RuntimeException(_('The protected configuration path is invalid.'));
+		}
+		$parts = explode('/', substr($path, 1));
+		if (count($parts) > 64 || array_intersect($parts, ['', '.', '..'])) {
+			throw new \RuntimeException(_('The protected configuration path is invalid.'));
+		}
+		$parent = '/';
+		foreach ($parts as $index => $part) {
+			clearstatcache(true, $parent);
+			if (!is_readable($parent) || !is_executable($parent)) {
+				throw new \RuntimeException(_('The configuration directory is inaccessible. Existing settings were preserved; check its owner and permissions.'));
+			}
+			$current = rtrim($parent, '/') . '/' . $part;
+			clearstatcache(true, $current);
+			$metadata = @lstat($current);
+			if ($metadata === false) { return null; }
+			if ($index === count($parts) - 1) { return $metadata; }
+			if (($metadata['mode'] & 0170000) !== 0040000) {
+				throw new \RuntimeException(_('The protected configuration path contains a symbolic link or an invalid directory. Existing settings were preserved.'));
+			}
+			$parent = $current;
+		}
+		throw new \RuntimeException(_('The protected configuration path is invalid.'));
+	}
+
 	private function loadSettingsFile($path)
 	{
 		$settings = $this->getDefaultSettings();
-		if (!is_readable($path) && $path === self::SETTINGS_JSON && is_readable(self::LEGACY_SETTINGS_JSON)) {
-			$path = self::LEGACY_SETTINGS_JSON;
+		$candidates = [$path];
+		if ($path === self::SETTINGS_JSON) {
+			$candidates[] = self::LEGACY_SETTINGS_JSON;
+			$candidates[] = self::LEGACY_OLD_SETTINGS_JSON;
 		}
-		if (!is_readable($path) && $path === self::SETTINGS_JSON && is_readable(self::LEGACY_OLD_SETTINGS_JSON)) {
-			$path = self::LEGACY_OLD_SETTINGS_JSON;
+		$present = false;
+		foreach ($candidates as $candidate) {
+			if ($this->configurationPathMetadata($candidate) !== null) { $path = $candidate; $present = true; break; }
 		}
-		if (is_readable($path)) {
-			$decoded = json_decode((string)file_get_contents($path), true);
+		if ($present) {
+			$decoded = SlsConfigCrypto::readFile($path);
 			if (!is_array($decoded)) {
 				throw new \RuntimeException(sprintf(_('Mass Notifications config is invalid JSON: %s.'), $path));
 			}
@@ -6988,6 +8033,7 @@ PY;
 
 	private function normalizeSettings(array $settings)
 	{
+		\SLS\MassNotify\RuntimeState::running($settings);
 		$settings = $this->migrateConfigCompatibility($settings);
 		$hasSystemNotificationEmails = array_key_exists('system_notification_emails', $settings);
 		$legacyLiveEmailRecipients = $this->normalizeEmailRecipientList($settings['_legacy_live_email_recipients'] ?? []);
@@ -7133,6 +8179,7 @@ PY;
 		$settings['paging_answer_timeout'] = $this->normalizePagingAnswerTimeout($settings['paging_answer_timeout'] ?? 5);
 		$settings['test_profiles'] = $this->normalizeTestProfiles($settings['test_profiles'] ?? []);
 		$settings['log_retention_days'] = $this->normalizeRetentionDays($settings['log_retention_days'] ?? 90);
+		$settings['generated_media_cache_mib'] = $settings['generated_media_cache_mib'] ?? 512;
 		unset($settings['desktop_api_token']);
 		$ami = is_array($settings['ami'] ?? null) ? $settings['ami'] : [];
 		$settings['ami'] = [
@@ -7141,15 +8188,11 @@ PY;
 			// config. A transient value would configure Asterisk differently from the
 			// protected file and make runtime authentication fail unpredictably.
 			'password' => $this->normalizeEndpointPassword($ami['password'] ?? ''),
-			'host' => '127.0.0.1',
+			'host' => $this->normalizeAmiHost($ami['host'] ?? $this->detectAmiHost()),
 			'port' => $this->normalizeInt($ami['port'] ?? $this->detectAmiPort(), 1, 65535, $this->detectAmiPort()),
 		];
 		$updates = is_array($settings['updates'] ?? null) ? $settings['updates'] : [];
-		$settings['updates'] = [
-			'github_enabled' => empty($updates['github_enabled']) ? '0' : '1',
-			'repository' => 'vipgabe09267/SouthlandServers_Mass_Notify_server',
-			'channel' => 'beta',
-		];
+		$settings['updates'] = \SLS\MassNotify\UpdatePolicy::normalize($updates);
 		$control = is_array($settings['control_api'] ?? null) ? $settings['control_api'] : [];
 		$apiKey = trim((string)($control['api_key'] ?? ''));
 		if ($apiKey === '' || !preg_match('/^[A-Za-z0-9_-]{24,128}$/', $apiKey)) {
@@ -7158,17 +8201,37 @@ PY;
 		$settings['control_api'] = [
 			'enabled' => empty($control['enabled']) ? '0' : '1',
 			'api_key' => $apiKey,
+			'credentials' => \SLS\MassNotify\ApiSecurity::credentials($control['credentials'] ?? []),
 			'base_url' => $this->getControlApiUrl($settings),
 			'ip_allowlist_enabled' => empty($control['ip_allowlist_enabled']) ? '0' : '1',
 			'ip_allowlist' => $this->normalizeIpAllowlist((string)($control['ip_allowlist'] ?? '')),
 			'rate_limit_enabled' => empty($control['rate_limit_enabled']) ? '0' : '1',
+			'audit_syslog' => ($control['audit_syslog'] ?? '0') === '1' ? '1' : '0',
 			'rate_limit_per_minute' => $this->normalizeInt($control['rate_limit_per_minute'] ?? 60, 1, 600, 60),
 			'audit_retention_days' => 30,
 		];
+		$settings['api_network'] = \SLS\MassNotify\ApiSecurity::network($settings['api_network'] ?? []);
+		$settings['media_access'] = \SLS\MassNotify\MediaAccess::normalize(array_key_exists('media_access', $settings) ? $settings['media_access'] : []);
 		$settings['desktop_auth_key'] = $this->normalizeDesktopAuthKey($settings['desktop_auth_key'] ?? '');
 		$desktopClientSource = array_key_exists('desktop_clients', $settings) ? $settings['desktop_clients'] : [$this->defaultDesktopClient('SLS Desktop App')];
+		$settings['desktop_client_limit'] = $this->normalizeInt($settings['desktop_client_limit'] ?? 25, 1, 1000, 25);
+		$settings['phone_device_limit'] = $this->normalizeInt($settings['phone_device_limit'] ?? 25, 1, 1000, 25);
+		$settings['outbound_voice'] = $this->normalizeOutboundVoice(array_key_exists('outbound_voice', $settings) ? $settings['outbound_voice'] : []);
+		$settings['announcement_email'] = $this->normalizeAnnouncementEmail(array_key_exists('announcement_email', $settings) ? $settings['announcement_email'] : []);
 		$settings['desktop_clients'] = $this->normalizeDesktopClients($desktopClientSource, $settings);
 		$settings['announcement_groups'] = $this->normalizeAnnouncementGroups($settings['announcement_groups'] ?? []);
+		$settings['live_paging'] = $this->normalizeLivePagingSettings($settings['live_paging'] ?? []);
+		$settings['incident_workflows'] = \SLS\MassNotify\IncidentConfig::normalize($settings['incident_workflows'] ?? []);
+		foreach (['labs_safety'=>\SLS\MassNotify\LabsSafety::class,'enterprise_operations'=>\SLS\MassNotify\EnterpriseOperationsConfig::class,
+			'enterprise_cluster'=>\SLS\MassNotify\EnterpriseClusterConfig::class,'enterprise_identity'=>\SLS\MassNotify\EnterpriseIdentityConfig::class,
+			'directory_sync'=>\SLS\MassNotify\DirectoryConfig::class,'subscriber_browser'=>\SLS\MassNotify\SubscriberConfig::class,
+			'enterprise_integrations'=>\SLS\MassNotify\EnterpriseIntegrationsConfig::class] as $key=>$class) {
+			if (array_key_exists($key,$settings)) { $settings[$key]=$class::normalize($settings[$key]); }
+		}
+		$settings['device_acceptance'] = \SLS\MassNotify\DeviceAcceptance::normalize($settings['device_acceptance'] ?? []);
+		if (array_key_exists('operator_access', $settings)) { $settings['operator_access'] = \SLS\MassNotify\OperatorAccess::normalize($settings['operator_access']); }
+		if (array_key_exists('automations', $settings)) { $settings['automations'] = \SLS\MassNotify\AutomationConfig::normalize($settings['automations']); }
+		$settings['location_directory'] = \SLS\MassNotify\LocationDirectory::normalize(array_key_exists('location_directory', $settings) ? $settings['location_directory'] : []);
 		$settings['scheduled_announcements'] = $this->normalizeScheduledAnnouncements($settings['scheduled_announcements'] ?? []);
 		$settings['xweather'] = $this->normalizeXweatherSettings($settings['xweather'] ?? [], $settings['nws_tts_volume'] ?? 25);
 		if (!empty($legacyLiveEmailRecipients)) {
@@ -7213,8 +8276,8 @@ PY;
 		return [
 			'pbx_host' => $host,
 			'base_url' => 'https://' . $host . '/api/sipnotify',
-			'media_scheme' => 'http',
-			'media_base_url' => 'http://' . $host . '/sls_mass_notify',
+			'media_scheme' => 'https',
+			'media_base_url' => 'https://' . $host . '/sls_mass_notify',
 			'format_overrides' => [],
 			'device_format_overrides' => [],
 		];
@@ -7247,7 +8310,7 @@ PY;
 	private function normalizeScheduleRecurrenceMode($value)
 	{
 		$value = strtolower(trim((string)$value));
-		return in_array($value, ['none', 'every_7_days', 'every_14_days'], true) ? $value : 'none';
+		return in_array($value, ['none', 'every_7_days', 'every_14_days', 'calendar'], true) ? $value : 'none';
 	}
 
 	private function scheduleRecurrenceIntervalDays($mode)
@@ -7262,9 +8325,14 @@ PY;
 		return 0;
 	}
 
-	private function buildScheduledOccurrences($scheduleId, array $occurrenceInputs, $recurrenceMode, \DateTimeZone $timezone, array $existingRunTimes, $minimumRunAt, $maximumRunAt)
+	private function buildScheduledOccurrences($scheduleId, array $occurrenceInputs, $recurrenceMode, \DateTimeZone $timezone, array $existingRunTimes, $minimumRunAt, $maximumRunAt, array $calendar = [])
 	{
 		$recurrenceMode = $this->normalizeScheduleRecurrenceMode($recurrenceMode);
+		if ($recurrenceMode === 'calendar') {
+			return \SLS\MassNotify\ScheduleCalendar::build((string)$scheduleId, $occurrenceInputs, $calendar, $timezone,
+				$existingRunTimes, (int)$minimumRunAt, (int)$maximumRunAt, self::MAX_SCHEDULE_OCCURRENCES,
+				function ($local, $zone) { return $this->resolveScheduleLocalDateTime($local, $zone); });
+		}
 		$intervalDays = $this->scheduleRecurrenceIntervalDays($recurrenceMode);
 		$minimumRunAt = (int)$minimumRunAt;
 		$maximumRunAt = (int)$maximumRunAt;
@@ -7381,10 +8449,34 @@ PY;
 		return true;
 	}
 
-	private function validateScheduledAnnouncementRecurrences(array $schedules)
+	private function validateScheduledAnnouncementRecurrences(array $schedules, array $groups = [])
 	{
 		$errors = [];
 		foreach ($schedules as $schedule) {
+			if (is_array($schedule)) { $errors = array_merge($errors, array_map('_', \SLS\MassNotify\SchedulePresentation::latenessErrors($schedule))); }
+			if (is_array($schedule)) { $errors = array_merge($errors, \SLS\MassNotify\SchedulePresentation::textErrors($schedule)); }
+			if (is_array($schedule) && is_array($schedule['targets'] ?? null) && array_key_exists('email_recipient_ids', $schedule['targets'])) {
+				$errors = array_merge($errors, $this->validateAnnouncementEmailRecipientIds($schedule['targets']['email_recipient_ids']));
+			}
+			if (is_array($schedule) && is_array($schedule['targets'] ?? null) && array_key_exists('webhook_ids', $schedule['targets'])) {
+				$errors = array_merge($errors, $this->validateAudienceWebhookIds($schedule['targets']['webhook_ids']));
+			}
+			if (is_array($schedule) && is_array($schedule['targets'] ?? null) && array_key_exists('sms_recipient_ids', $schedule['targets'])) {
+				$errors = array_merge($errors, $this->validateSmsRecipientIds($schedule['targets']['sms_recipient_ids']));
+			}
+			$hasVoiceTargets = false;
+			if (is_array($schedule) && is_array($schedule['targets'] ?? null) && array_key_exists('voice_recipient_ids', $schedule['targets'])) {
+				$voiceIds = $schedule['targets']['voice_recipient_ids'];
+				$errors = array_merge($errors, $this->validateVoiceRecipientIds($voiceIds));
+				$hasVoiceTargets = !empty($voiceIds);
+			}
+			foreach ($groups as $group) {
+				if (is_array($group) && !empty($group['voice_recipient_ids'])
+					&& in_array($group['id'] ?? '', (array)($schedule['targets']['groups'] ?? []), true)) { $hasVoiceTargets = true; }
+			}
+			if ($hasVoiceTargets && $this->normalizeAnnouncementAudioMode($schedule['delivery']['audio_mode'] ?? 'none') === 'none') {
+				$errors[] = _('A scheduled announcement has external voice recipients without audio enabled.');
+			}
 			if (!is_array($schedule) || !array_key_exists('recurrence', $schedule)) {
 				continue;
 			}
@@ -7394,7 +8486,7 @@ PY;
 				continue;
 			}
 			$modeValue = strtolower(trim((string)($recurrence['mode'] ?? 'none')));
-			if (!in_array($modeValue, ['none', 'every_7_days', 'every_14_days'], true)) {
+			if (!in_array($modeValue, ['none', 'every_7_days', 'every_14_days', 'calendar'], true)) {
 				$errors[] = _('A scheduled announcement uses an unsupported repeat interval.');
 				continue;
 			}
@@ -7411,7 +8503,15 @@ PY;
 				$errors[] = _('A repeating schedule contains an invalid timezone.');
 				continue;
 			}
-			if (!$this->scheduleRecurrenceMatchesOccurrences($modeValue, $startsAtLocal, $timezone, (array)($schedule['occurrences'] ?? []))) {
+			if ($modeValue === 'calendar') {
+				$plan = $this->buildScheduledOccurrences((string)($schedule['id'] ?? ''), [$startsAtLocal], 'calendar', $timezone, [], 0,
+					PHP_INT_MAX, is_array($recurrence['calendar'] ?? null) ? $recurrence['calendar'] : []);
+				if ($plan['errors']) { $errors = array_merge($errors, $plan['errors']); }
+				// JSON object key ordering must not change a calendar's validity.
+				elseif ($plan['occurrences'] != ($schedule['occurrences'] ?? [])) {
+					$errors[] = _('The calendar pattern does not match its protected occurrence list. Reopen and save the schedule to review its dates.');
+				}
+			} elseif (!$this->scheduleRecurrenceMatchesOccurrences($modeValue, $startsAtLocal, $timezone, (array)($schedule['occurrences'] ?? []))) {
 				$errors[] = _('A repeating schedule does not match its protected occurrence list.');
 			}
 		}
@@ -7485,7 +8585,7 @@ PY;
 			$recurrenceMode = $this->normalizeScheduleRecurrenceMode($rawRecurrence['mode'] ?? 'none');
 			$recurrenceStartsAt = str_replace(' ', 'T', substr(trim((string)($rawRecurrence['starts_at_local'] ?? '')), 0, 16));
 			if ($recurrenceMode === 'none'
-				|| !$this->scheduleRecurrenceMatchesOccurrences($recurrenceMode, $recurrenceStartsAt, $timezone, $occurrences)) {
+				|| ($recurrenceMode !== 'calendar' && !$this->scheduleRecurrenceMatchesOccurrences($recurrenceMode, $recurrenceStartsAt, $timezone, $occurrences))) {
 				$recurrenceMode = 'none';
 				$recurrenceStartsAt = '';
 			}
@@ -7529,11 +8629,12 @@ PY;
 				'updated_by' => $this->sanitizeScheduleText($rawSchedule['updated_by'] ?? '', 80, true),
 				'name' => $name,
 				'enabled' => empty($rawSchedule['enabled']) ? '0' : '1',
+				'max_lateness_minutes' => array_key_exists('max_lateness_minutes', $rawSchedule) ? $rawSchedule['max_lateness_minutes'] : 15,
 				'timezone' => $timezone->getName(),
 				'recurrence' => [
 					'mode' => $recurrenceMode,
 					'starts_at_local' => $recurrenceStartsAt,
-				],
+				] + ($recurrenceMode === 'calendar' ? ['calendar'=>$rawRecurrence['calendar'] ?? []] : []),
 				'occurrences' => $occurrences,
 				'message' => $message,
 				'targets' => [
@@ -7542,7 +8643,12 @@ PY;
 					'phones_all' => empty($targets['phones_all']) ? '0' : '1',
 					'desktop_clients' => array_values($desktops),
 					'desktop_all' => empty($targets['desktop_all']) ? '0' : '1',
-				],
+					// Preserve exact saved IDs, including stale or invalid values, so
+					// dispatch rejects them explicitly instead of silently retargeting.
+					'voice_recipient_ids' => array_key_exists('voice_recipient_ids', $targets) ? $targets['voice_recipient_ids'] : [],
+					'email_recipient_ids' => array_key_exists('email_recipient_ids', $targets) ? $targets['email_recipient_ids'] : [],
+					'sms_recipient_ids' => $targets['sms_recipient_ids'] ?? [],
+				] + (array_key_exists('webhook_ids', $targets) ? ['webhook_ids' => $targets['webhook_ids']] : []),
 				'delivery' => [
 					'audio_mode' => $audioMode,
 					'voice' => in_array($audioMode, ['tts', 'tones_tts'], true) ? substr(trim((string)($delivery['voice'] ?? $delivery['piper_voice'] ?? '')), 0, 255) : '',
@@ -7555,7 +8661,7 @@ PY;
 				],
 				'created_at' => $createdAt,
 				'updated_at' => $updatedAt,
-			];
+			] + (array_key_exists('operator_credential_id', $rawSchedule) ? ['operator_credential_id'=>$rawSchedule['operator_credential_id']] : []);
 		}
 		return $schedules;
 	}
@@ -7649,6 +8755,16 @@ PY;
 			if ($pending !== null && !hash_equals($expectedFingerprint, $this->scheduledAnnouncementsFingerprint($pending['scheduled_announcements'] ?? []))) {
 				throw new \RuntimeException(_('A staged configuration contains a different schedule list. Apply or discard those staged changes before editing Scheduling.'));
 			}
+			if (($this->operatorScheduleOrigin ?? null) !== null) {
+				$principal = \SLS\MassNotify\ApiSecurity::currentCredential($active, $this->operatorScheduleOrigin);
+				if (!$principal || !\SLS\MassNotify\OperatorAccess::may($principal, 'schedule')) { throw new \DomainException(_('Your operator login or scheduling role changed before saving. No schedule was saved.')); }
+				foreach ($schedules as $schedule) {
+					if (($schedule['operator_credential_id'] ?? '') !== $this->operatorScheduleOrigin) { continue; }
+					$targets = $schedule['targets'];
+					$request = ['phones'=>$targets['extensions'], 'desktops'=>$targets['desktop_clients'], 'webhooks'=>$targets['webhook_ids'] ?? [], 'voice_recipient_ids'=>$targets['voice_recipient_ids'], 'email_recipient_ids'=>$targets['email_recipient_ids'], 'sms_recipient_ids'=>$targets['sms_recipient_ids']];
+					if (!empty($targets['groups']) || !empty($targets['phones_all']) || !empty($targets['desktop_all']) || !\SLS\MassNotify\ApiSecurity::permitsResolvedAnnouncement($principal, $request, $active)) { throw new \DomainException(_('The saved schedule audience no longer fits your current assignments. No schedule was saved.')); }
+				}
+			}
 			$active['scheduled_announcements'] = $schedules;
 			if ($pending !== null) {
 				$pending['scheduled_announcements'] = $schedules;
@@ -7727,17 +8843,31 @@ PY;
 		if ($json === false) {
 			throw new \RuntimeException(_('Unable to encode scheduling execution state.'));
 		}
-		$tmp = self::SCHEDULE_STATE_JSON . '.tmp.' . bin2hex(random_bytes(4));
-		if (file_put_contents($tmp, $json . "\n", LOCK_EX) === false) {
-			@unlink($tmp);
-			throw new \RuntimeException(_('Unable to write scheduling execution state.'));
+		$tmp = self::SCHEDULE_STATE_JSON . '.tmp.' . bin2hex(random_bytes(16));
+		$previousMask = umask(0077);
+		try { $handle = @fopen($tmp, 'x+b'); }
+		finally { umask($previousMask); }
+		if (!$handle) { throw new \RuntimeException(_('Unable to create scheduling execution state.')); }
+		try {
+			$encoded = $json . "\n";
+			if (fwrite($handle, $encoded) !== strlen($encoded) || !fflush($handle)) {
+				throw new \RuntimeException(_('Unable to write scheduling execution state.'));
+			}
+			$this->setPrivateOwnership($tmp);
+			if (!fsync($handle)) { throw new \RuntimeException(_('Unable to synchronize scheduling execution state.')); }
+			if (!@rename($tmp, self::SCHEDULE_STATE_JSON)) {
+				throw new \RuntimeException(_('Unable to replace scheduling execution state.'));
+			}
+			$directory = @fopen(self::PLUGIN_DATA_DIR, 'r');
+			if (!$directory) { throw new \RuntimeException(_('Unable to synchronize scheduling storage.')); }
+			try {
+				if (!fsync($directory)) { throw new \RuntimeException(_('Unable to synchronize scheduling storage.')); }
+			} finally { fclose($directory); }
+			\SLS\MassNotify\EnterpriseClusterIntegration::replicateScheduleStore($this->getActiveSettings(),$store);
+		} finally {
+			fclose($handle);
+			if (is_file($tmp)) { @unlink($tmp); }
 		}
-		$this->setPrivateOwnership($tmp);
-		if (!@rename($tmp, self::SCHEDULE_STATE_JSON)) {
-			@unlink($tmp);
-			throw new \RuntimeException(_('Unable to replace scheduling execution state.'));
-		}
-		$this->setPrivateOwnership(self::SCHEDULE_STATE_JSON);
 	}
 
 	private function scheduleExecutionRecord(array $schedule, array $occurrence, $state, $message, array $current = [])
@@ -7753,6 +8883,9 @@ PY;
 			'claimed_at' => (string)($current['claimed_at'] ?? ''),
 			'updated_at' => gmdate('c'),
 		];
+		foreach (['job_id', 'deadline_at', 'request_fingerprint', 'job_state'] as $field) {
+			if (array_key_exists($field, $current)) { $record[$field] = $current[$field]; }
+		}
 		if (in_array($state, ['success', 'failed', 'missed', 'uncertain'], true)) {
 			$record['completed_at'] = gmdate('c');
 		}
@@ -7782,9 +8915,12 @@ PY;
 			}
 			$occurrenceId = substr(preg_replace('/[^A-Za-z0-9_-]/', '', (string)$occurrenceId), 0, 64);
 			$scheduleId = $currentOccurrences[$occurrenceId] ?? '';
-			if ($scheduleId === '' || (string)($record['schedule_id'] ?? '') !== $scheduleId) {
-				continue;
+			if ($scheduleId === '' && !empty($record['job_id'])) {
+				$scheduleId = (string)($record['schedule_id'] ?? '');
+				$record['orphaned_schedule'] = true;
 			}
+			if (!preg_match('/^[A-Za-z0-9_-]{1,64}$/D', $scheduleId) || (string)($record['schedule_id'] ?? '') !== $scheduleId) { continue; }
+			unset($record['request_fingerprint']);
 			$currentTime = strtotime((string)($record['updated_at'] ?? $record['run_at_utc'] ?? '')) ?: 0;
 			$previousTime = strtotime((string)($latest[$scheduleId]['updated_at'] ?? $latest[$scheduleId]['run_at_utc'] ?? '')) ?: 0;
 			if (!isset($latest[$scheduleId]) || $currentTime >= $previousTime) {
@@ -7807,6 +8943,9 @@ PY;
 	private function getScheduledAnnouncementHealthWarnings(array $settings)
 	{
 		$warnings = [];
+		$knownEmailIds = array_fill_keys(array_column($this->getAnnouncementEmailRecipients($settings), 'id'), true);
+		$knownSmsIds = array_fill_keys(array_column($this->getAnnouncementSmsRecipients($settings), 'id'), true);
+		$knownVoiceIds = array_fill_keys(array_column($this->getOutboundVoiceRecipients($settings), 'id'), true);
 		$knownExtensions = [];
 		foreach ($this->getAllPjsipExtensions() as $extension) {
 			$number = preg_replace('/[^0-9]/', '', (string)($extension['extension'] ?? ''));
@@ -7849,6 +8988,19 @@ PY;
 			$validRecipient = !empty($targets['phones_all']) || !empty($targets['desktop_all']);
 			$validPhoneTarget = !empty($targets['phones_all']);
 			$orphanedTarget = false;
+			$requestedEmailIds = array_key_exists('email_recipient_ids', $targets) ? $targets['email_recipient_ids'] : [];
+			$emailTargetErrors = $this->validateAnnouncementEmailRecipientIds($requestedEmailIds);
+			if ($emailTargetErrors) { $orphanedTarget = true; $requestedEmailIds = []; }
+			$requestedSmsIds = array_key_exists('sms_recipient_ids', $targets) ? $targets['sms_recipient_ids'] : [];
+			$smsTargetErrors = $this->validateSmsRecipientIds($requestedSmsIds);
+			if ($smsTargetErrors) { $orphanedTarget = true; $requestedSmsIds = []; }
+			$requestedWebhookIds = $targets['webhook_ids'] ?? [];
+			if ($this->validateAudienceWebhookIds($requestedWebhookIds, $settings)) { $orphanedTarget = true; }
+			elseif ($requestedWebhookIds) { $validRecipient = true; }
+			$requestedVoiceIds = array_key_exists('voice_recipient_ids', $targets) ? $targets['voice_recipient_ids'] : [];
+			$voiceTargetErrors = $this->validateVoiceRecipientIds($requestedVoiceIds);
+			if ($voiceTargetErrors) { $orphanedTarget = true; }
+			$requestedVoiceIds = empty($voiceTargetErrors) ? $requestedVoiceIds : [];
 			foreach ((array)($targets['extensions'] ?? []) as $extension) {
 				$extension = preg_replace('/[^0-9]/', '', (string)$extension);
 				if (isset($knownExtensions[$extension])) {
@@ -7867,6 +9019,19 @@ PY;
 				if (!empty($knownGroups[$groupId]['extensions'])) {
 					$validPhoneTarget = true;
 				}
+				$groupEmailIds = array_key_exists('email_recipient_ids', $knownGroups[$groupId]) ? $knownGroups[$groupId]['email_recipient_ids'] : [];
+				if ($this->validateAnnouncementEmailRecipientIds($groupEmailIds)) { $orphanedTarget = true; }
+				else { $requestedEmailIds = array_merge($requestedEmailIds, $groupEmailIds); }
+				$groupSmsIds = array_key_exists('sms_recipient_ids', $knownGroups[$groupId]) ? $knownGroups[$groupId]['sms_recipient_ids'] : [];
+				if ($this->validateSmsRecipientIds($groupSmsIds)) { $orphanedTarget = true; }
+				else { $requestedSmsIds = array_merge($requestedSmsIds, $groupSmsIds); }
+				if ($this->validateAudienceWebhookIds($knownGroups[$groupId]['webhook_ids'] ?? [], $settings)) { $orphanedTarget = true; }
+				$groupVoiceIds = $knownGroups[$groupId]['voice_recipient_ids'] ?? [];
+				if ($this->validateVoiceRecipientIds($groupVoiceIds)) {
+					$orphanedTarget = true;
+				} else {
+					$requestedVoiceIds = array_merge($requestedVoiceIds, $groupVoiceIds);
+				}
 			}
 			foreach ((array)($targets['desktop_clients'] ?? []) as $username) {
 				if (isset($knownDesktops[$username])) {
@@ -7874,6 +9039,22 @@ PY;
 				} else {
 					$orphanedTarget = true;
 				}
+			}
+			foreach (array_unique($requestedVoiceIds) as $voiceId) {
+				if (isset($knownVoiceIds[$voiceId])) {
+					$validRecipient = true;
+					$validPhoneTarget = true;
+				} else {
+					$orphanedTarget = true;
+				}
+			}
+			foreach (array_unique($requestedEmailIds) as $emailId) {
+				if (isset($knownEmailIds[$emailId])) { $validRecipient = true; }
+				else { $orphanedTarget = true; }
+			}
+			foreach (array_unique($requestedSmsIds) as $smsId) {
+				if (isset($knownSmsIds[$smsId])) { $validRecipient = true; }
+				else { $orphanedTarget = true; }
 			}
 			if ($orphanedTarget) {
 				$warnings[] = sprintf(_('Scheduled announcement %s references a removed or disabled recipient'), $name);
@@ -7885,10 +9066,13 @@ PY;
 			$delivery = is_array($schedule['delivery'] ?? null) ? $schedule['delivery'] : [];
 			$audioMode = $this->normalizeAnnouncementAudioMode($delivery['audio_mode'] ?? 'none');
 			if ($audioMode === 'none') {
+				if (!empty($requestedVoiceIds)) {
+					$warnings[] = sprintf(_('Scheduled announcement %s has external voice recipients without audio enabled'), $name);
+				}
 				continue;
 			}
 			if (!$validPhoneTarget) {
-				$warnings[] = sprintf(_('Scheduled announcement %s has phone audio enabled without a phone target'), $name);
+				$warnings[] = sprintf(_('Scheduled announcement %s has audio enabled without a phone or external voice target'), $name);
 			}
 			if (in_array($audioMode, ['tts', 'tones_tts'], true)) {
 				$voice = (string)($delivery['voice'] ?? '');
@@ -7931,7 +9115,7 @@ PY;
 
 	private function defaultDesktopClient($name = 'Desktop App')
 	{
-		$username = 'sls' . strtolower(bin2hex(random_bytes(3)));
+		$username = 'sls' . strtolower(bin2hex(random_bytes(12)));
 		return [
 			'id' => 'desk_' . bin2hex(random_bytes(6)),
 			'client_id' => $this->generateDesktopClientId(),
@@ -7958,9 +9142,10 @@ PY;
 	{
 		$clients = [];
 		foreach ((array)$value as $client) {
-			if (!is_array($client) || count($clients) >= 50) {
+			if (!is_array($client)) {
 				continue;
 			}
+			if (count($clients) >= 1000) { throw new \DomainException(_('Desktop clients exceed the 1000-client storage limit.')); }
 			$name = trim(preg_replace('/\s+/', ' ', (string)($client['name'] ?? '')));
 			$clientId = $this->normalizeDesktopClientId($client['client_id'] ?? '');
 			$username = $this->normalizeDesktopUsername($client['username'] ?? '');
@@ -7968,7 +9153,7 @@ PY;
 				$name = 'Desktop App';
 			}
 			if ($username === '') {
-				$username = $this->normalizeDesktopUsername('sls' . bin2hex(random_bytes(3)));
+				$username = $this->normalizeDesktopUsername('sls' . bin2hex(random_bytes(12)));
 			}
 			if ($clientId === '') {
 				$legacyOwner = trim(preg_replace('/\s+/', ' ', (string)($client['owner'] ?? '')));
@@ -8007,10 +9192,10 @@ PY;
 		$usernames = [];
 		$clientIds = [];
 		$clients = array_values(array_filter((array)$value, 'is_array'));
-		if (count($clients) > 50) {
-			$errors[] = _('Desktop clients are limited to 50.');
+		if (count($clients) > 1000) {
+			$errors[] = _('Desktop clients are limited to 1000.');
 		}
-			foreach (array_slice($clients, 0, 50) as $client) {
+			foreach (array_slice($clients, 0, 1000) as $client) {
 			$username = $this->normalizeDesktopUsername($client['username'] ?? '');
 			$clientId = $this->normalizeDesktopClientId($client['client_id'] ?? '');
 			if ($username !== '') {
@@ -8036,7 +9221,7 @@ PY;
 
 	private function generateDesktopClientId()
 	{
-		return 'cli_' . strtolower(bin2hex(random_bytes(3)));
+		return 'cli_' . strtolower(bin2hex(random_bytes(12)));
 	}
 
 	private function normalizeDesktopClientId($value)
@@ -8147,49 +9332,6 @@ PY;
 		return min(365, max(1, $days));
 	}
 
-	private function pruneEventLog()
-	{
-		if (!is_readable(self::EVENTS_LOG) || !is_writable(self::EVENTS_LOG)) {
-			return;
-		}
-		$retentionDays = $this->normalizeRetentionDays($this->getActiveSettings()['log_retention_days'] ?? 90);
-		$cutoff = time() - ($retentionDays * 86400);
-		$handle = @fopen(self::EVENTS_LOG, 'r+');
-		if ($handle === false || !flock($handle, LOCK_EX)) {
-			if (is_resource($handle)) {
-				fclose($handle);
-			}
-			return;
-		}
-		$lines = [];
-		while (($line = fgets($handle)) !== false) {
-			$line = trim($line);
-			if ($line !== '') {
-				$lines[] = $line;
-			}
-		}
-		$retained = [];
-		foreach ($lines as $line) {
-			$decoded = json_decode($line, true);
-			if (!is_array($decoded)) {
-				continue;
-			}
-			$loggedAt = strtotime((string)($decoded['logged_at'] ?? $decoded['created_at'] ?? '')) ?: time();
-			if ($loggedAt >= $cutoff) {
-				$retained[] = json_encode($decoded, JSON_UNESCAPED_SLASHES);
-			}
-		}
-		if (count($retained) !== count($lines)) {
-			rewind($handle);
-			ftruncate($handle, 0);
-			fwrite($handle, implode("\n", $retained) . (empty($retained) ? '' : "\n"));
-			fflush($handle);
-		}
-		flock($handle, LOCK_UN);
-		fclose($handle);
-		$this->setOwnership(self::EVENTS_LOG);
-	}
-
 	private function volumePercentToScalar($value, $fallback)
 	{
 		return number_format($this->normalizeTtsVolume($value, $fallback) / 100, 2, '.', '');
@@ -8200,17 +9342,48 @@ PY;
 		return rtrim(strtr(base64_encode(random_bytes(32)), '+/', '-_'), '=');
 	}
 
+	private function validateAudienceWebhookIds($ids, ?array $settings = null): array
+	{
+		if (!is_array($ids) || !array_is_list($ids) || count($ids) > self::MAX_WEBHOOK_DESTINATIONS) {
+			return [_('Select up to ten saved webhook destinations.')];
+		}
+		$seen = [];
+		foreach ($ids as $id) {
+			if (!is_string($id) || !preg_match('/^[A-Za-z0-9_-]{1,64}$/D', $id) || isset($seen[$id])) {
+				return [_('The webhook selection contains an invalid or duplicate destination. Select saved destinations.')];
+			}
+			$seen[$id] = true;
+		}
+		if ($settings !== null && $ids) {
+			$known = array_column(array_filter($this->normalizeWebhookDestinations($settings['announcement_webhooks'] ?? [], 'announcement'), static fn(array $row): bool => !empty($row['enabled'])), 'id');
+			if (array_diff($ids, $known)) { return [_('A selected audience webhook is removed or disabled. Review the saved audience and delivery provider settings.')]; }
+		}
+		return [];
+	}
+
 	private function validateAnnouncementGroupFields(array $groups)
 	{
 		$errors = [];
 		// These are the complete persisted fields emitted by the group editor and
 		// normalizer. Selection aliases on announcement requests are not config keys.
-		$allowed = ['id', 'name', 'extensions', 'desktop_clients'];
+		$allowed = ['id', 'name', 'extensions', 'desktop_clients', 'voice_recipient_ids', 'email_recipient_ids', 'sms_recipient_ids', 'webhook_ids', 'desktop_bindings', 'location_snapshot'];
 		foreach ($groups as $index => $group) {
 			if (!is_array($group) || (!empty($group) && array_is_list($group))) {
 				$errors[] = sprintf(_('announcement_groups[%d] must be an object.'), $index);
 				continue;
 			}
+			if (array_key_exists('location_snapshot', $group)) {
+				try { \SLS\MassNotify\LocationDirectory::snapshot($group['location_snapshot'], (array)($group['desktop_clients'] ?? [])); }
+				catch (\InvalidArgumentException $error) { $errors[] = $error->getMessage(); }
+			}
+			$errors = array_merge($errors, $this->validateAudienceWebhookIds($group['webhook_ids'] ?? []));
+			if (array_key_exists('desktop_bindings', $group)) {
+				try { \SLS\MassNotify\LocationDirectory::bindings($group['desktop_bindings'], (array)($group['desktop_clients'] ?? [])); }
+				catch (\InvalidArgumentException $error) { $errors[] = $error->getMessage(); }
+			}
+			$errors = array_merge($errors, $this->validateVoiceRecipientIds($group['voice_recipient_ids'] ?? []));
+			$errors = array_merge($errors, $this->validateAnnouncementEmailRecipientIds(array_key_exists('email_recipient_ids', $group) ? $group['email_recipient_ids'] : []));
+			$errors = array_merge($errors, $this->validateSmsRecipientIds(array_key_exists('sms_recipient_ids', $group) ? $group['sms_recipient_ids'] : []));
 			foreach (array_keys($group) as $field) {
 				if (!in_array($field, $allowed, true)) {
 					$errors[] = sprintf(_('Unknown config key: announcement_groups[%d].%s.'), $index, (string)$field);
@@ -8230,6 +9403,7 @@ PY;
 		$available = array_fill_keys($allowedExtensions, true);
 		$availableDesktops = $allowedDesktopUsernames === null ? null : array_fill_keys($allowedDesktopUsernames, true);
 		$groups = [];
+		$usedIds = [];
 		foreach ((array)$value as $group) {
 			if (!is_array($group) || count($groups) >= 20) {
 				continue;
@@ -8241,41 +9415,67 @@ PY;
 			if ($name === '') {
 				continue;
 			}
+			$locationSnapshot = array_key_exists('location_snapshot', $group)
+				? \SLS\MassNotify\LocationDirectory::snapshot($group['location_snapshot'], (array)($group['desktop_clients'] ?? [])) : null;
 			$extensions = [];
 			foreach ((array)($group['extensions'] ?? []) as $extension) {
 				$extension = preg_replace('/[^0-9]/', '', (string)$extension);
-				if ($extension !== '' && isset($available[$extension])) {
+				if ($extension !== '' && ($locationSnapshot !== null || isset($group['desktop_bindings']) || isset($available[$extension]))) {
 					$extensions[$extension] = $extension;
 				}
 			}
 			$desktopClients = [];
 			foreach ((array)($group['desktop_clients'] ?? []) as $username) {
 				$username = $this->normalizeDesktopUsername($username);
-				if ($username !== '' && ($availableDesktops === null || isset($availableDesktops[$username]))) {
+				if ($username !== '' && ($locationSnapshot !== null || isset($group['desktop_bindings']) || $availableDesktops === null || isset($availableDesktops[$username]))) {
 					$desktopClients[$username] = $username;
 				}
 			}
-			if (empty($extensions) && empty($desktopClients)) {
+			if (empty($extensions) && empty($desktopClients) && empty($group['voice_recipient_ids']) && empty($group['email_recipient_ids']) && empty($group['sms_recipient_ids']) && empty($group['webhook_ids'])) {
 				continue;
 			}
+			$id = (string)($group['id'] ?? '');
+			if (!preg_match('/^grp_[a-f0-9]{12,32}$/D', $id)) {
+				$id = 'grp_' . substr(hash('sha256', strtolower($name) . '|' . implode(',', $extensions) . '|' . implode(',', $desktopClients) . '|' . implode(',', (array)($group['voice_recipient_ids'] ?? [])) . (!empty($group['email_recipient_ids']) ? '|email:' . implode(',', $group['email_recipient_ids']) : '') . (!empty($group['sms_recipient_ids']) ? '|sms:' . implode(',', $group['sms_recipient_ids']) : '') . (!empty($group['webhook_ids']) ? '|webhooks:' . implode(',', $group['webhook_ids']) : '')), 0, 12);
+			}
+			if (isset($usedIds[$id])) { continue; }
+			$usedIds[$id] = true;
 			$groups[] = [
-				'id' => 'grp_' . substr(hash('sha256', strtolower($name) . '|' . implode(',', $extensions) . '|' . implode(',', $desktopClients)), 0, 12),
+				'id' => $id,
 				'name' => $name,
 				'extensions' => array_values($extensions),
 				'desktop_clients' => array_values($desktopClients),
-			];
+				'voice_recipient_ids' => array_values(array_unique((array)($group['voice_recipient_ids'] ?? []))),
+				'email_recipient_ids' => array_key_exists('email_recipient_ids', $group) ? $group['email_recipient_ids'] : [],
+				'sms_recipient_ids' => $group['sms_recipient_ids'] ?? [],
+			] + (array_key_exists('webhook_ids', $group) ? ['webhook_ids' => $group['webhook_ids']] : [])
+                + ($locationSnapshot !== null ? ['location_snapshot' => $locationSnapshot] : [])
+                + (array_key_exists('desktop_bindings', $group) ? ['desktop_bindings' => \SLS\MassNotify\LocationDirectory::bindings($group['desktop_bindings'], array_values($desktopClients))] : []);
 		}
 
 		return $groups;
 	}
 
-	private function syncPendingAnnouncementGroups(array $groups)
+	private function syncPendingAnnouncementGroups(array $groups, array $previousGroups)
 	{
 		$pending = $this->getPendingSettings();
 		if ($pending === null) {
 			return;
 		}
-		$pending['announcement_groups'] = $groups;
+		$before = array_column($previousGroups, null, 'id');
+		$after = array_column($groups, null, 'id');
+		$merged = [];
+		foreach ((array)($pending['announcement_groups'] ?? []) as $group) {
+			$id = $group['id'];
+			if (isset($before[$id]) && !isset($after[$id])) { continue; }
+			if (isset($after[$id]) && (!isset($before[$id]) || $after[$id] !== $before[$id])) { $group = $after[$id]; }
+			$merged[$id] = $group;
+		}
+		foreach ($after as $id => $group) {
+			if (!isset($before[$id]) || $group !== $before[$id]) { $merged[$id] = $group; }
+		}
+		$pending['announcement_groups'] = array_values($merged);
+		\SLS\MassNotify\LivePagingConfig::resolvedGroups($this->normalizeLivePagingSettings($pending['live_paging'] ?? []), $pending['announcement_groups']);
 		$this->persistPendingSettings($pending);
 	}
 
@@ -8284,7 +9484,9 @@ PY;
 		$defaults = $this->getDefaultSipNotifySettings();
 		$value = is_array($value) ? $value : [];
 		$host = $this->normalizePbxHost((string)($value['pbx_host'] ?? $defaults['pbx_host']));
-		$baseUrl = 'https://' . $host . '/api/sipnotify';
+		$advertisedApi = $value['base_url'] ?? '';
+		$apiPort = SlsAdvertisedAddress::savedPort(is_string($advertisedApi) && stripos($advertisedApi, 'https://') === 0 ? $advertisedApi : '', $host, '/api/sipnotify', 443);
+		$baseUrl = SlsAdvertisedAddress::url('https', $host, $apiPort, '/api/sipnotify');
 		$mediaScheme = $this->normalizePhoneMediaScheme((string)($value['media_scheme'] ?? $defaults['media_scheme']));
 		$mediaBaseUrl = $mediaScheme . '://' . $host . '/sls_mass_notify';
 		// The phone needs the advertised port, not Apache's port behind NAT.
@@ -8309,13 +9511,13 @@ PY;
 
 	private function normalizePhoneMediaScheme($value)
 	{
-		return strtolower(trim((string)$value)) === 'https' ? 'https' : 'http';
+		return strtolower(trim((string)$value)) === 'http' ? 'http' : 'https';
 	}
 
 	private function normalizeEndpointFormatOverrides($value)
 	{
 		$allowed = array_fill_keys([
-			'yealink', 'yealink_text', 'cisco', 'poly', 'polycom', 'grandstream', 'fanvil',
+			'yealink', 'yealink_text', 'yealink_image', 'cisco', 'poly', 'polycom', 'grandstream', 'fanvil',
 			'snom', 'aastra', 'mitel', 'sangoma', 'avaya', 'vtech', 'ale',
 			'panasonic',
 		], true);
@@ -8427,18 +9629,35 @@ PY;
 		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_weather_poll.sh', $runtimeDir . '/sls_mass_notify_weather_poll.sh', 0755);
 		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_schedule_worker.php', $runtimeDir . '/sls_mass_notify_schedule_worker.php', 0755);
 		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_announcement_worker.php', $runtimeDir . '/sls_mass_notify_announcement_worker.php', 0755);
+		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_automation_worker.php', $runtimeDir . '/sls_mass_notify_automation_worker.php', 0755);
+		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_cluster_worker.php', $runtimeDir . '/sls_mass_notify_cluster_worker.php', 0755);
+		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_cluster_effect.php', $runtimeDir . '/sls_mass_notify_cluster_effect.php', 0755);
+		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_delivery_authorization.php', $runtimeDir . '/sls_mass_notify_delivery_authorization.php', 0755);
+		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_panic.php', $runtimeDir . '/sls_mass_notify_panic.php', 0755);
+		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_phone_agi.py', $runtimeDir . '/sls_mass_notify_phone_agi.py', 0755);
+		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_weather_channels.php', $runtimeDir . '/sls_mass_notify_weather_channels.php', 0755);
+		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_live_paging.php', $runtimeDir . '/sls_mass_notify_live_paging.php', 0755);
 		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_test.sh', $runtimeDir . '/sls_mass_notify_test.sh', 0755);
 		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_update.sh', $runtimeDir . '/sls_mass_notify_update.sh', 0755);
 		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_maintenance.sh', $runtimeDir . '/sls_mass_notify_maintenance.sh', 0755);
 		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_uninstall.sh', $runtimeDir . '/sls_mass_notify_uninstall.sh', 0755);
 		$this->copyRuntimeFile(__DIR__ . '/bin/sls_mass_notify_install_piper_voices.sh', $runtimeDir . '/sls_mass_notify_install_piper_voices.sh', 0755);
 		$this->copyRuntimeFile(__DIR__ . '/bin/sign_sls_mass_notify_local_sig.sh', '/usr/local/sbin/sign_sls_mass_notify_local_sig.sh', 0755);
+		$this->copyRuntimeFile(__DIR__ . '/bin/slsconsole', '/usr/local/bin/slsconsole', 0755);
 		$this->pruneRuntimeDirectory(__DIR__ . '/bin/sls_mass_notify', $runtimeDir, [
 			'piper',
 			'sls_mass_notify_nws_poll.sh',
 			'sls_mass_notify_weather_poll.sh',
 			'sls_mass_notify_schedule_worker.php',
 			'sls_mass_notify_announcement_worker.php',
+			'sls_mass_notify_automation_worker.php',
+			'sls_mass_notify_cluster_worker.php',
+			'sls_mass_notify_cluster_effect.php',
+            'sls_mass_notify_delivery_authorization.php',
+			'sls_mass_notify_panic.php',
+			'sls_mass_notify_phone_agi.py',
+			'sls_mass_notify_live_paging.php',
+            'sls_mass_notify_weather_channels.php',
 			'sls_mass_notify_test.sh',
 			'sls_mass_notify_update.sh',
 			'sls_mass_notify_maintenance.sh',
@@ -8447,9 +9666,11 @@ PY;
 		]);
 		$this->copyRuntimeDirectory(__DIR__ . '/bin/sls_mass_notify', $runtimeDir, 0755);
 		$this->pruneRuntimeDirectory(__DIR__ . '/api/sipnotify', '/var/www/html/api/sipnotify');
-		$this->copyRuntimeDirectory(__DIR__ . '/api/sipnotify', '/var/www/html/api/sipnotify', 0644);
+		$this->copyRuntimeDirectory(__DIR__ . '/api/sipnotify', '/var/www/html/api/sipnotify', 0644, true, 0755);
 		$this->pruneRuntimeDirectory(__DIR__ . '/api/sls-mass-notify', '/var/www/html/api/sls-mass-notify');
-		$this->copyRuntimeDirectory(__DIR__ . '/api/sls-mass-notify', '/var/www/html/api/sls-mass-notify', 0644);
+		$this->copyRuntimeDirectory(__DIR__ . '/api/sls-mass-notify', '/var/www/html/api/sls-mass-notify', 0644, true, 0755);
+		$this->pruneRuntimeDirectory(__DIR__ . '/portal', '/var/www/html/mass-notify');
+		$this->copyRuntimeDirectory(__DIR__ . '/portal', '/var/www/html/mass-notify', 0644, true, 0755);
 		$this->pruneRuntimeDirectory(__DIR__ . '/assets', '/var/www/html/sls_mass_notify/assets');
 		$this->copyRuntimeDirectory(__DIR__ . '/assets', '/var/www/html/sls_mass_notify/assets', 0644);
 		$this->copyRuntimeDirectory(__DIR__ . '/sounds', self::SOUNDS_DIR, 0644, false);
@@ -8768,29 +9989,21 @@ PY;
 
 	private function ensurePiperRuntime()
 	{
-		if (!is_dir(self::PIPER_VOICE_DIR)) {
-			@mkdir(self::PIPER_VOICE_DIR, 0755, true);
+		if (!is_file(self::PIPER_VOICE_INSTALL_SCRIPT)) {
+			throw new \RuntimeException(_('The protected Piper runtime installer is missing. Restore the module runtime before attempting speech generation.'));
 		}
-		if (!is_executable(self::PIPER_BIN) && is_executable('/usr/bin/python3')) {
-			if (!is_dir(self::PIPER_RUNTIME_DIR . '/venv')) {
-				$this->runCommand('/usr/bin/python3 -m venv ' . escapeshellarg(self::PIPER_RUNTIME_DIR . '/venv'));
-				if (!is_executable(self::PIPER_RUNTIME_DIR . '/venv/bin/pip') && is_executable('/usr/bin/apt-get')) {
-					$this->runCommand('DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get update');
-					$this->runCommand('DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y python3-venv python3-pip');
-					$this->runCommand('/usr/bin/python3 -m venv ' . escapeshellarg(self::PIPER_RUNTIME_DIR . '/venv'));
-				}
-			}
-			if (is_executable(self::PIPER_RUNTIME_DIR . '/venv/bin/pip')) {
-				$this->runCommand(escapeshellarg(self::PIPER_RUNTIME_DIR . '/venv/bin/pip') . " install --upgrade 'pip==26.2.0' 'setuptools==83.0.0' 'wheel==0.47.0'");
-				$this->runCommand(escapeshellarg(self::PIPER_RUNTIME_DIR . '/venv/bin/pip') . ' install -r ' . escapeshellarg(self::RUNTIME_DIR . '/piper-requirements.txt'));
-				$this->repairPiperRuntimePermissions();
-			}
+		$output = [];
+		$exit = 0;
+		exec('/usr/bin/timeout --signal=TERM --kill-after=10 900 /bin/bash '
+			. escapeshellarg(self::PIPER_VOICE_INSTALL_SCRIPT) . ' --runtime-only 2>&1', $output, $exit);
+		if ($exit !== 0) {
+			throw new \RuntimeException(sprintf(_('Piper dependency verification or repair failed (exit code %d). Review /var/log/sls_mass_notify.log for the mismatched package or failed download before retrying.'), $exit));
 		}
 		$this->ensurePiperVoices();
 		$this->ensurePiperWrapper();
 		$this->repairPiperRuntimePermissions();
 		$this->secureExecutableRuntimeTree();
-		if (is_executable(self::PIPER_BIN) && is_file(self::PIPER_VOICE_INSTALL_SCRIPT)) {
+		if (is_executable(self::PIPER_BIN)) {
 			$this->runCommand('/usr/bin/timeout 120 /bin/bash ' . escapeshellarg(self::PIPER_VOICE_INSTALL_SCRIPT) . ' --repair-permissions-only');
 		}
 	}
@@ -8872,9 +10085,42 @@ executables = {
     'sls_mass_notify_nws_poll.sh',
     'sls_mass_notify_schedule_worker.php',
     'sls_mass_notify_announcement_worker.php',
+    'sls_mass_notify_automation_worker.php',
+    'sls_mass_notify_cluster_worker.php',
+    'sls_mass_notify_cluster_effect.php',
+    'sls_mass_notify_incident_response.php',
+    'sls_cluster_guard.py',
+            'sls_mass_notify_delivery_authorization.php',
+    'sls_mass_notify_panic.php',
+    'sls_trigger_actions.py',
+    'sls_weather_channels.py',
+    'sls_lightning_providers.py',
+    'sls_mass_notify_live_paging.php',
+            'sls_mass_notify_weather_channels.php',
+    'sls_mass_notify_phone_agi.py',
+    'sls_phone_admission.py',
+    'sls_phone_events.py',
+    'sls_emergency_observer.py',
+    'sls_phone_outcomes.py',
+    'sls_outbound_routes.py',
     'sls_storage_maintenance.py',
+    'sls_audit_separation.py',
+    'sls_operational_backup.py',
+    'sls_external_monitor.py',
+    'sls_resource_capacity.py',
+    'sls_piper_dependencies.py',
+    'sls_piper_environment.py',
+    'sls_update_policy.py',
+    'sls_module_trust.py',
+    'sls_release_trust.py',
+    'sls_privileged_install.py',
+    'sls_console.py',
+    'sls_installer_recovery.py',
+    'sls_install_idle.py',
+    'sls_install_guard.py',
     'sls_weather_queue.py',
     'sls_audio_queue.py',
+    'sls_audio_state.py',
     'sls_release_verify.py',
     'sls_mass_notify_test.sh',
     'sls_mass_notify_update.sh',
@@ -8883,6 +10129,7 @@ executables = {
     'sls_mass_notify_install_piper_voices.sh',
     'sls_mass_notify_xweather_poll.py',
     'sls_branded_email.py',
+    'sls_announcement_email.py',
     'sls_branded_discord.py',
     'sls_notification_destinations.py',
     'sls_system_notifications.py',
@@ -8890,6 +10137,7 @@ executables = {
     'sls_nws_delivery_claims.py',
     'sls_notify.py',
     'sls_config.py',
+    'sls_config_crypto.py',
 }
 visited = 0
 
@@ -8934,7 +10182,7 @@ finally:
 PY;
 		$output = [];
 		$status = 1;
-		@exec('/usr/bin/python3 -c ' . escapeshellarg($program) . ' ' . escapeshellarg(self::RUNTIME_DIR) . ' 2>/dev/null', $output, $status);
+		@exec('/usr/bin/python3 -I -c ' . escapeshellarg($program) . ' ' . escapeshellarg(self::RUNTIME_DIR) . ' 2>/dev/null', $output, $status);
 		if ($status !== 0) {
 			throw new \RuntimeException(_('Unable to secure the Mass Notifications executable runtime without following symbolic links.'));
 		}
@@ -8958,6 +10206,7 @@ PY;
 			self::RUNTIME_DIR,
 			'/var/www/html/api/sipnotify',
 			'/var/www/html/api/sls-mass-notify',
+			'/var/www/html/mass-notify',
 			'/var/www/html/sls_mass_notify',
 		] as $path) {
 			if (is_dir($path) && !is_link($path)) {
@@ -9047,10 +10296,20 @@ PY;
 		return [
 			'en_US-lessac-low.onnx' => $base . '/lessac/low/en_US-lessac-low.onnx',
 			'en_US-lessac-low.onnx.json' => $base . '/lessac/low/en_US-lessac-low.onnx.json',
+			'en_US-lessac-medium.onnx' => $base . '/lessac/medium/en_US-lessac-medium.onnx',
+			'en_US-lessac-medium.onnx.json' => $base . '/lessac/medium/en_US-lessac-medium.onnx.json',
 			'en_US-amy-low.onnx' => $base . '/amy/low/en_US-amy-low.onnx',
 			'en_US-amy-low.onnx.json' => $base . '/amy/low/en_US-amy-low.onnx.json',
 			'en_US-ryan-low.onnx' => $base . '/ryan/low/en_US-ryan-low.onnx',
 			'en_US-ryan-low.onnx.json' => $base . '/ryan/low/en_US-ryan-low.onnx.json',
+			'es_ES-davefx-medium.onnx' => 'https://huggingface.co/rhasspy/piper-voices/resolve/e21c7de8d4eab79b902f0d61e662b3f21664b8d2/es/es_ES/davefx/medium/es_ES-davefx-medium.onnx',
+			'es_ES-davefx-medium.onnx.json' => 'https://huggingface.co/rhasspy/piper-voices/resolve/e21c7de8d4eab79b902f0d61e662b3f21664b8d2/es/es_ES/davefx/medium/es_ES-davefx-medium.onnx.json',
+			'fr_FR-siwis-medium.onnx' => 'https://huggingface.co/rhasspy/piper-voices/resolve/e21c7de8d4eab79b902f0d61e662b3f21664b8d2/fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx',
+			'fr_FR-siwis-medium.onnx.json' => 'https://huggingface.co/rhasspy/piper-voices/resolve/e21c7de8d4eab79b902f0d61e662b3f21664b8d2/fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx.json',
+			'de_DE-thorsten-low.onnx' => 'https://huggingface.co/rhasspy/piper-voices/resolve/e21c7de8d4eab79b902f0d61e662b3f21664b8d2/de/de_DE/thorsten/low/de_DE-thorsten-low.onnx',
+			'de_DE-thorsten-low.onnx.json' => 'https://huggingface.co/rhasspy/piper-voices/resolve/e21c7de8d4eab79b902f0d61e662b3f21664b8d2/de/de_DE/thorsten/low/de_DE-thorsten-low.onnx.json',
+			'pt_BR-faber-medium.onnx' => 'https://huggingface.co/rhasspy/piper-voices/resolve/e21c7de8d4eab79b902f0d61e662b3f21664b8d2/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx',
+			'pt_BR-faber-medium.onnx.json' => 'https://huggingface.co/rhasspy/piper-voices/resolve/e21c7de8d4eab79b902f0d61e662b3f21664b8d2/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx.json',
 		];
 	}
 
@@ -9083,20 +10342,40 @@ PY;
 		return true;
 	}
 
-	private function isValidPiperVoiceFile($path)
+	private function isPresentPiperVoiceFile($path)
 	{
-		if (!is_readable($path)) {
+		clearstatcache(true, $path);
+		$metadata = @lstat($path);
+		if (!is_array($metadata) || ($metadata['mode'] & 0170000) !== 0100000
+			|| $metadata['nlink'] !== 1 || !is_readable($path)) {
 			return false;
 		}
+		$name = preg_replace('/\.download$/', '', basename((string)$path));
+		return $metadata['size'] > (str_ends_with($name, '.onnx') ? 1000000 : 0);
+	}
+
+	private function isValidPiperVoiceFile($path)
+	{
+		if (!$this->isPresentPiperVoiceFile($path)) { return false; }
 		$name = basename((string)$path);
 		$name = preg_replace('/\.download$/', '', $name);
 		$hashes = [
 			'en_US-lessac-low.onnx' => 'f7d01dde371555732c4c314111ac79672b1a5ce2fc19266ab42178fd8df7f375',
 			'en_US-lessac-low.onnx.json' => '45754dfdebb3b8661c3fc564713772deec6e064feeb5b4e9594857dc7305193a',
+			'en_US-lessac-medium.onnx' => '5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f',
+			'en_US-lessac-medium.onnx.json' => 'efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0',
 			'en_US-amy-low.onnx' => 'a5a91abb7de0f104358a25aded480ddacf1ff0762886325886ec406a2e86aab3',
 			'en_US-amy-low.onnx.json' => '2250a9a605b8dc35a116717fadc5056695dd809e34a15d02f72a0f52d53d3ebb',
 			'en_US-ryan-low.onnx' => '8d21a085cc4c0010f1f3e91d5008c8691277ccfa744eb0d747becd33a3444baf',
 			'en_US-ryan-low.onnx.json' => 'b27147e56b0525962609f82f58171f4618cbf17c6fb043d7d724ff28cc4aed60',
+			'es_ES-davefx-medium.onnx' => '6658b03b1a6c316ee4c265a9896abc1393353c2d9e1bca7d66c2c442e222a917',
+			'es_ES-davefx-medium.onnx.json' => '0e0dda87c732f6f38771ff274a6380d9252f327dca77aa2963d5fbdf9ec54842',
+			'fr_FR-siwis-medium.onnx' => '641d1ab097da2b81128c076810edb052b385decc8be3381814802a64a73baf99',
+			'fr_FR-siwis-medium.onnx.json' => '39479916c2db192b5ac9764daddd0c744d83e023ad890c6976c0633ae4df8959',
+			'de_DE-thorsten-low.onnx' => '9ac27fad17cec5c1a791161976a64f026f16fc058b400b1fea62565b8b2cf375',
+			'de_DE-thorsten-low.onnx.json' => 'df38e892ed949f62d0c40978bc666de0b341c5f7921840ae7c72f4df8e8ffa05',
+			'pt_BR-faber-medium.onnx' => '858555e3a064209c57088fe6bd70c4c3dc54d03eaa00c45d5ecaf43a33f95aa7',
+			'pt_BR-faber-medium.onnx.json' => '7e694de195ae3fc36dd732c445eb04fb49b649854893cb5506b978f0d50a1d6f',
 		];
 		if (!isset($hashes[$name]) || !hash_equals($hashes[$name], (string)hash_file('sha256', $path))) {
 			return false;
@@ -9122,6 +10401,7 @@ PY;
 		}
 		$settings = $this->getActiveSettings();
 		$ami = is_array($settings['ami'] ?? null) ? $settings['ami'] : [];
+		$this->normalizeAmiHost($ami['host'] ?? $this->detectAmiHost());
 		$username = $this->normalizeEndpointUsername($ami['username'] ?? 'slsmassnotify', 'ami');
 		$password = $this->normalizeEndpointPassword($ami['password'] ?? '');
 		if ($password === '') {
@@ -9144,10 +10424,10 @@ PY;
 				$manager->add_manager(
 					$username,
 					$password,
-					'0.0.0.0/0.0.0.0',
-					'127.0.0.1/255.255.255.255',
-					'system,call,originate',
-					'system,call,originate',
+					'0.0.0.0/0.0.0.0&::/0',
+					'127.0.0.1/255.255.255.255&::1/128',
+					'system,call,originate,reporting',
+					'system,call,originate,reporting',
 					1000
 				);
 				$this->removeManagedBlock('/etc/asterisk/manager_custom.conf', 'SLS Mass Notifications AMI');
@@ -9155,18 +10435,22 @@ PY;
 				$block = "[{$username}]\n"
 					. "secret = {$password}\n"
 					. "deny = 0.0.0.0/0.0.0.0\n"
+					. "deny = ::/0\n"
 					. "permit = 127.0.0.1/255.255.255.255\n"
-					. "read = system,call,originate\n"
-					. "write = system,call,originate\n";
+					. "permit = ::1/128\n"
+					. "read = system,call,originate,reporting\n"
+					. "write = system,call,originate,reporting\n";
 				$this->writeManagedBlock('/etc/asterisk/manager_custom.conf', 'SLS Mass Notifications AMI', $block);
 			}
 		} else {
 			$block = "[{$username}]\n"
 				. "secret = {$password}\n"
 				. "deny = 0.0.0.0/0.0.0.0\n"
+				. "deny = ::/0\n"
 				. "permit = 127.0.0.1/255.255.255.255\n"
-				. "read = system,call,originate\n"
-				. "write = system,call,originate\n";
+				. "permit = ::1/128\n"
+				. "read = system,call,originate,reporting\n"
+				. "write = system,call,originate,reporting\n";
 			$this->writeManagedBlock('/etc/asterisk/manager_custom.conf', 'SLS Mass Notifications AMI', $block);
 		}
 		$this->runCommand('/usr/sbin/asterisk -rx ' . escapeshellarg('manager reload'));
@@ -9179,6 +10463,36 @@ PY;
 		} catch (\Throwable $e) {
 			return '';
 		}
+	}
+
+	private function normalizeAmiHost($host)
+	{
+		if (!is_string($host) || !in_array(strtolower(trim($host)), ['localhost', '127.0.0.1', '::1'], true)) {
+			throw new \DomainException(_('The SLS AMI host must be 127.0.0.1, ::1, or localhost. Use ::1 explicitly for an IPv6-only AMI listener; localhost uses IPv4 loopback.'));
+		}
+		return strtolower(trim($host));
+	}
+
+	private function detectAmiHost()
+	{
+		// This supplies a default only. A saved explicit address always wins,
+		// even if the FreePBX client uses a different loopback address family.
+		// localhost remains IPv4 without DNS; listener changes are never made.
+		return strtolower(trim($this->getFreePbxConfigValue('ASTMANAGERHOST'))) === '::1' ? '::1' : '127.0.0.1';
+	}
+
+	private function amiEndpointDiagnostic(array $ami)
+	{
+		$displayHost = static function ($value) {
+			if (!is_string($value)) { return 'invalid'; }
+			$value = strtolower(trim($value));
+			return $value === '::1' ? '[::1]' : (in_array($value, ['localhost', '127.0.0.1'], true) ? $value : 'invalid');
+		};
+		$host = $displayHost($ami['host'] ?? $this->detectAmiHost());
+		$port = $this->normalizeInt($ami['port'] ?? $this->detectAmiPort(), 1, 65535, $this->detectAmiPort());
+		$freePbxHost = $displayHost($this->getFreePbxConfigValue('ASTMANAGERHOST') ?: 'localhost');
+		return sprintf(_('SLS AMI endpoint: %s:%d; FreePBX endpoint: %s:%d. Check protected ami.host/ami.port and the local AMI listener/ACL. localhost uses IPv4; IPv6-only requires ::1. Saved endpoints and listener settings are not changed automatically.'),
+			$host, $port, $freePbxHost, $this->detectAmiPort());
 	}
 
 	private function detectAmiPort()
@@ -9208,6 +10522,11 @@ PY;
 		file_put_contents($path, trim($current) === '' ? '' : rtrim($current) . "\n", LOCK_EX);
 			$block = "[sls-alert-autoanswer]\n"
 				. "exten => s,1,NoOp(SLS Mass Notification PJSIP auto-answer headers)\n"
+				. " same => n,Set(SLS_PHONE_ALLOW=0)\n"
+				. " same => n,AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,contact)\n"
+				. " same => n,GotoIf($[\"\${SLS_PHONE_ALLOW}\"=\"1\"]?admitted)\n"
+				. " same => n,Hangup()\n"
+				. " same => n(admitted),Set(CHANNEL(hangup_handler_push)=sls-phone-ended,s,1)\n"
 				. " same => n,Set(SLS_AUTOANSWER_CONTACT=\${CHANNEL(contact)})\n"
 				. " same => n,Set(SLS_AUTOANSWER_DEVICE=\${DB(DEVICE/\${ARG1}/dial)})\n"
 				. " same => n,Set(SLS_AUTOANSWER_AOR=\${CUT(SLS_AUTOANSWER_DEVICE,/,2)})\n"
@@ -9240,13 +10559,10 @@ PY;
 				. " same => n,Set(SLS_SAFE_SOUND=\${FILTER(0-9A-Za-z_/-,\${SLS_SOUND})})\n"
 			. " same => n,GotoIf($[\"\${SLS_SAFE_SOUND}\"=\"\"]?done)\n"
 			. " same => n,Set(__SLS_SAFE_SOUND=\${SLS_SAFE_SOUND})\n"
-			. " same => n,Set(SLS_DIAL=\${PJSIP_DIAL_CONTACTS(\${EXTEN})})\n"
-			. " same => n,Set(SLS_DEVICE_DIAL=\${DB(DEVICE/\${EXTEN}/dial)})\n"
-			. " same => n,Set(SLS_DEVICE_AOR=\${CUT(SLS_DEVICE_DIAL,/,2)})\n"
-			. " same => n,ExecIf($[\"\${SLS_DEVICE_AOR}\"=\"\"]?Set(SLS_DEVICE_AOR=\${EXTEN}))\n"
-			. " same => n,ExecIf($[\"\${SLS_DIAL}\"=\"\"]?Set(SLS_DIAL=\${PJSIP_DIAL_CONTACTS(\${SLS_DEVICE_AOR})}))\n"
-			. " same => n,ExecIf($[\"\${SLS_DIAL}\"=\"\"]?Set(SLS_DIAL=\${SLS_DEVICE_DIAL}))\n"
-			. " same => n,ExecIf($[\"\${SLS_DIAL}\"=\"\"]?Set(SLS_DIAL=PJSIP/\${EXTEN}))\n"
+			. " same => n,Set(SLS_PHONE_ALLOW=0)\n"
+			. " same => n,AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,origin)\n"
+			. " same => n,GotoIf($[\"\${SLS_PHONE_ALLOW}\"!=\"1\"]?done)\n"
+			. " same => n,Set(CHANNEL(hangup_handler_push)=sls-phone-ended,s,1)\n"
 				. " same => n,GotoIf($[\"\${SLS_DIAL}\"=\"\"]?done)\n"
 				. " same => n,NoOp(SLS Mass Notification dial string \${SLS_DIAL})\n"
 				. " same => n,Log(NOTICE,SLS Mass Notification dialing \${SLS_DIAL} for \${EXTEN})\n"
@@ -9257,7 +10573,34 @@ PY;
 				. " same => n,Page(\${SLS_DIAL},b(sls-alert-autoanswer^s^1(\${EXTEN}))A(\${SLS_SAFE_SOUND})inq,{$pagingAnswerTimeout})\n"
 				. " same => n,Log(NOTICE,SLS Mass Notification page completed for \${EXTEN})\n"
 				. " same => n,Verbose(1,SLS Mass Notification page completed for \${EXTEN})\n"
-				. " same => n(done),Hangup()\n";
+				. " same => n(done),Hangup()\n\n"
+				. "[sls-outbound-voice]\n"
+				. "exten => _voice_.,1,Set(SLS_PHONE_ALLOW=0)\n"
+				. " same => n,AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,outbound)\n"
+				. " same => n,GotoIf($[\"\${SLS_PHONE_ALLOW}\"!=\"1\"]?done)\n"
+				. " same => n,Set(CHANNEL(hangup_handler_push)=sls-phone-ended,s,1)\n"
+				. " same => n,Set(CALLERID(name)=SLS Mass Notify System)\n"
+				. " same => n,ExecIf($[\"\${SLS_OUTBOUND_CALLER_ID}\"!=\"\"]?Set(CALLERID(num)=\${SLS_OUTBOUND_CALLER_ID}))\n"
+				. " same => n,ExecIf($[\"\${SLS_OUTBOUND_CALLER_ID}\"!=\"\"]?Set(TRUNKCIDOVERRIDE=\${SLS_OUTBOUND_CALLER_ID}))\n"
+				. " same => n,GotoIf($[\"\${SLS_OUTBOUND_ROUTE_MODE}\"=\"trunk\"]?trunk)\n"
+				. " same => n,Goto(outbound-allroutes,\${SLS_OUTBOUND_NUMBER},1)\n"
+				. " same => n(trunk),Gosub(macro-dialout-trunk,s,1(\${SLS_OUTBOUND_TRUNK_ID},\${SLS_OUTBOUND_NUMBER},,off))\n"
+				. " same => n(done),Hangup()\n\n"
+				. "[sls-outbound-playback]\n"
+				. "exten => s,1,Set(SLS_PHONE_ALLOW=0)\n"
+				. " same => n,AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,playback)\n"
+				. " same => n,GotoIf($[\"\${SLS_PHONE_ALLOW}\"!=\"1\"]?done)\n"
+				. " same => n,Playback(\${SLS_SAFE_SOUND})\n"
+				. " same => n,AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,playback-result)\n"
+				. " same => n,GotoIf($[\"\${SLS_PHONE_ALLOW}\"!=\"1\" | \"\${PLAYBACKSTATUS}\"!=\"SUCCESS\"]?done)\n"
+				. " same => n,GotoIf($[\"\${SLS_ACK_REQUIRED}\"!=\"1\"]?incident-response)\n"
+				. " same => n,Read(SLS_ACK,\${SLS_ACK_PROMPT},1,,1,\${SLS_ACK_TIMEOUT})\n"
+				. " same => n,AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,ack)\n"
+				. " same => n(incident-response),AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,incident-response)\n"
+				. " same => n(done),Hangup()\n\n"
+				. "[sls-phone-ended]\n"
+				. "exten => s,1,AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,end)\n"
+				. " same => n,Return()\n";
 		$this->writeManagedBlock('/etc/asterisk/extensions_custom.conf', 'SLS Mass Notifications Dialplan', $block);
 		$this->runCommand('/usr/sbin/asterisk -rx ' . escapeshellarg('dialplan reload'));
 	}
@@ -9317,7 +10660,17 @@ PY;
 			. "</Directory>\n"
 			. "<Directory /var/www/html/sls_mass_notify>\n"
 			. "    Require all granted\n"
-			. "    Options -Indexes\n"
+			. "    Options -Indexes -MultiViews\n"
+			. "    AllowOverride None\n"
+			. "    RewriteEngine On\n"
+			. "    RewriteRule ^assets/[A-Za-z0-9_.-]+\\.(?:png|jpg|svg|ico)$ - [END]\n"
+			. "    RewriteRule ^([A-Za-z0-9][A-Za-z0-9_.-]{0,179}\\.(?:png|xml))$ /api/sls-mass-notify/media.php?file=$1 [END]\n"
+			. "    RewriteRule ^ - [F,END]\n"
+			. "</Directory>\n"
+			. "<Directory /var/www/html/mass-notify>\n"
+			. "    Require all granted\n"
+			. "    Options -Indexes -MultiViews\n"
+			. "    AllowOverride All\n"
 			. "</Directory>\n";
 		$path = '/etc/apache2/conf-available/sls-mass-notify.conf';
 		if (is_dir('/etc/apache2/conf-available')) {
@@ -9689,7 +11042,7 @@ PY;
 		}
 	}
 
-	private function copyRuntimeDirectory($source, $target, $mode = 0644, $overwrite = true)
+	private function copyRuntimeDirectory($source, $target, $mode = 0644, $overwrite = true, $directoryMode = null)
 	{
 		if (!is_dir($source) || is_link($source)) {
 			throw new \RuntimeException(sprintf(_('Required packaged directory is missing or unsafe: %s'), $source));
@@ -9697,8 +11050,29 @@ PY;
 		if (is_link($target)) {
 			throw new \RuntimeException(sprintf(_('Refusing to use a symbolic-link runtime directory: %s'), $target));
 		}
+		$createdDirectories = [];
+		if ($directoryMode !== null) {
+			if ($directoryMode !== 0755) { throw new \RuntimeException('Unsupported public runtime directory mode.'); }
+			// mkdir's requested mode is filtered by the installer's umask. The
+			// API trees need explicit search/read access for PHP-FPM immediately,
+			// including when a later install step fails before fwconsole chown.
+			for ($directory = $target; !is_dir($directory); $directory = dirname($directory)) {
+				if (is_link($directory) || dirname($directory) === $directory) {
+					throw new \RuntimeException(sprintf(_('Unsafe public runtime directory: %s'), $directory));
+				}
+				$createdDirectories[] = $directory;
+			}
+		}
 		if (!is_dir($target) && !@mkdir($target, 0755, true) && !is_dir($target)) {
 			throw new \RuntimeException(sprintf(_('Unable to create runtime directory: %s'), $target));
+		}
+		if ($directoryMode !== null) {
+			// Existing shared web parents keep their administrator-set metadata.
+			foreach (array_unique(array_merge(array_reverse($createdDirectories), [$target])) as $directory) {
+				if (!@chmod($directory, $directoryMode)) {
+					throw new \RuntimeException(sprintf(_('Unable to secure public runtime directory permissions: %s'), $directory));
+				}
+			}
 		}
 		$entries = scandir($source);
 		if ($entries === false) {
@@ -9711,7 +11085,7 @@ PY;
 			$src = $source . '/' . $entry;
 			$dst = $target . '/' . $entry;
 			if (is_dir($src)) {
-				$this->copyRuntimeDirectory($src, $dst, $mode, $overwrite);
+				$this->copyRuntimeDirectory($src, $dst, $mode, $overwrite, $directoryMode);
 			} else {
 				$this->copyRuntimeFile($src, $dst, $mode, $overwrite);
 			}
@@ -9781,12 +11155,12 @@ PY;
 			$cron->addLine($weatherCronLine);
 		}
 		$cron->addLine('* * * * * /usr/bin/timeout 1200 /usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php');
-		$announcementWorkerLine = '* * * * * /usr/bin/timeout 900 /usr/bin/php /usr/local/bin/sls_mass_notify/sls_mass_notify_announcement_worker.php';
+		$announcementWorkerLine = '* * * * * /usr/bin/timeout 900 /usr/bin/php /usr/local/bin/sls_mass_notify/sls_mass_notify_announcement_worker.php --reconcile';
 		foreach ($cron->getAll() as $line) {
 			if (strpos((string)$line, 'sls_mass_notify_announcement_worker.php') !== false) { $cron->remove($line); }
 		}
 		$cron->addLine($announcementWorkerLine);
-		$this->ensureRootUpdateCron();
+		// Root maintenance/update entries are installed by the authenticated root helper.
 	}
 
 	private function removeLegacyNwsCronJob()
@@ -9829,7 +11203,7 @@ PY;
 			$filtered[] = $line;
 		}
 		$filtered[] = '* * * * * /usr/bin/timeout 900 /usr/local/bin/sls_mass_notify/sls_mass_notify_maintenance.sh';
-		$filtered[] = '17 */6 * * * /usr/bin/timeout 1800 /usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh';
+		$filtered[] = '17 * * * * /usr/bin/timeout 1800 /usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh';
 		$tmp = tempnam(sys_get_temp_dir(), 'sls-root-cron.');
 		if ($tmp === false) {
 			return;
@@ -9848,22 +11222,7 @@ PY;
 				$cron->remove($line);
 			}
 		}
-		$current = [];
-		exec('/usr/bin/crontab -l 2>/dev/null', $current);
-		$filtered = array_values(array_filter($current, static function ($line) {
-			return strpos((string)$line, 'sls_mass_notify_update.sh') === false
-				&& strpos((string)$line, 'sls_mass_notify_maintenance.sh') === false
-				&& strpos((string)$line, 'nwsalerts_ensure_menu_patch.sh') === false;
-		}));
-		if ($filtered !== $current) {
-			$tmp = tempnam(sys_get_temp_dir(), 'sls-root-cron.');
-			if ($tmp !== false) {
-				file_put_contents($tmp, implode("\n", $filtered) . "\n");
-				@chmod($tmp, 0600);
-				$this->runCommand('/usr/bin/crontab ' . escapeshellarg($tmp));
-				@unlink($tmp);
-			}
-		}
+		// The root-owned uninstaller removes its separate maintenance/update cron entries.
 	}
 
 	private function detectPbxHost()
@@ -9894,7 +11253,7 @@ PY;
 			foreach (['myorigin', 'myhostname', 'mydomain'] as $setting) {
 				$output = [];
 				$exitCode = 1;
-				exec('/usr/sbin/postconf -h ' . $setting . ' 2>/dev/null', $output, $exitCode);
+				exec('/usr/bin/timeout --kill-after=1 2 /usr/sbin/postconf -h ' . $setting . ' 2>/dev/null', $output, $exitCode);
 				if ($exitCode !== 0) {
 					continue;
 				}
@@ -9993,6 +11352,26 @@ PY;
 		return $this->normalizeGenericWebhookUrl($value);
 	}
 
+	private function webhookPayloadFormat(array $destination, $type = 'generic')
+	{
+		$format = array_key_exists('payload_format', $destination) ? $destination['payload_format'] : 'native';
+		if (!is_string($format) || !in_array($format, ['native', 'slack', 'teams_workflow'], true)
+			|| ($type === 'discord' && $format !== 'native')) {
+			throw new \InvalidArgumentException('Webhook integration format must be native, slack, or teams_workflow. Discord destinations require native format.');
+		}
+		return $format;
+	}
+
+	private function webhookDestinationFingerprint(array $destination)
+	{
+		$format = $this->webhookPayloadFormat($destination);
+		$material = (string)$destination['url'];
+		if ($format !== 'native') {
+			$material .= "\npayload_format=" . $format;
+		}
+		return hash('sha256', $material);
+	}
+
 	private function normalizeWebhookDestinations($value, $type)
 	{
 		$type = in_array($type, ['discord', 'announcement'], true) ? $type : 'generic';
@@ -10004,6 +11383,7 @@ PY;
 			if (!is_array($entry) || count($destinations) >= self::MAX_WEBHOOK_DESTINATIONS) {
 				continue;
 			}
+			$format = $this->webhookPayloadFormat($entry, $type);
 			$url = $type === 'discord'
 				? $this->normalizeDiscordWebhookUrl($entry['url'] ?? $entry['webhook_url'] ?? '')
 				: ($type === 'announcement'
@@ -10042,6 +11422,7 @@ PY;
 				'id' => $id,
 				'name' => $name,
 				'url' => $url,
+				'payload_format' => $format,
 				'enabled' => array_key_exists('enabled', $entry) && empty($entry['enabled']) ? '0' : '1',
 			] + $auth;
 		}
@@ -10063,6 +11444,12 @@ PY;
 		foreach (array_slice($rows, 0, self::MAX_WEBHOOK_DESTINATIONS + 1) as $index => $entry) {
 			if (!is_array($entry)) {
 				$errors[] = sprintf(_('%s destination %d is invalid.'), $label, $index + 1);
+				continue;
+			}
+			try {
+				$this->webhookPayloadFormat($entry, $type);
+			} catch (\InvalidArgumentException $error) {
+				$errors[] = sprintf(_('%s destination %d has an unsupported integration format.'), $label, $index + 1);
 				continue;
 			}
 			$rawUrl = trim((string)($entry['url'] ?? $entry['webhook_url'] ?? ''));
@@ -10114,6 +11501,9 @@ PY;
 			$url = trim((string)($entry['url'] ?? $entry['webhook_url'] ?? ''));
 			if (($url === '' || $url === '[redacted]') && $id !== '' && isset($existingById[$id])) {
 				$entry['url'] = (string)$existingById[$id]['url'];
+			}
+			if (!array_key_exists('payload_format', $entry) && isset($existingById[$id])) {
+				$entry['payload_format'] = $existingById[$id]['payload_format'];
 			}
 			foreach (['bearer_token', 'signing_secret'] as $secretField) {
 				if (!empty($entry['clear_' . $secretField])) {
@@ -10212,10 +11602,13 @@ PY;
 			$groups[] = [
 				'id' => $id,
 				'name' => $name,
+				'site_id' => preg_match('/^loc_[a-f0-9]{24}$/D', (string)($group['site_id'] ?? '')) ? $group['site_id'] : '',
 				'zone' => $zone,
 				'extensions' => $extensions,
 				'desktop_clients' => array_values($desktopClients),
 				'email_recipients' => $emailRecipients,
+				'voice_recipient_ids' => $this->normalizeDestinationIdList($group['voice_recipient_ids'] ?? []),
+				'sms_recipient_ids' => $this->normalizeDestinationIdList($group['sms_recipient_ids'] ?? []),
 				'quiet_hours_enabled' => $quietEnabled,
 				'quiet_hours_start' => $quietStart,
 				'quiet_hours_end' => $quietEnd,
@@ -10278,7 +11671,7 @@ PY;
 
 	private function nwsZoneHasDeliveryDestination(array $group)
 	{
-		foreach (['extensions', 'recipients', 'desktop_clients', 'email_recipients', 'discord_webhook_ids', 'generic_webhook_ids'] as $field) {
+		foreach (['extensions', 'recipients', 'desktop_clients', 'email_recipients', 'voice_recipient_ids', 'sms_recipient_ids', 'discord_webhook_ids', 'generic_webhook_ids'] as $field) {
 			if ($this->destinationListHasValue($group[$field] ?? [])) {
 				return true;
 			}
@@ -10300,7 +11693,7 @@ PY;
 
 	private function xweatherGroupHasDeliveryDestination(array $group, array $settings)
 	{
-		foreach (['extensions', 'recipients', 'desktop_clients', 'email_recipients'] as $field) {
+		foreach (['extensions', 'recipients', 'desktop_clients', 'email_recipients', 'voice_recipient_ids', 'sms_recipient_ids'] as $field) {
 			if ($this->destinationListHasValue($group[$field] ?? [])) {
 				return true;
 			}
@@ -10324,6 +11717,8 @@ PY;
 				$errors[] = sprintf(_('%s must be an object.'), $label);
 				continue;
 			}
+			$errors = array_merge($errors, $this->validateVoiceRecipientIds($group['voice_recipient_ids'] ?? []), $this->validateSmsRecipientIds($group['sms_recipient_ids'] ?? []));
+            if (array_key_exists('site_id', $group) && (!is_string($group['site_id']) || ($group['site_id'] !== '' && !preg_match('/^loc_[a-f0-9]{24}$/D', $group['site_id'])))) { $errors[] = _('Select a saved site or an independent weather route.'); }
 			if ($this->normalizeNwsZone($group['zone'] ?? '') === '') {
 				$errors[] = sprintf(_('%s needs a valid weather.gov county or forecast zone.'), $label);
 			}
@@ -10490,13 +11885,15 @@ PY;
 				$errors[] = sprintf(_('%s must be an object.'), $label);
 				continue;
 			}
-			$allowedFields = ['id', 'name', 'enabled', 'adaptive_nws_zone_id', 'location', 'radius_miles', 'extensions', 'recipients', 'desktop_clients', 'email_recipients', 'all_clear', 'all_clear_minutes', 'strike_type', 'quiet_hours_enabled', 'quiet_hours_start', 'quiet_hours_end'];
+			$allowedFields = ['id', 'name', 'site_id', 'enabled', 'adaptive_nws_zone_id', 'location', 'radius_miles', 'extensions', 'recipients', 'desktop_clients', 'email_recipients', 'voice_recipient_ids', 'sms_recipient_ids', 'all_clear', 'all_clear_minutes', 'strike_type', 'quiet_hours_enabled', 'quiet_hours_start', 'quiet_hours_end'];
+			$errors = array_merge($errors, $this->validateVoiceRecipientIds($group['voice_recipient_ids'] ?? []), $this->validateSmsRecipientIds($group['sms_recipient_ids'] ?? []));
+            if (array_key_exists('site_id', $group) && (!is_string($group['site_id']) || ($group['site_id'] !== '' && !preg_match('/^loc_[a-f0-9]{24}$/D', $group['site_id'])))) { $errors[] = _('Select a saved site or an independent weather route.'); }
 			foreach (array_keys($group) as $field) {
 				if (!in_array($field, $allowedFields, true)) {
 					$errors[] = sprintf(_('%s contains an unsupported field: %s.'), $label, (string)$field);
 				}
 			}
-			foreach (['id', 'name', 'adaptive_nws_zone_id', 'location', 'all_clear'] as $stringField) {
+			foreach (['id', 'name', 'site_id', 'adaptive_nws_zone_id', 'location', 'all_clear'] as $stringField) {
 				if (array_key_exists($stringField, $group) && !is_scalar($group[$stringField])) {
 					$errors[] = sprintf(_('%s %s must be text.'), $label, str_replace('_', ' ', $stringField));
 				}
@@ -10645,6 +12042,23 @@ PY;
 		return false;
 	}
 
+	private function validateXweatherAdaptivePolicyInput(array $value)
+	{
+		$errors = [];
+		if (array_key_exists('adaptive_gate_failure_policy', $value)
+			&& !in_array($value['adaptive_gate_failure_policy'], ['standby', 'bounded_poll'], true)) {
+			$errors[] = _('Lightning Weather.gov outage policy must be standby or bounded_poll.');
+		}
+		if (array_key_exists('adaptive_fallback_minutes', $value)) {
+			$minutes = $value['adaptive_fallback_minutes'];
+			$integer = is_int($minutes) || (is_string($minutes) && preg_match('/^[0-9]{1,3}$/D', $minutes));
+			if (!$integer || (int)$minutes < 15 || (int)$minutes > 120) {
+				$errors[] = _('Lightning temporary outage polling must last a whole number of minutes from 15 to 120.');
+			}
+		}
+		return $errors;
+	}
+
 	private function normalizeXweatherSettings($value, $defaultTtsVolume = 25)
 	{
 		$value = is_array($value) ? $value : [];
@@ -10687,6 +12101,7 @@ PY;
 		}
 		return [
 			'enabled' => empty($value['enabled']) ? '0' : '1',
+			'provider' => in_array($value['provider'] ?? 'xweather', ['xweather', 'tempest', 'meteomatics'], true) ? ($value['provider'] ?? 'xweather') : 'xweather',
 			'client_id' => $cleanSecret($value['client_id'] ?? ''),
 			'client_secret' => $cleanSecret($value['client_secret'] ?? ''),
 			'location' => $location,
@@ -10694,6 +12109,8 @@ PY;
 			'query_interval_minutes' => $this->normalizeInt($value['query_interval_minutes'] ?? 5, 1, 10, 5),
 			'adaptive_free_tier' => array_key_exists('adaptive_free_tier', $value) && empty($value['adaptive_free_tier']) ? '0' : '1',
 			'adaptive_grace_minutes' => $this->normalizeInt($value['adaptive_grace_minutes'] ?? 60, 5, 120, 60),
+			'adaptive_gate_failure_policy' => ($value['adaptive_gate_failure_policy'] ?? 'standby') === 'bounded_poll' ? 'bounded_poll' : 'standby',
+			'adaptive_fallback_minutes' => $this->normalizeInt($value['adaptive_fallback_minutes'] ?? 30, 15, 120, 30),
 			'adaptive_nws_zone_id' => !empty($groups) ? (string)$groups[0]['adaptive_nws_zone_id'] : substr(preg_replace('/[^A-Za-z0-9_-]/', '', (string)($value['adaptive_nws_zone_id'] ?? '')), 0, 64),
 			'tts_volume' => $this->normalizeTtsVolume($value['tts_volume'] ?? $defaultTtsVolume, $defaultTtsVolume),
 			'opening_tone' => $normalizeLightningTone($openingTone),
@@ -10730,6 +12147,8 @@ PY;
 				'extensions' => $legacy['recipients'] ?? [],
 				'desktop_clients' => [],
 				'email_recipients' => [],
+				'voice_recipient_ids' => [],
+				'sms_recipient_ids' => [],
 				'all_clear' => $legacy['all_clear'] ?? 'none',
 				'strike_type' => $legacy['strike_type'] ?? 'cloud_to_ground',
 				'quiet_hours_enabled' => $legacy['quiet_hours_enabled'] ?? '0',
@@ -10780,12 +12199,15 @@ PY;
 				'id' => $id,
 				'name' => $name,
 				'enabled' => empty($group['enabled']) ? '0' : '1',
+				'site_id' => preg_match('/^loc_[a-f0-9]{24}$/D', (string)($group['site_id'] ?? '')) ? $group['site_id'] : '',
 				'adaptive_nws_zone_id' => substr(preg_replace('/[^A-Za-z0-9_-]/', '', (string)($group['adaptive_nws_zone_id'] ?? '')), 0, 64),
 				'location' => $location,
 				'radius_miles' => $this->normalizeInt($group['radius_miles'] ?? 25, 1, 62, 25),
 				'extensions' => $this->normalizeRecipientExtensions($group['extensions'] ?? $group['recipients'] ?? []),
 				'desktop_clients' => array_values($desktopClients),
 				'email_recipients' => $this->normalizeEmailRecipientList($group['email_recipients'] ?? []),
+				'voice_recipient_ids' => $this->normalizeDestinationIdList($group['voice_recipient_ids'] ?? []),
+				'sms_recipient_ids' => $this->normalizeDestinationIdList($group['sms_recipient_ids'] ?? []),
 				'all_clear' => $allClear,
 				'all_clear_minutes' => $this->normalizeInt($group['all_clear_minutes'] ?? 10, 5, 120, 10),
 				'strike_type' => $strikeType,
@@ -11203,23 +12625,47 @@ PY;
 		if (!in_array($lockMode, [LOCK_EX, LOCK_SH], true)) {
 			throw new \RuntimeException((string)$failureMessage);
 		}
-		if (is_link($path)) {
+		$path = (string)$path; $parent = @lstat(dirname($path)); $account = posix_getpwnam('asterisk');
+		$owners = array_unique([0, posix_geteuid(), $account['uid'] ?? -1]);
+		if (!$parent || ($parent['mode'] & 0170000) !== 0040000 || ($parent['mode'] & 0022)
+			|| !in_array($parent['uid'], $owners, true) || realpath(dirname($path)) !== dirname($path)) {
 			throw new \RuntimeException((string)$failureMessage);
 		}
-		$handle = @fopen($path, 'c+');
-		if ($handle === false) {
-			throw new \RuntimeException((string)$failureMessage);
-		}
-		$this->setPrivateOwnership($path);
-		$deadline = microtime(true) + max(1, min(120, (int)$timeoutSeconds));
-		do {
-			if (@flock($handle, $lockMode | LOCK_NB)) {
-				return $handle;
+		$regular = static function ($meta) use ($owners): bool {
+			return is_array($meta) && ($meta['mode'] & 0170000) === 0100000 && $meta['nlink'] === 1
+				&& in_array($meta['uid'], $owners, true) && ($meta['mode'] & 0027) === 0 && $meta['size'] <= 4096;
+		};
+		clearstatcache(true, $path); $before = @lstat($path);
+		if ($before !== false && !$regular($before)) { throw new \RuntimeException((string)$failureMessage); }
+		$mask = umask(0037);
+		try {
+			$handle = @fopen($path, $before === false ? 'x+b' : 'r+b'); $created = $before === false && is_resource($handle);
+			if (!$handle && $before === false) {
+				clearstatcache(true, $path); $before = @lstat($path);
+				if ($regular($before)) { $handle = @fopen($path, 'r+b'); }
 			}
-			usleep(100000);
-		} while (microtime(true) < $deadline);
-		fclose($handle);
-		throw new \RuntimeException((string)$failureMessage);
+		} finally { umask($mask); }
+		if (!is_resource($handle)) { throw new \RuntimeException((string)$failureMessage); }
+		$accepted = false;
+		try {
+			$identity = static function () use ($path, $handle, $before, $regular): bool {
+				clearstatcache(true, $path); $named = @lstat($path); $opened = fstat($handle);
+				return $regular($opened) && $regular($named) && $named['dev'] === $opened['dev'] && $named['ino'] === $opened['ino']
+					&& ($before === false || ($before['dev'] === $opened['dev'] && $before['ino'] === $opened['ino']));
+			};
+			if (!$identity()) { throw new \RuntimeException((string)$failureMessage); }
+			if ($created) { $this->setPrivateOwnership($path); }
+			$deadline = hrtime(true) + max(1, min(120, (int)$timeoutSeconds)) * 1000000000;
+			do {
+				if (!$identity()) { throw new \RuntimeException((string)$failureMessage); }
+				if (@flock($handle, $lockMode | LOCK_NB)) {
+					if (!$identity()) { throw new \RuntimeException((string)$failureMessage); }
+					$accepted = true; return $handle;
+				}
+				usleep(10000);
+			} while (hrtime(true) < $deadline);
+			throw new \RuntimeException((string)$failureMessage);
+		} finally { if (!$accepted) { fclose($handle); } }
 	}
 
 	private function releaseNativeBackupFileLock($handle)
@@ -11233,26 +12679,38 @@ PY;
 	private function readNativeBackupFile($path, $maxBytes, $failureMessage)
 	{
 		$maxBytes = max(1, (int)$maxBytes);
-		if (is_link($path) || !is_file($path) || !is_readable($path)) {
+		clearstatcache(true, $path); $before = @lstat($path);
+		if (!is_array($before) || ($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1
+			|| $before['size'] < 1 || $before['size'] > $maxBytes || realpath($path) !== $path) {
 			throw new \RuntimeException((string)$failureMessage);
 		}
-		$bytes = @filesize($path);
-		if (!is_int($bytes) || $bytes < 1 || $bytes > $maxBytes) {
-			throw new \RuntimeException((string)$failureMessage);
-		}
-		$contents = @file_get_contents($path);
-		if (!is_string($contents) || strlen($contents) !== $bytes) {
-			throw new \RuntimeException((string)$failureMessage);
-		}
-		return $contents;
+		// Read/write opening avoids blocking if a FIFO is substituted after lstat;
+		// nothing is written. Extracted FreePBX files must be writable by restore.
+		$handle = @fopen($path, 'r+b');
+		if (!$handle) { throw new \RuntimeException((string)$failureMessage); }
+		try {
+			$opened = fstat($handle);
+			if (!$opened || ($opened['mode'] & 0170000) !== 0100000 || $opened['nlink'] !== 1
+				|| $opened['dev'] !== $before['dev'] || $opened['ino'] !== $before['ino']
+				|| !flock($handle, LOCK_SH | LOCK_NB)) { throw new \RuntimeException((string)$failureMessage); }
+			$contents = stream_get_contents($handle, $maxBytes + 1);
+			$after = fstat($handle); clearstatcache(true, $path); $current = @lstat($path);
+			foreach (['dev', 'ino', 'nlink', 'size', 'mtime', 'ctime'] as $field) {
+				if (!is_array($after) || !is_array($current) || $before[$field] !== $after[$field] || $after[$field] !== $current[$field]) {
+					throw new \RuntimeException((string)$failureMessage);
+				}
+			}
+			if (!is_string($contents) || strlen($contents) !== $before['size']) { throw new \RuntimeException((string)$failureMessage); }
+			return $contents;
+		} finally { fclose($handle); }
 	}
 
 	private function validateNativeBackupConfig($raw)
 	{
-		if (!is_string($raw) || strlen($raw) < 2 || strlen($raw) > self::NATIVE_BACKUP_MAX_CONFIG_BYTES) {
+		if (!is_string($raw) || strlen($raw) < 2 || strlen($raw) > SlsConfigCrypto::MAX_FILE_BYTES) {
 			throw new \RuntimeException(_('The protected configuration exceeds the native backup limits.'));
 		}
-		$settings = json_decode($raw, true);
+		$settings = SlsConfigCrypto::decode($raw);
 		if (!is_array($settings) || empty($settings) || array_keys($settings) === range(0, count($settings) - 1)) {
 			throw new \RuntimeException(_('The protected configuration is not a valid JSON object.'));
 		}
@@ -11389,7 +12847,7 @@ PY;
 				}
 			}
 		}
-		$errors = array_merge($errors, $this->validateScheduledAnnouncementRecurrences($schedules));
+		$errors = array_merge($errors, $this->validateScheduledAnnouncementRecurrences($schedules, (array)($settings['announcement_groups'] ?? [])));
 		if (array_key_exists('mail_from_domain', $settings)) {
 			$mailFromDomain = $this->normalizeEmailSenderDomain((string)$settings['mail_from_domain']);
 			$mailFromLocalPart = $this->normalizeEmailSenderLocalPart((string)($settings['mail_from_local_part'] ?? 'no-reply'));
@@ -11405,6 +12863,8 @@ PY;
 			$this->validateWebhookDestinations($settings['generic_webhooks'] ?? [], 'generic'),
 			$this->validateWebhookDestinations($settings['announcement_webhooks'] ?? [], 'announcement')
 		);
+		try { $this->announcementEmailTargets($settings); }
+		catch (\DomainException $error) { $errors[] = $error->getMessage(); }
 		$errors = array_merge($errors, $this->validateNwsZoneDestinationAssignments(
 			$settings['nws_zones'] ?? [],
 			$settings
@@ -11423,13 +12883,35 @@ PY;
 
 	private function writeNativeSnapshotFile($path, $contents, $mode)
 	{
-		if (is_link($path) || !is_string($contents) || @file_put_contents($path, $contents, LOCK_EX) === false) {
-			@unlink($path);
+		if (!is_string($contents) || !in_array($mode, [0600, 0640], true) || realpath(dirname($path)) !== dirname($path)) {
 			throw new \RuntimeException(_('Unable to write a protected backup staging file.'));
 		}
-		if (!@chmod($path, (int)$mode)) {
-			@unlink($path);
-			throw new \RuntimeException(_('Unable to secure a protected backup staging file.'));
+		$mask = umask(0077);
+		try { $handle = @fopen($path, 'x+b'); } finally { umask($mask); }
+		if (!$handle) { throw new \RuntimeException(_('A backup staging file already exists or cannot be created. Existing files were preserved.')); }
+		$complete = false;
+		try {
+			$offset = 0;
+			while ($offset < strlen($contents)) {
+				$count = fwrite($handle, substr($contents, $offset));
+				if ($count === false || $count === 0) { throw new \RuntimeException(_('The backup staging write was incomplete. Check available space and storage health.')); }
+				$offset += $count;
+			}
+			if (!@chmod($path, $mode) || !fflush($handle) || !fsync($handle)) {
+				throw new \RuntimeException(_('The backup staging file could not be secured and synchronized. Check storage health.'));
+			}
+			$opened = fstat($handle); clearstatcache(true, $path); $current = @lstat($path);
+			if (!$current || $current['nlink'] !== 1 || $opened['dev'] !== $current['dev'] || $opened['ino'] !== $current['ino']) {
+				throw new \RuntimeException(_('The backup staging file changed unexpectedly. Preserve the private backup directory and review storage access.'));
+			}
+			$directory = @fopen(dirname($path), 'r');
+			if (!$directory) { throw new \RuntimeException(_('The backup directory could not be opened for synchronization.')); }
+			try { if (!fsync($directory)) { throw new \RuntimeException(_('The backup directory could not be synchronized. Check storage health.')); } }
+			finally { fclose($directory); }
+			$complete = true;
+		} finally {
+			fclose($handle);
+			if (!$complete) { @unlink($path); }
 		}
 	}
 
@@ -11462,7 +12944,7 @@ PY;
 		if (count($occurrences) > (self::MAX_SCHEDULES * self::MAX_SCHEDULE_OCCURRENCES)) {
 			throw new \RuntimeException(_('The scheduling journal contains too many occurrences.'));
 		}
-		$allowedStates = ['pending', 'claimed', 'success', 'failed', 'missed', 'uncertain'];
+		$allowedStates = ['pending', 'claimed', 'preparing', 'queued', 'running', 'success', 'failed', 'missed', 'uncertain'];
 		foreach ($occurrences as $occurrenceId => $record) {
 			$occurrenceId = (string)$occurrenceId;
 			if (!preg_match('/^[A-Za-z0-9_-]{1,64}$/', $occurrenceId) || !is_array($record)) {
@@ -11475,6 +12957,19 @@ PY;
 			$state = strtolower(trim((string)($record['state'] ?? 'pending')));
 			if (!in_array($state, $allowedStates, true)) {
 				throw new \RuntimeException(_('The scheduling journal contains an invalid delivery state.'));
+			}
+			if (array_key_exists('job_id', $record)) {
+				if (!is_string($record['job_id']) || !preg_match('/^job_[a-f0-9]{32}$/D', $record['job_id'])
+					|| !is_string($record['request_fingerprint'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $record['request_fingerprint'])
+					|| !is_int($record['deadline_at'] ?? null) || $record['deadline_at'] < 1
+					|| !is_string($record['job_state'] ?? null) || !in_array($record['job_state'], ['prepared', 'queued', 'worker_starting', 'running', 'complete', 'failed', 'partial_or_failed', 'expired'], true)) {
+					throw new \RuntimeException(_('The scheduling journal contains an invalid durable job link.'));
+				}
+			} elseif (in_array($state, ['preparing', 'queued', 'running'], true)) {
+				throw new \RuntimeException(_('The scheduling journal is missing a durable job link.'));
+			}
+			if (isset($record['deadline_at']) && (!is_int($record['deadline_at']) || $record['deadline_at'] < 1)) {
+				throw new \RuntimeException(_('The scheduling journal contains an invalid deadline.'));
 			}
 			$runAt = trim((string)($record['run_at_utc'] ?? ''));
 			if ($runAt !== '' && $this->parseScheduleUtcTimestamp($runAt) === false) {
@@ -11584,12 +13079,19 @@ PY;
 					$files['config'],
 					'slsmassnotify-config',
 					basename(self::SETTINGS_JSON),
-					self::NATIVE_BACKUP_MAX_CONFIG_BYTES
+					SlsConfigCrypto::MAX_FILE_BYTES
 				),
+				'key' => null,
 				'schedule' => null,
 				'tones' => [],
 			],
 		];
+		if (($files['key'] ?? null) !== null) {
+			if (!is_array($files['key'])) { throw new \RuntimeException(_('The encrypted configuration recovery-key inventory is invalid.')); }
+			$normalized['files']['key'] = $this->validateNativeBackupManifestRecord(
+				$files['key'], 'slsmassnotify-config-key', 'protected-config-key.json', SlsConfigCrypto::MAX_KEYRING_BYTES
+			);
+		}
 		if ($files['schedule'] !== null) {
 			if (!is_array($files['schedule'])) {
 				throw new \RuntimeException(_('The native backup scheduling inventory is invalid.'));
@@ -11600,6 +13102,16 @@ PY;
 				basename(self::SCHEDULE_STATE_JSON),
 				self::NATIVE_BACKUP_MAX_LEDGER_BYTES
 			);
+		}
+        $normalized['files']['sms']=null;
+        if (($files['sms']??null)!==null) {
+            if (!is_array($files['sms'])) { throw new \RuntimeException(_('The SMS continuity inventory is invalid.')); }
+            $normalized['files']['sms']=$this->validateNativeBackupManifestRecord($files['sms'],'slsmassnotify-sms','sms-ledger.jsonl',\SLS\MassNotify\Sms\Store::BACKUP_MAX_BYTES);
+        }
+		$normalized['files']['operational'] = null;
+		if (($files['operational'] ?? null) !== null) {
+			if (!is_array($files['operational'])) { throw new \RuntimeException(_('The operational recovery inventory is invalid.')); }
+			$normalized['files']['operational'] = $this->validateNativeBackupManifestRecord($files['operational'], 'slsmassnotify-operational', 'operational-evidence.jsonl', 64 * 1024 * 1024);
 		}
 		if (count($files['tones']) > self::NATIVE_BACKUP_MAX_TONES) {
 			throw new \RuntimeException(_('The native backup contains too many custom tones.'));
@@ -11635,7 +13147,10 @@ PY;
 		$seen = [];
 		foreach (array_merge(
 			[$normalized['files']['config']],
+			$normalized['files']['key'] === null ? [] : [$normalized['files']['key']],
 			$normalized['files']['schedule'] === null ? [] : [$normalized['files']['schedule']],
+            ($normalized['files']['sms']??null) === null ? [] : [$normalized['files']['sms']],
+			($normalized['files']['operational'] ?? null) === null ? [] : [$normalized['files']['operational']],
 			$normalized['files']['tones']
 		) as $record) {
 			$key = $record['type'] . "\0" . $record['archive_name'];
@@ -11683,7 +13198,10 @@ PY;
 		$expected = [];
 		$records = array_merge(
 			[$manifest['files']['config']],
+			($manifest['files']['key'] ?? null) === null ? [] : [$manifest['files']['key']],
 			$manifest['files']['schedule'] === null ? [] : [$manifest['files']['schedule']],
+            ($manifest['files']['sms']??null) === null ? [] : [$manifest['files']['sms']],
+			($manifest['files']['operational'] ?? null) === null ? [] : [$manifest['files']['operational']],
 			$manifest['files']['tones']
 		);
 		foreach ($records as $record) {
@@ -11734,9 +13252,25 @@ PY;
 		$configFile = $found[$configRecord['type'] . "\0" . $configRecord['archive_name']];
 		$configRaw = $this->readNativeBackupFile(
 			$configFile['path'],
-			self::NATIVE_BACKUP_MAX_CONFIG_BYTES,
+			SlsConfigCrypto::MAX_FILE_BYTES,
 			_('The restored protected configuration is unreadable.')
 		);
+		if (!hash_equals($configRecord['sha256'], hash('sha256', $configRaw))) {
+			throw new \RuntimeException(_('The restored configuration changed after manifest verification. No configuration was restored.'));
+		}
+		if (($manifest['files']['key'] ?? null) !== null) {
+			$keyRecord = $manifest['files']['key'];
+			$keyFile = $found[$keyRecord['type'] . "\0" . $keyRecord['archive_name']];
+			$keyRaw = $this->readNativeBackupFile($keyFile['path'], SlsConfigCrypto::MAX_KEYRING_BYTES,
+				_('The restored configuration recovery key is unreadable.'));
+			if (!hash_equals($keyRecord['sha256'], hash('sha256', $keyRaw))) {
+				throw new \RuntimeException(_('The restored configuration recovery key changed after manifest verification. No configuration was restored.'));
+			}
+			$configRaw = json_encode(SlsConfigCrypto::decodeBackup($configRaw, $keyRaw),
+				JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n";
+		} elseif (SlsConfigCrypto::isEncrypted(json_decode($configRaw, true))) {
+			throw new \RuntimeException(_('The encrypted native backup is missing its recovery key. No configuration was restored.'));
+		}
 		$configSettings = $this->validateNativeBackupConfig($configRaw);
 
 		$schedule = null;
@@ -11749,6 +13283,9 @@ PY;
 				self::NATIVE_BACKUP_MAX_LEDGER_BYTES,
 				_('The restored scheduling journal is unreadable.')
 			);
+			if (!hash_equals($scheduleRecord['sha256'], hash('sha256', $scheduleRaw))) {
+				throw new \RuntimeException(_('The restored scheduling journal changed after manifest verification. No configuration was restored.'));
+			}
 			$schedule = ['raw' => $scheduleRaw, 'data' => $this->validateNativeScheduleLedger($scheduleRaw)];
 		}
 
@@ -11766,6 +13303,8 @@ PY;
 		}
 		return [
 			'config' => ['raw' => $configRaw, 'settings' => $configSettings],
+            'sms' => ($manifest['files']['sms']??null)===null ? null : $found['slsmassnotify-sms'."\0".$manifest['files']['sms']['archive_name']],
+			'operational' => ($manifest['files']['operational'] ?? null) === null ? null : $found['slsmassnotify-operational' . "\0" . $manifest['files']['operational']['archive_name']],
 			'schedule' => $schedule,
 			'schedule_present' => $schedulePresent,
 			'tones' => $tones,
@@ -11803,6 +13342,20 @@ PY;
 		}
 
 		$now = max(0, (int)$now);
+		// Job payloads are not restored by the native config backup. Preserve links
+		// for diagnosis, but never reconstruct or activate their past deliveries.
+		foreach ($ledger['occurrences'] as &$restoredRecord) {
+			if (!is_array($restoredRecord) || empty($restoredRecord['job_id'])
+				|| in_array($restoredRecord['state'] ?? '', ['success', 'failed', 'missed', 'uncertain'], true)) { continue; }
+			$restoredRecord['state'] = 'uncertain';
+			$restoredRecord['message'] = _('A linked announcement job was not restored with this backup. It was not recreated or replayed.');
+			$restoredRecord['updated_at'] = gmdate('c', $now);
+			$restoredRecord['completed_at'] = gmdate('c', $now);
+			$ledgerChanged = true; $disableSchedules = true;
+		}
+		unset($restoredRecord);
+		if ($disableSchedules && $ledgerChanged) { $warnings[] = _('Schedules were disabled because linked delivery jobs require review after restore.'); }
+
 		foreach ($schedules as $scheduleIndex => &$scheduledAnnouncement) {
 			if (!is_array($scheduledAnnouncement)) {
 				$disableSchedules = true;
@@ -11862,6 +13415,25 @@ PY;
 				$warnings[] = _('Scheduled announcements were disabled because their restored state could not be verified safely.');
 			}
 		}
+        foreach ($settings['automations']['rules'] ?? [] as $index => $rule) {
+            if (!empty($rule['enabled'])) { $settings['automations']['rules'][$index]['enabled']=false; $configChanged=true; }
+        }
+        if (!empty($settings['automations']['rules'])) { $warnings[]=_('Automatic triggers were disabled after restore. Review enrolled identities, location assignments, recipients and script approvals before rearming them.'); }
+        if ($this->disableEnterpriseAfterRecovery($settings)) { $configChanged=true; $warnings[]=_('Enterprise Labs were disabled after recovery. Review peer identity, witness history, directory grants and physical-provider permissions before re-enabling. Dangerous features require a fresh acknowledgment; bearer sessions and operational work are not restored into execution.'); }
+        if (!empty($settings['announcement_sms']['enabled'])) {
+            $settings['announcement_sms']['enabled']=false; $configChanged=true;
+            $warnings[]=_('SMS was disabled after restore. Review restored recipient consent, provider routing and retained spending/opt-out history before enabling it. No SMS deliveries were replayed.');
+        }
+        if (!empty($settings['outbound_voice']['enabled'])) {
+            $settings['outbound_voice']['enabled'] = '0'; $configChanged = true;
+            $warnings[] = _('External voice was disabled after restore. Review approved numbers, trunk routing and the daily call allowance before enabling it. Pre-restore call usage may be absent on a replacement PBX; no external calls were replayed.');
+        }
+		if (!empty($settings['enabled']) || !empty($settings['xweather']['enabled'])) {
+			$settings['enabled'] = '0';
+			if (is_array($settings['xweather'] ?? null)) { $settings['xweather']['enabled'] = '0'; }
+			$configChanged = true;
+			$warnings[] = _('Weather and lightning automation were disabled after restore. Historical deduplication, storm and delivery evidence is not reactivated. Review current alerts, recipient routing and any recovery archive before enabling each service; do not assume a restored storm has cleared.');
+		}
 		if ($configChanged) {
 			$settings['scheduled_announcements'] = $schedules;
 			$configRaw = json_encode($settings, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
@@ -11894,7 +13466,7 @@ PY;
 		];
 	}
 
-	private function commitNativeRestorePayload($configRaw, $scheduleRaw, $schedulePresent, array $tones, $transactionId, array $warnings)
+	private function commitNativeRestorePayload($configRaw, $scheduleRaw, $schedulePresent, array $tones, $transactionId, array $warnings, ?array $sms = null, ?array $operational = null)
 	{
 		$this->ensurePluginDataDir();
 		if (is_link(self::PLUGIN_DATA_DIR) || is_link(self::TONES_DIR)) {
@@ -11919,9 +13491,24 @@ PY;
 		$configLock = null;
 		$rollback = [];
 		$committing = false;
+		$preserveRecovery = false;
 		try {
 			$stageConfig = $stageRoot . '/mass-notifications.config';
-			$this->writeNativeSnapshotFile($stageConfig, (string)$configRaw, 0600);
+			$this->writeNativeSnapshotFile($stageConfig, SlsConfigCrypto::encode($this->validateNativeBackupConfig((string)$configRaw)), 0600);
+            $stageSms=null;
+            if ($sms!==null) {
+                $stageSms=$stageRoot.'/sms-ledger.jsonl';
+                $raw=$this->readNativeBackupFile($sms['path']??'',\SLS\MassNotify\Sms\Store::BACKUP_MAX_BYTES,_('The SMS continuity backup is unreadable.'));
+                if (!hash_equals($sms['record']['sha256']??'',hash('sha256',$raw))) { throw new \RuntimeException(_('The SMS continuity backup changed before restore.')); }
+                $this->writeNativeSnapshotFile($stageSms,$raw,0600); unset($raw);
+            }
+			if ($operational !== null) {
+				$archived = $this->operationalBackupCommand('archive', (string)($operational['path'] ?? ''), (string)($operational['record']['sha256'] ?? ''));
+				if (!preg_match('/^[a-f0-9]{64}\.jsonl$/D', (string)($archived['archive_name'] ?? ''))) { throw new \RuntimeException(_('The operational recovery archive identity is invalid.')); }
+				$warnings[] = sprintf(_('Operational history was retained for review in %s/recovery-archives/%s. It was not loaded into queues, desktop inboxes or active incidents.'), self::PLUGIN_DATA_DIR, $archived['archive_name']);
+			} else {
+				$warnings[] = _('This older backup has no operational recovery evidence. Existing delivery history was preserved; no historical queues, receipts or storm state were recreated.');
+			}
 			$stageSchedule = null;
 			if ($schedulePresent) {
 				$stageSchedule = $stageRoot . '/schedule-executions.json';
@@ -11957,11 +13544,14 @@ PY;
 				self::SCHEDULE_LOCK_FILE,
 				_('The scheduled-announcement worker did not become idle in time for restore.')
 			);
+			$configLock = $this->acquireSettingsLock(true);
 			$announcementLock = $this->acquireNativeBackupFileLock(
 				self::ANNOUNCEMENT_LOCK_FILE,
 				_('An active announcement did not complete in time for restore.')
 			);
-			$configLock = $this->acquireSettingsLock(true);
+			$restoredSettings = json_decode((string)$configRaw, true);
+			if (!is_array($restoredSettings)) { throw new \RuntimeException(_('Restored configuration is not a JSON object.')); }
+			$this->assertDesktopCapacityChange($restoredSettings, $this->loadSettingsFile(self::SETTINGS_JSON));
 			$bundledTones = array_fill_keys([
 				self::DEFAULT_ANNOUNCEMENT_OPENING_TONE,
 				self::DEFAULT_ANNOUNCEMENT_CLOSING_TONE,
@@ -11985,6 +13575,9 @@ PY;
 			foreach (array_unique(array_merge(array_keys($currentCustomTones), array_keys($stagedTones))) as $toneName) {
 				$destinations[] = self::TONES_DIR . '/' . $toneName . '.wav';
 			}
+            // A failed config restore must not undo reservations or opt-outs.
+            // The merge adds evidence only; existing sends and costs are never rewound.
+            if ($stageSms!==null) { $this->announcementSmsStore()->mergeSnapshot($stageSms); }
 			$rollback = $this->backupNativeRestoreTargets($destinations, $rollbackRoot);
 			$committing = true;
 			$this->backupAppliedSettings();
@@ -12027,7 +13620,15 @@ PY;
 			$committing = false;
 		} catch (\Throwable $e) {
 			if ($committing && !empty($rollback)) {
-				$this->restoreNativeRestoreTargets($rollback);
+				try {
+					$this->restoreNativeRestoreTargets($rollback);
+				} catch (\Throwable $rollbackError) {
+					$preserveRecovery = true;
+					$message = sprintf(_('Native restore failed and rollback could not be verified. Recovery copies were retained at %s and %s. Preserve both directories and repair the failed files before retrying restore.'), $stageRoot, $rollbackRoot);
+					try { $this->updateStatusData(['last_native_restore_status' => 'fault', 'last_native_restore_message' => $message]); }
+					catch (\Throwable $statusError) { /* The retained recovery files must survive a status-write failure too. */ }
+					throw new \RuntimeException($message, 0, $rollbackError);
+				}
 			}
 			throw $e;
 		} finally {
@@ -12036,9 +13637,12 @@ PY;
 			}
 			$this->releaseNativeBackupFileLock($announcementLock);
 			$this->releaseNativeBackupFileLock($workerLock);
-			$this->removeNativeBackupDirectory($stageRoot);
-			$this->removeNativeBackupDirectory($rollbackRoot);
+			if (!$preserveRecovery) {
+				$this->removeNativeBackupDirectory($stageRoot);
+				$this->removeNativeBackupDirectory($rollbackRoot);
+			}
 		}
+		return $warnings;
 	}
 
 	private function nativeRestoreMarkerContents($transactionId, array $warnings)
@@ -12096,6 +13700,8 @@ PY;
 				$entry['existed'] = true;
 				$entry['backup'] = $backupPath;
 				$entry['mode'] = (int)(@fileperms($destination) & 0777);
+				$entry['sha256'] = $sourceHash;
+				$entry['bytes'] = @filesize($backupPath);
 			}
 			$rollback[] = $entry;
 		}
@@ -12140,6 +13746,14 @@ PY;
 			} else {
 				$this->setPrivateOwnership($destination);
 			}
+			clearstatcache(true, $destination);
+			$restored = @lstat($destination);
+			if (!is_array($restored) || ($restored['mode'] & 0170000) !== 0100000 || $restored['nlink'] !== 1
+				|| $restored['size'] !== ($entry['bytes'] ?? -1)
+				|| ($restored['mode'] & 0777) !== (int)$entry['mode']
+				|| !hash_equals((string)($entry['sha256'] ?? ''), (string)@hash_file('sha256', $destination))) {
+				$failures[] = $destination;
+			}
 		}
 		if (!empty($failures)) {
 			$this->updateStatusData([
@@ -12162,7 +13776,9 @@ PY;
 		if (!is_int($bytes) || $bytes < 2 || $bytes > 32768) {
 			throw new \RuntimeException(_('The protected post-restore repair marker has an invalid size.'));
 		}
-		$decoded = json_decode((string)@file_get_contents(self::FREEPBX_RESTORE_MARKER), true);
+		$decoded = json_decode($this->readNativeBackupFile(
+			self::FREEPBX_RESTORE_MARKER, 32768, _('The protected post-restore repair marker changed or cannot be read safely.')
+		), true);
 		if (!is_array($decoded) || (int)($decoded['version'] ?? 0) !== 1
 			|| trim((string)($decoded['transaction_id'] ?? '')) === ''
 			|| !hash_equals(
@@ -12176,27 +13792,47 @@ PY;
 		return $decoded;
 	}
 
-	private function verifyNativePostRestoreIntegration()
+	private function verifyNativePostRestoreIntegration($rootChecks = true)
 	{
+		$runAs = $rootChecks ? '/usr/sbin/runuser -u asterisk -- ' : '';
+		if (!$rootChecks) { $this->requireRuntimeAccount(); }
+		$this->verifyPhoneEventCollectorService();
+		$this->verifyPhoneEventCollectorReadiness();
 		$settings = $this->validateNativeBackupConfig($this->readNativeBackupFile(
 			self::SETTINGS_JSON,
-			self::NATIVE_BACKUP_MAX_CONFIG_BYTES,
+			SlsConfigCrypto::MAX_FILE_BYTES,
 			_('Post-restore verification could not read the protected configuration.')
 		));
 		$requiredFiles = [
 			__DIR__ . '/Backup.php' => false,
+			__DIR__ . '/ConfigCrypto.php' => false,
+			__DIR__ . '/OperationalBackup.php' => false,
+			__DIR__ . '/AdminAudit.php' => false,
+			__DIR__ . '/SecurityAudit.php' => false,
 			__DIR__ . '/Restore.php' => false,
 			__DIR__ . '/AnnouncementDelivery.php' => false,
+			__DIR__ . '/AnnouncementAdmission.php' => false,
+			__DIR__ . '/ScheduledDelivery.php' => false,
+			__DIR__ . '/SchedulePresentation.php' => false,
+			__DIR__ . '/UpdatePolicy.php' => false,
 			__DIR__ . '/TestProfiles.php' => false,
+			__DIR__ . '/PhoneEventService.php' => false,
+			__DIR__ . '/OutboundVoice.php' => false,
+			__DIR__ . '/AnnouncementEmail.php' => false,
+			__DIR__ . '/RecipientSelection.php' => false,
 			self::RUNTIME_DIR . '/sls_notify.py' => true,
 			self::RUNTIME_DIR . '/sls_config.py' => true,
+			self::RUNTIME_DIR . '/sls_config_crypto.py' => true,
+			self::RUNTIME_DIR . '/sls_config_crypto.php' => false,
 			self::RUNTIME_DIR . '/sls_branded_email.py' => true,
+			self::RUNTIME_DIR . '/sls_announcement_email.py' => true,
 			self::RUNTIME_DIR . '/sls_branded_discord.py' => true,
 			self::RUNTIME_DIR . '/sls_notification_destinations.py' => true,
 			self::RUNTIME_DIR . '/sls_system_notifications.py' => true,
 			self::RUNTIME_DIR . '/sls_nws_status.py' => true,
 			self::RUNTIME_DIR . '/sls_nws_delivery_claims.py' => true,
 			self::RUNTIME_DIR . '/sls_mass_notify_xweather_poll.py' => true,
+			self::RUNTIME_DIR . '/sls_lightning_providers.py' => false,
 			self::RUNTIME_DIR . '/sls_mass_notify_nws_poll.sh' => true,
 			self::RUNTIME_DIR . '/sls_mass_notify_test.sh' => true,
 			self::RUNTIME_DIR . '/sls_mass_notify_update.sh' => true,
@@ -12205,20 +13841,80 @@ PY;
 			self::RUNTIME_DIR . '/sls_mass_notify_install_piper_voices.sh' => true,
 			self::RUNTIME_DIR . '/sls_mass_notify_schedule_worker.php' => true,
 			self::RUNTIME_DIR . '/sls_mass_notify_announcement_worker.php' => true,
+			self::RUNTIME_DIR . '/sls_mass_notify_automation_worker.php' => true,
+			self::RUNTIME_DIR . '/sls_mass_notify_cluster_worker.php' => true,
+			self::RUNTIME_DIR . '/sls_mass_notify_cluster_effect.php' => true,
+			self::RUNTIME_DIR . '/sls_mass_notify_incident_response.php' => false,
+			self::RUNTIME_DIR . '/sls_cluster_guard.py' => true,
+            self::RUNTIME_DIR . '/sls_mass_notify_delivery_authorization.php' => true,
+			self::RUNTIME_DIR . '/sls_mass_notify_panic.php' => true,
+			self::RUNTIME_DIR . '/sls_trigger_actions.py' => true,
 			self::RUNTIME_DIR . '/sls_announcement_jobs.php' => false,
+			self::RUNTIME_DIR . '/sls_api_test_guard.php' => false,
 			self::RUNTIME_DIR . '/sls_storage_maintenance.py' => true,
+			self::RUNTIME_DIR . '/sls_audit_separation.py' => true,
+			self::RUNTIME_DIR . '/sls_operational_backup.py' => true,
+			self::RUNTIME_DIR . '/sls_external_monitor.py' => true,
+			self::RUNTIME_DIR . '/sls_resource_capacity.py' => true,
+			self::RUNTIME_DIR . '/sls_phone_admission.py' => true,
+			self::RUNTIME_DIR . '/sls_phone_events.py' => true,
+			self::RUNTIME_DIR . '/sls_phone_outcomes.py' => true,
+			self::RUNTIME_DIR . '/sls_outbound_routes.py' => true,
+			self::RUNTIME_DIR . '/sls_mass_notify_phone_agi.py' => true,
+			self::RUNTIME_DIR . '/sls_mass_notify_live_paging.php' => true,
+			self::RUNTIME_DIR . '/sls_live_paging.php' => false,
+			self::RUNTIME_DIR . '/sls_piper_dependencies.py' => true,
+			self::RUNTIME_DIR . '/sls_piper_environment.py' => true,
+			self::RUNTIME_DIR . '/external-acknowledgement.wav' => false,
+			self::RUNTIME_DIR . '/sls_update_policy.py' => true,
+			self::RUNTIME_DIR . '/sls_module_trust.py' => true,
+			self::RUNTIME_DIR . '/sls_privileged_install.py' => true,
+			'/usr/local/bin/slsconsole' => true,
+			self::RUNTIME_DIR . '/sls_console.py' => true,
+			self::RUNTIME_DIR . '/sls_runtime_state.php' => false,
+			self::RUNTIME_DIR . '/sls_installer_recovery.py' => true,
+			self::RUNTIME_DIR . '/sls_install_idle.py' => true,
+			self::RUNTIME_DIR . '/sls_install_guard.py' => true,
 			self::RUNTIME_DIR . '/sls_weather_queue.py' => true,
 			self::RUNTIME_DIR . '/sls_audio_queue.py' => true,
+			self::RUNTIME_DIR . '/sls_audio_state.py' => true,
 			self::RUNTIME_DIR . '/sls_release_verify.py' => true,
 			self::RUNTIME_DIR . '/release-signing.pub' => false,
 			self::RUNTIME_DIR . '/piper-requirements.txt' => false,
+			self::RUNTIME_DIR . '/piper-requirements.lock' => false,
+			self::RUNTIME_DIR . '/piper-packaging.lock' => false,
+			self::RUNTIME_DIR . '/piper-artifacts.json' => false,
 			self::RUNTIME_DIR . '/sls_mass_notify_weather_poll.sh' => true,
 			'/var/www/html/admin/modules/dashboard/sections/SlsMassNotifyAnnouncement.class.php' => false,
 			'/var/www/html/admin/modules/dashboard/views/sections/sls-mass-notify-announcement.php' => false,
 			'/etc/apache2/conf-enabled/sls-mass-notify.conf' => false,
 			'/var/www/html/api/sipnotify/index.php' => false,
+			'/var/www/html/mass-notify/index.php' => false,
+			'/var/www/html/api/sls-mass-notify/edge-view.php' => false,
+			'/var/www/html/api/sls-mass-notify/edge.php' => false,
+			'/var/www/html/api/sls-mass-notify/peer.php' => false,
+			'/var/www/html/mass-notify/subscriber.php' => false,
+			'/var/www/html/mass-notify/sso.php' => false,
+			'/var/www/html/mass-notify/.htaccess' => false,
 			'/var/www/html/api/sipnotify/.htaccess' => false,
 			'/var/www/html/api/sls-mass-notify/index.php' => false,
+			'/var/www/html/api/sls-mass-notify/contract.php' => false,
+			'/var/www/html/api/sls-mass-notify/security.php' => false,
+			'/var/www/html/api/sls-mass-notify/config-crypto.php' => false,
+			'/var/www/html/api/sls-mass-notify/event-log.php' => false,
+			'/var/www/html/api/sls-mass-notify/media.php' => false,
+			'/var/www/html/api/sls-mass-notify/media-policy.php' => false,
+			'/var/www/html/api/sls-mass-notify/sms-callback.php' => false,
+			'/var/www/html/api/sls-mass-notify/sms/Config.php' => false,
+			'/var/www/html/api/sls-mass-notify/sms/Store.php' => false,
+            '/var/www/html/api/sls-mass-notify/sms/Continuity.php' => false,
+			'/var/www/html/api/sls-mass-notify/sms/Provider.php' => false,
+			'/var/www/html/api/sls-mass-notify/sms/Service.php' => false,
+			'/var/www/html/api/sls-mass-notify/sms/.htaccess' => false,
+			'/var/www/html/api/sls-mass-notify/sms/vendor/twilio/RequestValidator.php' => false,
+			'/var/www/html/api/sls-mass-notify/sms/vendor/twilio/Values.php' => false,
+			'/var/www/html/api/sls-mass-notify/sms/vendor/twilio/LICENSE' => false,
+			'/var/www/html/api/sls-mass-notify/sms/vendor/twilio/UPSTREAM.json' => false,
 			'/var/www/html/api/sls-mass-notify/.htaccess' => false,
 		];
 		foreach ($requiredFiles as $path => $mustExecute) {
@@ -12233,16 +13929,22 @@ PY;
 			throw new \RuntimeException(_('Post-restore verification could not confirm FreePBX backup-job enrollment.'));
 		}
 		$parityFiles = [
+			__DIR__ . '/bin/sls_mass_notify/sls_config_crypto.py' => self::RUNTIME_DIR . '/sls_config_crypto.py',
+			__DIR__ . '/api/sls-mass-notify/config-crypto.php' => self::RUNTIME_DIR . '/sls_config_crypto.php',
+			__DIR__ . '/bin/sls_mass_notify/sls_config_crypto.php' => self::RUNTIME_DIR . '/sls_config_crypto.php',
 			__DIR__ . '/bin/sls_mass_notify/sls_announcement_jobs.php' => self::RUNTIME_DIR . '/sls_announcement_jobs.php',
+			__DIR__ . '/bin/sls_mass_notify/sls_api_test_guard.php' => self::RUNTIME_DIR . '/sls_api_test_guard.php',
 			__DIR__ . '/bin/sls_mass_notify/sls_notify.py' => self::RUNTIME_DIR . '/sls_notify.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_config.py' => self::RUNTIME_DIR . '/sls_config.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_branded_email.py' => self::RUNTIME_DIR . '/sls_branded_email.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_announcement_email.py' => self::RUNTIME_DIR . '/sls_announcement_email.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_branded_discord.py' => self::RUNTIME_DIR . '/sls_branded_discord.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_notification_destinations.py' => self::RUNTIME_DIR . '/sls_notification_destinations.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_system_notifications.py' => self::RUNTIME_DIR . '/sls_system_notifications.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_nws_status.py' => self::RUNTIME_DIR . '/sls_nws_status.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_nws_delivery_claims.py' => self::RUNTIME_DIR . '/sls_nws_delivery_claims.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py' => self::RUNTIME_DIR . '/sls_mass_notify_xweather_poll.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_lightning_providers.py' => self::RUNTIME_DIR . '/sls_lightning_providers.py',
 			__DIR__ . '/bin/sls_mass_notify_nws_poll.sh' => self::RUNTIME_DIR . '/sls_mass_notify_nws_poll.sh',
 			__DIR__ . '/bin/sls_mass_notify_test.sh' => self::RUNTIME_DIR . '/sls_mass_notify_test.sh',
 			__DIR__ . '/bin/sls_mass_notify_update.sh' => self::RUNTIME_DIR . '/sls_mass_notify_update.sh',
@@ -12251,18 +13953,82 @@ PY;
 			__DIR__ . '/bin/sls_mass_notify_install_piper_voices.sh' => self::RUNTIME_DIR . '/sls_mass_notify_install_piper_voices.sh',
 			__DIR__ . '/bin/sls_mass_notify_schedule_worker.php' => self::RUNTIME_DIR . '/sls_mass_notify_schedule_worker.php',
 			__DIR__ . '/bin/sls_mass_notify_announcement_worker.php' => self::RUNTIME_DIR . '/sls_mass_notify_announcement_worker.php',
+			__DIR__ . '/bin/sls_mass_notify_automation_worker.php' => self::RUNTIME_DIR . '/sls_mass_notify_automation_worker.php',
+			__DIR__ . '/bin/sls_mass_notify_cluster_worker.php' => self::RUNTIME_DIR . '/sls_mass_notify_cluster_worker.php',
+			__DIR__ . '/bin/sls_mass_notify_cluster_effect.php' => self::RUNTIME_DIR . '/sls_mass_notify_cluster_effect.php',
+			__DIR__ . '/bin/sls_mass_notify/sls_mass_notify_incident_response.php' => self::RUNTIME_DIR . '/sls_mass_notify_incident_response.php',
+			__DIR__ . '/bin/sls_mass_notify/sls_cluster_guard.py' => self::RUNTIME_DIR . '/sls_cluster_guard.py',
+            __DIR__ . '/bin/sls_mass_notify_delivery_authorization.php' => self::RUNTIME_DIR . '/sls_mass_notify_delivery_authorization.php',
+			__DIR__ . '/bin/sls_mass_notify_panic.php' => self::RUNTIME_DIR . '/sls_mass_notify_panic.php',
+			__DIR__ . '/bin/sls_mass_notify/sls_trigger_actions.py' => self::RUNTIME_DIR . '/sls_trigger_actions.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_storage_maintenance.py' => self::RUNTIME_DIR . '/sls_storage_maintenance.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_audit_separation.py' => self::RUNTIME_DIR . '/sls_audit_separation.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_operational_backup.py' => self::RUNTIME_DIR . '/sls_operational_backup.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_external_monitor.py' => self::RUNTIME_DIR . '/sls_external_monitor.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_resource_capacity.py' => self::RUNTIME_DIR . '/sls_resource_capacity.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_phone_admission.py' => self::RUNTIME_DIR . '/sls_phone_admission.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_phone_events.py' => self::RUNTIME_DIR . '/sls_phone_events.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_emergency_observer.py' => self::RUNTIME_DIR . '/sls_emergency_observer.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_phone_outcomes.py' => self::RUNTIME_DIR . '/sls_phone_outcomes.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_outbound_routes.py' => self::RUNTIME_DIR . '/sls_outbound_routes.py',
+			__DIR__ . '/bin/sls_mass_notify_phone_agi.py' => self::RUNTIME_DIR . '/sls_mass_notify_phone_agi.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_live_paging.php' => self::RUNTIME_DIR . '/sls_live_paging.php',
+			__DIR__ . '/bin/sls_mass_notify_live_paging.php' => self::RUNTIME_DIR . '/sls_mass_notify_live_paging.php',
+            __DIR__ . '/bin/sls_mass_notify_weather_channels.php' => self::RUNTIME_DIR . '/sls_mass_notify_weather_channels.php',
+            __DIR__ . '/bin/sls_mass_notify/sls_weather_channels.py' => self::RUNTIME_DIR . '/sls_weather_channels.py',
+            __DIR__ . '/bin/sls_mass_notify/sls_lightning_providers.py' => self::RUNTIME_DIR . '/sls_lightning_providers.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_piper_dependencies.py' => self::RUNTIME_DIR . '/sls_piper_dependencies.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_piper_environment.py' => self::RUNTIME_DIR . '/sls_piper_environment.py',
+			__DIR__ . '/bin/sls_mass_notify/external-acknowledgement.wav' => self::RUNTIME_DIR . '/external-acknowledgement.wav',
+			__DIR__ . '/bin/sls_mass_notify/sls_update_policy.py' => self::RUNTIME_DIR . '/sls_update_policy.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_module_trust.py' => self::RUNTIME_DIR . '/sls_module_trust.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_privileged_install.py' => self::RUNTIME_DIR . '/sls_privileged_install.py',
+			__DIR__ . '/bin/slsconsole' => '/usr/local/bin/slsconsole',
+			__DIR__ . '/bin/sls_mass_notify/sls_console.py' => self::RUNTIME_DIR . '/sls_console.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_runtime_state.php' => self::RUNTIME_DIR . '/sls_runtime_state.php',
+			__DIR__ . '/bin/sls_mass_notify/sls_installer_recovery.py' => self::RUNTIME_DIR . '/sls_installer_recovery.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_install_idle.py' => self::RUNTIME_DIR . '/sls_install_idle.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_install_guard.py' => self::RUNTIME_DIR . '/sls_install_guard.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_weather_queue.py' => self::RUNTIME_DIR . '/sls_weather_queue.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_audio_queue.py' => self::RUNTIME_DIR . '/sls_audio_queue.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_audio_state.py' => self::RUNTIME_DIR . '/sls_audio_state.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_release_verify.py' => self::RUNTIME_DIR . '/sls_release_verify.py',
 			__DIR__ . '/bin/sls_mass_notify/release-signing.pub' => self::RUNTIME_DIR . '/release-signing.pub',
 			__DIR__ . '/bin/sls_mass_notify/piper-requirements.txt' => self::RUNTIME_DIR . '/piper-requirements.txt',
+			__DIR__ . '/bin/sls_mass_notify/piper-requirements.lock' => self::RUNTIME_DIR . '/piper-requirements.lock',
+			__DIR__ . '/bin/sls_mass_notify/piper-packaging.lock' => self::RUNTIME_DIR . '/piper-packaging.lock',
+			__DIR__ . '/bin/sls_mass_notify/piper-artifacts.json' => self::RUNTIME_DIR . '/piper-artifacts.json',
 			__DIR__ . '/bin/sls_mass_notify_weather_poll.sh' => self::RUNTIME_DIR . '/sls_mass_notify_weather_poll.sh',
 			__DIR__ . '/dashboard/sections/SlsMassNotifyAnnouncement.class.php' => '/var/www/html/admin/modules/dashboard/sections/SlsMassNotifyAnnouncement.class.php',
 			__DIR__ . '/dashboard/views/sections/sls-mass-notify-announcement.php' => '/var/www/html/admin/modules/dashboard/views/sections/sls-mass-notify-announcement.php',
 			__DIR__ . '/api/sipnotify/index.php' => '/var/www/html/api/sipnotify/index.php',
+			__DIR__ . '/portal/index.php' => '/var/www/html/mass-notify/index.php',
+			__DIR__ . '/api/sls-mass-notify/edge-view.php' => '/var/www/html/api/sls-mass-notify/edge-view.php',
+			__DIR__ . '/api/sls-mass-notify/edge.php' => '/var/www/html/api/sls-mass-notify/edge.php',
+			__DIR__ . '/api/sls-mass-notify/peer.php' => '/var/www/html/api/sls-mass-notify/peer.php',
+			__DIR__ . '/portal/subscriber.php' => '/var/www/html/mass-notify/subscriber.php',
+			__DIR__ . '/portal/sso.php' => '/var/www/html/mass-notify/sso.php',
+			__DIR__ . '/portal/.htaccess' => '/var/www/html/mass-notify/.htaccess',
 			__DIR__ . '/api/sipnotify/.htaccess' => '/var/www/html/api/sipnotify/.htaccess',
 			__DIR__ . '/api/sls-mass-notify/index.php' => '/var/www/html/api/sls-mass-notify/index.php',
+			__DIR__ . '/api/sls-mass-notify/contract.php' => '/var/www/html/api/sls-mass-notify/contract.php',
+			__DIR__ . '/api/sls-mass-notify/security.php' => '/var/www/html/api/sls-mass-notify/security.php',
+			__DIR__ . '/api/sls-mass-notify/config-crypto.php' => '/var/www/html/api/sls-mass-notify/config-crypto.php',
+			__DIR__ . '/api/sls-mass-notify/event-log.php' => '/var/www/html/api/sls-mass-notify/event-log.php',
+			__DIR__ . '/api/sls-mass-notify/media.php' => '/var/www/html/api/sls-mass-notify/media.php',
+			__DIR__ . '/api/sls-mass-notify/media-policy.php' => '/var/www/html/api/sls-mass-notify/media-policy.php',
+			__DIR__ . '/api/sls-mass-notify/sms-callback.php' => '/var/www/html/api/sls-mass-notify/sms-callback.php',
+			__DIR__ . '/api/sls-mass-notify/trigger.php' => '/var/www/html/api/sls-mass-notify/trigger.php',
+			__DIR__ . '/api/sls-mass-notify/sms/Config.php' => '/var/www/html/api/sls-mass-notify/sms/Config.php',
+			__DIR__ . '/api/sls-mass-notify/sms/Store.php' => '/var/www/html/api/sls-mass-notify/sms/Store.php',
+            __DIR__ . '/api/sls-mass-notify/sms/Continuity.php' => '/var/www/html/api/sls-mass-notify/sms/Continuity.php',
+			__DIR__ . '/api/sls-mass-notify/sms/Provider.php' => '/var/www/html/api/sls-mass-notify/sms/Provider.php',
+			__DIR__ . '/api/sls-mass-notify/sms/Service.php' => '/var/www/html/api/sls-mass-notify/sms/Service.php',
+			__DIR__ . '/api/sls-mass-notify/sms/.htaccess' => '/var/www/html/api/sls-mass-notify/sms/.htaccess',
+			__DIR__ . '/api/sls-mass-notify/sms/vendor/twilio/RequestValidator.php' => '/var/www/html/api/sls-mass-notify/sms/vendor/twilio/RequestValidator.php',
+			__DIR__ . '/api/sls-mass-notify/sms/vendor/twilio/Values.php' => '/var/www/html/api/sls-mass-notify/sms/vendor/twilio/Values.php',
+			__DIR__ . '/api/sls-mass-notify/sms/vendor/twilio/LICENSE' => '/var/www/html/api/sls-mass-notify/sms/vendor/twilio/LICENSE',
+			__DIR__ . '/api/sls-mass-notify/sms/vendor/twilio/UPSTREAM.json' => '/var/www/html/api/sls-mass-notify/sms/vendor/twilio/UPSTREAM.json',
 			__DIR__ . '/api/sls-mass-notify/.htaccess' => '/var/www/html/api/sls-mass-notify/.htaccess',
 		];
 		foreach ($parityFiles as $source => $destination) {
@@ -12312,6 +14078,14 @@ PY;
 			'en_US-amy-low.onnx.json' => '2250a9a605b8dc35a116717fadc5056695dd809e34a15d02f72a0f52d53d3ebb',
 			'en_US-ryan-low.onnx' => '8d21a085cc4c0010f1f3e91d5008c8691277ccfa744eb0d747becd33a3444baf',
 			'en_US-ryan-low.onnx.json' => 'b27147e56b0525962609f82f58171f4618cbf17c6fb043d7d724ff28cc4aed60',
+			'es_ES-davefx-medium.onnx' => '6658b03b1a6c316ee4c265a9896abc1393353c2d9e1bca7d66c2c442e222a917',
+			'es_ES-davefx-medium.onnx.json' => '0e0dda87c732f6f38771ff274a6380d9252f327dca77aa2963d5fbdf9ec54842',
+			'fr_FR-siwis-medium.onnx' => '641d1ab097da2b81128c076810edb052b385decc8be3381814802a64a73baf99',
+			'fr_FR-siwis-medium.onnx.json' => '39479916c2db192b5ac9764daddd0c744d83e023ad890c6976c0633ae4df8959',
+			'de_DE-thorsten-low.onnx' => '9ac27fad17cec5c1a791161976a64f026f16fc058b400b1fea62565b8b2cf375',
+			'de_DE-thorsten-low.onnx.json' => 'df38e892ed949f62d0c40978bc666de0b341c5f7921840ae7c72f4df8e8ffa05',
+			'pt_BR-faber-medium.onnx' => '858555e3a064209c57088fe6bd70c4c3dc54d03eaa00c45d5ecaf43a33f95aa7',
+			'pt_BR-faber-medium.onnx.json' => '7e694de195ae3fc36dd732c445eb04fb49b649854893cb5506b978f0d50a1d6f',
 		];
 		foreach ($voiceHashes as $file => $expectedHash) {
 			$path = self::PIPER_VOICE_DIR . '/' . $file;
@@ -12351,8 +14125,8 @@ PY;
 			$accessOutput = [];
 			$accessStatus = 1;
 			@exec(
-				'/usr/sbin/runuser -u asterisk -- /usr/bin/test -w ' . escapeshellarg($spoolDir)
-				. ' && /usr/sbin/runuser -u asterisk -- /usr/bin/test -x ' . escapeshellarg($spoolDir)
+				$runAs . '/usr/bin/test -w ' . escapeshellarg($spoolDir)
+				. ' && ' . $runAs . '/usr/bin/test -x ' . escapeshellarg($spoolDir)
 				. ' 2>&1',
 				$accessOutput,
 				$accessStatus
@@ -12369,8 +14143,8 @@ PY;
 		foreach ([self::TONES_DIR, self::TTS_DIR] as $writableSoundDir) {
 			$accessStatus = 1;
 			@exec(
-				'/usr/sbin/runuser -u asterisk -- /usr/bin/test -w ' . escapeshellarg($writableSoundDir)
-				. ' && /usr/sbin/runuser -u asterisk -- /usr/bin/test -x ' . escapeshellarg($writableSoundDir)
+				$runAs . '/usr/bin/test -w ' . escapeshellarg($writableSoundDir)
+				. ' && ' . $runAs . '/usr/bin/test -x ' . escapeshellarg($writableSoundDir)
 				. ' 2>&1',
 				$accessOutput,
 				$accessStatus
@@ -12520,7 +14294,7 @@ PY;
 		$amiHealthOutput = [];
 		$amiHealthStatus = 1;
 		@exec(
-			'/usr/sbin/runuser -u asterisk -- /usr/bin/timeout 20 /usr/bin/python3 '
+			$runAs . '/usr/bin/timeout 20 /usr/bin/python3 '
 			. escapeshellarg(self::VISUAL_PUSH_SCRIPT) . ' --ami-health-json 2>/dev/null',
 			$amiHealthOutput,
 			$amiHealthStatus
@@ -12532,12 +14306,12 @@ PY;
 			|| ($amiHealth['ping'] ?? '') !== 'pong'
 			|| !in_array(($amiHealth['pjsip_show_contacts'] ?? ''), ['authorized', 'authorized_empty'], true)
 			|| ($amiHealth['pjsip_notify'] ?? '') !== 'authorized') {
-			throw new \RuntimeException(_('Post-restore verification could not complete the authenticated Asterisk Manager capability checks.'));
+			throw new \RuntimeException(_('Post-restore verification could not complete the authenticated Asterisk Manager capability checks.') . ' ' . $this->amiEndpointDiagnostic($ami));
 		}
 		$notifyCapabilityOutput = [];
 		$notifyCapabilityStatus = 1;
 		@exec(
-			'/usr/sbin/runuser -u asterisk -- /usr/bin/timeout 20 /usr/bin/python3 '
+			$runAs . '/usr/bin/timeout 20 /usr/bin/python3 '
 			. escapeshellarg(self::VISUAL_PUSH_SCRIPT) . ' --notify-capabilities-json 2>/dev/null',
 			$notifyCapabilityOutput,
 			$notifyCapabilityStatus
@@ -12557,7 +14331,7 @@ PY;
 		$endpointOutput = [];
 		$endpointStatus = 1;
 		@exec(
-			'/usr/sbin/runuser -u asterisk -- /usr/bin/timeout 20 /usr/bin/python3 '
+			$runAs . '/usr/bin/timeout 20 /usr/bin/python3 '
 			. escapeshellarg(self::VISUAL_PUSH_SCRIPT) . ' --list-endpoints-json 2>/dev/null',
 			$endpointOutput,
 			$endpointStatus
@@ -12566,9 +14340,14 @@ PY;
 		if ($endpointStatus !== 0 || !is_array($endpointJson)) {
 			throw new \RuntimeException(_('Post-restore verification could not complete an authenticated Asterisk Manager inventory request.'));
 		}
-		$pythonSyntaxCommand = '/usr/bin/python3 -c '
+		$pythonSyntaxCommand = '/usr/bin/python3 -I -c '
 			. escapeshellarg('import pathlib,sys; [compile(pathlib.Path(p).read_text(encoding="utf-8"), p, "exec") for p in sys.argv[1:]]')
 			. ' ' . escapeshellarg(self::RUNTIME_DIR . '/sls_notify.py')
+			. ' ' . escapeshellarg(self::RUNTIME_DIR . '/sls_phone_admission.py')
+			. ' ' . escapeshellarg(self::RUNTIME_DIR . '/sls_phone_events.py')
+			. ' ' . escapeshellarg(self::RUNTIME_DIR . '/sls_phone_outcomes.py')
+			. ' ' . escapeshellarg(self::RUNTIME_DIR . '/sls_outbound_routes.py')
+			. ' ' . escapeshellarg(self::RUNTIME_DIR . '/sls_mass_notify_phone_agi.py')
 			. ' ' . escapeshellarg(self::RUNTIME_DIR . '/sls_mass_notify_xweather_poll.py')
 			. ' ' . escapeshellarg(self::RUNTIME_DIR . '/sls_notification_destinations.py')
 			. ' ' . escapeshellarg(self::RUNTIME_DIR . '/sls_system_notifications.py')
@@ -12581,6 +14360,10 @@ PY;
 			'/usr/bin/php -l ' . escapeshellarg(self::RUNTIME_DIR . '/sls_mass_notify_announcement_worker.php'),
 			'/usr/bin/php -l ' . escapeshellarg(self::RUNTIME_DIR . '/sls_announcement_jobs.php'),
 			'/usr/bin/php -l ' . escapeshellarg(__DIR__ . '/AnnouncementDelivery.php'),
+			'/usr/bin/php -l ' . escapeshellarg(__DIR__ . '/AnnouncementAdmission.php'),
+			'/usr/bin/php -l ' . escapeshellarg(__DIR__ . '/ScheduledDelivery.php'),
+			'/usr/bin/php -l ' . escapeshellarg(__DIR__ . '/SchedulePresentation.php'),
+			'/usr/bin/php -l ' . escapeshellarg(__DIR__ . '/UpdatePolicy.php'),
 			'/bin/bash -n ' . escapeshellarg(self::RUNTIME_DIR . '/sls_mass_notify_nws_poll.sh'),
 			'/bin/bash -n ' . escapeshellarg(self::RUNTIME_DIR . '/sls_mass_notify_weather_poll.sh'),
 			'/bin/bash -n ' . escapeshellarg(self::RUNTIME_DIR . '/sls_mass_notify_update.sh'),
@@ -12589,12 +14372,12 @@ PY;
 			'/bin/bash -n ' . escapeshellarg(self::RUNTIME_DIR . '/sls_mass_notify_test.sh'),
 			'/bin/bash -n ' . escapeshellarg(self::RUNTIME_DIR . '/sls_mass_notify_install_piper_voices.sh'),
 			$pythonSyntaxCommand,
-			'/usr/sbin/apache2ctl configtest',
-			'/usr/sbin/runuser -u asterisk -- /usr/bin/timeout 20 '
+			$runAs . '/usr/bin/timeout 20 '
 				. escapeshellarg(self::RUNTIME_DIR . '/sls_mass_notify_schedule_worker.php') . ' --self-test',
-			'/usr/sbin/runuser -u asterisk -- /usr/bin/timeout 10 /usr/bin/php '
+			$runAs . '/usr/bin/timeout 10 /usr/bin/php '
 				. escapeshellarg(self::RUNTIME_DIR . '/sls_mass_notify_announcement_worker.php') . ' --health-check --record-health',
 		];
+		if ($rootChecks) { $syntaxCommands[] = '/usr/sbin/apache2ctl configtest'; }
 		foreach ($syntaxCommands as $command) {
 			$output = [];
 			$status = 1;
@@ -12608,26 +14391,25 @@ PY;
 			'/api/sipnotify/desktop' => ['401', '429'],
 			'/api/sipnotify/desktop/stream' => ['401', '429'],
 			'/api/sls-mass-notify/' => ['401', '403', '405', '429'],
+			'/api/sls-mass-notify/sms-callback.php' => ['405'],
 		];
 		foreach ($apiChecks as $path => $allowedCodes) {
-			$targets = [
-				['url' => 'https://127.0.0.1' . $path, 'resolve' => ''],
-				['url' => 'http://127.0.0.1' . $path, 'resolve' => ''],
-			];
-			if (preg_match('/^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/', $probeHost)) {
-				$targets[] = ['url' => 'https://' . $probeHost . $path, 'resolve' => $probeHost . ':443:127.0.0.1'];
-				$targets[] = ['url' => 'http://' . $probeHost . $path, 'resolve' => $probeHost . ':80:127.0.0.1'];
-			}
+			$targets = SlsLocalWebProbe::targets($probeHost);
+			$probeDeadline = microtime(true) + 25;
 			$accepted = false;
 			foreach ($targets as $target) {
+				$remainingSeconds = (int)ceil($probeDeadline - microtime(true));
+				if ($remainingSeconds < 1) {
+					break;
+				}
 				$curlCommand = '/usr/bin/curl -ksS --noproxy ' . escapeshellarg('*')
-					. ' --connect-timeout 5 --max-time 15 -o /dev/null -w ' . escapeshellarg('%{http_code}');
+					. ' --connect-timeout 5 --max-time ' . min(15, $remainingSeconds) . ' -o /dev/null -w ' . escapeshellarg('%{http_code}');
 				if ($target['resolve'] !== '') {
 					$curlCommand .= ' --resolve ' . escapeshellarg($target['resolve']);
 				}
 				$probeOutput = [];
 				$probeStatus = 1;
-				@exec($curlCommand . ' ' . escapeshellarg($target['url']) . ' 2>/dev/null', $probeOutput, $probeStatus);
+				@exec($curlCommand . ' ' . escapeshellarg($target['url'] . $path) . ' 2>/dev/null', $probeOutput, $probeStatus);
 				$probeCode = trim(implode('', $probeOutput));
 				if ($probeStatus === 0 && in_array($probeCode, $allowedCodes, true)) {
 					$accepted = true;
@@ -12635,9 +14417,11 @@ PY;
 				}
 			}
 			if (!$accepted) {
-				throw new \RuntimeException(sprintf(_('Post-restore verification could not reach the protected local API route: %s.'), $path));
+				throw new \RuntimeException(sprintf(_('Post-restore verification could not reach the protected local API route %s on the detected local Apache ports. Check Apache virtual-host routing and the application error log.'), $path));
 			}
 		}
+		$mediaProbe = SlsLocalWebProbe::mediaAccess($settings);
+		if (!$mediaProbe['ok']) { throw new \RuntimeException($mediaProbe['message']); }
 		$this->verifyNativeLocalApiAuthentication($settings);
 		foreach (['slsmassnotifyserver', 'dashboard', 'framework'] as $module) {
 			if (!$this->FreePBX->Modules->checkStatus($module)) {
@@ -12735,66 +14519,9 @@ PY;
 
 	private function nativeLocalApiProbeResponses(array $settings, $path, array $headers, $timeoutSeconds)
 	{
-		$path = (string)$path;
-		if (!preg_match('#^/[A-Za-z0-9/_?&=.-]{1,511}$#D', $path)) {
-			throw new \RuntimeException(_('Post-restore verification rejected an invalid local API probe path.'));
-		}
-		$headerText = '';
-		foreach ($headers as $header) {
-			$header = trim((string)$header);
-			if ($header === '' || strpos($header, "\r") !== false || strpos($header, "\n") !== false) {
-				throw new \RuntimeException(_('Post-restore verification rejected an invalid local API probe header.'));
-			}
-			$headerText .= $header . "\r\n";
-		}
-		$hosts = ['127.0.0.1'];
-		$publicHost = strtolower(trim((string)($settings['public_pbx_host'] ?? '')));
-		if (preg_match('/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/D', $publicHost)
-			&& !in_array($publicHost, ['127.0.0.1', 'localhost'], true)) {
-			$hosts[] = $publicHost;
-		}
-		$timeoutSeconds = max(2, min(10, (int)$timeoutSeconds));
-		foreach ($hosts as $host) {
-			$hostHeader = $host === '127.0.0.1' ? '' : 'Host: ' . $host . "\r\n";
-			$context = stream_context_create([
-				'http' => [
-					'method' => 'GET',
-					'header' => $hostHeader . $headerText . "Connection: close\r\n",
-					'timeout' => $timeoutSeconds,
-					'ignore_errors' => true,
-					'follow_location' => 0,
-					'max_redirects' => 0,
-				],
-				'ssl' => [
-					'verify_peer' => false,
-					'verify_peer_name' => false,
-					'peer_name' => $host,
-					'SNI_enabled' => true,
-				],
-			]);
-			foreach (['http', 'https'] as $scheme) {
-				$http_response_header = [];
-				$body = @file_get_contents(
-					$scheme . '://127.0.0.1' . $path,
-					false,
-					$context,
-					0,
-					262144
-				);
-				$responseHeaders = is_array($http_response_header) ? $http_response_header : [];
-				$status = 0;
-				foreach ($responseHeaders as $responseHeader) {
-					if (preg_match('#^HTTP/\S+\s+([0-9]{3})(?:\s|$)#i', (string)$responseHeader, $matches)) {
-						$status = (int)$matches[1];
-					}
-				}
-				yield [
-					'status' => $status,
-					'headers' => $responseHeaders,
-					'body' => is_string($body) ? $body : '',
-				];
-			}
-		}
+		yield from SlsLocalWebProbe::responses(
+			(string)($settings['public_pbx_host'] ?? ''), $path, $headers, $timeoutSeconds
+		);
 	}
 
 	private function clearSuccessfulInstallFailureState()

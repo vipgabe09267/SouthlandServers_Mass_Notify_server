@@ -2,6 +2,10 @@
 $announcementTargets = is_array($announcement_targets ?? null) ? $announcement_targets : [];
 $announcementGroupTargets = is_array($announcement_group_targets ?? null) ? $announcement_group_targets : $announcementTargets;
 $desktopClients = is_array($announcement_desktop_clients ?? null) ? $announcement_desktop_clients : [];
+$voiceRecipients = is_array($outbound_voice_recipients ?? null) ? $outbound_voice_recipients : [];
+$emailRecipients = array_map(static function ($row) { return ['id' => (string)($row['id'] ?? ''), 'name' => (string)($row['name'] ?? '')]; }, array_values(array_filter((array)($announcement_email_recipients ?? []), 'is_array')));
+$smsRecipients = array_map(static function ($row) { return ['id' => (string)($row['id'] ?? ''), 'name' => (string)($row['name'] ?? '')]; }, array_values(array_filter((array)($announcement_sms_recipients ?? []), 'is_array')));
+$recipientSelectionView = $recipient_selection_view ?? dirname(__DIR__, 3) . '/views/recipient_selection.php';
 $announcementWebhooks = is_array($announcement_webhooks ?? null) ? $announcement_webhooks : [];
 $announcementGroups = is_array($announcement_groups ?? null) ? $announcement_groups : [];
 $announcementCooldown = (int)($announcement_cooldown_remaining ?? 0);
@@ -289,7 +293,15 @@ foreach ($desktopClients as $desktopClient) {
 	font-weight: 700;
 	margin-bottom: 8px;
 }
+#dashboard-sls-mass-notify-announcement .sls-preview-actions { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); max-width:640px; gap:8px; margin:12px 0 8px; }
+#dashboard-sls-mass-notify-announcement .sls-preview-actions .btn { min-height:36px; padding:7px 12px; font-size:13px; }
+#dashboard-sls-mass-notify-announcement .sls-rendered-preview { max-width:640px; padding:14px; margin:8px 0 14px; border:1px solid #d9e2eb; border-radius:6px; background:#f7f9fc; }
+#dashboard-sls-mass-notify-announcement .sls-rendered-preview img { display:block; width:480px; max-width:100%; height:auto; border-radius:4px; margin:10px 0; }
+#dashboard-sls-mass-notify-announcement .sls-rendered-preview audio { display:block; width:100%; max-width:480px; margin:10px 0; }
+#dashboard-sls-mass-notify-announcement .sls-preview-text { white-space:pre-wrap; overflow-wrap:anywhere; margin-top:8px; }
 @media (max-width: 767px) {
+	#dashboard-sls-mass-notify-announcement .sls-preview-actions { grid-template-columns:repeat(2,minmax(0,1fr)); }
+	#dashboard-sls-mass-notify-announcement .sls-preview-actions .btn { white-space:normal; overflow-wrap:anywhere; }
 	#dashboard-sls-mass-notify-announcement .sls-destination-grid,
 	#dashboard-sls-mass-notify-announcement .sls-composer-grid { grid-template-columns: minmax(0, 1fr); }
 	#dashboard-sls-mass-notify-announcement .sls-action-row { align-items: stretch; flex-direction: column; }
@@ -343,14 +355,15 @@ foreach ($desktopClients as $desktopClient) {
 	<div id="dashboard-sls-mass-notify-group-result" role="status" aria-live="polite" style="display: none;"></div>
 	<p class="sls-widget-intro"><?php echo _('Choose destinations, write the message, and select how it should be delivered.'); ?></p>
 	<form id="dashboard-sls-mass-notify-announcement-form" method="post" action="config.php?display=slsmassnotifyserver">
+		<?php $recipient_selection_form_id = 'dashboard-sls-mass-notify-announcement-form'; $recipient_selection_keys = ['announcement_extensions', 'announcement_groups', 'announcement_desktop_clients', 'announcement_webhooks', 'voice_recipient_ids', 'announcement_email_recipient_ids', 'announcement_sms_recipient_ids']; include $recipientSelectionView; ?>
 		<input type="hidden" name="slsmassnotifyserver_action" value="send_announcement">
 		<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
-		<section class="sls-step-card" aria-labelledby="sls-dashboard-destinations-heading">
+		<section class="sls-step-card" data-sls-picker="announcement" aria-labelledby="sls-dashboard-destinations-heading">
 			<div class="sls-step-heading" id="sls-dashboard-destinations-heading"><span class="sls-step-number">1</span><?php echo _('Destinations'); ?></div>
 			<p class="sls-step-subtitle"><?php echo _('Select a saved group, or expand a destination type for individual targets.'); ?></p>
 			<div class="sls-groups-toolbar">
 				<label><?php echo _('Announcement Groups'); ?> <span class="badge" id="dashboard-announcement-group-count"><?php echo count($announcementGroups); ?></span></label>
-				<button type="button" class="btn btn-xs btn-default" id="dashboard-announcement-new-group" <?php echo empty($announcementGroupTargets) && empty($desktopClients) ? 'disabled' : ''; ?>><i class="fa fa-plus" aria-hidden="true"></i> <?php echo _('New Group'); ?></button>
+				<button type="button" class="btn btn-xs btn-default" id="dashboard-announcement-new-group" <?php echo empty($announcementGroupTargets) && empty($desktopClients) && empty($voiceRecipients) && empty($emailRecipients) && empty($smsRecipients) && empty($announcementWebhooks) ? 'disabled' : ''; ?>><i class="fa fa-plus" aria-hidden="true"></i> <?php echo _('New Group'); ?></button>
 			</div>
 			<div id="dashboard-announcement-groups" class="sls-group-list"></div>
 			<div class="sls-destination-grid">
@@ -414,6 +427,17 @@ foreach ($desktopClients as $desktopClient) {
 						<?php } ?>
 					</div>
 				</details>
+				<?php $email_selector_field = 'announcement_email_recipient_ids'; include dirname($recipientSelectionView) . '/announcement_email_selector.php'; ?>
+				<?php $sms_selector_field = 'announcement_sms_recipient_ids'; include dirname($recipientSelectionView) . '/announcement_sms_selector.php'; ?>
+				<details class="sls-destination-panel">
+					<summary><i class="fa fa-phone-square" aria-hidden="true"></i><span class="sls-destination-label"><?php echo _('External Voice'); ?></span><span class="sls-destination-count"><?php echo count($voiceRecipients); ?></span><i class="fa fa-chevron-down sls-destination-chevron" aria-hidden="true"></i></summary>
+					<div class="sls-destination-body">
+						<?php if (empty($voiceRecipients)) { ?><p class="help-block sls-compact-help"><?php echo _('Enable external voice and save recipients in General Settings.'); ?></p><?php } else { ?>
+						<div class="sls-target-list"><?php foreach ($voiceRecipients as $recipient) { ?><div class="checkbox"><label><input type="checkbox" name="voice_recipient_ids[]" value="<?php echo htmlspecialchars((string)($recipient['id'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>"> <?php echo htmlspecialchars((string)($recipient['name'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?> <span class="text-muted"><?php echo htmlspecialchars((string)($recipient['number'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?></span></label></div><?php } ?></div>
+						<p class="help-block sls-compact-help"><?php echo _('External recipients receive calls with the selected announcement audio. Choose an audio mode; text-only delivery cannot call external numbers.'); ?></p>
+						<?php } ?>
+					</div>
+				</details>
 				<details class="sls-destination-panel">
 					<summary>
 						<i class="fa fa-paper-plane" aria-hidden="true"></i>
@@ -438,7 +462,7 @@ foreach ($desktopClients as $desktopClient) {
 					</div>
 				</details>
 			</div>
-			<p class="help-block sls-compact-help"><?php echo _('Groups may include phones and desktop apps. Offline phones are skipped at send time.'); ?></p>
+			<p class="help-block sls-compact-help"><?php echo _('Groups may include phones, desktop apps, external voice and saved email or SMS recipients. Offline phones are skipped at send time.'); ?></p>
 		</section>
 		<section class="sls-step-card" aria-labelledby="sls-dashboard-message-heading">
 			<div class="sls-step-heading" id="sls-dashboard-message-heading"><span class="sls-step-number">2</span><?php echo _('Message and delivery'); ?></div>
@@ -446,7 +470,7 @@ foreach ($desktopClients as $desktopClient) {
 				<div>
 					<label for="dashboard_announcement_body"><?php echo _('Announcement Message'); ?></label>
 					<textarea class="form-control" id="dashboard_announcement_body" name="announcement_body" rows="3" maxlength="500" placeholder="<?php echo htmlspecialchars(_('Type the announcement')); ?>" aria-describedby="dashboard-announcement-message-help dashboard-announcement-character-count"></textarea>
-					<div id="dashboard-announcement-message-help" class="help-block sls-compact-help"><?php echo _('Shown on visual destinations and read aloud when TTS is enabled.'); ?></div>
+					<div id="dashboard-announcement-message-help" class="help-block sls-compact-help"><?php echo _('Shown on visual destinations, included in email or SMS, and read aloud when TTS is enabled.'); ?></div>
 					<span id="dashboard-announcement-character-count" class="sls-message-count">0 / 500</span>
 				</div>
 				<div class="sls-option-box">
@@ -472,6 +496,7 @@ foreach ($desktopClients as $desktopClient) {
 					<select class="form-control" id="dashboard_announcement_opening_tone" name="announcement_opening_tone">
 						<option value=""><?php echo _('None'); ?></option>
 						<?php foreach ($announcementTones as $tone) { ?><option value="<?php echo htmlspecialchars($tone); ?>" <?php echo ($announcementState['opening_tone'] ?? '') === $tone ? 'selected' : ''; ?>><?php echo htmlspecialchars(str_replace('_', ' ', $tone)); ?></option><?php } ?>
+						<?php include ($system_recording_options_view ?? dirname(__DIR__, 3).'/views/system_recording_options.php'); ?>
 					</select>
 				</div>
 				<div>
@@ -479,6 +504,7 @@ foreach ($desktopClients as $desktopClient) {
 					<select class="form-control" id="dashboard_announcement_closing_tone" name="announcement_closing_tone">
 						<option value=""><?php echo _('None'); ?></option>
 						<?php foreach ($announcementTones as $tone) { ?><option value="<?php echo htmlspecialchars($tone); ?>" <?php echo ($announcementState['closing_tone'] ?? '') === $tone ? 'selected' : ''; ?>><?php echo htmlspecialchars(str_replace('_', ' ', $tone)); ?></option><?php } ?>
+						<?php include ($system_recording_options_view ?? dirname(__DIR__, 3).'/views/system_recording_options.php'); ?>
 					</select>
 				</div>
 			</div>
@@ -495,7 +521,7 @@ foreach ($desktopClients as $desktopClient) {
 						</div>
 					</div>
 					<div class="col-sm-5">
-						<label><?php echo _('Preview'); ?></label>
+						<label><?php echo _('Color sample'); ?></label>
 						<div class="sls-color-preview" id="dashboard_announcement_color_preview">
 							<div class="sls-color-preview-title" id="dashboard_announcement_preview_title">Announcement</div>
 							<div id="dashboard_announcement_preview_body"><?php echo _('Announcement text'); ?></div>
@@ -505,6 +531,17 @@ foreach ($desktopClients as $desktopClient) {
 			</div>
 			<p class="help-block sls-compact-help"><?php echo _('Opening and closing sounds are included only when a tone audio mode is selected.'); ?></p>
 		</section>
+		<div class="sls-preview-actions" aria-label="<?php echo _('Message previews'); ?>">
+			<button type="button" class="btn btn-default btn-sm" data-announcement-preview="image"><i class="fa fa-picture-o" aria-hidden="true"></i> <?php echo _('Preview phone image'); ?></button>
+			<button type="button" class="btn btn-default btn-sm" data-announcement-preview="internal_speech"><i class="fa fa-volume-up" aria-hidden="true"></i> <?php echo _('Listen: internal'); ?></button>
+			<button type="button" class="btn btn-default btn-sm" data-announcement-preview="external_speech"><i class="fa fa-phone" aria-hidden="true"></i> <?php echo _('Listen: external'); ?></button>
+            <button type="button" class="btn btn-default btn-sm" data-announcement-preview="sms"><i class="fa fa-commenting-o" aria-hidden="true"></i> <?php echo _('Preview SMS'); ?></button>
+		</div>
+		<div class="sls-rendered-preview" id="sls-rendered-preview" hidden aria-busy="false">
+			<div id="sls-preview-status" role="status" aria-live="polite"></div>
+			<div id="sls-preview-media"></div>
+			<div id="sls-preview-text" class="sls-preview-text"></div>
+		</div>
 		<div class="sls-priority-field">
 			<label for="sls-announcement-priority"><?php echo _('Priority'); ?></label>
 			<select class="form-control" name="announcement_priority" id="sls-announcement-priority" aria-describedby="sls-priority-help">
@@ -526,6 +563,7 @@ foreach ($desktopClients as $desktopClient) {
 		<div class="modal-dialog" role="document">
 			<div class="modal-content">
 				<form id="dashboard-announcement-group-form">
+					<?php $recipient_selection_form_id = 'dashboard-announcement-group-form'; $recipient_selection_keys = ['group_extensions', 'group_desktop_clients', 'group_voice_recipient_ids', 'group_email_recipient_ids', 'group_sms_recipient_ids', 'group_webhook_ids']; include $recipientSelectionView; ?>
 					<div class="modal-header">
 						<button type="button" class="close" data-dismiss="modal" aria-label="<?php echo htmlspecialchars(_('Close')); ?>"><span aria-hidden="true">&times;</span></button>
 						<h4 class="modal-title"><?php echo _('Announcement Group'); ?></h4>
@@ -580,6 +618,16 @@ foreach ($desktopClients as $desktopClient) {
 								</div>
 							<?php } ?>
 						</div>
+						<?php $email_selector_field = 'group_email_recipient_ids'; include dirname($recipientSelectionView) . '/announcement_email_selector.php'; ?>
+						<?php $sms_selector_field = 'group_sms_recipient_ids'; include dirname($recipientSelectionView) . '/announcement_sms_selector.php'; ?>
+                        <?php $webhook_selector_field = 'group_webhook_ids'; include dirname($recipientSelectionView) . '/audience_webhook_selector.php'; ?>
+						<div class="form-group">
+							<label><?php echo _('External Voice Recipients'); ?></label>
+							<div id="dashboard-group-unavailable-voice"></div>
+							<?php if (empty($voiceRecipients)) { ?><p class="text-muted"><?php echo _('No enabled external voice recipients are configured.'); ?></p><?php } else { ?>
+							<div class="sls-target-list"><?php foreach ($voiceRecipients as $recipient) { ?><div class="checkbox"><label><input type="checkbox" name="group_voice_recipient_ids[]" value="<?php echo htmlspecialchars((string)($recipient['id'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>"> <?php echo htmlspecialchars((string)($recipient['name'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?> <span class="text-muted"><?php echo htmlspecialchars((string)($recipient['number'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?></span></label></div><?php } ?></div>
+							<?php } ?>
+						</div>
 					</div>
 					<div class="modal-footer">
 						<button type="button" class="btn btn-default" data-dismiss="modal"><?php echo _('Cancel'); ?></button>
@@ -594,7 +642,12 @@ foreach ($desktopClients as $desktopClient) {
 (function() {
 	var initialGroups = <?php echo json_encode(array_values($announcementGroups), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
 	var onlineExtensions = <?php echo json_encode(array_values(array_map(static function ($target) { return (string)($target['extension'] ?? ''); }, $announcementTargets)), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
-	var desktopClients = <?php echo json_encode(array_values($desktopClients), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
+	var desktopClients = <?php echo json_encode(array_values(array_map(static function ($client) {
+		return array_intersect_key($client, array_flip(['client_id', 'name', 'username', 'enabled']));
+	}, $desktopClients)), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_INVALID_UTF8_SUBSTITUTE); ?>;
+	var emailRecipients = <?php echo json_encode($emailRecipients, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_INVALID_UTF8_SUBSTITUTE); ?>;
+	var smsRecipients = <?php echo json_encode($smsRecipients, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_INVALID_UTF8_SUBSTITUTE); ?>;
+	var voiceRecipients = <?php echo json_encode(array_values($voiceRecipients), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_INVALID_UTF8_SUBSTITUTE); ?>;
 	var root = document.getElementById('dashboard-sls-mass-notify-announcement');
 	if (!root || root.getAttribute('data-ready') === '1') {
 		return;
@@ -608,6 +661,7 @@ foreach ($desktopClients as $desktopClient) {
 		disposed: false,
 		intervals: [],
 		timeouts: [],
+		events: [],
 		resizeObserver: null,
 		resizeHandler: null,
 		dispose: function() {
@@ -619,6 +673,8 @@ foreach ($desktopClients as $desktopClient) {
 			this.timeouts.forEach(function(timer) { window.clearTimeout(timer); });
 			this.intervals = [];
 			this.timeouts = [];
+			this.events.forEach(function(binding) { binding[0].removeEventListener(binding[1], binding[2]); });
+			this.events = [];
 			if (this.resizeObserver) {
 				this.resizeObserver.disconnect();
 				this.resizeObserver = null;
@@ -741,7 +797,14 @@ foreach ($desktopClients as $desktopClient) {
 		colorDesigner.style.display = enabled ? 'block' : 'none';
 		colorDesigner.setAttribute('aria-hidden', enabled ? 'false' : 'true');
 		if (colorPreview && colorInput) {
-			colorPreview.style.backgroundColor = colorInput.value || '#1f2937';
+			var background = /^#[0-9a-f]{6}$/i.test(colorInput.value) ? colorInput.value : '#1f2937';
+			var channels = [1, 3, 5].map(function (offset) {
+				var value = parseInt(background.slice(offset, offset + 2), 16) / 255;
+				return value <= 0.04045 ? value / 12.92 : Math.pow((value + 0.055) / 1.055, 2.4);
+			});
+			var luminance = channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+			colorPreview.style.backgroundColor = background;
+			colorPreview.style.color = (luminance + 0.05) / 0.05 > 1.05 / (luminance + 0.05) ? '#000000' : '#ffffff';
 		}
 		if (previewTitle && titleInput) {
 			previewTitle.textContent = titleInput.value.trim() || 'Announcement';
@@ -759,6 +822,71 @@ foreach ($desktopClients as $desktopClient) {
 			scheduleDashboardLayout();
 		}
 	}
+	var renderedPreview = document.getElementById('sls-rendered-preview');
+	var previewStatus = document.getElementById('sls-preview-status');
+	var previewMedia = document.getElementById('sls-preview-media');
+	var previewText = document.getElementById('sls-preview-text');
+	var previewButtons = root.querySelectorAll('[data-announcement-preview]');
+	function previewInputs() {
+		return {message: messageInput.value, title: titleInput.value, color: colorInput.value};
+	}
+	function clearPreviewMedia() {
+		var audio = previewMedia.querySelector('audio');
+		if (audio) { audio.pause(); audio.removeAttribute('src'); audio.load(); }
+		previewMedia.textContent = ''; previewText.textContent = '';
+	}
+	previewButtons.forEach(function (button) {
+		button.addEventListener('click', function () {
+			var values = previewInputs();
+			var snapshot = JSON.stringify(values);
+			var body = new FormData();
+			body.append('slsmassnotifyserver_action', 'preview_announcement');
+			body.append('slsmassnotifyserver_csrf', <?php echo json_encode($csrfToken); ?>);
+			body.append('kind', button.getAttribute('data-announcement-preview'));
+			Object.keys(values).forEach(function (key) { body.append(key, values[key]); });
+			clearPreviewMedia(); renderedPreview.hidden = false; renderedPreview.setAttribute('aria-busy', 'true');
+			previewStatus.textContent = 'Preparing preview…';
+			previewButtons.forEach(function (item) { item.disabled = true; });
+			scheduleDashboardLayout();
+			fetch(form.action, {method:'POST', credentials:'same-origin', cache:'no-store', body:body})
+				.then(function (response) { return response.json(); })
+				.then(function (data) {
+					if (!instanceActive()) return;
+					if (snapshot !== JSON.stringify(previewInputs())) { previewStatus.textContent = 'The message changed. Prepare a new preview.'; return; }
+					if (!data.success) { previewStatus.textContent = data.message || 'The preview failed. Check installation diagnostics.'; return; }
+                    if (data.kind === 'sms') {
+                        if (!Number.isInteger(data.segments) || data.segments < 1 || typeof data.text !== 'string' || typeof data.currency !== 'string') { throw new Error('Invalid SMS preview'); }
+                        previewStatus.textContent = data.segments + ' segment(s) per recipient · ' + data.encoding + ' · budgeted ' + (data.budgeted_cost_micros / 1000000).toFixed(4) + ' ' + data.currency + ' per recipient.' + (data.within_limit ? '' : ' Exceeds the configured maximum of ' + data.max_segments + ' segments; sending will be rejected.');
+                        previewText.textContent = data.text;
+                        return;
+                    }
+					if (typeof data.data !== 'string' || data.data.length > 14000000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(data.data)
+						|| ['image/png','audio/wav'].indexOf(data.mime) < 0) { throw new Error('Invalid preview response'); }
+					var media = document.createElement(data.mime === 'image/png' ? 'img' : 'audio');
+					media.src = 'data:' + data.mime + ';base64,' + data.data;
+					if (data.mime === 'image/png') {
+						media.alt = 'Rendered announcement for a 480 by 272 pixel phone display';
+						media.width = 480; media.height = 272;
+						previewStatus.textContent = data.text_clipped ? 'This phone image cannot show the complete message. Shorten it or use speech for the full instructions.' : 'Phone image · 480 × 272. Text-only phone displays may differ.';
+					} else {
+						media.controls = true; media.preload = 'metadata';
+						previewStatus.textContent = 'Speech preview · ' + (button.getAttribute('data-announcement-preview') === 'external_speech' ? 'external calls' : 'internal phones') + '. Opening and closing tones are not included.';
+						previewText.textContent = data.speech_text || '';
+					}
+					previewMedia.appendChild(media);
+				}).catch(function () { if (instanceActive()) previewStatus.textContent = 'The preview response was interrupted. Reload the page if your session expired, then try again.'; })
+				.finally(function () {
+					if (!instanceActive()) return;
+					renderedPreview.setAttribute('aria-busy', 'false');
+					previewButtons.forEach(function (item) { item.disabled = false; }); scheduleDashboardLayout();
+				});
+		});
+	});
+	[messageInput, titleInput, colorInput].forEach(function (input) {
+		input.addEventListener('input', function () {
+			if (!renderedPreview.hidden) { clearPreviewMedia(); previewStatus.textContent = 'The message changed. Prepare a new preview.'; }
+		});
+	});
 	if (audioMode) {
 		audioMode.addEventListener('change', renderAudioOptions);
 	}
@@ -827,6 +955,19 @@ foreach ($desktopClients as $desktopClient) {
 					return desktopLookup[username] || username;
 				}).join(', '));
 			}
+			if ((group.email_recipient_ids || []).length) {
+				groupParts.push('Email: ' + (group.email_recipient_ids || []).map(function(id) { var recipient = emailRecipients.find(function(row) { return row.id === id; }); return recipient ? recipient.name : 'Unavailable email recipient'; }).join(', '));
+			}
+			if ((group.sms_recipient_ids || []).length) {
+				groupParts.push('SMS: ' + (group.sms_recipient_ids || []).map(function(id) { var recipient = smsRecipients.find(function(row) { return row.id === id; }); return recipient ? recipient.name : 'Unavailable SMS recipient'; }).join(', '));
+			}
+			if ((group.voice_recipient_ids || []).length) {
+				groupParts.push('External voice: ' + (group.voice_recipient_ids || []).map(function(id) {
+					var recipient = voiceRecipients.find(function(row) { return row.id === id; });
+					return recipient ? recipient.name + ' (' + recipient.number + ')' : 'Unavailable recipient';
+				}).join(', '));
+			}
+			if ((group.webhook_ids || []).length) { groupParts.push('Webhooks: ' + group.webhook_ids.length); }
 			muted.textContent = '(' + groupParts.join(' | ') + ')';
 			label.appendChild(muted);
 			row.appendChild(label);
@@ -834,6 +975,10 @@ foreach ($desktopClients as $desktopClient) {
 			edit.type = 'button';
 			edit.className = 'btn btn-link btn-xs';
 			edit.textContent = 'Edit';
+			if (group.location_snapshot) {
+				edit.disabled = true; edit.textContent = 'Location snapshot';
+				edit.title = 'Create a new audience from Locations to change these recipients.';
+			}
 			edit.addEventListener('click', function() { openGroupModal(group); });
 			row.appendChild(edit);
 			var del = document.createElement('button');
@@ -858,6 +1003,24 @@ foreach ($desktopClients as $desktopClient) {
 		(group.desktop_clients || []).forEach(function(username) { selectedDesktops[username] = true; });
 		Array.prototype.forEach.call(groupForm.querySelectorAll('input[name="group_desktop_clients[]"]'), function(input) {
 			input.checked = !!selectedDesktops[input.value];
+		});
+		document.getElementById('sls-group-email-recipient-ids').slsEmailSelection(group.email_recipient_ids || []);
+		document.getElementById('sls-group-sms-recipient-ids').slsSmsSelection(group.sms_recipient_ids || []);
+        document.getElementById('sls-group-webhook-ids').slsWebhookSelection(group.webhook_ids || []);
+		var selectedVoice = {};
+		(group.voice_recipient_ids || []).forEach(function(id) { selectedVoice[id] = true; });
+		Array.prototype.forEach.call(groupForm.querySelectorAll('input[name="group_voice_recipient_ids[]"]'), function(input) {
+			input.checked = !!selectedVoice[input.value];
+		});
+		var unavailableVoice = document.getElementById('dashboard-group-unavailable-voice');
+		unavailableVoice.textContent = '';
+		(group.voice_recipient_ids || []).forEach(function(id) {
+			if (voiceRecipients.some(function(recipient) { return recipient.id === id; })) return;
+			var row = document.createElement('div'), label = document.createElement('label'), input = document.createElement('input');
+			row.className = 'checkbox text-warning';
+			input.type = 'checkbox'; input.name = 'group_voice_recipient_ids[]'; input.value = id; input.checked = true;
+			label.appendChild(input); label.appendChild(document.createTextNode(' Unavailable external recipient (' + id + ') — remove this selection or re-enable the recipient.'));
+			row.appendChild(label); unavailableVoice.appendChild(row);
 		});
 		groupModal.modal('show');
 	}
@@ -962,28 +1125,67 @@ foreach ($desktopClients as $desktopClient) {
 	var deliveryOutcomeUnknown = false;
 	var requestInFlight = false;
 	var activeJob = '';
+	var receiptJob = '', viewedJob = '', receiptDeadline = 0;
 	var jobPollBusy = false;
 	var receiptsPanel = document.getElementById('sls-announcement-receipts');
 	var lastReceiptView = '';
 	function showReceipts(data) {
 		if (!receiptsPanel) return;
 		var rows = Array.isArray(data.receipts) ? data.receipts : [];
-		var fingerprint = JSON.stringify(rows);
+		var evidence = data.phone_outcomes;
+		var fingerprint = JSON.stringify([rows, evidence, data.receipt_status_error, viewedJob]);
 		if (fingerprint === lastReceiptView) return;
 		lastReceiptView = fingerprint;
 		var wasOpen = !!(receiptsPanel.querySelector('details') && receiptsPanel.querySelector('details').open);
+		var needsAttention = rows.some(function(row) { return row.needs_attention !== false && ['failed', 'uncertain', 'cancelled', 'unavailable'].indexOf(row.state) >= 0; });
 		receiptsPanel.innerHTML = '';
 		if (!rows.length) return;
-		var details = document.createElement('details'); details.open = wasOpen;
+		var details = document.createElement('details'); details.open = wasOpen || needsAttention;
 		var summary = document.createElement('summary'); summary.textContent = 'Delivery details · ' + rows.length + ' destination(s)';
 		details.appendChild(summary);
 		var list = document.createElement('ul'); list.style.maxHeight = '200px'; list.style.overflowY = 'auto';
 		rows.forEach(function(row) {
 			var item = document.createElement('li'); item.style.overflowWrap = 'anywhere';
-			item.textContent = row.channel + ' · ' + row.target + ' · ' + row.state + (row.detail ? ' — ' + row.detail : '');
+			var receiptState = row.channel === 'email' && row.state === 'accepted' ? 'Accepted by PBX mail service'
+				: row.channel === 'webhook' && row.state === 'uncertain' && row.needs_attention === false ? 'Response unconfirmed' : row.state;
+			item.textContent = row.channel + ' · ' + row.target + ' · ' + receiptState + (row.detail ? ' — ' + row.detail : '');
 			list.appendChild(item);
 		});
-		details.appendChild(list); receiptsPanel.appendChild(details);
+		details.appendChild(list);
+		if (evidence) {
+			var note = document.createElement('p');
+			note.textContent = 'Phone evidence: ' + (evidence.available ? (evidence.active ? 'calls are active or awaiting start.' : 'call tracking has ended.') : 'no retained call evidence is available.') + ' Answer or conference entry does not confirm full playback or that a person heard the alert.';
+			details.appendChild(note);
+			var phoneList = document.createElement('ul'); phoneList.style.maxHeight = '200px'; phoneList.style.overflowY = 'auto';
+			(Array.isArray(evidence.targets) ? evidence.targets : []).forEach(function(row) {
+				var item = document.createElement('li');
+				var facts = [];
+				if (row.dial_status) facts.push(row.dial_status);
+				if (row.answered) facts.push('answered');
+				if (row.joined) facts.push('entered conference');
+				if (row.playback_completed) facts.push('audio application completed');
+				if (row.keypad_acknowledged) facts.push('recipient pressed 1 to acknowledge');
+				else if (row.acknowledgement_status === 'pending') facts.push('waiting for keypad acknowledgement');
+				else if (row.acknowledgement_status === 'timeout') facts.push('no keypad acknowledgement before timeout');
+				else if (row.acknowledgement_status === 'other_key') facts.push('a different key was pressed');
+				else if (row.acknowledgement_status === 'prompt_failed') facts.push('keypad prompt or input failed');
+				else if (row.acknowledgement_status === 'interrupted') facts.push('call ended before a keypad result was recorded');
+				if (row.ended) facts.push('channel ended');
+				if (row.uncertain || !facts.length) facts.push('outcome unknown or awaiting events');
+				item.textContent = row.recipient_id + ' · attempt ' + row.attempt + ', contact ' + row.contact_index + ' · ' + facts.join(', ');
+				phoneList.appendChild(item);
+			});
+			details.appendChild(phoneList);
+			if (evidence.truncated) { var clipped = document.createElement('p'); clipped.textContent = 'Only the first 1,000 contact results are shown.'; details.appendChild(clipped); }
+		}
+		if (data.receipt_status_error) { var error = document.createElement('p'); error.textContent = data.receipt_status_error; details.appendChild(error); }
+		if (viewedJob) {
+			var refresh = document.createElement('button'); refresh.type = 'button'; refresh.className = 'btn btn-default btn-sm';
+			refresh.textContent = 'Refresh delivery receipts';
+			refresh.addEventListener('click', function() { pollJob(true); });
+			details.appendChild(refresh);
+		}
+		receiptsPanel.appendChild(details);
 	}
 	function renderDeliveryStatus(data) {
 		var pending = ['queued', 'worker_starting', 'running'].indexOf(data.state) >= 0 || !!data.queued;
@@ -997,21 +1199,31 @@ foreach ($desktopClients as $desktopClient) {
 	}
 	function rememberJob(id) {
 		activeJob = /^job_[a-f0-9]{32}$/.test(id || '') ? id : '';
+		if (activeJob) { viewedJob = activeJob; receiptJob = ''; }
 		try { if (activeJob) sessionStorage.setItem('sls-announcement-job', activeJob); else sessionStorage.removeItem('sls-announcement-job'); } catch (ignored) {}
 	}
-	function pollJob() {
-		if (!activeJob || jobPollBusy || !instanceActive()) return;
+	function pollJob(manual) {
+		if (receiptJob && Date.now() >= receiptDeadline) receiptJob = '';
+		var requestedJob = activeJob || receiptJob || (manual === true ? viewedJob : '');
+		if (!requestedJob || jobPollBusy || !instanceActive() || (document.hidden && manual !== true) || (requestInFlight && !activeJob)) return;
 		jobPollBusy = true;
-		fetch('config.php?display=slsmassnotifyserver&slsmassnotifyserver_action=announcement_job&job_id=' + encodeURIComponent(activeJob), {credentials:'same-origin', cache:'no-store'})
+		fetch('config.php?display=slsmassnotifyserver&slsmassnotifyserver_action=announcement_job&job_id=' + encodeURIComponent(requestedJob), {credentials:'same-origin', cache:'no-store'})
 			.then(parseJsonResponse).then(function(data) {
-				if (!instanceActive()) return;
+				if (!instanceActive() || requestedJob !== viewedJob) return;
 				var pending = ['queued', 'worker_starting', 'running'].indexOf(data.state) >= 0;
 				renderDeliveryStatus(data);
 				showReceipts(data); setSubmitBusy(pending);
-				if (!pending) { rememberJob(''); remaining = parseInt(data.cooldown_remaining || '0', 10) || 0; }
+				if (!pending) {
+					rememberJob('');
+					receiptJob = data.receipt_poll_pending ? requestedJob : '';
+					receiptDeadline = Date.parse(data.created_at || '') + 600000;
+					if (!isFinite(receiptDeadline)) receiptJob = '';
+					remaining = parseInt(data.cooldown_remaining || '0', 10) || 0;
+				}
 				renderCooldown();
 			}).catch(function() {
-				if (instanceActive()) setAnnouncementStatus('warning', 'Waiting for the PBX delivery result. Do not resend yet.', false);
+				if (instanceActive() && requestedJob === viewedJob) setAnnouncementStatus('warning', activeJob
+					? 'Waiting for the PBX delivery result. Do not resend yet.' : 'Receipt refresh failed. Use Refresh delivery receipts to try again.', false);
 			}).then(function() { jobPollBusy = false; });
 	}
 	lifecycle.intervals.push(window.setInterval(pollJob, 2000));
@@ -1062,11 +1274,12 @@ foreach ($desktopClients as $desktopClient) {
 			renderCooldown();
 		}
 	}, 1000));
-	lifecycle.intervals.push(window.setInterval(function() {
-		if (!instanceActive()) {
-			return;
-		}
-		fetch('config.php?display=slsmassnotifyserver&slsmassnotifyserver_action=cooldowns', {credentials: 'same-origin'})
+	var cooldownPollBusy = false, lastCooldownRefresh = 0;
+	function refreshCooldown(force) {
+		if (!instanceActive() || document.hidden || cooldownPollBusy
+			|| (force !== true && Date.now() - lastCooldownRefresh < 10000)) return;
+		cooldownPollBusy = true; lastCooldownRefresh = Date.now();
+		fetch('config.php?display=slsmassnotifyserver&slsmassnotifyserver_action=cooldowns', {credentials: 'same-origin', cache: 'no-store'})
 				.then(parseJsonResponse)
 			.then(function(data) {
 				if (!instanceActive()) {
@@ -1078,8 +1291,17 @@ foreach ($desktopClients as $desktopClient) {
 					renderCooldown();
 				}
 			})
-			.catch(function() {});
-		}, 10000));
+			.catch(function() {}).then(function() { cooldownPollBusy = false; });
+	}
+	function refreshVisibleWidget() {
+		if (document.hidden || !instanceActive()) return;
+		refreshCooldown(true); pollJob();
+	}
+	function refreshFocusedWidget() { refreshCooldown(false); }
+	document.addEventListener('visibilitychange', refreshVisibleWidget);
+	form.addEventListener('focusin', refreshFocusedWidget);
+	lifecycle.events.push([document, 'visibilitychange', refreshVisibleWidget], [form, 'focusin', refreshFocusedWidget]);
+	lifecycle.intervals.push(window.setInterval(refreshCooldown, 60000));
 	form.addEventListener('submit', function(event) {
 		event.preventDefault();
 		if (!instanceActive()) {
@@ -1099,6 +1321,7 @@ foreach ($desktopClients as $desktopClient) {
 				return;
 			}
 		}
+		receiptJob = ''; viewedJob = '';
 		setSubmitBusy(true);
 		renderCooldown();
 		showReceipts({receipts: []});
@@ -1146,3 +1369,5 @@ foreach ($desktopClients as $desktopClient) {
 	if (activeJob) { setSubmitBusy(true); renderCooldown(); pollJob(); }
 }());
 </script>
+
+<?php $source_picker_choices = $source_picker_choices ?? []; $source_picker_mode = 'announcement'; include dirname($recipientSelectionView) . '/audience_source_picker.php'; ?>

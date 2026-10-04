@@ -1,0 +1,12 @@
+{
+  "name": "southlandservers/mass-notify-identity",
+  "description": "Isolated maintained cryptographic and OAuth dependencies for opt-in enterprise login",
+  "license": "GPL-3.0-or-later",
+  "require": {
+    "php": ">=8.2",
+    "onelogin/php-saml": "^4.3",
+    "firebase/php-jwt": "^7.0",
+    "league/oauth2-client": "^2.8"
+  },
+  "config": {"allow-plugins": {}, "sort-packages": true, "optimize-autoloader": true}
+}

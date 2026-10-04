@@ -130,7 +130,8 @@ printf 'after rotation\n' >>"$MODULE_UNINSTALL_LOG"
 
     def test_invalid_second_log_stops_before_removals(self):
         self.stock_log.symlink_to(self.base / "missing")
-        result = self.run_shell('''require_freepbx() { :; }
+        result = self.run_shell('''admit_root_runtime() { :; }
+require_freepbx() { :; }
 acquire_maintenance_coordination() { :; }
 snapshot_local_signer() { printf 'REMOVALS STARTED\n'; }
 main

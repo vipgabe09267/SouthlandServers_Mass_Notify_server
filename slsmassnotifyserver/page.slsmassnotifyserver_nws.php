@@ -1,6 +1,7 @@
 <?php
 
 $slsmassnotifyserver = \FreePBX::create()->Slsmassnotifyserver;
+$slsmassnotifyserver->enforceOperatorPageAccess('slsmassnotifyserver_nws');
 $saveResult = $_SESSION['slsmassnotifyserver_save_result'] ?? null;
 $applyResult = $_SESSION['slsmassnotifyserver_apply_result'] ?? null;
 $testResult = $_SESSION['slsmassnotifyserver_test_result'] ?? null;
@@ -39,6 +40,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$slsmassnotifyserver->validateCsrf
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 	$action = $_POST['slsmassnotifyserver_action'] ?? '';
+	if ($action === 'test_delivery_status') {
+		header('Content-Type: application/json'); header('Cache-Control: private, no-store');
+		try { echo json_encode($slsmassnotifyserver->getTestDeliveryStatus($_POST['delivery_ticket'] ?? null), JSON_THROW_ON_ERROR); }
+		catch (\Throwable $error) { http_response_code(400); echo json_encode(['success'=>false,'message'=>'The test delivery report expired or is unavailable.']); }
+		exit;
+	}
 	if ($action === 'trigger_test') {
 		$triggerName = 'FreePBX Dashboard';
 		if (isset($_SESSION['AMP_user']->username) && $_SESSION['AMP_user']->username !== '') {

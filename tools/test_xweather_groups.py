@@ -151,6 +151,13 @@ class XweatherGroupTests(unittest.TestCase):
         self.assertIn("--api-only", desktop_command)
         self.assertNotIn("--targets", desktop_command)
         self.assertNotIn("--desktop-all", desktop_command)
+        self.assertIn("--is-test", desktop_command)
+        self.assertIn("--is-test", phone_command)
+
+    def test_live_visual_wording_does_not_mark_a_test(self):
+        with mock.patch.object(worker.subprocess, "run") as run:
+            worker.send_visual([], ["north-desk"], "TEST wording is not metadata", is_test=False)
+        self.assertNotIn("--is-test", run.call_args.args[0])
 
     def test_visual_channel_failures_do_not_suppress_the_other_channel(self):
         desktop_failure = worker.subprocess.CalledProcessError(1, ["desktop"])
@@ -232,7 +239,7 @@ class XweatherGroupTests(unittest.TestCase):
         payload = {
             "properties": {
                 "probabilityOfThunder": {
-                    "values": [{"validTime": "2027-01-15T20:00:00+00:00/PT2H", "value": 35}]
+                    "values": [{"validTime": "2027-01-15T18:00:00+00:00/PT2H", "value": 0}, {"validTime": "2027-01-15T20:00:00+00:00/PT2H", "value": 35}]
                 },
                 "weather": {
                     "values": [{"validTime": "2027-01-15T20:00:00+00:00/PT2H", "value": [{"weather": "thunderstorms"}]}]
@@ -269,6 +276,7 @@ class XweatherGroupTests(unittest.TestCase):
             fixture.write_text(json.dumps(payload), encoding="utf-8")
             cache = root / "nws-forecast-gate-area.json"
             cache.write_text(json.dumps({
+                "coverage_schema": 2,
                 "configuration_identity": worker.lightning_area_identity({}, {"location": "30.5000,-97.7000"}),
                 "checked_at": storm_start - 300,
                 "expires_at": storm_start,
@@ -358,6 +366,7 @@ class XweatherGroupTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(worker, "queue_external_delivery", side_effect=queue_external))
             stack.enter_context(mock.patch.object(worker, "external_delivery_recorded", return_value=False))
             stack.enter_context(mock.patch.object(worker, "external_delivery_pending", return_value=False))
+            stack.enter_context(mock.patch.object(worker, "external_delivery_status", return_value="complete"))
             stack.enter_context(mock.patch.object(worker, "retry_external_deliveries", return_value={
                     "results": [{"delivery": "delivery-key", "type": "generic", "id": "archive", "status": "accepted"}],
                     "pending": 0,

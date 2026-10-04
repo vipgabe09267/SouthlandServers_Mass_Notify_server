@@ -1,0 +1,22 @@
+[Unit]
+Description=SLS read-only external PBX readiness check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+EnvironmentFile=/etc/sls-monitor/.config
+LoadCredential=read-token:/etc/sls-monitor/read-token
+ExecStart=/usr/bin/python3 /opt/sls-monitor/sls_external_monitor.py --origin ${SLS_MONITOR_ORIGIN} --token-file %d/read-token
+TimeoutStartSec=35
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=96M
+CPUQuota=10%
+StandardOutput=journal
+StandardError=journal

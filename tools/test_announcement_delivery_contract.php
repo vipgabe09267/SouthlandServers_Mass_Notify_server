@@ -27,6 +27,12 @@ foreach (['normal', 'urgent', [], true, 'urgent;id'] as $priority) {
 }
 $buildCommand = $reflection->getMethod('buildAnnouncementVisualPushCommand');
 $buildCommand->setAccessible(true);
+foreach ([false, true, 'true', 1] as $flag) {
+    $command = $buildCommand->invoke($module, 'TEST wording is not metadata', [], 0, ['mode'=>'api_only', 'is_test'=>$flag]);
+    if ((strpos($command, ' --is-test') !== false) !== ($flag === true)) {
+        announcement_contract_fail('Only an explicit boolean may mark a desktop announcement as a test.');
+    }
+}
 
 $apiOnly = (string)$buildCommand->invoke($module, 'Contract announcement', [], 300, [
 	'mode' => 'api_only',
@@ -70,9 +76,10 @@ $audioPreparation = strpos($deliverySource, '$audio = $this->sendAnnouncementTts
 $durationDesktop = strpos($deliverySource, 'if ($needsDuration) { $publishDesktop(); }');
 $phoneDelay = strpos($deliverySource, 'if ($audioQueued) { sleep(1); }');
 $webhookDispatch = strpos($deliverySource, '$this->dispatchAnnouncementWebhooks');
+$visualPool = strpos($deliverySource, '$this->executeAnnouncementPhoneVisualBatch($visualCommands');
 if ($earlyDesktop === false || $audioPreparation === false || $durationDesktop === false || $phoneDelay === false
-    || $webhookDispatch === false || !($earlyDesktop < $audioPreparation && $audioPreparation < $durationDesktop
-    && $durationDesktop < $phoneDelay && $phoneDelay < $webhookDispatch)) {
+    || $webhookDispatch === false || $visualPool === false || !($earlyDesktop < $audioPreparation && $audioPreparation < $durationDesktop
+    && $durationDesktop < $webhookDispatch && $webhookDispatch < $phoneDelay && $phoneDelay < $visualPool)) {
     announcement_contract_fail('Independent delivery ordering regressed.');
 }
 require __DIR__ . '/test_independent_channels.php';
@@ -91,7 +98,8 @@ $webhookMethodEnd = strpos($classSource, "\n\tprivate function buildAnnouncement
 $webhookMethod = ($webhookMethodStart !== false && $webhookMethodEnd !== false)
 	? substr($classSource, $webhookMethodStart, $webhookMethodEnd - $webhookMethodStart)
 	: '';
-foreach (['proc_open($command', "['bypass_shell' => true]", "'--announcement'", "'SLS_NOTIFICATION_LIVE'"] as $marker) {
+foreach (['proc_open($command', "['bypass_shell' => true]", "'--announcement'", "'SLS_NOTIFICATION_LIVE'",
+    "\$environment['SLS_DESTINATION_BUDGET_SECONDS'] = '6'", "'/usr/bin/timeout', '--signal=TERM', '--kill-after=1', '10'"] as $marker) {
 	if (strpos($webhookMethod, $marker) === false) {
 		announcement_contract_fail('Dashboard webhook dispatcher is missing its shell-free bounded handoff: ' . $marker);
 	}
@@ -118,10 +126,13 @@ if (strpos($audioSource, 'announcement audio workspace is unavailable') === fals
 $installStart = strpos($classSource, "\tpublic function install()");
 $installEnd = strpos($classSource, "\n\tpublic function uninstall()", $installStart === false ? 0 : $installStart);
 $installSource = ($installStart !== false && $installEnd !== false) ? substr($classSource, $installStart, $installEnd - $installStart) : '';
-$piperPosition = strpos($installSource, '$this->ensurePiperRuntime();');
-$permissionsPosition = strpos($installSource, '$this->ensureRuntimePermissions();');
-if ($piperPosition === false || $permissionsPosition === false || $permissionsPosition < $piperPosition) {
-	announcement_contract_fail('Install scans the managed data tree before repairing the Piper compatibility boundary.');
+foreach (['ensurePiperRuntime(', 'ensureRuntimePermissions(', 'installRuntimeFiles(', 'ensureSystemDependencies(', 'signLocalModulesIfAvailable('] as $privileged) {
+	if (strpos($installSource, $privileged) !== false) {
+		announcement_contract_fail('Unprivileged FreePBX installation still invokes a privileged operation: ' . $privileged);
+	}
+}
+if (strpos($installSource, '$this->requireRuntimeAccount();') === false) {
+	announcement_contract_fail('FreePBX installation does not enforce its runtime account.');
 }
 
 $dashboard = (string)file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/dashboard/views/sections/sls-mass-notify-announcement.php');
@@ -139,6 +150,9 @@ foreach ([
 	"checkbox.name = 'announcement_groups[]'",
 	'name="announcement_extensions[]"',
 	'name="announcement_desktop_clients[]"',
+	'name="voice_recipient_ids[]"',
+	'name="group_voice_recipient_ids[]"',
+	"'/views/recipient_selection.php'",
 	'name="announcement_all_phones"',
 	'name="announcement_all_desktops"',
 	'name="announcement_audio_mode"',
@@ -171,8 +185,8 @@ foreach ([
 		announcement_contract_fail('Dashboard delivery feedback contract is missing: ' . $marker);
 	}
 }
-if (substr_count($dashboard, '<details class="sls-destination-panel">') !== 3) {
-	announcement_contract_fail('Dashboard destinations are not consolidated into exactly three disclosure panels.');
+if (substr_count($dashboard, '<details class="sls-destination-panel">') !== 4) {
+	announcement_contract_fail('Dashboard must retain four destination panels: phones, desktops, external voice, and webhooks.');
 }
 if (substr_count($dashboard, '<section class="sls-step-card"') !== 2) {
 	announcement_contract_fail('Dashboard composer is no longer consolidated into two primary sections.');

@@ -2,6 +2,7 @@
 // Southland Servers Mass Notifications Server by the Southland Servers Group
 
 $slsmassnotifyserver = \FreePBX::create()->Slsmassnotifyserver;
+$slsmassnotifyserver->enforceOperatorPageAccess('slsmassnotifyserver_other');
 $saveResult = $_SESSION['slsmassnotifyserver_other_save_result'] ?? null;
 $applyResult = $_SESSION['slsmassnotifyserver_other_apply_result'] ?? null;
 $tokenResult = $_SESSION['slsmassnotifyserver_other_token_result'] ?? null;
@@ -23,6 +24,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['sls_maintenance_status'] ?? 
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$slsmassnotifyserver->validateCsrfToken($_POST['slsmassnotifyserver_csrf'] ?? '')) {
+	if (($_POST['slsmassnotifyserver_action'] ?? '') === 'check_bulkvs_sender') {
+		http_response_code(403); header('Content-Type: application/json; charset=utf-8'); header('Cache-Control: no-store');
+		echo json_encode(['success'=>false, 'message'=>_('The security token expired. Reload General Settings before checking the sender.')]);
+		exit;
+	}
 	$_SESSION['slsmassnotifyserver_other_save_result'] = [
 		'success' => false,
 		'message' => _('The request security token is invalid or expired. Reload the page and try again.'),
@@ -34,7 +40,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$slsmassnotifyserver->validateCsrf
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 	$action = $_POST['slsmassnotifyserver_action'] ?? '';
-	if ($action === 'save_other_settings') {
+	if ($action === 'manage_api_credential') {
+		header('Content-Type: application/json; charset=utf-8');
+		header('Cache-Control: no-store');
+		header('X-Content-Type-Options: nosniff');
+		if (session_status() === PHP_SESSION_ACTIVE) { session_write_close(); }
+		echo json_encode($slsmassnotifyserver->manageApiCredential($_POST), JSON_UNESCAPED_SLASHES);
+		exit;
+	} elseif ($action === 'check_advertised_address') {
+		header('Content-Type: application/json; charset=utf-8');
+		header('Cache-Control: no-store');
+		if (session_status() === PHP_SESSION_ACTIVE) { session_write_close(); }
+		echo json_encode($slsmassnotifyserver->checkAdvertisedAddress($_POST), JSON_UNESCAPED_SLASHES);
+		exit;
+	} elseif ($action === 'check_bulkvs_sender') {
+		header('Content-Type: application/json; charset=utf-8');
+		header('Cache-Control: no-store');
+		header('X-Content-Type-Options: nosniff');
+		if (session_status() === PHP_SESSION_ACTIVE) { session_write_close(); }
+		echo json_encode($slsmassnotifyserver->checkBulkvsSender(), JSON_UNESCAPED_SLASHES);
+		exit;
+	} elseif ($action === 'preview_device_capacity') {
+		header('Content-Type: application/json; charset=utf-8');
+		header('Cache-Control: no-store');
+		if (session_status() === PHP_SESSION_ACTIVE) { session_write_close(); }
+		echo json_encode($slsmassnotifyserver->previewDeviceCapacity($_POST), JSON_UNESCAPED_SLASHES);
+		exit;
+	} elseif ($action === 'save_other_settings') {
 		$_SESSION['slsmassnotifyserver_other_save_result'] = $slsmassnotifyserver->saveOtherSettings($_POST, $_FILES);
 		header('Location: config.php?display=slsmassnotifyserver_other');
 		exit;
@@ -42,14 +74,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 		$_SESSION['slsmassnotifyserver_other_token_result'] = $slsmassnotifyserver->regenerateControlApiKey($_POST);
 		header('Location: config.php?display=slsmassnotifyserver_other');
 		exit;
+	} elseif ($action === 'export_encrypted_config') {
+		try {
+			$encrypted = $slsmassnotifyserver->exportEncryptedConfig($_POST['backup_passphrase'] ?? '', $_POST['backup_passphrase_confirm'] ?? '');
+		} catch (\Throwable $error) {
+			$_SESSION['slsmassnotifyserver_other_save_result'] = ['success' => false, 'message' => $error->getMessage(), 'errors' => []];
+			header('Location: config.php?display=slsmassnotifyserver_other');
+			exit;
+		}
+		header('Content-Type: application/json; charset=utf-8');
+		header('Content-Disposition: attachment; filename="sls-mass-notify.encrypted.config"');
+		header('Cache-Control: no-store');
+		header('X-Content-Type-Options: nosniff');
+		echo $encrypted;
+		exit;
 	} elseif ($action === 'export_config') {
+		try {
+			$plain = $slsmassnotifyserver->exportConfig();
+		} catch (\Throwable $error) {
+			$_SESSION['slsmassnotifyserver_other_save_result'] = ['success' => false, 'message' => $error->getMessage(), 'errors' => []];
+			header('Location: config.php?display=slsmassnotifyserver_other');
+			exit;
+		}
 		header('Content-Type: application/json; charset=utf-8');
 		header('Content-Disposition: attachment; filename="sls-mass-notify.config"');
 		header('Cache-Control: no-store');
-		echo $slsmassnotifyserver->exportConfig();
+		header('X-Content-Type-Options: nosniff');
+		echo $plain;
 		exit;
 	} elseif ($action === 'import_config') {
-		$importResult = $slsmassnotifyserver->importConfigUpload($_FILES['config_upload'] ?? []);
+		$importResult = $slsmassnotifyserver->importConfigUpload($_FILES['config_upload'] ?? [], $_POST['import_passphrase'] ?? '');
 		$_SESSION['slsmassnotifyserver_other_import_result'] = $importResult;
 		header('Location: config.php?display=slsmassnotifyserver_other' . (!empty($importResult['success']) ? '&sls_maintenance_action=config' : ''));
 		exit;

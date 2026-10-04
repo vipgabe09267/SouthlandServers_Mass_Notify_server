@@ -9,6 +9,8 @@ PIPER_BIN="$PIPER_DIR/venv/bin/piper"
 PIPER_PY="$PIPER_DIR/venv/bin/python"
 LOG_FILE="/var/log/sls_mass_notify.log"
 PIPER_ARTIFACTS_CHANGED=0
+PIPER_DEPENDENCY_CHECK="/usr/local/bin/sls_mass_notify/sls_piper_dependencies.py"
+PIPER_REQUIREMENTS="/usr/local/bin/sls_mass_notify/piper-requirements.txt"
 
 log() {
   printf '%s: %s\n' "$(date)" "$*" >> "$LOG_FILE" 2>/dev/null || true
@@ -23,7 +25,7 @@ download_file() {
   tmp="$(mktemp /tmp/sls-piper-voice.XXXXXXXX)" || return 1
   if command -v curl >/dev/null 2>&1; then
     if ! curl -fL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 900 \
-      -A "SouthlandServers-Mass-Notifications-Server/0.1.4-beta" \
+      -A "SouthlandServers-Mass-Notifications-Server/0.1.5-beta" \
       -o "$tmp" "$url"; then
       rm -f "$tmp"
       return 1
@@ -51,13 +53,13 @@ download_file() {
       return 1
     }
   elif [[ "$target" == *.json ]]; then
-    python3 -m json.tool "$tmp" >/dev/null 2>&1 || {
+    python3 -I -m json.tool "$tmp" >/dev/null 2>&1 || {
       rm -f "$tmp"
       return 1
     }
   fi
 
-  SLS_PIPER_VOICE_SOURCE="$tmp" SLS_PIPER_VOICE_TARGET="$target" /usr/bin/python3 - <<'PY' || {
+  SLS_PIPER_VOICE_SOURCE="$tmp" SLS_PIPER_VOICE_TARGET="$target" /usr/bin/python3 -I - <<'PY' || {
 import os
 import pwd
 import secrets
@@ -67,7 +69,7 @@ source = os.environ["SLS_PIPER_VOICE_SOURCE"]
 target = os.environ["SLS_PIPER_VOICE_TARGET"]
 name = os.path.basename(target)
 if target != "/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices/" + name \
-        or not name.startswith("en_US-") \
+        or not __import__("re").fullmatch(r"[a-z]{2}_[A-Z]{2}-[A-Za-z0-9_-]+\.onnx(?:\.json)?", name) \
         or not (name.endswith(".onnx") or name.endswith(".onnx.json")):
     raise SystemExit(2)
 directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
@@ -133,36 +135,122 @@ PY
   return 0
 }
 
+reset_managed_piper_venv() {
+  PIPER_RESET_ROOT="$PIPER_DIR" /usr/bin/python3 -I - <<'PY'
+import os
+import shutil
+import stat
+import time
+
+root = os.environ["PIPER_RESET_ROOT"]
+if root != "/usr/local/bin/sls_mass_notify/piper":
+    raise SystemExit("Piper repair refused: runtime path is not the SLS-managed path")
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+deadline = time.monotonic() + 10
+entries = 0
+
+def trusted(metadata, label):
+    if metadata.st_uid != 0 or (not stat.S_ISLNK(metadata.st_mode) and metadata.st_mode & 0o022):
+        raise RuntimeError("Piper repair refused: " + label + " is not root-owned and protected from writes")
+
+def inspect_tree(descriptor, device):
+    global entries
+    trusted(os.fstat(descriptor), "runtime directory")
+    for name in os.listdir(descriptor):
+        entries += 1
+        if entries > 50000 or time.monotonic() > deadline:
+            raise RuntimeError("Piper repair refused: runtime inspection exceeded its bounded safety limit")
+        metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        trusted(metadata, "runtime entry")
+        if metadata.st_dev != device:
+            raise RuntimeError("Piper repair refused: runtime contains another mounted filesystem")
+        if stat.S_ISDIR(metadata.st_mode):
+            child = os.open(name, flags, dir_fd=descriptor)
+            try:
+                inspect_tree(child, device)
+            finally:
+                os.close(child)
+        elif stat.S_ISREG(metadata.st_mode):
+            if metadata.st_nlink != 1:
+                raise RuntimeError("Piper repair refused: runtime contains a hard-linked file")
+        elif not stat.S_ISLNK(metadata.st_mode):
+            raise RuntimeError("Piper repair refused: runtime contains an unsupported file type")
+        # Standard venv interpreter/lib64 symlinks are unlinked, never traversed.
+
+descriptor = os.open("/", flags)
+try:
+    trusted(os.fstat(descriptor), "root directory")
+    for component in root.strip("/").split("/"):
+        child = os.open(component, flags, dir_fd=descriptor)
+        os.close(descriptor)
+        descriptor = child
+        trusted(os.fstat(descriptor), "runtime ancestor")
+    try:
+        metadata = os.stat("venv", dir_fd=descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        metadata = None
+    if metadata is not None:
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeError("Piper repair refused: managed venv is not a real directory")
+        venv = os.open("venv", flags, dir_fd=descriptor)
+        try:
+            if os.fstat(venv).st_dev != os.fstat(descriptor).st_dev:
+                raise RuntimeError("Piper repair refused: managed venv is a mounted filesystem")
+            inspect_tree(venv, metadata.st_dev)
+            current = os.stat("venv", dir_fd=descriptor, follow_symlinks=False)
+            if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+                raise RuntimeError("Piper repair refused: managed venv changed during inspection")
+            if not shutil.rmtree.avoids_symlink_attacks:
+                raise RuntimeError("Piper repair refused: safe directory removal is unavailable")
+            shutil.rmtree("venv", dir_fd=descriptor)
+        finally:
+            os.close(venv)
+finally:
+    os.close(descriptor)
+PY
+}
+
+piper_venv_usable() {
+  [ -x "$PIPER_PY" ] \
+    && /usr/bin/timeout 20 "$PIPER_PY" -I -c \
+      'import os, sys; sys.exit(0 if sys.prefix != sys.base_prefix and os.path.realpath(sys.prefix) == os.path.realpath(sys.argv[1]) else 1)' \
+      "$PIPER_DIR/venv" >/dev/null 2>&1 \
+    && /usr/bin/timeout 20 "$PIPER_PY" -I -m pip --version >/dev/null 2>&1
+}
+
 ensure_piper_runtime() {
+  validate_piper_runtime_tree || { log "Piper executable tree failed ownership/link validation; no existing interpreter was executed"; return 1; }
   if ! python3 --version >/dev/null 2>&1; then
     log "Piper install failed: python3 is installed but not executable or broken"
     return 1
   fi
-  if [ -x "$PIPER_BIN" ] && [ -x "$PIPER_PY" ] && /usr/bin/timeout 20 "$PIPER_PY" -m piper -h >/dev/null 2>&1 \
-    && "$PIPER_PY" -c 'from importlib.metadata import version; from packaging.version import Version; assert Version(version("pip")) >= Version("26.2.0")' >/dev/null 2>&1 \
-    && "$PIPER_PY" -m pip check >/dev/null 2>&1; then
+  if piper_venv_usable && [ -x "$PIPER_BIN" ] && /usr/bin/timeout 20 "$PIPER_PY" -I -m piper -h >/dev/null 2>&1 \
+    && /usr/bin/timeout 20 "$PIPER_PY" -I "$PIPER_DEPENDENCY_CHECK" --requirements "$PIPER_REQUIREMENTS" --quiet \
+    && /usr/bin/timeout 20 "$PIPER_PY" -I -m pip check >/dev/null 2>&1; then
     return 0
+  fi
+  if [ -x "$PIPER_PY" ]; then
+    # Only package names and version mismatches are emitted by this checker.
+    /usr/bin/timeout 20 "$PIPER_PY" -I "$PIPER_DEPENDENCY_CHECK" --requirements "$PIPER_REQUIREMENTS" >> "$LOG_FILE" 2>&1 || true
   fi
   if ! command -v python3 >/dev/null 2>&1; then
     log "Piper install failed: python3 missing"
     return 1
   fi
-  if [ ! -x "$PIPER_DIR/venv/bin/pip" ]; then
-    rm -rf "$PIPER_DIR/venv"
-    if ! python3 -m venv "$PIPER_DIR/venv" >> "$LOG_FILE" 2>&1; then
-      if command -v apt-get >/dev/null 2>&1; then
-        DEBIAN_FRONTEND=noninteractive apt-get update >> "$LOG_FILE" 2>&1 || true
-        DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv python3-pip >> "$LOG_FILE" 2>&1 || true
-        python3 -m venv "$PIPER_DIR/venv" >> "$LOG_FILE" 2>&1 || return 1
-      else
-        return 1
-      fi
-    fi
-  fi
-  "$PIPER_DIR/venv/bin/pip" install --upgrade 'pip==26.2.0' 'setuptools==83.0.0' 'wheel==0.47.0' >> "$LOG_FILE" 2>&1 || return 1
-  "$PIPER_DIR/venv/bin/pip" install -r /usr/local/bin/sls_mass_notify/piper-requirements.txt >> "$LOG_FILE" 2>&1 || return 1
+  local environment_helper
+  local -a replacement_args=()
+  environment_helper="/usr/local/bin/sls_mass_notify/sls_piper_environment.py"
+  [ -r "$environment_helper" ] || { log "The signed Piper replacement helper is missing; no active packages were changed."; return 1; }
+  [ "${PIPER_WORKERS_PAUSED:-0}" != 1 ] || replacement_args+=(--workers-paused)
+  /usr/bin/python3 -I "$environment_helper" "${replacement_args[@]}" >> "$LOG_FILE" 2>&1 || {
+    log "Piper replacement did not complete. Review the specific namespace, dependency, activation or recovery error above. No in-place package upgrade was attempted."
+    return 1
+  }
   PIPER_ARTIFACTS_CHANGED=1
-  [ -x "$PIPER_BIN" ] && /usr/bin/timeout 20 "$PIPER_PY" -m piper -h >/dev/null 2>&1 && "$PIPER_PY" -m pip check >/dev/null 2>&1
+  piper_venv_usable && /usr/bin/timeout 20 "$PIPER_PY" -I -m piper -h >/dev/null 2>&1 \
+    && /usr/bin/timeout 20 "$PIPER_PY" -I "$PIPER_DEPENDENCY_CHECK" --requirements "$PIPER_REQUIREMENTS" >> "$LOG_FILE" 2>&1 \
+    && /usr/bin/timeout 20 "$PIPER_PY" -I -m pip check >/dev/null 2>&1
+
 }
 
 install_piper_wrapper() {
@@ -217,7 +305,7 @@ EOF
 install_piper_compatibility_path() {
   local result
   result="$(
-  /usr/bin/python3 - <<'PY'
+  /usr/bin/python3 -I - <<'PY'
 import os
 import secrets
 import stat
@@ -301,52 +389,126 @@ PY
   fi
 }
 
+validate_piper_runtime_tree() {
+  PIPER_PERMISSION_ROOT="$PIPER_DIR" /usr/bin/python3 -I - <<'PYGUARD'
+import os
+from pathlib import Path
+import re
+import stat
+import time
+
+root = Path(os.environ['PIPER_PERMISSION_ROOT'])
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+count = 0
+deadline = time.monotonic() + 15
+
+def protected(info, label):
+    sticky_ancestor = label == 'runtime ancestor' and info.st_mode & stat.S_ISVTX
+    if info.st_uid != 0 or (not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022 and not sticky_ancestor):
+        raise RuntimeError('Piper runtime is not root-owned and protected: ' + label)
+
+def system_python(path):
+    # Only distribution-owned Python interpreter links outside this venv.
+    for unused in range(8):
+        if not re.fullmatch(r'/usr/bin/python3(?:\.[0-9]+)?', path):
+            raise RuntimeError('unexpected external Piper interpreter link')
+        parent = os.open('/usr/bin', flags)
+        try:
+            protected(os.fstat(parent), 'distribution interpreter directory')
+            info = os.stat(Path(path).name, dir_fd=parent, follow_symlinks=False)
+            protected(info, path)
+            if stat.S_ISLNK(info.st_mode):
+                target = os.readlink(Path(path).name, dir_fd=parent)
+                path = target if target.startswith('/') else '/usr/bin/' + target
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise RuntimeError('unsafe distribution Python interpreter')
+            return
+        finally: os.close(parent)
+    raise RuntimeError('Piper interpreter link cycle')
+
+def visit(fd, relative=''):
+    global count
+    protected(os.fstat(fd), relative or 'runtime directory')
+    for name in os.listdir(fd):
+        count += 1
+        if count > 50000 or time.monotonic() > deadline:
+            raise RuntimeError('Piper runtime inspection exceeded safety limits')
+        rel = relative + '/' + name if relative else name
+        link_rel = re.sub(r'^\.replacement-[a-f0-9]{24}/', '', rel)
+        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        protected(info, rel)
+        if stat.S_ISDIR(info.st_mode):
+            child = os.open(name, flags, dir_fd=fd)
+            try:
+                current = os.fstat(child)
+                if (current.st_dev,current.st_ino) != (info.st_dev,info.st_ino):
+                    raise RuntimeError('Piper runtime directory changed')
+                visit(child,rel)
+            finally: os.close(child)
+        elif stat.S_ISREG(info.st_mode):
+            if info.st_nlink != 1:
+                raise RuntimeError('Piper runtime contains a hard-linked file: ' + rel)
+        elif stat.S_ISLNK(info.st_mode):
+            target = os.readlink(name, dir_fd=fd)
+            if link_rel == 'venv/lib64' and target == 'lib': continue
+            if re.fullmatch(r'venv/bin/python(?:3(?:\.[0-9]+)?)?',link_rel):
+                if target == 'python3' and link_rel != 'venv/bin/python3': continue
+                system_python(target)
+                continue
+            raise RuntimeError('Piper runtime contains an unexpected symbolic link: ' + rel)
+        else: raise RuntimeError('Piper runtime contains an unsupported entry: ' + rel)
+
+fd = os.open('/',flags)
+try:
+    for part in root.parts[1:]:
+        child = os.open(part,flags,dir_fd=fd)
+        os.close(fd); fd=child
+        protected(os.fstat(fd), 'runtime ancestor')
+    visit(fd)
+finally: os.close(fd)
+PYGUARD
+}
+
 secure_piper_runtime_tree() {
-  PIPER_PERMISSION_ROOT="$PIPER_DIR" /usr/bin/python3 - <<'PY'
+  # Never turn service-owned executable bytes into root-trusted code. Refuse
+  # the entire tree before metadata changes or interpreter execution.
+  validate_piper_runtime_tree || return 1
+  PIPER_PERMISSION_ROOT="$PIPER_DIR" /usr/bin/python3 -I - <<'PY'
 import os
 import stat
-
+import re
 root = os.environ["PIPER_PERMISSION_ROOT"]
-flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
 root_fd = os.open(root, flags)
-
-def secure_tree(directory_fd, relative=""):
-    os.fchown(directory_fd, 0, 0)
-    os.fchmod(directory_fd, 0o755)
-    for name in os.listdir(directory_fd):
-        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        child_relative = f"{relative}/{name}" if relative else name
-        if stat.S_ISDIR(metadata.st_mode):
-            child_fd = os.open(name, flags, dir_fd=directory_fd)
-            try:
-                secure_tree(child_fd, child_relative)
-            finally:
-                os.close(child_fd)
-        elif stat.S_ISREG(metadata.st_mode):
-            child_fd = os.open(
-                name,
-                os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=directory_fd,
-            )
-            try:
-                os.fchown(child_fd, 0, 0)
-                os.fchmod(child_fd, 0o755 if child_relative.startswith("venv/bin/") else 0o644)
-            finally:
-                os.close(child_fd)
-        elif stat.S_ISLNK(metadata.st_mode):
-            os.chown(name, 0, 0, dir_fd=directory_fd, follow_symlinks=False)
-        else:
-            raise RuntimeError(f"unsupported Piper runtime entry: {child_relative}")
-
-try:
-    secure_tree(root_fd)
-finally:
-    os.close(root_fd)
+def secure_tree(fd, relative=""):
+    for name in os.listdir(fd):
+        before = os.stat(name,dir_fd=fd,follow_symlinks=False)
+        rel = relative + '/' + name if relative else name
+        if stat.S_ISLNK(before.st_mode): continue
+        child = os.open(name,os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_DIRECTORY if stat.S_ISDIR(before.st_mode) else 0),dir_fd=fd)
+        try:
+            info = os.fstat(child)
+            current = os.stat(name,dir_fd=fd,follow_symlinks=False)
+            if ((info.st_dev,info.st_ino) != (before.st_dev,before.st_ino)
+                    or (info.st_dev,info.st_ino) != (current.st_dev,current.st_ino)
+                    or info.st_uid != 0 or info.st_mode & 0o022):
+                raise RuntimeError('Piper runtime entry changed during permission repair')
+            if stat.S_ISDIR(info.st_mode): secure_tree(child,rel)
+            elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                os.fchmod(child,0o600 if rel == '.replacement.lock' else (0o755 if re.sub(r'^\.replacement-[a-f0-9]{24}/', '', rel).startswith('venv/bin/') else 0o644))
+            else: raise RuntimeError('unsafe Piper runtime permission target')
+        finally: os.close(child)
+    info = os.fstat(fd)
+    if info.st_uid != 0 or info.st_mode & 0o022: raise RuntimeError('unsafe Piper runtime directory')
+    os.fchmod(fd,0o700 if re.fullmatch(r'\.replacement-[a-f0-9]{24}',relative) else 0o755)
+try: secure_tree(root_fd)
+finally: os.close(root_fd)
 PY
 }
 
 secure_piper_voice_tree() {
-  PIPER_VOICE_PERMISSION_ROOT="$VOICE_DIR" /usr/bin/python3 - <<'PY'
+  PIPER_VOICE_PERMISSION_ROOT="$VOICE_DIR" /usr/bin/python3 -I - <<'PY'
 import os
 import pwd
 import stat
@@ -360,14 +522,20 @@ try:
     os.fchmod(root_fd, 0o755)
     for name in os.listdir(root_fd):
         metadata = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
-        if not stat.S_ISREG(metadata.st_mode):
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
             raise RuntimeError(f"unsupported Piper voice entry: {name}")
         child_fd = os.open(
             name,
-            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW,
             dir_fd=root_fd,
         )
         try:
+            opened = os.fstat(child_fd)
+            current = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                    or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+                    or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)):
+                raise RuntimeError('unsafe Piper voice permission target')
             os.fchown(child_fd, account.pw_uid, account.pw_gid)
             os.fchmod(child_fd, 0o644)
         finally:
@@ -390,12 +558,20 @@ repair_piper_permissions_only() {
   install_piper_compatibility_path
 }
 
-if [ "${1:-}" = "--repair-permissions-only" ]; then
-  [ "$#" -eq 1 ] || exit 2
+PIPER_ACTION="all"
+PIPER_WORKERS_PAUSED=0
+for option in "$@"; do
+  case "$option" in
+    --runtime-only|--repair-permissions-only)
+      [ "$PIPER_ACTION" = all ] || exit 2
+      PIPER_ACTION="${option#--}" ;;
+    --workers-paused) PIPER_WORKERS_PAUSED=1 ;;
+    *) exit 2 ;;
+  esac
+done
+if [ "$PIPER_ACTION" = repair-permissions-only ]; then
   repair_piper_permissions_only
   exit $?
-elif [ "$#" -ne 0 ]; then
-  exit 2
 fi
 
 if [ -L "$PIPER_DIR" ] \
@@ -407,12 +583,17 @@ if [ -L "$PIPER_DIR" ] \
 fi
 mkdir -p "$PIPER_DIR"
 mkdir -p "$VOICE_DIR"
-chown root:root "$PIPER_DIR" 2>/dev/null || true
-chmod 0755 "$PIPER_DIR" 2>/dev/null || true
 
 if ! ensure_piper_runtime; then
   printf 'Piper TTS runtime could not be installed. Check %s for details.\n' "$LOG_FILE" >&2
   exit 1
+fi
+
+if [ "$PIPER_ACTION" = runtime-only ]; then
+  secure_piper_runtime_tree
+  install_piper_wrapper
+  install_piper_compatibility_path
+  exit 0
 fi
 
 voice_revision="e21c7de8d4eab79b902f0d61e662b3f21664b8d2"
@@ -420,25 +601,54 @@ base="https://huggingface.co/rhasspy/piper-voices/resolve/${voice_revision}/en/e
 declare -A files=(
   ["en_US-lessac-low.onnx"]="$base/lessac/low/en_US-lessac-low.onnx"
   ["en_US-lessac-low.onnx.json"]="$base/lessac/low/en_US-lessac-low.onnx.json"
+  ["en_US-lessac-medium.onnx"]="$base/lessac/medium/en_US-lessac-medium.onnx"
+  ["en_US-lessac-medium.onnx.json"]="$base/lessac/medium/en_US-lessac-medium.onnx.json"
   ["en_US-amy-low.onnx"]="$base/amy/low/en_US-amy-low.onnx"
   ["en_US-amy-low.onnx.json"]="$base/amy/low/en_US-amy-low.onnx.json"
   ["en_US-ryan-low.onnx"]="$base/ryan/low/en_US-ryan-low.onnx"
   ["en_US-ryan-low.onnx.json"]="$base/ryan/low/en_US-ryan-low.onnx.json"
+  ["es_ES-davefx-medium.onnx"]="https://huggingface.co/rhasspy/piper-voices/resolve/${voice_revision}/es/es_ES/davefx/medium/es_ES-davefx-medium.onnx"
+  ["es_ES-davefx-medium.onnx.json"]="https://huggingface.co/rhasspy/piper-voices/resolve/${voice_revision}/es/es_ES/davefx/medium/es_ES-davefx-medium.onnx.json"
+  ["fr_FR-siwis-medium.onnx"]="https://huggingface.co/rhasspy/piper-voices/resolve/${voice_revision}/fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx"
+  ["fr_FR-siwis-medium.onnx.json"]="https://huggingface.co/rhasspy/piper-voices/resolve/${voice_revision}/fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx.json"
+  ["de_DE-thorsten-low.onnx"]="https://huggingface.co/rhasspy/piper-voices/resolve/${voice_revision}/de/de_DE/thorsten/low/de_DE-thorsten-low.onnx"
+  ["de_DE-thorsten-low.onnx.json"]="https://huggingface.co/rhasspy/piper-voices/resolve/${voice_revision}/de/de_DE/thorsten/low/de_DE-thorsten-low.onnx.json"
+  ["pt_BR-faber-medium.onnx"]="https://huggingface.co/rhasspy/piper-voices/resolve/${voice_revision}/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx"
+  ["pt_BR-faber-medium.onnx.json"]="https://huggingface.co/rhasspy/piper-voices/resolve/${voice_revision}/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx.json"
 )
 declare -A hashes=(
   ["en_US-lessac-low.onnx"]="f7d01dde371555732c4c314111ac79672b1a5ce2fc19266ab42178fd8df7f375"
   ["en_US-lessac-low.onnx.json"]="45754dfdebb3b8661c3fc564713772deec6e064feeb5b4e9594857dc7305193a"
+  ["en_US-lessac-medium.onnx"]="5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f"
+  ["en_US-lessac-medium.onnx.json"]="efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0"
   ["en_US-amy-low.onnx"]="a5a91abb7de0f104358a25aded480ddacf1ff0762886325886ec406a2e86aab3"
   ["en_US-amy-low.onnx.json"]="2250a9a605b8dc35a116717fadc5056695dd809e34a15d02f72a0f52d53d3ebb"
   ["en_US-ryan-low.onnx"]="8d21a085cc4c0010f1f3e91d5008c8691277ccfa744eb0d747becd33a3444baf"
   ["en_US-ryan-low.onnx.json"]="b27147e56b0525962609f82f58171f4618cbf17c6fb043d7d724ff28cc4aed60"
+  ["es_ES-davefx-medium.onnx"]="6658b03b1a6c316ee4c265a9896abc1393353c2d9e1bca7d66c2c442e222a917"
+  ["es_ES-davefx-medium.onnx.json"]="0e0dda87c732f6f38771ff274a6380d9252f327dca77aa2963d5fbdf9ec54842"
+  ["fr_FR-siwis-medium.onnx"]="641d1ab097da2b81128c076810edb052b385decc8be3381814802a64a73baf99"
+  ["fr_FR-siwis-medium.onnx.json"]="39479916c2db192b5ac9764daddd0c744d83e023ad890c6976c0633ae4df8959"
+  ["de_DE-thorsten-low.onnx"]="9ac27fad17cec5c1a791161976a64f026f16fc058b400b1fea62565b8b2cf375"
+  ["de_DE-thorsten-low.onnx.json"]="df38e892ed949f62d0c40978bc666de0b341c5f7921840ae7c72f4df8e8ffa05"
+  ["pt_BR-faber-medium.onnx"]="858555e3a064209c57088fe6bd70c4c3dc54d03eaa00c45d5ecaf43a33f95aa7"
+  ["pt_BR-faber-medium.onnx.json"]="7e694de195ae3fc36dd732c445eb04fb49b649854893cb5506b978f0d50a1d6f"
 )
 
 failures=()
 for file in \
   en_US-lessac-low.onnx en_US-lessac-low.onnx.json \
+  en_US-lessac-medium.onnx en_US-lessac-medium.onnx.json \
   en_US-amy-low.onnx en_US-amy-low.onnx.json \
-  en_US-ryan-low.onnx en_US-ryan-low.onnx.json
+  en_US-ryan-low.onnx en_US-ryan-low.onnx.json \
+  es_ES-davefx-medium.onnx \
+  es_ES-davefx-medium.onnx.json \
+  fr_FR-siwis-medium.onnx \
+  fr_FR-siwis-medium.onnx.json \
+  de_DE-thorsten-low.onnx \
+  de_DE-thorsten-low.onnx.json \
+  pt_BR-faber-medium.onnx \
+  pt_BR-faber-medium.onnx.json
 do
   target="$VOICE_DIR/$file"
   if [ -f "$target" ] && printf '%s  %s\n' "${hashes[$file]}" "$target" | sha256sum -c - >/dev/null 2>&1; then

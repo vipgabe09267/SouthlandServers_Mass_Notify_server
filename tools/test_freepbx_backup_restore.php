@@ -165,6 +165,31 @@ namespace {
 	slsAssert(($disabledSettings['scheduled_announcements'][0]['enabled'] ?? '1') === '0', 'Missing journal did not disable schedules.');
 	slsAssert($withoutLedger['schedule_present'] === true, 'Replay-safe replacement journal was not created.');
 
+	$voiceSettings = $validatedSettings;
+	$voiceSettings['outbound_voice'] = ['enabled' => '1', 'daily_call_limit' => 20,
+		'acknowledgement_required' => true, 'ack_timeout_seconds' => 10, 'recipients' => []];
+	$voiceRaw = json_encode($voiceSettings, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+	$voiceRestored = slsInvoke($module, 'prepareNativeRestoredScheduleState', [[
+		'raw' => $voiceRaw, 'settings' => slsInvoke($module, 'validateNativeBackupConfig', [$voiceRaw]),
+	], ['raw' => $ledgerRaw, 'data' => $ledger], $timezone->getName(), strtotime('2027-01-01T00:00:00Z')]);
+	$restoredVoice = json_decode($voiceRestored['config_raw'], true)['outbound_voice'];
+	slsAssert($restoredVoice['enabled'] === '0', 'Restore left external calling enabled with unreviewed daily usage.');
+	slsAssert($restoredVoice['daily_call_limit'] === 20 && $restoredVoice['acknowledgement_required'] === true,
+		'Restore discarded the external call policy.');
+	slsAssert(strpos(implode(' ', $voiceRestored['warnings']), 'Pre-restore call usage') !== false,
+		'Restore did not explain why external calling needs review.');
+	slsAssert($voiceSettings['outbound_voice']['enabled'] === '1', 'Restore mutated its source configuration.');
+	$weatherSettings = $validatedSettings;
+	$weatherSettings['enabled'] = '1';
+	$weatherSettings['xweather'] = ['enabled' => '1'];
+	$weatherRaw = json_encode($weatherSettings) . "\n";
+	$weatherRestored = slsInvoke($module, 'prepareNativeRestoredScheduleState', [[
+		'raw' => $weatherRaw, 'settings' => $weatherSettings,
+	], ['raw' => $ledgerRaw, 'data' => $ledger], $timezone->getName(), strtotime('2027-01-01T00:00:00Z')]);
+	$restoredWeather = json_decode($weatherRestored['config_raw'], true);
+	slsAssert($restoredWeather['enabled'] === '0' && $restoredWeather['xweather']['enabled'] === '0', 'Restore automatically rearmed weather without live deduplication/storm state.');
+	slsAssert(strpos(implode(' ', $weatherRestored['warnings']), 'do not assume a restored storm has cleared') !== false, 'Weather restore omitted its current-storm warning.');
+
 	$configHash = str_repeat('a', 64);
 	$manifest = [
 		'schema_version' => 1,
@@ -186,6 +211,15 @@ namespace {
 	];
 	$validatedManifest = slsInvoke($module, 'validateNativeBackupManifest', [$manifest]);
 	slsAssert(($validatedManifest['files']['config']['bytes'] ?? 0) === 100, 'Valid native manifest was rejected.');
+	slsAssert($validatedManifest['files']['operational'] === null, 'Older backups were made incompatible by the recovery-evidence addition.');
+	$withEvidence = $manifest;
+	$withEvidence['files']['operational'] = ['type' => 'slsmassnotify-operational', 'archive_name' => 'operational-evidence.jsonl',
+		'restore_name' => 'operational-evidence.jsonl', 'bytes' => 100, 'sha256' => str_repeat('b', 64)];
+	slsAssert(slsInvoke($module, 'validateNativeBackupManifest', [$withEvidence])['files']['operational']['bytes'] === 100, 'Operational evidence inventory was rejected.');
+	$withEvidence['files']['operational']['bytes'] = 64 * 1024 * 1024 + 1;
+	$overLimit = false;
+	try { slsInvoke($module, 'validateNativeBackupManifest', [$withEvidence]); } catch (\RuntimeException $error) { $overLimit = true; }
+	slsAssert($overLimit, 'Operational evidence exceeded the native manifest bound.');
 	$unsafeManifest = $manifest;
 	$unsafeManifest['files']['config']['archive_name'] = '../protected-config.json';
 	$unsafeRejected = false;
@@ -234,6 +268,51 @@ namespace {
 		$tamperRejected = true;
 	}
 	slsAssert($tamperRejected, 'Tampered extracted config passed manifest verification.');
+
+	// A native backup restores without access to the source PBX keyring.
+	$keyId = bin2hex(random_bytes(16));
+	$backupKeyring = ['format' => \FreePBX\modules\SlsConfigCrypto::KEYRING_FORMAT, 'active' => $keyId,
+		'keys' => [$keyId => ['created_at' => time(), 'key' => base64_encode(random_bytes(32))]]];
+	$encryptedConfig = \FreePBX\modules\SlsConfigCrypto::encodeWithKeyring($settings, $backupKeyring);
+	$keyRaw = json_encode($backupKeyring, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n";
+	$restoreKey = $restoreFiles . '/protected-config-key.json';
+	file_put_contents($restoreConfig, $encryptedConfig);
+	file_put_contents($restoreKey, $keyRaw);
+	chmod($restoreConfig, 0600); chmod($restoreKey, 0600);
+	$encryptedManifest = $manifest;
+	$encryptedManifest['files']['config']['bytes'] = strlen($encryptedConfig);
+	$encryptedManifest['files']['config']['sha256'] = hash('sha256', $encryptedConfig);
+	$encryptedManifest['files']['key'] = ['type' => 'slsmassnotify-config-key', 'archive_name' => 'protected-config-key.json',
+		'restore_name' => 'protected-config-key.json', 'bytes' => strlen($keyRaw), 'sha256' => hash('sha256', $keyRaw)];
+	$encryptedManifest = slsInvoke($module, 'validateNativeBackupManifest', [$encryptedManifest]);
+	$restoreKeyObject = new class($restoreKey) {
+		private $path;
+		public function __construct($path) { $this->path = $path; }
+		public function getType() { return 'slsmassnotify-config-key'; }
+		public function getFilename() { return 'protected-config-key.json'; }
+		public function getPathname() { return $this->path; }
+	};
+	$encryptedPayload = slsInvoke($module, 'loadNativeRestorePayload', [$encryptedManifest, [$restoreFileObject, $restoreKeyObject], $restoreRoot]);
+	slsAssert($encryptedPayload['config']['settings'] === $validatedSettings, 'Portable encrypted native backup changed restored settings.');
+	slsAssert(json_decode($encryptedPayload['config']['raw'], true) === $settings, 'Encrypted backup was not decoded for replay-safe restore preparation.');
+	$missingKeyManifest = $encryptedManifest;
+	$missingKeyManifest['files']['key'] = null;
+	$missingKeyRejected = false;
+	try { slsInvoke($module, 'loadNativeRestorePayload', [$missingKeyManifest, [$restoreFileObject], $restoreRoot]); }
+	catch (\RuntimeException $error) { $missingKeyRejected = strpos($error->getMessage(), 'missing its recovery key') !== false; }
+	slsAssert($missingKeyRejected, 'Encrypted native backup silently relied on a machine-local key or plaintext fallback.');
+	$wrongKeyring = $backupKeyring;
+	$wrongKeyring['keys'][$keyId]['key'] = base64_encode(random_bytes(32));
+	$wrongKeyRaw = json_encode($wrongKeyring, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n";
+	file_put_contents($restoreKey, $wrongKeyRaw);
+	$wrongKeyManifest = $encryptedManifest;
+	$wrongKeyManifest['files']['key']['bytes'] = strlen($wrongKeyRaw);
+	$wrongKeyManifest['files']['key']['sha256'] = hash('sha256', $wrongKeyRaw);
+	$wrongKeyRejected = false;
+	try { slsInvoke($module, 'loadNativeRestorePayload', [$wrongKeyManifest, [$restoreFileObject, $restoreKeyObject], $restoreRoot]); }
+	catch (\RuntimeException $error) { $wrongKeyRejected = strpos($error->getMessage(), 'failed authentication') !== false; }
+	slsAssert($wrongKeyRejected, 'Wrong native backup recovery key was accepted.');
+	unlink($restoreKey);
 	unlink($restoreConfig);
 	rmdir($restoreFiles);
 	rmdir(dirname($restoreFiles));

@@ -249,6 +249,7 @@ class InstallerLogCompatibility(unittest.TestCase):
             'LOG_FILE="$1"\n'
             'fixture_owner="$2:$3"\n'
             'guard_config_on_exit() { :; }\n'
+            'preflight_hardware_requirements() { :; }\n'
             'require_freepbx() {\n'
             '  printf "preflight fixture\\n" >>"$INSTALL_LOG_OUTPUT"\n'
             '  chown "$fixture_owner" "$LOG_FILE"\n'

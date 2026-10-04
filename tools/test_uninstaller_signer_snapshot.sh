@@ -39,11 +39,15 @@ cat >"$mock_signer" <<'SH'
 #!/usr/bin/env bash
 acquire_signing_lock() { :; }
 publish_candidate_transactionally() { :; }
+approved_module_hashes() { :; }
 SH
 chmod 0755 "$mock_signer"
 expected_hash="$(sha256sum "$mock_signer" | awk '{print $1}')"
 
 export SLS_MASS_NOTIFY_SIGNER_SOURCE="$mock_signer"
+export SLS_MASS_NOTIFY_TRUST_HELPER_SOURCE="$fixture/sls_module_trust.py"
+printf '%s\n' '# Protected root helper fixture' >"$SLS_MASS_NOTIFY_TRUST_HELPER_SOURCE"
+chmod 0755 "$SLS_MASS_NOTIFY_TRUST_HELPER_SOURCE"
 snapshot_local_signer
 [ -n "$RECOVERY_SIGNER" ] && [ -x "$RECOVERY_SIGNER" ]
 [ "$(stat -c '%a %U:%G' "$RECOVERY_SIGNER")" = "700 root:root" ]
@@ -51,7 +55,8 @@ snapshot_local_signer
 
 # The FreePBX uninstall hook removes both installed signer copies. The protected
 # snapshot must remain usable through stock dashboard/framework restoration.
-rm -f "$mock_signer"
+rm -f "$mock_signer" "$SLS_MASS_NOTIFY_TRUST_HELPER_SOURCE"
+[ -f "$RECOVERY_SIGNER_DIR/sls_module_trust.py" ]
 bash -n "$RECOVERY_SIGNER"
 cleanup_recovery_signer
 [ -z "$RECOVERY_SIGNER" ] && [ -z "$RECOVERY_SIGNER_DIR" ]
@@ -220,3 +225,11 @@ if [ "$(id -u)" -eq 0 ]; then
 fi
 
 printf 'Uninstaller signer-snapshot regressions passed.\n'
+
+# No old live-tree signing fallback is allowed when the protected signer was
+# unavailable. This failure path cannot generate/import a key or bless files.
+RECOVERY_SIGNER=""
+if locally_sign_stock_module dashboard >/dev/null 2>&1; then
+  printf 'Uninstaller accepted legacy signing without an approved inventory.\n' >&2
+  exit 1
+fi

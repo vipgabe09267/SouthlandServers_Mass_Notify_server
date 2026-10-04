@@ -1,6 +1,8 @@
 <?php
 // Southland Servers Mass Notifications Server by the Southland Servers Group
 $settings = is_array($settings ?? null) ? $settings : [];
+require_once dirname(__DIR__) . '/AdvertisedAddress.php';
+$addressFields = \FreePBX\modules\SlsAdvertisedAddress::fields($settings);
 $saveResult = $save_result ?? null;
 $applyResult = $apply_result ?? null;
 $tokenResult = $token_result ?? null;
@@ -36,6 +38,7 @@ $packageStatusClass = (($packageStatus['state'] ?? '') === 'error') ? 'label-dan
 $formatOverrides = [];
 $formatLabels = [
 	'yealink' => _('Yealink - Color'), 'yealink_text' => _('Yealink - Text Only'),
+	'yealink_image' => _('Yealink - Always Image (color phones)'),
 	'cisco' => _('Cisco'), 'poly' => _('Poly / Polycom'), 'grandstream' => _('Grandstream'),
 	'fanvil' => _('Fanvil'), 'snom' => _('Snom'), 'aastra' => _('Aastra / Mitel'),
 	'sangoma' => _('Sangoma'), 'avaya' => _('Avaya'), 'vtech' => _('VTech'),
@@ -58,6 +61,14 @@ if (empty($discordWebhooks) && !empty($settings['discord_webhook_url'])) {
 }
 $genericWebhooks = is_array($settings['generic_webhooks'] ?? null) ? $settings['generic_webhooks'] : [];
 $announcementWebhooks = is_array($settings['announcement_webhooks'] ?? null) ? $settings['announcement_webhooks'] : [];
+$renderWebhookFormat = static function ($type, $name, $selected = 'native') {
+	$options = ['native' => $type === 'announcement' ? _('Discord-compatible') : _('SLS event JSON'), 'slack' => _('Slack incoming webhook'), 'teams_workflow' => _('Microsoft Teams Workflows')];
+	echo '<label>' . _('Integration') . '<select class="form-control" data-field="payload_format" name="' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8') . '">';
+	foreach ($options as $value => $label) {
+		echo '<option value="' . $value . '"' . ($selected === $value ? ' selected' : '') . '>' . htmlspecialchars($label, ENT_QUOTES, 'UTF-8') . '</option>';
+	}
+	echo '</select></label>';
+};
 $enabledDiscordWebhooks = array_filter($discordWebhooks, static function ($destination) {
 	return is_array($destination) && !empty($destination['enabled']);
 });
@@ -90,6 +101,12 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 }
 ?>
 <style>
+#sls-other-settings-form .input-group > .form-control { min-width:0; width:1%; flex:1 1 0; }
+#sls-other-settings-form .input-group > .input-group-addon { flex:0 0 auto; width:auto; white-space:nowrap; }
+.sls-update-policy .form-group { display:block; }
+#sls-address-editor .sls-address-ports {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:8px 0 12px;}
+#sls-address-editor .sls-address-ports > div {min-width:0;}
+@media(max-width:600px){#sls-address-editor .sls-address-ports{grid-template-columns:1fr;}}
 .sls-labs-badge {
 	display: inline-block;
 	margin-left: 6px;
@@ -260,26 +277,58 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 			<?php } ?>
 
 			<form method="post" id="sls-other-settings-form" enctype="multipart/form-data">
+				<input type="hidden" name="sls_general_form_present" value="1">
 				<input type="hidden" name="slsmassnotifyserver_action" value="save_other_settings">
 				<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
 
+<?php include __DIR__ . '/settings_navigation.php'; ?>
+<section class="sls-settings-section" id="sls-settings-phones" data-settings-section="phones" aria-labelledby="sls-settings-tab-phones">
 				<h3 class="sls-settings-heading"><i class="fa fa-phone text-primary" aria-hidden="true"></i> <?php echo _('Phone Delivery'); ?></h3>
+                <div class="form-group" style="max-width:620px">
+                    <label for="sls-phone-limit"><?php echo _('Simultaneous Phone Capacity'); ?></label>
+                    <input class="form-control" id="sls-phone-limit" name="phone_device_limit" type="number" min="1" max="1000" value="<?php echo (int)($settings['phone_device_limit'] ?? 25); ?>">
+                    <p class="help-block"><?php echo _('Default: 25 registered device contacts. An extension registered on several phones uses one slot per contact. Increases require enough CPU, memory, and SLS free disk space for both the phone and desktop capacities. An audio audience larger than this limit is rejected before calls are queued. Existing calls retain their slots until they end.'); ?></p>
+                </div>
+                <div class="sls-capacity-preview" id="sls-capacity-preview" aria-live="polite" aria-busy="false">
+                    <strong><i class="fa fa-tachometer text-primary" aria-hidden="true"></i> <?php echo _('Resources for the selected capacities'); ?></strong>
+                    <p class="help-block" data-capacity-status><?php echo _('Checking combined phone and desktop requirements…'); ?></p>
+                    <dl class="sls-capacity-metrics" hidden>
+                        <div><dt><?php echo _('CPU required'); ?></dt><dd data-capacity-cpu></dd></div>
+                        <div><dt><?php echo _('RAM required'); ?></dt><dd data-capacity-memory></dd></div>
+                        <div><dt><?php echo _('Additional SLS free space'); ?></dt><dd data-capacity-storage></dd></div>
+                        <div><dt><?php echo _('Temporary workspace'); ?></dt><dd data-capacity-temporary></dd></div>
+                    </dl>
+                    <p class="help-block" data-capacity-hardware></p><ul data-capacity-errors hidden></ul>
+                    <p class="help-block"><?php echo _('Updates when phone or desktop capacity changes. Each check shows whether this PBX has sufficient resources. Saving an unsupported increase is rejected. Shared filesystems must have space for both SLS storage and temporary workspace. Existing calls, recordings and workload need additional headroom.'); ?></p>
+                </div>
 				<div class="row">
 					<div class="col-md-6">
 						<div class="form-group">
 							<label><?php echo _('Public PBX Hostname'); ?></label>
-							<div class="input-group"><span class="input-group-addon"><i class="fa fa-lock" aria-hidden="true"></i></span><input class="form-control" value="<?php echo htmlspecialchars($settings['public_pbx_host'] ?? ($settings['sipnotify']['pbx_host'] ?? '')); ?>" readonly aria-readonly="true"></div>
-							<p class="help-block"><?php echo _('Automatically detected by the PBX and used for API links and hosted phone media.'); ?></p>
+							<div class="input-group"><span class="input-group-addon"><i class="fa fa-globe" aria-hidden="true"></i></span><input id="sls-advertised-host" name="advertised_pbx_host" class="form-control" maxlength="253" value="<?php echo htmlspecialchars($addressFields['host'], ENT_QUOTES, 'UTF-8'); ?>" disabled></div>
+							<p class="help-block"><?php echo _('Saved by SLS for API links and hosted images. Changing DNS or the operating-system hostname does not update this address.'); ?></p>
+							<label><input type="checkbox" id="sls-address-change" name="sls_address_change" value="1"> <?php echo _('Change advertised address'); ?></label>
+							<div id="sls-address-editor" hidden>
+								<div class="sls-address-ports">
+									<div><label for="sls-advertised-api-port"><?php echo _('Desktop HTTPS port'); ?></label><input id="sls-advertised-api-port" class="form-control" type="number" name="advertised_api_port" min="1" max="65535" value="<?php echo (int)$addressFields['api_port']; ?>" disabled></div>
+									<div><label for="sls-advertised-control-port"><?php echo _('Control API HTTPS port'); ?></label><input id="sls-advertised-control-port" class="form-control" type="number" name="advertised_control_port" min="1" max="65535" value="<?php echo (int)$addressFields['control_port']; ?>" disabled></div>
+									<div><label for="sls-advertised-media-port"><?php echo _('Phone image port'); ?></label><input id="sls-advertised-media-port" class="form-control" type="number" name="advertised_media_port" min="1" max="65535" value="<?php echo (int)$addressFields['media_port']; ?>" disabled></div>
+								</div>
+								<p class="help-block"><?php echo _('Use the ports your clients connect to, including any router or proxy mapping. Submit and Apply Config save these addresses in the .config file. DNS, certificates, firewall rules, desktop connection settings, and the email sender domain are managed separately.'); ?></p>
+								<div id="sls-address-preview" class="well well-sm" style="overflow-wrap:anywhere;"></div>
+								<button type="button" id="sls-address-check" class="btn btn-default btn-sm"><i class="fa fa-stethoscope" aria-hidden="true"></i> <?php echo _('Check local HTTPS'); ?></button>
+								<p id="sls-address-check-result" role="status" aria-live="polite" class="help-block"></p>
+							</div>
 						</div>
 					</div>
 					<div class="col-md-3">
 						<div class="form-group">
 							<label><?php echo _('Phone Image Transport'); ?></label>
 							<select class="form-control" name="sipnotify_media_scheme">
-								<option value="http" <?php echo (($settings['sipnotify']['media_scheme'] ?? 'http') === 'http') ? 'selected' : ''; ?>>HTTP</option>
-								<option value="https" <?php echo (($settings['sipnotify']['media_scheme'] ?? 'http') === 'https') ? 'selected' : ''; ?>>HTTPS</option>
+								<option value="http" <?php echo (($settings['sipnotify']['media_scheme'] ?? 'https') === 'http') ? 'selected' : ''; ?>>HTTP</option>
+								<option value="https" <?php echo (($settings['sipnotify']['media_scheme'] ?? 'https') === 'https') ? 'selected' : ''; ?>>HTTPS</option>
 							</select>
-							<p class="help-block"><?php echo _('HTTP is the compatibility default for legacy phones such as the Yealink T48G. Authenticated APIs remain HTTPS.'); ?></p>
+							<p class="help-block"><?php echo _('If HTTPS does not work try HTTP for legacy phones.'); ?></p>
 							<p class="help-block" style="overflow-wrap:anywhere;"><?php echo _('Phone image address:'); ?> <span><?php echo htmlspecialchars((string)($settings['sipnotify']['media_base_url'] ?? ''), ENT_QUOTES, 'UTF-8'); ?></span></p>
 						</div>
 					</div>
@@ -310,12 +359,19 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 				</div></div></div>
 				<script type="text/template" id="sls-format-row-template"><div class="sls-editor-row" data-format-row><div class="sls-editor-grow"><label><?php echo _('Extension'); ?></label><input class="form-control" inputmode="numeric" pattern="[0-9]+"></div><div class="sls-editor-format"><label><?php echo _('Phone family'); ?></label><select class="form-control"><?php foreach ($formatLabels as $formatValue => $formatLabel) { ?><option value="<?php echo htmlspecialchars($formatValue); ?>"><?php echo htmlspecialchars($formatLabel); ?></option><?php } ?></select></div><button type="button" class="btn btn-link text-danger" data-remove-format style="margin-top:20px"><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div></script>
 
-				<h3 class="sls-settings-heading"><i class="fa fa-envelope text-warning" aria-hidden="true"></i> <?php echo _('Email and Webhook Delivery'); ?></h3>
+</section>
+<section class="sls-settings-section" id="sls-settings-channels" data-settings-section="channels" aria-labelledby="sls-settings-tab-channels">
+				<?php $slsRecipientDirectoryManaged = true; ?>
+<input type="hidden" name="recipient_directory_managed" value="1">
+<?php include __DIR__ . '/outbound_voice.php'; ?>
+                <?php include __DIR__ . '/announcement_sms.php'; ?>
+
+				<h3 class="sls-settings-heading"><i class="fa fa-envelope text-warning" aria-hidden="true"></i> <?php echo _('Email and Webhooks'); ?> <?php include __DIR__ . '/labs.php'; ?></h3>
 				<div class="sls-manager-card">
-					<div class="row"><div class="col-md-8"><h4><i class="fa fa-paper-plane"></i> <?php echo _('Outbound Delivery'); ?></h4><div class="sls-manager-summary"><?php echo sprintf(_('Email sender %s; %d system/error recipient(s); %d enabled Discord alert destination(s); %d enabled generic alert webhook(s); %d enabled Dashboard announcement webhook(s).'), htmlspecialchars($mailFromAddress), count($systemNotificationEmails), count($enabledDiscordWebhooks), count($enabledGenericWebhooks), count($enabledAnnouncementWebhooks)); ?> <?php echo _('Weather and Lightning email recipients are selected within each zone or trigger area.'); ?></div></div><div class="col-md-4 text-right"><button type="button" class="btn btn-default" data-toggle="modal" data-target="#sls-notification-manager"><i class="fa fa-pencil"></i> <?php echo _('Manage Delivery'); ?></button></div></div>
+					<div class="row"><div class="col-md-8"><h4><i class="fa fa-paper-plane"></i> <?php echo _('Outbound Delivery'); ?></h4><div class="sls-manager-summary"><?php echo sprintf(_('Email sender %s; %d system/error recipient(s); %d enabled Discord alert destination(s); %d enabled Weather integration(s); %d enabled Dashboard announcement webhook(s).'), htmlspecialchars($mailFromAddress), count($systemNotificationEmails), count($enabledDiscordWebhooks), count($enabledGenericWebhooks), count($enabledAnnouncementWebhooks)); ?> <?php echo _('Weather and Lightning email recipients are selected within each zone or trigger area.'); ?></div></div><div class="col-md-4 text-right"><button type="button" class="btn btn-default" data-toggle="modal" data-target="#sls-notification-manager"><i class="fa fa-pencil"></i> <?php echo _('Manage Delivery'); ?></button></div></div>
 				</div>
 				<div class="modal fade sls-manager-modal" id="sls-notification-manager" tabindex="-1" role="dialog" aria-hidden="true"><div class="modal-dialog"><div class="modal-content">
-					<div class="modal-header"><button type="button" class="close" data-dismiss="modal" aria-label="<?php echo htmlspecialchars(_('Close')); ?>"><span aria-hidden="true">&times;</span></button><h4 class="modal-title"><?php echo _('Email and Webhook Delivery'); ?></h4></div>
+					<div class="modal-header"><button type="button" class="close" data-dismiss="modal" aria-label="<?php echo htmlspecialchars(_('Close')); ?>"><span aria-hidden="true">&times;</span></button><h4 class="modal-title"><?php echo _('Email and Webhooks'); ?></h4></div>
 					<div class="modal-body">
 						<input type="hidden" name="system_notification_recipients_present" value="1">
 						<input type="hidden" name="discord_webhooks_present" value="1">
@@ -324,16 +380,18 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						<ul class="nav nav-tabs sls-destination-tabs" role="tablist">
 							<li class="active" role="presentation"><a href="#sls-destination-email" data-toggle="tab" role="tab"><i class="fa fa-envelope"></i> <?php echo _('Email Setup'); ?> <span class="badge"><?php echo count($systemNotificationEmails); ?></span></a></li>
 							<li role="presentation"><a href="#sls-destination-discord" data-toggle="tab" role="tab"><i class="fa fa-comments"></i> <?php echo _('Discord'); ?> <span class="badge"><?php echo count($discordWebhooks); ?></span></a></li>
-							<li role="presentation"><a href="#sls-destination-generic" data-toggle="tab" role="tab"><i class="fa fa-exchange"></i> <?php echo _('Generic Webhooks'); ?> <span class="badge"><?php echo count($genericWebhooks); ?></span></a></li>
+							<li role="presentation"><a href="#sls-destination-generic" data-toggle="tab" role="tab"><i class="fa fa-exchange"></i> <?php echo _('Weather Integrations'); ?> <span class="badge"><?php echo count($genericWebhooks); ?></span></a></li>
 							<li role="presentation"><a href="#sls-destination-announcement" data-toggle="tab" role="tab"><i class="fa fa-bullhorn"></i> <?php echo _('Dashboard Webhooks'); ?> <span class="badge"><?php echo count($announcementWebhooks); ?></span></a></li>
 						</ul>
 						<div class="tab-content">
 							<section class="tab-pane active sls-destination-pane" id="sls-destination-email" role="tabpanel">
 								<h4><?php echo _('Postfix Email Configuration'); ?></h4>
+								<?php include __DIR__.'/postfix_help.php'; ?>
 								<p class="text-muted"><?php echo _('The module hands branded HTML email with a plain-text fallback to the PBX local mail service. Final delivery depends on Postfix, DNS, and any relay configured outside this module.'); ?></p>
 							<div class="row"><div class="col-sm-5"><div class="form-group"><label for="sls-mail-from-local-part"><?php echo _('Sender Local Part'); ?></label><input class="form-control" id="sls-mail-from-local-part" name="mail_from_local_part" type="text" value="<?php echo htmlspecialchars($mailFromLocalPart); ?>" maxlength="64" pattern="[A-Za-z0-9](?:[A-Za-z0-9._+\-]{0,62}[A-Za-z0-9])?" autocomplete="off" spellcheck="false" placeholder="no-reply"><p class="help-block"><?php echo _('The part before the @ sign.'); ?></p></div></div><div class="col-sm-7"><div class="form-group"><label for="sls-mail-from-domain"><?php echo _('Sender Domain'); ?></label><div class="input-group"><span class="input-group-addon">@</span><input class="form-control" id="sls-mail-from-domain" name="mail_from_domain" type="text" value="<?php echo htmlspecialchars($mailFromDomain); ?>" maxlength="253" autocomplete="off" spellcheck="false" placeholder="pbx.example.com"></div></div></div></div>
 								<p class="help-block"><?php echo _('Fresh installations use the local Postfix identity when it is valid. Editing this address does not configure a relay, SPF, DKIM, DMARC, or reverse DNS.'); ?></p>
 								<div class="well"><div><strong><?php echo _('Email From'); ?>:</strong> <?php echo htmlspecialchars($settings['mail_from_name'] ?? 'SLS Mass Notification System'); ?> &lt;<span id="sls-mail-from-preview"><?php echo htmlspecialchars($mailFromAddress); ?></span>&gt;</div><div><strong><?php echo _('Delivery Method'); ?>:</strong> <?php echo _('Local Postfix sendmail'); ?> <code>/usr/sbin/sendmail</code></div></div>
+								<?php include __DIR__.'/announcement_email.php'; ?>
 								<h4><?php echo _('System and Error Notifications'); ?></h4>
 								<p class="text-muted"><?php echo _('These addresses receive module health, configuration, maintenance, and delivery-fault notices. Weather and Lightning alert recipients are configured separately on their zone or trigger area.'); ?></p>
 							<div class="sls-destination-list" id="sls-email-editor-list">
@@ -350,30 +408,38 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 									</div><button type="button" class="btn btn-default btn-sm" data-add-webhook="discord"><i class="fa fa-plus"></i> <?php echo _('Add Discord Destination'); ?></button><span class="text-muted sls-destination-limit" data-webhook-limit="discord" aria-live="polite" hidden><?php echo _('10-destination limit reached.'); ?></span>
 							</section>
 							<section class="tab-pane sls-destination-pane" id="sls-destination-generic" role="tabpanel">
-								<h4><?php echo _('Generic HTTPS Webhooks'); ?></h4><p class="text-muted"><?php echo _('Add up to 10 HTTPS hostname endpoints. When an alert is sent, the module resolves the hostname and rejects private or non-public addresses, redirects, embedded credentials, and insecure TLS.'); ?></p>
+								<h4><?php echo _('Weather and Lightning Integrations'); ?></h4><p class="text-muted"><?php echo _('Add up to 10 destinations for Weather and Lightning alerts, then select them within each zone or trigger area. Choose SLS event JSON, Slack incoming webhook, or Microsoft Teams Workflows. HTTPS on port 443 is required; private addresses, redirects, and invalid TLS certificates are blocked.'); ?></p>
 							<div class="sls-destination-list" id="sls-generic-editor-list">
-							<?php if (empty($genericWebhooks)) { ?><div class="sls-empty-state" data-destination-empty><?php echo _('No generic webhooks are configured.'); ?></div><?php } ?>
-								<?php foreach ($genericWebhooks as $index => $destination) { ?><div class="sls-editor-row sls-webhook-row" data-webhook-row data-webhook-type="generic"><div class="sls-webhook-enabled"><input type="hidden" name="generic_webhooks[<?php echo (int)$index; ?>][enabled]" value="0"><label><input type="checkbox" name="generic_webhooks[<?php echo (int)$index; ?>][enabled]" value="1" <?php echo !empty($destination['enabled']) ? 'checked' : ''; ?>> <?php echo _('Enabled'); ?></label><input type="hidden" name="generic_webhooks[<?php echo (int)$index; ?>][id]" value="<?php echo htmlspecialchars($destination['id'] ?? ''); ?>"></div><div><label><?php echo _('Name'); ?></label><input class="form-control" name="generic_webhooks[<?php echo (int)$index; ?>][name]" value="<?php echo htmlspecialchars($destination['name'] ?? ''); ?>" maxlength="80"></div><div><label><?php echo _('HTTPS URL'); ?></label><input class="form-control" type="password" name="generic_webhooks[<?php echo (int)$index; ?>][url]" value="" autocomplete="new-password" placeholder="<?php echo htmlspecialchars(_('Stored; enter a new URL to replace')); ?>"><div class="sls-stored-secret"><i class="fa fa-lock"></i> <?php echo _('Stored in the protected central configuration'); ?></div></div><button type="button" class="btn btn-link text-danger" data-remove-webhook><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div><?php } ?>
-									</div><button type="button" class="btn btn-default btn-sm" data-add-webhook="generic"><i class="fa fa-plus"></i> <?php echo _('Add Generic Webhook'); ?></button><span class="text-muted sls-destination-limit" data-webhook-limit="generic" aria-live="polite" hidden><?php echo _('10-destination limit reached.'); ?></span>
+							<?php if (empty($genericWebhooks)) { ?><div class="sls-empty-state" data-destination-empty><?php echo _('No Weather or Lightning integrations are configured.'); ?></div><?php } ?>
+								<?php foreach ($genericWebhooks as $index => $destination) { ?><div class="sls-editor-row sls-webhook-row" data-webhook-row data-webhook-type="generic"><div class="sls-webhook-enabled"><input type="hidden" name="generic_webhooks[<?php echo (int)$index; ?>][enabled]" value="0"><label><input type="checkbox" name="generic_webhooks[<?php echo (int)$index; ?>][enabled]" value="1" <?php echo !empty($destination['enabled']) ? 'checked' : ''; ?>> <?php echo _('Enabled'); ?></label><input type="hidden" name="generic_webhooks[<?php echo (int)$index; ?>][id]" value="<?php echo htmlspecialchars($destination['id'] ?? ''); ?>"></div><div><label><?php echo _('Name'); ?></label><input class="form-control" name="generic_webhooks[<?php echo (int)$index; ?>][name]" value="<?php echo htmlspecialchars($destination['name'] ?? ''); ?>" maxlength="80"><?php $renderWebhookFormat('generic', 'generic_webhooks[' . (int)$index . '][payload_format]', $destination['payload_format'] ?? 'native'); ?></div><div><label><?php echo _('HTTPS URL'); ?></label><input class="form-control" type="password" name="generic_webhooks[<?php echo (int)$index; ?>][url]" value="" autocomplete="new-password" placeholder="<?php echo htmlspecialchars(_('Stored; enter a new URL to replace')); ?>"><div class="sls-stored-secret"><i class="fa fa-lock"></i> <?php echo _('Stored in the protected central configuration'); ?></div></div><button type="button" class="btn btn-link text-danger" data-remove-webhook><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div><?php } ?>
+									</div><button type="button" class="btn btn-default btn-sm" data-add-webhook="generic"><i class="fa fa-plus"></i> <?php echo _('Add Integration'); ?></button><span class="text-muted sls-destination-limit" data-webhook-limit="generic" aria-live="polite" hidden><?php echo _('10-destination limit reached.'); ?></span>
 							</section>
 							<section class="tab-pane sls-destination-pane" id="sls-destination-announcement" role="tabpanel">
 								<h4><?php echo _('Dashboard Announcement Webhooks'); ?></h4>
-								<p class="text-muted"><?php echo _('Add up to 10 named Discord or Discord-compatible HTTPS webhook destinations. They are optional and appear as individual targets in the Dashboard announcement panel. A selected destination receives bounded branded Discord embed JSON; Weather and Lightning routing is unchanged.'); ?></p>
+								<p class="text-muted"><?php echo _('Add up to 10 named Discord-compatible, Slack incoming webhook, or Microsoft Teams Workflows destinations. Select them as individual targets in the Dashboard announcement panel.'); ?></p>
 								<div class="sls-destination-list" id="sls-announcement-editor-list">
 								<?php if (empty($announcementWebhooks)) { ?><div class="sls-empty-state" data-destination-empty><?php echo _('No Dashboard announcement webhooks are configured.'); ?></div><?php } ?>
-								<?php foreach ($announcementWebhooks as $index => $destination) { ?><div class="sls-editor-row sls-webhook-row" data-webhook-row data-webhook-type="announcement"><div class="sls-webhook-enabled"><input type="hidden" name="announcement_webhooks[<?php echo (int)$index; ?>][enabled]" value="0"><label><input type="checkbox" name="announcement_webhooks[<?php echo (int)$index; ?>][enabled]" value="1" <?php echo !empty($destination['enabled']) ? 'checked' : ''; ?>> <?php echo _('Enabled'); ?></label><input type="hidden" name="announcement_webhooks[<?php echo (int)$index; ?>][id]" value="<?php echo htmlspecialchars($destination['id'] ?? ''); ?>"></div><div><label><?php echo _('Name'); ?></label><input class="form-control" name="announcement_webhooks[<?php echo (int)$index; ?>][name]" value="<?php echo htmlspecialchars($destination['name'] ?? ''); ?>" maxlength="80"></div><div><label><?php echo _('HTTPS Webhook URL'); ?></label><div class="input-group"><input class="form-control" type="password" name="announcement_webhooks[<?php echo (int)$index; ?>][url]" value="" autocomplete="new-password" placeholder="<?php echo htmlspecialchars(_('Stored; enter a new URL to replace')); ?>"><span class="input-group-btn"><button type="button" class="btn btn-default" data-toggle-secret title="<?php echo htmlspecialchars(_('Show or hide the URL being entered')); ?>" aria-label="<?php echo htmlspecialchars(_('Show or hide the URL being entered')); ?>"><i class="fa fa-eye" aria-hidden="true"></i></button></span></div><div class="sls-stored-secret"><i class="fa fa-lock"></i> <?php echo _('Stored in the protected central configuration; the saved token is never returned to the page.'); ?></div></div><button type="button" class="btn btn-link text-danger" data-remove-webhook><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div><?php } ?>
+								<?php foreach ($announcementWebhooks as $index => $destination) { ?><div class="sls-editor-row sls-webhook-row" data-webhook-row data-webhook-type="announcement"><div class="sls-webhook-enabled"><input type="hidden" name="announcement_webhooks[<?php echo (int)$index; ?>][enabled]" value="0"><label><input type="checkbox" name="announcement_webhooks[<?php echo (int)$index; ?>][enabled]" value="1" <?php echo !empty($destination['enabled']) ? 'checked' : ''; ?>> <?php echo _('Enabled'); ?></label><input type="hidden" name="announcement_webhooks[<?php echo (int)$index; ?>][id]" value="<?php echo htmlspecialchars($destination['id'] ?? ''); ?>"></div><div><label><?php echo _('Name'); ?></label><input class="form-control" name="announcement_webhooks[<?php echo (int)$index; ?>][name]" value="<?php echo htmlspecialchars($destination['name'] ?? ''); ?>" maxlength="80"><?php $renderWebhookFormat('announcement', 'announcement_webhooks[' . (int)$index . '][payload_format]', $destination['payload_format'] ?? 'native'); ?></div><div><label><?php echo _('HTTPS Webhook URL'); ?></label><div class="input-group"><input class="form-control" type="password" name="announcement_webhooks[<?php echo (int)$index; ?>][url]" value="" autocomplete="new-password" placeholder="<?php echo htmlspecialchars(_('Stored; enter a new URL to replace')); ?>"><span class="input-group-btn"><button type="button" class="btn btn-default" data-toggle-secret title="<?php echo htmlspecialchars(_('Show or hide the URL being entered')); ?>" aria-label="<?php echo htmlspecialchars(_('Show or hide the URL being entered')); ?>"><i class="fa fa-eye" aria-hidden="true"></i></button></span></div><div class="sls-stored-secret"><i class="fa fa-lock"></i> <?php echo _('Stored in the protected central configuration; the saved token is never returned to the page.'); ?></div></div><button type="button" class="btn btn-link text-danger" data-remove-webhook><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div><?php } ?>
 								</div><button type="button" class="btn btn-default btn-sm" data-add-webhook="announcement"><i class="fa fa-plus"></i> <?php echo _('Add Dashboard Webhook'); ?></button><span class="text-muted sls-destination-limit" data-webhook-limit="announcement" aria-live="polite" hidden><?php echo _('10-destination limit reached.'); ?></span>
 							</section>
 						</div>
+						<details class="sls-integration-help"><summary><?php echo _('Slack and Teams setup'); ?> <?php include __DIR__ . '/labs.php'; ?></summary>
+							<p><?php echo _('Slack: create an incoming webhook for the desired channel. Teams: create a Workflows webhook that posts Adaptive Cards to the desired channel or chat, with the trigger authentication set to Anyone. Paste the generated secret URL and choose the matching integration above. Tenant-authenticated Teams triggers and retired Office 365 connector URLs are not supported.'); ?></p>
+							<p><?php echo _('The provider or workflow chooses the channel. Keep the URL secret and assign a workflow co-owner so delivery does not depend on one user account. Accepted means the webhook accepted the request; it does not confirm that people received or read the message. Messages that exceed the provider size limit fail without shortening the alert.'); ?></p>
+							<p><?php echo _('Incident messages include an Open incident in SLS link when the configured HTTPS Control API address matches the advertised PBX hostname. The link preserves the configured port and opens the incident in FreePBX; sign-in and module access are required. Opening it does not acknowledge an alert. Ordinary announcements and weather messages do not acquire an incident link from their wording.'); ?></p>
+							<p><a href="https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/" target="_blank" rel="noopener noreferrer"><?php echo _('Slack setup guide'); ?></a> · <a href="https://support.microsoft.com/en-us/workflows/send-messages-in-teams-using-incoming-webhooks" target="_blank" rel="noopener noreferrer"><?php echo _('Teams Workflows setup guide'); ?></a></p>
+						</details>
 						<p class="text-muted sls-destination-note"><i class="fa fa-info-circle"></i> <?php echo _('Close this window, then use Save General Settings to stage the changes.'); ?></p>
 					</div>
 					<div class="modal-footer"><button type="button" class="btn btn-primary" data-dismiss="modal"><?php echo _('Done Editing'); ?></button></div>
 				</div></div></div>
 				<script type="text/template" id="sls-email-row-template"><div class="sls-editor-row" data-email-row><div class="sls-editor-grow"><input class="form-control" type="email" placeholder="pbx-operations@example.com"></div><button type="button" class="btn btn-link text-danger" data-remove-email><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div></script>
 				<script type="text/template" id="sls-discord-row-template"><div class="sls-editor-row sls-webhook-row" data-webhook-row data-webhook-type="discord"><div class="sls-webhook-enabled"><input type="hidden" data-field="enabled-hidden" value="0"><label><input type="checkbox" data-field="enabled" value="1" checked> <?php echo _('Enabled'); ?></label><input type="hidden" data-field="id" value=""></div><div><label><?php echo _('Name'); ?></label><input class="form-control" data-field="name" maxlength="80" placeholder="Operations"></div><div><label><?php echo _('Webhook URL'); ?></label><input class="form-control" type="password" data-field="url" autocomplete="new-password" placeholder="https://discord.com/api/webhooks/..."></div><button type="button" class="btn btn-link text-danger" data-remove-webhook><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div></script>
-				<script type="text/template" id="sls-generic-row-template"><div class="sls-editor-row sls-webhook-row" data-webhook-row data-webhook-type="generic"><div class="sls-webhook-enabled"><input type="hidden" data-field="enabled-hidden" value="0"><label><input type="checkbox" data-field="enabled" value="1" checked> <?php echo _('Enabled'); ?></label><input type="hidden" data-field="id" value=""></div><div><label><?php echo _('Name'); ?></label><input class="form-control" data-field="name" maxlength="80" placeholder="Incident Platform"></div><div><label><?php echo _('HTTPS URL'); ?></label><input class="form-control" type="password" data-field="url" autocomplete="new-password" placeholder="https://alerts.example.com/hooks/sls"></div><button type="button" class="btn btn-link text-danger" data-remove-webhook><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div></script>
-				<script type="text/template" id="sls-announcement-row-template"><div class="sls-editor-row sls-webhook-row" data-webhook-row data-webhook-type="announcement"><div class="sls-webhook-enabled"><input type="hidden" data-field="enabled-hidden" value="0"><label><input type="checkbox" data-field="enabled" value="1" checked> <?php echo _('Enabled'); ?></label><input type="hidden" data-field="id" value=""></div><div><label><?php echo _('Name'); ?></label><input class="form-control" data-field="name" maxlength="80" placeholder="Announcements"></div><div><label><?php echo _('HTTPS Webhook URL'); ?></label><div class="input-group"><input class="form-control" type="password" data-field="url" autocomplete="new-password" placeholder="https://discord.com/api/webhooks/..."><span class="input-group-btn"><button type="button" class="btn btn-default" data-toggle-secret title="<?php echo htmlspecialchars(_('Show or hide the URL being entered')); ?>" aria-label="<?php echo htmlspecialchars(_('Show or hide the URL being entered')); ?>"><i class="fa fa-eye" aria-hidden="true"></i></button></span></div></div><button type="button" class="btn btn-link text-danger" data-remove-webhook><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div></script>
+				<script type="text/template" id="sls-generic-row-template"><div class="sls-editor-row sls-webhook-row" data-webhook-row data-webhook-type="generic"><div class="sls-webhook-enabled"><input type="hidden" data-field="enabled-hidden" value="0"><label><input type="checkbox" data-field="enabled" value="1" checked> <?php echo _('Enabled'); ?></label><input type="hidden" data-field="id" value=""></div><div><label><?php echo _('Name'); ?></label><input class="form-control" data-field="name" maxlength="80" placeholder="Incident Platform"><?php $renderWebhookFormat('generic', ''); ?></div><div><label><?php echo _('HTTPS URL'); ?></label><input class="form-control" type="password" data-field="url" autocomplete="new-password" placeholder="https://alerts.example.com/hooks/sls"></div><button type="button" class="btn btn-link text-danger" data-remove-webhook><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div></script>
+				<script type="text/template" id="sls-announcement-row-template"><div class="sls-editor-row sls-webhook-row" data-webhook-row data-webhook-type="announcement"><div class="sls-webhook-enabled"><input type="hidden" data-field="enabled-hidden" value="0"><label><input type="checkbox" data-field="enabled" value="1" checked> <?php echo _('Enabled'); ?></label><input type="hidden" data-field="id" value=""></div><div><label><?php echo _('Name'); ?></label><input class="form-control" data-field="name" maxlength="80" placeholder="Announcements"><?php $renderWebhookFormat('announcement', ''); ?></div><div><label><?php echo _('HTTPS Webhook URL'); ?></label><div class="input-group"><input class="form-control" type="password" data-field="url" autocomplete="new-password" placeholder="https://discord.com/api/webhooks/..."><span class="input-group-btn"><button type="button" class="btn btn-default" data-toggle-secret title="<?php echo htmlspecialchars(_('Show or hide the URL being entered')); ?>" aria-label="<?php echo htmlspecialchars(_('Show or hide the URL being entered')); ?>"><i class="fa fa-eye" aria-hidden="true"></i></button></span></div></div><button type="button" class="btn btn-link text-danger" data-remove-webhook><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div></script>
 
+</section>
+<section class="sls-settings-section" id="sls-settings-audio" data-settings-section="audio" aria-labelledby="sls-settings-tab-audio">
 				<h3 class="sls-settings-heading"><i class="fa fa-volume-up text-success" aria-hidden="true"></i> <?php echo _('Regular Paging Audio'); ?></h3>
 				<div class="alert alert-info"><i class="fa fa-info-circle" aria-hidden="true"></i> <?php echo _('These defaults apply only to dashboard and API announcements. Weather Alerts and Lightning Alerts keep their own independent sounds and volume settings.'); ?></div>
 				<div class="row">
@@ -447,6 +513,11 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						</div>
 					</div>
 				</div>
+                <div class="form-group">
+                    <label for="sls-pronunciation"><i class="fa fa-commenting-o text-primary" aria-hidden="true"></i> <?php echo _('Announcement pronunciation'); ?></label>
+                    <textarea class="form-control" id="sls-pronunciation" name="announcement_pronunciation_text" rows="4" maxlength="40000" aria-describedby="sls-pronunciation-help" placeholder="<?php echo htmlspecialchars(_('Example: PBX = P B X')); ?>"><?php echo htmlspecialchars(implode("\n", array_map(static function ($row) { return $row['phrase'].' = '.$row['spoken']; }, $settings['announcement_pronunciation'] ?? [])), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?></textarea>
+                    <p id="sls-pronunciation-help" class="help-block"><?php echo _('Optional: one phrase = spoken replacement per line, up to 50. Matches whole phrases without regard to capitalization; the longest match wins. Replacements affect announcement speech only. Save, then use Listen on the dashboard to review the exact spoken text and audio.'); ?></p>
+                </div>
 				<div class="row">
 					<div class="col-md-6">
 						<div class="form-group">
@@ -468,7 +539,21 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 					</div>
 				</div>
 
-				<h3 class="sls-settings-heading"><i class="fa fa-desktop text-info" aria-hidden="true"></i> <?php echo _('Desktop Clients'); ?></h3>
+</section>
+<section class="sls-settings-section" id="sls-settings-desktops" data-settings-section="desktops" aria-labelledby="sls-settings-tab-desktops">
+				<h3 class="sls-settings-heading"><i class="fa fa-desktop text-info" aria-hidden="true"></i> <?php echo _('Desktop Clients'); ?> <?php include __DIR__ . '/labs.php'; ?></h3>
+				<div class="form-group" style="max-width:420px">
+					<label for="sls-desktop-limit"><?php echo _('Desktop Capacity'); ?></label>
+					<input class="form-control" id="sls-desktop-limit" name="desktop_client_limit" type="number" min="1" max="1000" value="<?php echo (int)($settings['desktop_client_limit'] ?? 25); ?>">
+					<p class="help-block"><?php echo _('Default: 25. Increasing this limit requires a successful CPU, memory, and disk check. Capacity above 32 simultaneous streams requires desktop apps that support cursor-based JSON fallback. Verify delivery under your expected load before deployment.'); ?></p>
+				</div>
+				<input type="hidden" name="desktop_clients_present" value="1">
+				<div class="form-group" style="max-width:420px">
+					<label for="sls-desktop-minimum-version"><?php echo _('Minimum desktop app version'); ?></label>
+					<input class="form-control" id="sls-desktop-minimum-version" name="desktop_minimum_version" type="text" maxlength="40" placeholder="1.10.0" value="<?php echo htmlspecialchars($settings['desktop_minimum_version'] ?? '', ENT_QUOTES, 'UTF-8'); ?>">
+					<p class="help-block"><?php echo _('Optional. Help & Diagnostics flags reporting apps below this version. This advisory policy does not block delivery. Older apps that do not report their version remain marked Not reported.'); ?></p>
+				</div>
+				<input type="hidden" name="desktop_clients_json" id="sls-desktop-clients-json" value="">
 					<p class="help-block"><?php echo _('Each desktop app should use its own username and password against /api/sipnotify/desktop. Client IDs are generated automatically and cannot be edited. Passwords are AES-encrypted in the central config file.'); ?></p>
 				<div class="table-responsive sls-desktop-client-scroll" id="desktop-client-scroll" aria-label="<?php echo htmlspecialchars(_('Desktop client list')); ?>">
 					<table class="table table-striped table-bordered" id="desktop-client-table">
@@ -504,14 +589,18 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 					</table>
 				</div>
 				<button type="button" class="btn btn-default" id="add-desktop-client"><?php echo _('Add Desktop Client'); ?></button>
+				<input type="hidden" name="desktop_clients_complete" value="1">
+				<p id="sls-desktop-capacity-error" class="text-danger" role="status" aria-live="polite"></p>
 				<div class="well" style="margin-top: 12px;">
 					<strong><?php echo _('Desktop Endpoint'); ?></strong>
 					<div><code><?php echo htmlspecialchars(($settings['sipnotify']['base_url'] ?? ('https://' . ($_SERVER['HTTP_HOST'] ?? 'localhost') . '/api/sipnotify')) . '/desktop'); ?></code></div>
 						<p class="help-block" style="margin-bottom: 0;"><?php echo _('Use HTTP Basic authentication with the desktop client username and password. Legacy Bearer token access is not accepted for desktop clients.'); ?></p>
 				</div>
 
+</section>
+<section class="sls-settings-section" id="sls-settings-security" data-settings-section="security" aria-labelledby="sls-settings-tab-security">
 				<div class="panel panel-warning" style="border-width: 2px;">
-					<div class="panel-heading"><strong><i class="fa fa-code text-warning" aria-hidden="true"></i> <?php echo _('Control API'); ?></strong><span class="label label-success sls-labs-badge"><i class="fa fa-flask" aria-hidden="true"></i> <?php echo _('Labs'); ?></span></div>
+					<div class="panel-heading"><strong><i class="fa fa-code text-warning" aria-hidden="true"></i> <?php echo _('Control API'); ?></strong><?php include __DIR__ . '/labs.php'; ?></div>
 					<div class="panel-body">
 						<p class="text-warning"><?php echo _('Remote management can send announcements, trigger NWS tests, read status/logs, and update normalized Mass Notifications config. Keep this disabled unless a trusted remote controller needs it.'); ?></p>
 						<div class="row">
@@ -577,13 +666,69 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 								</div>
 							</div>
 							<div class="col-md-6">
-								<p class="help-block" style="margin-top: 25px;"><?php echo _('Control API use is audited by source IP/action and retained for 30 days. Secrets are not written to the audit log.'); ?></p>
+								<p class="help-block" style="margin-top: 25px;"><?php echo _('Control API use is audited by source IP, action and credential identity. Local retention keeps up to 10,000 records for up to 30 days. Secrets and message contents are excluded.'); ?></p>
 							</div>
 						</div>
 					</div>
 				</div>
 
+				<div class="panel panel-default">
+					<div class="panel-heading"><strong><i class="fa fa-history" aria-hidden="true"></i> <?php echo _('Audit forwarding'); ?></strong></div>
+					<div class="panel-body">
+						<div class="row">
+							<div class="col-md-4"><div class="form-group">
+								<label for="sls-audit-syslog"><?php echo _('Send API audit events to the system logger'); ?></label>
+								<select id="sls-audit-syslog" class="form-control" name="control_api[audit_syslog]" aria-describedby="sls-audit-syslog-help">
+									<option value="0" <?php echo ($control['audit_syslog'] ?? '0') !== '1' ? 'selected' : ''; ?>><?php echo _('Disabled'); ?></option>
+									<option value="1" <?php echo ($control['audit_syslog'] ?? '0') === '1' ? 'selected' : ''; ?>><?php echo _('Enabled'); ?></option>
+								</select>
+							</div></div>
+							<div class="col-md-8"><p id="sls-audit-syslog-help" class="help-block"><?php echo _('Use an existing system logging agent to forward these events to a separate collector over authenticated TLS. SLS sends bounded local events tagged sls-mass-notify (local5.info), with unique event IDs. Source IPs and credential identities are included. Local acceptance does not confirm remote receipt; verify the collector before relying on it.'); ?></p></div>
+						</div>
+						<p class="help-block"><i class="fa fa-info-circle" aria-hidden="true"></i> <?php echo _('This setting does not install or reconfigure a logging service. Apply Config to activate it. Deployment readiness reports local forwarding failures; local audit history is retained independently.'); ?></p>
+					</div>
+				</div>
+				<?php include __DIR__ . '/api_credentials.php'; ?>
+				<div class="panel panel-default" style="margin-top:20px">
+					<div class="panel-heading"><strong><i class="fa fa-shield" aria-hidden="true"></i> <?php echo _('API reverse proxies'); ?></strong></div>
+					<div class="panel-body">
+						<label for="sls-trusted-proxies"><?php echo _('Trusted proxy networks'); ?></label>
+						<textarea id="sls-trusted-proxies" class="form-control" name="trusted_proxy_cidrs" rows="3" placeholder="192.0.2.10/32&#10;2001:db8::10/128" aria-describedby="sls-trusted-proxy-help"><?php echo htmlspecialchars(implode("\n", $settings['api_network']['trusted_proxy_cidrs'] ?? []), ENT_QUOTES, 'UTF-8'); ?></textarea>
+						<p id="sls-trusted-proxy-help" class="help-block"><?php echo _('Leave empty for a direct connection. Add only the addresses of proxies you administer, one IPv4 or IPv6 CIDR per line. Use individual hosts or narrow networks. Each trusted proxy must overwrite X-Forwarded-For and X-Forwarded-Proto. Missing or invalid forwarded information is rejected; forwarded hostnames are never trusted. Submit and Apply Config to activate changes.'); ?></p>
+					</div>
+				</div>
+</section>
+<section class="sls-settings-section" id="sls-settings-maintenance" data-settings-section="maintenance" aria-labelledby="sls-settings-tab-maintenance">
 				<h3 class="sls-settings-heading"><i class="fa fa-history text-muted" aria-hidden="true"></i> <?php echo _('Updates and Retention'); ?></h3>
+				<div class="panel panel-default">
+					<div class="panel-heading"><strong><i class="fa fa-shield" aria-hidden="true"></i> <?php echo _('Generated image and phone XML access'); ?></strong></div>
+					<div class="panel-body">
+						<?php $mediaAccess = array_replace(['network_restricted'=>false, 'allowed_cidrs'=>[], 'max_age_minutes'=>0], $settings['media_access'] ?? []); ?>
+						<p class="help-block"><?php echo _('Images and phone XML use unguessable URLs without a desktop password or browser session. Optional restrictions below apply to every new download, including existing URLs. They do not retract content already downloaded. Defaults preserve existing device access.'); ?></p>
+						<input type="hidden" name="media_access[network_restricted]" value="0">
+						<div class="checkbox"><label><input type="checkbox" name="media_access[network_restricted]" value="1" <?php echo $mediaAccess['network_restricted'] ? 'checked' : ''; ?>> <?php echo _('Allow generated media only from listed networks'); ?></label></div>
+						<div class="row">
+							<div class="col-sm-7"><label for="sls-media-networks"><?php echo _('Allowed device networks'); ?></label>
+								<textarea id="sls-media-networks" class="form-control" name="media_access[allowed_cidrs]" rows="3" maxlength="4096" placeholder="192.0.2.0/24&#10;2001:db8:1234::/48" aria-describedby="sls-media-networks-help"><?php echo htmlspecialchars(implode("\n", $mediaAccess['allowed_cidrs']), ENT_QUOTES, 'UTF-8'); ?></textarea>
+								<p id="sls-media-networks-help" class="help-block"><?php echo _('Up to 32 IPv4/IPv6 addresses or CIDRs. Include every phone network and the public NAT address used by remote desktops. Forwarded addresses are accepted only from the trusted proxies configured above. A /0 network is not allowed.'); ?></p>
+							</div>
+							<div class="col-sm-5"><label for="sls-media-expiry"><?php echo _('Download expiry after file creation'); ?></label>
+								<div class="input-group"><input id="sls-media-expiry" class="form-control" type="number" name="media_access[max_age_minutes]" min="0" max="1440" step="1" required value="<?php echo (int)$mediaAccess['max_age_minutes']; ?>" aria-describedby="sls-media-expiry-help"><span class="input-group-addon"><?php echo _('minutes'); ?></span></div>
+								<p id="sls-media-expiry-help" class="help-block"><?php echo _('0 disables expiry. Otherwise choose 10–1440 minutes. Repeated downloads never extend this age. An older active weather image can expire too; allow enough time for your phone displays. Delivery history is retained.'); ?></p>
+							</div>
+						</div>
+						<p class="text-muted"><i class="fa fa-info-circle" aria-hidden="true"></i> <?php echo _('Save and Apply Config activates this policy without a firewall change. Desktop Details retains message text when an image is unavailable. Some phone formats need the image or XML download to display the alert.'); ?></p>
+					</div>
+				</div>
+				<div class="panel panel-default">
+					<div class="panel-heading"><strong><i class="fa fa-hdd-o" aria-hidden="true"></i> <?php echo _('Generated media storage'); ?></strong></div>
+					<div class="panel-body"><div class="row">
+						<div class="col-sm-4"><label for="sls-media-cache"><?php echo _('Cache target'); ?></label>
+							<div class="input-group"><input id="sls-media-cache" class="form-control" name="generated_media_cache_mib" type="number" min="64" max="4096" step="1" required aria-describedby="sls-media-cache-help" value="<?php echo (int)($settings['generated_media_cache_mib'] ?? 512); ?>"><span class="input-group-addon">MiB</span></div>
+						</div>
+						<div class="col-sm-8"><p id="sls-media-cache-help" class="help-block"><?php echo _('Default: 512 MiB for generated speech, images and phone XML combined. Maintenance removes the oldest unused files when the target is exceeded. Active alerts, saved references and files created within 15 minutes remain protected. This target is not a disk reservation or a limit on active announcements; excess protected usage produces a storage warning.'); ?></p></div>
+					</div></div>
+				</div>
 				<?php if (($packageStatus['state'] ?? '') === 'update') { ?>
 					<div class="alert alert-warning"><i class="fa fa-exclamation-triangle" aria-hidden="true"></i> <strong><?php echo htmlspecialchars($packageStatus['label'] ?? _('Update available')); ?></strong><?php if (!empty($packageStatus['message'])) { ?> <?php echo htmlspecialchars($packageStatus['message']); ?><?php } ?></div>
 				<?php } ?>
@@ -600,19 +745,47 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						</select>
 					</div>
 					<div class="col-md-3">
-						<label><?php echo _('Update Channel'); ?></label>
-						<input type="hidden" name="updates[channel]" value="beta">
-						<p class="form-control-static"><span class="label label-info"><?php echo _('Verified releases'); ?></span></p>
-						<p class="help-block"><?php echo _('Public beta updates are the only available channel right now.'); ?></p>
+						<label for="sls-update-channel"><?php echo _('Update Channel'); ?></label>
+						<select id="sls-update-channel" class="form-control" name="updates[channel]">
+							<option value="beta" <?php echo ($updates['channel'] ?? 'beta') === 'beta' ? 'selected' : ''; ?>><?php echo _('Beta and stable releases'); ?></option>
+							<option value="stable" <?php echo ($updates['channel'] ?? 'beta') === 'stable' ? 'selected' : ''; ?>><?php echo _('Stable releases only'); ?></option>
+						</select>
+						<p class="help-block"><?php echo _('Every installation requires a valid publisher signature. Stable waits until a stable release is published.'); ?></p>
 					</div>
 					<div class="col-md-3">
 						<label><?php echo _('Installed Package Version'); ?></label>
 						<p class="form-control-static"><code><?php echo htmlspecialchars($package_version ?? 'unknown'); ?></code> <span class="label <?php echo $packageStatusClass; ?>"><?php echo htmlspecialchars($packageStatus['label'] ?? 'LATEST'); ?></span></p>
 						<div class="sls-update-controls">
 							<?php if ($hasPackageUpdate) { ?>
-								<button type="submit" class="btn btn-warning btn-sm" name="slsmassnotifyserver_action" value="manual_update"><i class="fa fa-refresh" aria-hidden="true"></i> <?php echo _('Update to Latest Release'); ?></button>
+								<button type="submit" class="btn btn-warning btn-sm" name="slsmassnotifyserver_action" value="manual_update"><i class="fa fa-refresh" aria-hidden="true"></i> <?php echo _('Install Selected Release'); ?></button>
 							<?php } ?>
 						</div>
+					</div>
+				</div>
+				<div class="panel panel-default sls-update-policy" style="margin-top:16px">
+					<div class="panel-heading"><strong><i class="fa fa-calendar-check-o" aria-hidden="true"></i> <?php echo _('Update policy'); ?></strong></div>
+					<div class="panel-body">
+						<div class="row">
+							<div class="col-sm-6 col-md-3 form-group">
+								<label for="sls-update-pin"><?php echo _('Pinned version'); ?></label>
+								<input id="sls-update-pin" class="form-control" name="updates[pinned_version]" maxlength="19" placeholder="0.1.5-beta" value="<?php echo htmlspecialchars($updates['pinned_version'] ?? '', ENT_QUOTES, 'UTF-8'); ?>" aria-describedby="sls-update-pin-help">
+								<p id="sls-update-pin-help" class="help-block"><?php echo _('Optional exact version. Leave blank for the newest eligible release. An older pin holds the current installation; it does not downgrade it.'); ?></p>
+							</div>
+							<div class="col-sm-6 col-md-3 form-group">
+								<label for="sls-update-delay"><?php echo _('Wait after publication'); ?></label>
+								<div class="input-group"><input id="sls-update-delay" class="form-control" name="updates[rollout_delay_hours]" type="number" min="0" max="168" step="1" value="<?php echo (int)($updates['rollout_delay_hours'] ?? 0); ?>"><span class="input-group-addon"><?php echo _('hours'); ?></span></div>
+								<p class="help-block"><?php echo _('Delay automatic installation by up to seven days. Use different delays on different PBXs for a staged rollout.'); ?></p>
+							</div>
+							<div class="col-sm-6 col-md-3 form-group">
+								<label for="sls-update-window-start"><?php echo _('Automatic window starts'); ?></label>
+								<input id="sls-update-window-start" class="form-control" name="updates[window_start]" type="time" value="<?php echo htmlspecialchars($updates['window_start'] ?? '', ENT_QUOTES, 'UTF-8'); ?>" aria-describedby="sls-update-window-help">
+							</div>
+							<div class="col-sm-6 col-md-3 form-group">
+								<label for="sls-update-window-end"><?php echo _('Automatic window ends'); ?></label>
+								<input id="sls-update-window-end" class="form-control" name="updates[window_end]" type="time" value="<?php echo htmlspecialchars($updates['window_end'] ?? '', ENT_QUOTES, 'UTF-8'); ?>" aria-describedby="sls-update-window-help">
+							</div>
+						</div>
+						<p id="sls-update-window-help" class="help-block"><i class="fa fa-info-circle" aria-hidden="true"></i> <?php echo _('Times use the PBX operating-system timezone. Allow at least one hour, including overnight windows, or leave both times blank. Checks run hourly at minute 17; a window controls when installation starts. Manual installation bypasses the window and delay, while retaining the saved channel and version pin. Save and Apply Config before requesting an update.'); ?></p>
 					</div>
 				</div>
 				<div id="sls-update-progress"
@@ -634,7 +807,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 				</div>
 
 				<details style="margin:20px 0;padding:14px;border:1px solid #dce2e8;border-radius:8px">
-					<summary><i class="fa fa-check-square-o text-primary" aria-hidden="true"></i> <?php echo _('Saved Channel Checks (optional)'); ?> <span tabindex="0" class="fa fa-question-circle text-muted" role="img" title="<?php echo htmlspecialchars(_('Optional shortcuts for testing selected phones and desktops with audio, visuals, or both. Not required for normal announcements or weather alerts.')); ?>" aria-label="<?php echo htmlspecialchars(_('Optional shortcuts for testing selected phones and desktops with audio, visuals, or both. Not required for normal announcements or weather alerts.')); ?>"></span></summary>
+					<summary><i class="fa fa-check-square-o text-primary" aria-hidden="true"></i> <?php echo _('Saved Channel Checks (optional)'); ?> <?php include __DIR__ . '/labs.php'; ?> <span tabindex="0" class="fa fa-question-circle text-muted" role="img" title="<?php echo htmlspecialchars(_('Optional shortcuts for testing selected phones and desktops with audio, visuals, or both. Not required for normal announcements or weather alerts.')); ?>" aria-label="<?php echo htmlspecialchars(_('Optional shortcuts for testing selected phones and desktops with audio, visuals, or both. Not required for normal announcements or weather alerts.')); ?>"></span></summary>
 					<p class="help-block"><?php echo _('Save up to ten scoped phone/desktop test profiles. Checks use the regular announcement audio settings and send no email or webhooks. They do not test Weather.gov or Xweather. Save and apply new profiles before running them.'); ?></p>
 					<input type="hidden" name="test_profiles_present" value="1">
 					<div id="sls-test-profile-list"></div>
@@ -646,16 +819,39 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 					<div class="input-group"><input id="sls-paging-answer-timeout" name="paging_answer_timeout" type="number" min="1" max="5" class="form-control" value="<?php echo (int)($settings['paging_answer_timeout'] ?? 5); ?>"><span class="input-group-addon"><?php echo _('seconds'); ?></span></div>
 					<p class="help-block"><?php echo _('Default 5 seconds; may be shortened to 1–4. Paging requires automatic answering. This does not change the visual alert expiry or extend playback.'); ?></p>
 				</div>
+</section>
 				<div class="sls-save-actions">
 					<button type="submit" class="btn btn-primary btn-lg"><i class="fa fa-save" aria-hidden="true"></i> <?php echo _('Save General Settings'); ?></button>
 				</div>
+				<input type="hidden" name="sls_general_form_complete" value="1">
 			</form>
 
+			<div data-settings-related="maintenance" aria-labelledby="sls-settings-tab-maintenance">
 			<h3 class="sls-config-backup"><i class="fa fa-download text-primary" aria-hidden="true"></i> <?php echo _('Config Backup'); ?></h3>
-			<form method="post" style="margin-bottom: 15px;">
+			<?php if (!empty($configuration_backup_reminder['due'])): ?>
+			<div class="alert alert-info" role="note">
+				<i class="fa fa-shield" aria-hidden="true"></i>
+				<strong><?php echo _('SLS backup reminder'); ?></strong>
+				<?php echo _('Export an encrypted configuration backup every 90 days and before major changes. Save it outside the PBX and keep its passphrase separately. Configure scheduled backups in FreePBX Backup & Restore.'); ?>
+			</div>
+			<?php endif; ?>
+			<form method="post" class="sls-manager-card" style="max-width:760px;margin-bottom:15px;">
+				<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
+				<input type="hidden" name="slsmassnotifyserver_action" value="export_encrypted_config">
+				<h4><i class="fa fa-lock text-primary" aria-hidden="true"></i> <?php echo _('Encrypted configuration backup'); ?></h4>
+				<p class="help-block"><?php echo _('Protect the configuration and its credentials with a separate backup passphrase. SLS does not store this passphrase and cannot recover a forgotten one. This export includes configuration; it does not include recordings or delivery history. Exports are audited before download; an audit storage or forwarding error prevents the download.'); ?></p>
+				<div class="form-group"><label for="sls-backup-passphrase"><?php echo _('Backup passphrase'); ?></label><input class="form-control" id="sls-backup-passphrase" name="backup_passphrase" type="password" minlength="12" maxlength="1024" autocomplete="new-password" required><p class="help-block"><?php echo _('Use at least 12 characters, preferably several unrelated words. Store it separately from the downloaded file.'); ?></p></div>
+				<div class="form-group"><label for="sls-backup-passphrase-confirm"><?php echo _('Confirm passphrase'); ?></label><input class="form-control" id="sls-backup-passphrase-confirm" name="backup_passphrase_confirm" type="password" minlength="12" maxlength="1024" autocomplete="new-password" required></div>
+				<button type="submit" class="btn btn-primary"><i class="fa fa-download" aria-hidden="true"></i> <?php echo _('Download encrypted .config'); ?></button>
+			</form>
+			<details style="max-width:760px;margin-bottom:20px;"><summary><?php echo _('Unencrypted export for compatibility'); ?></summary>
+			<p class="help-block"><?php echo _('An unencrypted export contains reusable credentials. Keep it in protected storage.'); ?></p>
+			<form method="post">
 				<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
 				<button type="submit" class="btn btn-default" name="slsmassnotifyserver_action" value="export_config"><?php echo _('Download .config'); ?></button>
 			</form>
+			</details>
+			<?php include __DIR__ . '/deployment_readiness.php'; ?>
 			<form method="post" action="config.php?display=slsmassnotifyserver" style="margin:24px 0">
 				<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
 				<button type="submit" class="btn btn-default" name="slsmassnotifyserver_action" value="diagnostic_download"><i class="fa fa-stethoscope" aria-hidden="true"></i> <?php echo _('Download diagnostics'); ?></button>
@@ -708,16 +904,81 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 								<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
 								<input type="hidden" name="slsmassnotifyserver_action" value="import_config">
 								<div class="form-group"><label><?php echo _('Upload .config'); ?></label><input type="file" name="config_upload" accept=".config,application/json" required></div>
+								<div class="form-group"><label for="sls-import-passphrase"><?php echo _('Backup passphrase'); ?></label><input class="form-control" id="sls-import-passphrase" type="password" name="import_passphrase" maxlength="1024" autocomplete="off"><p class="help-block"><?php echo _('Required for an encrypted backup. Leave empty for an older unencrypted export. The file is authenticated and validated before changes are staged.'); ?></p></div>
 								<button type="submit" class="btn btn-danger"><?php echo _('Replace Config'); ?></button>
 							</form>
 						</section>
 					</div>
 				</div>
 			</div>
+			</div>
 		</div>
 	</div>
 </div>
 <script>
+<?php readfile(__DIR__.'/device_capacity.js'); ?>
+(function () {
+    'use strict';
+    var toggle = document.getElementById('sls-address-change');
+    if (!toggle) { return; }
+    var panel = document.getElementById('sls-address-editor');
+    var host = document.getElementById('sls-advertised-host');
+    var api = document.getElementById('sls-advertised-api-port');
+    var media = document.getElementById('sls-advertised-media-port');
+    var control = document.getElementById('sls-advertised-control-port');
+    var scheme = document.querySelector('[name="sipnotify_media_scheme"]');
+    var preview = document.getElementById('sls-address-preview');
+    var button = document.getElementById('sls-address-check');
+    var status = document.getElementById('sls-address-check-result');
+    var inputs = [host, api, control, media], original = inputs.map(function (input) { return input.value; });
+    var request = null, generation = 0;
+    function refresh(reset) {
+        generation++;
+        if (request) { request.abort(); request = null; }
+        button.disabled = false; status.textContent = '';
+        panel.hidden = !toggle.checked;
+        inputs.forEach(function (input, index) {
+            input.disabled = !toggle.checked; input.required = toggle.checked;
+            if (reset && !toggle.checked) { input.value = original[index]; }
+        });
+        preview.textContent = '';
+        var name = host.value.trim().toLowerCase();
+        var apiBase = 'https://' + name + (Number(api.value) === 443 ? '' : ':' + api.value);
+        var controlBase = 'https://' + name + (Number(control.value) === 443 ? '' : ':' + control.value);
+        var mediaBase = scheme.value + '://' + name + (Number(media.value) === (scheme.value === 'https' ? 443 : 80) ? '' : ':' + media.value);
+        [['Desktop', apiBase + '/api/sipnotify/desktop'], ['Control API', controlBase + '/api/sls-mass-notify'], ['Phone images', mediaBase + '/sls_mass_notify']].forEach(function (row) {
+            var line = document.createElement('div'); line.textContent = row[0] + ': ' + row[1]; preview.appendChild(line);
+        });
+    }
+    toggle.addEventListener('change', function () { refresh(true); if (toggle.checked) { host.focus(); } });
+    inputs.concat([scheme]).forEach(function (input) { input.addEventListener('input', function () { refresh(false); }); });
+    button.addEventListener('click', function () {
+        if (!toggle.checked || !inputs.every(function (input) { return input.reportValidity(); })) { return; }
+        var current = ++generation, body = new FormData();
+        body.set('slsmassnotifyserver_action', 'check_advertised_address');
+        body.set('slsmassnotifyserver_csrf', toggle.form.querySelector('[name="slsmassnotifyserver_csrf"]').value);
+        inputs.forEach(function (input) { body.set(input.name, input.value); });
+        body.set('sipnotify_media_scheme', scheme.value);
+        button.disabled = true; status.textContent = 'Checking the local HTTPS origin…';
+        var xhr = request = new XMLHttpRequest(); xhr.open('POST', 'config.php?display=slsmassnotifyserver_other'); xhr.timeout = 15000;
+        xhr.onload = function () {
+            if (current !== generation) { return; }
+            button.disabled = false; request = null;
+            var result = null;
+            try { result = JSON.parse(xhr.responseText); } catch (ignored) {}
+            status.textContent = result && typeof result.message === 'string' ? result.message
+                : (result && result.connection && typeof result.connection.message === 'string' ? result.connection.message
+                : 'The HTTPS check returned an unexpected response (HTTP ' + xhr.status + '). Reload the page if your administrator session expired.');
+        };
+        xhr.onerror = xhr.ontimeout = function () {
+            if (current !== generation) { return; }
+            button.disabled = false; request = null;
+            status.textContent = 'The HTTPS check could not finish within 15 seconds. Check the PBX connection and try again.';
+        };
+        xhr.send(body);
+    });
+    refresh(false);
+}());
 (function() {
 	var updateProgress = document.getElementById('sls-update-progress');
 	if (updateProgress && updateProgress.getAttribute('data-active') === '1') {
@@ -989,6 +1250,8 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 			if (id) id.name = prefix + '[id]';
 			if (name) name.name = prefix + '[name]';
 			if (url) url.name = prefix + '[url]';
+			var format = row.querySelector('[data-field="payload_format"]');
+			if (format) format.name = prefix + '[payload_format]';
 			if (type !== 'discord') {
 				var auth = row.querySelector('[data-webhook-auth]');
 				if (!auth) {
@@ -1013,9 +1276,10 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						auth.appendChild(clearLabel);
 					});
 					var hint = document.createElement('p'); hint.className = 'help-block';
-					hint.textContent = 'For generic HTTPS receivers only. Discord uses the token in its webhook URL. Secrets stay in the protected central configuration.';
+					hint.textContent = 'For native HTTPS receivers only. Slack and Teams Workflows use the secret in their URL; these optional headers are not sent to them. Secrets stay in the protected central configuration.';
 					auth.appendChild(hint); row.appendChild(auth);
 				}
+				auth.hidden = format && format.value !== 'native';
 				auth.querySelectorAll('[data-auth-field]').forEach(function(input) {
 					input.name = prefix + '[' + input.getAttribute('data-auth-field') + ']';
 				});
@@ -1036,6 +1300,9 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 		var template = document.getElementById('sls-' + type + '-row-template');
 		var addButton = document.querySelector('[data-add-webhook="' + type + '"]');
 		if (list) {
+			list.addEventListener('change', function(event) {
+				if (event.target.matches('[data-field="payload_format"]')) reindexWebhooks(type);
+			});
 			list.addEventListener('click', function(event) {
 				var remove = event.target.closest('[data-remove-webhook]');
 				if (remove) {
@@ -1103,8 +1370,34 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 	if (!table || !add) {
 		return;
 	}
+	var capacity = document.getElementById('sls-desktop-limit');
+	var capacityError = document.getElementById('sls-desktop-capacity-error');
+	var clientJson = document.getElementById('sls-desktop-clients-json');
+	// A single JSON field avoids PHP's max_input_vars truncating large fleets.
+	// Serialize only this manager; all other settings keep their usual form fields.
+	if (clientJson && clientJson.form) clientJson.form.addEventListener('submit', function () {
+		var clients = [];
+		table.querySelectorAll('[data-desktop-client-row]').forEach(function (row) {
+			var client = {enabled: '0'};
+			row.querySelectorAll('[name]').forEach(function (input) {
+				var match = /^desktop_clients\[\d+\]\[([a-z_]+)\]$/.exec(input.name);
+				if (match && (input.type !== 'checkbox' || input.checked)) client[match[1]] = input.value;
+			});
+			clients.push(client);
+		});
+		clientJson.value = JSON.stringify(clients);
+		var inputs = table.querySelectorAll('[name]');
+		inputs.forEach(function (input) { input.disabled = true; });
+		// Re-enable if another handler stops submission, retaining the edited form.
+		window.setTimeout(function () { inputs.forEach(function (input) { input.disabled = false; }); }, 0);
+	}, true);
 	function nextIndex() {
-		return table.querySelectorAll('[data-desktop-client-row]').length;
+		var highest = -1;
+		table.querySelectorAll('[name]').forEach(function (input) {
+			var match = /^desktop_clients\[(\d+)\]/.exec(input.name);
+			if (match) highest = Math.max(highest, Number(match[1]));
+		});
+		return highest + 1;
 	}
 	table.addEventListener('click', function(event) {
 		if (event.target.matches('[data-remove-desktop-client]')) {
@@ -1112,6 +1405,11 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 		}
 	});
 		add.addEventListener('click', function() {
+			if (table.querySelectorAll('[data-desktop-client-row]').length >= Number(capacity.value || 25)) {
+				capacityError.textContent = 'Desktop capacity reached. Increase Desktop Capacity before adding another client.';
+				return;
+			}
+			capacityError.textContent = '';
 			var index = nextIndex();
 				var row = document.createElement('tr');
 		row.setAttribute('data-desktop-client-row', '1');

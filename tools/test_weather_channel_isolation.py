@@ -20,10 +20,11 @@ class IsolationTests(unittest.TestCase):
                 'location': 'this area', 'recipients': ['1000'], 'desktop_clients': ['fixture-desktop'],
                 'query_interval_minutes': 5, 'all_clear': 'send'}
         area.update(area_changes or {})
-        record = {'group_id': 'fixture', 'configuration_identity': 'identity', 'event_kind': 'entry',
+        record = {'group_id': 'fixture', 'configuration_identity': 'a' * 64, 'event_kind': 'entry',
                   'cluster_started': 1, 'message': 'Fixture warning', 'subject': 'Fixture',
                   'event_name': 'Lightning', 'severity': 'Severe', 'state_label': 'active',
-                  'alert_id': 'fixture-alert', 'correlation_key': 'fixture-key', 'observed_at': time.time()}
+                  'alert_id': 'fixture-alert', 'correlation_key': 'fixture-key', 'observed_at': time.time(),
+                  'routing_snapshot': {'phones': ['1000'], 'desktops': ['fixture-desktop'], 'emails': [], 'webhooks': []}}
         order = []
         def audio(*args):
             order.append('audio')
@@ -33,12 +34,13 @@ class IsolationTests(unittest.TestCase):
         with mock.patch.multiple(lightning,
              load_config=mock.Mock(return_value=({'desktop_clients': [{'username': 'fixture-desktop', 'enabled': '1'}]}, {})),
              select_group=mock.Mock(return_value=area), configure_group_runtime=mock.Mock(),
-             lightning_area_identity=mock.Mock(return_value='identity'), quiet_hours_active=mock.Mock(return_value=False),
+             lightning_area_identity=mock.Mock(return_value='a' * 64), quiet_hours_active=mock.Mock(return_value=False),
+             CURRENT_GROUP_ID='fixture',
              read_state=mock.Mock(return_value=observation or {'last_observed_at': time.time(), 'active': True, 'cluster_started': 1}),
              send_visual=mock.Mock(side_effect=lambda *args: order.append('desktop')),
              generate_audio=mock.Mock(side_effect=audio),
              submit_local_channels=mock.Mock(side_effect=lambda *args: (order.append('phone') or 1, [])),
-             queue_external_delivery=mock.Mock(side_effect=lambda *args: order.append('external-queue')),
+             queue_external_delivery=mock.Mock(side_effect=lambda *args, **kwargs: order.append('external-queue')),
              append_event=mock.Mock(), record_xweather_outcome=mock.Mock(),
              atomic_json_update=mock.Mock(side_effect=AssertionError('Dispatcher must not rewrite observer state'))):
             result = lightning.deliver_queued_event(record)

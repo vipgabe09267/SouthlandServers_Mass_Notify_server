@@ -1,9 +1,62 @@
 <?php
 namespace FreePBX\modules;
+require_once __DIR__ . '/DeviceAcceptance.php';
 
 /** A small allowlisted report, never a dump of configuration or raw logs. */
 trait SlsSupportDiagnostics
 {
+    private function mayIncludeDeviceAcceptance(array $settings): bool
+    {
+        $principal = $GLOBALS['sls_control_principal'] ?? null;
+        // Trusted local tools already run with protected configuration access.
+        if (PHP_SAPI === 'cli' && !isset($_SESSION['AMP_user']) && $principal === null) { return true; }
+        if ($principal !== null) {
+            if (!is_array($principal) || isset($principal['operator_role']) || ($principal['id'] ?? '') === 'legacy') { return false; }
+            $current = \SLS\MassNotify\ApiSecurity::currentCredential($settings, $principal['id'] ?? '');
+            return is_array($current) && in_array('read', $current['scopes'] ?? [], true)
+                && ($current['audience']['unrestricted'] ?? false) === true;
+        }
+        try { return ($this->currentOperator()['operator_role'] ?? '') === 'administrator'; }
+        catch (\Throwable $error) { return false; }
+    }
+
+    public function getDeploymentReadiness(): array
+    {
+        require_once __DIR__ . '/DeploymentReadiness.php';
+        $now = time(); $checks = []; $settings = $this->getActiveSettings();
+        // Monitoring does not need a live AMI device scan. Existing diagnostics
+        // and bounded snapshots remain useful when maintenance has stopped.
+        $summary = $this->getDiagnosticsSummary(false);
+        foreach (array_slice((array)($summary['checks'] ?? []), 0, 64) as $index => $check) {
+            if (!is_array($check)) { continue; }
+            $checks[] = SlsDeploymentReadiness::check('runtime_' . $index, (string)($check['label'] ?? ''),
+                ($check['ok'] ?? false) === true ? 'ok' : 'warning', (string)($check['detail'] ?? ''));
+        }
+        $storage = SlsDeploymentReadiness::snapshot(self::PLUGIN_DATA_DIR . '/storage-summary.json');
+        $checks[] = SlsDeploymentReadiness::heartbeat('maintenance', _('Maintenance heartbeat'), $storage, 300, $now);
+        $checks = array_merge($checks, SlsDeploymentReadiness::audit($storage, ($settings['control_api']['audit_syslog'] ?? '0') === '1'));
+        $checks[] = SlsDeploymentReadiness::heartbeat('worker_probe', _('Announcement worker heartbeat'),
+            SlsDeploymentReadiness::snapshot(self::PLUGIN_DATA_DIR . '/announcement-jobs/worker-probe.json'), 600, $now);
+        $checks[] = SlsDeploymentReadiness::clock();
+        $checks[] = SlsDeploymentReadiness::certificate(SlsAdvertisedAddress::checkLocalHttps($settings), $now);
+        $media = SlsLocalWebProbe::mediaAccess($settings);
+        $checks[] = SlsDeploymentReadiness::check('media_access', _('Generated-media access'), $media['ok'] ? 'ok' : 'warning', $media['message']);
+        $capacity = $this->checkDesktopCapacityResources((int)($settings['desktop_client_limit'] ?? 25), (int)($settings['phone_device_limit'] ?? 25));
+        $checks[] = SlsDeploymentReadiness::capacity($capacity);
+        $checks = array_merge($checks, $this->automationDependencyChecks($settings));
+        $attention = count(array_filter($checks, static function ($check) { return $check['state'] === 'warning'; }));
+        $unknown = count(array_filter($checks, static function ($check) { return $check['state'] === 'unknown'; }));
+        $report = ['schema'=>'sls-deployment-readiness-v1', 'generated_at'=>gmdate('c'), 'version'=>self::MODULE_VERSION,
+            'operational_ready'=>$attention === 0 && $unknown === 0,
+            'attention_count'=>$attention, 'unknown_count'=>$unknown, 'checks'=>$checks,
+            'verification_scope'=>_('Read-only local PBX checks. Test the advertised address from a desktop to verify external routing. Handset display, complete audio playback and enabled provider delivery need separate device or provider acceptance tests.')];
+        if ($this->mayIncludeDeviceAcceptance($settings)) {
+            $stored = $this->deviceAcceptanceConfiguration(self::SETTINGS_JSON);
+            $report['device_acceptance'] = \SLS\MassNotify\DeviceAcceptance::report($stored['settings'], self::MODULE_VERSION);
+        }
+        return $report;
+    }
+
     public function getRedactedSupportDiagnostics()
     {
         $version = static function ($value) {
@@ -31,12 +84,12 @@ trait SlsSupportDiagnostics
         // Only these static labels can appear; diagnostic details may contain
         // settings or paths and must never be copied into the downloadable file.
         $labels = ['Central config', 'Central config loader', 'SIP NOTIFY sender', 'NWS poller',
-            'Weather scheduler', 'Weather delivery worker', 'Announcement scheduler', 'General announcement worker', 'Xweather poller',
+            'Weather scheduler', 'Weather delivery worker', 'Announcement scheduler', 'General announcement worker', 'Phone admission and outcome collector', 'Xweather poller',
             'Branded email sender', 'Branded Discord sender', 'Notification destination dispatcher',
             'System/error email notifier', 'Weather zone status helper', 'Weather cross-zone delivery coordinator',
             'Maintenance worker', 'Piper binary', 'Executable runtime ownership', 'Piper voice',
             'Notification log', 'Desktop journal', 'Local email transport', 'Control API',
-            'Storage available', 'External delivery queue', 'Weather delivery queue'];
+            'Storage free-space measurement', 'External delivery queue', 'Weather delivery queue'];
         try {
             $summary = $this->getDiagnosticsSummary();
             $checks = $summary['checks'] ?? [];
@@ -89,10 +142,11 @@ trait SlsSupportDiagnostics
         } catch (\Throwable $error) { $report['devices']['available'] = false; }
         try {
             $summary = $this->loadJsonFile(self::PLUGIN_DATA_DIR . '/storage-summary.json');
-            foreach (['pending_external', 'expired_external', 'queue_errors', 'pending_weather', 'failed_weather', 'uncertain_weather', 'expired_weather'] as $key) {
+            foreach (['pending_external', 'expired_external', 'queue_errors', 'queue_files_scanned', 'queue_files_seen', 'audit_failed_records', 'pending_weather', 'failed_weather', 'uncertain_weather', 'expired_weather', 'weather_running', 'weather_max_workers', 'weather_oldest_queued_age_seconds', 'weather_oldest_running_age_seconds', 'weather_deadline_misses'] as $key) {
                 $value = $summary[$key] ?? null;
                 $report['queue_counts'][$key] = is_int($value) && $value >= 0 && $value <= 1000000 ? $value : null;
             }
+            $report['queue_scan_incomplete'] = ($summary['queue_scan_incomplete'] ?? false) === true;
         } catch (\Throwable $error) { $report['queue_counts_available'] = false; }
         return $report;
     }

@@ -52,6 +52,16 @@ assert_same(false, announcement_display_expired([
 	'display_expires_at' => 'not-a-time',
 ], $now), 'Malformed expiry was not handled safely.');
 
+assert_same(true, desktop_event_display_expired([
+	'kind' => 'alert', 'expires' => '2026-07-31T17:59:00Z',
+], $now), 'Expired weather alert was not filtered.');
+assert_same(false, desktop_event_display_expired([
+	'kind' => 'alert', 'expires' => '2026-07-31T18:01:00Z',
+], $now), 'Unexpired weather alert was incorrectly filtered.');
+assert_same(true, desktop_event_display_expired([
+	'kind' => 'alert', 'message_type' => 'Cancel', 'expires' => '2026-07-31T18:01:00Z',
+], $now), 'Cancellation record was presented as an active weather alert.');
+
 $streamEvents = [
 	[
 		'id' => 'expired-cursor',
@@ -90,4 +100,24 @@ $expiredBatch = desktop_stream_events_after_cursor($streamEvents, 'desktop-a', '
 assert_same('expired-followup', $expiredBatch['last_event_id'], 'SSE cursor did not advance across an expired routed event.');
 assert_same([], $expiredBatch['events'], 'Expired SSE event was emitted to the desktop.');
 
-echo "Desktop announcement expiry regressions passed.\n";
+$weatherEvents = [
+	['id' => 'old-weather', 'kind' => 'alert', 'chain_key' => 'storm-1', 'desktop_all' => true, 'expires' => '2026-07-31T18:05:00Z'],
+	['id' => 'new-weather', 'kind' => 'alert', 'chain_key' => 'storm-1', 'desktop_all' => true, 'expires' => '2026-07-31T18:10:00Z'],
+	['id' => 'expired-weather', 'kind' => 'alert', 'desktop_all' => true, 'expires' => '2026-07-31T17:59:00Z'],
+];
+$weatherBatch = desktop_stream_events_after_cursor($weatherEvents, 'desktop-a', 'missing-cursor', $now);
+assert_same(['new-weather'], array_column($weatherBatch['events'], 0), 'Weather replay included expired or superseded instructions.');
+assert_same('expired-weather', $weatherBatch['last_event_id'], 'Weather expiry did not advance the cursor.');
+$weatherEvents[] = ['id' => 'cancel-weather', 'kind' => 'alert', 'chain_key' => 'storm-1', 'message_type' => 'Cancel', 'desktop_all' => true];
+$cancelledBatch = desktop_stream_events_after_cursor($weatherEvents, 'desktop-a', '@sls:empty', $now);
+assert_same([], $cancelledBatch['events'], 'Cancelled weather chain replayed an earlier alert.');
+assert_same('cancel-weather', $cancelledBatch['last_event_id'], 'Cancellation did not advance the cursor.');
+
+// A newer record routed only to another client must not reveal or suppress the
+// record this client is authorized to read.
+$weatherEvents[1]['desktop_all'] = false;
+$weatherEvents[1]['desktop_recipients'] = ['desktop-b'];
+$isolatedBatch = desktop_stream_events_after_cursor(array_slice($weatherEvents, 0, 2), 'desktop-a', '@sls:empty', $now);
+assert_same(['old-weather'], array_column($isolatedBatch['events'], 0), 'Another client\'s update changed this client\'s replay.');
+
+echo "Desktop announcement/weather expiry, cancellation and cursor regressions passed.\n";

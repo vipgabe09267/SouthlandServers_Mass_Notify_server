@@ -39,7 +39,8 @@ namespace {
 		if (!$condition) { throw new \RuntimeException($message); }
 	};
 	$accept = static function (array $settings, string $label) use ($invoke, $assert): array {
-		$assert($invoke('validateConfigSchema', $settings) === [], $label . ': import validation failed.');
+		$errors = $invoke('validateConfigSchema', $settings);
+		$assert($errors === [], $label . ': import validation failed: ' . implode('; ', $errors));
 		return $invoke('validateNativeBackupConfig', json_encode($settings, JSON_THROW_ON_ERROR));
 	};
 	$reject = static function (array $settings, string $label) use ($invoke, $assert): void {
@@ -59,7 +60,66 @@ namespace {
 	$accept($defaults, 'Defaults');
 	$normalizedDefaults = $invoke('normalizeSettings', $defaults);
 	$accept($normalizedDefaults, 'Normalized defaults');
+	$media = $defaults;
+	$media['media_access'] = ['network_restricted'=>true, 'allowed_cidrs'=>['192.0.2.0/24','2001:db8::/32'], 'max_age_minutes'=>60];
+	$assert($accept($media, 'Media policy')['media_access'] === $media['media_access'], 'Protected backup changed media policy.');
+	$assert($invoke('normalizeSettings', $media)['media_access'] === $media['media_access'], 'Normalizer lost media policy.');
+	foreach ([null, ['network_restricted'=>'1'], ['network_restricted'=>true,'allowed_cidrs'=>[]], ['max_age_minutes'=>1]] as $badMedia) {
+		$media['media_access'] = $badMedia; $reject($media, 'Malformed media policy');
+	}
 	$assert($invoke('normalizeSettings', $normalizedDefaults) === $normalizedDefaults, 'Canonical default settings are not idempotent.');
+
+	$geographic = $normalizedDefaults; $locationId = 'loc_' . str_repeat('a', 24); $reviewed = time();
+	$position = ['latitude' => 30.25, 'longitude' => -97.75, 'reviewed_at' => $reviewed];
+	$geographic['location_directory'] = \SLS\MassNotify\LocationDirectory::normalize(['nodes' => [[
+		'id' => $locationId, 'type' => 'site', 'parent_id' => '', 'name' => 'Fixture site', 'position' => $position,
+		'members' => ['extensions' => ['1000']]]]]);
+	$geographic['announcement_groups'] = [['id' => 'grp_' . str_repeat('a', 24), 'name' => 'Geographic fixture', 'extensions' => ['1000'],
+		'desktop_clients' => [], 'voice_recipient_ids' => [], 'email_recipient_ids' => [], 'sms_recipient_ids' => [],
+		'location_snapshot' => ['schema' => 2, 'path' => 'Geographic area', 'created_at' => $reviewed, 'directory_revision' => str_repeat('b', 64),
+			'desktop_bindings' => [], 'geographic' => ['selection' => ['west' => -98.0, 'south' => 30.0, 'east' => -97.0, 'north' => 31.0, 'max_age_days' => 30],
+				'locations' => [['id' => $locationId, 'position' => $position + ['source_id' => $locationId]]]]]]];
+	$geoRestored = $invoke('normalizeSettings', $accept($geographic, 'Geographic configuration'));
+	$assert($geoRestored['location_directory'] === $geographic['location_directory'], 'Protected roundtrip changed geographic coordinates.');
+	$assert($geoRestored['announcement_groups'] === $geographic['announcement_groups'], 'Protected roundtrip changed geographic audience metadata.');
+	$geographic['location_directory']['nodes'][0]['position'] = null; $reject($geographic, 'Explicit null coordinates');
+
+	$paging = $normalizedDefaults;
+	$paging['live_paging'] = \SLS\MassNotify\LivePagingConfig::normalize(['enabled'=>'1','extension'=>'799','external_access'=>'1','groups'=>[[
+		'group_id'=>'paging_fixture','name'=>'Fixture group','menu_number'=>1,'extensions'=>['1001'],'allowed_callers'=>['1000'],
+		'allow_external'=>'1','external_callers'=>['+15125550123'],'pin_hash'=>password_hash('0123',PASSWORD_DEFAULT)]]]);
+	$pagingRestored = $invoke('normalizeSettings', $accept($paging, 'Paging caller allowlist configuration'));
+	$assert($pagingRestored['live_paging'] === $paging['live_paging'], 'Protected roundtrip changed paging caller authorization or PIN.');
+	$pagingRedacted = $invoke('redactConfigSecrets', $paging);
+	$assert($pagingRedacted['live_paging']['groups'][0]['external_callers'] === ['[redacted]'], 'External caller number leaked through redacted config.');
+	$assert($pagingRedacted['live_paging']['groups'][0]['pin_hash'] === '[redacted]', 'Paging PIN hash leaked through redacted config.');
+	$paging['live_paging']['groups'][0]['external_callers'] = []; $reject($paging, 'External paging without approved callers');
+
+	// Named API credentials and proxy trust must survive every central-config
+	// path without widening permissions or exposing a password verifier.
+	$issued = \SLS\MassNotify\ApiSecurity::issue(['name' => 'Fixture automation', 'scopes' => ['send'],
+		'audience' => ['unrestricted' => false, 'extensions' => ['1000']]]);
+	$secured = $normalizedDefaults;
+	$secured['control_api']['credentials'] = [$issued['credential']];
+	$secured['api_network'] = ['trusted_proxy_cidrs' => ['192.0.2.10/32', '2001:db8::10/128']];
+	$accept($secured, 'Named credentials and explicit proxies');
+	$normalizedSecurity = $invoke('normalizeSettings', $secured);
+	$assert($normalizedSecurity['control_api']['credentials'] === $secured['control_api']['credentials'], 'Normalization lost named credentials.');
+	$assert($normalizedSecurity['api_network'] === $secured['api_network'], 'Normalization changed proxy trust.');
+	$redacted = $invoke('redactConfigSecrets', $secured);
+	$assert($redacted['control_api']['credentials'][0]['secret_hash'] === '[redacted]', 'Password verifier leaked through redacted config.');
+	$assert($redacted['control_api']['credentials'][0]['audience'] === $issued['credential']['audience'], 'Redaction changed permission metadata.');
+	foreach ([['api_network' => ['trusted_proxy_cidrs' => []]], ['control_api' => ['credentials' => []]]] as $patch) {
+		$assert($invoke('validateAndNormalizeControlConfigPatch', $patch)['errors'] !== [], 'Control API can mutate credential or proxy trust policy.');
+	}
+	foreach (['administrator', 'unknown'] as $scope) {
+		$invalid = $secured; $invalid['control_api']['credentials'][0]['scopes'] = [$scope];
+		$reject($invalid, 'Unknown named-credential scope');
+	}
+	foreach (['0.0.0.0/0', '::/0', 'invalid-proxy', 42] as $cidr) {
+		$invalid = $secured; $invalid['api_network']['trusted_proxy_cidrs'] = [$cidr];
+		$reject($invalid, 'Invalid trusted proxy');
+	}
 
 	foreach (['cloud_to_ground', 'cloud_to_cloud', 'both'] as $strikeType) {
 		$api = $invoke('validateAndNormalizeControlConfigPatch', ['xweather' => ['strike_type' => $strikeType]]);

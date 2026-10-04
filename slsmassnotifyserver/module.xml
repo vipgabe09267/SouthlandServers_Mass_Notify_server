@@ -2,7 +2,7 @@
 	<rawname>slsmassnotifyserver</rawname>
 	<repo>custom</repo>
 	<name>Southland Servers Mass Notifications Server</name>
-	<version>0.1.4-beta</version>
+	<version>0.1.5-beta</version>
 	<publisher>Southland Servers</publisher>
 	<license>AGPLv3+</license>
 	<licenselink>http://www.gnu.org/licenses/agpl-3.0.txt</licenselink>
@@ -13,10 +13,17 @@
 		Southland Servers Mass Notifications Server for FreePBX. Provides SIP NOTIFY alerts, scheduled announcements, U.S. weather.gov and optional Xweather notifications, live desktop notifications, and Piper TTS audio.
 	</description>
 	<menuitems>
+		<slsmassnotifyserver_operations category="Mass Notify" sort="0.5" href="/mass-notify/" target="_blank">Operator Portal</slsmassnotifyserver_operations>
+		<slsmassnotifyserver_operators category="Mass Notify" sort="4.9">Operator Access</slsmassnotifyserver_operators>
+		<slsmassnotifyserver_enterprise category="Mass Notify" sort="4.95">Enterprise Labs</slsmassnotifyserver_enterprise>
 		<slsmassnotifyserver_help category="Mass Notify" sort="1">Help</slsmassnotifyserver_help>
 		<slsmassnotifyserver category="Mass Notify" sort="2">Notification Logs</slsmassnotifyserver>
 		<slsmassnotifyserver_other category="Mass Notify" sort="3">General Settings</slsmassnotifyserver_other>
 		<slsmassnotifyserver_scheduling category="Mass Notify" sort="4">Scheduling</slsmassnotifyserver_scheduling>
+		<slsmassnotifyserver_paging category="Mass Notify" sort="4.5">Dial-in Paging</slsmassnotifyserver_paging>
+		<slsmassnotifyserver_locations category="Mass Notify" sort="4.6">Locations and Audiences</slsmassnotifyserver_locations>
+		<slsmassnotifyserver_incidents category="Mass Notify" sort="4.7">Incidents and Drills</slsmassnotifyserver_incidents>
+		<slsmassnotifyserver_automations category="Mass Notify" sort="4.8">Triggers and Actions</slsmassnotifyserver_automations>
 		<slsmassnotifyserver_nws category="Mass Notify" sort="5">Weather Alerts</slsmassnotifyserver_nws>
 		<slsmassnotifyserver_lightning category="Mass Notify" sort="6">Lightning Alerts</slsmassnotifyserver_lightning>
 	</menuitems>
@@ -31,6 +38,9 @@
 		<module>recordings ge 17.0.0</module>
 	</depends>
 	<hooks>
+		<framework class="Reload" namespace="FreePBX">
+			<method callingMethod="postReload" class="Slsmassnotifyserver" namespace="FreePBX\modules">postReloadPhoneEventCollector</method>
+		</framework>
 		<dashboard class="Overview" namespace="FreePBX\modules\Dashboard\Sections">
 			<method callingMethod="getSummary" class="Slsmassnotifyserver" namespace="FreePBX\modules">dashboardService</method>
 		</dashboard>

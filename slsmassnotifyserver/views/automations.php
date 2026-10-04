@@ -1,0 +1,23 @@
+<?php
+$revision=substr(hash('sha256',hash_file('sha256',__DIR__.'/automations.js').hash_file('sha256',__DIR__.'/automations.css')),0,16);
+?>
+<link rel="stylesheet" href="modules/slsmassnotifyserver/views/locations.css?v=<?php echo $revision; ?>">
+<link rel="stylesheet" href="modules/slsmassnotifyserver/views/automations.css?v=<?php echo $revision; ?>">
+<div class="container-fluid" id="sls-locations"><div class="display full-border"><div class="fpbx-container" id="sls-automations">
+<?php echo load_view(__DIR__.'/hero.php',['hero_image'=>$hero_image ?? '']); ?>
+<header class="sls-location-heading"><div><h1><i class="fa fa-bolt text-primary" aria-hidden="true"></i> Triggers and Actions <?php include __DIR__.'/labs.php'; ?></h1><p class="text-muted">Connect an enrolled source to a saved message, its recipients, and optional local actions.</p></div></header>
+<div class="alert alert-info">Labs integrations need acceptance testing with your devices and providers. New items start disabled. Saving configuration sends no notifications.</div>
+<div class="alert alert-info" id="sls-auto-pending" hidden><i class="fa fa-info-circle" aria-hidden="true"></i> Pending settings are shown. Apply Config to activate them.</div>
+<div class="alert" id="sls-auto-status" role="status" tabindex="-1" hidden></div>
+<section class="sls-location-card" id="sls-auto-enrollment" hidden aria-labelledby="sls-auto-enrollment-heading"><div class="sls-location-card-heading"><h2 id="sls-auto-enrollment-heading"><i class="fa fa-key" aria-hidden="true"></i> Enrollment secret · shown once</h2></div><div class="sls-location-card-body"><p>Copy this secret into the authorized source. It works only for this trigger after Apply Config. Rotating it revokes the previous enrollment.</p><label for="sls-auto-secret">Secret</label><input class="form-control" id="sls-auto-secret" readonly autocomplete="off"><p class="help-block">Use the signed request contract in Help / Trigger integrations. Keep the secret out of URLs, screenshots and logs.</p></div></section>
+<div class="sls-auto-columns">
+<?php foreach (['rules'=>['Triggers','bolt','An enrolled panic identity, signed sensor, trusted CAP feed, or designated internal emergency-call source.'], 'actions'=>['Device and script actions','plug','BrightSign presentation events, PATLITE signal towers, and approved local scripts.']] as $key=>$labels): ?>
+<section class="sls-location-card"><div class="sls-location-card-heading"><h2><i class="fa fa-<?php echo $labels[1]; ?>" aria-hidden="true"></i> <?php echo $labels[0]; ?></h2><button type="button" class="btn btn-primary btn-sm" data-auto-add="<?php echo $key; ?>"><i class="fa fa-plus" aria-hidden="true"></i> Add</button></div><div class="sls-location-card-body"><p class="help-block"><?php echo $labels[2]; ?></p><div id="sls-auto-<?php echo $key; ?>" class="sls-auto-list"></div></div></section>
+<?php endforeach; ?>
+</div>
+<form class="sls-location-card" id="sls-auto-editor" hidden><div class="sls-location-card-heading"><h2 id="sls-auto-title"></h2><span class="sls-location-badge" id="sls-auto-edit-state">Configuration</span></div><div class="sls-location-card-body"><div class="sls-location-fields" id="sls-auto-fields"></div></div><footer class="sls-location-card-footer"><div class="sls-location-actions"><button class="btn btn-primary" type="submit"><i class="fa fa-save" aria-hidden="true"></i> Save</button><button class="btn btn-default" type="button" id="sls-auto-close">Close</button></div><button class="btn btn-link text-danger" type="button" id="sls-auto-remove"><i class="fa fa-trash" aria-hidden="true"></i> Remove</button></footer></form>
+<section class="sls-location-card"><div class="sls-location-card-heading"><h2><i class="fa fa-history" aria-hidden="true"></i> Recent trigger activity</h2><a class="btn btn-default btn-sm" href="config.php?display=slsmassnotifyserver_automations"><i class="fa fa-refresh" aria-hidden="true"></i> Refresh</a></div><div class="sls-location-card-body"><p class="help-block">An accepted device command is not confirmation that a screen or lamp changed. Script success means the script exited with zero. Announcements retain their own delivery evidence.</p><div id="sls-auto-history" class="sls-auto-list"></div></div></section>
+<noscript><div class="alert alert-warning">JavaScript is required to edit triggers. Existing configuration remains active.</div></noscript>
+<script type="application/json" id="sls-auto-data"><?php echo json_encode(['state'=>$state,'csrf'=>$csrf_token ?? ''],JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT|JSON_THROW_ON_ERROR); ?></script>
+<script src="modules/slsmassnotifyserver/views/automations.js?v=<?php echo $revision; ?>" defer></script>
+</div></div></div>

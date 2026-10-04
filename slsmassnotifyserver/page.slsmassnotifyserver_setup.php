@@ -2,6 +2,7 @@
 // Southland Servers Mass Notifications Server by the Southland Servers Group
 
 $slsmassnotifyserver = \FreePBX::create()->Slsmassnotifyserver;
+$slsmassnotifyserver->enforceOperatorPageAccess('slsmassnotifyserver_setup');
 $saveResult = $_SESSION['slsmassnotifyserver_setup_result'] ?? null;
 unset($_SESSION['slsmassnotifyserver_setup_result']);
 

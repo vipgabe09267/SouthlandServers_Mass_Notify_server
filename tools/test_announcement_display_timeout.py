@@ -26,6 +26,12 @@ def visual_config():
 
 
 class AnnouncementDisplayTimeoutTests(unittest.TestCase):
+    def test_desktop_presentation_uses_readable_foreground(self):
+        for background, expected in [('#ffffff', '#000000'), ('#ffff00', '#000000'), ('#000000', '#ffffff'), ('#1f2937', '#ffffff')]:
+            record = SENDER_MODULE.announcement_api_record('fixture', 'message', '', [], background_color=background, image=True)
+            self.assertEqual(record['text_color'], expected)
+            self.assertEqual(record['presentation']['text_color'], expected)
+
     def test_timeout_is_clamped(self):
         self.assertEqual(SENDER_MODULE.normalize_announcement_timeout_seconds(-1), 0)
         self.assertEqual(SENDER_MODULE.normalize_announcement_timeout_seconds("90"), 90)
@@ -44,6 +50,24 @@ class AnnouncementDisplayTimeoutTests(unittest.TestCase):
             )
         self.assertIn("YealinkIPPhoneImageScreen", payload)
         self.assertIn("Timeout='75'", payload)
+
+    def test_opt_in_image_phone_keeps_plain_desktop_and_other_phones(self):
+        with mock.patch.object(SENDER_MODULE, 'render_announcement_image', return_value='https://pbx/unique.png') as render:
+            payload = SENDER_MODULE.build_phone_xml_for_format(visual_config(), 'yealink_image', 'announcement',
+                message='Full message', image=False, timeout_seconds=45)
+            self.assertIn('YealinkIPPhoneImageScreen', payload)
+            self.assertIn("Timeout='45'", payload)
+            self.assertEqual(render.call_args.args[2], 'Full message')
+            self.assertEqual(SENDER_MODULE.notify_events_for_format('yealink_image'), ['Yealink-xml'])
+            self.assertEqual(SENDER_MODULE.notify_content_type_for_format('yealink_image'), 'application/xml')
+            self.assertEqual(SENDER_MODULE.normalize_phone_format('yealink_image'), 'yealink_image')
+            for fmt in ('yealink', 'yealink_text'):
+                text = SENDER_MODULE.build_phone_xml_for_format(visual_config(), fmt, 'announcement', message='Full message', image=False)
+                self.assertIn('YealinkIPPhoneTextScreen', text)
+                self.assertNotIn('ImageScreen', text)
+            self.assertEqual(render.call_count, 1)
+        record = SENDER_MODULE.announcement_api_record('event', 'Full message', '', [], image=False)
+        self.assertEqual(record['announcement_style'], 'standard')
 
     def test_yealink_text_format_gets_timeout_but_generic_does_not(self):
         yealink = SENDER_MODULE.build_phone_xml_for_format(
@@ -90,7 +114,8 @@ class AnnouncementDisplayTimeoutTests(unittest.TestCase):
     def test_desktop_api_filters_without_removing_retained_journal_entries(self):
         source = DESKTOP_API.read_text(encoding="utf-8")
         self.assertIn("function announcement_display_expired", source)
-        self.assertGreaterEqual(source.count("announcement_display_expired($event"), 2)
+        self.assertIn("return announcement_display_expired($event, $now)", source)
+        self.assertIn("desktop_event_display_expired($event, $now)", source)
         retained = re.search(
             r"function retained_events\(array \$settings\): array\s*\{(?P<body>.*?)\n\}",
             source,

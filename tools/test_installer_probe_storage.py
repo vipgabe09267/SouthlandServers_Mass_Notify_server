@@ -84,6 +84,11 @@ asterisk() {
 refresh_module_install() { printf 'refresh\n' >>"$FIXTURE_ROOT/trace"; }
 sleep() { :; }
 php() { :; }
+runuser() {
+  [[ "$1 $2 $3 $4 $5" == '-u asterisk -- /usr/bin/php -r' ]] || return 95
+  printf 'media-policy\n' >>"$FIXTURE_ROOT/trace"
+  [ "${FAKE_MEDIA:-ok}" = ok ] || { printf 'Fixture media route cannot read protected configuration.\n' >&2; return 1; }
+}
 curl() {
   local output=""
   while [ "$#" -gt 0 ]; do
@@ -148,6 +153,7 @@ verify_ami_with_repair
             ("/api/sipnotify/desktop", "^(401|429)$", "401/429", "401"),
             ("/api/sipnotify/desktop/stream", "^(401|429)$", "401/429", "429"),
             ("/api/sls-mass-notify/", "^(401|403|405|429)$", "401/403/405/429", "403"),
+            ("/api/sls-mass-notify/sms-callback.php", "^405$", "405", "405"),
         ):
             with self.subTest(path=path):
                 result = self.run_helper(
@@ -177,9 +183,45 @@ verify_ami_with_repair
                 self.assertIn("Unable to create private", result.stdout)
                 self.assertEqual(self.trace.read_text(), "")
 
+    def test_media_policy_probe_runs_unprivileged_and_reports_failures(self):
+        result = self.run_helper('verify_media_access\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.trace.read_text(), 'media-policy\n')
+        result = self.run_helper('verify_media_access\n', FAKE_MEDIA='failed')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Fixture media route cannot read protected configuration.', self.log.read_text())
+        self.assertIn('Generated-media access enforcement could not be verified', result.stdout)
+
+    def test_render_probe_accepts_only_exact_bytes_or_explicit_policy_denial(self):
+        block = SOURCE.split('  verify_media_access || { rm -f "$media_probe" "$media_fetch"; exit 1; }', 1)[1]
+        block = block.split('  log "Verifying Asterisk PJSIP contact inventory', 1)[0]
+        config = self.base / 'fixture.config'
+        block = block.replace('/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config', str(config))
+        for code, body, restricted, expected in (
+            ('200', 'fixture-image', False, 0), ('200', 'wrong-image', False, 1),
+            ('403', '{"error":"media_network_denied"}', True, 0),
+            ('403', '{"error":"media_network_denied"}', False, 1),
+            ('403', 'Apache denied this path', True, 1), ('404', 'missing', False, 1),
+        ):
+            with self.subTest(code=code, restricted=restricted, body=body):
+                import json
+                config.write_text(json.dumps({'media_access': {'network_restricted': restricted}}))
+                (self.base / 'media.png').write_text('fixture-image')
+                (self.base / 'http-body').write_text(body)
+                script = '''
+media_probe="$FIXTURE_ROOT/media.png"
+media_fetch="$FIXTURE_ROOT/fetch"
+local_web_probe() { cat "$FIXTURE_ROOT/http-body" >"$2"; printf '%s' "$FAKE_HTTP"; }
+identify() { printf '480 272 8 sRGB None'; }
+'''
+                result = self.run_helper(script + block, FAKE_HTTP=code)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                self.assertFalse((self.base / 'media.png').exists())
+                self.assertFalse((self.base / 'fetch').exists())
+
     def test_final_verification_calls_private_helpers_and_keeps_media_temp_reserved(self):
         self.assertIn("verify_pjsip_contact_inventory || exit 1", SOURCE)
-        self.assertEqual(len(re.findall(r"^  verify_local_api_route /api/", SOURCE, re.M)), 3)
+        self.assertEqual(len(re.findall(r"^  verify_local_api_route /api/", SOURCE, re.M)), 4)
         media = SOURCE.split('  media_probe="', 1)[1].split('  if ! runuser', 1)[0]
         self.assertIn('media_fetch="$(mktemp /tmp/sls-mass-notify-render-fetch.XXXXXX)"', media)
         self.assertNotRegex(media, r'rm[^\n]*\$media_fetch')

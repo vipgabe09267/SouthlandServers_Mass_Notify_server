@@ -44,8 +44,8 @@ CYCLE_RETENTION_SECONDS = 2 * 3600
 # slot. Keep its reservation alive beyond that bound so another zone cannot
 # take the same destination while the first worker is still active.
 RESERVATION_LEASE_SECONDS = 70 * 60
-ALLOWED_KINDS = {"phone", "desktop", "email", "discord", "generic"}
-KIND_ORDER = ("phone", "desktop", "email", "discord", "generic")
+ALLOWED_KINDS = {"phone", "desktop", "email", "discord", "generic", "voice", "sms"}
+KIND_ORDER = ("phone", "desktop", "email", "discord", "generic", "voice", "sms")
 
 
 class CoordinationError(RuntimeError):
@@ -284,6 +284,8 @@ def _normalize_destination(kind: str, value) -> str:
         return normalized if len(normalized) <= 254 and re.fullmatch(
             r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,63}", normalized
         ) else ""
+    if kind in {"voice", "sms"}:
+        return raw if re.fullmatch(kind + r"_[a-f0-9]{24}", raw) else ""
     if kind in {"discord", "generic"}:
         return raw if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", raw) else ""
     return ""
@@ -439,7 +441,8 @@ def claim_destination_sets(
     total = 0
     for kind in KIND_ORDER:
         destinations = destination_sets.get(kind, [])
-        if not isinstance(destinations, list) or len(destinations) > 100:
+        limit = 1000 if kind in {'phone','desktop','voice'} else (50 if kind in {'email','sms'} else 10)
+        if not isinstance(destinations, list) or len(destinations) > limit:
             raise CoordinationError("destination list is invalid")
         normalized = []
         kind_originals = {}
@@ -451,7 +454,7 @@ def claim_destination_sets(
                 kind_originals[item] = str(value).strip()
                 normalized.append(item)
         total += len(normalized)
-        if total > 300:
+        if total > 3120:
             raise CoordinationError("destination set capacity is exhausted")
         normalized_sets[kind] = normalized
         originals[kind] = kind_originals

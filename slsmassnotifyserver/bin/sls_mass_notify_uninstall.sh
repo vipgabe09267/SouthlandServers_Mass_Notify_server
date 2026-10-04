@@ -145,7 +145,7 @@ require_freepbx() {
     log "/etc/freepbx.conf is missing or unreadable."
     exit 1
   }
-  php -d pcre.jit=0 -r '
+  /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 -r '
 $bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
 require "/etc/freepbx.conf";
 \FreePBX::Database()->query("SELECT 1");
@@ -194,6 +194,7 @@ acquire_maintenance_coordination() {
 
 snapshot_local_signer() {
   local candidate=""
+  local trust_helper="${SLS_MASS_NOTIFY_TRUST_HELPER_SOURCE:-/usr/local/bin/sls_mass_notify/sls_module_trust.py}"
   local -a candidates=()
 
   if [ -n "${SLS_MASS_NOTIFY_SIGNER_SOURCE:-}" ]; then
@@ -209,11 +210,11 @@ snapshot_local_signer() {
       log "Refusing an unsafe local signer while preparing uninstall: $candidate"
       return 1
     }
-    # Older releases did not have the transactional signer. They retain the
-    # compatibility fallback below; current releases snapshot the robust helper
-    # before the FreePBX uninstall hook removes both original copies.
+    # Snapshot only an inventory-aware signer. Older permissive signers must
+    # never become a fallback authorization path after removing the module.
     grep -Fq 'publish_candidate_transactionally' "$candidate" \
-      && grep -Fq 'acquire_signing_lock' "$candidate" || continue
+      && grep -Fq 'acquire_signing_lock' "$candidate" \
+      && grep -Fq 'approved_module_hashes' "$candidate" || continue
     [ "$(stat -c '%U:%G' "$candidate" 2>/dev/null || true)" = "root:root" ] \
       && [ "$(stat -c '%a' "$candidate" 2>/dev/null || true)" = "755" ] || {
       log "The transactional local signer has unsafe ownership or permissions: $candidate"
@@ -231,6 +232,30 @@ snapshot_local_signer() {
       log "Unable to snapshot the PBX-local signer exactly."
       return 1
     }
+    /usr/bin/python3 -I - "$trust_helper" "$RECOVERY_SIGNER_DIR/sls_module_trust.py" <<'PYTRUSTCOPY' || return 1
+import os
+from pathlib import Path
+import stat
+import sys
+source, target = map(Path, sys.argv[1:])
+for item in [source] + list(source.parents)[:-1]:
+    info = item.lstat()
+    if (stat.S_ISLNK(info.st_mode) or info.st_uid != 0
+            or info.st_mode & 0o022 and not (item != source and info.st_mode & stat.S_ISVTX)):
+        raise SystemExit("Protected module trust helper has an unsafe path")
+fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+with os.fdopen(fd, "rb") as handle:
+    info = os.fstat(handle.fileno())
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 256 * 1024:
+        raise SystemExit("Protected module trust helper is unsafe")
+    body = handle.read(256 * 1024 + 1)
+    after = os.fstat(handle.fileno())
+    if len(body) > 256 * 1024 or (info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+        raise SystemExit("Protected module trust helper changed during snapshot")
+fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700)
+with os.fdopen(fd, "wb") as handle:
+    handle.write(body); handle.flush(); os.fsync(handle.fileno())
+PYTRUSTCOPY
     return 0
   done
   return 0
@@ -265,11 +290,11 @@ run_fwconsole() (
   close_inherited_maintenance_lock_fds
   # PCRE JIT allocation can be denied by otherwise healthy unprivileged LXC
   # containers. Limit this compatibility override to the uninstall process.
-  php -d pcre.jit=0 "$(command -v fwconsole)" "$@"
+  /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 /usr/sbin/fwconsole "$@"
 )
 
 module_registry_exists() {
-  SLS_MODULE_NAME="$MODULE" php -d pcre.jit=0 -r '
+  SLS_MODULE_NAME="$MODULE" /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 -r '
 $bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
 require "/etc/freepbx.conf";
 $statement = \FreePBX::Database()->prepare("SELECT COUNT(*) FROM modules WHERE modulename = ?");
@@ -290,7 +315,7 @@ remove_module_registration() {
   fi
   if module_registry_exists; then
     log "FreePBX left the $MODULE registry row behind; removing that single stale row before deleting module files."
-    SLS_MODULE_NAME="$MODULE" php -d pcre.jit=0 -r '
+    SLS_MODULE_NAME="$MODULE" /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 -r '
 $bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
 require "/etc/freepbx.conf";
 $statement = \FreePBX::Database()->prepare("DELETE FROM modules WHERE modulename = ?");
@@ -588,7 +613,7 @@ restore_user_data_on_exit() {
 remove_menu_patch() {
   local path="/var/www/html/admin/views/menu_items.php"
   [ -w "$path" ] || return 0
-  python3 - "$path" <<'PY'
+  /usr/sbin/runuser -u asterisk -- /usr/bin/python3 -I - "$path" <<'PY'
 import re
 import sys
 
@@ -621,7 +646,7 @@ PY
 remove_legacy_dashboard_patch() {
   local path="/var/www/html/admin/modules/dashboard/sections/Overview.class.php"
   [ -w "$path" ] || return 0
-  python3 - "$path" <<'PY'
+  /usr/sbin/runuser -u asterisk -- /usr/bin/python3 -I - "$path" <<'PY'
 import re
 import sys
 
@@ -651,7 +676,7 @@ remove_managed_block() {
   local path="$1"
   local name="$2"
   [ -f "$path" ] || return 0
-  python3 - "$path" "$name" <<'PY'
+  /usr/sbin/runuser -u asterisk -- /usr/bin/python3 -I - "$path" "$name" <<'PY'
 import re
 import sys
 
@@ -670,6 +695,30 @@ with open(path, "w", encoding="utf-8") as handle:
 PY
 }
 
+remove_phone_collector_service() {
+  local unit="/etc/systemd/system/sls-mass-notify-phone-events.service" active_state
+  [ -e "$unit" ] || [ -L "$unit" ] || return 0
+  python3 -I - "$unit" <<'PY'
+import os
+import stat
+import sys
+path = sys.argv[1]
+metadata = os.lstat(path)
+if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+        or metadata.st_uid != 0 or metadata.st_mode & 0o022):
+    raise SystemExit("Refusing to remove an unsafe phone collector service file.")
+with open(path, encoding="utf-8") as handle:
+    if handle.read(128).splitlines()[:2] != ["# Managed by SLS Mass Notify Server", "[Unit]"]:
+        raise SystemExit("Refusing to remove an unrelated phone collector service.")
+PY
+  [ "$?" -eq 0 ] || return 1
+  /usr/bin/timeout --kill-after=2 20 systemctl disable --now sls-mass-notify-phone-events.service || return 1
+  active_state="$(/usr/bin/timeout --kill-after=2 10 systemctl show --property=ActiveState --value sls-mass-notify-phone-events.service)" || return 1
+  case "$active_state" in inactive|failed) ;; *) log "The phone collector has not stopped; its service file was preserved."; return 1 ;; esac
+  rm -- "$unit" || return 1
+  /usr/bin/timeout --kill-after=2 10 systemctl daemon-reload || return 1
+}
+
 disable_apache_conf() {
   rm -f /etc/logrotate.d/sls-mass-notify
   command -v a2disconf >/dev/null && a2disconf sls-mass-notify >/dev/null 2>&1 || true
@@ -681,14 +730,15 @@ disable_apache_conf() {
 }
 
 remove_freepbx_manager_users() {
-  SLS_CONFIG="$DATA_DIR/mass-notifications.config" php -d pcre.jit=0 <<'PHP'
+  SLS_CONFIG="$DATA_DIR/mass-notifications.config" /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 <<'PHP'
 <?php
 $bootstrap_settings = ['freepbx_auth' => false, 'skip_astman' => true];
 require '/etc/freepbx.conf';
 $candidates = ['slsmassnotify', 'sls_mass_notify', 'nws_push'];
 $path = (string)getenv('SLS_CONFIG');
 if ($path !== '' && is_readable($path)) {
-    $settings = json_decode((string)file_get_contents($path), true);
+    require_once '/usr/local/bin/sls_mass_notify/sls_config_crypto.php';
+    $settings = \FreePBX\modules\SlsConfigCrypto::decode((string)file_get_contents($path));
     $configured = is_array($settings) ? (string)($settings['ami']['username'] ?? '') : '';
     if ($configured !== '') {
         $candidates[] = $configured;
@@ -715,7 +765,7 @@ PHP
 }
 
 remove_bundled_system_recordings() {
-  SLS_DATA_DIR="$DATA_DIR" php -d pcre.jit=0 <<'PHP'
+  SLS_DATA_DIR="$DATA_DIR" /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 <<'PHP'
 <?php
 $bootstrap_settings = ['freepbx_auth' => false, 'skip_astman' => true];
 require '/etc/freepbx.conf';
@@ -755,14 +805,15 @@ verify_freepbx_cleanup() {
 	    log "Uninstall verification failed; the $MODULE FreePBX registry row remains."
 	    return 1
 	  fi
-  SLS_CONFIG="$DATA_DIR/mass-notifications.config" php -d pcre.jit=0 <<'PHP'
+  SLS_CONFIG="$DATA_DIR/mass-notifications.config" /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 <<'PHP'
 <?php
 $bootstrap_settings = ['freepbx_auth' => false, 'skip_astman' => true];
 require '/etc/freepbx.conf';
 $candidates = ['slsmassnotify', 'sls_mass_notify', 'nws_push'];
 $path = (string)getenv('SLS_CONFIG');
 if ($path !== '' && is_readable($path)) {
-    $settings = json_decode((string)file_get_contents($path), true);
+    require_once '/usr/local/bin/sls_mass_notify/sls_config_crypto.php';
+    $settings = \FreePBX\modules\SlsConfigCrypto::decode((string)file_get_contents($path));
     $configured = is_array($settings) ? (string)($settings['ami']['username'] ?? '') : '';
     if ($configured !== '') {
         $candidates[] = $configured;
@@ -774,7 +825,7 @@ $statement = $database->prepare('SELECT COUNT(*) FROM manager WHERE name = ?');
 foreach ($candidates as $username) {
     $statement->execute([$username]);
     if ((int)$statement->fetchColumn() > 0) {
-        fwrite(STDERR, "FreePBX AMI user remains after uninstall: {$username}\n");
+        file_put_contents("php://stderr", "FreePBX AMI user remains after uninstall: {$username}\n");
         exit(1);
     }
 }
@@ -795,10 +846,12 @@ PHP
     /var/lib/apache2/conf/enabled_by_admin/sls-mass-notify \
     /var/lib/apache2/conf/disabled_by_admin/sls-mass-notify \
     /etc/asterisk/slsmassnotify \
+    /etc/systemd/system/sls-mass-notify-phone-events.service \
     /usr/local/bin/sls_mass_notify \
     /usr/local/sbin/sign_sls_mass_notify_local_sig.sh \
     /var/www/html/api/sipnotify \
     /var/www/html/api/sls-mass-notify \
+    /var/www/html/mass-notify \
     /var/www/html/sls_mass_notify \
     /var/lib/asterisk/sounds/SLS_Mass_Notifications_Plugin \
     /var/lib/asterisk/sounds/en/SLS_Mass_Notifications_Plugin \
@@ -832,7 +885,7 @@ PHP
 
 verify_stock_module() {
   local stock_module="$1"
-  SLS_VERIFY_MODULE="$stock_module" php -d pcre.jit=0 -r '
+  SLS_VERIFY_MODULE="$stock_module" /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 -r '
 $bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
 require "/etc/freepbx.conf";
 $gpg = \FreePBX::GPG();
@@ -847,17 +900,6 @@ $valid = is_array($result)
     && count($result["details"]) === 0;
 exit($valid ? 0 : 1);
 '
-}
-
-redownload_stock_module() {
-  local stock_module="$1"
-  : > "$STOCK_RESTORE_LOG"
-  if run_fwconsole ma --no-interaction --ignorecache --stable -f downloadinstall "$stock_module" >>"$STOCK_RESTORE_LOG" 2>&1; then
-    return 0
-  fi
-  # Some FreePBX 17 builds reject --stable while still accepting the same
-  # forced fresh-cache download through the default configured repository.
-  run_fwconsole ma --no-interaction --ignorecache -f downloadinstall "$stock_module" >>"$STOCK_RESTORE_LOG" 2>&1
 }
 
 locally_sign_stock_module() {
@@ -876,6 +918,8 @@ locally_sign_stock_module() {
     }
     if ! SLS_LOCAL_SIGN_HOME="$SIGN_HOME" \
       SLS_LOCAL_SIGN_LOCK="/run/lock/sls-mass-notify-signing.lock" \
+      SLS_LOCAL_TRUST_HELPER="$RECOVERY_SIGNER_DIR/sls_module_trust.py" \
+      SLS_LOCAL_TRUST_MODE="uninstalled" \
       /usr/bin/timeout --signal=TERM 360 "$RECOVERY_SIGNER" "$stock_module" \
         >>"$STOCK_RESTORE_LOG" 2>&1; then
       log "The protected local signer could not verify the cleaned $stock_module module."
@@ -885,100 +929,10 @@ locally_sign_stock_module() {
     return 0
   fi
 
-  log "Using the legacy local-signing compatibility path for $stock_module."
-  [ -d "$module_dir" ] || return 1
-  command -v gpg >/dev/null || return 1
-  workdir="$(mktemp -d "/tmp/${stock_module}-sls-uninstall-sign.XXXXXX")"
-  chmod 0700 "$workdir"
-  signedby="Southland Servers Mass Notifications Uninstall Recovery <root@$(hostname -f 2>/dev/null || hostname)>"
-
-  install -d -m 0700 "$SIGN_HOME"
-  if ! GNUPGHOME="$SIGN_HOME" gpg --batch --list-secret-keys --with-colons 2>/dev/null | grep -q '^sec:'; then
-    {
-      printf '%s\n' 'Key-Type: RSA'
-      printf '%s\n' 'Key-Length: 3072'
-      printf '%s\n' 'Name-Real: Southland Servers Mass Notifications Uninstall Recovery'
-      printf 'Name-Email: root@%s\n' "$(hostname -f 2>/dev/null || hostname)"
-      printf '%s\n' 'Expire-Date: 0'
-      printf '%s\n' '%no-protection'
-      printf '%s\n' '%commit'
-    } > "$workdir/keyparams"
-    GNUPGHOME="$SIGN_HOME" gpg --batch --generate-key "$workdir/keyparams" >/dev/null 2>&1 || {
-      rm -rf "$workdir"
-      return 1
-    }
-  fi
-
-  keyid="$(GNUPGHOME="$SIGN_HOME" gpg --batch --list-secret-keys --with-colons 2>/dev/null | awk -F: '/^sec:/ {print $5; exit}')"
-  fingerprint="$(GNUPGHOME="$SIGN_HOME" gpg --batch --list-secret-keys --with-colons 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')"
-  if [ -z "$keyid" ] || [ -z "$fingerprint" ]; then
-    rm -rf "$workdir"
-    return 1
-  fi
-  SIGNING_FINGERPRINT="$fingerprint"
-
-  {
-    printf '%s\n' ';################################################'
-    printf '%s\n' ';#        FreePBX Module Signature File         #'
-    printf '%s\n' ';################################################'
-    printf '%s\n' ';# Do not alter the contents of this file!  If  #'
-    printf '%s\n' ';# this file is tampered with, the module will  #'
-    printf '%s\n' ';# fail validation and be marked as invalid!    #'
-    printf '%s\n' ';################################################'
-    printf '%s\n' '[config]'
-    printf '%s\n' 'version=1'
-    printf '%s\n' 'hash=sha256'
-    printf 'signedwith=%s\n' "$keyid"
-    printf "signedby='%s'\n" "$signedby"
-    printf '%s\n' 'repo=local'
-    php -r 'printf("timestamp=%.4f\n", microtime(true));'
-    printf '%s\n' '[hashes]'
-    cd "$module_dir"
-    find . -type f ! -name 'module.sig' ! -name '*.pyc' ! -path '*/__pycache__/*' -printf '%P\n' \
-      | LC_ALL=C sort \
-      | while IFS= read -r relative_file; do
-          printf '%s = %s\n' "$relative_file" "$(sha256sum "$relative_file" | awk '{print $1}')"
-        done
-  } > "$workdir/module.plain"
-
-  GNUPGHOME="$SIGN_HOME" gpg --batch --yes --pinentry-mode loopback --passphrase '' \
-    --local-user "$keyid" --clearsign --output "$workdir/module.sig" "$workdir/module.plain" >/dev/null 2>&1 || {
-      rm -rf "$workdir"
-      return 1
-    }
-  install -m 0644 -o asterisk -g asterisk "$workdir/module.sig" "$module_dir/module.sig"
-  GNUPGHOME="$SIGN_HOME" gpg --batch --armor --export "$keyid" > "$workdir/public.asc"
-
-  freepbx_gpg_home="$(php -d pcre.jit=0 -r '
-$bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
-require "/etc/freepbx.conf";
-$gpg = \FreePBX::GPG();
-$reflection = new ReflectionClass($gpg);
-if ($reflection->hasMethod("getGpgLocation")) {
-    $method = $reflection->getMethod("getGpgLocation");
-    $method->setAccessible(true);
-    echo (string)$method->invoke($gpg);
-} else {
-    echo "/var/lib/asterisk/.gnupg";
-}
-exit(0);
-')"
-  [ -n "$freepbx_gpg_home" ] || freepbx_gpg_home="/var/lib/asterisk/.gnupg"
-  install -d -m 0700 -o asterisk -g asterisk "$freepbx_gpg_home"
-  timeout 30 su -s /bin/bash asterisk -c "gpg --homedir '$freepbx_gpg_home' --batch --import" \
-    < "$workdir/public.asc" >/dev/null 2>&1 || {
-      rm -rf "$workdir"
-      return 1
-    }
-  printf '%s:6:\n' "$fingerprint" \
-    | timeout 30 su -s /bin/bash asterisk -c "gpg --homedir '$freepbx_gpg_home' --batch --import-ownertrust" >/dev/null 2>&1 || {
-      rm -rf "$workdir"
-      return 1
-    }
-  chown -R asterisk:asterisk "$freepbx_gpg_home" 2>/dev/null || true
-  chmod 0700 "$freepbx_gpg_home" 2>/dev/null || true
-  rm -rf "$workdir"
-  verify_stock_module "$stock_module"
+  # Older signers inventory the current web tree and would authorize unrelated
+  # modifications. Never weaken trust when repository recovery is unavailable.
+  log "No protected inventory-aware local signer is available for $stock_module. Preserve recovery files and restore a verified upstream module or reviewed baseline."
+  return 1
 }
 
 remove_piper_wrapper() {
@@ -1018,6 +972,7 @@ remove_runtime_files() {
     rmdir "$DATA_DIR/piper/venv/bin" "$DATA_DIR/piper/venv" 2>/dev/null || true
   fi
   rm -rf /usr/local/bin/sls_mass_notify
+  rm -f /usr/local/bin/slsconsole
   rm -f /usr/local/bin/nwsalerts_ensure_menu_patch.sh
   rm -f /usr/local/sbin/sign_sls_mass_notify_local_sig.sh
   rm -f /usr/local/sbin/sign_sls_mass_notify_local_sig.sh.bak-*
@@ -1028,6 +983,7 @@ remove_runtime_files() {
   rm -f /var/lib/asterisk/bin/sls_mass_notify_test.sh
   rm -rf /var/www/html/api/sls-mass-notify
   rm -rf /var/www/html/api/sipnotify
+  rm -rf /var/www/html/mass-notify
   rm -rf /var/www/html/sls_mass_notify
   rm -rf /etc/asterisk/slsmassnotify
   rm -rf "$DATA_DIR"
@@ -1057,34 +1013,30 @@ remove_cron() {
 restore_stock_modules() {
   rm -f /var/www/html/admin/modules/dashboard/sections/SlsMassNotifyAnnouncement.class.php
   rm -f /var/www/html/admin/modules/dashboard/views/sections/sls-mass-notify-announcement.php
-	  remove_legacy_dashboard_patch
+  remove_legacy_dashboard_patch
+  local stock_module
   for stock_module in dashboard framework; do
-	    [ -d "/var/www/html/admin/modules/$stock_module" ] || continue
-	    if grep -q '^repo=local$' "/var/www/html/admin/modules/$stock_module/module.sig" 2>/dev/null || \
-	      ! verify_stock_module "$stock_module"; then
-	      log "Restoring the stock FreePBX $stock_module module."
-	      if redownload_stock_module "$stock_module" && verify_stock_module "$stock_module"; then
-	        log "Restored and verified the stock FreePBX $stock_module module."
-	      elif locally_sign_stock_module "$stock_module"; then
-	        KEEP_SIGNING_TRUST=1
-	        log "Warning: the FreePBX repository was unavailable for $stock_module. The cleaned module was locally signed and verified so the FreePBX UI remains usable."
-	        log "When repository access returns, run: fwconsole ma --ignorecache -f downloadinstall $stock_module"
-	      else
-	        log "Unable to restore or locally verify the FreePBX $stock_module module. Details: $STOCK_RESTORE_LOG_PATH"
-	        return 1
-	      fi
+    [ -d "/var/www/html/admin/modules/$stock_module" ] || continue
+    # Preserve independently reviewed branding and dependency hardening.
+    # Only the approved uninstall variant may be signed; never replace the
+    # whole Framework/Dashboard tree or learn a new baseline from live files.
+    if ! locally_sign_stock_module "$stock_module"; then
+      log "The cleaned $stock_module module differs from its reviewed uninstall inventory. Preserved review artifacts and log: $STOCK_RESTORE_LOG_PATH"
+      return 1
     fi
+    KEEP_SIGNING_TRUST=1
+    log "Preserved and verified approved $stock_module files after removing SLS integration."
   done
 }
 
 refresh_dashboard_hook_index() {
-  php -d pcre.jit=0 <<'PHP'
+  /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 <<'PHP'
 <?php
 $bootstrap_settings = ['freepbx_auth' => false, 'skip_astman' => true];
 require '/etc/freepbx.conf';
 $hooksFile = '/var/www/html/admin/modules/dashboard/classes/DashboardHooks.class.php';
 if (!is_readable($hooksFile)) {
-    fwrite(STDERR, "Dashboard hook loader is missing after uninstall.\n");
+    file_put_contents("php://stderr", "Dashboard hook loader is missing after uninstall.\n");
     exit(1);
 }
 require_once $hooksFile;
@@ -1094,7 +1046,7 @@ $hooks = \DashboardHooks::genHooks(is_array($visualOrder) ? $visualOrder : []);
 foreach ((array)$hooks as $page) {
     foreach ((array)($page['entries'] ?? []) as $entry) {
         if (($entry['rawname'] ?? '') === 'SlsMassNotifyAnnouncement') {
-            fwrite(STDERR, "Removed Mass Notify Dashboard hook is still discoverable.\n");
+            file_put_contents("php://stderr", "Removed Mass Notify Dashboard hook is still discoverable.\n");
             exit(1);
         }
     }
@@ -1106,9 +1058,8 @@ PHP
 
 remove_trusted_signing_key() {
   if [ "$KEEP_SIGNING_TRUST" = "1" ]; then
-    # A repository outage forced a local signature fallback. Delete the private
-    # signing material, but retain the public key FreePBX needs to verify the
-    # cleaned stock modules until the administrator redownloads vendor copies.
+    # Reviewed stock modules retain approved branding and hardening overlays.
+    # Delete private signing material but retain the public verification key.
     rm -rf "$SIGN_HOME"
     log "The temporary private signing key was removed; only its public verification key was retained."
     return 0
@@ -1137,14 +1088,43 @@ remove_trusted_signing_key() {
   rm -rf "$SIGN_HOME"
 }
 
+admit_root_runtime() {
+  /usr/bin/python3 -I - "/usr/local/bin/sls_mass_notify/sls_privileged_install.py" <<'PYGUARD' || return 1
+import os
+from pathlib import Path
+import stat
+import sys
+path = Path(sys.argv[1])
+for file in (path, path.with_name('sls_module_trust.py')):
+    for item in [file] + list(file.parents)[:-1]:
+        info = item.lstat()
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise SystemExit('Untrusted SLS protected runtime path: ' + str(item))
+    info = file.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise SystemExit('Unsafe SLS protected helper file')
+PYGUARD
+  /usr/bin/python3 -I "/usr/local/bin/sls_mass_notify/sls_privileged_install.py" admit
+}
+
 main() {
+  admit_root_runtime || { log "Protected publisher runtime verification failed; restore using the verified installer before uninstalling."; return 1; }
   require_freepbx
   acquire_maintenance_coordination
   prepare_uninstall_logs
   trap restore_user_data_on_exit EXIT
   snapshot_local_signer
+  [ -n "$RECOVERY_SIGNER" ] || { log "An approved-inventory signer is required before uninstall can preserve the reviewed FreePBX modules."; return 1; }
+  local reviewed_module
+  for reviewed_module in slsmassnotifyserver dashboard framework; do
+    /usr/bin/python3 -I "$RECOVERY_SIGNER_DIR/sls_module_trust.py" check --module "$reviewed_module" --web-root /var/www/html || {
+      log "The installed $reviewed_module files differ from their reviewed inventory. No module teardown was started; review the protected baseline before retrying."
+      return 1
+    }
+  done
   capture_signing_fingerprint
   preserve_user_data
+  remove_phone_collector_service
 	  remove_freepbx_manager_users
 	  remove_module_registration
   remove_bundled_system_recordings
@@ -1173,6 +1153,9 @@ main() {
     log "SLS Mass Notify uninstall cleanup finished. Configuration and user data were purged."
   else
     log "SLS Mass Notify uninstall cleanup finished. Central config, config backups, and uploaded tones were preserved."
+  fi
+  if [ -e /etc/sls-mass-notify/config-keys.json ] || [ -L /etc/sls-mass-notify/config-keys.json ]; then
+    log "Configuration recovery keys were retained at /etc/sls-mass-notify/config-keys.json, including after a data purge. Keep this protected keyring while older encrypted configurations or backups may still be needed."
   fi
 }
 

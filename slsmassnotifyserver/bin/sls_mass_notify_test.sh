@@ -52,6 +52,7 @@ EVENTS_LOG="${EVENTS_LOG:-/var/log/sls_mass_notify_events.jsonl}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-90}"
 CONFIG_JSON_FILE="${CONFIG_JSON_FILE:-${CONFIG_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config}}"
 CONFIG_LOADER="${CONFIG_LOADER:-/usr/local/bin/sls_mass_notify/sls_config.py}"
+AUDIO_QUEUE_HELPER="/usr/local/bin/sls_mass_notify/sls_audio_queue.py"
 VISUAL_PUSH_SCRIPT="${VISUAL_PUSH_SCRIPT:-/usr/local/bin/sls_mass_notify/sls_notify.py}"
 BRANDED_EMAIL_SCRIPT="${BRANDED_EMAIL_SCRIPT:-/usr/local/bin/sls_mass_notify/sls_branded_email.py}"
 BRANDED_DISCORD_SCRIPT="${BRANDED_DISCORD_SCRIPT:-/usr/local/bin/sls_mass_notify/sls_branded_discord.py}"
@@ -79,7 +80,8 @@ SOURCE_NAME="SLS Mass Notification System"
 DELIVERY_TARGETS=""
 DESKTOP_DELIVERY_TARGETS=""
 TEST_AUDIO_LABEL="None"
-VISUAL_TEST_ID=""
+VISUAL_TEST_ID="${SLS_TEST_DELIVERY_ID:-}"
+API_TEST_REMOVED_RECIPIENTS=0
 TRIGGER_EXTENSION="${1:-unknown}"
 TRIGGER_NAME="${2:-Unknown Caller}"
 NWS_ALERTS_DRY_RUN="${NWS_ALERTS_DRY_RUN:-0}"
@@ -96,6 +98,34 @@ Time: {{time}}"
 
 timestamp_now() {
   date --iso-8601=seconds
+}
+
+refresh_api_test_permissions() {
+  # GUI/legacy tests retain their established behavior. Named API tests carry
+  # only a frozen scope/identity snapshot; no bearer secret enters this worker.
+  [ -n "${SLS_API_TEST_CONTEXT:-}" ] || return 0
+  local output
+  local -a allowed=()
+  if ! output="$(/usr/bin/timeout --kill-after=1 5 /usr/bin/php /usr/local/bin/sls_mass_notify/sls_api_test_guard.php "$CONFIG_JSON_FILE")"; then
+    NWS_ALERT_RECIPIENTS=()
+    NWS_DESKTOP_CLIENTS=()
+    printf '%s\n' 'ERROR: Weather test API authorization could not be verified. No further recipients will be submitted.' >&2
+    return 1
+  fi
+  mapfile -t allowed <<< "$output"
+  if [ "${#allowed[@]}" -ne 3 ] || [[ ! "${allowed[0]}" =~ ^([0-9]{1,20}(,[0-9]{1,20})*)?$ ]] \
+      || [[ ! "${allowed[1]}" =~ ^([A-Za-z0-9_.@-]{1,80}(,[A-Za-z0-9_.@-]{1,80})*)?$ ]] \
+      || [[ ! "${allowed[2]}" =~ ^[0-9]+$ ]]; then
+    NWS_ALERT_RECIPIENTS=()
+    NWS_DESKTOP_CLIENTS=()
+    printf '%s\n' 'ERROR: Weather test authorization returned an invalid recipient list. No further recipients will be submitted.' >&2
+    return 1
+  fi
+  NWS_ALERT_RECIPIENTS=()
+  NWS_DESKTOP_CLIENTS=()
+  [ -z "${allowed[0]}" ] || IFS=',' read -r -a NWS_ALERT_RECIPIENTS <<< "${allowed[0]}"
+  [ -z "${allowed[1]}" ] || IFS=',' read -r -a NWS_DESKTOP_CLIENTS <<< "${allowed[1]}"
+  if [ "${allowed[2]}" -gt 0 ]; then API_TEST_REMOVED_RECIPIENTS=1; fi
 }
 
 claim_test_cooldown() {
@@ -154,56 +184,7 @@ finally:
 PY
 }
 
-prune_event_log() {
-  [ -r "$EVENTS_LOG" ] || return 0
-  LOG_PATH="$EVENTS_LOG" RETENTION_DAYS="$LOG_RETENTION_DAYS" python3 - <<'PY'
-import fcntl
-import json
-import os
-import time
-from datetime import datetime
-
-path = os.environ["LOG_PATH"]
-try:
-    days = int(os.environ.get("RETENTION_DAYS", "90"))
-except ValueError:
-    days = 90
-days = max(1, min(365, days))
-cutoff = time.time() - (days * 86400)
-retained = []
-changed = False
-try:
-    with open(path, "r+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        lines = [line.rstrip("\n") for line in handle if line.strip()]
-        for line in lines:
-            try:
-                item = json.loads(line)
-            except Exception:
-                changed = True
-                continue
-            value = str(item.get("logged_at") or item.get("created_at") or "")
-            try:
-                ts = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-            except Exception:
-                ts = time.time()
-            if ts >= cutoff:
-                retained.append(json.dumps(item, separators=(",", ":")))
-            else:
-                changed = True
-        if changed:
-            handle.seek(0)
-            handle.truncate(0)
-            if retained:
-                handle.write("\n".join(retained) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    os.chmod(path, 0o640)
-except FileNotFoundError:
-    raise SystemExit(0)
-PY
-}
+# Periodic storage maintenance owns event retention and its recovery backups.
 
 update_status() {
   local patch_json="$1"
@@ -334,7 +315,6 @@ generate_test_tts_audio() {
   local base_name
   local tmp_file
   local output_file
-  local trimmed_file
   local duration
   local text
   local generation_timeout
@@ -378,16 +358,18 @@ generate_test_tts_audio() {
   fi
   rm -f "$tmp_file"
 
-  if command -v soxi >/dev/null 2>&1; then
-    duration="$(soxi -D "$output_file" 2>/dev/null || echo 0)"
-    if awk "BEGIN { exit !($duration > ${PIPER_MAX_SECONDS:-30}) }"; then
-		trimmed_file="${output_file}.trimmed.wav"
-      if sox "$output_file" "$trimmed_file" trim 0 "${PIPER_MAX_SECONDS:-30}" >> "$LOG" 2>&1; then
-        mv "$trimmed_file" "$output_file"
-      else
-        rm -f "$trimmed_file"
-      fi
-    fi
+  duration="$(soxi -D "$output_file" 2>/dev/null)"
+  if ! [[ "$duration" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk "BEGIN { exit !($duration > 0) }"; then
+    rm -f "$output_file"
+    echo "ERROR: Test speech duration could not be measured; no speech was queued." | tee -a "$LOG" >&2
+    printf '%s\n' 'SLS_TTS_ERROR:Test speech duration could not be measured; no speech was queued.'
+    return 1
+  fi
+  if awk "BEGIN { exit !($duration > ${PIPER_MAX_SECONDS:-30}) }"; then
+    rm -f "$output_file"
+    echo "ERROR: Test speech lasts ${duration} seconds; the configured maximum is ${PIPER_MAX_SECONDS:-30} seconds. Increase the speech limit to fit the complete message; no speech was queued." | tee -a "$LOG" >&2
+    printf '%s\n' "SLS_TTS_ERROR:Test speech lasts ${duration} seconds; the configured maximum is ${PIPER_MAX_SECONDS:-30} seconds. Increase the speech limit to fit the complete message; no speech was queued."
+    return 1
   fi
 
   chown asterisk:asterisk "$output_file" 2>/dev/null || true
@@ -456,6 +438,8 @@ trigger_visual_test() {
 	local desktop_targets
 	local -a command
 
+  refresh_api_test_permissions || return 1
+
   if [ ! -x "$VISUAL_PUSH_SCRIPT" ]; then
     echo "$(date): Visual test skipped — visual notification worker is not executable" >> "$LOG"
     return 1
@@ -508,6 +492,9 @@ trigger_visual_test() {
     echo "$(date): ERROR — Manual Weather visual channel submission failed" >> "$LOG"
     return 1
   fi
+  if [ "$channel" = "desktop" ]; then
+    /usr/bin/python3 -c 'import json,sys; print("SLS_TEST_DESKTOP_PUBLICATION " + json.dumps({"event_id":sys.argv[1],"targets":sys.argv[2].split(",")}))' "$test_id" "$desktop_targets"
+  fi
   return 0
 }
 
@@ -548,10 +535,31 @@ queue_test_audio_to_recipients() {
   local queued=0
   local page_hold_seconds
   local call_wait_seconds
+  local -a valid_recipients=()
+  local -A seen_recipients=()
+
+  TEST_CALL_QUEUE_FAILURES=0
+  refresh_api_test_permissions || return 1
 
   if [ "${#NWS_ALERT_RECIPIENTS[@]}" -eq 0 ]; then
     echo "$(date): ERROR — No NWS alert recipient extensions configured" >> "$LOG"
     report_fault "delivery" "No NWS alert recipient extensions configured"
+    return 1
+  fi
+
+  for raw_recipient in "${NWS_ALERT_RECIPIENTS[@]}"; do
+    if [[ ! "$raw_recipient" =~ ^[0-9]{1,20}$ ]]; then
+      echo "$(date): ERROR — Invalid manual Weather audio recipient was not queued" >> "$LOG"
+      TEST_CALL_QUEUE_FAILURES=$((TEST_CALL_QUEUE_FAILURES + 1))
+      continue
+    fi
+    if [ -z "${seen_recipients[$raw_recipient]:-}" ]; then
+      valid_recipients+=("$raw_recipient")
+      seen_recipients["$raw_recipient"]=1
+    fi
+  done
+  if [ "${#valid_recipients[@]}" -eq 0 ]; then
+    report_fault "delivery" "No valid manual Weather audio recipients were selected; no test audio was submitted"
     return 1
   fi
 
@@ -562,11 +570,40 @@ queue_test_audio_to_recipients() {
   fi
   call_wait_seconds=$((page_hold_seconds + 30))
 
-  TEST_CALL_QUEUE_FAILURES=0
-  for raw_recipient in "${NWS_ALERT_RECIPIENTS[@]}"; do
-    recipient="$(printf '%s' "$raw_recipient" | tr -dc '0-9')"
-    if [ -z "$recipient" ]; then
-      echo "$(date): ERROR — Invalid manual Weather audio recipient was not queued" >> "$LOG"
+  local reservation_recipients
+  reservation_recipients="$(IFS=,; printf '%s' "${valid_recipients[*]}")"
+  # Manual tests share recipient exclusion and media leases with live alerts.
+  # Bound this wait separately so a busy page does not prevent the remaining
+  # requested visual channels from being attempted by the manual test worker.
+  if ! /usr/bin/timeout --signal=TERM --kill-after=2 30 /usr/bin/python3 "$AUDIO_QUEUE_HELPER" \
+      --recipients "$reservation_recipients" --duration "$page_hold_seconds" --sound "$sound_sequence" --priority normal >> "$LOG" 2>&1; then
+    TEST_CALL_QUEUE_FAILURES=$((TEST_CALL_QUEUE_FAILURES + ${#valid_recipients[@]}))
+    echo "$(date): ERROR — Shared paging queue could not reserve the manual Weather recipients; no test audio was submitted" >> "$LOG"
+    report_fault "delivery" "Shared paging queue could not reserve the manual Weather recipients within the test wait limit; no test audio was submitted"
+    return 1
+  fi
+  local admission_lines phone_token
+  local -a admitted_recipients=()
+  if ! admission_lines="$(/usr/bin/timeout --signal=TERM --kill-after=2 65 /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_phone_admission.py \
+      --recipients "$reservation_recipients" --service manual --correlation "${SLS_TEST_DELIVERY_ID:-}" --wait 20 --format lines)"; then
+    printf '%s\n' "$admission_lines" >> "$LOG"
+    report_fault "delivery" "Phone device capacity or registered contacts could not be admitted; no new audio was submitted"
+    TEST_CALL_QUEUE_FAILURES=$((TEST_CALL_QUEUE_FAILURES + ${#valid_recipients[@]}))
+    return 1
+  fi
+  mapfile -t admitted_recipients <<< "$admission_lines"
+  phone_token="${admitted_recipients[0]:-}"
+  if [[ ! "$phone_token" =~ ^[a-f0-9]{32}$ ]]; then
+    report_fault "delivery" "Phone admission returned an invalid ticket; no new audio was submitted"
+    return 1
+  fi
+  admitted_recipients=("${admitted_recipients[@]:1}")
+  TEST_CALL_QUEUE_FAILURES=$((TEST_CALL_QUEUE_FAILURES + ${#valid_recipients[@]} - ${#admitted_recipients[@]}))
+  # Admission can wait for capacity. Recheck once more before any call file is
+  # written and intersect the admitted set; never replace it with new targets.
+  refresh_api_test_permissions || return 1
+  for recipient in "${admitted_recipients[@]}"; do
+    if [ -n "${SLS_API_TEST_CONTEXT:-}" ] && [[ ! ",$(IFS=,; printf '%s' "${NWS_ALERT_RECIPIENTS[*]}")," == *",${recipient},"* ]]; then
       TEST_CALL_QUEUE_FAILURES=$((TEST_CALL_QUEUE_FAILURES + 1))
       continue
     fi
@@ -576,7 +613,10 @@ queue_test_audio_to_recipients() {
       continue
     fi
     if ! cat > "$callfile" << CALL
-Channel: Local/${recipient}@${SLS_AUDIO_CONTEXT}
+Channel: Local/${recipient}@${SLS_AUDIO_CONTEXT}/n
+Account: slsphone_${phone_token}
+Setvar: __SLS_PHONE_TOKEN=${phone_token}
+Setvar: __SLS_PHONE_RECIPIENT=${recipient}
 CallerID: "${SLS_CALLERID_NAME}" <${SLS_CALLERID_NUM}>
 Setvar: SLS_SOUND=${sound_sequence}
 Setvar: SLS_CALLERID_NAME=${SLS_CALLERID_NAME}
@@ -720,9 +760,9 @@ if [ "${NWS_DESKTOP_CLIENTS_OVERRIDE+x}" = "x" ]; then
     IFS=',' read -r -a NWS_DESKTOP_CLIENTS <<< "$NWS_DESKTOP_CLIENTS_OVERRIDE"
   fi
 fi
-prune_event_log
 DELIVERY_TARGETS="$(get_nws_recipient_targets)"
 DESKTOP_DELIVERY_TARGETS="$(get_nws_desktop_targets)"
+refresh_api_test_permissions || exit 1
 
 if [ "${#NWS_ALERT_RECIPIENTS[@]}" -eq 0 ] && [ "${#NWS_DESKTOP_CLIENTS[@]}" -eq 0 ]; then
   echo "ERROR: The selected Weather zones do not have a phone or desktop channel that can be tested. Email destinations are intentionally skipped during manual tests."
@@ -785,10 +825,13 @@ fi
 
 if [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ]; then
   TTS_FILE="$(generate_test_tts_audio)"
-  if [ -z "$TTS_FILE" ]; then
+  if [ -z "$TTS_FILE" ] || [[ "$TTS_FILE" == SLS_TTS_ERROR:* ]]; then
     PHONE_AUDIO_OK=0
-    DELIVERY_FAILURES+=("Piper TTS test audio was not generated")
-    echo "ERROR: Piper TTS test audio was not generated."
+    TTS_ERROR="Piper TTS test audio was not generated"
+    [[ "$TTS_FILE" != SLS_TTS_ERROR:* ]] || TTS_ERROR="${TTS_FILE#SLS_TTS_ERROR:}"
+    TTS_FILE=""
+    DELIVERY_FAILURES+=("$TTS_ERROR")
+    echo "ERROR: $TTS_ERROR"
   else
     AUDIO_SEQUENCE="$(build_audio_sequence "$TTS_FILE")"
     if [ -z "$AUDIO_SEQUENCE" ]; then
@@ -840,6 +883,9 @@ elif [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ]; then
   fi
 fi
 
+if [ "$API_TEST_REMOVED_RECIPIENTS" -gt 0 ]; then
+  DELIVERY_FAILURES+=("API permissions or recipient identities changed; removed recipients were not submitted")
+fi
 if [ "${#DELIVERY_FAILURES[@]}" -eq 0 ]; then
   echo "$(date): Requested manual Weather channels accepted the local submission — phones=${#NWS_ALERT_RECIPIENTS[@]} desktops=${#NWS_DESKTOP_CLIENTS[@]}" >> "$LOG"
 else

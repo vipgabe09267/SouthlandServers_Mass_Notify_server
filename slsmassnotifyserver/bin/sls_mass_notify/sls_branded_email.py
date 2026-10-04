@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Build and send branded multipart alert email without exposing config secrets."""
 
+import importlib.util
 import html
 import ipaddress
-import json
 import os
 import re
 import subprocess
@@ -12,6 +12,15 @@ import time
 from email.message import EmailMessage
 from email.utils import formataddr
 from pathlib import Path
+
+import sys as _config_sys
+_config_sys.dont_write_bytecode = True
+_config_crypto_spec = importlib.util.spec_from_file_location("sls_config_crypto", Path(__file__).resolve().with_name("sls_config_crypto.py"))
+_config_crypto = importlib.util.module_from_spec(_config_crypto_spec)
+_config_crypto_spec.loader.exec_module(_config_crypto)
+_cluster_spec = importlib.util.spec_from_file_location('sls_cluster_guard', Path(__file__).resolve().with_name('sls_cluster_guard.py'))
+_cluster_guard = importlib.util.module_from_spec(_cluster_spec)
+_cluster_spec.loader.exec_module(_cluster_guard)
 
 
 DEFAULT_CONFIG = Path("/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config")
@@ -120,16 +129,47 @@ def body_sections(body):
     for line in nonempty[1:]:
         if ":" in line:
             label, value = line.split(":", 1)
-            if label.strip() and value.strip() and len(label.strip()) <= 40:
+            if label.strip() and value.strip() and len(label.strip()) <= 40 and len(details) < 32:
                 details.append((label.strip(), value.strip()))
                 continue
         notes.append(line)
-    return lead, details[:12], notes
+    return lead, details, notes
 
 
-def build_html(subject, body, event="", severity=""):
-    color, pale, icon, urgency = alert_profile(subject, body, event, severity)
-    lead, details, notes = body_sections(body)
+def weather_body(template_body, feature, spoken_message):
+    """Keep official alert information even when a legacy template omits it."""
+    if not isinstance(feature, dict) or not isinstance(feature.get("properties"), dict):
+        raise ValueError("weather_alert_details_missing")
+    properties = feature["properties"]
+
+    def text(key):
+        value = properties.get(key)
+        if value is None or value == "":
+            return "Not supplied by NWS."
+        if not isinstance(value, str):
+            raise ValueError("weather_alert_details_invalid")
+        return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", value).strip()
+
+    blocks = [
+        "Phone announcement: " + str(spoken_message).strip(),
+        "Affected areas: " + text("areaDesc"),
+        "Protective instructions: " + text("instruction"),
+        "Alert headline: " + text("headline"),
+        "Effective: " + text("effective"),
+        "Onset: " + text("onset"),
+        "Expires: " + text("expires"),
+        "Official alert details:\n" + text("description"),
+        str(template_body).strip(),
+    ]
+    result = "\n\n".join(blocks)
+    if len(result.encode("utf-8")) > 30000:
+        raise ValueError("weather_alert_details_too_large")
+    return result
+
+
+def build_html(subject, body, event="", severity="", *, profile=None, full_body=False):
+    color, pale, icon, urgency = profile if profile is not None else alert_profile(subject, body, event, severity)
+    lead, details, notes = (str(body), [], []) if full_body else body_sections(body)
     detail_rows = "".join(
         "<tr><td style='padding:9px 12px;border-bottom:1px solid #e5e7eb;color:#64748b;font-size:13px;width:35%'>"
         + html.escape(label)
@@ -160,10 +200,23 @@ def build_html(subject, body, event="", severity=""):
 <tr><td style="height:8px;background:{color}"></td></tr>
 <tr><td style="padding:26px 28px 10px"><span style="display:inline-block;padding:7px 11px;border-radius:999px;background:{pale};color:{color};font-size:12px;font-weight:800;letter-spacing:.7px">{icon} {html.escape(urgency)}</span>
 <h1 style="margin:16px 0 10px;color:#111827;font-size:25px;line-height:1.25">{html.escape(subject)}</h1>
-<div style="padding:16px 18px;border-left:5px solid {color};background:{pale};border-radius:7px;color:#111827;font-size:17px;font-weight:600;line-height:1.55">{html.escape(lead)}</div>
+<div style="padding:16px 18px;border-left:5px solid {color};background:{pale};border-radius:7px;color:#111827;font-size:17px;font-weight:600;line-height:1.55{";white-space:pre-wrap" if full_body else ""}">{html.escape(lead)}</div>
 {details_html}{notes_html}</td></tr>
 <tr><td style="padding:22px 28px 26px"><div style="border-top:1px solid #e5e7eb;padding-top:18px;color:#64748b;font-size:12px;line-height:1.5">Sent by the <strong>SLS Mass Notification System</strong><br>Southland Servers Group &bull; PBX-integrated alert delivery</div></td></tr>
 </table></td></tr></table></body></html>"""
+
+
+def build_announcement_html(subject, body, *, is_test, severity):
+    """General announcements use explicit metadata and retain the complete text."""
+    if type(is_test) is not bool or severity not in ("info", "warning", "critical"):
+        raise ValueError("invalid announcement classification")
+    profiles = {
+        "info": ("#1d4ed8", "#dbeafe", "📢", "ANNOUNCEMENT"),
+        "warning": ("#b45309", "#fef3c7", "⚠️", "WARNING"),
+        "critical": ("#b91c1c", "#fee2e2", "⚠️", "CRITICAL ALERT"),
+    }
+    profile = ("#6d28d9", "#ede9fe", "🧪", "SYSTEM TEST — NOT AN ACTUAL ALERT") if is_test else profiles[severity]
+    return build_html(subject, body, profile=profile, full_body=True)
 
 
 def send_branded_email(config, subject, body, event="", severity="", recipients_override=None):
@@ -197,6 +250,7 @@ def send_branded_email(config, subject, body, event="", severity="", recipients_
     logo = next((path for path in LOGO_PATHS if path.is_file() and path.stat().st_size > 0), None)
     if logo is not None:
         message.get_payload()[1].add_related(logo.read_bytes(), maintype="image", subtype="png", cid="<sls-mass-notify-logo>", filename="Southland-Servers-Group.png", disposition="inline")
+    _cluster_guard.fence_legacy(config)
     subprocess.run(
         [str(sendmail), "-oi", "-t", "-f", from_addr],
         input=message.as_bytes(),
@@ -208,8 +262,7 @@ def send_branded_email(config, subject, body, event="", severity="", recipients_
 
 def main():
     config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CONFIG
-    with config_path.open("r", encoding="utf-8") as handle:
-        config = json.load(handle)
+    config = _config_crypto.read_config(config_path)
     source = os.environ.get("SLS_NOTIFICATION_SOURCE", "").strip().lower()
     if (
         os.environ.get("SLS_NOTIFICATION_LIVE", "0") != "1"

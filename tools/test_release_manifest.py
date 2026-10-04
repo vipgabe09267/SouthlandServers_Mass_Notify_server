@@ -36,7 +36,7 @@ class ReleaseManifestTests(unittest.TestCase):
                         '-in', str(self.manifest), '-out', str(self.signature)], check=True, capture_output=True)
 
     def verify(self):
-        return verifier.verify(self.manifest, self.signature, self.installer, self.package, '0.1.2-beta', self.public)
+        return verifier.verify(self.manifest, self.signature, self.installer, self.package, '0.1.2-beta', self.public, trust_directory=self.root/'trust')
 
     def test_valid(self):
         self.assertEqual(self.verify(), self.data)

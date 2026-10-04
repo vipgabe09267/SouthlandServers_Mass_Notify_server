@@ -1,3 +1,6 @@
+<?php foreach ((array)($log_notices ?? []) as $notice) { ?>
+	<div class="alert alert-warning" role="status"><?php echo htmlspecialchars((string)$notice, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?></div>
+<?php } ?>
 <?php if ($event === null) { ?>
 	<div class="alert alert-warning"><i class="fa fa-exclamation-triangle" aria-hidden="true"></i> <?php echo _('That event could not be found.'); ?></div>
 	<p><a class="btn btn-default" href="config.php?display=slsmassnotifyserver"><i class="fa fa-arrow-left" aria-hidden="true"></i> <?php echo _('Back to Notification Logs'); ?></a></p>
@@ -58,6 +61,12 @@ $meta = $typeMeta[$event['notification_type'] ?? ''] ?? ['icon' => 'fa-circle-o'
 			<?php if (!empty($event['notify_delay_seconds'])) { ?><div class="sls-detail-row"><dt><?php echo _('Notify Delay'); ?></dt><dd><?php echo (int)$event['notify_delay_seconds']; ?>s</dd></div><?php } ?>
 		</dl></div></div></div>
 	</div>
+
+	<?php foreach ($weather_delivery['warnings'] ?? [] as $warning) { ?><div class="alert alert-warning" role="status"><?php echo htmlspecialchars($warning, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?></div><?php } ?>
+	<?php if (!empty($weather_delivery['rows'])) { ?><div class="sls-detail-card"><div class="sls-detail-card-title"><i class="fa fa-paper-plane text-primary" aria-hidden="true"></i> <?php echo _('Email and Webhook Delivery'); ?></div><div class="sls-detail-card-body">
+	<p class="text-muted"><?php echo _('Accepted means the mail transport or webhook service accepted the submission. It does not confirm that a person saw the alert. Older records may lack transport evidence.'); ?></p>
+	<?php foreach ($weather_delivery['rows'] as $receipt) { ?><dl class="sls-detail-list"><div class="sls-detail-row"><dt><?php echo htmlspecialchars($receipt['channel']); ?></dt><dd><strong><?php echo htmlspecialchars(str_replace('_', ' ', $receipt['status'])); ?></strong><?php if ($receipt['http_status']) { ?> · HTTP <?php echo (int)$receipt['http_status']; ?><?php } ?><br><?php echo htmlspecialchars($receipt['group']); ?> · <?php echo htmlspecialchars($receipt['queue_state']); ?><?php if ($receipt['error']) { ?><br><code><?php echo htmlspecialchars($receipt['error']); ?></code><?php } ?><?php if ($receipt['recorded_at']) { ?><br><small class="text-muted"><?php echo htmlspecialchars($receipt['recorded_at']); ?></small><?php } ?></dd></div></dl><?php } ?>
+	</div></div><?php } ?>
 
 	<?php if (!empty($event['body'])) { ?><div class="sls-detail-card"><div class="sls-detail-card-title"><i class="fa fa-comment text-primary" aria-hidden="true"></i> <?php echo _('Notification Message'); ?></div><div class="sls-detail-card-body"><div class="sls-detail-message"><?php echo htmlspecialchars($event['body']); ?></div></div></div><?php } ?>
 	<?php if (!empty($event['audio_sequence'])) { ?><div class="sls-detail-card"><div class="sls-detail-card-title"><i class="fa fa-volume-up text-success" aria-hidden="true"></i> <?php echo _('Audio Sequence'); ?></div><div class="sls-detail-card-body"><code><?php echo htmlspecialchars(implode(', ', $event['audio_sequence'])); ?></code></div></div><?php } ?>

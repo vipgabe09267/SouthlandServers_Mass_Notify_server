@@ -20,6 +20,10 @@ SPEC = importlib.util.spec_from_file_location(
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
+# Transport-state tests below isolate their own state machine. Source-policy
+# fixtures exercise the real validator separately at the end of this file.
+REAL_VALIDATOR = MODULE.validate_external_weather
+MODULE.validate_external_weather = lambda *_args: ("eligible", "", None)
 # Use the same deterministic clock for enqueue, expiry and retry operations.
 from unittest import mock
 test_clock = mock.patch.object(MODULE.time, 'time', return_value=1100)
@@ -85,7 +89,7 @@ with tempfile.TemporaryDirectory(prefix="sls-external-retry-") as directory:
                 "name": identifier,
                 "status": "accepted" if accepted else "failed",
                 "attempts": 1,
-                "http_status": 204 if accepted else 503,
+                "http_status": 204 if accepted else 429,
                 "error": "" if accepted else "http_failure",
             })
         return results
@@ -103,6 +107,15 @@ with tempfile.TemporaryDirectory(prefix="sls-external-retry-") as directory:
         fail("first attempt did not retain only its failed external work")
     if webhook_calls != [{"discord:primary", "discord:secondary"}]:
         fail(f"first attempt did not address the configured destination set: {webhook_calls}")
+
+    stored = json.loads(state_path.read_text())["deliveries"][delivery_key]
+    receipts = stored["destination_receipts"]
+    if receipts["discord:primary"]["status"] != "accepted" or receipts["discord:primary"]["http_status"] != 204:
+        fail("HTTP acceptance was not retained independently of pending delivery")
+    if receipts["discord:secondary"]["status"] != "failed" or receipts["discord:secondary"]["http_status"] != 429:
+        fail("failed destination lost its actionable HTTP receipt")
+    if any(word in json.dumps(receipts) for word in ("https://", "@example.com")):
+        fail("external receipts retained a webhook secret or recipient address")
 
     second = MODULE.retry_external_deliveries(
         state_path,
@@ -239,6 +252,247 @@ with tempfile.TemporaryDirectory(prefix="sls-external-retry-fairness-") as direc
     migrated_state = json.loads(state_path.read_text(encoding="utf-8"))
     if migrated_state.get("attempt_sequence") != 7:
         fail("legacy retry record did not receive the next durable attempt sequence")
+
+
+with tempfile.TemporaryDirectory(prefix="sls-external-uncertain-") as directory:
+    state_path = Path(directory) / "external-deliveries.json"
+    uncertainty_config = {
+        "discord_webhooks": [
+            {"id": name, "name": name, "url": f"https://discord.com/api/webhooks/1/{name}-SECRET"}
+            for name in ("accepted", "uncertain", "preconnect")
+        ],
+    }
+    correlation = "uncertain-chain"
+    delivery_key = MODULE.queue_external_delivery(
+        state_path, uncertainty_config, correlation, "Alert", "Body",
+        source="nws", event_id="stable-retry-event", now=1000,
+    )
+    dispatched = []
+
+    def mixed_dispatcher(*args, destination_keys=None, **_kwargs):
+        dispatched.append((set(destination_keys), args[8]))
+        results = []
+        for key in sorted(destination_keys):
+            kind, identifier = key.split(":", 1)
+            row = {"kind": kind, "id": identifier, "name": identifier}
+            if identifier == "uncertain":
+                result = MODULE._uncertain_delivery(row, reason="request_timeout")
+            else:
+                accepted = identifier == "accepted" or len(dispatched) > 1
+                result = {
+                    "type": kind, "id": identifier, "name": identifier,
+                    "status": "accepted" if accepted else "failed", "attempts": 1,
+                    "http_status": 204 if accepted else None,
+                    "error": "" if accepted else "network_failure",
+                }
+            results.append(result)
+        return results
+
+    first = MODULE.retry_external_deliveries(
+        state_path, uncertainty_config, "nws", live=True, webhook_dispatcher=mixed_dispatcher,
+    )
+    stored = json.loads(state_path.read_text())["deliveries"][delivery_key]
+    assert first["pending"] == 1 and first["uncertain"] == 1
+    assert stored["webhook_pending"] == ["discord:preconnect"]
+    assert list(stored["webhook_uncertain"]) == ["discord:uncertain"]
+    assert stored["webhook_inflight"] == []
+    assert MODULE.external_delivery_uncertain(state_path, "nws", correlation)
+    second = MODULE.retry_external_deliveries(
+        state_path, uncertainty_config, "nws", live=True, webhook_dispatcher=mixed_dispatcher,
+    )
+    assert second["pending"] == 0 and second["uncertain"] == 1
+    assert dispatched == [
+        ({"discord:accepted", "discord:uncertain", "discord:preconnect"}, "stable-retry-event"),
+        ({"discord:preconnect"}, "stable-retry-event"),
+    ]
+    stored = json.loads(state_path.read_text())["deliveries"][delivery_key]
+    assert stored["terminal_status"] == "uncertain" and stored["completed_at"] == 1100
+    MODULE.retry_external_deliveries(
+        state_path, uncertainty_config, "nws", live=True, webhook_dispatcher=mixed_dispatcher,
+    )
+    assert len(dispatched) == 2, "An uncertain destination was automatically replayed"
+    assert "SECRET" not in state_path.read_text()
+
+with tempfile.TemporaryDirectory(prefix="sls-external-interrupted-") as directory:
+    state_path = Path(directory) / "external-deliveries.json"
+    key = MODULE.queue_external_delivery(
+        state_path, config, "interrupted-chain", "Alert", "Body", source="nws", now=1000,
+    )
+
+    class SimulatedExit(BaseException):
+        pass
+
+    calls = []
+
+    def interrupted_dispatcher(*_args, destination_keys=None, **_kwargs):
+        calls.append(set(destination_keys))
+        intent = json.loads(state_path.read_text())["deliveries"][key]
+        assert intent["webhook_inflight"] == sorted(destination_keys)
+        raise SimulatedExit()
+
+    try:
+        MODULE.retry_external_deliveries(
+            state_path, config, "nws", live=True, webhook_dispatcher=interrupted_dispatcher,
+        )
+    except SimulatedExit:
+        pass
+    else:
+        fail("Process interruption fixture did not exit during submission")
+    assert MODULE.external_delivery_uncertain(state_path, "nws", "interrupted-chain")
+    recovered = MODULE.retry_external_deliveries(
+        state_path, config, "nws", live=True, webhook_dispatcher=interrupted_dispatcher,
+    )
+    assert len(calls) == 1 and recovered["pending"] == 0 and recovered["uncertain"] == 1
+    assert len(recovered["results"]) == 2
+    assert all(result["failure_reason"] == "interrupted_submission" for result in recovered["results"])
+    stored = json.loads(state_path.read_text())["deliveries"][key]
+    assert stored["terminal_status"] == "uncertain" and not stored["webhook_inflight"]
+
+with tempfile.TemporaryDirectory(prefix="sls-external-missing-receipt-") as directory:
+    state_path = Path(directory) / "external-deliveries.json"
+    key = MODULE.queue_external_delivery(
+        state_path, config, "missing-receipt", "Alert", "Body", source="nws", now=1000,
+    )
+
+    def incomplete_dispatcher(*_args, **_kwargs):
+        return [{"type": "discord", "id": "primary", "status": "accepted"}]
+
+    result = MODULE.retry_external_deliveries(
+        state_path, config, "nws", live=True, webhook_dispatcher=incomplete_dispatcher,
+    )
+    stored = json.loads(state_path.read_text())["deliveries"][key]
+    assert result["pending"] == 0 and result["uncertain"] == 1
+    assert list(stored["webhook_uncertain"]) == ["discord:secondary"]
+    assert stored["webhook_uncertain"]["discord:secondary"]["failure_reason"] == "dispatcher_failed"
+
+
+from datetime import datetime, timezone
+import copy
+
+def iso(epoch):
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+
+with tempfile.TemporaryDirectory(prefix="sls-source-validity-") as directory:
+    directory = Path(directory)
+    state_path = directory / "external-deliveries-north.json"
+    source_config = {
+        **config, "enabled": "1",
+        "nws_zones": [{"id": "north", "name": "North", "zone": "TXC491",
+            "email_recipients": ["alerts@example.com"], "discord_webhook_ids": ["primary"],
+            "generic_webhook_ids": [], "quiet_hours_enabled": "0", "quiet_critical_events": ["Tornado Warning"]}],
+    }
+    original_feature = {"id": "provider-alert-1", "properties": {
+        "event": "Tornado Warning", "status": "Actual", "messageType": "Alert", "expires": iso(2000)}}
+    validity = MODULE.weather_source_validity("nws", "north", feature=original_feature,
+        chain_key="Tornado Warning|provider-alert-1", zone="TXC491", observed_at=1000)
+    observation_path = directory / "weather-delivery.json"
+
+    def write_observation(feature=original_feature, observed_at=1100):
+        observation_path.write_text(json.dumps({"snapshots": {"north": {
+            "zone": "TXC491", "observed_at": observed_at,
+            "active": {validity["chain_key"]: feature} if feature else {}}}}))
+
+    record = {"source_validity": validity, "payload": {"event": "Tornado Warning"}}
+    write_observation()
+    assert REAL_VALIDATOR(record, source_config, directory, 1100)[:2] == ("eligible", "")
+    for changed, expected in (
+        (None, "source_cancelled"),
+        ({**original_feature, "id": "provider-alert-2"}, "source_superseded"),
+        ({**original_feature, "properties": {**original_feature["properties"], "messageType": "Cancel"}}, "source_cancelled"),
+        ({**original_feature, "properties": {**original_feature["properties"], "expires": iso(1001)}}, "source_expired"),
+    ):
+        write_observation(changed)
+        assert REAL_VALIDATOR(record, source_config, directory, 1100)[:2] == ("cancelled", expected)
+    write_observation(observed_at=919)
+    assert REAL_VALIDATOR(record, source_config, directory, 1100)[:2] == ("deferred", "source_observation_stale")
+    write_observation()
+    assert REAL_VALIDATOR(record, source_config, directory, 2001)[:2] == ("cancelled", "source_expired")
+    changed_config = copy.deepcopy(source_config)
+    changed_config["nws_zones"][0]["zone"] = "TXC001"
+    assert REAL_VALIDATOR(record, changed_config, directory, 1100)[:2] == ("cancelled", "source_area_changed")
+    changed_config["enabled"] = "0"
+    assert REAL_VALIDATOR(record, changed_config, directory, 1100)[:2] == ("cancelled", "source_disabled_or_removed")
+    assert REAL_VALIDATOR({}, source_config, directory, 1100)[:2] == ("cancelled", "source_identity_unavailable")
+    with mock.patch.object(MODULE, "_quiet_now", return_value=True):
+        assert REAL_VALIDATOR(record, source_config, directory, 1100)[0] == "eligible"
+        assert REAL_VALIDATOR({**record, "payload": {"event": "Heat Advisory"}}, source_config, directory, 1100)[:2] == ("deferred", "quiet_hours")
+
+    # An old source is terminally cancelled with a reason and zero transports.
+    cancelled_key = MODULE.queue_external_delivery(state_path, source_config, "cancelled-source", "Alert", "Body",
+        event="Tornado Warning", source="nws", email_recipients="alerts@example.com",
+        webhook_destination_keys=["discord:primary"], source_validity=validity, now=1000)
+    write_observation(None)
+    transports = []
+    def accepted_email(*args):
+        transports.append(("email", args[-1])); return True
+    def accepted_webhooks(*args, destination_keys=None, **kwargs):
+        transports.append(("webhooks", set(destination_keys)))
+        return [{"type": key.split(":")[0], "id": key.split(":")[1], "status": "accepted"} for key in destination_keys]
+    outcome = MODULE.retry_external_deliveries(state_path, source_config, "nws", live=True,
+        email_sender=accepted_email, webhook_dispatcher=accepted_webhooks, validity_checker=REAL_VALIDATOR)
+    assert not transports and outcome["results"][0]["error"] == "source_cancelled"
+    assert MODULE.external_delivery_status(state_path, "nws", "cancelled-source") == "cancelled"
+
+    # Revocation narrows the original audience; newly selected destinations and
+    # recipients never receive already queued content.
+    write_observation()
+    MODULE.queue_external_delivery(state_path, source_config, "frozen-audience", "Alert", "Body",
+        event="Tornado Warning", source="nws", email_recipients="alerts@example.com",
+        webhook_destination_keys=["discord:primary"], source_validity=validity, now=1000)
+    current = copy.deepcopy(source_config)
+    current["nws_zones"][0].update(email_recipients=["new@example.com"], discord_webhook_ids=["primary", "secondary"])
+    MODULE.retry_external_deliveries(state_path, current, "nws", live=True,
+        email_sender=accepted_email, webhook_dispatcher=accepted_webhooks, validity_checker=REAL_VALIDATOR)
+    assert transports == [("webhooks", {"discord:primary"})]
+    assert MODULE.external_delivery_status(state_path, "nws", "frozen-audience") == "partial_cancelled"
+
+    MODULE.queue_external_delivery(state_path, source_config, "changed-webhook", "Alert", "Body",
+        event="Tornado Warning", source="nws", webhook_destination_keys=["discord:primary"],
+        source_validity=validity, now=1000)
+    changed_endpoint = copy.deepcopy(source_config)
+    changed_endpoint["discord_webhooks"][0]["url"] = "https://discord.com/api/webhooks/99/NEW-SECRET"
+    before = len(transports)
+    MODULE.retry_external_deliveries(state_path, changed_endpoint, "nws", live=True,
+        email_sender=accepted_email, webhook_dispatcher=accepted_webhooks, validity_checker=REAL_VALIDATOR)
+    assert len(transports) == before, "An existing destination ID redirected a queued alert to a new receiver"
+    assert "NEW-SECRET" not in state_path.read_text()
+
+    # Stale observations defer without delivery, then a fresh one permits the
+    # original routes. Source expiry remains bounded during a prolonged outage.
+    MODULE.queue_external_delivery(state_path, source_config, "stale-source", "Alert", "Body",
+        event="Tornado Warning", source="nws", email_recipients="alerts@example.com",
+        webhook_destination_keys=[], source_validity=validity, now=1000)
+    write_observation(observed_at=919)
+    before = len(transports)
+    MODULE.retry_external_deliveries(state_path, source_config, "nws", live=True,
+        email_sender=accepted_email, webhook_dispatcher=accepted_webhooks, validity_checker=REAL_VALIDATOR)
+    assert len(transports) == before
+    assert MODULE.external_delivery_status(state_path, "nws", "stale-source") == "pending"
+    write_observation()
+    MODULE.retry_external_deliveries(state_path, source_config, "nws", live=True,
+        email_sender=accepted_email, webhook_dispatcher=accepted_webhooks, validity_checker=REAL_VALIDATOR)
+    assert transports[-1] == ("email", "alerts@example.com")
+
+    # Lightning must still refer to the same observed area and storm episode.
+    from sls_mass_notify_xweather_poll import lightning_area_identity, configured_groups
+    lightning_config = {"xweather": {"enabled": "1", "query_interval_minutes": 5, "groups": [{
+        "id": "lightning_north", "enabled": "1", "location": "Round Rock, TX", "radius_miles": 10,
+        "strike_type": "cloud_to_ground", "all_clear": "send", "email_recipients": ["alerts@example.com"]}]}}
+    area = configured_groups(lightning_config["xweather"])[0]
+    lightning_validity = MODULE.weather_source_validity("xweather", "lightning_north", observed_at=1000,
+        event_kind="entry", cluster_started=1000, configuration_identity=lightning_area_identity(lightning_config, area))
+    lightning_record = {"source_validity": lightning_validity, "payload": {"event": "Lightning Radius Alert"}}
+    lightning_observation = directory / "xweather-lightning-state-lightning_north.json"
+    lightning_observation.write_text(json.dumps({"last_observed_at": 1100, "cluster_started": 1000, "active": True}))
+    assert REAL_VALIDATOR(lightning_record, lightning_config, directory, 1100)[0] == "eligible"
+    with mock.patch.object(MODULE, "_quiet_now", return_value=True):
+        assert REAL_VALIDATOR(lightning_record, lightning_config, directory, 1100)[:2] == ("deferred", "quiet_hours")
+    lightning_observation.write_text(json.dumps({"last_observed_at": 1100, "cluster_started": 1000, "active": False}))
+    assert REAL_VALIDATOR(lightning_record, lightning_config, directory, 1100)[:2] == ("cancelled", "source_cleared")
+    lightning_record["source_validity"] = {**lightning_validity, "event_kind": "clear"}
+    assert REAL_VALIDATOR(lightning_record, lightning_config, directory, 1100)[0] == "eligible"
+    lightning_observation.write_text(json.dumps({"last_observed_at": 1100, "cluster_started": 1001, "active": True}))
+    assert REAL_VALIDATOR(lightning_record, lightning_config, directory, 1100)[:2] == ("cancelled", "source_superseded")
 
 
 source = (RUNTIME.parent / "sls_mass_notify_nws_poll.sh").read_text(encoding="utf-8")

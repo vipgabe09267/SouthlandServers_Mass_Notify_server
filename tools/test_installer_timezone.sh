@@ -13,7 +13,11 @@ grep -Fq '[ -r /usr/share/zoneinfo/UTC ] || missing_packages+=(tzdata)' "${ROOT_
 # timedatectl set-timezone.
 detected="$(detect_system_timezone)"
 timezone_zoneinfo_path "$detected" >/dev/null
-validate_system_timezone UTC
+if /usr/bin/timedatectl list-timezones >/dev/null 2>&1; then
+  validate_system_timezone UTC
+else
+  printf 'SKIP: host timezone catalogue unavailable; mocked validation and rollback checks still run.\n'
+fi
 for invalid in '' '../UTC' '/etc/passwd' 'America//Chicago' $'UTC\nEtc/UTC' 'Not/A_Real_Zone'; do
   if validate_system_timezone "$invalid"; then
     printf 'Installer accepted an invalid timezone value.\n' >&2

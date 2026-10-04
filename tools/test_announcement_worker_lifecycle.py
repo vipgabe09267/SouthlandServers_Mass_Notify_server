@@ -119,6 +119,25 @@ class FixtureAnnouncementModule {
         }
         self.bootstrap.write_text(source.replace("MODULE_ACTION", module_actions[module_action]).replace("PROCESS_ACTION", actions[action]))
 
+    def test_health_loads_real_module_after_runtime_helper(self):
+        module_path = CANDIDATE / "Slsmassnotifyserver.class.php"
+        if not module_path.is_file():
+            module_path = ROOT / "slsmassnotifyserver/Slsmassnotifyserver.class.php"
+        self.bootstrap.write_text(
+            "<?php\ninterface BMO {}\nrequire " + self.php_string(str(module_path)) + ";\n"
+            "class FreePBX { public static function Slsmassnotifyserver() {\n"
+            "return (new ReflectionClass(\\FreePBX\\modules\\Slsmassnotifyserver::class))"
+            "->newInstanceWithoutConstructor(); }}\n"
+        )
+        result = self.run_worker("--health-check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = json.loads(result.stdout)
+        self.assertTrue(report["ok"])
+        self.assertTrue(report["module_loaded"])
+        self.assertTrue(report["storage_writable"])
+        self.assertEqual(report["failure_category"], "")
+        self.assertEqual(list(self.data.iterdir()), [], "Read-only health probe left job state")
+
     def assert_failed(self, result, category, uncertain=False):
         job = self.read()
         self.assertEqual(job["state"], "failed", result.stdout + result.stderr)
@@ -184,6 +203,23 @@ class FixtureAnnouncementModule {
         self.assertEqual(job["receipts"][0]["state"], "submitted_to_asterisk")
         self.assertFalse((self.data / ("pending_" + JOB_ID + ".mark")).exists())
 
+    def test_standby_authority_denial_preserves_queue_and_reconciliation(self):
+        self.seed("worker_starting", age=1200); self.module()
+        authority = self.folder / "sls_mass_notify_cluster_effect.php"
+        authority.write_text('<?php if(stream_get_contents(STDIN)!==\'{"action":"authority"}\'){exit(2);} echo \'{"ok":false}\';exit(1);')
+        original = (self.data / (JOB_ID + ".json")).read_bytes()
+        for arguments in ((JOB_ID,), ("--supervise", JOB_ID), ("--reconcile",)):
+            self.assertNotEqual(self.run_worker(*arguments).returncode, 0)
+            self.assertEqual((self.data / (JOB_ID + ".json")).read_bytes(), original)
+
+    def test_supervisor_lost_authority_preserves_pending_child_result(self):
+        self.seed(); self.module("return_true_without_finish")
+        authority = self.folder / "sls_mass_notify_cluster_effect.php"
+        authority.write_text('<?php $n=(int)@file_get_contents(__DIR__."/authority-count");file_put_contents(__DIR__."/authority-count",$n+1);if($n<2){echo \'{"ok":true}\';exit(0);}echo \'{"ok":false}\';exit(1);')
+        self.assertNotEqual(self.run_worker("--supervise", JOB_ID).returncode, 0)
+        self.assertEqual(self.read()["state"], "running")
+        self.assertNotIn("failure_category", self.read())
+
     def test_supervisor_timeout_leaves_uncertain_terminal_failure(self):
         self.seed(); self.module("hang")
         worker = self.worker.read_text()
@@ -241,6 +277,24 @@ class FixtureAnnouncementModule {
         self.assertFalse((self.data / ("pending_" + broken_id + ".mark")).exists())
         self.assertFalse(orphan.exists())
 
+    def test_channel_failure_summary_is_specific_bounded_and_preserves_job_history(self):
+        job = self.seed('failed')
+        job.update(failure_category='channel_submission_failed', receipts=[
+            {'channel':'audio','target':'1000','state':'queued'},
+            {'channel':'desktop','target':SECRET,'state':'published'},
+            {'channel':'external_voice','target':SECRET,'state':'failed','detail':'Route rejected (outbound_subroutine_unsupported).'},
+            {'channel':'external_voice','state':'failed','failure_code':'<script>'+SECRET},
+            {'channel':'not_a_channel','state':'failed','failure_code':SECRET},
+        ])
+        self.php('$store = new SlsAnnouncementJobStore(); $job = json_decode(' + self.php_string(json.dumps(job)) + ', true); $store->write($job);')
+        health = json.loads((self.data / 'worker-state.json').read_text())
+        self.assertIn('External voice (outbound_subroutine_unsupported)',health['failure_reason'])
+        self.assertNotIn('Phone audio',health['failure_reason'])
+        self.assertNotIn(SECRET,json.dumps(health))
+        self.assertEqual(health['job_id'],JOB_ID)
+        self.assertEqual(self.read()['receipts'],job['receipts'])
+        self.assertLess(len(health['failure_reason']),1024)
+
     def test_health_bootstrap_failure_is_sanitized(self):
         self.bootstrap.write_text("<?php throw new RuntimeException(" + self.php_string(SECRET) + ");")
         result = self.run_worker("--health-check", "--record-health")
@@ -265,8 +319,17 @@ class FixtureAnnouncementModule {
         # Model deployment: runtime worker and packaged module contain separate
         # paths to the same helper class. require_once alone cannot deduplicate it.
         packaged_helper.write_text(self.helper.read_text())
+        (packaged_helper.parent / 'sls_runtime_state.php').write_bytes((CANDIDATE / 'bin/sls_mass_notify/sls_runtime_state.php').read_bytes())
         packaged_trait = packaged / "AnnouncementDelivery.php"
         packaged_trait.write_text((CANDIDATE / "AnnouncementDelivery.php").read_text())
+        # The complete module ships the disabled-by-default delivery fence too.
+        for dependency in CANDIDATE.glob("EnterpriseCluster*.php"):
+            (packaged / dependency.name).write_bytes(dependency.read_bytes())
+        for name in ("LabsSafety.php", "IncidentStore.php"):
+            (packaged / name).write_bytes((CANDIDATE / name).read_bytes())
+        packaged_security = packaged / "api/sls-mass-notify/security.php"
+        packaged_security.parent.mkdir(parents=True)
+        packaged_security.write_bytes((CANDIDATE / "api/sls-mass-notify/security.php").read_bytes())
         self.module()
         bootstrap = self.bootstrap.read_text()
         assertion = (

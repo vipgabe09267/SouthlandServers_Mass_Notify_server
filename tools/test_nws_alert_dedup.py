@@ -11,6 +11,7 @@ import sys
 import tempfile
 import textwrap
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -211,7 +212,19 @@ with tempfile.TemporaryDirectory(prefix="sls-nws-local-intent-unit-") as directo
 
 
 def write_executable(path, source):
-    path.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
+    source = textwrap.dedent(source).lstrip()
+    if "def queue_external_delivery(" in source:
+        # The queue facade reads configuration through the shared decoder.
+        # Preserve that dependency while substituting transport-only behavior.
+        helper = ROOT / "slsmassnotifyserver/bin/sls_mass_notify/sls_config_crypto.py"
+        dependency = (
+            "import importlib.util\n"
+            "_spec = importlib.util.spec_from_file_location('sls_config_crypto', " + repr(str(helper)) + ")\n"
+            "_config_crypto = importlib.util.module_from_spec(_spec)\n"
+            "_spec.loader.exec_module(_config_crypto)\n"
+        )
+        source = source.replace("#!/usr/bin/env python3\n", "#!/usr/bin/env python3\n" + dependency, 1)
+    path.write_text(source, encoding="utf-8")
     path.chmod(0o755)
 
 
@@ -227,6 +240,7 @@ def run_live_poller_case(
     repair_journal=False,
     force_replay=False,
     external_only=False,
+    mail_rejected=False,
 ):
     """Exercise the real shell flow with local-only fakes and no network."""
     with tempfile.TemporaryDirectory(prefix=f"sls-nws-intent-{case_name}-") as directory:
@@ -250,9 +264,10 @@ def run_live_poller_case(
                         "severity": "Moderate",
                         "status": "Actual",
                         "messageType": "Alert",
+                        "expires": datetime.fromtimestamp(time.time() + 3600, timezone.utc).isoformat(),
                         "areaDesc": "Test County",
                         "headline": "Synthetic nonnetwork regression payload",
-                        "description": "Synthetic nonnetwork regression payload.",
+                        "description": "a" * 31000 if mail_rejected else "Synthetic nonnetwork regression payload.",
                         "instruction": "Stay hydrated.",
                         "references": [],
                     },
@@ -261,7 +276,7 @@ def run_live_poller_case(
             encoding="utf-8",
         )
         config_path = root / "mass-notifications.config"
-        config_path.write_text("{}\n", encoding="utf-8")
+        config_path.write_text('{"enabled":"1"}\n', encoding="utf-8")
         loader_path = root / "config-loader.py"
         write_executable(
             loader_path,
@@ -311,6 +326,9 @@ def run_live_poller_case(
                 import os
                 from pathlib import Path
 
+                def weather_source_validity(*_args, **kwargs):
+                    return {"version": 1, "fixture_source": kwargs}
+
                 def queue_external_delivery(state_path, _config, correlation_key, *_args, **_kwargs):
                     path = Path(state_path)
                     state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"deliveries": {}}
@@ -338,6 +356,9 @@ def run_live_poller_case(
                 import json
                 import os
                 from pathlib import Path
+
+                def weather_source_validity(*_args, **kwargs):
+                    return {"version": 1, "fixture_source": kwargs}
 
                 def queue_external_delivery(state_path, _config, correlation_key, *_args, **_kwargs):
                     path = Path(state_path)
@@ -433,6 +454,7 @@ def run_live_poller_case(
             "PATH": str(fake_bin) + os.pathsep + environment.get("PATH", ""),
             "CONFIG_JSON_FILE": str(config_path),
             "CONFIG_LOADER": str(loader_path),
+            "BRANDED_EMAIL_SCRIPT": str(ROOT / "slsmassnotifyserver/bin/sls_mass_notify/sls_branded_email.py"),
             "NOTIFICATION_DESTINATION_SCRIPT": str(destination_path),
             "NWS_STATUS_HELPER": str(status_driver),
             "NWS_REAL_STATUS_HELPER": str(STATUS_HELPER),
@@ -453,9 +475,10 @@ def run_live_poller_case(
             "SPOOL_TMP": str(root / "spool-tmp"),
             "VISUAL_SCRIPT": str(visual_path),
             "NWS_ZONE_OVERRIDE": "TXC001",
+            "NWS_ZONE_GROUP_ID_OVERRIDE": "fixture_north",
             "NWS_RECIPIENTS_OVERRIDE": "",
             "NWS_DESKTOP_CLIENTS_OVERRIDE": "" if external_only else "test-desktop",
-            "NWS_EMAIL_RECIPIENTS_OVERRIDE": "external@example.com" if external_only else "",
+            "NWS_EMAIL_RECIPIENTS_OVERRIDE": "external@example.com" if external_only or mail_rejected else "",
             "NWS_TEST_PAYLOAD_SOURCE": str(payload_path),
             "NWS_EXPECTED_ALERT_KEY": alert_key,
             "NWS_VISUAL_MARKER": str(visual_marker),
@@ -533,6 +556,13 @@ def run_live_poller_case(
         external_recorded = external_path.exists() and bool(
             json.loads(external_path.read_text(encoding="utf-8")).get("deliveries")
         )
+        if mail_rejected:
+            records = json.loads(external_path.read_text())["deliveries"]
+            assert len(records) == 1
+            rejected = next(iter(records.values()))
+            assert rejected["terminal_status"] == "failed" and rejected["completed_at"] > 0
+            assert not rejected["email_pending"] and not rejected["webhook_pending"]
+            assert rejected["destination_receipts"]["email:email"]["error"] == "weather_details_unavailable"
         if repair_journal and external_recorded:
             assert len(json.loads(external_path.read_text(encoding="utf-8"))["deliveries"]) == 1
         if external_probe:
@@ -562,6 +592,13 @@ assert fresh_key in fresh_processed
 assert fresh_status["last_delivery_status"] == "queued"
 assert fresh_key in json.loads(fresh_local)["intents"]
 assert fresh_external
+
+mail_status, mail_processed, mail_visual, _, mail_key, mail_external, _ = run_live_poller_case(
+    "oversize-mail", mail_rejected=True
+)
+assert mail_visual == [mail_key] and mail_key in mail_processed and mail_external
+assert mail_status["last_delivery_status"] == "partial_failure"
+assert "external delivery was rejected" in mail_status["last_delivery_message"]
 
 recovery_status, recovery_processed, recovery_visual, _, recovery_key, recovery_external, _ = run_live_poller_case(
     "recovery", prequeue=True

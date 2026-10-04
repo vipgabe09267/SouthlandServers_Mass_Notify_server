@@ -1,0 +1,23 @@
+<?php
+declare(strict_types=1);
+require dirname(__DIR__).'/slsmassnotifyserver/api/sls-mass-notify/sms/Service.php';
+use SLS\MassNotify\Sms\{Config,Store,Service};
+function check(bool $ok,string $message):void{if(!$ok)throw new RuntimeException($message);}
+function rejects(callable $call):void{try{$call();}catch(Throwable $e){return;}throw new RuntimeException('Unauthenticated SMS event accepted');}
+$directory=sys_get_temp_dir().'/sls-human-sms-'.bin2hex(random_bytes(8));mkdir($directory,0700);$now=time();$events=[];$store=new Store($directory);$service=new Service($store,null,'/fixture-media',static function($event)use(&$events){$events[]=$event;});
+$recipient=['id'=>'sms_'.str_repeat('a',24),'name'=>'Fixture person','number'=>'+15555550102','enabled'=>true,'consent'=>true,'consent_note'=>'Isolated fixture','consent_at'=>gmdate('c',$now-60)];
+$settings=['public_pbx_host'=>'pbx.example.org','control_api'=>['base_url'=>'https://pbx.example.org:8443/api/sls-mass-notify'],'announcement_sms'=>['enabled'=>true,'provider'=>'twilio','from'=>'+15555550101','organization'=>'Fixture','segment_cost_micros'=>10000,'twilio_account_sid'=>'AC'.str_repeat('a',32),'twilio_auth_token'=>str_repeat('f',32),'twilio_key_sid'=>'SK'.str_repeat('b',32),'twilio_key_secret'=>'fixture-secret','recipients'=>[$recipient]]];
+function twilio(array $payload,string $url,string $key):array{$sorted=$payload;ksort($sorted);$bytes=$url;foreach($sorted as $name=>$value)$bytes.=$name.$value;return[http_build_query($payload),['content-type'=>'application/x-www-form-urlencoded','x-twilio-signature'=>base64_encode(hash_hmac('sha1',$bytes,$key,true))]];}
+try{
+ $url=Service::callbackUrl($settings);$payload=['AccountSid'=>$settings['announcement_sms']['twilio_account_sid'],'MessageSid'=>'SM'.str_repeat('c',32),'MessageStatus'=>'received','From'=>$recipient['number'],'To'=>'+15555550101','Body'=>'SLS AAAAAAAAAAAA SAFE'];[$raw,$headers]=twilio($payload,$url,str_repeat('f',32));
+ rejects(fn()=>$service->callback($settings,'',$raw,array_replace($headers,['x-twilio-signature'=>'bad']),$now));check(!$events,'Unsigned reply reached human callback');
+ $service->callback($settings,'',$raw,$headers,$now);check(count($events)===1&&$events[0]['provider']==='twilio'&&$events[0]['body']===$payload['Body'],'Signed Twilio reply normalization');
+ $payload['Body']='STOP';$payload['MessageSid']='SM'.str_repeat('d',32);[$raw,$headers]=twilio($payload,$url,str_repeat('f',32));$service->callback($settings,'',$raw,$headers,$now);check(count($events)===1,'STOP counted as human response');
+ $payload['Body']='SLS AAAAAAAAAAAA HELP';$payload['MessageSid']='SM'.str_repeat('e',32);[$raw,$headers]=twilio($payload,$url,str_repeat('f',32));$service->callback($settings,'',$raw,$headers,$now);check(count($events)===1,'Old consent accepted a reply after STOP');
+ $settings['announcement_sms']['recipients'][0]['consent_at']=gmdate('c',$now+1);$service->callback($settings,'',$raw,$headers,$now+2);check(count($events)===2,'New saved consent did not permit reply');
+ $pair=sodium_crypto_sign_keypair();$public=sodium_crypto_sign_publickey($pair);$secret=sodium_crypto_sign_secretkey($pair);$profile='11111111-1111-4111-8111-111111111111';
+ $settings['announcement_sms']=array_replace($settings['announcement_sms'],['provider'=>'telnyx','telnyx_api_key'=>str_repeat('f',32),'telnyx_profile_id'=>$profile,'telnyx_public_key'=>base64_encode($public)]);
+ $event=['data'=>['id'=>'22222222-2222-4222-8222-222222222222','event_type'=>'message.received','payload'=>['id'=>'33333333-3333-4333-8333-333333333333','messaging_profile_id'=>$profile,'from'=>['phone_number'=>$recipient['number']],'to'=>[['phone_number'=>'+15555550101']],'text'=>'SLS AAAAAAAAAAAA RECEIVED']]];$raw=json_encode($event);$stamp=(string)($now+2);$headers=['content-type'=>'application/json','telnyx-timestamp'=>$stamp,'telnyx-signature-ed25519'=>base64_encode(sodium_crypto_sign_detached($stamp.'|'.$raw,$secret))];$service->callback($settings,'',$raw,$headers,$now+2);check(count($events)===3&&$events[2]['provider']==='telnyx','Signed Telnyx reply');rejects(fn()=>$service->callback($settings,'',$raw.' ',$headers,$now+2));check(count($events)===3,'Tampered Telnyx reply reached human callback');
+ $settings['announcement_sms']['provider']='bulkvs';rejects(fn()=>$service->callback($settings,'',$raw,$headers,$now+2));check(count($events)===3,'Undocumented BulkVS callback accepted');
+ echo "Signed Twilio/Telnyx human reply, tamper rejection, STOP/new consent and BulkVS refusal fixtures passed; no messages sent.\n";
+}finally{unset($service,$store);foreach(new DirectoryIterator($directory)as$file){if(!$file->isDot())unlink($file->getPathname());}rmdir($directory);}

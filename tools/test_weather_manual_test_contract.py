@@ -4,6 +4,7 @@
 import json
 import os
 import pathlib
+import shlex
 import subprocess
 import tempfile
 import time
@@ -40,6 +41,27 @@ def run_case(
         spool_tmp = scratch / "tmp"
         for path in (tts, tones, spool, spool_tmp):
             path.mkdir(parents=True, exist_ok=True)
+
+        # Execute the repository helper with private reservation storage. The
+        # worker's production helper path is intentionally not an environment
+        # override; redirect that one constant in a temporary source copy.
+        queue_helper = scratch / 'sls_audio_queue.py'
+        (scratch / 'sls_audio_state.py').write_bytes((ROOT / 'slsmassnotifyserver/bin/sls_mass_notify/sls_audio_state.py').read_bytes())
+        queue_source = (ROOT / 'slsmassnotifyserver/bin/sls_mass_notify/sls_audio_queue.py').read_text(encoding='utf-8')
+        queue_marker = "DATA = Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin')"
+        if queue_source.count(queue_marker) != 1:
+            fail('manual Weather fixture could not isolate the reservation directory')
+        queue_helper.write_text(queue_source.replace(queue_marker, f'DATA = Path({str(scratch)!r})'), encoding='utf-8')
+        fixture_worker = scratch / 'sls_mass_notify_test.sh'
+        worker_source = WORKER.read_text(encoding='utf-8')
+        worker_marker = 'AUDIO_QUEUE_HELPER="/usr/local/bin/sls_mass_notify/sls_audio_queue.py"'
+        if worker_source.count(worker_marker) != 1:
+            fail('manual Weather fixture could not isolate the reservation helper')
+        phone_helper = scratch / 'phone-fixture.py'
+        phone_helper.write_text("import sys\nprint('a' * 32)\nprint(sys.argv[sys.argv.index('--recipients') + 1].replace(',', '\\n'))\n")
+        worker_source = worker_source.replace('/usr/local/bin/sls_mass_notify/sls_phone_admission.py', shlex.quote(str(phone_helper)))
+        fixture_worker.write_text(worker_source.replace(worker_marker,
+            'AUDIO_QUEUE_HELPER=' + shlex.quote(str(queue_helper))), encoding='utf-8')
 
         config = scratch / "mass-notifications.config"
         config.write_text("{}\n", encoding="utf-8")
@@ -133,6 +155,7 @@ print(os.environ.get("MOCK_ASTERISK_CHANNELS", ""))
                 "CONFIG_LOADER": str(config_loader),
                 "COOLDOWN_FILE": str(cooldown_file),
                 "EVENTS_LOG": str(scratch / "events.jsonl"),
+                "FAULT_STATE_FILE": str(scratch / "fault.state"),
                 "LOG": str(scratch / "worker.log"),
                 "MOCK_ASTERISK_CHANNELS": (
                     "Local/1000@sls-alert-audio-00000001;2!"
@@ -144,6 +167,7 @@ print(os.environ.get("MOCK_ASTERISK_CHANNELS", ""))
                 "NWS_RECIPIENTS_OVERRIDE": ",".join(phone_targets),
                 "NWS_ZONE_OVERRIDE": "TXC491",
                 "PIPER_MARKER": str(piper_marker),
+                "PYTHONDONTWRITEBYTECODE": "1",
                 "SLS_TONES_DIR": str(tones),
                 "SLS_TTS_DIR": str(tts),
                 "SPOOL": str(spool),
@@ -156,7 +180,7 @@ print(os.environ.get("MOCK_ASTERISK_CHANNELS", ""))
             }
         )
         process = subprocess.Popen(
-            ["bash", str(WORKER), "GUI", "Contract Test"],
+            ["bash", str(fixture_worker), "GUI", "Contract Test"],
             cwd=ROOT,
             env=env,
             text=True,
@@ -194,6 +218,8 @@ print(os.environ.get("MOCK_ASTERISK_CHANNELS", ""))
             "piper_ran": piper_marker.exists(),
             "calls": captured_calls,
             "cooldown_lock_exists": pathlib.Path(str(cooldown_file) + ".lock").exists(),
+            "reservation": json.loads((scratch / 'audio-reservations.json').read_text(encoding='utf-8'))
+                if (scratch / 'audio-reservations.json').exists() else None,
         }
 
 
@@ -224,6 +250,8 @@ if "Archive: yes" in phone["calls"][0] or "Data: 1\n" in phone["calls"][0]:
     fail("phone test retained the false archive gate or a one-second Page origin")
 if "Channel: Local/1000@sls-alert-audio" not in phone["calls"][0]:
     fail("phone test did not queue its requested extension")
+if set(phone['reservation']['recipients']) != {'1000'} or not phone['reservation']['media']:
+    fail('phone test did not reserve its recipient and media in isolated storage')
 
 mixed = run_case(["1000"], ["desk_ops"])
 if mixed["returncode"] != 0:
@@ -297,6 +325,20 @@ if len(partial_queue["visual_calls"]) != 2:
     fail("a partial audio queue failure prevented phone or Desktop visual submission")
 if "one or more Weather audio page jobs could not be queued" not in partial_queue["stdout"]:
     fail("a partial multi-extension queue failure was not reported accurately")
+if set(partial_queue['reservation']['recipients']) != {'1000'}:
+    fail('invalid manual Weather recipient reached the reservation helper')
+
+strict_partial = run_case(['1000', 'bad1001', '1000'], ['desk_ops'])
+if strict_partial['returncode'] == 0 or len(strict_partial['calls']) != 1:
+    fail('invalid numeric-looking recipient or duplicate changed the valid audio audience')
+if set(strict_partial['reservation']['recipients']) != {'1000'}:
+    fail('manual Weather recipient validation stripped invalid characters into a new extension')
+
+all_invalid = run_case(['invalid', 'bad1000'], ['desk_ops'])
+if all_invalid['returncode'] == 0 or all_invalid['calls'] or all_invalid['reservation'] is not None:
+    fail('all-invalid manual Weather recipients invoked reservation or queued audio')
+if len(all_invalid['visual_calls']) != 2:
+    fail('all-invalid audio recipients blocked independent visual submissions')
 
 no_channels = run_case([], [])
 if no_channels["returncode"] == 0:
@@ -323,7 +365,9 @@ trigger_source = class_source.split(
 for marker in (
     "NWS_DESKTOP_CLIENTS_OVERRIDE",
     "unavailable or disabled desktop clients",
-    "Asterisk picked up the audio jobs and accepted SIP NOTIFY",
+    "withTestDeliveryReport",
+    "SLS_TEST_DELIVERY_ID",
+    "testDesktopPublications",
     "per-zone email",
     "unknown or invalid zone selection",
     "Successful channel submissions are not replayed",

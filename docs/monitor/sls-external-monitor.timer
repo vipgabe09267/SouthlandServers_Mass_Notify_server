@@ -1,0 +1,12 @@
+[Unit]
+Description=Check SLS PBX readiness from this separate host every minute
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+RandomizedDelaySec=5
+AccuracySec=1
+Unit=sls-external-monitor.service
+
+[Install]
+WantedBy=timers.target

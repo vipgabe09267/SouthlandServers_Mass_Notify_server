@@ -238,13 +238,16 @@ if parts and parts[-1] == b"":
     parts.pop()
 if len(parts) % 2:
     raise SystemExit(2)
-destinations = {kind: [] for kind in ("phone", "desktop", "email", "discord", "generic")}
+destinations = {kind: [] for kind in ("phone", "desktop", "email", "discord", "generic", "voice", "sms")}
 for offset in range(0, len(parts), 2):
     kind = parts[offset].decode("ascii", "strict")
     value = parts[offset + 1].decode("utf-8", "strict")
     if kind not in destinations:
         raise SystemExit(2)
     destinations[kind].append(value)
+snapshot = json.loads(os.environ.get("SLS_WEATHER_CHANNEL_SNAPSHOT") or "{}")
+for kind,key in (("voice","voice_recipient_ids"),("sms","sms_recipient_ids")):
+    destinations[kind] = snapshot.get(key, [])
 print(json.dumps({
     "op": "claim_many",
     "alert_chain": os.environ["NWS_CLAIM_ALERT_CHAIN"],
@@ -258,12 +261,23 @@ print(json.dumps({
 ')" || return 1
 
   response="$(nws_coordination_call "$request" 2>> "$LOG")" || return 1
+  if [ -n "${SLS_WEATHER_CHANNEL_SNAPSHOT:-}" ]; then
+    SLS_WEATHER_CHANNEL_SNAPSHOT="$(printf '%s' "$response" | /usr/bin/python3 -c '
+import json, os, sys
+reply=json.load(sys.stdin)
+snapshot=json.loads(os.environ["SLS_WEATHER_CHANNEL_SNAPSHOT"])
+for kind,key in (("voice","voice_recipient_ids"),("sms","sms_recipient_ids")):
+    snapshot[key]=[value for value in snapshot[key] if value in reply["claimed"][kind]]
+print(json.dumps(snapshot,separators=(",",":")))
+')" || return 1
+    export SLS_WEATHER_CHANNEL_SNAPSHOT
+  fi
   claimed_lines="$(printf '%s\n' "$response" | /usr/bin/python3 -c '
 import json
 import sys
 
 result = json.load(sys.stdin)
-kinds = ("phone", "desktop", "email", "discord", "generic")
+kinds = ("phone", "desktop", "email", "discord", "generic", "voice", "sms")
 if result.get("ok") is not True or not isinstance(result.get("claimed"), dict):
     raise SystemExit(2)
 duplicates = result.get("duplicates")
@@ -311,6 +325,7 @@ print(f"reserved\t{reserved_count}")
         claimed_webhooks+=("generic:$value")
         NWS_CLAIMED_GENERIC_COUNT=$((NWS_CLAIMED_GENERIC_COUNT + 1))
         ;;
+      voice|sms) ;;
       meta) duplicate_count="$value" ;;
       reserved) reserved_count="$value" ;;
       *) return 1 ;;
@@ -335,14 +350,15 @@ print(f"reserved\t{reserved_count}")
     # An earlier zone has not yet crossed its durable handoff boundary. Release
     # this zone's partial reservations and defer the complete alert so its
     # alert-level local intent cannot strand the blocked destinations.
-    finalize_cross_zone_destinations "$alert_chain" release phone desktop email discord generic >/dev/null 2>&1 || true
+    finalize_cross_zone_destinations "$alert_chain" release phone desktop email discord generic voice sms >/dev/null 2>&1 || true
     printf '%s: deferred %s because %s destination reservation(s) from an earlier Weather zone are still pending\n' \
       "$(date)" "$EVENT" "$reserved_count" >> "$LOG"
     return 10
   fi
   if [[ "$duplicate_count" =~ ^[0-9]+$ ]] \
     && [ "$duplicate_count" -gt 0 ] \
-    && [ "$((${#claimed_phones[@]} + ${#claimed_desktops[@]} + ${#claimed_emails[@]} + ${#claimed_webhooks[@]}))" -eq 0 ]; then
+    && [ "$((${#claimed_phones[@]} + ${#claimed_desktops[@]} + ${#claimed_emails[@]} + ${#claimed_webhooks[@]}))" -eq 0 ] \
+    && [ -z "${SLS_WEATHER_CHANNEL_SNAPSHOT:-}" ]; then
     return 11
   fi
   return 0
@@ -476,55 +492,7 @@ queued_delivery_is_current() {
   /usr/bin/python3 /usr/local/bin/sls_mass_notify/sls_weather_queue.py check "$SLS_WEATHER_JOB_ID"
 }
 
-prune_event_log() {
-  [ -r "$EVENTS_LOG" ] || return 0
-  LOG_PATH="$EVENTS_LOG" RETENTION_DAYS="$LOG_RETENTION_DAYS" python3 - <<'PY'
-import fcntl
-import json
-import os
-import time
-from datetime import datetime
-
-path = os.environ["LOG_PATH"]
-try:
-    days = int(os.environ.get("RETENTION_DAYS", "90"))
-except ValueError:
-    days = 90
-days = max(1, min(365, days))
-cutoff = time.time() - (days * 86400)
-retained = []
-changed = False
-try:
-    with open(path, "r+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        lines = [line.rstrip("\n") for line in handle if line.strip()]
-        for line in lines:
-            try:
-                item = json.loads(line)
-            except Exception:
-                changed = True
-                continue
-            value = str(item.get("logged_at") or item.get("created_at") or "")
-            try:
-                ts = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-            except Exception:
-                ts = time.time()
-            if ts >= cutoff:
-                retained.append(json.dumps(item, separators=(",", ":")))
-            else:
-                changed = True
-        if changed:
-            handle.seek(0)
-            handle.truncate(0)
-            if retained:
-                handle.write("\n".join(retained) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-except FileNotFoundError:
-    raise SystemExit(0)
-PY
-}
+# Periodic storage maintenance owns event retention and its recovery backups.
 
 json_string() {
   python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"
@@ -552,7 +520,7 @@ report_fault() {
 }
 
 clear_fault_state() {
-  run_status_mutation '{"clear_faults":true,"reset_api":true}'
+  run_status_mutation '{"clear_faults":true,"preserve_fault_stages":["external"],"reset_api":true}'
 }
 
 clear_api_fault_state() {
@@ -805,7 +773,6 @@ CONFIGURED_NWS_ALERT_RECIPIENTS=("${NWS_ALERT_RECIPIENTS[@]}")
 CONFIGURED_NWS_DESKTOP_RECIPIENTS=("${NWS_DESKTOP_RECIPIENTS[@]}")
 CONFIGURED_NWS_ZONE_EMAIL_RECIPIENTS=("${NWS_ZONE_EMAIL_RECIPIENTS[@]}")
 CONFIGURED_NWS_WEBHOOK_DESTINATION_KEYS_OVERRIDE="$NWS_WEBHOOK_DESTINATION_KEYS_OVERRIDE"
-prune_event_log
 DELIVERY_TARGETS="$(delivery_targets)"
 
 if declare -p SUPPORTED_NWS_EVENTS >/dev/null 2>&1; then
@@ -941,6 +908,29 @@ cancel_local_dispatch_intent() {
   return "$result"
 }
 
+complete_weather_email_body() {
+  local alert_b64="$1" template_body="$2" spoken
+  spoken="$(build_tts_text "$alert_b64")" || return 1
+  SLS_MAIL_FEATURE="$alert_b64" SLS_MAIL_TEMPLATE="$template_body" SLS_MAIL_SPOKEN="$spoken" \
+  SLS_MAIL_HELPER="$BRANDED_EMAIL_SCRIPT" python3 - <<'PY'
+import base64
+import importlib.util
+import json
+import os
+import sys
+sys.dont_write_bytecode = True
+try:
+    spec = importlib.util.spec_from_file_location("sls_weather_mail", os.environ["SLS_MAIL_HELPER"])
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    feature = json.loads(base64.b64decode(os.environ["SLS_MAIL_FEATURE"], validate=True))
+    print(helper.weather_body(os.environ["SLS_MAIL_TEMPLATE"], feature, os.environ["SLS_MAIL_SPOKEN"]))
+except Exception:
+    print("Weather email details could not be prepared completely; no external submission was made.", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
 build_tts_text() {
   local alert_b64="$1"
 
@@ -956,19 +946,6 @@ def clean(value):
     value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+", " ", str(value or ""))
     return re.sub(r"\s+", " ", value).strip()
 
-def first_sentence(value):
-    value = clean(value)
-    if not value:
-        return ""
-    match = re.search(r"(.{20,220}?[.!?])(?:\s|$)", value)
-    return clean(match.group(1) if match else value[:180])
-
-def shorten_words(value, limit):
-    words = clean(value).split()
-    if len(words) <= limit:
-        return " ".join(words)
-    return " ".join(words[:limit]).rstrip(" ,;:") + "."
-
 try:
     feature = json.loads(base64.b64decode(os.environ["ALERT_B64"]).decode("utf-8"))
 except Exception:
@@ -977,10 +954,10 @@ except Exception:
 props = feature.get("properties", {}) if isinstance(feature, dict) else {}
 event = clean(props.get("event")) or "weather alert"
 area = clean(props.get("areaDesc")) or "the configured area"
-area = "; ".join([part.strip() for part in area.split(";") if part.strip()][:2]) or "the configured area"
-headline = first_sentence(props.get("headline"))
-description = first_sentence(props.get("description"))
-instruction = first_sentence(props.get("instruction"))
+area = "; ".join(part.strip() for part in area.split(";") if part.strip()) or "the configured area"
+headline = clean(props.get("headline"))
+description = clean(props.get("description"))
+instruction = clean(props.get("instruction"))
 
 event_lower = event.lower()
 if "tornado" in event_lower and ("warning" in event_lower or "emergency" in event_lower):
@@ -1000,10 +977,8 @@ elif "fire" in event_lower or "red flag" in event_lower:
 else:
     action = instruction or headline or description or "Monitor local weather information for instructions."
 
-max_seconds = max(1, min(600, int(os.environ.get("PIPER_MAX_SECONDS", "30") or "30")))
-word_limit = max(18, min(1200, max_seconds * 2))
 message = f"Weather alert. {event} for {area}. {action}"
-print(shorten_words(message, word_limit))
+print(message)
 PY
 }
 
@@ -1015,7 +990,6 @@ generate_tts_audio() {
   local base_name
   local tmp_file
   local output_file
-  local trimmed_file
   local text
   local duration
   local generation_timeout
@@ -1066,16 +1040,18 @@ generate_tts_audio() {
   fi
   rm -f "$tmp_file"
 
-  if command -v soxi >/dev/null 2>&1; then
-    duration="$(soxi -D "$output_file" 2>/dev/null || echo 0)"
-    if awk "BEGIN { exit !($duration > ${PIPER_MAX_SECONDS:-30}) }"; then
-		trimmed_file="${output_file}.trimmed.wav"
-      if sox "$output_file" "$trimmed_file" trim 0 "${PIPER_MAX_SECONDS:-30}" >> "$LOG" 2>&1; then
-        mv "$trimmed_file" "$output_file"
-      else
-        rm -f "$trimmed_file"
-      fi
-    fi
+  duration="$(soxi -D "$output_file" 2>/dev/null)"
+  if ! [[ "$duration" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk "BEGIN { exit !($duration > 0) }"; then
+    rm -f "$output_file"
+    echo "ERROR: Weather speech duration could not be measured; no speech was queued." | tee -a "$LOG" >&2
+    printf '%s\n' 'SLS_TTS_ERROR:Weather speech duration could not be measured; no speech was queued.'
+    return 1
+  fi
+  if awk "BEGIN { exit !($duration > ${PIPER_MAX_SECONDS:-30}) }"; then
+    rm -f "$output_file"
+    echo "ERROR: Weather speech lasts ${duration} seconds; the configured maximum is ${PIPER_MAX_SECONDS:-30} seconds. Increase the speech limit to fit the complete message; no speech was queued." | tee -a "$LOG" >&2
+    printf '%s\n' "SLS_TTS_ERROR:Weather speech lasts ${duration} seconds; the configured maximum is ${PIPER_MAX_SECONDS:-30} seconds. Increase the speech limit to fit the complete message; no speech was queued."
+    return 1
   fi
 
   chown asterisk:asterisk "$output_file" 2>/dev/null || true
@@ -1252,14 +1228,32 @@ queue_audio_to_recipients() {
     report_fault "delivery" "Shared paging queue could not reserve these recipients; no audio was submitted" "$event" "$alert_id"
     return 1
   fi
+  local admission_lines phone_token
+  local -a admitted_recipients=()
+  if ! admission_lines="$(/usr/bin/timeout --signal=TERM --kill-after=2 65 /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_phone_admission.py \
+      --recipients "$reservation_recipients" --service nws --wait 20 --format lines)"; then
+    printf '%s\n' "$admission_lines" >> "$LOG"
+    report_fault "delivery" "Phone device capacity or registered contacts could not be admitted; no new audio was submitted"
+    return 1
+  fi
+  mapfile -t admitted_recipients <<< "$admission_lines"
+  phone_token="${admitted_recipients[0]:-}"
+  if [[ ! "$phone_token" =~ ^[a-f0-9]{32}$ ]]; then
+    report_fault "delivery" "Phone admission returned an invalid ticket; no new audio was submitted"
+    return 1
+  fi
+  admitted_recipients=("${admitted_recipients[@]:1}")
   queued_delivery_is_current || return 1
 
-  for recipient in "${NWS_ALERT_RECIPIENTS[@]}"; do
+  for recipient in "${admitted_recipients[@]}"; do
     recipient="$(printf '%s' "$recipient" | tr -dc '0-9')"
     [ -n "$recipient" ] || continue
     callfile=$(mktemp "$SPOOL_TMP/sls_alert_XXXXXX.call")
     cat > "$callfile" << CALL
-Channel: Local/${recipient}@${SLS_AUDIO_CONTEXT}
+Channel: Local/${recipient}@${SLS_AUDIO_CONTEXT}/n
+Account: slsphone_${phone_token}
+Setvar: __SLS_PHONE_TOKEN=${phone_token}
+Setvar: __SLS_PHONE_RECIPIENT=${recipient}
 CallerID: "${SLS_CALLERID_NAME}" <${SLS_CALLERID_NUM}>
 Setvar: SLS_SOUND=${sound_sequence}
 Setvar: SLS_CALLERID_NAME=${SLS_CALLERID_NAME}
@@ -1272,6 +1266,11 @@ Data: ${page_hold_seconds}
 CALL
     chown asterisk:asterisk "$callfile" 2>/dev/null || true
     chmod 0640 "$callfile"
+    if ! /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_cluster_guard.py --check-legacy "$CONFIG_JSON_FILE" >> "$LOG" 2>&1; then
+      rm -f "$callfile" 2>/dev/null || true
+      report_fault "delivery" "Notification HA does not qualify legacy NWS audio, or its protected transport guard is unavailable. No call file was submitted; use durable announcement or owned-site dispatch." "$event" "$alert_id"
+      return 1
+    fi
     if ! mv "$callfile" "$SPOOL/"; then
       echo "$(date): ERROR — Unable to move alert call file for $recipient into $SPOOL" >> "$LOG"
       rm -f "$callfile" 2>/dev/null || true
@@ -1386,6 +1385,9 @@ queue_external_destinations() {
   SLS_NOTIFICATION_TEST="0" \
   SLS_NOTIFICATION_DRY_RUN="0" \
   SLS_DESTINATION_SOURCE="nws" \
+  SLS_SOURCE_ALERT_B64="$ALERT_B64" \
+  SLS_SOURCE_GROUP_ID="${NWS_ZONE_GROUP_ID_OVERRIDE:-}" \
+  SLS_SOURCE_CHAIN_KEY="$correlation_key" \
   SLS_DESTINATION_SUBJECT="$subject" \
   SLS_DESTINATION_BODY="$body" \
   SLS_DESTINATION_TYPE="$alert_type" \
@@ -1402,12 +1404,16 @@ queue_external_destinations() {
   SLS_DESTINATION_TRIGGER_EXTENSION="$trigger_extension" \
   SLS_DESTINATION_AUDIO_SEQUENCE="$audio_sequence" \
   SLS_EMAIL_RECIPIENTS="$LIVE_EMAIL_TO" \
+  SLS_EXTERNAL_PREPARATION_ERROR="${EXTERNAL_PREPARATION_ERROR:-}" \
   SLS_WEBHOOK_DESTINATION_KEYS="$NWS_WEBHOOK_DESTINATION_KEYS_OVERRIDE" \
     /usr/bin/timeout --signal=TERM --kill-after=1 "$command_timeout" \
       /usr/bin/python3 - "$NOTIFICATION_DESTINATION_SCRIPT" "$CONFIG_JSON_FILE" "$EXTERNAL_DELIVERY_STATE" >> "$LOG" 2>&1 <<'PY'
 import importlib.util
+import base64
+import hashlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -1419,8 +1425,7 @@ if spec is None or spec.loader is None:
 module = importlib.util.module_from_spec(spec)
 try:
     spec.loader.exec_module(module)
-    with config_path.open("r", encoding="utf-8") as handle:
-        config = json.load(handle)
+    config = module._config_crypto.read_config(config_path)
     fields = [
         (name, os.environ.get("SLS_DESTINATION_" + name.upper(), ""))
         for name in ("Type", "Event", "Severity", "Zone", "Recipients", "Audio", "Trigger")
@@ -1434,7 +1439,17 @@ try:
         "trigger": os.environ.get("SLS_DESTINATION_TRIGGER", ""),
         "trigger_extension": os.environ.get("SLS_DESTINATION_TRIGGER_EXTENSION", ""),
     }
-    module.queue_external_delivery(
+    group_id = os.environ.get("SLS_SOURCE_GROUP_ID", "")
+    if not group_id:
+        zone = os.environ.get("SLS_DESTINATION_ZONE", "")
+        groups = config.get("nws_zones") or [{"name": "Primary Weather Zone", "zone": config.get("nws_zone", zone)}]
+        candidates = [group for group in groups if isinstance(group, dict) and group.get("zone") == zone]
+        if len(candidates) != 1:
+            raise ValueError("source_area_ambiguous")
+        group = candidates[0]
+        name = re.sub(r"\s+", " ", str(group.get("name") or zone)).strip()[:64]
+        group_id = str(group.get("id") or "nws_" + hashlib.sha256(f"{name.lower()}|{zone}".encode()).hexdigest()[:12])
+    delivery_key = module.queue_external_delivery(
         state_path,
         config,
         os.environ.get("SLS_EXTERNAL_CORRELATION_KEY", ""),
@@ -1449,14 +1464,25 @@ try:
         details,
         os.environ.get("SLS_EMAIL_RECIPIENTS", ""),
         [value for value in os.environ.get("SLS_WEBHOOK_DESTINATION_KEYS", "").split(",") if value],
+        source_validity=module.weather_source_validity(
+            "nws", group_id,
+            feature=json.loads(base64.b64decode(os.environ["SLS_SOURCE_ALERT_B64"], validate=True)),
+            chain_key=os.environ.get("SLS_SOURCE_CHAIN_KEY", ""),
+            zone=os.environ.get("SLS_DESTINATION_ZONE", ""),
+        ),
+        payload_preparation_error=os.environ.get("SLS_EXTERNAL_PREPARATION_ERROR", ""),
     )
+    if os.environ.get("SLS_EXTERNAL_PREPARATION_ERROR"):
+        with state_path.open("r", encoding="utf-8") as handle:
+            record = json.load(handle)["deliveries"][delivery_key]
+        if record.get("terminal_status") == "failed":
+            raise SystemExit(1)
 except Exception as exc:
     print(f"external_queue_failed:{type(exc).__name__}", file=sys.stderr)
     raise SystemExit(75)
 PY
   result=$?
-  [ "$result" -eq 0 ] || return 75
-  return 0
+  case "$result" in 0|1) return "$result" ;; *) return 75 ;; esac
 }
 
 touch "$SEEN_ALERTS" "$PROCESSED_ALERTS" "$AUDIO_DELIVERED_ALERTS"
@@ -1512,13 +1538,13 @@ if [ -n "$INPUT_PAYLOAD" ]; then
 else
 	ALERTS=$(curl -fsS --retry 3 --retry-all-errors --retry-connrefused --connect-timeout 10 --max-time 30 --max-filesize 10485760 \
     -H "Accept: application/geo+json" \
-    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.4-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
+    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.5-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
     "${NWS_API_BASE_URL%/}/alerts/active?zone=${NWS_ZONE}&status=actual" 2>>"$LOG") || ALERTS=""
   if [ -z "$ALERTS" ]; then
     echo "$(date): Initial NWS request failed; retrying over IPv4" >> "$LOG"
 	  ALERTS=$(curl -4 -fsS --retry 2 --retry-all-errors --retry-connrefused --connect-timeout 10 --max-time 30 --max-filesize 10485760 \
       -H "Accept: application/geo+json" \
-	    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.4-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
+	    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.5-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
       "${NWS_API_BASE_URL%/}/alerts/active?zone=${NWS_ZONE}&status=actual" 2>>"$LOG") || ALERTS=""
   fi
 fi
@@ -1847,6 +1873,12 @@ printf '%s\n' "$PARSED_ALERTS" | while IFS=$'\t' read -r ALERT_ID EVENT SEVERITY
       "trigger_extension=" \
       "trigger_name=" \
       "audio_sequence=$QUIET_AUDIO")"
+    EXTERNAL_PREPARATION_ERROR=""
+    MAIL_TEMPLATE_BODY="$MAIL_BODY"
+    if ! MAIL_BODY="$(complete_weather_email_body "$ALERT_B64" "$MAIL_BODY")"; then
+      MAIL_BODY="$MAIL_TEMPLATE_BODY"
+      EXTERNAL_PREPARATION_ERROR="weather_details_unavailable"
+    fi
     MAIL_BODY="${MAIL_BODY}
 
 ${QUIET_NOTE}"
@@ -1873,14 +1905,17 @@ ${QUIET_NOTE}"
 	        report_fault "external_state" "Quiet-hours external delivery could not be persisted" "$EVENT" "$ALERT_ID"
 	        QUIET_AUX_OK=0
 	        QUIET_STATE_PERSISTED=0
+	      elif [ "$QUIET_EXTERNAL_STATUS" -eq 1 ]; then
+          QUIET_AUX_OK=0
+          report_fault "payload" "Complete weather details could not be prepared; external delivery was rejected and recorded. Check the mail helper and the 30000-byte message limit." "$EVENT" "$ALERT_ID"
 		      fi
       if [ "$QUIET_STATE_PERSISTED" = "1" ]; then
-        if ! finalize_cross_zone_destinations "$ALERT_KEY" commit email discord generic; then
+        if ! finalize_cross_zone_destinations "$ALERT_KEY" commit email discord generic voice sms; then
           echo "$(date): WARNING - Quiet-hours external work is durable, but its cross-zone reservation could not yet be committed for $EVENT" >> "$LOG"
           CROSS_ZONE_FINALIZE_OK=0
         fi
       else
-        finalize_cross_zone_destinations "$ALERT_KEY" release email discord generic >/dev/null 2>&1 || true
+        finalize_cross_zone_destinations "$ALERT_KEY" release email discord generic voice sms >/dev/null 2>&1 || true
       fi
       QUIET_TS="$(timestamp_now)"
       if [ "$QUIET_AUX_OK" = "1" ]; then
@@ -1891,6 +1926,9 @@ ${QUIET_NOTE}"
       else
         QUIET_DELIVERY_STATUS="partial_failure"
 	        QUIET_DELIVERY_MESSAGE="Paging suppressed by quiet hours, but external destination work could not be made durable for ${EVENT}."
+        if [ "$QUIET_STATE_PERSISTED" = "1" ]; then
+          QUIET_DELIVERY_MESSAGE="Paging suppressed by quiet hours; external delivery was rejected because complete weather details could not be prepared. See destination results."
+        fi
         QUIET_EVENT_STATUS="partial_failure"
       fi
       update_status "$(printf '{"last_delivery_at":%s,"last_delivery_status":%s,"last_delivery_source":"nws","last_delivery_event":%s,"last_delivery_audio":%s,"last_delivery_message":%s,"last_delivery_page_group":%s,"last_delivery_alert_id":%s}' \
@@ -1967,11 +2005,14 @@ ${QUIET_NOTE}"
     AUDIO_SEQUENCE=""
   elif [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ]; then
     TTS_FILE="$(generate_tts_audio "$ALERT_B64" "$EVENT" "$ALERT_ID")"
-    if [ -z "$TTS_FILE" ]; then
+    if [ -z "$TTS_FILE" ] || [[ "$TTS_FILE" == SLS_TTS_ERROR:* ]]; then
       LOCAL_PREP_OK=0
       AUDIO_LABEL="Piper TTS preparation failed"
       echo "$(date): ERROR - Piper TTS audio was not generated for $EVENT" >> "$LOG"
-      report_fault "audio" "Piper TTS audio was not generated" "$EVENT" "$ALERT_ID"
+      TTS_ERROR="Piper TTS audio was not generated"
+      [[ "$TTS_FILE" != SLS_TTS_ERROR:* ]] || TTS_ERROR="${TTS_FILE#SLS_TTS_ERROR:}"
+      TTS_FILE=""
+      report_fault "audio" "$TTS_ERROR" "$EVENT" "$ALERT_ID"
     else
       AUDIO_SEQUENCE="$(build_audio_sequence "$TTS_FILE")"
       if [ -z "$AUDIO_SEQUENCE" ]; then
@@ -2022,6 +2063,12 @@ ${QUIET_NOTE}"
     "trigger_extension=" \
     "trigger_name=" \
     "audio_sequence=$AUDIO_SEQUENCE")"
+  EXTERNAL_PREPARATION_ERROR=""
+  MAIL_TEMPLATE_BODY="$MAIL_BODY"
+  if ! MAIL_BODY="$(complete_weather_email_body "$ALERT_B64" "$MAIL_BODY")"; then
+    MAIL_BODY="$MAIL_TEMPLATE_BODY"
+    EXTERNAL_PREPARATION_ERROR="weather_details_unavailable"
+  fi
   AUX_DELIVERY_OK=1
   EXTERNAL_STATE_PERSISTED=1
 
@@ -2039,18 +2086,18 @@ ${QUIET_NOTE}"
       report_fault "external_state" "Live external delivery could not be persisted; no local submission was attempted" "$EVENT" "$ALERT_ID"
     elif [ "$EXTERNAL_STATUS" -eq 1 ]; then
       AUX_DELIVERY_OK=0
-      echo "$(date): One or more live external destinations remain durably pending for $EVENT" >> "$LOG"
-      report_fault "external" "One or more live external destinations remain pending" "$EVENT" "$ALERT_ID"
+      echo "$(date): External delivery was rejected for $EVENT; independent local delivery will continue" >> "$LOG"
+      report_fault "payload" "Complete weather details could not be prepared; external delivery was rejected and recorded. Check the mail helper and the 30000-byte message limit." "$EVENT" "$ALERT_ID"
     fi
   fi
 
   if [ "$EXTERNAL_STATE_PERSISTED" = "1" ]; then
-    if ! finalize_cross_zone_destinations "$ALERT_KEY" commit email discord generic; then
+    if ! finalize_cross_zone_destinations "$ALERT_KEY" commit email discord generic voice sms; then
       echo "$(date): WARNING - External work is durable, but its cross-zone reservation could not yet be committed for $EVENT" >> "$LOG"
       CROSS_ZONE_FINALIZE_OK=0
     fi
   else
-    finalize_cross_zone_destinations "$ALERT_KEY" release email discord generic >/dev/null 2>&1 || true
+    finalize_cross_zone_destinations "$ALERT_KEY" release email discord generic voice sms >/dev/null 2>&1 || true
   fi
 
   if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
@@ -2168,6 +2215,9 @@ ${QUIET_NOTE}"
   if [ "$AUX_DELIVERY_OK" = "0" ] && [ "$DELIVERY_STATUS" = "queued" ]; then
     DELIVERY_STATUS="partial_failure"
     DELIVERY_MESSAGE="Local submission commands accepted ${EVENT}, while one or more durable external destinations remain pending"
+    if [ -n "$EXTERNAL_PREPARATION_ERROR" ]; then
+      DELIVERY_MESSAGE="Local submission commands accepted ${EVENT}; external delivery was rejected because complete weather details could not be prepared. See destination results."
+    fi
   fi
 
   DELIVERY_TS="$(timestamp_now)"

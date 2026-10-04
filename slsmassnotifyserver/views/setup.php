@@ -20,6 +20,7 @@ $setupSystemSounds = is_array($available_system_sounds ?? null) ? $available_sys
 $dismissible = !empty($dismissible);
 $weatherSetupEnabled = (($settings['enabled'] ?? '0') === '1');
 $lightningSetupEnabled = (($xweather['enabled'] ?? '0') === '1');
+$setupAddress = \FreePBX\modules\SlsAdvertisedAddress::fields($settings);
 ?>
 <style>
 	.sls-setup-backdrop {
@@ -80,7 +81,7 @@ $lightningSetupEnabled = (($xweather['enabled'] ?? '0') === '1');
 			left: 8px;
 		}
 		.sls-setup-modal-content {
-			padding: 12px;
+			padding: 12px 15px;
 		}
 	}
 </style>
@@ -131,6 +132,7 @@ $lightningSetupEnabled = (($xweather['enabled'] ?? '0') === '1');
 			<?php } ?>
 
 				<form method="post" action="config.php?display=slsmassnotifyserver">
+					<input type="hidden" name="sls_setup_form_present" value="1">
 					<input type="hidden" name="slsmassnotifyserver_action" value="save_setup_wizard">
 					<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars((string)($csrf_token ?? '')); ?>">
 
@@ -248,7 +250,7 @@ $lightningSetupEnabled = (($xweather['enabled'] ?? '0') === '1');
 
 				<section class="sls-setup-section" aria-labelledby="sls-setup-lightning-title">
 				<h3 id="sls-setup-lightning-title"><i class="fa fa-bolt text-warning" aria-hidden="true"></i> <?php echo _('Lightning Alerts'); ?></h3>
-				<p class="help-block"><?php echo _('Optional Xweather lightning monitoring is separate from NWS. It alerts once when a storm enters the radius and can optionally announce an all clear after the storm leaves.'); ?></p>
+				<p class="help-block"><?php echo _('Optional lightning monitoring is separate from NWS. It alerts once when a storm enters the radius and can optionally announce an all clear after the storm leaves.'); ?></p>
 				<div class="sls-setup-enable-row form-group">
 					<label for="sls-setup-lightning-enabled"><?php echo _('Set up Lightning Alerts now?'); ?></label>
 					<select class="form-control" id="sls-setup-lightning-enabled" name="xweather[enabled]"><option value="0" <?php echo !$lightningSetupEnabled ? 'selected' : ''; ?>><?php echo _('No'); ?></option><option value="1" <?php echo $lightningSetupEnabled ? 'selected' : ''; ?>><?php echo _('Yes'); ?></option></select>
@@ -264,7 +266,7 @@ $lightningSetupEnabled = (($xweather['enabled'] ?? '0') === '1');
 				<p class="help-block"><?php echo _('Cloud-to-ground strikes are queried. Standard/free Xweather lightning data covers the past 5 minutes, so the 5-minute default is the longest gap-free period. Values from 6–10 minutes may miss strikes without extended-history access.'); ?></p>
 				<div class="row"><div class="col-md-5"><div class="form-group"><label><?php echo _('Adaptive protection'); ?></label><div id="sls-setup-adaptive-card" class="sls-setup-adaptive-card <?php echo (!array_key_exists('adaptive_free_tier', $xweather) || !empty($xweather['adaptive_free_tier'])) ? 'is-enabled' : 'is-disabled'; ?>"><input type="hidden" name="xweather[adaptive_free_tier]" value="0"><label class="sls-setup-toggle" aria-label="<?php echo htmlspecialchars(_('Toggle adaptive protection')); ?>"><input id="sls-setup-adaptive" type="checkbox" name="xweather[adaptive_free_tier]" value="1" <?php echo !array_key_exists('adaptive_free_tier', $xweather) || !empty($xweather['adaptive_free_tier']) ? 'checked' : ''; ?>><span></span></label><span class="sls-setup-adaptive-state"><i id="sls-setup-adaptive-shield" class="fa fa-shield" aria-hidden="true"></i><strong id="sls-setup-adaptive-label"></strong></span><p class="sls-setup-adaptive-copy"><?php echo _('Enabled polls Xweather only for a qualifying current Weather.gov alert, the structured thunder forecast period active at that time, or the grace period. Disabled polls continuously at the configured API period.'); ?></p></div></div></div><div class="col-md-4"><div class="form-group"><label><?php echo _('Weather trigger zone'); ?></label><select class="form-control" id="sls-setup-adaptive-zone" name="xweather[adaptive_nws_zone_id]"><option value=""><?php echo _('Select a configured weather zone'); ?></option><?php foreach ($setupWeatherZones as $zoneGroup) { ?><option value="<?php echo htmlspecialchars((string)($zoneGroup['id'] ?? '')); ?>" <?php echo $setupAdaptiveZone === (string)($zoneGroup['id'] ?? '') ? 'selected' : ''; ?>><?php echo htmlspecialchars((string)($zoneGroup['name'] ?? $zoneGroup['zone'] ?? '') . ' — ' . (string)($zoneGroup['zone'] ?? '')); ?></option><?php } ?></select></div></div><div class="col-md-3"><div class="form-group"><label><?php echo _('Storm-mode grace'); ?></label><select class="form-control" name="xweather[adaptive_grace_minutes]"><?php foreach ([5, 10, 15, 30, 45, 60, 90, 120] as $grace) { ?><option value="<?php echo $grace; ?>" <?php echo (int)($xweather['adaptive_grace_minutes'] ?? 60) === $grace ? 'selected' : ''; ?>><?php echo sprintf(_('%d minutes'), $grace); ?></option><?php } ?></select><p class="help-block"><?php echo _('Default 60 minutes.'); ?></p></div></div></div>
 				<div class="alert alert-warning"><i class="fa fa-exclamation-triangle" aria-hidden="true"></i> <?php echo _('Adaptive mode is recommended for the 15,000-token free allowance. It requires Weather Alerts and at least one weather zone. A future thunder period is remembered but does not start paid Xweather polling before that period begins; unexpected lightning can still be missed.'); ?></div>
-				<div class="row"><div class="col-md-6"><div class="form-group"><label><?php echo _('Xweather Client ID'); ?></label><input class="form-control" name="xweather[client_id]" value="<?php echo htmlspecialchars($xweather['client_id'] ?? ''); ?>" autocomplete="off"></div></div><div class="col-md-6"><div class="form-group"><label><?php echo _('Xweather Client Secret'); ?></label><input class="form-control" type="password" name="xweather[client_secret]" value="" placeholder="<?php echo !empty($xweather['client_secret']) ? htmlspecialchars(_('Stored; leave blank to keep')) : ''; ?>" autocomplete="new-password"></div></div></div><p class="help-block"><a href="https://www.xweather.com/docs/weather-api/getting-started" target="_blank" rel="noopener noreferrer"><i class="fa fa-external-link" aria-hidden="true"></i> <?php echo _('Create an Xweather account and API access keys'); ?></a></p>
+				<div class="form-group"><label><i class="fa fa-flask" aria-hidden="true"></i> <?php echo _('Lightning provider'); ?> <span class="label label-info">Labs</span></label><select class="form-control" name="xweather[provider]" id="sls-setup-lightning-provider"><?php foreach (['xweather'=>'Xweather (default)','tempest'=>'Tempest — paid Lightning API','meteomatics'=>'Meteomatics — Lightning WFS'] as $key=>$label) { ?><option value="<?php echo $key; ?>" <?php echo ($xweather['provider']??'xweather')===$key?'selected':''; ?>><?php echo htmlspecialchars($label); ?></option><?php } ?></select><p class="help-block"><?php echo _('Tempest requires an API key; Meteomatics requires a username and password. Both need coordinates. Enable after provider acceptance testing.'); ?></p></div><div class="row"><div class="col-md-6"><div class="form-group"><label><?php echo _('Client ID, API key or username'); ?></label><input class="form-control" name="xweather[client_id]" value="<?php echo htmlspecialchars($xweather['client_id'] ?? ''); ?>" autocomplete="off"></div></div><div class="col-md-6"><div class="form-group"><label><?php echo _('Client secret or password'); ?></label><input class="form-control" type="password" name="xweather[client_secret]" value="" placeholder="<?php echo !empty($xweather['client_secret']) ? htmlspecialchars(_('Stored; leave blank to keep')) : ''; ?>" autocomplete="new-password"></div></div></div><p class="help-block"><a href="https://www.xweather.com/docs/weather-api/getting-started" target="_blank" rel="noopener noreferrer"><i class="fa fa-external-link" aria-hidden="true"></i> <?php echo _('Create an Xweather account and API access keys'); ?></a></p>
 				<div class="form-group"><label><?php echo _('Lightning Recipients'); ?></label><div class="row"><?php foreach ($extensions as $target) { ?><div class="col-sm-3"><label class="checkbox-inline"><input type="checkbox" name="xweather[recipients][]" value="<?php echo htmlspecialchars($target['extension']); ?>" <?php echo isset($lightningRecipients[$target['extension']]) ? 'checked' : ''; ?>> <?php echo htmlspecialchars($target['extension'] . (($target['name'] ?? '') !== '' ? ' - ' . $target['name'] : '')); ?></label></div><?php } ?></div></div>
 				<div class="row">
 				<?php foreach (['opening' => _('Lightning Pre-tone'), 'closing' => _('Lightning Closing Tone')] as $prefix => $label) { $selectedTone = (string)($xweather[$prefix . '_tone'] ?? ($prefix === 'opening' ? 'opening_Lightning_alert' : '')); ?>
@@ -278,15 +280,25 @@ $lightningSetupEnabled = (($xweather['enabled'] ?? '0') === '1');
 
 				<h3><i class="fa fa-key text-muted" aria-hidden="true"></i> <?php echo _('Remote API'); ?></h3>
 				<div class="form-group">
-					<label><i class="fa fa-lock text-muted" aria-hidden="true"></i> <?php echo _('Public PBX Hostname'); ?></label>
-					<input class="form-control" value="<?php echo htmlspecialchars($settings['public_pbx_host'] ?? ($settings['sipnotify']['pbx_host'] ?? '')); ?>" readonly aria-readonly="true">
-					<p class="help-block"><?php echo _('Automatically detected by the PBX and displayed for reference. It is used for desktop API links and phone image URLs.'); ?></p>
+					<label for="sls-setup-host"><i class="fa fa-globe text-primary" aria-hidden="true"></i> <?php echo _('Advertised PBX hostname'); ?></label>
+					<input id="sls-setup-host" name="advertised_pbx_host" class="form-control" maxlength="253" value="<?php echo htmlspecialchars($setupAddress['host'], ENT_QUOTES, 'UTF-8'); ?>" disabled>
+					<p class="help-block"><?php echo _('SLS saves this address in the .config file. A later DNS or operating-system hostname change does not update it automatically.'); ?></p>
+					<label class="checkbox-inline"><input id="sls-setup-address-change" name="sls_address_change" type="checkbox" value="1" aria-controls="sls-setup-ports"> <?php echo _('Set hostname or forwarded ports'); ?></label>
+					<fieldset id="sls-setup-ports" disabled hidden>
+						<div class="row">
+							<?php foreach (['api'=>_('Desktop HTTPS port'), 'control'=>_('Control API HTTPS port'), 'media'=>_('Phone image port')] as $kind=>$label) { ?>
+							<div class="col-sm-4 form-group"><label for="sls-setup-port-<?php echo $kind; ?>"><?php echo $label; ?></label><input id="sls-setup-port-<?php echo $kind; ?>" class="form-control" name="advertised_<?php echo $kind; ?>_port" type="number" min="1" max="65535" step="1" required value="<?php echo (int)$setupAddress[$kind.'_port']; ?>"></div>
+							<?php } ?>
+						</div>
+						<p class="help-block"><?php echo _('Enter the external ports your clients use. HTTPS normally uses 443; HTTP phone images normally use 80. Router forwarding and proxy ports may differ from the PBX listener. SLS saves the advertised URLs without changing the firewall, router, DNS or certificates.'); ?></p>
+					</fieldset>
+					<div id="sls-setup-address-preview" class="well well-sm" style="white-space:pre-line;overflow-wrap:anywhere" aria-live="polite"><?php echo htmlspecialchars(_('Desktop API:').' '.($settings['sipnotify']['base_url'] ?? '')."\n"._('Control API:').' '.($settings['control_api']['base_url'] ?? ''), ENT_QUOTES, 'UTF-8'); ?></div>
 				</div>
 				<div class="form-group">
 					<label><?php echo _('Phone Image Transport'); ?></label>
 					<select class="form-control" name="sipnotify_media_scheme">
-						<option value="http" <?php echo (($settings['sipnotify']['media_scheme'] ?? 'http') === 'http') ? 'selected' : ''; ?>><?php echo _('HTTP - Legacy phone compatibility'); ?></option>
-						<option value="https" <?php echo (($settings['sipnotify']['media_scheme'] ?? 'http') === 'https') ? 'selected' : ''; ?>><?php echo _('HTTPS - Requires phone-compatible certificate and TLS'); ?></option>
+						<option value="http" <?php echo (($settings['sipnotify']['media_scheme'] ?? 'https') === 'http') ? 'selected' : ''; ?>><?php echo _('HTTP - Legacy phone compatibility'); ?></option>
+						<option value="https" <?php echo (($settings['sipnotify']['media_scheme'] ?? 'https') === 'https') ? 'selected' : ''; ?>><?php echo _('HTTPS - Requires phone-compatible certificate and TLS'); ?></option>
 					</select>
 					<p class="help-block"><?php echo _('This affects generated phone image files only. Control and desktop API authentication remain HTTPS.'); ?></p>
 				</div>
@@ -350,12 +362,38 @@ $lightningSetupEnabled = (($xweather['enabled'] ?? '0') === '1');
 					<div class="col-md-6">
 						<label><?php echo _('TTS Max Seconds'); ?></label>
 						<input class="form-control" name="tts_max_seconds" type="number" min="1" max="600" value="<?php echo (int)($settings['tts_max_seconds'] ?? 30); ?>">
+						<p class="help-block"><?php echo _('Speech longer than this limit is rejected with its measured duration. It is never silently cut short.'); ?></p>
 					</div>
 					<div class="col-md-6">
 						<label><?php echo _('Notification Log Retention Days'); ?></label>
 						<input class="form-control" name="log_retention_days" type="number" min="1" max="365" value="<?php echo (int)($settings['log_retention_days'] ?? 90); ?>">
 					</div>
 				</div>
+				<section class="sls-setup-section" aria-labelledby="sls-setup-capacity-title">
+					<div class="form-group"><label for="sls-setup-timezone"><i class="fa fa-clock-o" aria-hidden="true"></i> <?php echo _('PBX timezone'); ?></label>
+					<select class="form-control" id="sls-setup-timezone" name="pbx_timezone">
+					<?php $selectedTimezone = ($settings['pbx_timezone'] ?? '') ?: ($pbx_timezone ?? date_default_timezone_get()); foreach (\DateTimeZone::listIdentifiers(\DateTimeZone::ALL_WITH_BC) as $zone) { ?><option value="<?php echo htmlspecialchars($zone, ENT_QUOTES, 'UTF-8'); ?>" <?php echo $zone === $selectedTimezone ? 'selected' : ''; ?>><?php echo htmlspecialchars($zone, ENT_QUOTES, 'UTF-8'); ?></option><?php } ?>
+					</select><p class="help-block"><?php echo _('A timezone change is applied by protected maintenance when notifications are idle. Review scheduled times and quiet hours after changing it.'); ?></p></div>
+					<h3 id="sls-setup-capacity-title"><i class="fa fa-server text-primary" aria-hidden="true"></i> <?php echo _('Device capacity'); ?></h3>
+					<p class="help-block"><?php echo _('New installations start with 25 desktops and 25 simultaneous phone contacts. Increasing either limit requires sufficient CPU, RAM and dedicated SLS free space; setup rejects increases the PBX cannot support. An extension with multiple registered phones uses multiple phone slots.'); ?></p>
+					<div class="row">
+						<div class="col-sm-6 form-group"><label for="sls-setup-desktop-capacity"><?php echo _('Desktop capacity'); ?></label><input id="sls-setup-desktop-capacity" class="form-control" name="desktop_client_limit" type="number" min="1" max="1000" step="1" required value="<?php echo (int)($settings['desktop_client_limit'] ?? 25); ?>"></div>
+						<div class="col-sm-6 form-group"><label for="sls-setup-phone-capacity"><?php echo _('Simultaneous phone contacts'); ?></label><input id="sls-setup-phone-capacity" class="form-control" name="phone_device_limit" type="number" min="1" max="1000" step="1" required value="<?php echo (int)($settings['phone_device_limit'] ?? 25); ?>"></div>
+						<p class="help-block col-sm-12"><?php echo _('On a new installation, phone capacity starts at 25 or the detected internal phone count rounded up to the next 50, whichever is higher. You can adjust it here; increases require sufficient resources.'); ?></p>
+					</div>
+				</section>
+				<section class="sls-setup-section" aria-labelledby="sls-setup-next-title">
+					<h3 id="sls-setup-next-title"><i class="fa fa-sliders text-primary" aria-hidden="true"></i> <?php echo _('After setup'); ?></h3>
+					<div class="row">
+						<div class="col-sm-6"><h4><i class="fa fa-phone" aria-hidden="true"></i> <?php echo _('Dial-in paging'); ?> <?php include __DIR__ . '/labs.php'; ?></h4><p><?php echo _('Use the Paging tab to configure one dial-in extension and up to ten groups, each with authorized internal callers, recipients, saved phone text and its own PIN. New group PINs are randomly generated and required by default. Optional external IVR access requires each group’s approved caller-number list and always requires its PIN. Save group stores the configuration; Apply Config prepares speech and activates the menu.'); ?></p></div>
+						<div class="col-sm-6"><h4><i class="fa fa-address-book-o" aria-hidden="true"></i> <?php echo _('Recipients and integrations'); ?></h4><p><?php echo _('Locations and Audiences manages saved external phone, email and SMS recipients and device groups. General Settings manages desktop credentials, providers, webhook destinations and API permissions in categorized sections. External calling uses configured FreePBX routes or a selected trunk. Email uses the PBX mail service. SMS needs a configured Twilio, Telnyx or BulkVS account, recipient consent and sending limits. Enable and test each service before relying on it.'); ?></p></div>
+						<div class="col-sm-6"><h4><i class="fa fa-shield" aria-hidden="true"></i> <?php echo _('Operators and triggers'); ?> <?php include __DIR__ . '/labs.php'; ?></h4><p><?php echo _('Operator Access manages scoped PBX roles and dedicated portal accounts with passwords and authenticators. The separate portal is disabled until an administrator enables it. Operators can send permitted alerts, manage schedules and record roll call. Triggers and Actions connects authorized panic sources, emergency-call observations, signed sensors and trusted CAP feeds to reviewed messages or actions. New integrations start disabled.'); ?></p></div>
+						<div class="col-sm-6"><h4><i class="fa fa-calendar" aria-hidden="true"></i> <?php echo _('Schedules and incidents'); ?></h4><p><?php echo _('Scheduling manages one-time, repeating and weekday calendars with holidays, late starts and reviewed date imports. General Settings includes deployment readiness checks. Incidents manages templates, updates, all-clear and operator roll call. A desktop receipt confirms software delivery; it does not mean a person read or acknowledged the message. Incident templates also support reviewed resource links and manually reviewed language variants. Reviewed English, Spanish, French, German and Portuguese variants can use matching installed speech voices.'); ?></p></div>
+						<div class="col-sm-6"><h4><i class="fa fa-map-marker" aria-hidden="true"></i> <?php echo _('Locations and audiences'); ?></h4><p><?php echo _('After setup, organize saved recipients into sites, buildings, floors and rooms. Review a location’s audience or add reviewed coordinates and select a geographic area. Missing and stale positions are listed before saving. Apply Config to activate the group. Location edits do not change existing groups or queued alerts.'); ?></p></div>
+						<div class="col-sm-6"><h4><i class="fa fa-shield" aria-hidden="true"></i> <?php echo _('Maintenance and media access'); ?></h4><p><?php echo _('General Settings provides encrypted configuration exports, signed update policy, and optional network restrictions and download expiry for generated phone images and XML. Media restrictions and automatic installation are off by default. Check deployment readiness and perform a limited recipient test after setup.'); ?></p></div>
+					</div>
+				</section>
+				<input type="hidden" name="sls_setup_form_complete" value="1">
 				<hr>
 				<button type="submit" class="btn btn-primary"><?php echo _('Complete Setup'); ?></button>
 			</form>
@@ -366,6 +404,35 @@ $lightningSetupEnabled = (($xweather['enabled'] ?? '0') === '1');
 </div>
 <script>
 (function() {
+	var addressToggle = document.getElementById('sls-setup-address-change');
+	var addressPorts = document.getElementById('sls-setup-ports');
+	var addressHost = document.getElementById('sls-setup-host');
+	var addressPreview = document.getElementById('sls-setup-address-preview');
+	var setupForm = addressHost && addressHost.form;
+	var imageScheme = setupForm && setupForm.querySelector('[name="sipnotify_media_scheme"]');
+	var savedPreview = addressPreview ? addressPreview.textContent : '';
+	function renderSetupAddress() {
+		if (!addressToggle || !addressPorts || !addressHost || !addressPreview) { return; }
+		var enabled = addressToggle.checked;
+		addressHost.disabled = !enabled;
+		addressHost.required = enabled;
+		addressPorts.disabled = !enabled;
+		addressPorts.hidden = !enabled;
+		addressToggle.setAttribute('aria-expanded', enabled ? 'true' : 'false');
+		if (!enabled) { addressPreview.textContent = savedPreview; return; }
+		function address(kind, scheme, path) {
+			var port = document.getElementById('sls-setup-port-' + kind).value;
+			return scheme + '://' + addressHost.value.trim().toLowerCase() + (port === (scheme === 'https' ? '443' : '80') ? '' : ':' + port) + path;
+		}
+		addressPreview.textContent = <?php echo json_encode(_('Desktop API:')); ?> + ' ' + address('api', 'https', '/api/sipnotify')
+			+ '\n' + <?php echo json_encode(_('Control API:')); ?> + ' ' + address('control', 'https', '/api/sls-mass-notify')
+			+ '\n' + <?php echo json_encode(_('Phone images:')); ?> + ' ' + address('media', imageScheme ? imageScheme.value : 'http', '/sls_mass_notify');
+	}
+	if (setupForm) {
+		setupForm.addEventListener('input', renderSetupAddress);
+		setupForm.addEventListener('change', renderSetupAddress);
+	}
+	renderSetupAddress();
 	var weatherSelect = document.getElementById('sls-setup-weather-enabled');
 	var weatherDetails = document.getElementById('sls-setup-weather-details');
 	var lightningSelect = document.getElementById('sls-setup-lightning-enabled');
@@ -439,3 +506,5 @@ $lightningSetupEnabled = (($xweather['enabled'] ?? '0') === '1');
 }());
 </script>
 <?php } ?>
+
+<script>(function(){var select=document.getElementById("sls-setup-lightning-provider");if(select)select.addEventListener("change",function(){this.closest("form").querySelectorAll('[name="xweather[client_id]"],[name="xweather[client_secret]"]').forEach(function(input){input.value="";});});})();</script>

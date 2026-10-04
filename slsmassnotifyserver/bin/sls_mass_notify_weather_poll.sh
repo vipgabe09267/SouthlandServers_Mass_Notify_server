@@ -13,15 +13,18 @@ case "$#" in
     esac ;;
   *) printf '%s\n' 'Unexpected positional arguments.' >&2; exit 2 ;;
 esac
-/usr/bin/python3 - "$CONFIG_FILE" <<'PY'
+/usr/bin/python3 - "$CONFIG_FILE" "$RUNTIME_DIR/sls_config_crypto.py" <<'PY'
 import hashlib
 import json
 import re
 import sys
 
 try:
-    with open(sys.argv[1], "r", encoding="utf-8") as handle:
-        config = json.load(handle)
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("sls_config_crypto", sys.argv[2])
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    config = module.read_config(sys.argv[1])
 except Exception:
     raise SystemExit(2)
 if not isinstance(config, dict):
@@ -114,7 +117,7 @@ for index, group in enumerate(groups[:5]):
                 identifier = re.sub(r"[^A-Za-z0-9_-]", "", str(value))[:64]
                 if identifier:
                     webhook_keys.append(f"{kind}:{identifier}")
-    if not recipients and not desktop_recipients and not email_recipients and not webhook_keys:
+    if not recipients and not desktop_recipients and not email_recipients and not webhook_keys and not group.get('voice_recipient_ids') and not group.get('sms_recipient_ids'):
         continue
     records.append([
         group_id,

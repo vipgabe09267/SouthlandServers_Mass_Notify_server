@@ -59,7 +59,7 @@ foreach ([
 		update_contract_fail('Maintenance worker is missing manual-update progress handling.');
 	}
 }
-if (substr_count($moduleSource, "17 */6 * * * /usr/bin/timeout 1800 /usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh") !== 1) {
+if (substr_count($moduleSource, "17 * * * * /usr/bin/timeout 1800 /usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh") !== 1) {
 	update_contract_fail('Root automatic-update cron is missing or duplicated in module source.');
 }
 

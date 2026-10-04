@@ -1,6 +1,7 @@
 <?php
 
 $slsmassnotifyserver = \FreePBX::create()->Slsmassnotifyserver;
+$slsmassnotifyserver->enforceOperatorPageAccess('slsmassnotifyserver');
 $view = isset($_REQUEST['view']) ? $_REQUEST['view'] : 'main';
 $saveResult = null;
 $setupResult = $_SESSION['slsmassnotifyserver_setup_result'] ?? null;
@@ -26,12 +27,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$slsmassnotifyserver->validateCsrf
 		'cooldown_remaining' => 0,
 	];
 	$csrfAction = (string)($_POST['slsmassnotifyserver_action'] ?? '');
-	if (in_array($csrfAction, ['send_announcement', 'retry_announcement', 'run_test_profile', 'save_announcement_group', 'delete_announcement_group'], true)) {
+	if (in_array($csrfAction, ['deployment_readiness', 'preview_announcement', 'send_announcement', 'retry_announcement', 'run_test_profile', 'save_announcement_group', 'delete_announcement_group'], true)) {
 		slsmassnotifyserver_json_response($csrfResult, 403);
 	}
 	$_SESSION['slsmassnotifyserver_setup_result'] = $csrfResult;
 	header('Location: config.php?display=slsmassnotifyserver');
 	exit;
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    require_once __DIR__ . '/RecipientSelection.php';
+    try { $_POST = \SLS\MassNotify\RecipientSelection::decode($_POST); }
+    catch (\DomainException $error) { slsmassnotifyserver_json_response(['success' => false, 'message' => $error->getMessage(), 'delivery_started' => false], 400); }
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action'] ?? '') === 'deployment_readiness') {
+	if (session_status() === PHP_SESSION_ACTIVE) { session_write_close(); }
+	try { $report = $slsmassnotifyserver->getDeploymentReadiness(); }
+	catch (\Throwable $error) {
+		slsmassnotifyserver_json_response(['success'=>false, 'message'=>_('The readiness report could not be generated. Check module diagnostics and the PHP error log, then retry.')], 503);
+	}
+	slsmassnotifyserver_json_response(['success'=>true, 'report'=>$report]);
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action'] ?? '') === 'diagnostic_download') {
@@ -51,6 +67,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action
 	header('X-Content-Type-Options: nosniff');
 	echo $report, "\n";
 	exit;
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action'] ?? '') === 'preview_announcement') {
+	if (session_status() === PHP_SESSION_ACTIVE) { session_write_close(); }
+	slsmassnotifyserver_json_response($slsmassnotifyserver->previewAnnouncement($_POST));
 }
 
 if (($_REQUEST['slsmassnotifyserver_action'] ?? '') === 'announcement_job') {
@@ -96,6 +117,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action
 			'desktop_all' => !empty($_POST['announcement_all_desktops']),
 			'desktop_clients' => $_POST['announcement_desktop_clients'] ?? [],
 			'webhook_ids' => $_POST['announcement_webhooks'] ?? [],
+			'voice_recipient_ids' => $_POST['voice_recipient_ids'] ?? [],
+			'email_recipient_ids' => $_POST['announcement_email_recipient_ids'] ?? [],
+			'sms_recipient_ids' => $_POST['announcement_sms_recipient_ids'] ?? [],
 			'style' => !empty($_POST['announcement_colored']) ? 'colored' : 'standard',
 			'image' => !empty($_POST['announcement_colored']),
 			'title' => $_POST['announcement_title'] ?? 'Announcement',
@@ -113,7 +137,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action
 		$_POST['group_id'] ?? '',
 		$_POST['group_name'] ?? '',
 		$_POST['group_extensions'] ?? [],
-		$_POST['group_desktop_clients'] ?? []
+		$_POST['group_desktop_clients'] ?? [],
+		$_POST['group_voice_recipient_ids'] ?? [],
+		$_POST['group_email_recipient_ids'] ?? [],
+		$_POST['group_sms_recipient_ids'] ?? [],
+		$_POST['group_webhook_ids'] ?? []
 	));
 }
 

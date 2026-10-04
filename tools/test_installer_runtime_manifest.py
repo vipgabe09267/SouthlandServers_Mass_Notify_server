@@ -3,12 +3,15 @@
 import ast
 from pathlib import Path
 import re
+import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 module = ROOT / 'slsmassnotifyserver'
 installer = (ROOT / 'tools/install_release.sh').read_text()
 maintenance = (module / 'bin/sls_mass_notify_maintenance.sh').read_text()
 source = (module / 'Slsmassnotifyserver.class.php').read_text()
+parity = installer.split('verify_installed_payload_parity() {', 1)[1].split('\nPY\n', 1)[0]
+assert '(module / "portal", pathlib.Path("/var/www/html/mass-notify"), "operator portal")' in parity, 'installed parity verification omits the operator portal tree'
 workers = {path.name for path in (module / 'bin').glob('sls_mass_notify*') if path.is_file()}
 helpers = {path.name for path in (module / 'bin/sls_mass_notify').glob('*.py')}
 for function in ('runtime_install_postconditions_available', 'verify_installed_payload_parity'):
@@ -18,10 +21,12 @@ for function in ('runtime_install_postconditions_available', 'verify_installed_p
 permissions = source.split('private function secureExecutableRuntimeTree()', 1)[1]
 executables = ast.literal_eval(re.search(r'executables = (\{.*?\})', permissions, re.S)[1])
 assert workers | helpers <= executables, ('module permission repair omits', (workers | helpers) - executables)
-for worker in workers:
-    if worker.endswith('.php'):
-        for text in (installer, maintenance):
-            assert 'child_relative == "' + worker + '"' in text, ('PHP worker loses execute permission', worker)
+# Protected promotion now owns executable modes; mutable PHP helpers no
+# longer recursively repair root runtime permissions.
+protected = (module / 'bin/sls_mass_notify/sls_privileged_install.py').read_text()
+assert "0o755" in protected and "RUNTIME + '/'" in protected
+assert 'protected_install_phase prepare --apply' in installer
+assert '"$PRIVILEGED_HELPER" "$phase" --apply' in maintenance
 runtime_check = re.search(r'runtime_python_files=\((.*?)\n  \)', installer, re.S)[1]
 for helper in helpers:
     assert '/usr/local/bin/sls_mass_notify/' + helper + '\n' in runtime_check + '\n', ('missing runtime verification', helper)
@@ -32,4 +37,5 @@ for helper in (module / 'bin/sls_mass_notify').glob('*.php'):
         'post-restore verification omits PHP helper', helper.name)
     assert "__DIR__ . '/bin/sls_mass_notify/" + helper.name + "' => self::RUNTIME_DIR . '/" + helper.name + "'" in restore_parity, (
         'post-restore parity omits PHP helper', helper.name)
-print('Every packaged runtime worker/helper is covered by installer manifests and permission repair.')
+subprocess.run(['php', str(ROOT / 'tools/test_runtime_file_install.php')], check=True)
+print('Every packaged runtime worker/helper is copied and covered by installer manifests and permission repair.')

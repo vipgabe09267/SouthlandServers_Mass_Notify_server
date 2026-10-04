@@ -2,12 +2,18 @@
 """Verify a publisher-signed release without executing downloaded code."""
 import argparse
 import hashlib
+import importlib.util
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 PUBLIC_KEY = Path(__file__).with_name('release-signing.pub')
+sys.dont_write_bytecode = True
+_spec = importlib.util.spec_from_file_location('sls_release_trust', Path(__file__).with_name('sls_release_trust.py'))
+trust = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(trust)
 
 
 def digest(path):
@@ -18,18 +24,15 @@ def digest(path):
     return result.hexdigest()
 
 
-def verify(manifest, signature, installer, package, version, public_key=PUBLIC_KEY):
+def verify(manifest, signature, installer, package, version, public_key=PUBLIC_KEY, *, trust_directory=trust.DIRECTORY, now=None):
     if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-beta)?', version):
         raise ValueError('Invalid release version')
     if Path(manifest).stat().st_size > 16384 or Path(signature).stat().st_size != 64:
         raise ValueError('Invalid release manifest/signature size')
-    result = subprocess.run(['/usr/bin/openssl', 'pkeyutl', '-verify', '-rawin', '-pubin',
-                             '-inkey', str(public_key), '-in', str(manifest), '-sigfile', str(signature)],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-    if result.returncode:
-        raise ValueError('Release publisher signature is invalid')
-    # Only inspect the manifest after authenticating its exact bytes.
-    data = json.loads(Path(manifest).read_bytes())
+    # Authenticate with the root-reviewed authority before inspecting identity
+    # or hashes. This also enforces signed metadata expiry when present.
+    data = trust.authenticate_manifest(trust.bounded_read(manifest), trust.bounded_read(signature),
+        Path(public_key).read_bytes(), trust_directory, now)
     expected_name = f'slsmassnotifyserver-{version}.tgz'
     if not isinstance(data, dict) or data.get('schema') != 1 or data.get('version') != version \
             or data.get('tag') != f'slsmassnotifyserver-{version}' or data.get('package') != expected_name:

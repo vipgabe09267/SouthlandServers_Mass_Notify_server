@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+import importlib.util
 import argparse
 import base64
 import configparser
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import html
@@ -11,6 +13,7 @@ import os
 import re
 import secrets
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -18,11 +21,78 @@ import time
 import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import sys as _config_sys
+_config_sys.dont_write_bytecode = True
+_config_crypto_spec = importlib.util.spec_from_file_location("sls_config_crypto", Path(__file__).resolve().with_name("sls_config_crypto.py"))
+_config_crypto = importlib.util.module_from_spec(_config_crypto_spec)
+_config_crypto_spec.loader.exec_module(_config_crypto)
+_cluster_spec = importlib.util.spec_from_file_location('sls_cluster_guard', Path(__file__).resolve().with_name('sls_cluster_guard.py'))
+_cluster_guard = importlib.util.module_from_spec(_cluster_spec)
+_cluster_spec.loader.exec_module(_cluster_guard)
 from zoneinfo import ZoneInfo
 
 CENTRAL_SETTINGS_FILE = Path("/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config")
 LOCAL_TZ = ZoneInfo(os.environ.get("TZ") or "UTC")
 DEFAULT_API_EVENTS_FILE = Path("/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sipnotify/sipnotify_events.jsonl")
+PHONE_VISUAL_STATE = Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin/phone-visual-state')
+
+
+@contextmanager
+def phone_visual_owner(extension, owner='', expected_owner='', directory=None):
+    """Serialize a handset's pushes; a page may clear only its own last popup."""
+    if not re.fullmatch(r'[0-9]{1,20}', str(extension)):
+        raise ValueError('Invalid phone visual recipient')
+    for token in (owner, expected_owner):
+        if token and not re.fullmatch(r'[a-f0-9]{32}', token):
+            raise ValueError('Invalid phone visual owner')
+    if owner and expected_owner:
+        raise ValueError('A visual push cannot claim and clear an owner together')
+    directory = Path(directory) if directory is not None else PHONE_VISUAL_STATE
+    directory.mkdir(mode=0o750, exist_ok=True)
+    meta = directory.lstat()
+    if not stat.S_ISDIR(meta.st_mode) or meta.st_uid != os.geteuid() or meta.st_mode & 0o022 or directory.resolve() != directory:
+        raise OSError('Phone visual state directory is unsafe')
+    path = directory / (str(extension) + '.json')
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o640)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.geteuid() or opened.st_nlink != 1 or opened.st_mode & 0o022 or opened.st_size > 512:
+            raise OSError('Phone visual state file is unsafe')
+        deadline = time.monotonic() + 3
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise OSError('Phone visual state is busy') from None
+                time.sleep(.01)
+        current = path.lstat()
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            raise OSError('Phone visual state changed')
+        raw = os.read(descriptor, 513)
+        if len(raw) > 512:
+            raise OSError('Phone visual state exceeds its limit')
+        try:
+            saved = json.loads(raw) if raw else {}
+        except (ValueError, UnicodeError):
+            # Unknown ownership never authorizes a completion push. A new
+            # ordinary alert can replace a corrupt, non-secret marker.
+            saved = {}
+        if expected_owner and (not isinstance(saved, dict) or saved.get('owner') != expected_owner):
+            yield False
+            return
+        value = json.dumps({'owner': owner}, separators=(',', ':')).encode()
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        os.ftruncate(descriptor, 0)
+        if os.write(descriptor, value) != len(value):
+            raise OSError('Phone visual ownership could not be saved')
+        os.fsync(descriptor)
+        # Keep the lock until every contact for this extension is submitted.
+        yield True
+    finally:
+        os.close(descriptor)
 
 ALERT_MAP = {
     "Tornado Warning": ("⚠ TORNADO WARNING", "yes"),
@@ -280,7 +350,10 @@ def resolve_local_ami_endpoint(ami):
         raise RuntimeError("FreePBX AMI port is invalid") from exc
     if not 1 <= port <= 65535:
         raise RuntimeError("FreePBX AMI port is outside the supported range")
-    return "127.0.0.1", port
+    # Preserve an explicitly selected IPv6 loopback. localhost intentionally
+    # remains IPv4 without DNS or a silent cross-family fallback; IPv6-only
+    # installations must select ::1 in the protected AMI settings.
+    return ("::1" if host == "::1" else "127.0.0.1"), port
 
 
 def phone_media_base_url(host, media_scheme, configured_url=""):
@@ -299,11 +372,24 @@ def phone_media_base_url(host, media_scheme, configured_url=""):
     return f"{media_scheme}://{authority}/sls_mass_notify"
 
 
+def desktop_media_base_url(host, configured_api_url=""):
+    """Desktop images use HTTPS; phone transport and advertised ports stay separate."""
+    authority = host
+    if isinstance(configured_api_url, str):
+        match = re.fullmatch(
+            r"https://" + re.escape(host) + r"(?::([0-9]{1,5}))?/api/sipnotify/?",
+            configured_api_url, flags=re.IGNORECASE | re.ASCII,
+        )
+        if match and match.group(1) and 1 <= int(match.group(1)) <= 65535:
+            authority = f"{host}:{int(match.group(1))}"
+    return f"https://{authority}/sls_mass_notify"
+
+
 def load_config():
     config = configparser.ConfigParser(interpolation=None)
     if CENTRAL_SETTINGS_FILE.is_file():
         try:
-            settings = json.loads(CENTRAL_SETTINGS_FILE.read_text(encoding="utf-8"))
+            settings = _config_crypto.read_config(CENTRAL_SETTINGS_FILE)
         except Exception as exc:
             raise RuntimeError(f"Unable to read central config {CENTRAL_SETTINGS_FILE}: {exc}") from exc
         if not isinstance(settings, dict):
@@ -315,9 +401,9 @@ def load_config():
         host = re.sub(r"^https?://", "", host, flags=re.I).split("/", 1)[0].strip()
         if not re.match(r"^[A-Za-z0-9.-]+$", host):
             host = "localhost"
-        media_scheme = str(sipnotify.get("media_scheme") or "http").strip().lower()
+        media_scheme = str(sipnotify.get("media_scheme") or "https").strip().lower()
         if media_scheme not in {"http", "https"}:
-            media_scheme = "http"
+            media_scheme = "https"
 
         ami_host, ami_port = resolve_local_ami_endpoint(ami)
         config.read_dict({
@@ -336,6 +422,7 @@ def load_config():
             "visual": {
                 "web_dir": "/var/www/html/sls_mass_notify",
                 "public_base_url": phone_media_base_url(host, media_scheme, sipnotify.get("media_base_url")),
+                "desktop_public_base_url": desktop_media_base_url(host, sipnotify.get("base_url")),
                 "image_width": "480",
                 "image_height": "272",
                 "retry_delays": "",
@@ -539,23 +626,11 @@ def render_alert_image(config, alert):
         os.chown(output, pwd.getpwnam("asterisk").pw_uid, grp.getgrnam("asterisk").gr_gid)
     except Exception:
         pass
-    prune_old_images(web_dir)
     return f"{public_base_url}/{output.name}"
 
 
-def prune_old_images(web_dir, max_age_seconds=259200):
-    cutoff = time.time() - max_age_seconds
-    candidates = []
-    for pattern in ("alert_*.png", "announcement_*.png", "phone_payload_*.xml"):
-        candidates.extend(web_dir.glob(pattern))
-    for path in candidates:
-        try:
-            if path.stat().st_mtime < cutoff:
-                path.unlink()
-                logging.info("Removed old generated alert image %s", path)
-        except Exception as exc:
-            logging.warning("Unable to remove old generated alert image %s: %s", path, exc)
-
+# Periodic storage maintenance owns generated-media retention and protects
+# queued work, desktop journal references and active playback reservations.
 
 def validate_rendered_png(path, expected_width, expected_height):
     if not path.is_file() or path.stat().st_size < 128:
@@ -630,7 +705,7 @@ def build_text_xml(alert):
     )
 
 
-def build_announcement_xml(message, timeout_seconds=0):
+def build_announcement_xml(message, timeout_seconds=0, title='Announcement'):
     cleaned = "\n".join(line.strip() for line in (message or "").splitlines()).strip()
     if not cleaned:
         cleaned = "Announcement"
@@ -641,8 +716,8 @@ def build_announcement_xml(message, timeout_seconds=0):
     timeout_seconds = normalize_announcement_timeout_seconds(timeout_seconds)
     return (
         "<?xml version='1.0' encoding='UTF-8'?>"
-        f"<YealinkIPPhoneTextScreen Beep='yes' Timeout='{timeout_seconds}'>"
-        "<Title>Announcement</Title>"
+        f"<YealinkIPPhoneTextScreen Beep='yes' Timeout='{timeout_seconds}' LockIn='no'>"
+        f"<Title wrap='yes'>{html.escape(clean_payload_text(title, 80) or 'Announcement')}</Title>"
         f"<Text>{escaped_text}</Text>"
         "<SoftKey index='1'>"
         "<Label>Dismiss</Label>"
@@ -706,7 +781,6 @@ def hosted_phone_payload(config, xml_payload):
         os.chown(output, pwd.getpwnam("asterisk").pw_uid, grp.getgrnam("asterisk").gr_gid)
     except Exception:
         pass
-    prune_old_images(web_dir)
     return f"{public_base_url}/{output.name}"
 
 
@@ -803,11 +877,25 @@ def normalize_hex_color(value, fallback="#1f2937"):
     return fallback
 
 
-def render_announcement_image(config, title, message, background_color="#1f2937", background_image=""):
-    width = config.getint("visual", "image_width", fallback=480)
-    height = config.getint("visual", "image_height", fallback=272)
+def contrasting_text_color(background):
+    """Choose the higher WCAG relative-luminance contrast for a solid color."""
+    color = normalize_hex_color(background)
+    channels = [int(color[offset:offset + 2], 16) / 255 for offset in (1, 3, 5)]
+    linear = [value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4 for value in channels]
+    luminance = sum(weight * value for weight, value in zip((0.2126, 0.7152, 0.0722), linear))
+    white_contrast = 1.05 / (luminance + 0.05)
+    black_contrast = (luminance + 0.05) / 0.05
+    return "#000000" if black_contrast > white_contrast else "#ffffff"
+
+
+def render_announcement_image(config, title, message, background_color="#1f2937", background_image="", desktop=False):
+    # Render text at its target resolution; upscaling the phone bitmap blurs it.
+    scale = 3 if desktop else 1
+    width = 1440 if desktop else config.getint("visual", "image_width", fallback=480)
+    height = 816 if desktop else config.getint("visual", "image_height", fallback=272)
     web_dir = Path(config.get("visual", "web_dir", fallback="/var/www/html/sls_mass_notify"))
-    public_base_url = config.get("visual", "public_base_url", fallback="https://PBX_HOST/sls_mass_notify").rstrip("/")
+    url_setting = "desktop_public_base_url" if desktop else "public_base_url"
+    public_base_url = config.get("visual", url_setting, fallback="https://PBX_HOST/sls_mass_notify").rstrip("/")
     web_dir.mkdir(parents=True, exist_ok=True)
 
     title = imagemagick_text((title or "Announcement").strip(), 48) or "Announcement"
@@ -821,29 +909,31 @@ def render_announcement_image(config, title, message, background_color="#1f2937"
     background_image_path = Path(background_image) if background_image else None
 
     if background_image_path and background_image_path.is_file():
+        body_color = "#ffffff"
         command = [
             "convert", str(background_image_path),
             "-auto-orient", "-resize", f"{width}x{height}^", "-gravity", "center", "-extent", f"{width}x{height}",
-            "-fill", "rgba(0,0,0,0.45)", "-draw", f"rectangle 0,0 {width},{height}",
-            "-fill", "rgba(17,24,39,0.82)", "-draw", f"rectangle 0,0 {width},72",
+            "-fill", "rgba(0,0,0,0.65)", "-draw", f"rectangle 0,0 {width},{height}",
+            "-fill", "rgba(17,24,39,0.82)", "-draw", f"rectangle 0,0 {width},{72 * scale}",
         ]
     else:
+        body_color = contrasting_text_color(background_color)
         command = [
             "convert",
             "-size", f"{width}x{height}", f"xc:{background_color}",
-            "-fill", "rgba(17,24,39,0.88)", "-draw", f"rectangle 0,0 {width},72",
+            "-fill", "rgba(17,24,39,0.88)", "-draw", f"rectangle 0,0 {width},{72 * scale}",
         ]
 
     command.extend([
-        "-fill", "#fbbf24", "-draw", f"rectangle 0,72 {width},78",
+        "-fill", "#fbbf24", "-draw", f"rectangle 0,{72 * scale} {width},{78 * scale}",
         "-font", "DejaVu-Sans-Bold", "-fill", "#ffffff", "-gravity", "North",
-        "-pointsize", "30", "-annotate", "+0+18", title,
-        "-font", "DejaVu-Sans", "-fill", "#ffffff", "-gravity", "NorthWest",
-        "-pointsize", "20", "-annotate", "+30+108", body_lines[0],
-        "-pointsize", "20", "-annotate", "+30+136", body_lines[1],
-        "-pointsize", "20", "-annotate", "+30+164", body_lines[2],
-        "-pointsize", "20", "-annotate", "+30+192", body_lines[3],
-        "-pointsize", "20", "-annotate", "+30+220", body_lines[4],
+        "-pointsize", str(30 * scale), "-annotate", f"+0+{18 * scale}", title,
+        "-font", "DejaVu-Sans", "-fill", body_color, "-gravity", "NorthWest",
+        "-pointsize", str(20 * scale), "-annotate", f"+{30 * scale}+{108 * scale}", body_lines[0],
+        "-pointsize", str(20 * scale), "-annotate", f"+{30 * scale}+{136 * scale}", body_lines[1],
+        "-pointsize", str(20 * scale), "-annotate", f"+{30 * scale}+{164 * scale}", body_lines[2],
+        "-pointsize", str(20 * scale), "-annotate", f"+{30 * scale}+{192 * scale}", body_lines[3],
+        "-pointsize", str(20 * scale), "-annotate", f"+{30 * scale}+{220 * scale}", body_lines[4],
         "-alpha", "off", "-colorspace", "sRGB", "-strip", "-depth", "8", "-interlace", "none",
         "-define", "png:color-type=2",
         "PNG24:" + str(output),
@@ -852,6 +942,9 @@ def render_announcement_image(config, title, message, background_color="#1f2937"
     if result.returncode != 0:
         raise RuntimeError((result.stderr or "ImageMagick convert failed").strip())
     validate_rendered_png(output, width, height)
+    if desktop and output.stat().st_size > 5 * 1024 * 1024:
+        output.unlink()
+        raise RuntimeError("Generated desktop image exceeds the application's 5 MiB download limit")
     os.chmod(output, 0o644)
     try:
         import grp
@@ -859,7 +952,6 @@ def render_announcement_image(config, title, message, background_color="#1f2937"
         os.chown(output, pwd.getpwnam("asterisk").pw_uid, grp.getgrnam("asterisk").gr_gid)
     except Exception:
         pass
-    prune_old_images(web_dir)
     return f"{public_base_url}/{output.name}"
 
 
@@ -914,6 +1006,7 @@ PHONE_FORMAT_ALIASES = {
 SUPPORTED_PHONE_FORMATS = {
     "yealink",
     "yealink_text",
+    "yealink_image",
     "cisco",
     "poly",
     "grandstream",
@@ -1133,7 +1226,7 @@ def phone_title_and_message_from_alert(alert):
 def build_phone_xml_for_format(config, fmt, payload_type, alert=None, message="", image=False, title="Announcement", background_color="#1f2937", background_image="", timeout_seconds=0):
     fmt = fmt or "yealink"
     if payload_type == "alert":
-        if fmt == "yealink":
+        if fmt in {"yealink", "yealink_image"}:
             return build_xml(config, alert)
         if fmt == "yealink_text":
             return build_text_xml(alert)
@@ -1142,10 +1235,12 @@ def build_phone_xml_for_format(config, fmt, payload_type, alert=None, message=""
         if fmt == "cisco":
             return cisco_execute_xml(hosted_phone_payload(config, payload))
         return payload
-    if image and fmt == "yealink":
+    # Opt-in for color handsets whose text browser is unreliable. Keep the
+    # desktop's plain-text presentation and every other phone format unchanged.
+    if fmt == "yealink_image" or (image and fmt == "yealink"):
         return build_announcement_image_xml(config, message, title, background_color, background_image, timeout_seconds)
     if fmt in {"yealink", "yealink_text"}:
-        return build_announcement_xml(message, timeout_seconds)
+        return build_announcement_xml(message, timeout_seconds, title)
     payload = text_xml_for_format(fmt, title or "Announcement", message)
     if fmt == "cisco":
         return cisco_execute_xml(hosted_phone_payload(config, payload))
@@ -1157,6 +1252,7 @@ def notify_events_for_format(phone_format):
     events = {
         "yealink": ["Yealink-xml"],
         "yealink_text": ["Yealink-xml"],
+        "yealink_image": ["Yealink-xml"],
         "cisco": ["XML-Service"],
         "fanvil": ["xml", "CiscoIPPhoneText"],
         "poly": ["polycom-push", "xml"],
@@ -1182,7 +1278,7 @@ def notify_events_for_format(phone_format):
 
 def notify_content_type_for_format(phone_format):
     phone_format = (phone_format or "yealink").lower()
-    if phone_format in {"yealink", "yealink_text"}:
+    if phone_format in {"yealink", "yealink_text", "yealink_image"}:
         return "application/xml"
     if phone_format in {"poly", "polycom"}:
         return "application/x-com-polycom-spipx"
@@ -1314,7 +1410,10 @@ def send_notify(ami, target, xml_payload, phone_format="yealink", target_field="
     content_type = notify_content_type_for_format(phone_format)
     attempts = []
     for event_name in notify_events_for_format(phone_format):
+        claim = None
         try:
+            claim = _cluster_guard.begin('sip_notify', str(target) + ':' + event_name,
+                                         {'xml': xml_payload, 'event': event_name, 'target_field': target_field})
             response, _ = ami.action({
                 "Action": "PJSIPNotify",
                 target_field: target,
@@ -1324,7 +1423,12 @@ def send_notify(ami, target, xml_payload, phone_format="yealink", target_field="
                     f"Content={xml_payload}",
                 ],
             })
+            _cluster_guard.finish(claim, uncertain=False, category='ami_response_received')
         except Exception:
+            try:
+                _cluster_guard.finish(claim, uncertain=True, category='ami_submission_uncertain')
+            except Exception:
+                pass
             attempts.append({"event": event_name, "response": "unavailable", "message_category": "ami_action_error"})
             # Preserve the existing no-retry-on-transport-error behavior. The
             # server may have received the action before the connection failed.
@@ -1398,29 +1502,147 @@ def set_journal_file_metadata(file_descriptor):
         pass
 
 
-def atomic_write_journal(path, lines):
+# Match the maintenance pruner's file/line limits. Scan older journals fully
+# within these bounds before retaining their newest 1,000 valid records.
+JOURNAL_MAX_BYTES = 64 * 1024 * 1024
+JOURNAL_MAX_LINE_BYTES = 256 * 1024
+JOURNAL_MAX_LINES = 100000
+JOURNAL_MAX_RECORDS = 1000
+JOURNAL_LOCK_SECONDS = 0.25
+
+
+def journal_identity(file_descriptor, path):
+    import stat
+    opened = os.fstat(file_descriptor)
+    named = os.stat(path, follow_symlinks=False)
+    if (not stat.S_ISREG(opened.st_mode) or not stat.S_ISREG(named.st_mode)
+            or opened.st_nlink != 1 or named.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+        raise OSError("Desktop journal path is not a single regular file")
+    return opened
+
+
+def open_journal_file(path):
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    descriptor = os.open(path, flags, 0o640)
+    try:
+        journal_identity(descriptor, path)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def lock_journal_file(descriptor, deadline):
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise OSError("Desktop journal is busy; publication was not recorded") from None
+            time.sleep(0.01)
+
+
+def read_journal_lines(handle):
+    from collections import deque
+    retained = deque(maxlen=JOURNAL_MAX_RECORDS)
+    if os.fstat(handle.fileno()).st_size > JOURNAL_MAX_BYTES:
+        raise OSError("Desktop journal exceeds the byte limit; existing evidence was preserved")
+    total = 0
+    count = 0
+    deadline = time.monotonic() + 5.0
+    while True:
+        raw = handle.readline(JOURNAL_MAX_LINE_BYTES + 1)
+        if not raw:
+            break
+        total += len(raw)
+        count += 1
+        if total > JOURNAL_MAX_BYTES or count > JOURNAL_MAX_LINES or time.monotonic() > deadline:
+            raise OSError("Desktop journal exceeds the scan limit; existing evidence was preserved")
+        if len(raw) > JOURNAL_MAX_LINE_BYTES:
+            raise OSError("Desktop journal event exceeds the line limit; existing evidence was preserved")
+        if not raw.strip():
+            continue
+        try:
+            line = raw.decode("utf-8").rstrip("\r\n")
+            decoded = json.loads(line, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Non-finite JSON")))
+            if not isinstance(decoded, dict):
+                raise ValueError("Journal records must be objects")
+        except (UnicodeError, ValueError, RecursionError):
+            raise OSError("Desktop journal contains a corrupt record; existing evidence was preserved") from None
+        retained.append(line)
+    return list(retained)
+
+
+def encoded_journal_record(record):
+    try:
+        encoded = json.dumps(record, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError, RecursionError):
+        raise OSError("Desktop publication contains an invalid journal record") from None
+    if len(encoded.encode("utf-8")) + 1 > JOURNAL_MAX_LINE_BYTES:
+        raise OSError("Desktop publication exceeds the journal event byte limit")
+    return encoded
+
+
+class ScheduledStartExpired(RuntimeError):
+    """No new submission was made at this guarded boundary."""
+
+
+def scheduled_start_guard(latest_start):
+    if latest_start is None:
+        return None
+    if type(latest_start) is not int or not 0 < latest_start <= 253402300799:
+        raise ValueError('Invalid scheduled start deadline')
+    latest_tick = time.monotonic() + max(0, latest_start - time.time())
+    def check():
+        if time.time() >= latest_start or time.monotonic() >= latest_tick:
+            raise ScheduledStartExpired('The scheduled start deadline elapsed before submission')
+    check()
+    return check
+
+
+def atomic_write_journal(path, lines, expected_metadata=None, submission_guard=None):
+    import stat
+    if len(lines) > JOURNAL_MAX_RECORDS:
+        raise OSError("Desktop journal replacement exceeds the record limit")
+    lengths = [len(line.encode("utf-8")) + 1 for line in lines]
+    if any(length > JOURNAL_MAX_LINE_BYTES for length in lengths) or sum(lengths) > JOURNAL_MAX_BYTES:
+        raise OSError("Desktop journal replacement exceeds its byte limits")
+    before = path.lstat() if path.exists() or path.is_symlink() else None
+    if before is not None and (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1):
+        raise OSError("Desktop journal replacement path is unsafe")
+    if expected_metadata is not None and (before is None or
+            (before.st_dev, before.st_ino) != (expected_metadata.st_dev, expected_metadata.st_ino)):
+        raise OSError("Desktop journal changed before replacement")
     temporary_fd = None
     temporary_path = None
+    temporary_metadata = None
     try:
-        temporary_fd, temporary_name = tempfile.mkstemp(
-            prefix=f".{path.name}.tmp.",
-            dir=str(path.parent),
-            text=True,
-        )
+        temporary_fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.tmp.", dir=str(path.parent))
         temporary_path = Path(temporary_name)
-        with os.fdopen(temporary_fd, "w", encoding="utf-8", newline="\n") as handle:
+        temporary_metadata = os.fstat(temporary_fd)
+        with os.fdopen(temporary_fd, "wb") as handle:
             temporary_fd = None
+            journal_identity(handle.fileno(), temporary_path)
             set_journal_file_metadata(handle.fileno())
-            if lines:
-                handle.write("\n".join(lines) + "\n")
+            for line in lines:
+                handle.write(line.encode("utf-8") + b"\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
-        temporary_path = None
-
-        directory_flags = os.O_RDONLY
-        directory_flags |= getattr(os, "O_CLOEXEC", 0)
-        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+            journal_identity(handle.fileno(), temporary_path)
+            current = path.lstat() if path.exists() or path.is_symlink() else None
+            if before is not None:
+                if (current is None or not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                        or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)):
+                    raise OSError("Desktop journal changed during replacement")
+            elif current is not None:
+                raise OSError("Desktop journal appeared during replacement")
+            if submission_guard is not None:
+                submission_guard()
+            os.replace(temporary_path, path)
+            temporary_path = None
+        directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
         directory_fd = os.open(path.parent, directory_flags)
         try:
             os.fsync(directory_fd)
@@ -1431,42 +1653,49 @@ def atomic_write_journal(path, lines):
             os.close(temporary_fd)
         if temporary_path is not None:
             try:
-                temporary_path.unlink()
+                current = temporary_path.lstat()
+                if (current.st_dev, current.st_ino) == (temporary_metadata.st_dev, temporary_metadata.st_ino):
+                    temporary_path.unlink()
             except FileNotFoundError:
                 pass
 
 
-def append_sipnotify_event(config, record):
-    path = api_events_file(config)
+def append_sipnotify_event(config, record, submission_guard=None):
+    if submission_guard is not None:
+        submission_guard()
+    path = api_events_file(config).absolute()
     record = dict(record)
     record["created_at"] = datetime.now(timezone.utc).astimezone().isoformat()
-    encoded = json.dumps(record, ensure_ascii=True, separators=(",", ":"))
+    encoded = encoded_journal_record(record)
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    open_flags = os.O_RDWR | os.O_CREAT
-    open_flags |= getattr(os, "O_CLOEXEC", 0)
-    open_flags |= getattr(os, "O_NOFOLLOW", 0)
+    if path.parent.resolve() != path.parent:
+        raise OSError("Desktop journal directory is not a canonical directory")
     lock_path = path.with_name(path.name + ".lock")
-    lock_fd = os.open(lock_path, open_flags, 0o640)
-    with os.fdopen(lock_fd, "r+", encoding="utf-8") as lock_handle:
+    deadline = time.monotonic() + JOURNAL_LOCK_SECONDS
+    lock_fd = open_journal_file(lock_path)
+    with os.fdopen(lock_fd, "r+b") as lock_handle:
+        lock_journal_file(lock_handle.fileno(), deadline)
+        if submission_guard is not None:
+            submission_guard()
+        journal_identity(lock_handle.fileno(), lock_path)
         set_journal_file_metadata(lock_handle.fileno())
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-
-        journal_fd = os.open(path, open_flags, 0o640)
-        with os.fdopen(journal_fd, "r+", encoding="utf-8") as journal_handle:
+        journal_fd = open_journal_file(path)
+        with os.fdopen(journal_fd, "r+b") as journal_handle:
+            lock_journal_file(journal_handle.fileno(), deadline)
+            metadata = journal_identity(journal_handle.fileno(), path)
             set_journal_file_metadata(journal_handle.fileno())
-            fcntl.flock(journal_handle.fileno(), fcntl.LOCK_EX)
-            journal_handle.seek(0)
-            lines = [line.rstrip("\n") for line in journal_handle if line.strip()]
+            lines = read_journal_lines(journal_handle)
             record_id = str(record.get("id") or "")
             replaced = False
             if record_id:
                 for index, line in enumerate(lines):
-                    try:
-                        existing = json.loads(line)
-                    except Exception:
-                        continue
+                    existing = json.loads(line)
                     if str(existing.get("id") or "") == record_id:
+                        # Repeated publication keeps its original identity/time
+                        # and absolute display expiry instead of extending it.
+                        for key in ("created_at", "display_expires_at", "display_timeout_seconds"):
+                            if key in existing:
+                                record[key] = existing[key]
                         if existing.get("kind") == "alert" and record.get("kind") == "alert":
                             record["recipients"] = sorted(set(existing.get("recipients") or []) | set(record.get("recipients") or []))
                             record["desktop_recipients"] = sorted(set(existing.get("desktop_recipients") or []) | set(record.get("desktop_recipients") or []))
@@ -1474,12 +1703,32 @@ def append_sipnotify_event(config, record):
                             merged_formats = dict(existing.get("phone_formats") or {})
                             merged_formats.update(record.get("phone_formats") or {})
                             record["phone_formats"] = merged_formats
-                            encoded = json.dumps(record, ensure_ascii=True, separators=(",", ":"))
+                        encoded = encoded_journal_record(record)
                         lines[index] = encoded
                         replaced = True
             if not replaced:
                 lines.append(encoded)
-            atomic_write_journal(path, lines[-1000:])
+            journal_identity(journal_handle.fileno(), path)
+            journal_identity(lock_handle.fileno(), lock_path)
+            claim = None
+            def guarded_publication():
+                nonlocal claim
+                if submission_guard is not None:
+                    submission_guard()
+                claim = _cluster_guard.begin('desktop', 'publication', record,
+                                             delivery_id=str(record.get('id') or ''))
+            try:
+                # The authority check occurs after temporary bytes are fsynced,
+                # immediately before replacing the externally visible feed.
+                atomic_write_journal(path, lines[-JOURNAL_MAX_RECORDS:], metadata,
+                                     submission_guard=guarded_publication)
+                _cluster_guard.finish(claim, uncertain=False, category='desktop_publication_committed')
+            except Exception:
+                try:
+                    _cluster_guard.finish(claim, uncertain=True, category='desktop_publication_uncertain')
+                except Exception:
+                    pass
+                raise
 
 
 def new_announcement_id(now=None):
@@ -1491,7 +1740,7 @@ def new_announcement_id(now=None):
     return f"announcement-{current.strftime('%Y%m%d%H%M%S%f')}-{secrets.token_hex(16)}"
 
 
-def alert_api_record(alert, xml_payload, extensions, desktop_targets=None, desktop_all=False, phone_formats=None):
+def alert_api_record(alert, xml_payload, extensions, desktop_targets=None, desktop_all=False, phone_formats=None, is_test=False):
     props = alert.get("properties", {})
     event = props.get("event", "Unknown")
     alert_id = alert.get("id") or props.get("id") or "unknown"
@@ -1500,6 +1749,7 @@ def alert_api_record(alert, xml_payload, extensions, desktop_targets=None, deskt
     return {
         "kind": "alert",
         "id": alert_id,
+        "is_test": is_test is True,
         "chain_key": alert_chain_key(alert),
         "event": event,
         "title": alert_title(event),
@@ -1533,7 +1783,26 @@ def alert_api_record(alert, xml_payload, extensions, desktop_targets=None, deskt
     }
 
 
-def announcement_api_record(alert_id, message, xml_payload, extensions, desktop_targets=None, desktop_all=False, phone_formats=None, title="Announcement", background_color="#1f2937", image=False, timeout_seconds=0):
+def normalize_incident_context(value):
+    if value is None:
+        return None
+    keys = {'schema', 'incident_id', 'sequence', 'kind', 'severity', 'is_test'}
+    if (not isinstance(value, dict) or set(value) != keys
+            or type(value['schema']) is not int or value['schema'] != 1
+            or not isinstance(value['incident_id'], str)
+            or re.fullmatch(r'inc_[0-9a-f]{32}', value['incident_id']) is None
+            or type(value['sequence']) is not int or not 1 <= value['sequence'] <= 250
+            or value['kind'] not in ('initial', 'update', 'all_clear', 'escalation')
+            or value['severity'] not in ('information', 'warning', 'critical')
+            or type(value['is_test']) is not bool):
+        raise ValueError('Invalid incident publication metadata')
+    return dict(value)
+
+
+def announcement_api_record(alert_id, message, xml_payload, extensions, desktop_targets=None, desktop_all=False, phone_formats=None, title="Announcement", background_color="#1f2937", image=False, timeout_seconds=0, is_test=False, desktop_image_url=None, incident=None):
+    incident = normalize_incident_context(incident)
+    if incident is not None and incident['is_test'] != (is_test is True):
+        raise ValueError('Incident and announcement test metadata disagree')
     normalized_title = clean_payload_text(title or "Announcement", 80) or "Announcement"
     normalized_background = normalize_hex_color(background_color)
     timeout_seconds = normalize_announcement_timeout_seconds(timeout_seconds)
@@ -1543,9 +1812,11 @@ def announcement_api_record(alert_id, message, xml_payload, extensions, desktop_
             datetime.now(timezone.utc) + timedelta(seconds=timeout_seconds)
         ).isoformat().replace("+00:00", "Z")
     style = "colored" if image else "standard"
-    return {
+    text_color = contrasting_text_color(normalized_background)
+    record = {
         "kind": "announcement",
         "id": alert_id,
+        "is_test": is_test is True,
         "event": "Announcement",
         "sender": clean_payload_text(os.environ.get("SLS_ANNOUNCEMENT_SENDER", ""), 80),
         "title": normalized_title,
@@ -1554,14 +1825,14 @@ def announcement_api_record(alert_id, message, xml_payload, extensions, desktop_
         "announcement_style": style,
         "background_color": normalized_background,
         "header_color": normalized_background,
-        "accent_color": "#ffffff",
-        "text_color": "#ffffff",
+        "accent_color": text_color,
+        "text_color": text_color,
         "presentation": {
             "style": style,
             "background_color": normalized_background,
             "header_color": normalized_background,
-            "accent_color": "#ffffff",
-            "text_color": "#ffffff",
+            "accent_color": text_color,
+            "text_color": text_color,
         },
         "beep": "yes",
         "body": message,
@@ -1570,16 +1841,21 @@ def announcement_api_record(alert_id, message, xml_payload, extensions, desktop_
         "message": message,
         "display_timeout_seconds": timeout_seconds,
         "display_expires_at": display_expires_at,
-        "image_url": image_url_from_xml(xml_payload),
+        "image_url": image_url_from_xml(xml_payload) if desktop_image_url is None else desktop_image_url,
+        "phone_image_url": image_url_from_xml(xml_payload),
         "xml": xml_payload,
         "recipients": extensions,
         "desktop_all": bool(desktop_all),
         "desktop_recipients": sorted(set(desktop_targets or [])),
         "phone_formats": phone_formats or {},
     }
+    if incident is not None:
+        record['incident'] = incident
+    return record
 
 
-def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_results=False, attempt_label="initial", unavailable_targets=None, defer_unavailable_failure=False):
+
+def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_results=False, attempt_label="initial", unavailable_targets=None, defer_unavailable_failure=False, visual_owner='', clear_visual_owner=''):
     # Keep the historical integer return (contact coverage of accepted actions)
     # for callers. It is not a count of handset deliveries. The structured result
     # reports AMI submissions and independently addressed contacts separately.
@@ -1661,7 +1937,7 @@ def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_resul
                 f"fallback_outcome={record['fallback_outcome']} ({record['attempt']})"
             )
 
-    for extension, info in sorted(endpoint_info.items()):
+    def route_extension(extension, info):
         contacts = info.get("contacts") or []
         contact_targets = []
         seen_contact_targets = set()
@@ -1695,13 +1971,13 @@ def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_resul
             )
             submit(extension, info, extension, "generic", "Endpoint", contact_formats,
                    "contact_uri", fallback_reason, len(contact_targets), max(1, len(contacts)))
-            continue
+            return
 
         if contact_targets and not use_contact_uri:
             for phone_format in contact_formats or [info.get("format", "yealink")]:
                 submit(extension, info, extension, phone_format, "Endpoint", [phone_format],
                        "endpoint", "none", len(contact_targets), max(1, len(contact_targets)))
-            continue
+            return
 
         if contact_targets:
             for contact_uri, phone_format in contact_targets:
@@ -1709,11 +1985,16 @@ def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_resul
                        "contact_uri", "none", len(contact_targets), 1)
             # A URI failure must not trigger endpoint fan-out, which could submit
             # the wrong vendor format or duplicate contacts already submitted.
-            continue
+            return
 
         for phone_format in info.get("formats") or [info.get("format", "yealink")]:
             submit(extension, info, extension, phone_format, "Endpoint", [phone_format],
                    "endpoint", "none", 0, 1)
+
+    for extension, info in sorted(endpoint_info.items()):
+        with phone_visual_owner(extension, visual_owner, clear_visual_owner) as permitted:
+            if permitted:
+                route_extension(extension, info)
 
     for extension in unavailable_targets:
         submit(extension, {}, extension, "", None, [], "endpoint", "none", 0, 0, unavailable=True)
@@ -1753,7 +2034,7 @@ def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_resul
             "handset delivery is not confirmed",
             summary,
         )
-    if endpoint_info and successes == 0:
+    if endpoint_info and successes == 0 and not clear_visual_owner:
         raise NotifyBatchError("SIP NOTIFY was not submitted to Asterisk for any requested endpoint", summary)
     return successes
 
@@ -1796,6 +2077,7 @@ def push_alert(
     desktop_targets=None,
     desktop_all=False,
     require_all_targets=False,
+    is_test=False,
 ):
     primary_xml_payload = build_xml(config, alert)
     props = alert.get("properties", {})
@@ -1807,7 +2089,7 @@ def push_alert(
     if api_only:
         if not desktop_targets and not desktop_all:
             raise RuntimeError("API-only alert publication requires at least one desktop target")
-        append_sipnotify_event(config, alert_api_record(alert, primary_xml_payload, [], desktop_targets, desktop_all, {}))
+        append_sipnotify_event(config, alert_api_record(alert, primary_xml_payload, [], desktop_targets, desktop_all, {}, is_test=is_test))
         return []
     # Live alert channels remain independent: a targeted desktop alert must
     # still be available if AMI or a handset-side SIP submission fails. Manual
@@ -1820,7 +2102,7 @@ def push_alert(
     if desktop_pre_published:
         append_sipnotify_event(
             config,
-            alert_api_record(alert, primary_xml_payload, [], desktop_targets, desktop_all, {}),
+            alert_api_record(alert, primary_xml_payload, [], desktop_targets, desktop_all, {}, is_test=is_test),
         )
     with AmiClient(
         config["ami"].get("host", "127.0.0.1"),
@@ -1849,7 +2131,7 @@ def push_alert(
         # Live targeted desktop delivery was already published above and must
         # not be written a second time after phone discovery.
         if api_publish and not desktop_pre_published:
-            append_sipnotify_event(config, alert_api_record(alert, primary_xml_payload, extensions, desktop_targets, desktop_all, phone_formats))
+            append_sipnotify_event(config, alert_api_record(alert, primary_xml_payload, extensions, desktop_targets, desktop_all, phone_formats, is_test=is_test))
         if not retries:
             raise_unavailable_notify_targets(missing_extensions)
             return
@@ -1863,24 +2145,47 @@ def push_alert(
         raise_unavailable_notify_targets(missing_extensions)
 
 
-def push_announcement(config, message, targets, print_results=True, api_publish=True, api_only=False, image=False, title="Announcement", background_color="#1f2937", background_image="", desktop_targets=None, desktop_all=False, timeout_seconds=0):
+def push_announcement(config, message, targets, print_results=True, api_publish=True, api_only=False, image=False, title="Announcement", background_color="#1f2937", background_image="", desktop_targets=None, desktop_all=False, timeout_seconds=0, is_test=False, incident=None, latest_start=None, visual_owner='', clear_visual_owner=''):
+    if latest_start is not None and not api_only:
+        raise ValueError('A scheduled publication deadline requires the desktop-only sender')
+    submission_guard = scheduled_start_guard(latest_start) if latest_start is not None else None
+    incident = normalize_incident_context(incident)
+    if incident is not None and incident['is_test'] != (is_test is True):
+        raise ValueError('Incident and announcement test metadata disagree')
     timeout_seconds = normalize_announcement_timeout_seconds(timeout_seconds)
     if image:
         xml_payload = build_announcement_image_xml(config, message, title, background_color, background_image, timeout_seconds)
     else:
-        xml_payload = build_announcement_xml(message, timeout_seconds)
+        xml_payload = build_announcement_xml(message, timeout_seconds, title)
+    if clear_visual_owner:
+        # Yealink Timeout accepts whole seconds. A quiet one-second completion
+        # replaces only this page's popup; it never dismisses a newer alert.
+        xml_payload = xml_payload.replace("Beep='yes'", "Beep='no'")
     alert_id = new_announcement_id()
     desktop_targets = sorted(set(desktop_targets or []))
+    desktop_image_url = ""
+    if image and api_publish and (desktop_targets or desktop_all):
+        try:
+            desktop_image_url = render_announcement_image(
+                config, title, message, background_color, background_image, desktop=True,
+            )
+        except Exception as exc:
+            # Preserve the complete plain-text announcement if only the desktop
+            # rendition fails; never substitute an insecure phone-media URL.
+            logging.error("Unable to render desktop announcement image; publishing plain text: %s", exc)
     if api_only:
         if not desktop_targets and not desktop_all:
             raise RuntimeError("API-only announcement publication requires at least one desktop target")
-        append_sipnotify_event(config, announcement_api_record(alert_id, message, xml_payload, [], desktop_targets, desktop_all, title=title, background_color=background_color, image=image, timeout_seconds=timeout_seconds))
+        append_sipnotify_event(config, announcement_api_record(alert_id, message, xml_payload, [], desktop_targets, desktop_all, title=title, background_color=background_color, image=image, timeout_seconds=timeout_seconds, is_test=is_test, desktop_image_url=desktop_image_url, incident=incident),
+                              **({'submission_guard': submission_guard} if submission_guard is not None else {}))
+        if print_results:
+            print("SLS_DESKTOP_PUBLICATION " + json.dumps({"event_id": alert_id}, separators=(",", ":")), flush=True)
         return []
     desktop_pre_published = bool(api_publish and (desktop_targets or desktop_all))
     if desktop_pre_published:
         append_sipnotify_event(
             config,
-            announcement_api_record(alert_id, message, xml_payload, sorted(targets or []), desktop_targets, desktop_all, title=title, background_color=background_color, image=image, timeout_seconds=timeout_seconds),
+            announcement_api_record(alert_id, message, xml_payload, sorted(targets or []), desktop_targets, desktop_all, title=title, background_color=background_color, image=image, timeout_seconds=timeout_seconds, is_test=is_test, desktop_image_url=desktop_image_url, incident=incident),
         )
     with AmiClient(
         config["ami"].get("host", "127.0.0.1"),
@@ -1896,13 +2201,16 @@ def push_announcement(config, message, targets, print_results=True, api_publish=
             requested = ", ".join(sorted(targets))
             raise RuntimeError(f"No requested phone endpoints are registered/reachable for SIP NOTIFY: {requested}")
         missing_extensions = sorted(set(targets or []) - set(extensions))
-        payload_builder = lambda fmt: xml_payload if fmt == "yealink" else build_phone_xml_for_format(config, fmt, "announcement", message=message, image=image, title=title, background_color=background_color, background_image=background_image, timeout_seconds=timeout_seconds)
+        def payload_builder(fmt):
+            payload = xml_payload if fmt == 'yealink' else build_phone_xml_for_format(config, fmt, 'announcement', message=message, image=image, title=title, background_color=background_color, background_image=background_image, timeout_seconds=timeout_seconds)
+            return payload.replace("Beep='yes'", "Beep='no'") if clear_visual_owner else payload
         send_notify_batch(
             ami, endpoint_info, payload_builder, alert_id, print_results, "initial",
             unavailable_targets=missing_extensions, defer_unavailable_failure=True,
+            visual_owner=visual_owner, clear_visual_owner=clear_visual_owner,
         )
         if api_publish and not desktop_pre_published:
-            append_sipnotify_event(config, announcement_api_record(alert_id, message, xml_payload, extensions, desktop_targets, desktop_all, phone_formats, title=title, background_color=background_color, image=image, timeout_seconds=timeout_seconds))
+            append_sipnotify_event(config, announcement_api_record(alert_id, message, xml_payload, extensions, desktop_targets, desktop_all, phone_formats, title=title, background_color=background_color, image=image, timeout_seconds=timeout_seconds, is_test=is_test, desktop_image_url=desktop_image_url, incident=incident))
         raise_unavailable_notify_targets(missing_extensions)
         return extensions
 
@@ -1950,10 +2258,38 @@ def run_test(config, event="Tornado Warning", severity="Extreme", area="Williams
             "description": description,
         },
     }
-    push_alert(config, alert, print_results=True, retries=retries)
+    push_alert(config, alert, print_results=True, retries=retries, is_test=True)
+
+
+def announcement_image_preview(mms=False):
+    """Private preview only: never load PBX settings, AMI or event journals."""
+    request = json.loads(sys.stdin.buffer.read(4097))
+    if (not isinstance(request, dict) or set(request) != {"title", "message", "color"}
+            or any(not isinstance(value, str) for value in request.values())
+            or not 1 <= len(request["message"]) <= 500 or len(request["title"]) > 80
+            or not re.fullmatch(r"#[0-9A-Fa-f]{6}", request["color"])
+            or any(ord(char) < 32 and char not in "\r\n\t" for value in request.values() for char in value)):
+        raise ValueError("Enter a message of 1–500 characters, a title up to 80 characters and a valid color.")
+    with tempfile.TemporaryDirectory(prefix="sls-image-preview-") as directory:
+        config = configparser.ConfigParser(interpolation=None)
+        config["visual"] = {"web_dir": directory, "public_base_url": "https://preview.invalid"}
+        url = render_announcement_image(config, request["title"], request["message"], request["color"], desktop=mms)
+        data = (Path(directory) / url.rsplit("/", 1)[-1]).read_bytes()
+        if len(data) > (300000 if mms else 1024 * 1024):
+            raise ValueError("The rendered MMS image exceeds 300 KB." if mms else "The rendered preview exceeds its one MiB limit.")
+        lines = textwrap.wrap(" ".join(request["message"].split()), width=34, break_long_words=False, break_on_hyphens=False)
+        return {"success": True, "data": base64.b64encode(data).decode("ascii"), "mime": "image/png",
+                "width": 1440 if mms else 480, "height": 816 if mms else 272, "text_clipped": len(lines) > 5 or any(len(line) > 34 for line in lines) or len(request["title"].strip()) > 48}
 
 
 def main():
+    if sys.argv[1:] in (["--preview-image"], ["--preview-mms-image"]):
+        try:
+            print(json.dumps(announcement_image_preview(mms=sys.argv[1] == "--preview-mms-image")))
+            return 0
+        except (ValueError, OSError, RuntimeError, subprocess.SubprocessError):
+            print(json.dumps({"success": False, "message": "Phone image preview failed. Check the message, ImageMagick and temporary disk space."}))
+            return 1
     parser = argparse.ArgumentParser(description="SLS Mass Notify SIP NOTIFY push for supported phones")
     parser.add_argument("--test", action="store_true", help="Send a fake Tornado Warning to registered phones and exit")
     parser.add_argument("--event", default="", help="Synthetic alert event to push, for PBX tests")
@@ -1962,9 +2298,11 @@ def main():
     parser.add_argument("--description", default="", help="Synthetic alert description")
     parser.add_argument("--expires-minutes", type=int, default=45, help="Synthetic alert expiration in minutes")
     parser.add_argument("--test-id", default="", help="Synthetic alert ID")
+    parser.add_argument("--is-test", action="store_true", help="Explicitly mark a trusted local test publication for desktop clients")
     parser.add_argument("--alert-json-b64", default="", help="Base64-encoded NWS alert feature JSON to push once")
     parser.add_argument("--targets", default="", help="Comma-separated endpoint list to notify")
     parser.add_argument("--announcement", default="", help="Send this text-only SIP NOTIFY announcement and exit")
+    parser.add_argument("--incident-json", default="", help="Typed internal incident context for desktop announcement publication")
     parser.add_argument("--announcement-image", action="store_true", help="Render announcement as an image screen for image-capable phone formats")
     parser.add_argument("--announcement-title", default="Announcement", help="Announcement image title")
     parser.add_argument("--announcement-bg-color", default="#1f2937", help="Announcement image background color")
@@ -1974,12 +2312,32 @@ def main():
     parser.add_argument("--desktop-all", action="store_true", help="Allow all enabled desktop app clients to receive this API event")
     parser.add_argument("--no-api", action="store_true", help="Do not publish this announcement/alert to the desktop API journal")
     parser.add_argument("--api-only", action="store_true", help="Publish announcement to the desktop API journal without sending SIP NOTIFY")
+    parser.add_argument('--latest-start', type=int, help='Absolute scheduled desktop publication deadline')
     parser.add_argument("--require-all-targets", action="store_true", help="Fail unless every requested phone endpoint is registered and reachable (manual delivery tests)")
     parser.add_argument("--list-endpoints-json", action="store_true", help="Print registered endpoint vendor detection as JSON and exit")
     parser.add_argument("--ami-health-json", action="store_true", help="Authenticate to AMI, issue Ping, and print a JSON health result")
     parser.add_argument("--notify-capabilities-json", action="store_true", help="Print adaptive Asterisk SIP NOTIFY routing capabilities and exit")
     parser.add_argument("--no-retry", action="store_true", help="Do not send delayed visual retries")
+    parser.add_argument('--visual-owner', default='', help='Internal live-page popup identity')
+    parser.add_argument('--clear-visual-owner', default='', help='Clear only this live page’s current popup')
     args = parser.parse_args()
+    if args.visual_owner or args.clear_visual_owner:
+        if (not args.announcement or not args.targets or not args.no_api or not args.no_retry or args.api_only
+                or args.desktop_targets or args.desktop_all or args.incident_json
+                or (args.visual_owner and args.clear_visual_owner)
+                or any(token and not re.fullmatch(r'[a-f0-9]{32}', token) for token in (args.visual_owner, args.clear_visual_owner))
+                or (args.clear_visual_owner and (args.announcement_image or args.announcement_timeout_seconds != 1))):
+            parser.error('Live-page popup ownership requires a bounded phone-only request')
+    incident = None
+    if args.incident_json:
+        if not args.announcement or not args.api_only or len(args.incident_json) > 1024:
+            parser.error('Incident metadata requires a bounded desktop-only announcement')
+        try:
+            incident = normalize_incident_context(json.loads(args.incident_json))
+            if incident is None or incident['is_test'] != args.is_test:
+                raise ValueError('Incident test marker mismatch')
+        except (ValueError, TypeError):
+            parser.error('Incident metadata is invalid or its test marker disagrees')
 
     try:
         config = load_config()
@@ -2050,6 +2408,10 @@ def main():
                 desktop_targets=desktop_targets,
                 desktop_all=args.desktop_all,
                 timeout_seconds=normalize_announcement_timeout_seconds(args.announcement_timeout_seconds),
+                is_test=args.is_test,
+                incident=incident,
+                latest_start=args.latest_start,
+                visual_owner=args.visual_owner, clear_visual_owner=args.clear_visual_owner,
             )
         elif args.alert_json_b64:
             alert = alert_from_json_b64(args.alert_json_b64)
@@ -2058,6 +2420,7 @@ def main():
                 targets=targets, api_publish=not args.no_api, api_only=args.api_only,
                 desktop_targets=desktop_targets, desktop_all=args.desktop_all,
                 require_all_targets=args.require_all_targets,
+                is_test=args.is_test,
             )
         elif args.event:
             description = args.description or "PBX test visual alert. This image was generated by the FreePBX Mass Notifications testing page."
@@ -2067,12 +2430,16 @@ def main():
                 targets=targets, api_publish=not args.no_api, api_only=args.api_only,
                 desktop_targets=desktop_targets, desktop_all=args.desktop_all,
                 require_all_targets=args.require_all_targets,
+                is_test=True,
             )
         elif args.test:
             run_test(config, retries=not args.no_retry)
         else:
             parser.print_help(sys.stderr)
             return 2
+    except ScheduledStartExpired:
+        print('SLS_SUBMISSION_REJECTED schedule_deadline_expired', flush=True)
+        return 78
     except Exception as exc:
         logging.error("Fatal startup error: %s", exc)
         print(f"ERROR: {exc}", file=sys.stderr)

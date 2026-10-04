@@ -22,6 +22,7 @@ $fixture->profiles[0]['channels']='visual';
 $visual=$fixture->runTestProfile('chosen');
 if ($visual['ttsAudio'] || $visual['options']['_test_channels']['audio']!==[] || $visual['options']['_test_channels']['webhook']!==[]) throw new RuntimeException('Visual-only profile leaked audio/webhooks');
 if (strpos($visual['message'],'SYSTEM TEST')===false) throw new RuntimeException('Missing test label');
+if (($visual['options']['_is_test'] ?? false) !== true || ($audio['options']['_is_test'] ?? false) !== true) throw new RuntimeException('Saved channel test lacks explicit test metadata');
 if (!empty($fixture->runTestProfile('missing')['success'])) throw new RuntimeException('Missing profile accepted');
 $bound=$class->getMethod('normalizePagingAnswerTimeout'); $bound->setAccessible(true);
 foreach ([-100=>1,0=>1,1=>1,3=>3,5=>5,999=>5] as $input=>$expected) if ($bound->invoke($fixture,$input)!==$expected) throw new RuntimeException('Paging answer bound failed');

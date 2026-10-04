@@ -14,6 +14,31 @@ if (!$health && !$reconcile && !(preg_match('/^job_[a-f0-9]{32}$/D', $id) && ($s
     fwrite(STDERR, "Usage: sls_mass_notify_announcement_worker.php --help\n"); exit(2);
 }
 ini_set('display_errors', '0');
+/** Standby supervision must not retire work owned by an active peer. */
+function slsAnnouncementJournalAuthority(): bool
+{
+    $helper=__DIR__.'/sls_mass_notify_cluster_effect.php';
+    if (!is_file($helper)) {
+        // Disposable lifecycle fixtures copy this worker into a private folder.
+        // A complete installed runtime must contain the authenticated guard.
+        return __DIR__ !== '/usr/local/bin/sls_mass_notify';
+    }
+    $pipes=[];
+    $process=@proc_open([PHP_BINARY,$helper],[0=>['pipe','r'],1=>['pipe','w'],2=>['file','/dev/null','w']],$pipes,
+        '/', ['PATH'=>'/usr/bin:/bin','LANG'=>'C.UTF-8'], ['bypass_shell'=>true]);
+    if (!is_resource($process)) { return false; }
+    fwrite($pipes[0],'{"action":"authority"}');fclose($pipes[0]);
+    stream_set_blocking($pipes[1],false);$body='';$deadline=microtime(true)+16;$status=null;
+    do {
+        $body.=(string)stream_get_contents($pipes[1],4097-strlen($body));
+        $status=proc_get_status($process);
+        if(strlen($body)>4096||microtime(true)>$deadline){proc_terminate($process,9);break;}
+        if($status['running']){usleep(20000);}
+    } while ($status['running']);
+    fclose($pipes[1]);$closed=proc_close($process);$code=$status['exitcode']>=0?$status['exitcode']:$closed;
+    $reply=json_decode($body,true);
+    return $code===0&&is_array($reply)&&($reply['ok']??null)===true;
+}
 $phase = 'worker_start_failed'; $finished = false; $store = null;
 register_shutdown_function(static function () use (&$finished, &$store, &$phase, $id, $health, $reconcile, $arguments) {
     if ($finished) { return; }
@@ -26,7 +51,7 @@ register_shutdown_function(static function () use (&$finished, &$store, &$phase,
         error_log('SLS announcement health: ' . $phase);
         exit(1);
     }
-    if ($store && !$health && !$reconcile) {
+    if ($store && !$health && !$reconcile && slsAnnouncementJournalAuthority()) {
         try { $store->fail($id, $phase); } catch (Throwable $ignored) {}
     }
     error_log('SLS announcement worker: ' . $phase);
@@ -41,6 +66,10 @@ try {
         }
     }
     $store = new SlsAnnouncementJobStore();
+    if (!$health && !slsAnnouncementJournalAuthority()) {
+        error_log('SLS announcement worker: cluster_authority_unavailable; queued work preserved');
+        $finished=true;exit(1);
+    }
     if ($reconcile) {
         $ok = true;
         foreach ($store->pendingIds() as $pending) {
@@ -55,7 +84,7 @@ try {
         $process = @proc_open(['/usr/bin/timeout', '--kill-after=5s', '900', PHP_BINARY, __FILE__, $id],
             [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
             $pipes, null, null, ['bypass_shell' => true]);
-        if (!is_resource($process)) { $store->fail($id, 'worker_start_failed'); $finished = true; exit(1); }
+        if (!is_resource($process)) { if(slsAnnouncementJournalAuthority()){$store->fail($id, 'worker_start_failed');} $finished = true; exit(1); }
         foreach ($pipes as $pipe) { stream_set_blocking($pipe, false); }
         $deadline = microtime(true) + 910; $diagnostic = ''; $exitCode = -1; $timedOut = false;
         while (true) {
@@ -84,7 +113,7 @@ try {
         $job = $store->read($id);
         if ($job && in_array($job['state'] ?? '', SlsAnnouncementJobStore::PENDING, true)) {
             $category = $timedOut ? 'worker_timeout' : (($job['state'] ?? '') === 'running' ? 'worker_runtime_failed' : 'worker_start_failed');
-            $store->fail($id, $category);
+            if(slsAnnouncementJournalAuthority()){$store->fail($id, $category);}
             if ($exitCode === 0) { $exitCode = 1; }
         }
         $job = $store->read($id);
@@ -117,7 +146,7 @@ try {
     $ok = $module->processAnnouncementJobs($id);
     $finished = true; exit($ok ? 0 : 1);
 } catch (Throwable $error) {
-    if ($store && !$health && !$reconcile) {
+    if ($store && !$health && !$reconcile && slsAnnouncementJournalAuthority()) {
         try { $store->fail($id, $phase); } catch (Throwable $ignored) {}
     }
     if ($health) {

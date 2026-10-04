@@ -152,6 +152,26 @@ if set(multi_area_faults) != {
 }:
     fail(f"Lightning aggregate/group faults were duplicated or incomplete: {sorted(multi_area_faults)}")
 
+# A later successful local alert or all-clear cannot resolve a previous HTTP
+# submission whose receipt is unknown. Only external health clears that fault.
+external_status = {
+    "last_xweather_delivery_status": "queued",
+    "last_xweather_delivery_message": "New all-clear local channels submitted.",
+    "last_xweather_external_status": "fault",
+    "last_xweather_external_message": "One external submission is unconfirmed; replay suppressed.",
+    "last_xweather_external_at": "2026-09-20T12:00:00Z",
+    "xweather_groups": {"north": {"group_name": "North", "last_xweather_delivery_status": "queued"}},
+}
+faults = MODULE.collect_faults(external_status, {}, {}, {})
+assert set(faults) == {"lightning_external"}
+assert "unconfirmed" in faults["lightning_external"]["message"]
+external_status["xweather_groups"]["north"].update({key: value for key, value in external_status.items() if key.startswith("last_xweather_external_")})
+faults = MODULE.collect_faults(external_status, {}, {}, {})
+assert set(faults) == {"lightning_group_north_external"}
+external_status["last_xweather_external_status"] = "complete"
+external_status["xweather_groups"]["north"]["last_xweather_external_status"] = "complete"
+assert MODULE.collect_faults(external_status, {}, {}, {}) == {}
+
 with tempfile.TemporaryDirectory(prefix="sls-system-email-status-") as directory:
     status_path = Path(directory) / "status.json"
     status_path.write_text(json.dumps({
@@ -244,8 +264,12 @@ with tempfile.TemporaryDirectory(prefix="sls-system-email-") as directory:
         sender=accepted_sender,
         now=1_000_180,
     )
+    if len(calls) != 1:
+        fail("a flapping fault bypassed the 24-hour recurrence limit")
+    MODULE.process_faults(config, {}, state_path, sender=accepted_sender, now=1_000_240)
+    MODULE.process_faults(config, {"weather": first_fault}, state_path, sender=accepted_sender, now=1_086_401)
     if len(calls) != 2:
-        fail("a fault recurrence after a healthy transition was not sent")
+        fail("a fault recurrence after the daily limit was not sent")
 
 
 with tempfile.TemporaryDirectory(prefix="sls-system-email-retry-") as directory:

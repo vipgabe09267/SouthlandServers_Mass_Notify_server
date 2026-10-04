@@ -35,7 +35,7 @@ with tempfile.TemporaryDirectory() as directory:
         requested.append(url)
         if '/points/' in url:
             return {'properties': {'forecastGridData': 'https://api.weather.gov/gridpoints/NEW/1,1'}}
-        return {'properties': {'weather': {'values': []}}}
+        return {'properties': {'weather': {'values': [{'validTime': '1970-01-01T00:00:00Z/PT12H', 'value': []}]}}}
     m._nws_json = fake_nws
     result = m.forecast_storm_gate({}, new, 1000, 60)
     assert not result[0]

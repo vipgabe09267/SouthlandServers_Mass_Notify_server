@@ -20,6 +20,8 @@ FREEPBX_GPG_HOME=""
 FREEPBX_USER_HOME=""
 FREEPBX_ASTSPOOLDIR=""
 SIGNING_FINGERPRINT=""
+TRUST_HELPER="${SLS_LOCAL_TRUST_HELPER:-/usr/local/bin/sls_mass_notify/sls_module_trust.py}"
+TRUST_ROOT="/var/lib/sls-mass-notify-trust"
 
 log() {
 	printf 'SLS local signer: %s\n' "$*" >&2
@@ -45,20 +47,22 @@ close_inherited_maintenance_lock() {
 	done
 }
 
-restore_previous_signature() {
-	local restore_target
+signature_operation() {
+	local action="$1"
+	shift
+	/usr/bin/python3 -I "$TRUST_HELPER" signature-file --module "$MODULE" \
+		--web-root "$FREEPBX_WEB_ROOT" --web-user "$FREEPBX_WEB_USER" --action "$action" "$@"
+}
 
+restore_previous_signature() {
 	[ "$SIGNATURE_PUBLISHED" -eq 1 ] || return 0
-	if [ -n "$PREVIOUS_SIG" ] && [ -f "$PREVIOUS_SIG" ]; then
-		restore_target="${MODULE_DIR}/.module.sig.sls-restore.$$"
-		if ! cp -p -- "$PREVIOUS_SIG" "$restore_target" \
-			|| ! mv -f -- "$restore_target" "$MODULE_SIG"; then
-			rm -f -- "$restore_target"
+	if [ -n "$PREVIOUS_SIG" ]; then
+		if ! signature_operation restore --path "$PREVIOUS_SIG" >/dev/null; then
 			log "CRITICAL: unable to restore the previous signature for $MODULE."
 			return 1
 		fi
 	else
-		if ! rm -f -- "$MODULE_SIG"; then
+		if ! signature_operation remove >/dev/null; then
 			log "CRITICAL: unable to remove the rejected signature for $MODULE."
 			return 1
 		fi
@@ -88,7 +92,7 @@ load_freepbx_metadata() {
 	local metadata_file="$WORKDIR/freepbx-signing-metadata"
 	local -a metadata
 
-	if ! php -d pcre.jit=0 -r '
+	if ! /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 -r '
 $bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
 require "/etc/freepbx.conf";
 $webUser = trim((string)\FreePBX::Config()->get("AMPASTERISKWEBUSER"));
@@ -139,12 +143,44 @@ validate_absolute_path() {
 		&& [[ "$path" != *$'\r'* ]]
 }
 
+# PHP runs without privilege, so its output is a request, not authority to
+# select a different root-maintained account/home. Resolve those via passwd.
+validate_account_metadata() {
+	/usr/bin/python3 -I - "$FREEPBX_WEB_USER" "$FREEPBX_USER_HOME" "$FREEPBX_ASTSPOOLDIR" "$FREEPBX_GPG_HOME" <<'PYACCOUNT'
+import os
+from pathlib import Path
+import pwd
+import stat
+import sys
+user, reported_home, spool, gpg = sys.argv[1:]
+account = pwd.getpwnam(user)
+if user != "asterisk" or account.pw_uid == 0 or reported_home != account.pw_dir:
+    raise SystemExit("FreePBX signing metadata must match the unprivileged service account")
+home = Path(account.pw_dir)
+if home.is_dir():
+    expected = str(home / ".gnupg")
+else:
+    parent = Path(spool)
+    info = parent.lstat()
+    if (not parent.is_absolute() or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != account.pw_uid or info.st_mode & 0o002):
+        raise SystemExit("Asterisk fallback signing directory is not owned by its service account")
+    expected = str(parent / ".gnupg")
+if gpg != expected:
+    raise SystemExit("FreePBX signing metadata points outside the service account GPG home")
+PYACCOUNT
+}
+
 validate_freepbx_metadata() {
 	local module_root expected_module_dir canonical_module_dir
 	local canonical_gpg_home canonical_user_home canonical_spool_home
 
 	id "$FREEPBX_WEB_USER" >/dev/null 2>&1 || {
 		log "Configured FreePBX web user does not exist: $FREEPBX_WEB_USER"
+		return 1
+	}
+	[ "$(id -u "$FREEPBX_WEB_USER")" -ne 0 ] || {
+		log "Refusing privileged FreePBX web-account metadata."
 		return 1
 	}
 	[ -n "$FREEPBX_WEB_GROUP" ] || {
@@ -180,6 +216,7 @@ validate_freepbx_metadata() {
 		return 1
 	fi
 	FREEPBX_GPG_HOME="$canonical_gpg_home"
+	validate_account_metadata || return 1
 
 	module_root="$(readlink -m -- "${FREEPBX_WEB_ROOT}/admin/modules")"
 	expected_module_dir="${module_root}/${MODULE}"
@@ -368,34 +405,73 @@ EOF
 }
 
 prepare_freepbx_gpg_home() {
-	local freepbx_home_symlink=""
-
-	install -d -m 0700 -o "$FREEPBX_WEB_USER" -g "$FREEPBX_WEB_GROUP" "$FREEPBX_GPG_HOME" || {
-		log "Unable to prepare the exact FreePBX GPG home."
-		return 1
-	}
-	if ! freepbx_home_symlink="$(find "$FREEPBX_GPG_HOME" -xdev -type l -print -quit)"; then
-		log "Unable to inspect the FreePBX GPG home."
-		return 1
-	fi
-	if [ -n "$freepbx_home_symlink" ]; then
-		log "Refusing a FreePBX GPG home containing symbolic links."
-		return 1
-	fi
-	# Restored/cloned PBXs commonly contain root-owned keybox or trust files.
-	# Repair the exact FreePBX GPG home before invoking GPG as its web account.
-	chown -R -h "$FREEPBX_WEB_USER:$FREEPBX_WEB_GROUP" "$FREEPBX_GPG_HOME" || {
-		log "Unable to repair FreePBX GPG-home ownership."
-		return 1
-	}
-	find "$FREEPBX_GPG_HOME" -xdev -type d -exec chmod 0700 {} + || {
-		log "Unable to secure FreePBX GPG-home directories."
-		return 1
-	}
-	find "$FREEPBX_GPG_HOME" -xdev -type f -exec chmod 0600 {} + || {
-		log "Unable to secure FreePBX GPG-home files."
-		return 1
-	}
+	# Repair restored ownership through descriptors. In particular, a hardlink
+	# planted in the web-owned keyring must not chmod/chown its external target.
+	/usr/bin/python3 -I - "$FREEPBX_GPG_HOME" "$FREEPBX_WEB_USER" <<'PYHOME'
+import os
+from pathlib import Path
+import pwd
+import stat
+import sys
+path = Path(sys.argv[1]); account = pwd.getpwnam(sys.argv[2])
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+parent = os.open("/", flags)
+root = -1
+try:
+    for part in path.parts[1:-1]:
+        child = os.open(part, flags, dir_fd=parent)
+        os.close(parent); parent = child
+    try:
+        os.mkdir(path.name, 0o700, dir_fd=parent)
+    except FileExistsError:
+        pass
+    root = os.open(path.name, flags, dir_fd=parent)
+    count = 0
+    def repair(fd):
+        global count
+        current = os.fstat(fd)
+        if current.st_uid not in (0, account.pw_uid):
+            raise RuntimeError("Unexpected owner in the service account keyring")
+        for name in os.listdir(fd):
+            count += 1
+            if count > 5000:
+                raise RuntimeError("Service account keyring exceeds inspection limit")
+            before = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if (fd == root and stat.S_ISSOCK(before.st_mode) and before.st_uid == account.pw_uid
+                    and before.st_gid == account.pw_gid and before.st_nlink == 1
+                    and name in {"S.gpg-agent", "S.gpg-agent.browser", "S.gpg-agent.extra", "S.gpg-agent.ssh", "S.dirmngr"}):
+                # Existing top-level agent/dirmngr sockets are IPC endpoints, not
+                # key files. Preserve them without opening, connecting, chmod,
+                # chown, unlink, or following anything at the socket path.
+                continue
+            if stat.S_ISDIR(before.st_mode):
+                child = os.open(name, flags, dir_fd=fd)
+            elif stat.S_ISREG(before.st_mode) and before.st_nlink == 1:
+                child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=fd)
+            else:
+                raise RuntimeError("Unsafe link or special file in service account keyring")
+            try:
+                opened = os.fstat(child)
+                current = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if ((before.st_dev, before.st_ino, before.st_mode, before.st_nlink)
+                        != (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_nlink)
+                        or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+                        or opened.st_uid not in (0, account.pw_uid)):
+                    raise RuntimeError("Service account keyring changed during permission repair")
+                if stat.S_ISDIR(opened.st_mode):
+                    repair(child)
+                else:
+                    os.fchown(child, account.pw_uid, account.pw_gid)
+                    os.fchmod(child, 0o600)
+            finally:
+                os.close(child)
+        os.fchown(fd, account.pw_uid, account.pw_gid)
+        os.fchmod(fd, 0o700)
+    repair(root)
+finally:
+    if root >= 0: os.close(root)
+    os.close(parent)
+PYHOME
 }
 
 run_freepbx_gpg() {
@@ -449,22 +525,48 @@ trust_signing_key_in_freepbx() {
 	}
 }
 
+# The executable helper and registry are root-protected installation inputs.
+# A web-owned manifest or a successful old local signature is never enrollment.
+approved_module_hashes() {
+	local -a trust_arguments=()
+	if [ "${SLS_LOCAL_TRUST_MODE:-installed}" = "uninstalled" ]; then
+		trust_arguments+=(--uninstalled)
+	elif [ "${SLS_LOCAL_TRUST_MODE:-installed}" != "installed" ]; then
+		log "Unknown signing inventory mode."
+		return 1
+	fi
+	[ -f "$TRUST_HELPER" ] && [ ! -L "$TRUST_HELPER" ] || {
+		log "Protected module trust helper is unavailable; run the verified installer."
+		return 1
+	}
+	/usr/bin/python3 -I - "$TRUST_HELPER" <<'PYGUARD' || return 1
+import os
+from pathlib import Path
+import stat
+import sys
+path = Path(sys.argv[1])
+for item in [path] + list(path.parents)[:-1]:
+    info = item.lstat()
+    if (stat.S_ISLNK(info.st_mode) or info.st_uid != 0
+            or info.st_mode & 0o022 and not (item != path and info.st_mode & stat.S_ISVTX)):
+        raise SystemExit("Module trust helper is not protected from web-account changes")
+if not path.is_file() or path.stat().st_nlink != 1:
+    raise SystemExit("Module trust helper is not a single-link regular file")
+PYGUARD
+	/usr/bin/python3 -I "$TRUST_HELPER" --root "$TRUST_ROOT" hashes --module "$MODULE" --web-root "$FREEPBX_WEB_ROOT" "${trust_arguments[@]}"
+}
+
 build_candidate_signature() {
 	local keyid="${SIGNING_FINGERPRINT: -16}"
-	local file_list="$WORKDIR/module-files.list"
-	local relative_file file_hash timestamp
+	local approved_hash_file="$WORKDIR/approved-hashes"
+	local timestamp
 
 	if ! timestamp="$(php -r 'printf("%.4f", microtime(true));')"; then
 		log "Unable to create the module signature timestamp."
 		return 1
 	fi
-	if ! find "$MODULE_DIR" -type f \
-			! -name 'module.sig' \
-			! -name '.module.sig.sls-*' \
-			! -name '*.pyc' \
-			! -path '*/__pycache__/*' \
-			-printf '%P\0' | LC_ALL=C sort -z >"$file_list"; then
-		log "Unable to enumerate module files for signing."
+	if ! approved_module_hashes >"$approved_hash_file"; then
+		log "No reviewed inventory authorizes this module tree. Existing signatures are preserved."
 		return 1
 	fi
 
@@ -489,22 +591,7 @@ EOF
 		log "Unable to build the plain-text module signature manifest."
 		return 1
 	fi
-	while IFS= read -r -d '' relative_file; do
-		[[ "$relative_file" != *$'\n'* && "$relative_file" != *'='* ]] || {
-			log "Module contains a filename that cannot be represented safely in module.sig."
-			return 1
-		}
-		if ! file_hash="$(sha256sum "$MODULE_DIR/$relative_file" | awk '{print $1}')"; then
-			log "Unable to hash module file: $relative_file"
-			return 1
-		fi
-		[[ "$file_hash" =~ ^[a-f0-9]{64}$ ]] || {
-			log "Invalid SHA-256 result for module file: $relative_file"
-			return 1
-		}
-		printf '%s = %s\n' "$relative_file" "$file_hash" \
-			>>"$WORKDIR/module.plain" || return 1
-	done <"$file_list"
+	cat "$approved_hash_file" >>"$WORKDIR/module.plain" || return 1
 
 	if ! signing_home_gpg 90 --pinentry-mode loopback --passphrase '' \
 		--local-user "${SIGNING_FINGERPRINT}!" --clearsign \
@@ -515,7 +602,7 @@ EOF
 }
 
 verify_published_signature() {
-	SIGN_MODULE="$MODULE" php -d pcre.jit=0 -r '
+	SIGN_MODULE="$MODULE" /usr/sbin/runuser -u "$FREEPBX_WEB_USER" -- /usr/bin/php -d pcre.jit=0 -r '
 $bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
 require "/etc/freepbx.conf";
 $module = (string)getenv("SIGN_MODULE");
@@ -541,30 +628,22 @@ exit(0);
 }
 
 publish_candidate_transactionally() {
-	local candidate_target="${MODULE_DIR}/.module.sig.sls-new.$$"
-
+	local previous_state
 	PREVIOUS_SIG=""
-	if [ -e "$MODULE_SIG" ]; then
-		[ -f "$MODULE_SIG" ] && [ ! -L "$MODULE_SIG" ] || {
-			log "Existing module signature is not a safe regular file."
-			return 1
-		}
-		if ! cp -p -- "$MODULE_SIG" "$WORKDIR/module.sig.previous"; then
-			log "Unable to preserve the previous module signature."
-			return 1
-		fi
-		PREVIOUS_SIG="$WORKDIR/module.sig.previous"
-	fi
-
-	if ! install -m 0644 -o "$FREEPBX_WEB_USER" -g "$FREEPBX_WEB_GROUP" \
-		"$WORKDIR/module.sig.candidate" "$candidate_target"; then
-		log "Unable to stage the candidate module signature."
-		rm -f -- "$candidate_target"
+	if ! previous_state="$(signature_operation backup --path "$WORKDIR/module.sig.previous")"; then
+		log "Unable to preserve the previous module signature safely."
 		return 1
 	fi
-	if ! mv -f -- "$candidate_target" "$MODULE_SIG"; then
-		log "Unable to publish the candidate module signature."
-		rm -f -- "$candidate_target"
+	if [ "$previous_state" = "present" ]; then
+		PREVIOUS_SIG="$WORKDIR/module.sig.previous"
+	elif [ "$previous_state" != "absent" ]; then
+		log "Unexpected module signature backup state."
+		return 1
+	fi
+	SIGNATURE_PUBLISHED=1
+	if ! signature_operation publish --path "$WORKDIR/module.sig.candidate" >/dev/null; then
+		log "Unable to publish the candidate module signature safely."
+		restore_previous_signature || true
 		return 1
 	fi
 	SIGNATURE_PUBLISHED=1
@@ -573,7 +652,9 @@ publish_candidate_transactionally() {
 		restore_previous_signature
 		return 1
 	fi
-	if verify_published_signature; then
+	if approved_module_hashes >"$WORKDIR/postpublication-hashes" \
+		&& cmp -s "$WORKDIR/approved-hashes" "$WORKDIR/postpublication-hashes" \
+		&& verify_published_signature; then
 		SIGNATURE_PUBLISHED=0
 		return 0
 	fi
@@ -618,6 +699,7 @@ main() {
 	chmod 0700 "$WORKDIR"
 	load_freepbx_metadata
 	validate_freepbx_metadata
+	approved_module_hashes >"$WORKDIR/preflight-hashes"
 	prepare_signing_home
 	select_usable_signing_key
 

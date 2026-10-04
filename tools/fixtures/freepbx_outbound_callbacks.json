@@ -1,0 +1,1164 @@
+{
+  "provenance": "Read-only generated FreePBX17 dialplan; core17.0.18.54,missedcall17.0.6,sangomacrm17.0.1.26,allowlist17.0.1.1. All four installed vendor signatures verified129 with no mismatches. No call originated.",
+  "contexts": {
+    "macro-dialout-trunk": [
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "1",
+        "Priority": "1",
+        "Application": "Goto",
+        "AppData": "s-INVALIDNMBR,1"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "17",
+        "Priority": "1",
+        "Application": "Goto",
+        "AppData": "s-BUSY,1"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "18",
+        "Priority": "1",
+        "Application": "Goto",
+        "AppData": "s-NOANSWER,1"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "22",
+        "Priority": "1",
+        "Application": "Goto",
+        "AppData": "s-CHANGED,1"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "23",
+        "Priority": "1",
+        "Application": "Goto",
+        "AppData": "s-CHANGED,1"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "28",
+        "Priority": "1",
+        "Application": "Goto",
+        "AppData": "s-INVALIDNMBR,1"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "bypass",
+        "Priority": "1",
+        "Application": "Noop",
+        "AppData": "TRUNK: ${OUT_${DIAL_TRUNK}} BYPASSING because dialout-trunk-predial-hook"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "continue",
+        "Priority": "1",
+        "Application": "Noop",
+        "AppData": "TRUNK Dial failed due to ${DIALSTATUS} HANGUPCAUSE: ${HANGUPCAUSE} - failing through to other trunks"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "continue",
+        "Priority": "2",
+        "Application": "ExecIf",
+        "AppData": "$[\"${AMPUSER}\"!=\"\" ]?Set(CALLERID(number)=${AMPUSER})"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "continue",
+        "Priority": "3",
+        "Application": "Return",
+        "AppData": ""
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "disabletrunk",
+        "Priority": "1",
+        "Application": "Noop",
+        "AppData": "TRUNK: ${OUT_${DIAL_TRUNK}} DISABLED - falling through to next trunk"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "h",
+        "Priority": "1",
+        "Application": "Gosub",
+        "AppData": "macro-hangupcall,s,1()"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "1",
+        "Application": "Set",
+        "AppData": "DIAL_TRUNK=${ARG1}"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "2",
+        "Application": "ExecIf",
+        "AppData": "$[\"${DIRECTION}\" = \"INBOUND\"]?Set(DIAL_OPTIONS=${STRREPLACE(DIAL_OPTIONS,T)})"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "3",
+        "Application": "ExecIf",
+        "AppData": "$[\"${QCALLBACK}\" = \"1\"]?Set(DIAL_OPTIONS=${STRREPLACE(DIAL_OPTIONS,t)})"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "4",
+        "Application": "ExecIf",
+        "AppData": "$[\"${QCALLBACK}\" = \"1\"]?Set(DIAL_OPTIONS=${STRREPLACE(DIAL_OPTIONS,T)})"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "5",
+        "Application": "GosubIf",
+        "AppData": "$[$[\"${ARG3}\" != \"\"] & $[\"${DB(AMPUSER/${AMPUSER}/pinless)}\" != \"NOPASSWD\"]]?sub-pincheck,s,1(${ARG3})"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "6",
+        "Application": "ExecIf",
+        "AppData": "$[\"${INTRACOMPANYROUTE}\" = \"YES\" & ${DB_EXISTS(AMPUSER/${AMPUSER}/cidnum)} & \"${AMPUSER}\" != \"${DB(AMPUSER/${AMPUSER}/cidnum)}\"]?Set(CALLERID(num)=${DB(AMPUSER/${AMPUSER}/cidnum)})"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "7",
+        "Application": "GotoIf",
+        "AppData": "$[\"x${OUTDISABLE_${DIAL_TRUNK}}\" = \"xon\"]?disabletrunk,1"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "8",
+        "Application": "Set",
+        "AppData": "DIAL_NUMBER=${ARG2}"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "9",
+        "Application": "Set",
+        "AppData": "DIAL_TRUNK_OPTIONS=${DIAL_OPTIONS}"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "10",
+        "Application": "Set",
+        "AppData": "OUTBOUND_GROUP=OUT_${DIAL_TRUNK}"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "11",
+        "Application": "Set",
+        "AppData": "DIAL_TRUNK_OPTIONS=${IF($[\"${DB_EXISTS(TRUNK/${DIAL_TRUNK}/dialopts)}\" = \"1\"]?${DB_RESULT}:${TRUNK_OPTIONS})}"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "12",
+        "Application": "ExecIf",
+        "AppData": "$[\"${QCALLBACK}\" = \"1\"]?Set(DIAL_TRUNK_OPTIONS=${STRREPLACE(DIAL_TRUNK_OPTIONS,T)})"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "13",
+        "Application": "GotoIf",
+        "AppData": "$[\"${OUTMAXCHANS_${DIAL_TRUNK}}\" = \"\"]?nomax"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "14",
+        "Application": "GotoIf",
+        "AppData": "$[ ${GROUP_COUNT(OUT_${DIAL_TRUNK})} >= ${OUTMAXCHANS_${DIAL_TRUNK}} ]?chanfull"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "15",
+        "Application": "GotoIf",
+        "AppData": "$[\"${INTRACOMPANYROUTE}\" = \"YES\"]?skipoutcid",
+        "ExtensionLabel": "nomax"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "16",
+        "Application": "Gosub",
+        "AppData": "macro-outbound-callerid,s,1(${DIAL_TRUNK})"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "17",
+        "Application": "GosubIf",
+        "AppData": "$[\"${PREFIX_TRUNK_${DIAL_TRUNK}}\" != \"\"]?sub-flp-${DIAL_TRUNK},s,1()",
+        "ExtensionLabel": "skipoutcid"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "18",
+        "Application": "Set",
+        "AppData": "OUTNUM=${OUTPREFIX_${DIAL_TRUNK}}${DIAL_NUMBER}"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "19",
+        "Application": "Set",
+        "AppData": "custom=${CUT(OUT_${DIAL_TRUNK},:,1)}"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "20",
+        "Application": "ExecIf",
+        "AppData": "$[\"${MOHCLASS}\"!=\"default\" & \"${MOHCLASS}\"!=\"\" & \"${FORCE_CONFIRM}\"=\"\" ]?Set(DIAL_TRUNK_MOH=${MOHCLASS})"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "21",
+        "Application": "ExecIf",
+        "AppData": "$[\"${FORCE_CONFIRM}\"!=\"\" ]?Set(DIAL_TRUNK_OPTIONS=${DIAL_TRUNK_OPTIONS}U(macro-confirm))"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "22",
+        "Application": "ExecIf",
+        "AppData": "$[${DB_EXISTS(allowlist/autoadd/${ROUTEID})}]?AGI(allowlist-autoadd.agi,)"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "23",
+        "Application": "Gosub",
+        "AppData": "macro-dialout-trunk-predial-hook,s,1()",
+        "ExtensionLabel": "gocall"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "24",
+        "Application": "GotoIf",
+        "AppData": "$[\"${CRM_DIRECTION}\"!=\"\"]?skipcrm"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "25",
+        "Application": "Set",
+        "AppData": "__CRM_DIRECTION=OUTBOUND"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "26",
+        "Application": "Set",
+        "AppData": "__CRM_DESTINATION=${OUTNUM}"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "27",
+        "Application": "Set",
+        "AppData": "__CRM_SOURCE=${AMPUSER}"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "28",
+        "Application": "AGI",
+        "AppData": "agi://127.0.0.1/sangomacrm.agi"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "29",
+        "Application": "Set",
+        "AppData": "CHANNEL(hangup_handler_push)=crm-hangup,s,1"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "30",
+        "Application": "Noop",
+        "AppData": "CRM Finished",
+        "ExtensionLabel": "skipcrm"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "31",
+        "Application": "GotoIf",
+        "AppData": "$[\"${PREDIAL_HOOK_RET}\" = \"BYPASS\"]?bypass,1"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "32",
+        "Application": "ExecIf",
+        "AppData": "$[\"${DB(AMPUSER/${AMPUSER}/cidname)}\" != \"\"]?Set(CONNECTEDLINE(num,i)=${DIAL_NUMBER})"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "33",
+        "Application": "ExecIf",
+        "AppData": "$[$[\"${DB(AMPUSER/${AMPUSER}/cidname)}\" != \"\"] & $[\"${CALLERID(name)}\"!=\"hidden\"]]?Set(CONNECTEDLINE(name,i)=CID:${CALLERID(number)})"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "34",
+        "Application": "ExecIf",
+        "AppData": "$[$[\"${DB(AMPUSER/${AMPUSER}/cidname)}\" != \"\"] & $[\"${CALLERID(name)}\"=\"hidden\"]]?Set(CONNECTEDLINE(name,i)=CID:(Hidden)${CALLERID(number)})"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "35",
+        "Application": "GotoIf",
+        "AppData": "$[\"${custom}\" = \"AMP\"]?customtrunk"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "36",
+        "Application": "ExecIf",
+        "AppData": "$[\"${DIRECTION}\" = \"INBOUND\"]?Set(DIAL_TRUNK_OPTIONS=${STRREPLACE(DIAL_TRUNK_OPTIONS,T)})"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "37",
+        "Application": "Set",
+        "AppData": "HASH(__SIPHEADERS,Alert-Info)=unset"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "38",
+        "Application": "Gosub",
+        "AppData": "trunk-dial-with-exten,${DIAL_NUMBER},1()"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "39",
+        "Application": "Noop",
+        "AppData": "Dial failed for some reason with DIALSTATUS = ${DIALSTATUS} and HANGUPCAUSE = ${HANGUPCAUSE}"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "40",
+        "Application": "GotoIf",
+        "AppData": "$[\"${ARG4}\" = \"on\"]?continue,1:s-${DIALSTATUS},1"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "41",
+        "Application": "Set",
+        "AppData": "pre_num=${CUT(OUT_${DIAL_TRUNK},$,1)}",
+        "ExtensionLabel": "customtrunk"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "42",
+        "Application": "Set",
+        "AppData": "the_num=${CUT(OUT_${DIAL_TRUNK},$,2)}"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "43",
+        "Application": "Set",
+        "AppData": "post_num=${CUT(OUT_${DIAL_TRUNK},$,3)}"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "44",
+        "Application": "GotoIf",
+        "AppData": "$[\"${the_num}\" = \"OUTNUM\"]?outnum:skipoutnum"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "45",
+        "Application": "Set",
+        "AppData": "the_num=${OUTNUM}",
+        "ExtensionLabel": "outnum"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "46",
+        "Application": "Dial",
+        "AppData": "${pre_num:4}${the_num}${post_num},${TRUNK_RING_TIMER},${DIAL_TRUNK_OPTIONS}",
+        "ExtensionLabel": "skipoutnum"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "47",
+        "Application": "Noop",
+        "AppData": "Dial failed for some reason with DIALSTATUS = ${DIALSTATUS} and HANGUPCAUSE = ${HANGUPCAUSE}"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "48",
+        "Application": "GotoIf",
+        "AppData": "$[\"${ARG4}\" = \"on\"]?continue,1:s-${DIALSTATUS},1"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "49",
+        "Application": "Noop",
+        "AppData": "max channels used up",
+        "ExtensionLabel": "chanfull"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s",
+        "Priority": "50",
+        "Application": "Return",
+        "AppData": ""
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s-ANSWER",
+        "Priority": "1",
+        "Application": "Noop",
+        "AppData": "Call successfully answered - Hanging up now"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s-ANSWER",
+        "Priority": "2",
+        "Application": "Gosub",
+        "AppData": "macro-hangupcall,s,1()"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s-BUSY",
+        "Priority": "1",
+        "Application": "Noop",
+        "AppData": "Dial failed due to trunk reporting BUSY - giving up"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s-BUSY",
+        "Priority": "2",
+        "Application": "Playtones",
+        "AppData": "busy"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s-BUSY",
+        "Priority": "3",
+        "Application": "Busy",
+        "AppData": "20"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s-CHANGED",
+        "Priority": "1",
+        "Application": "Noop",
+        "AppData": "Dial failed due to trunk reporting Number Changed - giving up"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s-CHANGED",
+        "Priority": "2",
+        "Application": "Playtones",
+        "AppData": "busy"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s-CHANGED",
+        "Priority": "3",
+        "Application": "Busy",
+        "AppData": "20"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s-INVALIDNMBR",
+        "Priority": "1",
+        "Application": "Noop",
+        "AppData": "Dial failed due to trunk reporting Address Incomplete - giving up"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s-INVALIDNMBR",
+        "Priority": "2",
+        "Application": "Progress",
+        "AppData": ""
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s-INVALIDNMBR",
+        "Priority": "3",
+        "Application": "Playback",
+        "AppData": "ss-noservice,noanswer"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s-INVALIDNMBR",
+        "Priority": "4",
+        "Application": "Busy",
+        "AppData": "20"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s-NOANSWER",
+        "Priority": "1",
+        "Application": "Noop",
+        "AppData": "Dial failed due to trunk reporting NOANSWER - giving up"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s-NOANSWER",
+        "Priority": "2",
+        "Application": "Progress",
+        "AppData": ""
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s-NOANSWER",
+        "Priority": "3",
+        "Application": "Playback",
+        "AppData": "number-not-answering,noanswer"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "s-NOANSWER",
+        "Priority": "4",
+        "Application": "Congestion",
+        "AppData": "20"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "_s-.",
+        "Priority": "1",
+        "Application": "Set",
+        "AppData": "RC=${IF($[${ISNULL(${HANGUPCAUSE})}]?0:${HANGUPCAUSE})}"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "_s-.",
+        "Priority": "2",
+        "Application": "Goto",
+        "AppData": "${RC},1"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "_X.",
+        "Priority": "1",
+        "Application": "Goto",
+        "AppData": "continue,1"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "Extension": "_X",
+        "Priority": "1",
+        "Application": "Goto",
+        "AppData": "continue,1"
+      },
+      {
+        "Context": "macro-dialout-trunk",
+        "IncludeContext": "macro-dialout-trunk-custom"
+      }
+    ],
+    "macro-hangupcall": [
+      {
+        "Context": "macro-hangupcall",
+        "Extension": "s",
+        "Priority": "1",
+        "Application": "Set",
+        "AppData": "__MCVMSTATUS=${VMSTATUS}"
+      },
+      {
+        "Context": "macro-hangupcall",
+        "Extension": "s",
+        "Priority": "2",
+        "Application": "Gosub",
+        "AppData": "app-missedcall-hangup,${EXTEN},1()"
+      },
+      {
+        "Context": "macro-hangupcall",
+        "Extension": "s",
+        "Priority": "3",
+        "Application": "UserEvent",
+        "AppData": "MES,RTPAUDIOQOSMESBRIDGED:${RTPAUDIOQOSMESBRIDGED},RTPAUDIOQOSMES:${RTPAUDIOQOSMES}"
+      },
+      {
+        "Context": "macro-hangupcall",
+        "Extension": "s",
+        "Priority": "4",
+        "Application": "GotoIf",
+        "AppData": "$[\"${USE_CONFIRMATION}\"=\"\" | \"${RINGGROUP_INDEX}\"=\"\" | \"${CHANNEL}\"!=\"${UNIQCHAN}\"]?theend",
+        "ExtensionLabel": "start"
+      },
+      {
+        "Context": "macro-hangupcall",
+        "Extension": "s",
+        "Priority": "5",
+        "Application": "Noop",
+        "AppData": "Deleting: RG/${RINGGROUP_INDEX}/${CHANNEL} ${DB_DELETE(RG/${RINGGROUP_INDEX}/${CHANNEL})}",
+        "ExtensionLabel": "delrgi"
+      },
+      {
+        "Context": "macro-hangupcall",
+        "Extension": "s",
+        "Priority": "6",
+        "Application": "ExecIf",
+        "AppData": "$[\"${ONETOUCH_RECFILE}\"!=\"\" & \"${CDR(recordingfile)}\"=\"\"]?Set(CDR(recordingfile)=${ONETOUCH_RECFILE})",
+        "ExtensionLabel": "theend"
+      },
+      {
+        "Context": "macro-hangupcall",
+        "Extension": "s",
+        "Priority": "7",
+        "Application": "ExecIf",
+        "AppData": "$[\"${PBXMFA}\"=\"1\"]?AGI(pbxmfa.agi,noanswer)"
+      },
+      {
+        "Context": "macro-hangupcall",
+        "Extension": "s",
+        "Priority": "8",
+        "Application": "Hangup",
+        "AppData": "",
+        "ExtensionLabel": "hangup"
+      },
+      {
+        "Context": "macro-hangupcall",
+        "Extension": "s",
+        "Priority": "9",
+        "Application": "Return",
+        "AppData": "${GOSUB_RETVAL}"
+      },
+      {
+        "Context": "macro-hangupcall",
+        "IncludeContext": "macro-hangupcall-custom"
+      }
+    ],
+    "trunk-dial-with-exten": [
+      {
+        "Context": "trunk-dial-with-exten",
+        "Extension": "h",
+        "Priority": "1",
+        "Application": "Gosub",
+        "AppData": "macro-hangupcall,s,1()"
+      },
+      {
+        "Context": "trunk-dial-with-exten",
+        "Extension": "_*X.",
+        "Priority": "1",
+        "Application": "Dial",
+        "AppData": "${OUT_${DIAL_TRUNK}}/${OUTNUM}${OUT_${DIAL_TRUNK}_SUFFIX},${TRUNK_RING_TIMER},${DIAL_TRUNK_OPTIONS}b(func-apply-sipheaders^s^1,(${DIAL_TRUNK}))U(sub-send-obroute-email^${DIAL_NUMBER}^${MACRO_EXTEN}^${DIAL_TRUNK}^${NOW}^${CALLERID(name)}^${CALLERID(number)},^${DIAL_TRUNK_MOH})"
+      },
+      {
+        "Context": "trunk-dial-with-exten",
+        "Extension": "_*X.",
+        "Priority": "2",
+        "Application": "Return",
+        "AppData": ""
+      },
+      {
+        "Context": "trunk-dial-with-exten",
+        "Extension": "_X",
+        "Priority": "1",
+        "Application": "Dial",
+        "AppData": "${OUT_${DIAL_TRUNK}}/${OUTNUM}${OUT_${DIAL_TRUNK}_SUFFIX},${TRUNK_RING_TIMER},${DIAL_TRUNK_OPTIONS}b(func-apply-sipheaders^s^1,(${DIAL_TRUNK}))U(sub-send-obroute-email^${DIAL_NUMBER}^${MACRO_EXTEN}^${DIAL_TRUNK}^${NOW}^${CALLERID(name)}^${CALLERID(number)},^${DIAL_TRUNK_MOH})"
+      },
+      {
+        "Context": "trunk-dial-with-exten",
+        "Extension": "_X",
+        "Priority": "2",
+        "Application": "Return",
+        "AppData": ""
+      },
+      {
+        "Context": "trunk-dial-with-exten",
+        "Extension": "_[+-X].",
+        "Priority": "1",
+        "Application": "Dial",
+        "AppData": "${OUT_${DIAL_TRUNK}}/${OUTNUM}${OUT_${DIAL_TRUNK}_SUFFIX},${TRUNK_RING_TIMER},${DIAL_TRUNK_OPTIONS}b(func-apply-sipheaders^s^1,(${DIAL_TRUNK}))U(sub-send-obroute-email^${DIAL_NUMBER}^${MACRO_EXTEN}^${DIAL_TRUNK}^${NOW}^${CALLERID(name)}^${CALLERID(number)},^${DIAL_TRUNK_MOH})"
+      },
+      {
+        "Context": "trunk-dial-with-exten",
+        "Extension": "_[+-X].",
+        "Priority": "2",
+        "Application": "Return",
+        "AppData": ""
+      },
+      {
+        "Context": "trunk-dial-with-exten",
+        "IncludeContext": "trunk-dial-with-exten-custom"
+      }
+    ],
+    "app-missedcall-hangup": [
+      {
+        "Context": "app-missedcall-hangup",
+        "Extension": "_.",
+        "Priority": "1",
+        "Application": "Noop",
+        "AppData": "Dialed: ${EXTEN}"
+      },
+      {
+        "Context": "app-missedcall-hangup",
+        "Extension": "_.",
+        "Priority": "2",
+        "Application": "Noop",
+        "AppData": "Caller: ${MCEXTEN}"
+      },
+      {
+        "Context": "app-missedcall-hangup",
+        "Extension": "_.",
+        "Priority": "3",
+        "Application": "GotoIf",
+        "AppData": "$[\"${CHANNEL(LINKEDID)}\"!=\"${CHANNEL(UNIQUEID)}\" & \"${EXTEN}\"=\"s\"]?exit"
+      },
+      {
+        "Context": "app-missedcall-hangup",
+        "Extension": "_.",
+        "Priority": "4",
+        "Application": "Set",
+        "AppData": "EXTENNUM=${CUT(EXTEN,@,1)}"
+      },
+      {
+        "Context": "app-missedcall-hangup",
+        "Extension": "_.",
+        "Priority": "5",
+        "Application": "Set",
+        "AppData": "FEXTENNUM=${IF($[[\"${EXTENNUM:0:2}\"=\"90\"] || [\"${EXTENNUM:0:2}\"=\"98\"]]?${EXTENNUM:2}:${EXTEN})}"
+      },
+      {
+        "Context": "app-missedcall-hangup",
+        "Extension": "_.",
+        "Priority": "6",
+        "Application": "GotoIf",
+        "AppData": "$[${DB_EXISTS(AMPUSER/${FEXTENNUM}/missedcall)} & \"${DB(AMPUSER/${FEXTENNUM}/missedcall)}\"=\"disable\"]?exit"
+      },
+      {
+        "Context": "app-missedcall-hangup",
+        "Extension": "_.",
+        "Priority": "7",
+        "Application": "AGI",
+        "AppData": "agi://127.0.0.1/missedcallnotify.php,${FEXTENNUM},,${FEXTENNUM},${DB_EXISTS(AMPUSER/${FEXTENNUM}/missedcall)},${DB(AMPUSER/${FEXTENNUM}/missedcall)},${CHANNEL},${DIALSTATUS},${MCQUEUE},${MCGROUP},${FMFM}"
+      },
+      {
+        "Context": "app-missedcall-hangup",
+        "Extension": "_.",
+        "Priority": "8",
+        "Application": "Return",
+        "AppData": "",
+        "ExtensionLabel": "exit"
+      },
+      {
+        "Context": "app-missedcall-hangup",
+        "IncludeContext": "app-missedcall-hangup-custom"
+      }
+    ],
+    "crm-hangup": [
+      {
+        "Context": "crm-hangup",
+        "Extension": "s",
+        "Priority": "1",
+        "Application": "Noop",
+        "AppData": "Sending Hangup to CRM"
+      },
+      {
+        "Context": "crm-hangup",
+        "Extension": "s",
+        "Priority": "2",
+        "Application": "Noop",
+        "AppData": "HANGUP CAUSE: ${HANGUPCAUSE}"
+      },
+      {
+        "Context": "crm-hangup",
+        "Extension": "s",
+        "Priority": "3",
+        "Application": "ExecIf",
+        "AppData": "$[${LEN(${CRM_VOICEMAIL})} > 0]?Set(__CRM_VOICEMAIL=${VMSTATUS})"
+      },
+      {
+        "Context": "crm-hangup",
+        "Extension": "s",
+        "Priority": "4",
+        "Application": "Noop",
+        "AppData": "MASTER CHANNEL: ${CHANNEL(UNIQUEID)} = ${MASTER_CHANNEL(CHANNEL(UNIQUEID))}"
+      },
+      {
+        "Context": "crm-hangup",
+        "Extension": "s",
+        "Priority": "5",
+        "Application": "GotoIf",
+        "AppData": "$[\"${CHANNEL(UNIQUEID)}\"!=\"${MASTER_CHANNEL(CHANNEL(UNIQUEID))}\"]?return"
+      },
+      {
+        "Context": "crm-hangup",
+        "Extension": "s",
+        "Priority": "6",
+        "Application": "Set",
+        "AppData": "__CRM_HANGUP=1"
+      },
+      {
+        "Context": "crm-hangup",
+        "Extension": "s",
+        "Priority": "7",
+        "Application": "AGI",
+        "AppData": "agi://127.0.0.1/sangomacrm.agi"
+      },
+      {
+        "Context": "crm-hangup",
+        "Extension": "s",
+        "Priority": "8",
+        "Application": "Return",
+        "AppData": "",
+        "ExtensionLabel": "return"
+      },
+      {
+        "Context": "crm-hangup",
+        "IncludeContext": "crm-hangup-custom"
+      }
+    ],
+    "sub-send-obroute-email": [
+      {
+        "Context": "sub-send-obroute-email",
+        "Extension": "s",
+        "Priority": "1",
+        "Application": "GosubIf",
+        "AppData": "$[\"${ARG8}\"!=\"\" ]?macro-setmusic,s,1(${ARG8})"
+      },
+      {
+        "Context": "sub-send-obroute-email",
+        "Extension": "s",
+        "Priority": "2",
+        "Application": "GotoIf",
+        "AppData": "$[\"${FORCE_CONFIRM}\"!=\"\" ]?gosubconfirm:normal"
+      },
+      {
+        "Context": "sub-send-obroute-email",
+        "Extension": "s",
+        "Priority": "3",
+        "Application": "Gosub",
+        "AppData": "macro-confirm,s,1()",
+        "ExtensionLabel": "gosubconfirm"
+      },
+      {
+        "Context": "sub-send-obroute-email",
+        "Extension": "s",
+        "Priority": "4",
+        "Application": "GotoIf",
+        "AppData": "$[\"${EMAILNOTIFICATION}\" = \"TRUE\"]?sendEmail",
+        "ExtensionLabel": "normal"
+      },
+      {
+        "Context": "sub-send-obroute-email",
+        "Extension": "s",
+        "Priority": "5",
+        "Application": "Noop",
+        "AppData": "email notifications disabled..exiting."
+      },
+      {
+        "Context": "sub-send-obroute-email",
+        "Extension": "s",
+        "Priority": "6",
+        "Application": "Return",
+        "AppData": ""
+      },
+      {
+        "Context": "sub-send-obroute-email",
+        "Extension": "s",
+        "Priority": "7",
+        "Application": "AGI",
+        "AppData": "agi://127.0.0.1/outboundRouteEmail.php,${ARG1},${ARG2},${ARG3},${ARG4},${ARG5},${ARG6},${ROUTEID},${ROUTENAME},${CALLERIDNAMEINTERNAL},${CALLERIDNUMINTERNAL},${CHANNEL(LINKEDID)},${HOTDESKEXTEN},${EMERGENCYROUTE}",
+        "ExtensionLabel": "sendEmail"
+      },
+      {
+        "Context": "sub-send-obroute-email",
+        "Extension": "s",
+        "Priority": "8",
+        "Application": "Return",
+        "AppData": ""
+      },
+      {
+        "Context": "sub-send-obroute-email",
+        "IncludeContext": "sub-send-obroute-email-custom"
+      }
+    ],
+    "macro-setmusic": [
+      {
+        "Context": "macro-setmusic",
+        "Extension": "s",
+        "Priority": "1",
+        "Application": "Set",
+        "AppData": "CHANNEL(musicclass)=${ARG1}"
+      },
+      {
+        "Context": "macro-setmusic",
+        "Extension": "s",
+        "Priority": "2",
+        "Application": "Return",
+        "AppData": ""
+      },
+      {
+        "Context": "macro-setmusic",
+        "IncludeContext": "macro-setmusic-custom"
+      }
+    ],
+    "func-apply-sipheaders": [
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "1",
+        "Application": "ExecIf",
+        "AppData": "$[\"${CRM_DIRECTION}\"=\"INBOUND\"]?Set(CHANNEL(hangup_handler_push)=crm-hangup,s,1)"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "2",
+        "Application": "Noop",
+        "AppData": "Applying SIP Headers to channel ${CHANNEL}"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "3",
+        "Application": "Set",
+        "AppData": "localchan=${CUT(CHANNEL,/,2)}"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "4",
+        "Application": "Set",
+        "AppData": "DialMCEXT=${CUT(localchan,-,1)}"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "5",
+        "Application": "Set",
+        "AppData": "CHANNEL(hangup_handler_push)=app-missedcall-hangup,${DialMCEXT},1"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "6",
+        "Application": "Set",
+        "AppData": "Dchan=${CUT(CHANNEL,/,2)}"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "7",
+        "Application": "Set",
+        "AppData": "DIALLEGEXT=${IF($[${LEN(${DialMCEXT})}>0]?${DialMCEXT}:${CUT(${Dchan},-,1)})}"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "8",
+        "Application": "Set",
+        "AppData": "RG_VOLHDRKEY=Alert-Info-Ring-Volume"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "9",
+        "Application": "Set",
+        "AppData": "RG_PERLEG=${RG_SHARED_RVOL}"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "10",
+        "Application": "GotoIf",
+        "AppData": "$[\"${RG_PERLEG}\" = \"0\"]?headers"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "11",
+        "Application": "Gosub",
+        "AppData": "sub-check-pseries,s,1(${DIALLEGEXT})"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "12",
+        "Application": "Set",
+        "AppData": "TECH=${CUT(CHANNEL,/,1)}",
+        "ExtensionLabel": "headers"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "13",
+        "Application": "Set",
+        "AppData": "SIPHEADERKEYS=${IF($[${LEN(${HASHKEYS(__SIPHEADERS)})}>0]?${HASHKEYS(__SIPHEADERS)}:${HASHKEYS(SIPHEADERS)})}"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "14",
+        "Application": "While",
+        "AppData": "$[\"${SET(sipkey=${SHIFT(SIPHEADERKEYS)})}\" != \"\"]"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "15",
+        "Application": "Set",
+        "AppData": "sipheader=${IF($[${LEN(${HASH(__SIPHEADERS,${sipkey})})}>0]?${HASH(__SIPHEADERS,${sipkey})}:${HASH(SIPHEADERS,${sipkey})})}"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "16",
+        "Application": "GotoIf",
+        "AppData": "$[\"${RG_PERLEG}\" = \"0\"]?applyheader"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "17",
+        "Application": "GotoIf",
+        "AppData": "$[\"${sipkey}\" = \"${RG_VOLHDRKEY}\" & \"${IS_PPHONE}\" != \"1\"]?nextheader"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "18",
+        "Application": "GotoIf",
+        "AppData": "$[\"${sipkey}\" != \"Alert-Info\" | \"${IS_PPHONE}\" = \"1\"]?applyheader"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "19",
+        "Application": "GotoIf",
+        "AppData": "$[${REGEX(\"volume=\" ${sipheader})} = 1]?applyheader"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "20",
+        "Application": "Set",
+        "AppData": "RVOL_USE=${IF($[\"${RVOL}\"!=\"\"]?${RVOL}:${RVOLPARENT})}"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "21",
+        "Application": "GotoIf",
+        "AppData": "$[\"${RVOL_USE}\" = \"\"]?applyheader"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "22",
+        "Application": "Set",
+        "AppData": "RG_AITONE=${IF($[\"${ALERT_INFO}\"!=\"\"]?${ALERT_INFO}:Normal)}"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "23",
+        "Application": "Set",
+        "AppData": "sipheader=${RG_AITONE};volume=${RVOL_USE}"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "24",
+        "Application": "Noop",
+        "AppData": "",
+        "ExtensionLabel": "applyheader"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "25",
+        "Application": "ExecIf",
+        "AppData": "$[\"${sipheader}\" = \"unset\" & \"${TECH}\" = \"PJSIP\"]?Set(PJSIP_HEADER(remove,${sipkey})=)"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "26",
+        "Application": "ExecIf",
+        "AppData": "$[\"${sipheader}\" != \"unset\" & \"${sipkey}\" = \"Alert-Info\" & ${REGEX(\"^<[^>]*>\" ${sipheader})} != 1 & ${REGEX(\";info=\" ${sipheader})} != 1]?Set(sipheader=<http://127.0.0.1>;info=${sipheader})"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "27",
+        "Application": "ExecIf",
+        "AppData": "$[\"${sipheader}\" != \"unset\" & \"${sipkey}\" = \"Alert-Info\" & ${REGEX(\"^<[^>]*>\" ${sipheader})} != 1]?Set(sipheader=<http://127.0.0.1>${sipheader})"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "28",
+        "Application": "ExecIf",
+        "AppData": "$[\"${TECH}\" = \"PJSIP\" & \"${sipheader}\" != \"unset\"]?Set(PJSIP_HEADER(add,${sipkey})=${sipheader})"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "29",
+        "Application": "EndWhile",
+        "AppData": "",
+        "ExtensionLabel": "nextheader"
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "Extension": "s",
+        "Priority": "30",
+        "Application": "Return",
+        "AppData": ""
+      },
+      {
+        "Context": "func-apply-sipheaders",
+        "IncludeContext": "func-apply-sipheaders-custom"
+      }
+    ]
+  },
+  "context_sha256": {
+    "app-missedcall-hangup": "21a9e67ba4acee7cb8f8f3fabaf7431d1d33e3ffcc518a6dccd9b362f8faf8e7",
+    "crm-hangup": "eafd76de6c2eba6dc2aeb8482c668864e915b88c58cc4a2ffebff718dde6cccf",
+    "sub-send-obroute-email": "c59e690170245c9aafd7ad5e428128f124d6c562e5a11cd9fc26d2a776f79230",
+    "macro-setmusic": "981c49d923dd99a431c06405d422c9af65226aed2090c0b635043b267ee8424f"
+  },
+  "script_sha256": {
+    "missedcallnotify.php": "3b068a293a30f583d6243950cc5088a2eff3e8df8862889a9228eaadfd14e78f",
+    "sangomacrm.agi": "c4e440dbb46d7afcf320b2c6afecb199d6acd5295340dd020f4be910707075b7",
+    "outboundRouteEmail.php": "c07838154a0dba14cb906c07c01ad6e6be9a8bd662540fd86c85d42ef086c29b",
+    "allowlist-autoadd.agi": "684160575de8a740ba3f7872f3d156e23341165ee63720549a8e71ffa1c2886e",
+    "allowlist-common.php": "cd31204b2edf2ef77576cf783fe2f16e561c1631bbb56e66bc3a6b068e5245a3"
+  }
+}

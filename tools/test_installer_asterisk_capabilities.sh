@@ -200,23 +200,15 @@ log() {
     '
 )
 
-# An exact-content signer with unsafe ownership/mode must still be repaired
-# before the root installer executes it.
+# Root signer admission uses the authenticated helper and never reads a
+# replacement signer from the web-writable module directory.
 (
-  mock_signer_dir="$(mktemp -d /tmp/sls-installer-signer.XXXXXX)"
-  trap 'find "$mock_signer_dir" -depth -delete' EXIT
-  SLS_MASS_NOTIFY_SIGNER_SOURCE="$mock_signer_dir/source.sh"
-  SLS_MASS_NOTIFY_SIGNER_TARGET="$mock_signer_dir/target.sh"
-  {
-    printf '%s\n' '#!/usr/bin/env bash'
-    printf '%s\n' 'exit 0'
-  } >"$SLS_MASS_NOTIFY_SIGNER_SOURCE"
-  cp "$SLS_MASS_NOTIFY_SIGNER_SOURCE" "$SLS_MASS_NOTIFY_SIGNER_TARGET"
-  chown www-data:"$(id -gn www-data)" "$SLS_MASS_NOTIFY_SIGNER_TARGET"
-  chmod 0777 "$SLS_MASS_NOTIFY_SIGNER_TARGET"
+  called=0
+  protected_install_phase() { [ "$*" = admit ] || return 1; called=$((called + 1)); }
   ensure_local_signer
-  [ "$(stat -c '%a %U:%G' "$SLS_MASS_NOTIFY_SIGNER_TARGET")" = "755 root:root" ]
-  cmp -s "$SLS_MASS_NOTIFY_SIGNER_SOURCE" "$SLS_MASS_NOTIFY_SIGNER_TARGET"
+  [ "$called" -eq 1 ]
+  protected_install_phase() { return 23; }
+  if ensure_local_signer; then exit 1; fi
 )
 
 # Exact-version package repair must restore only the package that owns the
@@ -758,6 +750,31 @@ fi
   [ "$(endpoint_inventory_records "$inventory_dir/unknown.json")" = $'1000\tunknown\t2\t1\t0\tunknown\tCommunity Phone' ]
   printf '%s\n' '{"1000":{"contacts":2,"format":"yealink","formats":["yealink","poly"],"user_agent":"Yealink | Poly"}}' >"$inventory_dir/mixed.json"
   [ "$(endpoint_inventory_records "$inventory_dir/mixed.json")" = $'1000\tyealink\t2\t0\t1\tpoly,yealink\tYealink | Poly' ]
+  # Exercise every actual runtime format, including an explicit T48G image
+  # override. Adding a working renderer must not make installation roll back.
+  python3 -I - "$ROOT_DIR" "$inventory_dir" <<'PY'
+import ast
+import json
+import pathlib
+import sys
+source = pathlib.Path(sys.argv[1]) / 'slsmassnotifyserver/bin/sls_mass_notify/sls_notify.py'
+tree = ast.parse(source.read_text())
+formats = next(ast.literal_eval(node.value) for node in tree.body
+               if isinstance(node, ast.Assign)
+               and any(isinstance(target, ast.Name) and target.id == 'SUPPORTED_PHONE_FORMATS'
+                       for target in node.targets))
+assert 'yealink_image' in formats
+inventory = {str(1000 + index): {'contacts': 1, 'format': name, 'formats': [name],
+                               'override': True, 'user_agent': 'Supported phone'}
+             for index, name in enumerate(sorted(formats))}
+pathlib.Path(sys.argv[2], 'all-supported.json').write_text(json.dumps(inventory))
+pathlib.Path(sys.argv[2], 'expected.tsv').write_text(''.join(
+    '\t'.join((extension, row['format'], '1', '1' if row['format'] == 'unknown' else '0',
+               '0', row['format'], row['user_agent'])) + '\n'
+    for extension, row in sorted(inventory.items())))
+PY
+  endpoint_inventory_records "$inventory_dir/all-supported.json" >"$inventory_dir/actual.tsv"
+  cmp "$inventory_dir/expected.tsv" "$inventory_dir/actual.tsv"
   printf '%s\n' '{"1000":{"contacts":1,"format":"unsupported","formats":["unsupported"]}}' >"$inventory_dir/invalid.json"
   if endpoint_inventory_records "$inventory_dir/invalid.json" >/dev/null 2>&1; then
     printf 'An unsupported endpoint inventory format was incorrectly accepted.\n' >&2
@@ -817,7 +834,7 @@ grep -Fq 'add_error(' "$installer_source"
 grep -Fq "const INSTALL_FAILURE_JSON = self::PLUGIN_DATA_DIR . '/install-failure.json';" "$class_dependency_source"
 grep -Fq 'The last installation or repair failed during %s. Possible solution: %s' "$class_dependency_source"
 maintenance_source="${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_maintenance.sh"
-repair_verify_line="$(grep -nFm1 'verifyProtectedRepairIntegration' "$maintenance_source" | cut -d: -f1)"
+repair_verify_line="$(grep -nFm1 'verifyUnprivilegedIntegration' "$maintenance_source" | cut -d: -f1)"
 repair_clear_line="$(grep -nF 'clear_install_failure' "$maintenance_source" | tail -n1 | cut -d: -f1)"
 [ -n "$repair_verify_line" ]
 [ -n "$repair_clear_line" ]
@@ -857,18 +874,12 @@ if grep -Fq 'Dial(\${SLS_DIAL}' "$class_source"; then
   printf 'Managed paging still uses first-answer Dial semantics.\n' >&2
   exit 1
 fi
-dynamic_contacts_line="$(grep -nFm1 'Set(SLS_DIAL=\${PJSIP_DIAL_CONTACTS(\${EXTEN})})' "$class_source" | cut -d: -f1)"
-device_lookup_line="$(grep -nFm1 'Set(SLS_DEVICE_DIAL=\${DB(DEVICE/\${EXTEN}/dial)})' "$class_source" | cut -d: -f1)"
-device_aor_line="$(grep -nFm1 'Set(SLS_DEVICE_AOR=\${CUT(SLS_DEVICE_DIAL,/,2)})' "$class_source" | cut -d: -f1)"
-device_aor_default_line="$(grep -nFm1 'Set(SLS_DEVICE_AOR=\${EXTEN})' "$class_source" | cut -d: -f1)"
-device_contacts_line="$(grep -nFm1 'Set(SLS_DIAL=\${PJSIP_DIAL_CONTACTS(\${SLS_DEVICE_AOR})})' "$class_source" | cut -d: -f1)"
-device_fallback_line="$(grep -nFm1 'Set(SLS_DIAL=\${SLS_DEVICE_DIAL})' "$class_source" | cut -d: -f1)"
-[ "$dynamic_contacts_line" -lt "$device_lookup_line" ]
-[ "$device_lookup_line" -lt "$device_aor_line" ]
-[ "$device_aor_line" -lt "$device_aor_default_line" ]
-[ "$device_aor_default_line" -lt "$device_contacts_line" ]
-[ "$device_contacts_line" -lt "$device_fallback_line" ]
-[ "$dynamic_contacts_line" -lt "$device_fallback_line" ]
+grep -Fq 'sls_mass_notify_phone_agi.py,origin' "$class_source"
+grep -Fq 'sls_mass_notify_phone_agi.py,contact' "$class_source"
+if grep -Fq 'Set(SLS_DIAL=\${PJSIP_DIAL_CONTACTS' "$class_source"; then
+  printf 'Managed dialplan resolves contacts after admission.\n' >&2
+  exit 1
+fi
 grep -Fq 'Page(${SLS_DIAL},b(sls-alert-autoanswer^s^1(${EXTEN}))A(${SLS_SAFE_SOUND})inq,' "${ROOT_DIR}/tools/install_release.sh"
 grep -Fq 'for seconds in range(1,6)' "${ROOT_DIR}/tools/install_release.sh"
 
@@ -900,7 +911,7 @@ for producer in \
   fi
 done
 
-expected_mapping=$'function|PJSIP_HEADER|res_pjsip_header_funcs.so\nfunction|PJSIP_CONTACT|func_pjsip_contact.so\nfunction|PJSIP_AOR|func_pjsip_aor.so\nfunction|PJSIP_DIAL_CONTACTS|chan_pjsip.so\nfunction|TOLOWER|func_strings.so\nfunction|CUT|func_strings.so\nfunction|FILTER|func_strings.so\nfunction|CHANNEL|func_channel.so\nfunction|IF|func_logic.so\nfunction|DB|func_db.so\nfunction|CALLERID|func_callerid.so\napplication|ConfBridge|app_confbridge.so\napplication|Page|app_page.so\napplication|ExecIf|app_exec.so\napplication|Gosub|app_stack.so\napplication|Return|app_stack.so\napplication|Log|app_verbose.so\napplication|Verbose|app_verbose.so\nrequired|application|Wait'
+expected_mapping=$'function|PJSIP_HEADER|res_pjsip_header_funcs.so\nfunction|PJSIP_CONTACT|func_pjsip_contact.so\nfunction|PJSIP_AOR|func_pjsip_aor.so\nfunction|PJSIP_DIAL_CONTACTS|chan_pjsip.so\nfunction|TOLOWER|func_strings.so\nfunction|CUT|func_strings.so\nfunction|FILTER|func_strings.so\nfunction|CHANNEL|func_channel.so\nfunction|IF|func_logic.so\nfunction|DB|func_db.so\nfunction|CALLERID|func_callerid.so\napplication|ConfBridge|app_confbridge.so\napplication|Page|app_page.so\napplication|AGI|res_agi.so\napplication|Playback|app_playback.so\napplication|Read|app_read.so\napplication|ExecIf|app_exec.so\napplication|Gosub|app_stack.so\napplication|Return|app_stack.so\napplication|Log|app_verbose.so\napplication|Verbose|app_verbose.so\nrequired|application|Wait'
 actual_mapping="$(
   ensure_asterisk_capability() {
     printf '%s|%s|%s\n' "$1" "$2" "$3"

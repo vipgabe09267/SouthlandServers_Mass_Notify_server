@@ -7,6 +7,7 @@ PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
 
 REQUEST_FILE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/repair.request"
+TIMEZONE_REQUEST_FILE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/timezone.request"
 UPDATE_REQUEST_FILE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/update.request"
 UPDATE_PROGRESS_FILE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/update-progress.json"
 MAINTENANCE_PROGRESS_FILE="/run/asterisk/sls-mass-notify-maintenance-progress.json"
@@ -15,6 +16,7 @@ UNINSTALL_REQUEST_FILE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/uninstal
 INSTALL_FAILURE_FILE="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/install-failure.json"
 RUNTIME_DIR="/usr/local/bin/sls_mass_notify"
 SIGNER="/usr/local/sbin/sign_sls_mass_notify_local_sig.sh"
+PRIVILEGED_HELPER="$RUNTIME_DIR/sls_privileged_install.py"
 LOG_FILE="/var/log/sls_mass_notify.log"
 LOCK_FILE="/run/lock/sls-mass-notify-maintenance.lock"
 MODULE_DIR="/var/www/html/admin/modules/slsmassnotifyserver"
@@ -101,83 +103,235 @@ close_inherited_maintenance_lock_fds() {
 # key refresh from keeping repair/update/uninstall blocked after this run exits.
 run_without_maintenance_lock() (
   close_inherited_maintenance_lock_fds
+  if [ -n "${MUTATION_KEEPALIVE_FD:-}" ]; then exec {MUTATION_KEEPALIVE_FD}>&-; fi
   "$@"
 )
 
-write_update_progress() {
-  local state="$1"
-  local message="$2"
-  UPDATE_PROGRESS_FILE="$UPDATE_PROGRESS_FILE" UPDATE_STATE="$state" UPDATE_MESSAGE="$message" UPDATE_ERROR_CATEGORY="${3:-}" UPDATE_EXIT_CODE="${4:-0}" /usr/bin/python3 - <<'PY'
+# Admit the protected helper before importing or executing any runtime Python.
+# The helper then verifies all root-executable SLS bytes against the enrolled
+# publisher generation. Local signature status never authorizes execution.
+admit_root_runtime() {
+  /usr/bin/python3 -I - "$PRIVILEGED_HELPER" <<'PYGUARD' || return 1
+import os
+from pathlib import Path
+import stat
+import sys
+path = Path(sys.argv[1])
+for file in (path, path.with_name('sls_module_trust.py')):
+    for item in [file] + list(file.parents)[:-1]:
+        info = item.lstat()
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise SystemExit('Untrusted SLS protected runtime path: ' + str(item))
+    info = file.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise SystemExit('Unsafe SLS protected helper file')
+PYGUARD
+  run_without_maintenance_lock /usr/bin/python3 -I "$PRIVILEGED_HELPER" admit
+}
+
+# A dedicated authenticated child owns the worker and settings locks. Keep
+# service/PHP children from retaining its lifetime pipe after maintenance exits.
+acquire_mutation_coordination() {
+  MUTATION_STARTED=0
+  MUTATION_VERIFIED=0
+  MUTATION_BASELINE_DIR="$(mktemp -d /run/sls-maintenance-idle.XXXXXXXX)" || return 1
+  chmod 0700 "$MUTATION_BASELINE_DIR" || { release_mutation_coordination; return 1; }
+  coproc SLS_MAINTENANCE_GUARD {
+    /usr/bin/python3 -I "$RUNTIME_DIR/sls_install_guard.py" --data "${CONFIG_FILE%/*}" --settings hold
+  }
+  MUTATION_GUARD_PID="$SLS_MAINTENANCE_GUARD_PID"
+  exec {MUTATION_KEEPALIVE_FD}>&"${SLS_MAINTENANCE_GUARD[1]}"
+  local status
+  if ! IFS= read -r status <&"${SLS_MAINTENANCE_GUARD[0]}" || [ "$status" != ready ]; then
+    release_mutation_coordination
+    return 1
+  fi
+  if ! run_without_maintenance_lock /usr/bin/python3 -I "$RUNTIME_DIR/sls_install_idle.py" --data "${CONFIG_FILE%/*}" inspect >"$MUTATION_BASELINE_DIR/before.json"; then
+    release_mutation_coordination
+    return 1
+  fi
+  chmod 0600 "$MUTATION_BASELINE_DIR/before.json" || { release_mutation_coordination; return 1; }
+  MUTATION_CONFIG_BEFORE="$(mutation_config_fingerprint)" || { release_mutation_coordination; return 1; }
+  MUTATION_STARTED=1
+}
+
+mutation_config_fingerprint() {
+  /usr/bin/python3 -I - "${CONFIG_FILE%/*}" <<'PYCONFIG'
+import hashlib, json, os, pwd, stat, sys
+account = pwd.getpwnam('asterisk')
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+parent = os.open('/', flags)
+try:
+    for part in sys.argv[1].split('/'):
+        if not part: continue
+        if part in ('.', '..'): raise RuntimeError('Unsafe settings directory')
+        child = os.open(part, flags, dir_fd=parent)
+        os.close(parent); parent = child
+        info = os.fstat(parent)
+        if info.st_uid not in (0, account.pw_uid) or (info.st_mode & 0o002 and not (info.st_uid == 0 and info.st_mode & stat.S_ISVTX)):
+            raise RuntimeError('Unsafe settings ancestor')
+    result = {}
+    for name in ('mass-notifications.config', 'mass-notifications.pending.config'):
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+        except FileNotFoundError:
+            result[name] = None
+            continue
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_uid not in (0, account.pw_uid) or before.st_size > 16777216:
+                raise RuntimeError('Unsafe or oversized settings file')
+            digest = hashlib.sha256(); size = 0
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk: break
+                size += len(chunk)
+                if size > 16777216: raise RuntimeError('Settings file exceeds size limit')
+                digest.update(chunk)
+            after = os.fstat(fd); current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            identity = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns, item.st_nlink)
+            if identity(before) != identity(after) or identity(after) != identity(current):
+                raise RuntimeError('Settings file changed during inspection')
+            result[name] = digest.hexdigest()
+        finally: os.close(fd)
+    print(json.dumps(result, sort_keys=True))
+finally: os.close(parent)
+PYCONFIG
+}
+
+verify_mutation_idle() {
+  [ -n "${MUTATION_GUARD_PID:-}" ] && kill -0 "$MUTATION_GUARD_PID" 2>/dev/null || return 1
+  local after
+  after="$(mutation_config_fingerprint)" || return 1
+  [ "$after" = "$MUTATION_CONFIG_BEFORE" ] || {
+    log "Maintenance changed active or pending settings unexpectedly; preserve evidence and do not rewind settings."
+    return 1
+  }
+  run_without_maintenance_lock /usr/bin/python3 -I "$RUNTIME_DIR/sls_install_idle.py" --data "${CONFIG_FILE%/*}" inspect --baseline "$MUTATION_BASELINE_DIR/before.json" || return 1
+  MUTATION_VERIFIED=1
+}
+
+release_mutation_coordination() {
+  if [ -n "${MUTATION_KEEPALIVE_FD:-}" ]; then
+    printf 'release\n' >&"$MUTATION_KEEPALIVE_FD" 2>/dev/null || true
+    exec {MUTATION_KEEPALIVE_FD}>&-
+    MUTATION_KEEPALIVE_FD=""
+  fi
+  [ -z "${MUTATION_GUARD_PID:-}" ] || wait "$MUTATION_GUARD_PID" 2>/dev/null || true
+  MUTATION_GUARD_PID=""
+  if [ -n "${MUTATION_BASELINE_DIR:-}" ]; then
+    if [ "${MUTATION_STARTED:-0}" -eq 1 ] && [ "${MUTATION_VERIFIED:-0}" -ne 1 ]; then
+      log "Preserved pre-maintenance idle evidence: $MUTATION_BASELINE_DIR/before.json"
+    else
+      rm -f -- "$MUTATION_BASELINE_DIR/before.json"
+      rmdir -- "$MUTATION_BASELINE_DIR" 2>/dev/null || true
+    fi
+    MUTATION_BASELINE_DIR=""
+  fi
+}
+
+write_status_json() {
+  /usr/bin/python3 -I - "$@" <<'PY'
 import json
 import os
 import pwd
-import tempfile
+import stat
+import sys
 from datetime import datetime, timezone
 
-path = os.environ["UPDATE_PROGRESS_FILE"]
-directory = os.path.dirname(path)
-os.makedirs(directory, mode=0o750, exist_ok=True)
-payload = {
-    "state": os.environ["UPDATE_STATE"],
-    "message": os.environ["UPDATE_MESSAGE"][:300],
-    "updated_at": datetime.now(timezone.utc).isoformat(),
-    "error_category": os.environ["UPDATE_ERROR_CATEGORY"],
-    "exit_code": int(os.environ["UPDATE_EXIT_CODE"]),
-}
-fd, temporary = tempfile.mkstemp(prefix=".update-progress.", dir=directory)
-with os.fdopen(fd, "w", encoding="utf-8") as handle:
-    json.dump(payload, handle, separators=(",", ":"))
-    handle.write("\n")
-os.chmod(temporary, 0o640)
+kind, path, first, second, third, category, status = sys.argv[1:]
+now = datetime.now(timezone.utc).isoformat()
+if kind == 'update':
+    payload = {'state': first, 'message': second[:300], 'updated_at': now,
+               'error_category': category, 'exit_code': int(status)}
+elif kind == 'maintenance':
+    payload = {'action': first, 'state': second, 'message': third[:300],
+               'updated_at': now, 'error_category': category, 'exit_code': int(status)}
+elif kind == 'install':
+    payload = {'version': 1, 'failed_at': now, 'stage': first[:80],
+               'message': 'SLS Mass Notify installation repair did not complete.',
+               'solution': second[:400], 'log': '/var/log/sls_mass_notify.log'}
+else:
+    raise SystemExit('Unknown maintenance status type')
+parts = path.split('/')[1:]
+if not path.startswith('/') or not parts or any(part in ('', '.', '..') for part in parts):
+    raise SystemExit('Unsafe maintenance status path')
 account = pwd.getpwnam("asterisk")
-os.chown(temporary, account.pw_uid, account.pw_gid)
-os.replace(temporary, path)
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+parent = os.open('/', flags)
+temporary = None
+try:
+    for component in parts[:-1]:
+        try:
+            child = os.open(component, flags, dir_fd=parent)
+        except FileNotFoundError:
+            os.mkdir(component, 0o750, dir_fd=parent)
+            child = os.open(component, flags, dir_fd=parent)
+            os.fchown(child, account.pw_uid, account.pw_gid)
+        os.close(parent); parent = child
+    try: existing = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError: existing = None
+    if existing is not None and (not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1
+                                 or existing.st_uid not in (0, account.pw_uid)):
+        raise SystemExit('Unsafe maintenance status destination')
+    temporary = '.sls-status-' + os.urandom(12).hex()
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent)
+    with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+        json.dump(payload, handle, separators=(',', ':'))
+        handle.write('\n'); handle.flush()
+        os.fchown(handle.fileno(), account.pw_uid, account.pw_gid)
+        os.fchmod(handle.fileno(), 0o640)
+        os.fsync(handle.fileno())
+    os.replace(temporary, parts[-1], src_dir_fd=parent, dst_dir_fd=parent)
+    temporary = None
+    os.fsync(parent)
+finally:
+    if temporary is not None:
+        try: os.unlink(temporary, dir_fd=parent)
+        except FileNotFoundError: pass
+    os.close(parent)
 PY
+}
+
+write_update_progress() {
+  write_status_json update "$UPDATE_PROGRESS_FILE" "$1" "$2" "" "${3:-}" "${4:-0}"
 }
 
 write_maintenance_progress() {
-  local action="$1"
-  local state="$2"
-  local message="$3"
-  MAINTENANCE_PROGRESS_FILE="$MAINTENANCE_PROGRESS_FILE" MAINTENANCE_ACTION="$action" MAINTENANCE_STATE="$state" MAINTENANCE_MESSAGE="$message" MAINTENANCE_ERROR_CATEGORY="${4:-}" MAINTENANCE_EXIT_CODE="${5:-0}" /usr/bin/python3 - <<'PY'
-import json
-import os
-import pwd
-import tempfile
-from datetime import datetime, timezone
-
-path = os.environ["MAINTENANCE_PROGRESS_FILE"]
-directory = os.path.dirname(path)
-os.makedirs(directory, mode=0o755, exist_ok=True)
-payload = {
-    "action": os.environ["MAINTENANCE_ACTION"],
-    "state": os.environ["MAINTENANCE_STATE"],
-    "message": os.environ["MAINTENANCE_MESSAGE"][:300],
-    "updated_at": datetime.now(timezone.utc).isoformat(),
-    "error_category": os.environ["MAINTENANCE_ERROR_CATEGORY"],
-    "exit_code": int(os.environ["MAINTENANCE_EXIT_CODE"]),
-}
-fd, temporary = tempfile.mkstemp(prefix=".maintenance-progress.", dir=directory)
-with os.fdopen(fd, "w", encoding="utf-8") as handle:
-    json.dump(payload, handle, separators=(",", ":"))
-    handle.write("\n")
-os.chmod(temporary, 0o640)
-account = pwd.getpwnam("asterisk")
-os.chown(temporary, account.pw_uid, account.pw_gid)
-os.replace(temporary, path)
-PY
+  write_status_json maintenance "$MAINTENANCE_PROGRESS_FILE" "$1" "$2" "$3" "${4:-}" "${5:-0}"
 }
 
 update_progress_is() {
-  /usr/bin/python3 - "$UPDATE_PROGRESS_FILE" "$1" <<'PY'
+  /usr/bin/python3 -I - "$UPDATE_PROGRESS_FILE" "$1" <<'PY'
 import json
+import os
+import stat
 import sys
+fd = -1
+parent = -1
 try:
-    with open(sys.argv[1], encoding="utf-8") as handle:
-        progress = json.load(handle)
-    raise SystemExit(0 if isinstance(progress, dict) and progress.get("state") == sys.argv[2] else 1)
+    parts = sys.argv[1].split('/')[1:]
+    if not sys.argv[1].startswith('/') or not parts or any(part in ('', '.', '..') for part in parts):
+        raise ValueError('unsafe status path')
+    parent = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    for part in parts[:-1]:
+        child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        os.close(parent); parent = child
+    fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 65536:
+        raise ValueError('unsafe status file')
+    with os.fdopen(fd, 'rb') as handle:
+        fd = -1
+        body = handle.read(65537)
+    if len(body) > 65536: raise ValueError('oversized status')
+    progress = json.loads(body)
+    raise SystemExit(0 if isinstance(progress, dict) and progress.get('state') == sys.argv[2] else 1)
 except (OSError, ValueError):
     raise SystemExit(1)
+finally:
+    if fd >= 0: os.close(fd)
+    if parent >= 0: os.close(parent)
 PY
 }
 
@@ -197,6 +351,7 @@ fail_maintenance() {
 finish_maintenance() {
   local status=$?
   trap - EXIT
+  release_mutation_coordination
   if [ "$status" -ne 0 ] && [ "$FAILURE_RECORDED" -ne 1 ] && [ -n "$ACTIVE_ACTION" ]; then
     fail_maintenance "process_failed" "The maintenance process stopped unexpectedly. Review Notification Logs for details." "$status"
   fi
@@ -206,34 +361,8 @@ finish_maintenance() {
 write_install_failure() {
   local stage="$1"
   local solution="$2"
-  INSTALL_FAILURE_FILE="$INSTALL_FAILURE_FILE" INSTALL_FAILURE_STAGE="$stage" INSTALL_FAILURE_SOLUTION="$solution" /usr/bin/python3 - <<'PY'
-import json
-import os
-import pwd
-import tempfile
-from datetime import datetime, timezone
-
-path = os.environ["INSTALL_FAILURE_FILE"]
-directory = os.path.dirname(path)
-os.makedirs(directory, mode=0o750, exist_ok=True)
-payload = {
-    "version": 1,
-    "failed_at": datetime.now(timezone.utc).isoformat(),
-    "stage": os.environ["INSTALL_FAILURE_STAGE"][:80],
-    "message": "SLS Mass Notify installation repair did not complete.",
-    "solution": os.environ["INSTALL_FAILURE_SOLUTION"][:400],
-    "log": "/var/log/sls_mass_notify.log",
-}
-fd, temporary = tempfile.mkstemp(prefix=".install-failure.", dir=directory)
-with os.fdopen(fd, "w", encoding="utf-8") as handle:
-    json.dump(payload, handle, indent=2, sort_keys=True)
-    handle.write("\n")
-os.chmod(temporary, 0o640)
-account = pwd.getpwnam("asterisk")
-os.chown(temporary, account.pw_uid, account.pw_gid)
-os.replace(temporary, path)
-PY
-  /usr/bin/php -r '
+  write_status_json install "$INSTALL_FAILURE_FILE" "$stage" "$solution" "" "" 0
+  /usr/sbin/runuser -u asterisk -- /usr/bin/php -r '
 require "/etc/freepbx.conf";
 \FreePBX::Notifications()->add_error(
     "slsmassnotifyserver",
@@ -252,7 +381,7 @@ clear_install_failure() {
   if [ ! -L "$INSTALL_FAILURE_FILE" ]; then
     rm -f "$INSTALL_FAILURE_FILE" 2>/dev/null || true
   fi
-  /usr/bin/php -r '
+  /usr/sbin/runuser -u asterisk -- /usr/bin/php -r '
 require "/etc/freepbx.conf";
 \FreePBX::Notifications()->delete("slsmassnotifyserver", "INSTALLFAILED");
 exit(0);
@@ -260,38 +389,49 @@ exit(0);
 }
 
 secure_central_config() {
-  [ -e "$CONFIG_FILE" ] || return 0
-  if ! CONFIG_PATH="$CONFIG_FILE" /usr/bin/python3 - <<'PY'
+  [ -e "$CONFIG_FILE" ] || [ -L "$CONFIG_FILE" ] || return 0
+  if ! CONFIG_PATH="$CONFIG_FILE" /usr/bin/python3 -I - <<'PY'
 import os
 import pwd
 import stat
 
 path = os.environ["CONFIG_PATH"]
 parts = [part for part in path.split("/") if part]
-if not path.startswith("/") or not parts or "\x00" in path:
+if not path.startswith("/") or not parts or "\x00" in path or ".." in parts:
     raise SystemExit(2)
 directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
 parent_fd = os.open("/", directory_flags)
+config_fd = -1
 try:
     for component in parts[:-1]:
         next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
         os.close(parent_fd)
         parent_fd = next_fd
-    config_fd = os.open(parts[-1], os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
-finally:
-    os.close(parent_fd)
-try:
-    metadata = os.fstat(config_fd)
-    if not stat.S_ISREG(metadata.st_mode):
-        raise SystemExit(3)
     account = pwd.getpwnam("asterisk")
+    before = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_uid not in (0, account.pw_uid):
+        raise SystemExit(3)
+    config_fd = os.open(parts[-1], os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+    metadata = os.fstat(config_fd)
+    current = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+            or metadata.st_uid not in (0, account.pw_uid)
+            or (before.st_dev, before.st_ino, before.st_uid) != (metadata.st_dev, metadata.st_ino, metadata.st_uid)
+            or (current.st_dev, current.st_ino, current.st_mode, current.st_nlink)
+            != (metadata.st_dev, metadata.st_ino, metadata.st_mode, 1)):
+        raise SystemExit(3)
     os.fchmod(config_fd, 0o640)
     os.fchown(config_fd, account.pw_uid, account.pw_gid)
     verified = os.fstat(config_fd)
-    if stat.S_IMODE(verified.st_mode) != 0o640 or verified.st_uid != account.pw_uid or verified.st_gid != account.pw_gid:
+    current = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+    if (stat.S_IMODE(verified.st_mode) != 0o640 or verified.st_uid != account.pw_uid
+            or verified.st_gid != account.pw_gid or verified.st_nlink != 1
+            or (current.st_dev, current.st_ino) != (verified.st_dev, verified.st_ino)):
         raise SystemExit(4)
 finally:
-    os.close(config_fd)
+    if config_fd >= 0:
+        os.close(config_fd)
+    os.close(parent_fd)
 PY
   then
     log "Rejected unsafe protected central configuration path"
@@ -300,32 +440,63 @@ PY
 }
 
 repair_runtime_permissions() {
-  [ -d "$RUNTIME_DIR" ] || return 0
-  RUNTIME_PERMISSION_ROOT="$RUNTIME_DIR" /usr/bin/python3 - <<'PY' || return 1
+  [ -e "$RUNTIME_DIR" ] || [ -L "$RUNTIME_DIR" ] || return 0
+  RUNTIME_PERMISSION_ROOT="$RUNTIME_DIR" /usr/bin/python3 -I - <<'PY' || return 1
 import os
+import pwd
 import stat
+import re
 
 root = os.environ["RUNTIME_PERMISSION_ROOT"]
 flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
-root_fd = os.open(root, flags)
+account = pwd.getpwnam("asterisk")
+parts = [part for part in root.split("/") if part]
+if not root.startswith("/") or not parts or ".." in parts or "\x00" in root:
+    raise RuntimeError("unsafe runtime root")
+root_fd = os.open("/", flags)
+try:
+    for component in parts:
+        next_fd = os.open(component, flags, dir_fd=root_fd)
+        os.close(root_fd)
+        root_fd = next_fd
+except BaseException:
+    os.close(root_fd)
+    raise
+
+def same_entry(before, opened, current, directory=False):
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    return (expected_type(opened.st_mode) and opened.st_uid in (0, account.pw_uid)
+            and (directory or opened.st_nlink == 1)
+            and (before.st_dev, before.st_ino, before.st_uid) == (opened.st_dev, opened.st_ino, opened.st_uid)
+            and (current.st_dev, current.st_ino, current.st_mode, current.st_nlink)
+            == (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_nlink))
 
 def secure_tree(directory_fd, relative=""):
+    directory_metadata = os.fstat(directory_fd)
+    if not stat.S_ISDIR(directory_metadata.st_mode) or directory_metadata.st_uid not in (0, account.pw_uid):
+        raise RuntimeError("runtime directory has unexpected type or ownership")
     os.fchown(directory_fd, 0, 0)
-    os.fchmod(directory_fd, 0o755)
+    os.fchmod(directory_fd, 0o700 if re.fullmatch(r"piper/\.replacement-[a-f0-9]{24}", relative) else 0o755)
     for name in os.listdir(directory_fd):
         metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         child_relative = f"{relative}/{name}" if relative else name
         if stat.S_ISDIR(metadata.st_mode):
             child_fd = os.open(name, flags, dir_fd=directory_fd)
             try:
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if not same_entry(metadata, os.fstat(child_fd), current, directory=True):
+                    raise RuntimeError(f"runtime directory changed during repair: {child_relative}")
                 secure_tree(child_fd, child_relative)
             finally:
                 os.close(child_fd)
         elif stat.S_ISREG(metadata.st_mode):
-            file_fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
+            if metadata.st_nlink != 1 or metadata.st_uid not in (0, account.pw_uid):
+                raise RuntimeError(f"unsafe runtime file: {child_relative}")
+            file_fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
             try:
-                if not stat.S_ISREG(os.fstat(file_fd).st_mode):
-                    raise RuntimeError(f"runtime entry changed type during repair: {child_relative}")
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if not same_entry(metadata, os.fstat(file_fd), current):
+                    raise RuntimeError(f"runtime entry changed during repair: {child_relative}")
                 os.fchown(file_fd, 0, 0)
                 executable = (
                     "/" not in child_relative
@@ -333,12 +504,23 @@ def secure_tree(directory_fd, relative=""):
                         child_relative.endswith((".sh", ".py"))
                         or child_relative == "sls_mass_notify_schedule_worker.php"
                         or child_relative == "sls_mass_notify_announcement_worker.php"
+                        or child_relative == "sls_mass_notify_automation_worker.php"
+                        or child_relative == "sls_mass_notify_delivery_authorization.php"
+                        or child_relative == "sls_mass_notify_panic.php"
+                        or child_relative == "sls_mass_notify_live_paging.php"
                     )
-                ) or child_relative.startswith("piper/venv/bin/")
-                os.fchmod(file_fd, 0o755 if executable else 0o644)
+                ) or re.sub(r"^piper/\.replacement-[a-f0-9]{24}/", "piper/", child_relative).startswith("piper/venv/bin/")
+                os.fchmod(file_fd, 0o600 if child_relative == "piper/.replacement.lock" else (0o755 if executable else 0o644))
             finally:
                 os.close(file_fd)
         elif stat.S_ISLNK(metadata.st_mode):
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if (metadata.st_nlink != 1 or metadata.st_uid not in (0, account.pw_uid)
+                    or (current.st_dev, current.st_ino, current.st_mode, current.st_nlink)
+                    != (metadata.st_dev, metadata.st_ino, metadata.st_mode, 1)):
+                raise RuntimeError(f"unsafe runtime symbolic link: {child_relative}")
+            # Its parent has already been secured root:root 0755. Never follow
+            # interpreter/lib64 links when repairing their own ownership.
             os.chown(name, 0, 0, dir_fd=directory_fd, follow_symlinks=False)
         else:
             raise RuntimeError(f"unsupported runtime entry: {child_relative}")
@@ -366,13 +548,27 @@ open_root_owned_file MAINTENANCE_LOCK_FD "$LOCK_FILE" || {
   exit 1
 }
 flock -n "$MAINTENANCE_LOCK_FD" || exit 0
+if ! admit_root_runtime >> "$LOG_FILE" 2>&1; then
+  ACTIVE_ACTION="trust"
+  fail_maintenance "publisher_runtime_verification_failed" "The protected SLS runtime does not match an enrolled publisher release. Use the verified release installer to restore it; no automatic baseline was enrolled." 2
+fi
 if ! secure_central_config; then
   ACTIVE_ACTION="config"
   fail_maintenance "protected_config_validation_failed" "The protected central configuration could not be secured. Maintenance was stopped." 2
 fi
 
+# The protected daily journal avoids scanning configuration backups each minute.
+if ! encryption_result="$(/usr/bin/timeout 120 /usr/bin/python3 -I "$RUNTIME_DIR/sls_config_crypto.py" daily 2>> "$LOG_FILE")"; then
+  log "$encryption_result"
+  ACTIVE_ACTION="config"
+  fail_maintenance "configuration_encryption_failed" "SLS configuration encryption or annual key rotation could not be verified. Preserve the protected keyring and review the maintenance log before restoring settings." 2
+fi
+case "$encryption_result" in
+  *'"rotated":true'*|*'"encrypted_files":'[1-9]*) log "$encryption_result" ;;
+esac
+
 # Generated speech and composite audio are short-lived delivery artifacts.
-/usr/bin/python3 "$RUNTIME_DIR/sls_storage_maintenance.py" >> "$LOG_FILE" 2>&1 || log "Storage retention could not complete; existing media was preserved."
+/usr/sbin/runuser -u asterisk -- /usr/bin/python3 -I "$RUNTIME_DIR/sls_storage_maintenance.py" >> "$LOG_FILE" 2>&1 || log "Some storage retention stages were deferred; inspect the preceding retention detail."
 
 # Reconciliation never sends an announcement. Probe worker bootstrap/storage as
 # its service account, so a root-only success cannot mask delivery failures.
@@ -404,13 +600,16 @@ done
 if [ -r "$MENU_FILE" ] && ! grep -Fq 'SLS Mass Notifications menu placement:' "$MENU_FILE"; then
   integration_drift=1
 fi
+if [ "$integration_drift" -eq 1 ] && ! acquire_mutation_coordination >> "$LOG_FILE" 2>&1; then
+  integration_drift=0
+  log "Dashboard/menu repair deferred: active delivery, paging, or configuration editing did not become safely idle."
+fi
 if [ "$integration_drift" -eq 1 ]; then
   log "FreePBX update drift detected; restoring Mass Notify dashboard/menu integration"
   integration_ok=1
-  if run_without_maintenance_lock /usr/bin/env SLS_MASS_NOTIFY_DEFER_SIGNING=1 /usr/bin/php -r 'require "/etc/freepbx.conf"; \FreePBX::Create()->Slsmassnotifyserver->repairUpdateSensitiveIntegration(); exit(0);' >> "$LOG_FILE" 2>&1; then
-    run_without_maintenance_lock /usr/sbin/fwconsole chown >> "$LOG_FILE" 2>&1 || integration_ok=0
-    repair_runtime_permissions || { integration_ok=0; log "Unable to restore protected runtime permissions after fwconsole chown"; }
-    secure_central_config || integration_ok=0
+  if run_without_maintenance_lock /usr/sbin/runuser -u asterisk -- /usr/bin/env SLS_MASS_NOTIFY_DEFER_SIGNING=1 /usr/bin/php -r 'require "/etc/freepbx.conf"; \FreePBX::Create()->Slsmassnotifyserver->repairUpdateSensitiveIntegration(); exit(0);' >> "$LOG_FILE" 2>&1; then
+    # Widget/menu files are web-account data. Do not invoke root FreePBX
+    # bootstrap or a global ownership sweep to repair these two UI hooks.
     for module in dashboard framework; do
       [ -d "/var/www/html/admin/modules/$module" ] || continue
       run_without_maintenance_lock "$SIGNER" "$module" >> "$LOG_FILE" 2>&1 || { integration_ok=0; log "Unable to refresh local signature for $module"; }
@@ -423,6 +622,12 @@ if [ "$integration_drift" -eq 1 ]; then
   else
     log "Automatic dashboard/menu integration repair failed; it will retry on the next maintenance run"
   fi
+  if ! verify_mutation_idle >> "$LOG_FILE" 2>&1; then
+    log "Dashboard/menu repair idle verification failed; preserve delivery history and review the maintenance log."
+    release_mutation_coordination
+    exit 1
+  fi
+  release_mutation_coordination
 fi
 
 safe_request() {
@@ -447,8 +652,23 @@ safe_request() {
 # Send each currently active operational fault once. This runs inside the same
 # root maintenance lock as status-producing repair/update work, and failure to
 # submit a notice is logged for a bounded retry without blocking maintenance.
+if safe_request "$TIMEZONE_REQUEST_FILE" "timezone"; then
+  ACTIVE_ACTION="timezone"
+  if ! admit_root_runtime >> "$LOG_FILE" 2>&1 || ! acquire_mutation_coordination >> "$LOG_FILE" 2>&1; then
+    fail_maintenance "timezone_apply_deferred" "The saved timezone could not be applied while delivery or configuration activity was present. Review the setup wizard and retry once activity finishes." 2
+  fi
+  if run_without_maintenance_lock /usr/bin/python3 -I "$PRIVILEGED_HELPER" timezone --apply >> "$LOG_FILE" 2>&1; then
+    rm -f "$TIMEZONE_REQUEST_FILE"
+    verify_mutation_idle >> "$LOG_FILE" 2>&1 || fail_maintenance "timezone_state_changed" "Timezone apply could not verify preserved configuration and delivery history. Preserve the maintenance log." 2
+    release_mutation_coordination
+    log "Applied the explicitly saved setup timezone"
+    ACTIVE_ACTION=""
+  else
+    fail_maintenance "timezone_apply_failed" "The PBX rejected the saved timezone. Review the maintenance log and select a valid IANA timezone in the setup wizard." 2
+  fi
+fi
 if [ -x "$RUNTIME_DIR/sls_system_notifications.py" ]; then
-  if ! /usr/bin/timeout 20 /usr/bin/python3 "$RUNTIME_DIR/sls_system_notifications.py" >> "$LOG_FILE" 2>&1; then
+  if ! /usr/bin/timeout 20 /usr/bin/python3 -I "$RUNTIME_DIR/sls_system_notifications.py" >> "$LOG_FILE" 2>&1; then
     log "System/error email notification check failed; it will retry later"
   fi
 fi
@@ -510,32 +730,26 @@ write_maintenance_progress "repair" "running" "Refreshing runtime files, permiss
 if ! /usr/bin/python3 "$RUNTIME_DIR/sls_config.py" "$CONFIG_FILE" >/dev/null 2>>"$LOG_FILE"; then
   fail_maintenance "protected_config_validation_failed" "The protected central configuration is invalid or unavailable. Repair was not started." 2
 fi
-# Validate every packaged shell script before the install hook copies it into
-# the active runtime. A broken updater must never be installed by a repair.
-while IFS= read -r -d '' script; do
-  if ! /bin/bash -n "$script" >> "$LOG_FILE" 2>&1; then
-    fail_maintenance "update_script_syntax_error" "A packaged runtime shell script contains a syntax error. Repair was not started." 2
-  fi
-done < <(find "$MODULE_DIR/bin" -type f -name '*.sh' -print0)
+if ! acquire_mutation_coordination >> "$LOG_FILE" 2>&1; then
+  fail_maintenance "active_delivery_or_configuration" "Repair did not start because notifications, paging, configuration editing, or collector health could not be confirmed idle. Allow current activity to finish and retry; no delivery was interrupted." 2
+fi
+# Root operations use only the immutable publisher generation. All FreePBX
+# bootstrap, module hooks, DB access and reload hooks run as asterisk.
 repair_ok=1
 repair_status=0
-# Normalize the managed runtime before the module hook even when Piper is not
-# installed yet; secure runtime-tree validation must never depend on whether a
-# particular optional executable already exists.
-repair_runtime_permissions || { repair_status=$?; repair_ok=0; }
+for phase in prepare dependencies; do
+  if [ "$repair_ok" -eq 1 ]; then
+    run_without_maintenance_lock /usr/bin/python3 -I "$PRIVILEGED_HELPER" "$phase" --apply >> "$LOG_FILE" 2>&1 || { repair_status=$?; repair_ok=0; }
+  fi
+done
 if [ "$repair_ok" -eq 1 ]; then
-run_without_maintenance_lock /usr/bin/env SLS_MASS_NOTIFY_DEFER_SIGNING=1 /usr/bin/php -r 'require "/etc/freepbx.conf"; require_once "/var/www/html/admin/modules/slsmassnotifyserver/Slsmassnotifyserver.class.php"; $class = "\\FreePBX\\modules\\Slsmassnotifyserver"; $obj = new $class(\FreePBX::Create()); $obj->install(); exit(0);' >> "$LOG_FILE" 2>&1 || { repair_status=$?; repair_ok=0; }
+  run_without_maintenance_lock /usr/sbin/runuser -u asterisk -- /usr/bin/env SLS_MASS_NOTIFY_DEFER_SIGNING=1 /usr/bin/php -r 'require "/etc/freepbx.conf"; \FreePBX::Create()->Slsmassnotifyserver->installUnprivilegedPhase();' >> "$LOG_FILE" 2>&1 || { repair_status=$?; repair_ok=0; }
 fi
 if [ "$repair_ok" -eq 1 ]; then
-  run_without_maintenance_lock /usr/sbin/fwconsole chown >> "$LOG_FILE" 2>&1 || { repair_status=$?; repair_ok=0; }
-  repair_runtime_permissions || { repair_status=$?; repair_ok=0; }
+  run_without_maintenance_lock /usr/bin/python3 -I "$PRIVILEGED_HELPER" activate --apply >> "$LOG_FILE" 2>&1 || { repair_status=$?; repair_ok=0; }
 fi
 if [ "$repair_ok" -eq 1 ]; then
-  secure_central_config || { repair_status=$?; repair_ok=0; }
-fi
-if [ "$repair_ok" -eq 1 ]; then
-  run_without_maintenance_lock /usr/sbin/fwconsole reload >> "$LOG_FILE" 2>&1 || { repair_status=$?; repair_ok=0; }
-  asterisk -rx "dialplan reload" >> "$LOG_FILE" 2>&1 || { repair_status=$?; repair_ok=0; }
+  run_without_maintenance_lock /usr/sbin/runuser -u asterisk -- /usr/bin/env SLS_MASS_NOTIFY_PRESERVE_PENDING=1 /usr/sbin/fwconsole reload >> "$LOG_FILE" 2>&1 || { repair_status=$?; repair_ok=0; }
 fi
 if [ "$repair_ok" -eq 1 ]; then
   for module in slsmassnotifyserver dashboard framework; do
@@ -544,18 +758,20 @@ if [ "$repair_ok" -eq 1 ]; then
   done
 fi
 if [ "$repair_ok" -eq 1 ]; then
-  # A successful command exit is not enough to clear a persistent failure.
-  # Recheck signatures, generated dialplan, Asterisk capabilities and AMI,
-  # runtime syntax/executability, Piper voices, cron, Apache/API and Dashboard
-  # integration after the repair and signing steps have all completed.
-  run_without_maintenance_lock /usr/bin/timeout 300 /usr/bin/php -r '
+  run_without_maintenance_lock /usr/bin/python3 -I "$PRIVILEGED_HELPER" verify >> "$LOG_FILE" 2>&1 || { repair_status=$?; repair_ok=0; }
+fi
+if [ "$repair_ok" -eq 1 ]; then
+  run_without_maintenance_lock /usr/sbin/runuser -u asterisk -- /usr/bin/timeout 300 /usr/bin/php -r '
 require "/etc/freepbx.conf";
-require_once "/var/www/html/admin/modules/slsmassnotifyserver/Slsmassnotifyserver.class.php";
-$class = "\\FreePBX\\modules\\Slsmassnotifyserver";
-$obj = new $class(\FreePBX::Create());
-$obj->verifyProtectedRepairIntegration();
-exit(0);
+$obj = \FreePBX::Create()->Slsmassnotifyserver;
+$obj->verifyUnprivilegedIntegration();
 ' >> "$LOG_FILE" 2>&1 || { repair_status=$?; repair_ok=0; }
+fi
+if [ "$repair_ok" -eq 1 ]; then
+  verify_mutation_idle >> "$LOG_FILE" 2>&1 || { repair_status=$?; repair_ok=0; }
+fi
+if [ "$repair_ok" -eq 1 ]; then
+  run_without_maintenance_lock /usr/sbin/runuser -u asterisk -- /usr/bin/php -r 'require "/etc/freepbx.conf"; \FreePBX::Create()->Slsmassnotifyserver->finalizeVerifiedUnprivilegedRestore();' >> "$LOG_FILE" 2>&1 || { repair_status=$?; repair_ok=0; }
 fi
 if [ "$repair_ok" -eq 1 ]; then
   log "Queued installation repair completed"

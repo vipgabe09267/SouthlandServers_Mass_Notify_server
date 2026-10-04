@@ -52,6 +52,15 @@ $call = static function (string $method, ...$arguments) use ($parent, $fixture) 
 	return $target->invoke($fixture, ...$arguments);
 };
 
+foreach ([0, 63, 4097, '512', true, [], null] as $value) {
+	$result = $call('validateAndNormalizeControlConfigPatch', ['generated_media_cache_mib'=>$value]);
+	if (!$result['errors']) { configuration_security_fail('Unsafe generated media limit was accepted.'); }
+}
+foreach ([64, 512, 4096] as $value) {
+	$result = $call('validateAndNormalizeControlConfigPatch', ['generated_media_cache_mib'=>$value]);
+	if ($result['errors'] || $result['patch']['generated_media_cache_mib'] !== $value) { configuration_security_fail('Valid generated media limit was changed or rejected.'); }
+}
+
 $announcementErrors = $call('validateControlApiAnnouncementPayload', [
 	'message' => 'Test',
 	'all_phones' => 'false',
@@ -102,11 +111,12 @@ if (stripos(implode(' ', $badBooleanPatch['errors'] ?? []), 'JSON boolean') === 
 $validPatch = $call('validateAndNormalizeControlConfigPatch', [
 	'enabled' => false,
 	'nws_api_base_url' => 'https://api.weather.gov',
-	'control_api' => ['rate_limit_enabled' => true, 'rate_limit_per_minute' => 30],
+	'control_api' => ['rate_limit_enabled' => true, 'rate_limit_per_minute' => 30, 'audit_syslog' => true],
 ]);
 if (!empty($validPatch['errors'])
 	|| ($validPatch['patch']['enabled'] ?? null) !== '0'
-	|| ($validPatch['patch']['control_api']['rate_limit_enabled'] ?? null) !== '1') {
+	|| ($validPatch['patch']['control_api']['rate_limit_enabled'] ?? null) !== '1'
+	|| ($validPatch['patch']['control_api']['audit_syslog'] ?? null) !== '1') {
 	configuration_security_fail('A valid Control API config patch was not normalized safely.');
 }
 $badNwsEndpoint = $call('validateAndNormalizeControlConfigPatch', [
@@ -308,8 +318,9 @@ foreach (['dashboard-announcement-section.php', 'dedicated-sounds', 'mass-notify
 		configuration_security_fail('Known legacy runtime-link migration is incomplete: ' . $legacyLinkMarker);
 	}
 }
-$cleanupPosition = strpos($classSource, '$this->cleanupLegacyRuntimeArtifacts();');
-$permissionPosition = strpos($classSource, '$this->ensureRuntimePermissions();');
+$protectedSource = (string)file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/bin/sls_mass_notify/sls_privileged_install.py');
+$cleanupPosition = strpos($protectedSource, 'self.files.cleanup_legacy_links()');
+$permissionPosition = strpos($protectedSource, 'self.files.secure_tree(DATA)');
 if ($cleanupPosition === false || $permissionPosition === false || $cleanupPosition > $permissionPosition) {
 	configuration_security_fail('Legacy runtime links are not cleaned before the fail-closed permission scan.');
 }

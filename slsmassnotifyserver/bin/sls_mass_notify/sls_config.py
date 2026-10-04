@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
-"""Read and validate the SLS Mass Notify central JSON configuration."""
+"""Read and validate the SLS Mass Notify central configuration."""
 
+import importlib.util
 import json
 import ipaddress
 import os
 import re
 import sys
 from pathlib import Path
+
+import sys as _config_sys
+_config_sys.dont_write_bytecode = True
+_config_crypto_spec = importlib.util.spec_from_file_location("sls_config_crypto", Path(__file__).resolve().with_name("sls_config_crypto.py"))
+_config_crypto = importlib.util.module_from_spec(_config_crypto_spec)
+_config_crypto_spec.loader.exec_module(_config_crypto)
 from urllib.parse import urlparse
 
 
@@ -151,12 +158,15 @@ def emit(key, value):
 def main():
     path = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CONFIG
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = _config_crypto.read_config(path)
     except Exception as exc:
         print(f"Unable to read central config {path}: {exc}", file=sys.stderr)
         return 1
     if not isinstance(data, dict):
         print(f"Central config {path} is not a JSON object", file=sys.stderr)
+        return 1
+    if type(data.get('runtime_enabled', True)) is not bool:
+        print('SLS runtime_enabled must be a boolean; correct the protected configuration before activation.', file=sys.stderr)
         return 1
 
     try:
@@ -271,6 +281,9 @@ def main():
             or zone_desktop_recipients
             or zone_email_recipients
             or zone_has_webhook_destination
+            or any(group.get('voice_recipient_ids') or group.get('sms_recipient_ids') for group in matching_zone_groups)
+            or bool(text(os.environ.get('SLS_WEATHER_CHANNEL_SNAPSHOT')) and json.loads(os.environ['SLS_WEATHER_CHANNEL_SNAPSHOT']).get('voice_recipient_ids'))
+            or bool(text(os.environ.get('SLS_WEATHER_CHANNEL_SNAPSHOT')) and json.loads(os.environ['SLS_WEATHER_CHANNEL_SNAPSHOT']).get('sms_recipient_ids'))
             or worker_has_destination_override
         )
     ):
@@ -312,7 +325,11 @@ def main():
         "AMI_PORT": bounded_int(ami.get("port"), 1, 65535, 5038),
         "GITHUB_UPDATES_ENABLED": enabled(updates.get("github_enabled")),
         "GITHUB_UPDATES_REPOSITORY": text(updates.get("repository"), "vipgabe09267/SouthlandServers_Mass_Notify_server"),
-        "GITHUB_UPDATES_CHANNEL": "beta",
+        "GITHUB_UPDATES_CHANNEL": text(updates.get("channel"), "beta"),
+        "GITHUB_UPDATES_PIN": text(updates.get("pinned_version")),
+        "GITHUB_UPDATES_WINDOW_START": text(updates.get("window_start")),
+        "GITHUB_UPDATES_WINDOW_END": text(updates.get("window_end")),
+        "GITHUB_UPDATES_DELAY_HOURS": str(updates.get("rollout_delay_hours", 0)),
     }
     for key, value in values.items():
         emit(key, value)

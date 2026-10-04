@@ -2,9 +2,11 @@
 """Release-gate regressions for cross-PBX AMI and SIP NOTIFY behavior."""
 
 import importlib.util
+import json
 import logging
 import pathlib
 import sys
+import tempfile
 from types import SimpleNamespace
 from unittest import mock
 
@@ -18,6 +20,13 @@ UNINSTALL_SOURCE = (ROOT / "tools/uninstall_release.sh").read_text(encoding="utf
 SPEC = importlib.util.spec_from_file_location("sls_notify_portability_test", SOURCE)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+# The installed runtime correctly fences absent policy. This transport-only
+# fixture supplies a private explicit disabled policy instead of host settings.
+POLICY_DIRECTORY=tempfile.TemporaryDirectory(prefix='sls-portability-policy-')
+POLICY_PATH=pathlib.Path(POLICY_DIRECTORY.name)/'disabled.config'
+POLICY_PATH.write_text(json.dumps({'enterprise_cluster':{'enabled':False}}))
+POLICY_PATH.chmod(0o600)
+MODULE._cluster_guard.CONFIG=POLICY_PATH
 
 
 recording_unlink_guard = "if ($fileOwned && (!is_array($row) || $rowOwned))"
@@ -35,19 +44,45 @@ permissions_method = CLASS_SOURCE.split("private function repairPiperRuntimePerm
 assert "$this->isSlsOwnedPiperWrapper('/usr/local/bin/piper')" in permissions_method
 
 
-assert MODULE.resolve_local_ami_endpoint({"host": "localhost", "port": 5040}) == ("127.0.0.1", 5040)
-assert MODULE.resolve_local_ami_endpoint({"host": "::1", "port": "5038"}) == ("127.0.0.1", 5038)
+with mock.patch.object(MODULE.Path, "is_file", return_value=False):
+    assert MODULE.resolve_local_ami_endpoint({"host": "localhost", "port": 5040}) == ("127.0.0.1", 5040)
+    assert MODULE.resolve_local_ami_endpoint({"host": "::1", "port": "5038"}) == ("::1", 5038)
+    assert MODULE.resolve_local_ami_endpoint({"host": "127.0.0.1", "port": 5038}) == ("127.0.0.1", 5038)
+with mock.patch.object(MODULE.Path, "is_file", return_value=True), mock.patch.object(
+    MODULE.Path, "read_text", return_value="ASTMANAGERHOST=::1\nASTMANAGERPORT=5041\n"
+):
+    assert MODULE.resolve_local_ami_endpoint({}) == ("::1", 5041)
+    assert MODULE.resolve_local_ami_endpoint({"host": "127.0.0.1", "port": 5038}) == ("127.0.0.1", 5038)
+    assert MODULE.resolve_local_ami_endpoint({"host": "localhost", "port": 5038}) == ("127.0.0.1", 5038)
+with mock.patch.object(MODULE.Path, "is_file", return_value=True), mock.patch.object(
+    MODULE.Path, "read_text", return_value="ASTMANAGERHOST=127.0.0.1\nASTMANAGERPORT=5038\n"
+):
+    assert MODULE.resolve_local_ami_endpoint({"host": "::1", "port": 5041}) == ("::1", 5041)
+
 for invalid_ami in (
     {"host": "192.0.2.20", "port": 5038},
+    {"host": "2001:db8::1", "port": 5038},
+    {"host": "::", "port": 5038},
+    {"host": "[::1]", "port": 5038},
+    {"host": "localhost.example.test", "port": 5038},
     {"host": "localhost", "port": 0},
     {"host": "localhost", "port": "not-a-port"},
 ):
     try:
-        MODULE.resolve_local_ami_endpoint(invalid_ami)
+        with mock.patch.object(MODULE.Path, "is_file", return_value=False):
+            MODULE.resolve_local_ami_endpoint(invalid_ami)
     except RuntimeError:
         pass
     else:
         raise AssertionError(f"unsafe AMI endpoint was accepted: {invalid_ami!r}")
+
+# Exercise the actual socket handoff with mocks, not a live AMI endpoint.
+with mock.patch.object(MODULE.socket, "create_connection") as connection:
+    client = MODULE.AmiClient("::1", 5041, "fixture-user", "fixture-secret")
+    with mock.patch.object(client, "action", return_value=({"Response": "Success"}, [])):
+        client.connect()
+    connection.assert_called_once_with(("::1", 5041), client.timeout)
+    client.close()
 
 
 MANAGER_HELP = """
@@ -151,6 +186,19 @@ class NotifyAmi:
     def action(self, fields, complete_event=None):
         self.actions.append(fields)
         return self.response, []
+
+
+missing_policy_ami=NotifyAmi()
+with mock.patch.object(MODULE._cluster_guard,'CONFIG',POLICY_PATH.with_name('missing.config')), mock.patch.object(
+    MODULE._cluster_guard,'HELPER',SOURCE
+):
+    try:
+        MODULE.send_notify(missing_policy_ami,'1000','<xml/>')
+    except MODULE.NotifySubmissionError:
+        pass
+    else:
+        raise AssertionError('installed transport accepted missing protected policy')
+assert missing_policy_ami.actions==[], 'missing policy reached the AMI action'
 
 
 for transport_uri in transport_uris:

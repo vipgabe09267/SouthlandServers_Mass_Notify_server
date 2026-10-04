@@ -294,6 +294,7 @@ def test_weather_worker_overrides():
         installed_claim_helper = runtime / "sls_nws_delivery_claims.py"
         shutil.copyfile(CROSS_ZONE_CLAIM_HELPER, installed_claim_helper)
         installed_claim_helper.chmod(0o755)
+        shutil.copyfile(ROOT / "slsmassnotifyserver/bin/sls_mass_notify/sls_config_crypto.py", runtime / "sls_config_crypto.py")
         config_path = temp / "mass-notifications.config"
         config = {
             "enabled": "1",

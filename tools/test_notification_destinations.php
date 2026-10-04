@@ -173,8 +173,43 @@ if (($redacted['discord_webhook_url'] ?? '') !== '[redacted]'
 	destination_fail('Control API redaction exposed a nested webhook URL.');
 }
 
+foreach (['generic', 'announcement'] as $kind) {
+	foreach (['slack', 'teams_workflow'] as $format) {
+		$row = ['id'=>'integration', 'name'=>'Operations', 'url'=>$generic, 'enabled'=>'1', 'payload_format'=>$format];
+		$normalized = $call('normalizeWebhookDestinations', [$row], $kind);
+		if ($normalized[0]['payload_format'] !== $format || $call('validateWebhookDestinations', [$row], $kind) !== []) {
+			destination_fail('A supported collaboration adapter was not preserved.');
+		}
+		$expected = hash('sha256', $generic . "\npayload_format=" . $format);
+		if ($call('webhookDestinationFingerprint', $normalized[0]) !== $expected) {
+			destination_fail('PHP/Python adapter fingerprint material differs.');
+		}
+		$partial = $call('mergeWebhookDestinationSecrets', [['id'=>'integration', 'url'=>'[redacted]', 'name'=>'Renamed']], [$row], $kind);
+		if ($partial[0]['payload_format'] !== $format || $partial[0]['url'] !== $generic) {
+			destination_fail('A partial update downgraded the saved adapter or lost its secret URL.');
+		}
+		$redacted = $call('redactConfigSecrets', [$kind . '_webhooks'=>[$row]]);
+		if ($redacted[$kind . '_webhooks'][0]['url'] !== '[redacted]' || $redacted[$kind . '_webhooks'][0]['payload_format'] !== $format) {
+			destination_fail('Provider redaction lost its nonsecret format or exposed its URL.');
+		}
+	}
+	foreach (['unknown', '', null, [], 1] as $format) {
+		$row = ['name'=>'Receiver', 'url'=>$generic, 'payload_format'=>$format];
+		if (!$call('validateWebhookDestinations', [$row], $kind)) {
+			destination_fail('Invalid adapter was accepted during validation.');
+		}
+		try {
+			$call('normalizeWebhookDestinations', [$row], $kind);
+			destination_fail('Invalid adapter was silently downgraded during normalization.');
+		} catch (InvalidArgumentException $expected) {}
+	}
+}
+if ($call('webhookDestinationFingerprint', ['url'=>$generic]) !== hash('sha256', $generic)) {
+	destination_fail('Native adapter migration changed existing queued route fingerprints.');
+}
+
 $view = (string)file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/views/other_settings.php');
-foreach (['system_notification_recipients_present', 'system_notification_recipients[]', 'System and Error Notifications', 'Weather and Lightning email recipients are selected within each zone or trigger area.', 'discord_webhooks_present', 'generic_webhooks_present', 'announcement_webhooks_present', 'Dashboard Announcement Webhooks', 'value="" autocomplete="new-password"'] as $marker) {
+foreach (['system_notification_recipients_present', 'system_notification_recipients[]', 'System and Error Notifications', 'Weather and Lightning email recipients are selected within each zone or trigger area.', 'discord_webhooks_present', 'generic_webhooks_present', 'announcement_webhooks_present', 'Dashboard Announcement Webhooks', 'Microsoft Teams Workflows', 'Slack incoming webhook', 'payload_format', 'value="" autocomplete="new-password"'] as $marker) {
 	if (strpos($view, $marker) === false) {
 		destination_fail("Notification destination UI secret-preservation contract is missing: {$marker}");
 	}

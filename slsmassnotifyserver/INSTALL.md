@@ -7,7 +7,7 @@
 - Asterisk with PJSIP endpoints
 - FreePBX Framework, Dashboard, Backup & Restore, and System Recordings modules. The release installer installs a missing dependency or enables an installed disabled dependency; it does not silently upgrade an already installed core module.
 - Active Apache and cron services, with Apache rewrite and authorization-header support
-- Canonical `/usr/bin/php` CLI plus PHP OpenSSL, mbstring, and POSIX support for encrypted desktop credentials, scheduling, account lookup, and bounded alert-text handling
+- Canonical `/usr/bin/php` CLI plus PHP OpenSSL, Sodium, mbstring, POSIX, cURL and PDO SQLite support for encrypted desktop credentials, scheduling, account lookup, bounded alert-text handling and durable SMS receipts
 - Python 3 with `venv` and `pip`
 - `curl`, `wget`, CA certificates, GnuPG, OpenSSL 3, `logrotate`, and `tar`
 - Piper TTS runtime. The installer creates the root-owned `/usr/local/bin/sls_mass_notify/piper/venv`, exposes it at the compatibility path `/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/venv`, installs the versioned `piper-requirements.txt` dependency set and pinned packaging tools, and downloads checksum-verified voices to the module data folder.
@@ -24,9 +24,9 @@ Run as `root` on the FreePBX server:
 ```bash
 cd /tmp
 curl -fsSL -o sls-install.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.4-beta/tools/install_release.sh
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.5-beta/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.4-beta/slsmassnotifyserver-0.1.4-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.5-beta/slsmassnotifyserver-0.1.5-beta.tgz' \
 ./sls-install.sh
 ```
 
@@ -34,7 +34,7 @@ The installer prints the PBX operating-system timezone before module activation.
 
 ```bash
 SLS_MASS_NOTIFY_TIMEZONE='America/Chicago' \
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.4-beta/slsmassnotifyserver-0.1.4-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.5-beta/slsmassnotifyserver-0.1.5-beta.tgz' \
 ./sls-install.sh
 ```
 
@@ -47,7 +47,7 @@ The updater resolves a release tag to its commit, verifies the publisher’s Ed2
 For an offline/local package, obtain its SHA-256 through a trusted channel and use the matching version’s installer:
 
 ```bash
-SLS_MASS_NOTIFY_TGZ='/tmp/slsmassnotifyserver-0.1.4-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ='/tmp/slsmassnotifyserver-0.1.5-beta.tgz' \
 SLS_MASS_NOTIFY_SHA256='<trusted 64-character SHA-256>' \
 ./sls-install.sh
 ```
@@ -63,7 +63,7 @@ The module install hook prepares the local PBX integration by applying managed c
 - copies runtime scripts to `/usr/local/bin/sls_mass_notify`
 - copies API endpoints to `/var/www/html/api/sipnotify` and `/var/www/html/api/sls-mass-notify`
 - copies web assets to `/var/www/html/sls_mass_notify`
-- creates the central config at `/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config` on a fresh install and preserves it byte-for-byte during updates
+- creates the central config at `/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config` on a fresh install and preserves existing settings and credentials during updates; AES migration or key rotation can change the encrypted file's bytes without changing those settings
 - has shell, Python, PHP, and API services read the central config directly
 - initializes the email sender from the local Postfix/PBX identity on a fresh install. The local part defaults to `no-reply`, both parts can be edited, and opt-in system/error recipients remain separate from Weather and Lightning alert recipients
 - installs the local AMI user through the FreePBX Manager module, which generates `/etc/asterisk/manager_additional.conf`, and uses FreePBX's validated loopback Manager host and port rather than assuming port 5038
@@ -78,7 +78,7 @@ The module install hook prepares the local PBX integration by applying managed c
 - verifies all Asterisk functions and applications used by the paging dialplan before module activation, including `PJSIP_HEADER`, `PJSIP_CONTACT`, `PJSIP_AOR`, `PJSIP_DIAL_CONTACTS`, `CUT`, `Page`, and ConfBridge. An installed but unloaded provider is loaded and rechecked; a Debian-owned missing provider can be repaired using the exact installed package without upgrading Asterisk, while an unavailable or unmanaged provider stops with its exact module path before any module replacement
 - verifies every required Asterisk provider will load after restart. `autoload=no` systems must explicitly load each provider, and matching `noload` entries are rejected with the affected module name
 - validates preserved central-config AMI credentials before activation and refuses a malformed legacy value without changing or printing it
-- stages and syntax-checks the complete module before activation, retains a recoverable copy of the previous module during upgrades, removes partial integration before rollback, restores the prior module and protected configuration after a failed install, and retries a repaired loopback AMI integration before returning an error
+- verifies the publisher-signed archive and installer before running packaged helpers, stages and syntax-checks the module, and retains root-private recovery material before activation. Fixed root helpers install protected files; FreePBX hooks and database integration run as `asterisk`. Failed activation restores validated static files and supported service state without rewinding delivery journals or invoking old module hooks as root
 - compares every managed runtime, API, public asset, signer, and Dashboard file with its packaged source; stale managed files are removed without touching the central configuration or Piper models
 - verifies all six Piper model/metadata hashes and performs a real synthesis with Amy, Lessac, and Ryan
 - refuses to replace an existing `/usr/local/bin/piper` wrapper unless its contents prove it is already managed by SLS Mass Notify
@@ -87,7 +87,7 @@ The module install hook prepares the local PBX integration by applying managed c
 - verifies an authenticated Control API status request when the Control API is enabled and loopback is allowed; disabled or deliberately loopback-blocked APIs remain valid configurations
 - resolves every PJSIP contact for audio and pages them together through `Page()`/ConfBridge, so a softphone registration does not replace a desk phone registration. Mixed-family visual SIP NOTIFY uses contact-specific vendor payloads when URI routing is available and one safe generic endpoint payload otherwise; an unknown format alone does not block installation, and UDP/TCP/TLS SIP/SIPS URI syntax is retained
 - accepts an authenticated Asterisk 22 `No Contacts found` AMI response as an authorized empty inventory on PBXs where no phones are currently registered, without accepting authentication or permission failures
-- restores the packaged local signer as an exact root-owned executable, discovers the FreePBX web account, module root, and GPG home from that PBX, repairs ownership on the selected keyring before importing trust, and requires exact trusted status 129 for every touched module
+- installs the signer from the authenticated publisher generation, checks protected expected module inventories before signing, and requires exact trusted status 129 for every touched module. Framework and Dashboard require an approved upstream/overlay baseline; existing local signatures alone cannot establish that baseline
 - serializes install, update, repair, and uninstall work with the root maintenance lock. A child installer launched by the maintenance worker reuses the inherited lock instead of deadlocking, while direct CLI operations wait for an active maintenance transaction to finish
 - performs one final signing pass after reload. A candidate `module.sig` is published only after FreePBX verifies it; a failed verification restores the previous signature
 - records a failed install or repair in protected state and FreePBX notifications. Dashboard health shows a red fault with the failed stage and a possible next step until comprehensive integration, signature, runtime, and health verification completes successfully
@@ -116,12 +116,7 @@ After installing the module:
 
 Notification Logs supports combined event-type and PBX-local calendar-date filtering. General Settings keeps repair, complete uninstall, and configuration replacement in separate Danger Zone cards so the scope of each confirmed maintenance action remains clear.
 
-If Piper voices are missing after install, run:
-
-```bash
-/usr/local/bin/sls_mass_notify/sls_mass_notify_install_piper_voices.sh
-fwconsole reload
-```
+If Piper voices are missing after installation, use **General Settings > Repair installation**. Repair first admits the protected release generation and then checks the managed speech environment. Unsafe ownership, links or unreviewed code require resolving the specific diagnostic before retrying.
 
 To find a Weather.gov forecast zone, open the [official NWS Public Zone Maps](https://www.weather.gov/pimar/PubZone), choose the state, and find the three-digit zone number covering the location. Enter the two-letter state abbreviation, `Z`, and the three digits. For example, Texas zone `163` is `TXZ163`.
 
@@ -139,6 +134,10 @@ Weather and Lightning observations are separate from queued delivery and externa
 
 Desktop protocol 2 fixes initial/reconnect event cursors and supports optional authenticated acknowledgments. The client must implement ACK to populate acknowledgment status. A connected stream is not proof of app display or human receipt.
 
+## Runtime console
+
+Installation, update and protected repair install and verify the publisher-authenticated `/usr/local/bin/slsconsole` entrypoint. Native restore checks its parity; rollback captures it, and uninstall removes it. Use `sudo slsconsole status`, `stop`, `start` or `reboot`. Stop pauses new notification admission, while existing calls and receipt tracking continue. Reboot restarts only the SLS phone collector and preserves a stopped state. Control commands preserve other active and staged configuration settings and do not restart PBX services. See README for the command table.
+
 ## Update Safety
 
 Module code is installed under FreePBX modules. Runtime configuration is stored under:
@@ -151,7 +150,7 @@ Updates should not overwrite the central settings file. Use **General Settings >
 
 Portable `.config` exports include schedule definitions but not the PBX-local execution history, so importing one disables its schedules for review. Native FreePBX backups include the execution journal and use the replay-safe restore path described below.
 
-The native FreePBX 17 backup adapter includes the protected config, schedule execution journal, and custom module tones in module-based backup jobs. The installer enables FreePBX Backup, verifies adapter discovery, and enrolls Mass Notify in existing module-based jobs. A system with no administrator-defined jobs is healthy; create one in **Backup & Restore** when its schedule, storage, and retention policy have been chosen. Restores validate manifest records, SHA-256 hashes, size limits, config structure, credentials, and WAV data before an atomic replacement, then run post-restore integration repair. Due or completed occurrences are not replayed. FreePBX cannot download an unknown custom module from this project automatically, so install `slsmassnotifyserver` on a replacement PBX before restoring its archive and keep an independent `.config` backup.
+The native FreePBX 17 backup adapter includes the protected config, schedule execution journal, custom module tones, SMS continuity when present, and a bounded operational evidence archive in module-based backup jobs. Historical queues, desktop inbox entries, storm state and incidents are archived for review, never reactivated. Weather/lightning automation and external voice remain disabled after restore until reviewed. See [recovery policy and acceptance checks](docs/RECOVERY.md). The installer enables FreePBX Backup, verifies adapter discovery, and enrolls Mass Notify in existing module-based jobs. A system with no administrator-defined jobs is healthy; create one in **Backup & Restore** when its schedule, storage, and retention policy have been chosen. Restores validate manifest records, SHA-256 hashes, size limits, config structure, credentials, and WAV data before an atomic replacement, then run post-restore integration repair. Due or completed occurrences are not replayed. FreePBX cannot download an unknown custom module from this project automatically, so install `slsmassnotifyserver` on a replacement PBX before restoring its archive and keep an independent `.config` backup.
 
 Executable runtime, including Piper and the automatic updater, is root-owned. Mutable config, voice models, tones, journals, and generated audio remain in the Asterisk data folder. Generated TTS and combined announcement audio is removed automatically fifteen minutes after its reserved playback ends; queued media is leased until then. This prevents the Asterisk service account from replacing code later executed by a privileged maintenance/update job.
 
@@ -166,6 +165,26 @@ On a minimal Debian 12 FreePBX host, missing Python is installed before opening 
 If a log is refused, inspect it with `stat` and check its parent directories. A symlink, hardlink, special file, or unexpected owner requires administrator review; do not work around this with `chmod 777`, disabled kernel protections, or a complete uninstall. Use a new absolute `SLS_MASS_NOTIFY_INSTALL_LOG` path inside a root-owned, non-writable directory if the old path must be preserved untouched.
 
 For a runtime-integration failure, retain the installer log and the exact missing executable or mismatched file reported. For a Weather test where desktops succeed but the phone channel fails, check the matching `SIP_NOTIFY_TARGET` / `SIP_NOTIFY_RESULT` entries or sender error in `/var/log/sls_mass_notify.log`. The phone and desktop channels are independent; changing SIP transport or disabling TLS is not a general fix for that message.
+
+### Audio reservation migration and recovery
+
+`0.1.5-beta` changes the shared audio journal protocol. Install the complete package: the Python queue/admission helpers, PHP dial-in paging, media cleanup, idle inspector, and maintenance guard must agree on the permanent `audio-reservations.lock`. Updating only one helper can leave processes coordinating through different locks.
+
+The installer first drains normal workers and all live-paging slots, then holds shared locks on the permanent sidecar and any existing legacy JSON inode while it checks idle state and activates the new runtime. Standalone older audio helpers must finish too; an active or uninspectable process is a reason to defer installation, not to force it through. The collector is restarted during activation before the maintenance guard is released. Existing reservations and phone-delivery history remain in place; static rollback must not restore older operational journals.
+
+If an error reports corrupt or empty audio reservation storage, an invalid initialization marker, unsafe ownership/linkage, or missing initialized storage, retain `audio-reservations.json`, `audio-reservations.lock`, and the installer log for diagnosis. Do not delete either file to clear the error, copy an older journal over it, or relax permissions. An uncertain commit may already contain the new reservation even though the caller received an error; do not assume it is safe to replay the announcement. Resolve the reported storage problem and confirm playback/queued work is idle before retrying maintenance. The normal installer does not reset this state or change live notification configuration to bypass the checks.
+
+### Automatic repair and configuration variants
+
+The supported target is FreePBX 17 on Debian 12 with the documented conventional paths and Asterisk service account. The installer checks capabilities instead of requiring one exact Asterisk build. It can install missing supported dependencies, load installed Asterisk providers, repair safely identified Debian-owned providers at the installed Asterisk version, restore SLS-owned permissions, and regenerate and verify SLS integrations in FreePBX's required order. It does not replace an administrator's custom Asterisk build or change `autoload`/`noload` policy to bypass a failed check.
+
+Local web checks discover bounded Apache virtual-host ports and connect only to loopback while preserving the configured hostname for Host/SNI. Public forwarded ports remain separate from local listeners. These checks do not modify Apache listeners, firewall/NAT rules, or the configured public address, and cannot prove a remote phone can reach that address.
+
+The SLS AMI account permits IPv4 and IPv6 loopback only. A saved literal `127.0.0.1` or `::1` is preserved; a new configuration follows FreePBX when its manager host explicitly selects `::1`. `localhost` retains the existing IPv4 interpretation. An IPv6-only deployment must use literal `::1` in both relevant configurations. A conflicting saved endpoint is reported for review rather than silently rewritten, and remote AMI is unsupported. No administrator-controlled AMI listener is changed.
+
+For speech, an executable file alone is insufficient: the managed environment's interpreter, environment prefix, pip, pinned packages, and Piper startup are checked. A broken interpreter or pip triggers recreation of only the protected SLS virtual environment; package-version drift is reconciled in place. Unsafe ownership, links, mounted subtrees, or unsupported wheel availability produce a specific error. Voice models and the central `.config` are preserved. This repair does not replace a broken system Python interpreter.
+
+Repairs are followed by the same required postconditions as a new install, including API access under the web account, AMI capability checks after FreePBX reload, collector readiness, runtime parity, and local signatures. A failed upgrade attempts restoration and verifies the restored state. Incomplete restoration retains its recovery locations and fault notice. Hardware shortages, unrelated configuration faults, and unavailable external services cannot be fixed by skipping verification.
 
 ### Why is there no terminal wizard?
 
@@ -212,7 +231,26 @@ The default uninstall preserves the central config, config backups, uploaded ton
 ```bash
 cd /tmp
 curl -fsSL -o sls-uninstall.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.4-beta/tools/uninstall_release.sh
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.5-beta/tools/uninstall_release.sh
 chmod +x sls-uninstall.sh
 ./sls-uninstall.sh
 ```
+
+## Authenticated installation and recovery
+
+The installer requires an independently verified SLS release generation and approved Framework/Dashboard inventories before privileged activation. Review [the trust inventory procedure](docs/privileged-trust.md) when preparing an existing PBX or accepting an upstream module update. Inventories preserve reviewed local branding and security fixes; the installer must not replace those changes with stock vendor files or learn trust from unreviewed live files. These inventories are protected installation metadata, separate from the portable `.config`.
+
+Keep all recovery paths printed by a failed installer. Static recovery preserves the original snapshot and does not rewind notification or schedule execution history. If old SLS root jobs cannot be authenticated, they remain disabled and the installer reports incomplete automatic recovery until authenticated activation succeeds. A restored file tree alone is not sufficient proof of a complete repair.
+
+The installer verifies that generated image/XML requests pass through the configured [media access policy](docs/MEDIA_ACCESS.md), including legacy API aliases. It preserves existing restrictions, enables the required Apache modules idempotently, and distinguishes an intentional network denial from broken routing. Policy settings remain in the central `.config`; changing them does not restart the firewall or PBX.
+
+
+### Candidate prerequisites and release trust
+
+Dependency repair checks the selected CLI PHP version, installs its matching SQLite, cURL, XML/DOM and other required packages, then verifies the actual loaded extensions before module activation. Missing interpreter/package metadata, failed package operations and extensions that remain unloaded produce specific errors. JavaScript actions require `/usr/bin/node`; enabled CAP feeds require DOM and cURL. Resource shortages do not trigger destructive reconfiguration.
+
+The current self-signing key is preserved. Release manifests now include signed expiry metadata. Optional reviewed publisher rotation/revocation and root offline recovery are documented in [Release Trust](docs/RELEASE_TRUST.md). Do not initialize a stricter publisher policy merely to troubleshoot an install: initialization intentionally disables legacy manifests without expiry metadata.
+
+Fresh installation detects configured internal PJSIP phones and their registered contacts, excluding trunks. Phone capacity remains 25 for up to 25 contacts, then rounds up to the next 50: 79/89 selects 100, and 125 selects 150. Offline configured devices reserve one slot each. The rounded capacity must pass the combined resource check before any dependency/module changes, and again before configuration creation. The setup wizard displays this detected capacity. Upgrades preserve the saved limits; failed or incomplete inventories stop with an actionable error instead of guessing.
+
+Setup offers an IANA timezone selector. Leaving the existing timezone selected preserves it; an explicit change is applied by the protected maintenance worker. The CLI installer keeps the existing timezone unless SLS_MASS_NOTIFY_TIMEZONE is supplied. See README for combined capacity and dedicated free-space budgets.

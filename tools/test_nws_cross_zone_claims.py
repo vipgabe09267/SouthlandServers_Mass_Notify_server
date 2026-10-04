@@ -70,7 +70,7 @@ class CrossZoneClaimTests(unittest.TestCase):
         self.assertIn("print rounded + 7", poller)
         self.assertIn('"timeout_seconds": 3300', poller)
         queue_source = (NWS_POLLER.parent / 'sls_mass_notify/sls_weather_queue.py').read_text()
-        self.assertIn("timeout=5400", queue_source)
+        self.assertIn("SLS_WORKER_DEADLINE_EPOCH", queue_source)
         self.assertGreater(claims.RESERVATION_LEASE_SECONDS, 3300)
         self.assertIn("weather-observation.lock", queue_source)
         self.assertIn("weather-dispatch-worker.lock", queue_source)

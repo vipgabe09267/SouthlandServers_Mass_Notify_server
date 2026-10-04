@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/twilio/twilio-php",
+  "commit": "3ca28d03c22c298f903498de86e7ce8d164a93ad",
+  "source_sha256": {
+    "src/Twilio/Security/RequestValidator.php": "2c872ef8376664ab405ea12589a70eb8a2fb0be14d615bbcf3d1b35043d759db",
+    "src/Twilio/Values.php": "5a4ba58f298330aea3fc7ae88fec51f9b77d636defad90671eaa2d454374a88f",
+    "LICENSE": "f142b5f67e4b6d505e48fd92baf787b5b990d81315f836adf3dc59f00b3e619d"
+  },
+  "modifications": "Namespace isolated under SLS\\MassNotify\\Vendor to avoid FreePBX dependency collisions. No behavior changes.",
+  "vendored_sha256": {
+    "RequestValidator.php": "9de0aaea56847d1e93632ebf2b9b401eabcedd193781c9627497e16303dd3417",
+    "Values.php": "fd9d767cfa549837cab579eed8e4a63141207d3a3cc943603021dea8b11d3f9f",
+    "LICENSE": "f142b5f67e4b6d505e48fd92baf787b5b990d81315f836adf3dc59f00b3e619d"
+  }
+}

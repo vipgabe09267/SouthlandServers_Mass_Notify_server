@@ -558,7 +558,11 @@ def mutate_status(
 
         faults = group.get("faults") if isinstance(group.get("faults"), dict) else {}
         if mutation.get("clear_faults") is True:
-            faults = {}
+            # A successful local alert cannot resolve an uncertain external
+            # submission. Only the external retry worker owns that condition.
+            preserve = mutation.get("preserve_fault_stages")
+            preserve = preserve if isinstance(preserve, list) else []
+            faults = {stage: value for stage, value in faults.items() if stage == "external" and stage in preserve}
         clear_stage = re.sub(r"[^a-z0-9_-]", "", _text(mutation.get("clear_fault_stage"), 48).lower())
         if clear_stage:
             faults.pop(clear_stage, None)

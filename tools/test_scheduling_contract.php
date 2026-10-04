@@ -192,6 +192,8 @@ if (stripos(implode(' ', $typeErrors), 'Unknown config key') === false) {
 $worker = file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/bin/sls_mass_notify_schedule_worker.php');
 $class = file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/Slsmassnotifyserver.class.php');
 $view = file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/views/scheduling.php');
+$scheduler = file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/ScheduledDelivery.php');
+$admission = file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/AnnouncementAdmission.php');
 foreach ([
 	'processScheduledAnnouncements' => $worker,
 	'\\FreePBX::Slsmassnotifyserver()' => $worker,
@@ -202,12 +204,13 @@ foreach ([
 	'SCHEDULE_GRACE_SECONDS = 900' => $class,
 	"'delivery_started'" => $class,
 	"'error_code'" => $class,
-	"['cooldown', 'delivery_busy', 'no_targets', 'no_audio_targets']" => $class,
+	"'recipient_cooldown'" => $admission,
+	'activateScheduledAnnouncementJob' => $scheduler,
 	'findLiveScheduledOccurrence' => $class,
 	'buildScheduledOccurrences' => $class,
 	'validateScheduledAnnouncementRecurrences' => $class,
-	'The scheduler could not open its worker lock file.' => $class,
-	'loadScheduleExecutionStore(true)' => $class,
+	'The scheduler could not acquire its protected worker lock.' => $scheduler,
+	'loadScheduleExecutionStore(true)' => $scheduler,
 	'persistAppliedSettings($normalized, true, true)' => $class,
 	'$currentPendingFingerprint = $this->settingsFileFingerprint(self::PENDING_SETTINGS_JSON)' => $class,
 	'Another request changed the staged Mass Notifications settings.' => $class,

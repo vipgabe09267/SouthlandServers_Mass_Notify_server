@@ -16,6 +16,10 @@ MODULE_NAME="signerfixture"
 MODULE_DIR="${WEB_ROOT}/admin/modules/${MODULE_NAME}"
 
 cleanup() {
+  local status=$?
+  if [ "$status" -ne 0 ]; then
+    tail -n 15 "$FIXTURE_ROOT"/*.log >&2 || true
+  fi
   gpgconf --homedir "$GPG_HOME" --kill gpg-agent >/dev/null 2>&1 || true
   gpgconf --homedir "$SIGN_HOME" --kill gpg-agent >/dev/null 2>&1 || true
   if [ -d "$FIXTURE_ROOT" ]; then
@@ -31,6 +35,22 @@ install -d -m 0700 -o "$WEB_USER" -g "$WEB_GROUP" "$USER_HOME" "$GPG_HOME"
 printf '%s\n' 'local signer regression payload' >"${MODULE_DIR}/payload.txt"
 chmod 0644 "${MODULE_DIR}/payload.txt"
 
+# Enrollment comes from a separately approved fixture inventory, never from
+# the signer's live-tree traversal. Real expected-hash enforcement runs below.
+TRUST_HELPER="$FIXTURE_ROOT/sls_module_trust.py"
+TRUST_ROOT="$FIXTURE_ROOT/trust"
+cp "$ROOT_DIR/slsmassnotifyserver/bin/sls_mass_notify/sls_module_trust.py" "$TRUST_HELPER"
+chmod 0700 "$TRUST_HELPER"
+python3 - "$FIXTURE_ROOT/approved.json" <<'TRUST_FIXTURE'
+import hashlib, json, pathlib, sys
+body = b'local signer regression payload\n'
+value = {'schema': 1, 'module': 'signerfixture', 'version': '1.0',
+ 'source': {'kind': 'reviewed-upstream-and-overlays', 'archive_sha256': 'a' * 64},
+ 'files': {'payload.txt': {'sha256': hashlib.sha256(body).hexdigest(), 'target': 'admin/modules/signerfixture/payload.txt'}}}
+path = pathlib.Path(sys.argv[1]); path.write_text(json.dumps(value)); path.chmod(0o600)
+TRUST_FIXTURE
+python3 -I "$TRUST_HELPER" --root "$TRUST_ROOT" enroll-reviewed --inventory "$FIXTURE_ROOT/approved.json" --sha256 "$(sha256sum "$FIXTURE_ROOT/approved.json" | awk '{print $1}')" >/dev/null
+
 # Seed a valid but wrong-owned FreePBX GPG home, matching restored/cloned PBXs
 # where root operations have changed the keybox and trust database ownership.
 runuser -u "$WEB_USER" -- env HOME="$USER_HOME" \
@@ -43,7 +63,12 @@ run_fixture_signer() {
   local force_verify_failure="${1:-0}"
   local module_name="${2:-$MODULE_NAME}"
   local force_backup_failure="${3:-0}"
+  local force_file_race="${4:-0}"
 
+  SLS_TEST_FORCE_FILE_RACE="$force_file_race" \
+  SLS_TEST_RACED_MANIFEST="$FIXTURE_ROOT/raced-manifest.txt" \
+  SLS_TEST_TRUST_HELPER="$TRUST_HELPER" \
+  SLS_TEST_TRUST_ROOT="$TRUST_ROOT" \
   SLS_TEST_SIGNER="$SIGNER" \
   SLS_TEST_MODULE="$module_name" \
   SLS_TEST_SIGN_HOME="$SIGN_HOME" \
@@ -62,14 +87,25 @@ source "$SLS_TEST_SIGNER"
 MODULE="$SLS_TEST_MODULE"
 SIGN_HOME="$SLS_TEST_SIGN_HOME"
 LOCK_FILE="$SLS_TEST_LOCK_FILE"
+TRUST_HELPER="$SLS_TEST_TRUST_HELPER"
+TRUST_ROOT="$SLS_TEST_TRUST_ROOT"
 
 if [ "$SLS_TEST_FORCE_BACKUP_FAILURE" = "1" ]; then
-  cp() {
-    local argument
-    for argument in "$@"; do
-      [[ "$argument" == */module.sig.previous ]] && return 1
-    done
-    command cp "$@"
+  signature_operation() {
+    [ "$1" != "backup" ] || return 1
+    command /usr/bin/python3 -I "$TRUST_HELPER" signature-file --module "$MODULE" \
+      --web-root "$FREEPBX_WEB_ROOT" --web-user "$FREEPBX_WEB_USER" --action "$1" "${@:2}"
+  }
+fi
+
+if [ "$SLS_TEST_FORCE_FILE_RACE" = "1" ]; then
+  signature_operation() {
+    command /usr/bin/python3 -I "$TRUST_HELPER" signature-file --module "$MODULE" \
+      --web-root "$FREEPBX_WEB_ROOT" --web-user "$FREEPBX_WEB_USER" --action "$1" "${@:2}" || return 1
+    if [ "$1" = "publish" ]; then
+      cp "$WORKDIR/module.plain" "$SLS_TEST_RACED_MANIFEST"
+      printf '%s\n' 'changed after signing' >"$MODULE_DIR/payload.txt"
+    fi
   }
 fi
 
@@ -81,6 +117,9 @@ load_freepbx_metadata() {
   FREEPBX_GPG_HOME="$SLS_TEST_GPG_HOME"
   FREEPBX_ASTSPOOLDIR="$SLS_TEST_AST_SPOOL"
 }
+
+# This fixture uses a private web home instead of the production passwd home.
+validate_account_metadata() { :; }
 
 verify_published_signature() {
   local plaintext="$WORKDIR/verified-module.plain"
@@ -149,4 +188,30 @@ if run_fixture_signer 0 '../unsafe-module' >"${FIXTURE_ROOT}/unsafe-module.log" 
   exit 1
 fi
 
-printf 'Transactional local-signing regressions passed.\n'
+# Change live bytes after the candidate is signed and published. Only the
+# expected digest may enter that candidate; final parity must roll it back.
+if run_fixture_signer 0 "$MODULE_NAME" 0 1 >"${FIXTURE_ROOT}/file-race.log" 2>&1; then
+  printf 'Signer accepted a file race after candidate publication.\n' >&2
+  exit 1
+fi
+[ "$(sha256sum "${MODULE_DIR}/module.sig" | awk '{print $1}')" = "$signature_hash_before" ]
+original_digest="$(printf '%s\n' 'local signer regression payload' | sha256sum | awk '{print $1}')"
+grep -Fqx "payload.txt = $original_digest" "$FIXTURE_ROOT/raced-manifest.txt"
+printf '%s\n' 'local signer regression payload' >"${MODULE_DIR}/payload.txt"
+
+# A modified unrelated file must be rejected before signing, preserving the
+# previously accepted signature even when the new bytes are syntactically valid.
+printf '%s\n' 'unapproved replacement' >"${MODULE_DIR}/payload.txt"
+if run_fixture_signer >"${FIXTURE_ROOT}/unapproved.log" 2>&1; then
+  printf 'Signer accepted content not authorized by its protected inventory.\n' >&2
+  exit 1
+fi
+[ "$(sha256sum "${MODULE_DIR}/module.sig" | awk '{print $1}')" = "$signature_hash_before" ]
+printf '%s\n' 'local signer regression payload' >"${MODULE_DIR}/payload.txt"
+printf '%s\n' '<?php unexpected();' >"${MODULE_DIR}/unexpected.php"
+if run_fixture_signer >"${FIXTURE_ROOT}/unexpected.log" 2>&1; then
+  printf 'Signer accepted an unapproved additional PHP file.\n' >&2
+  exit 1
+fi
+[ "$(sha256sum "${MODULE_DIR}/module.sig" | awk '{print $1}')" = "$signature_hash_before" ]
+printf 'Transactional local-signing and approved-inventory regressions passed.\n'

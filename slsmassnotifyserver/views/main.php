@@ -94,6 +94,9 @@ $notificationTypeMeta = [
 					<div class="sls-log-filter-actions"><button type="submit" class="btn btn-primary"><i class="fa fa-refresh" aria-hidden="true"></i> <?php echo _('Refresh View'); ?></button><?php if (!empty($selected_type) || !empty($selected_date)) { ?><a class="btn btn-default" href="config.php?display=slsmassnotifyserver"><i class="fa fa-times" aria-hidden="true"></i> <?php echo _('Clear Filters'); ?></a><?php } ?></div>
 				</div>
 			</form>
+			<?php foreach ((array)($log_notices ?? []) as $notice) { ?>
+				<div class="alert alert-warning" role="status"><?php echo htmlspecialchars((string)$notice, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?></div>
+			<?php } ?>
 
 			<?php if (empty($events)) { ?>
 				<div class="sls-log-empty"><i class="fa fa-inbox" aria-hidden="true"></i><strong><?php echo _('No matching notification events'); ?></strong><div><?php echo _('New deliveries will appear here automatically after they are recorded.'); ?></div></div>

@@ -1,0 +1,12 @@
+{
+  "name": "Chart.js",
+  "version": "2.9.4",
+  "repository": "https://github.com/chartjs/Chart.js",
+  "source": "https://raw.githubusercontent.com/chartjs/Chart.js/v2.9.4/dist/Chart.bundle.min.js",
+  "license": "MIT",
+  "modifications": "None. Bundled locally for the FreePBX Sysadmin disk chart; replaces its legacy CDN request without editing vendor modules.",
+  "sha256": {
+    "Chart.bundle-2.9.4.min.js": "780fb2721eeddf53a3897b377d85348968e7f47bd732208b9ae9cfd86a608689",
+    "LICENSE.md": "7b43caae91f31b18dc81fae6e0f7aa1acbecaa6d84e3249905cbe15308307d67"
+  }
+}

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import time
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,8 +31,13 @@ def main():
     installer = ROOT / 'tools/install_release.sh'
     manifest = ROOT / 'dist/release-manifest.json'
     signature = ROOT / 'dist/release-manifest.sig'
+    public = subprocess.run(['/usr/bin/openssl', 'pkey', '-in', str(key), '-pubout'], check=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10).stdout
+    issued = int(time.time())
     data = {'schema': 1, 'version': version, 'tag': f'slsmassnotifyserver-{version}', 'package': package.name,
-            'package_sha256': verifier.digest(package), 'installer_sha256': verifier.digest(installer)}
+            'package_sha256': verifier.digest(package), 'installer_sha256': verifier.digest(installer),
+            'signing': {'key_id': verifier.trust.key_entry(public)['id'], 'issued_at': issued,
+                        'expires_at': issued + 366 * 86400}}
     manifest.write_text(json.dumps(data, sort_keys=True, separators=(',', ':')) + '\n')
     subprocess.run(['/usr/bin/openssl', 'pkeyutl', '-sign', '-rawin', '-inkey', str(key),
                     '-in', str(manifest), '-out', str(signature)], check=True, timeout=10)

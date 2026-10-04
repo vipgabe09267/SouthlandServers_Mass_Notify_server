@@ -12,9 +12,14 @@ STATUS_FILE="${STATUS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/upda
 UPDATE_PROGRESS_FILE="${UPDATE_PROGRESS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/update-progress.json}"
 LOG_FILE="${LOG_FILE:-/var/log/sls_mass_notify.log}"
 LOCK_FILE="${LOCK_FILE:-/run/lock/sls-mass-notify-update.lock}"
-CURRENT_VERSION="${SLS_MASS_NOTIFY_CURRENT_VERSION:-0.1.4-beta}"
+CURRENT_VERSION="${SLS_MASS_NOTIFY_CURRENT_VERSION:-0.1.5-beta}"
 
 GITHUB_UPDATES_ENABLED="0"
+GITHUB_UPDATES_CHANNEL="beta"
+GITHUB_UPDATES_PIN=""
+GITHUB_UPDATES_WINDOW_START=""
+GITHUB_UPDATES_WINDOW_END=""
+GITHUB_UPDATES_DELAY_HOURS="0"
 MANUAL_UPDATE="${SLS_MASS_NOTIFY_MANUAL_UPDATE:-0}"
 CHECK_ONLY="${SLS_MASS_NOTIFY_CHECK_ONLY:-0}"
 readonly GITHUB_UPDATES_REPOSITORY="vipgabe09267/SouthlandServers_Mass_Notify_server"
@@ -160,7 +165,7 @@ load_update_config() {
   fi
   while IFS= read -r -d '' key && IFS= read -r -d '' value; do
     case "$key" in
-      GITHUB_UPDATES_ENABLED)
+      GITHUB_UPDATES_ENABLED|GITHUB_UPDATES_CHANNEL|GITHUB_UPDATES_PIN|GITHUB_UPDATES_WINDOW_START|GITHUB_UPDATES_WINDOW_END|GITHUB_UPDATES_DELAY_HOURS)
         printf -v "$key" '%s' "$value"
         ;;
     esac
@@ -224,18 +229,42 @@ if ! load_update_config; then
   fail_update "protected_config_validation_failed" "The protected central configuration is invalid or unavailable." 2
 fi
 
+export GITHUB_UPDATES_CHANNEL GITHUB_UPDATES_PIN GITHUB_UPDATES_WINDOW_START GITHUB_UPDATES_WINDOW_END GITHUB_UPDATES_DELAY_HOURS
 release_json="$(CURRENT_VERSION="$CURRENT_VERSION" REPOSITORY="$GITHUB_UPDATES_REPOSITORY" python3 - <<'PY'
+import importlib.util
 import json
 import os
 import re
+import sys
 import urllib.request
 from datetime import datetime, timezone
 
+# Root's restrictive umask must not create an unreadable runtime __pycache__.
+# -I ignores PYTHONDONTWRITEBYTECODE, so set this before importing our sibling.
+sys.dont_write_bytecode = True
+
 repo = os.environ.get("REPOSITORY", "")
-current = os.environ.get("CURRENT_VERSION", "0.1.4-beta")
+current = os.environ.get("CURRENT_VERSION", "0.1.5-beta")
 now = datetime.now(timezone.utc).astimezone().isoformat()
 if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
     print(json.dumps({"ok": False, "checked_at": now, "update_available": False, "latest_version": current, "message": "Configured GitHub repository is invalid."}, separators=(",", ":")))
+    raise SystemExit(0)
+
+try:
+    spec = importlib.util.spec_from_file_location('sls_update_policy', '/usr/local/bin/sls_mass_notify/sls_update_policy.py')
+    policy_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(policy_module)
+    delay = os.environ['GITHUB_UPDATES_DELAY_HOURS']
+    if not re.fullmatch(r'(?:0|[1-9][0-9]{0,2})', delay):
+        raise ValueError('invalid delay')
+    policy = policy_module.validate({
+        'channel': os.environ['GITHUB_UPDATES_CHANNEL'], 'pinned_version': os.environ['GITHUB_UPDATES_PIN'],
+        'window_start': os.environ['GITHUB_UPDATES_WINDOW_START'], 'window_end': os.environ['GITHUB_UPDATES_WINDOW_END'],
+        'rollout_delay_hours': int(delay),
+    })
+except Exception:
+    print(json.dumps({'ok': False, 'checked_at': now, 'update_available': False, 'latest_version': current,
+        'message': 'Update policy is invalid or its protected runtime helper is unavailable.'}, separators=(',', ':')))
     raise SystemExit(0)
 
 def norm(value):
@@ -252,23 +281,30 @@ def version_key(value):
 
 try:
     request = urllib.request.Request(
-        f"https://api.github.com/repos/{repo}/releases",
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "SouthlandServers-Mass-Notifications-Updater/0.1.4-beta"},
+        f"https://api.github.com/repos/{repo}/releases?per_page=100",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "SouthlandServers-Mass-Notifications-Updater/0.1.5-beta"},
     )
     with urllib.request.urlopen(request, timeout=20) as response:
-        releases = json.load(response)
+        body = response.read(2097153)
+        if len(body) > 2097152:
+            raise ValueError('release feed exceeded its size limit')
+        releases = json.loads(body)
+        if not isinstance(releases, list) or len(releases) > 100:
+            raise ValueError('invalid release feed')
 except Exception:
     print(json.dumps({"ok": False, "checked_at": now, "update_available": False, "latest_version": current, "message": "The verified release feed could not be checked."}, separators=(",", ":")))
     raise SystemExit(0)
 
 candidates = []
+matching_releases = 0
 for release in releases if isinstance(releases, list) else []:
-    if not isinstance(release, dict) or release.get("draft"):
+    if not policy_module.release_allowed(release, policy):
         continue
+    matching_releases += 1
     tag = str(release.get("tag_name") or "")
     if not re.fullmatch(r"slsmassnotifyserver-\d+\.\d+\.\d+(?:-beta)?", tag):
         continue
-    for asset in release.get("assets") or []:
+    for asset in release.get("assets", []) if isinstance(release.get("assets"), list) else []:
         if not isinstance(asset, dict):
             continue
         expected_name = tag + ".tgz"
@@ -277,14 +313,19 @@ for release in releases if isinstance(releases, list) else []:
         digest = str(asset.get("digest") or "")
         if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
             continue
-        candidates.append((version_key(tag), tag, str(asset.get("browser_download_url") or ""), digest.split(":", 1)[1].lower()))
+        url = str(asset.get('browser_download_url') or '')
+        if url != f'https://github.com/{repo}/releases/download/{tag}/{expected_name}':
+            continue
+        candidates.append((version_key(tag), tag, url, digest.split(":", 1)[1].lower(), release))
 
-candidates.sort(reverse=True)
+candidates.sort(key=lambda candidate: candidate[0], reverse=True)
 if not candidates:
-    print(json.dumps({"ok": False, "checked_at": now, "update_available": False, "latest_version": current, "message": "No release asset with verified SHA-256 metadata was found."}, separators=(",", ":")))
+    message = 'No published release matches the selected channel and version pin in the latest 100 releases.' if not matching_releases else 'No matching release has the expected package and SHA-256 metadata.'
+    print(json.dumps({"ok": not matching_releases, "checked_at": now, "update_available": False, "latest_version": current, "message": message}, separators=(",", ":")))
     raise SystemExit(0)
 
-_, tag, tgz_url, sha256 = candidates[0]
+_, tag, tgz_url, sha256, release = candidates[0]
+gate = policy_module.automatic_gate(release, policy)
 available = version_key(tag) > version_key(current)
 installer_commit = ""
 if available:
@@ -311,7 +352,8 @@ print(json.dumps({
     "sha256": sha256,
     "installer_commit": installer_commit,
     "installer_url": f"https://raw.githubusercontent.com/{repo}/{installer_commit}/tools/install_release.sh" if installer_commit else "",
-    "message": "Update available." if available else "Installed package is current.",
+    **gate,
+    "message": ('Update available. ' + gate['deferred_reason']).strip() if available else 'No newer release matches the update policy. Automatic downgrades are disabled.',
 }, separators=(",", ":")))
 PY
 )"
@@ -330,6 +372,11 @@ if [ "$update_available" != "1" ]; then
   exit 0
 fi
 [ "$GITHUB_UPDATES_ENABLED" = "1" ] || [ "$MANUAL_UPDATE" = "1" ] || exit 0
+automatic_eligible="$(printf '%s' "$release_json" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("automatic_eligible") is True else "0")')"
+if [ "$MANUAL_UPDATE" != "1" ] && [ "$automatic_eligible" != "1" ]; then
+  log "Automatic update deferred by the configured maintenance window or rollout delay."
+  exit 0
+fi
 
 readarray -t release_values < <(printf '%s' "$release_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("tgz_url", "")); print(d.get("sha256", "")); print(d.get("installer_url", "")); print(d.get("latest_version", ""))')
 tgz_url="${release_values[0]:-}"

@@ -1,8 +1,12 @@
 # Tested Python 3.11 runtime on Debian 12, amd64.
-piper-tts==1.4.2
-onnxruntime==1.27.0
+# NumPy 2.5 requires Python >=3.12; retain the compatible Python 3.11 release.
+pip==26.2.1
+setuptools==84.0.0
+wheel==0.48.0
+piper-tts==1.8.0
+onnxruntime==1.30.0
 numpy==2.4.6
 flatbuffers==25.12.19
-packaging==26.2
+packaging==26.3
 pathvalidate==3.3.1
-protobuf==7.35.1
+protobuf==7.36.2

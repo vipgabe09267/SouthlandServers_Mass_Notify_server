@@ -39,6 +39,9 @@ $placeholderHelp = "{{event}}, {{severity}}, {{message_type}}, {{audio}}, {{page
 .sls-nws-scroll { max-height: 240px; overflow: auto; }
 .sls-nws-scroll.is-disabled { opacity: .48; background: #f1f5f9; transition: opacity .15s ease; }
 .sls-nws-page { max-width: 1180px; margin: 0 auto; }
+.sls-nws-page-heading { display:flex;justify-content:space-between;gap:15px;align-items:flex-start;flex-wrap:wrap; }
+.sls-nws-page-heading > div { min-width:0; }
+@media(max-width:767px) { .sls-nws-page-heading { display:block; } .sls-nws-page-heading > div { margin-bottom:12px; } }
 .sls-settings-card { border: 1px solid #dfe5ec; border-radius: 8px; box-shadow: 0 2px 8px rgba(15,23,42,.05); margin-bottom: 18px; overflow: hidden; }
 .sls-settings-card > .panel-heading { padding: 14px 18px; background: #f8fafc; border-bottom: 1px solid #e8edf2; }
 .sls-settings-card > .panel-body { padding: 18px; }
@@ -66,7 +69,7 @@ $placeholderHelp = "{{event}}, {{severity}}, {{message_type}}, {{audio}}, {{page
 	<div class="display full-border">
 		<div class="fpbx-container">
 			<?php echo load_view(__DIR__ . '/hero.php', ['hero_image' => $hero_image]); ?>
-			<div style="display: flex; justify-content: space-between; gap: 15px; align-items: flex-start;">
+			<div class="sls-nws-page-heading">
 				<div>
 					<h1 class="sls-weather-title"><i class="fa fa-cloud text-primary" aria-hidden="true"></i> <?php echo $showTestSection ? _('Weather Alerts') : _('Weather Alert Settings'); ?></h1>
 					<p class="text-muted"><?php echo _('Test and configure weather-alert delivery.'); ?></p>
@@ -232,6 +235,7 @@ $placeholderHelp = "{{event}}, {{severity}}, {{message_type}}, {{audio}}, {{page
 								var errors = data && Array.isArray(data.errors) ? data.errors.filter(Boolean) : [];
 								var successful = !!(data && data.success);
 								renderTestStatus(successful ? 'success' : 'error', successful ? <?php echo json_encode(_('Weather test submitted')); ?> : <?php echo json_encode(_('Weather test needs attention')); ?>, message + (errors.length ? ' ' + errors.join(' ') : ''));
+								window.SlsTestDeliveryReports.start(data, form, 'sls-test-result');
 								if (!data || !data.success) {
 									window.alert('Weather test error\n\n' + message + (errors.length ? '\n\n' + errors.join('\n') : ''));
 								}
@@ -308,7 +312,9 @@ $placeholderHelp = "{{event}}, {{severity}}, {{message_type}}, {{audio}}, {{page
 								<div class="row"><div class="col-md-7"><div class="form-group"><label><?php echo _('Group Name'); ?></label><input class="form-control" data-zone-field="name" name="nws_zones[<?php echo $zoneIndex; ?>][name]" maxlength="64" value="<?php echo htmlspecialchars($zoneGroup['name'] ?? ''); ?>" placeholder="<?php echo htmlspecialchars(_('Williamson County')); ?>"></div></div><div class="col-md-5"><div class="form-group"><label><?php echo _('NWS Zone'); ?></label><input class="form-control" data-zone-field="zone" name="nws_zones[<?php echo $zoneIndex; ?>][zone]" maxlength="6" value="<?php echo htmlspecialchars($zoneGroup['zone'] ?? ''); ?>" placeholder="TXZ163"></div></div></div>
 								<div class="row"><div class="col-md-6"><label><?php echo _('Recipient Extensions'); ?></label><div class="sls-recipient-grid sls-nws-scroll"><div class="row"><?php foreach ((array)($available_extensions ?? []) as $extension) { ?><div class="col-md-6"><div class="checkbox"><label><input type="checkbox" data-zone-extension name="nws_zones[<?php echo $zoneIndex; ?>][extensions][]" value="<?php echo htmlspecialchars($extension['extension']); ?>" <?php echo isset($zoneRecipients[$extension['extension']]) ? 'checked' : ''; ?>> <?php echo htmlspecialchars($extension['extension'] . ($extension['name'] !== '' ? ' - ' . $extension['name'] : '')); ?> <span class="text-muted"><?php echo !empty($extension['registered']) ? _('online') : _('offline'); ?></span></label></div></div><?php } ?></div></div></div><div class="col-md-6"><label><?php echo _('Desktop Clients'); ?></label><div class="sls-recipient-grid sls-nws-scroll"><div class="row"><?php foreach ($desktopClients as $desktopClient) { $username = (string)($desktopClient['username'] ?? ''); $desktopEnabled = !empty($desktopClient['enabled']); $desktopSelected = isset($zoneDesktopRecipients[$username]); ?><div class="col-md-6"><div class="checkbox"><label><input type="checkbox" data-zone-desktop name="nws_zones[<?php echo $zoneIndex; ?>][desktop_clients][]" value="<?php echo htmlspecialchars($username); ?>" <?php echo $desktopSelected ? 'checked' : ''; ?> <?php echo (!$desktopEnabled && !$desktopSelected) ? 'disabled' : ''; ?>> <?php echo htmlspecialchars($desktopNames[$username] ?? $username); ?> <span class="text-muted"><?php echo $desktopEnabled ? _('enabled') : ($desktopSelected ? _('disabled — uncheck to remove this assignment') : _('disabled')); ?></span></label></div></div><?php } ?><?php if (empty($desktopClients)) { ?><div class="col-xs-12 text-muted"><?php echo _('No desktop clients are configured in General Settings.'); ?></div><?php } ?></div></div></div></div>
 								<?php if (!empty($zoneUnknownDesktopRecipients)) { ?><div class="alert alert-warning" style="margin-top:12px"><strong><?php echo _('Unavailable desktop assignments:'); ?></strong> <?php echo _('Uncheck each missing client to remove its assignment before saving.'); ?><?php foreach (array_keys($zoneUnknownDesktopRecipients) as $unknownUsername) { ?><div class="checkbox"><label><input type="checkbox" data-zone-desktop name="nws_zones[<?php echo $zoneIndex; ?>][desktop_clients][]" value="<?php echo htmlspecialchars($unknownUsername); ?>" checked> <?php echo htmlspecialchars($unknownUsername); ?> <span class="text-muted"><?php echo _('missing — uncheck to remove'); ?></span></label></div><?php } ?></div><?php } ?>
-								<div class="form-group" style="margin-top:12px"><label><?php echo _('Email Recipients for This Zone'); ?></label><textarea class="form-control" data-zone-email name="nws_zones[<?php echo $zoneIndex; ?>][email_recipients]" rows="2" maxlength="4096" placeholder="weather-team@example.com"><?php echo htmlspecialchars(implode("\n", (array)($zoneGroup['email_recipients'] ?? []))); ?></textarea><p class="help-block"><?php echo _('Optional. Only live alerts from this zone use these addresses. Up to 50 unique addresses are allowed per zone. Manual tests never send email.'); ?></p></div>
+								<?php $weather_site_group=$zoneGroup; $weather_site_prefix='zone'; include __DIR__.'/weather_site_picker.php'; ?>
+<?php $weather_channel_group=$zoneGroup; $weather_channel_prefix='zone'; include __DIR__.'/weather_channel_picker.php'; ?>
+<div class="form-group" style="margin-top:12px"><label><?php echo _('Email Recipients for This Zone'); ?></label><textarea class="form-control" data-zone-email name="nws_zones[<?php echo $zoneIndex; ?>][email_recipients]" rows="2" maxlength="4096" placeholder="weather-team@example.com"><?php echo htmlspecialchars(implode("\n", (array)($zoneGroup['email_recipients'] ?? []))); ?></textarea><p class="help-block"><?php echo _('Optional. Only live alerts from this zone use these addresses. Up to 50 unique addresses are allowed per zone. Manual tests never send email.'); ?></p></div>
 								<div class="row"><div class="col-md-6"><label><?php echo _('Discord Destinations'); ?></label><?php foreach ($discordDestinations as $destination) { $id=(string)($destination['id']??''); ?><div class="checkbox"><label><input type="checkbox" data-zone-discord name="nws_zones[<?php echo $zoneIndex; ?>][discord_webhook_ids][]" value="<?php echo htmlspecialchars($id); ?>" <?php echo isset($zoneDiscord[$id])?'checked':''; ?>> <?php echo htmlspecialchars((string)($destination['name']??$id)); ?></label></div><?php } ?><?php if (!$discordDestinations) { ?><p class="text-muted"><?php echo _('No enabled Discord destinations.'); ?></p><?php } ?></div><div class="col-md-6"><label><?php echo _('Generic Webhook Destinations'); ?></label><?php foreach ($genericDestinations as $destination) { $id=(string)($destination['id']??''); ?><div class="checkbox"><label><input type="checkbox" data-zone-generic name="nws_zones[<?php echo $zoneIndex; ?>][generic_webhook_ids][]" value="<?php echo htmlspecialchars($id); ?>" <?php echo isset($zoneGeneric[$id])?'checked':''; ?>> <?php echo htmlspecialchars((string)($destination['name']??$id)); ?></label></div><?php } ?><?php if (!$genericDestinations) { ?><p class="text-muted"><?php echo _('No enabled generic webhook destinations.'); ?></p><?php } ?></div></div>
 								<div class="row"><div class="col-md-3"><div class="form-group"><label><?php echo _('Zone Quiet Hours'); ?></label><select class="form-control" data-zone-field="quiet_hours_enabled" name="nws_zones[<?php echo $zoneIndex; ?>][quiet_hours_enabled]"><option value="0" <?php echo empty($zoneGroup['quiet_hours_enabled'])?'selected':''; ?>><?php echo _('Disabled'); ?></option><option value="1" <?php echo !empty($zoneGroup['quiet_hours_enabled'])?'selected':''; ?>><?php echo _('Enabled'); ?></option></select></div></div><div class="col-md-3"><div class="form-group"><label><?php echo _('Start'); ?></label><input class="form-control" type="time" data-zone-field="quiet_hours_start" name="nws_zones[<?php echo $zoneIndex; ?>][quiet_hours_start]" value="<?php echo htmlspecialchars((string)($zoneGroup['quiet_hours_start']??'21:00')); ?>"></div></div><div class="col-md-3"><div class="form-group"><label><?php echo _('End'); ?></label><input class="form-control" type="time" data-zone-field="quiet_hours_end" name="nws_zones[<?php echo $zoneIndex; ?>][quiet_hours_end]" value="<?php echo htmlspecialchars((string)($zoneGroup['quiet_hours_end']??'06:00')); ?>"></div></div><div class="col-md-3"><div class="form-group"><label><?php echo _('Critical bypass events'); ?></label><input class="form-control" data-zone-field="quiet_critical_events" name="nws_zones[<?php echo $zoneIndex; ?>][quiet_critical_events][]" value="<?php echo htmlspecialchars(implode(', ', (array)($zoneGroup['quiet_critical_events']??[]))); ?>"></div></div></div>
 							</div>
@@ -405,11 +411,12 @@ $placeholderHelp = "{{event}}, {{severity}}, {{message_type}}, {{audio}}, {{page
 				}
 				row.querySelector('[data-zone-empty="' + field + '"]').name = 'nws_zones[' + index + '][' + field + '][]';
 			});
-			['id','name','zone','quiet_hours_enabled','quiet_hours_start','quiet_hours_end','quiet_critical_events'].forEach(function(field) {
+			['id','name','site_id','zone','quiet_hours_enabled','quiet_hours_start','quiet_hours_end','quiet_critical_events'].forEach(function(field) {
 				var input = row.querySelector('[data-zone-field="' + field + '"]');
 				if (input) input.name = 'nws_zones[' + index + '][' + field + ']';
 			});
 			Array.prototype.forEach.call(row.querySelectorAll('[data-zone-extension]'), function(input) { input.name = 'nws_zones[' + index + '][extensions][]'; });
+			['voice','sms'].forEach(function(kind){row.querySelectorAll('[data-zone-'+kind+']').forEach(function(input){input.name='nws_zones['+index+']['+kind+'_recipient_ids][]';});});
 			Array.prototype.forEach.call(row.querySelectorAll('[data-zone-desktop]'), function(input) { input.name = 'nws_zones[' + index + '][desktop_clients][]'; });
 			Array.prototype.forEach.call(row.querySelectorAll('[data-zone-discord]'), function(input) { input.name = 'nws_zones[' + index + '][discord_webhook_ids][]'; });
 			Array.prototype.forEach.call(row.querySelectorAll('[data-zone-generic]'), function(input) { input.name = 'nws_zones[' + index + '][generic_webhook_ids][]'; });
@@ -449,3 +456,7 @@ $placeholderHelp = "{{event}}, {{severity}}, {{message_type}}, {{audio}}, {{page
 	reindex();
 }());
 </script>
+
+<?php $source_picker_mode = 'weather'; include __DIR__ . '/audience_source_picker.php'; ?>
+
+<?php include __DIR__.'/test_delivery.php'; ?>

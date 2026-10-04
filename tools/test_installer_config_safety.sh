@@ -88,54 +88,14 @@ snapshot_line="$(grep -nFm1 'snapshot_config' <<<"$main_body" | cut -d: -f1)"
 activation_line="$(grep -nFm1 'install_module_with_autoenable' <<<"$main_body" | cut -d: -f1)"
 sync_line="$(grep -nFm1 'sync_module_version' <<<"$main_body" | cut -d: -f1)"
 runtime_line="$(grep -nFm1 'ensure_runtime_installed' <<<"$main_body" | cut -d: -f1)"
-mapfile -t repair_lines < <(grep -nF 'repair_runtime_permissions' <<<"$main_body" | cut -d: -f1)
-pre_activation_repair=0
-post_sync_repair=0
-for repair_line in "${repair_lines[@]}"; do
-  if [ "$repair_line" -lt "$activation_line" ]; then
-    pre_activation_repair=1
-  fi
-  if [ "$repair_line" -gt "$sync_line" ] && [ "$repair_line" -lt "$runtime_line" ]; then
-    post_sync_repair=1
-  fi
-done
-[ "$pre_activation_repair" -eq 1 ] || {
-  printf 'Installer does not normalize runtime permissions before the FreePBX module hook.\n' >&2
-  exit 1
-}
-[ "$post_sync_repair" -eq 1 ] || {
-  printf 'Installer does not normalize runtime permissions after version sync and before runtime refresh.\n' >&2
-  exit 1
-}
-while IFS=: read -r chown_line _; do
-  next_command="$(tail -n +$((chown_line + 1)) <<<"$main_body" | sed -n '/[^[:space:]]/{s/^[[:space:]]*//;p;q;}')"
-  case "$next_command" in
-    repair_runtime_permissions*) ;;
-    *)
-      printf 'Installer fwconsole chown is not followed immediately by runtime permission repair.\n' >&2
-      exit 1
-      ;;
-  esac
-done < <(grep -nE '^[[:space:]]*(/usr/sbin/)?fwconsole chown' <<<"$main_body")
-
+prepare_line="$(grep -nFm1 'protected_install_phase prepare --apply' <<<"$main_body" | cut -d: -f1)"
+[ "$prepare_line" -lt "$activation_line" ]
+[ "$sync_line" -lt "$runtime_line" ]
+! grep -Eq '^[[:space:]]*(/usr/sbin/)?fwconsole chown' <<<"$main_body"
 maintenance_script="${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_maintenance.sh"
-while IFS=: read -r chown_line _; do
-  next_command="$(tail -n +$((chown_line + 1)) "$maintenance_script" | sed -n '/[^[:space:]]/{s/^[[:space:]]*//;p;q;}')"
-  case "$next_command" in
-    repair_runtime_permissions*) ;;
-    *)
-      printf 'Maintenance fwconsole chown is not followed immediately by runtime permission repair.\n' >&2
-      exit 1
-      ;;
-  esac
-done < <(grep -nE '^[[:space:]]*(/usr/sbin/)?fwconsole chown' "$maintenance_script")
-maintenance_repair_line="$(grep -nFm1 'repair_runtime_permissions || { repair_status=$?; repair_ok=0; }' "$maintenance_script" | cut -d: -f1)"
-maintenance_install_line="$(grep -nFm1 'new $class' "$maintenance_script" | cut -d: -f1)"
-[ -n "$maintenance_repair_line" ] && [ -n "$maintenance_install_line" ] \
-  && [ "$maintenance_repair_line" -lt "$maintenance_install_line" ] || {
-    printf 'Maintenance does not normalize an existing Piper runtime before module repair.\n' >&2
-    exit 1
-  }
+! grep -Eq '^[[:space:]]*(/usr/sbin/)?fwconsole chown' "$maintenance_script"
+grep -Fq '"$PRIVILEGED_HELPER" "$phase" --apply' "$maintenance_script"
+grep -Fq 'Slsmassnotifyserver->installUnprivilegedPhase()' "$maintenance_script"
 
 piper_installer="${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_install_piper_voices.sh"
 grep -Fq -- '--repair-permissions-only' "$piper_installer"
@@ -174,21 +134,15 @@ if grep -Fq "'/bin/chown -R root:root ' . escapeshellarg(self::RUNTIME_DIR)" "${
   exit 1
 fi
 grep -Fq 'getattr(os, "O_NOFOLLOW", 0)' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_maintenance.sh"
-grep -Fq 'root_fd = os.open(root, flags)' "${ROOT_DIR}/tools/install_release.sh"
-grep -Fq 'root_fd = os.open(root, flags)' "$maintenance_script"
-grep -Fq 'runtime entry changed type during repair' "${ROOT_DIR}/tools/install_release.sh"
-grep -Fq 'runtime entry changed type during repair' "$maintenance_script"
-grep -Fq 'child_relative == "sls_mass_notify_schedule_worker.php"' "${ROOT_DIR}/tools/install_release.sh"
-grep -Fq 'child_relative == "sls_mass_notify_schedule_worker.php"' "$maintenance_script"
-grep -Fq 'child_relative == "sls_mass_notify_announcement_worker.php"' "${ROOT_DIR}/tools/install_release.sh"
-grep -Fq 'child_relative == "sls_mass_notify_announcement_worker.php"' "$maintenance_script"
+declare -f repair_runtime_permissions | grep -Fq 'protected_install_phase prepare --apply'
+declare -f ensure_local_signer | grep -Fq 'protected_install_phase admit'
 declare -f runtime_install_postconditions_available | grep -Fq '"sls_mass_notify_announcement_worker.php",'
 declare -f verify_installed_payload_parity | grep -Fq '"sls_mass_notify_announcement_worker.php",'
 grep -Fq "'sls_weather_queue.py'," "${ROOT_DIR}/slsmassnotifyserver/Slsmassnotifyserver.class.php"
 grep -Fq 'if temporary and bin_fd >= 0:' "$piper_installer"
 grep -Fq 'mktemp /usr/local/bin/.sls-piper.XXXXXX' "$piper_installer"
 grep -Fq 'close_inherited_maintenance_lock' "${ROOT_DIR}/slsmassnotifyserver/bin/sign_sls_mass_notify_local_sig.sh"
-grep -Fq 'run_without_maintenance_lock /usr/bin/timeout 300 /usr/bin/php' "$maintenance_script"
+grep -Fq 'run_without_maintenance_lock /usr/sbin/runuser -u asterisk -- /usr/bin/timeout 300 /usr/bin/php' "$maintenance_script"
 grep -Fq 'run_without_install_maintenance_lock /usr/bin/timeout --signal=TERM 360' "${ROOT_DIR}/tools/install_release.sh"
 if grep -Fq 'chown -R root:root /usr/local/bin/sls_mass_notify' "${ROOT_DIR}/tools/install_release.sh" \
   || grep -Fq 'chown -R root:root "$RUNTIME_DIR"' "$maintenance_script"; then

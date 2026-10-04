@@ -59,7 +59,8 @@ if data and 'repo = os.environ.get("REPOSITORY"' in data:
     else:
         print(json.dumps({"ok": True, "update_available": failure != "current",
             "latest_version": "99.0.0", "tgz_url": "https://fixture.invalid/package.tgz",
-            "sha256": "a" * 64, "installer_url": "https://fixture.invalid/install_release.sh"}))
+            "sha256": "a" * 64, "installer_url": "https://fixture.invalid/install_release.sh",
+            "automatic_eligible": failure != "deferred"}))
     raise SystemExit(0)
 raise SystemExit(subprocess.run([sys.executable, *sys.argv[1:]], input=data, text=True).returncode)
 ''')
@@ -128,6 +129,18 @@ else:
                 self.assertEqual(progress.get("state"), "complete")
                 self.assertEqual(progress.get("exit_code"), 0)
 
+    def test_automatic_deferral_cannot_run_installer_and_manual_bypasses_time_only(self):
+        self.env['SLS_MASS_NOTIFY_MANUAL_UPDATE'] = '0'
+        result, _ = self.run_update('deferred')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.base / 'installer-called').exists())
+        self.assertTrue(json.loads((self.base / 'status.json').read_text())['update_available'])
+        self.env['SLS_MASS_NOTIFY_MANUAL_UPDATE'] = '1'
+        result, progress = self.run_update('deferred')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.base / 'installer-called').exists())
+        self.assertEqual(progress['state'], 'complete')
+
 
 class MaintenanceFailures(unittest.TestCase):
     def run_fixture(self, updater):
@@ -137,6 +150,7 @@ class MaintenanceFailures(unittest.TestCase):
             runtime.mkdir()
             executable(runtime / "sls_mass_notify_update.sh", updater)
             executable(runtime / "sls_storage_maintenance.py", "raise SystemExit(0)\n")
+            executable(runtime / "sls_config_crypto.py", 'import json; print(json.dumps({"ok": True, "skipped": True}))\n')
             (base / "update.request").touch()
             source = (BIN / "sls_mass_notify_maintenance.sh").read_text()
             for old, new in {
@@ -151,7 +165,7 @@ class MaintenanceFailures(unittest.TestCase):
             }.items():
                 source = source.replace(old, new)
             source = source.replace(SERVICE_ACCOUNT, FIXTURE_ACCOUNT)
-            source = source.replace('[ "${EUID:-$(id -u)}" -eq 0 ] || exit 1', "secure_central_config() { :; }\n")
+            source = source.replace('[ "${EUID:-$(id -u)}" -eq 0 ] || exit 1', "secure_central_config() { :; }\nadmit_root_runtime() { :; }\n")
             # Fixture-owned markers are valid even when this test is not root.
             source = source.replace('[ "$owner" != "asterisk" ] && [ "$owner" != "root" ]', "false")
             executable(base / "maintenance.sh", source)

@@ -6,6 +6,16 @@ import os
 import sys
 from pathlib import Path
 
+import importlib.util
+import sys as _config_sys
+_config_sys.dont_write_bytecode = True
+_config_crypto_spec = importlib.util.spec_from_file_location("sls_config_crypto", Path(__file__).resolve().with_name("sls_config_crypto.py"))
+_config_crypto = importlib.util.module_from_spec(_config_crypto_spec)
+_config_crypto_spec.loader.exec_module(_config_crypto)
+_cluster_spec = importlib.util.spec_from_file_location('sls_cluster_guard', Path(__file__).resolve().with_name('sls_cluster_guard.py'))
+_cluster_guard = importlib.util.module_from_spec(_cluster_spec)
+_cluster_spec.loader.exec_module(_cluster_guard)
+
 from sls_notification_destinations import (
     alert_profile,
     build_discord_payload,
@@ -35,6 +45,8 @@ def send_branded_discord(
     test=False,
     dry_run=False,
 ):
+    if live and not test and not dry_run:
+        _cluster_guard.fence_legacy(config)
     results = dispatch_discord_destinations(
         config,
         subject,
@@ -60,8 +72,7 @@ def send_branded_discord(
 
 def main():
     config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CONFIG
-    with config_path.open("r", encoding="utf-8") as handle:
-        config = json.load(handle)
+    config = _config_crypto.read_config(config_path)
     field_names = ("Type", "Event", "Severity", "Zone", "Radius", "Recipients", "Audio", "Trigger")
     fields = [(name, os.environ.get("SLS_DISCORD_" + name.upper(), "")) for name in field_names]
     results = dispatch_discord_destinations(

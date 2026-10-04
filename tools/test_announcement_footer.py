@@ -12,8 +12,10 @@ assert 'Review destinations' not in source and 'id="sls-announcement-preview"' n
 assert 'remaining > 0 || requestInFlight || deliveryOutcomeUnknown || activeJob' in source
 assert 'class="btn btn-primary sls-send-button"' in source
 assert 'error && error.message ? error.message' not in source[source.index("form.addEventListener('submit'"):]
-render = subprocess.run(['php', '-r', '$setup_complete=true; $csrf_token="fixture"; include $argv[1];', str(path)], capture_output=True, text=True, check=True)
+render = subprocess.run(['php', '-r', '$setup_complete=true; $csrf_token="fixture"; $announcement_desktop_clients=[["client_id"=>"cli_fixture", "username"=>"fixture-user", "name"=>"Fixture desktop", "enabled"=>"1", "password_enc"=>"secret-ciphertext-must-not-render", "future_secret"=>"unknown-secret-must-not-render"]]; include $argv[1];', str(path)], capture_output=True, text=True, check=True)
 assert not render.stderr, render.stderr
+assert 'secret-ciphertext-must-not-render' not in render.stdout and 'unknown-secret-must-not-render' not in render.stdout
+assert 'cli_fixture' in render.stdout and 'Fixture desktop' in render.stdout
 scripts = re.findall(r'<script[^>]*>(.*?)</script>', render.stdout, re.S)
 assert scripts
 for script in scripts:

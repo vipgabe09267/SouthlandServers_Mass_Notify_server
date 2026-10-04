@@ -42,6 +42,23 @@ eval('class AnnouncementActivityFixture {
     }
 ' . $methods . '}');
 
+require_once dirname(__DIR__).'/slsmassnotifyserver/EnterpriseAdministration.php';
+class EnterpriseActivityFixture extends AnnouncementActivityFixture
+{
+    use \FreePBX\modules\SlsEnterpriseAdministration;
+    const SETTINGS_JSON = 'inert-active-fixture';
+    const PENDING_SETTINGS_JSON = 'inert-pending-fixture';
+    public array $settings=['unrelated'=>'preserved'];
+    public int $writes=0;
+    protected function assertEnterpriseAdministrator(): array { return ['username'=>'fixture']; }
+    public function updateEnterprise(): void { $this->saveEnterpriseNamespace('enterprise_operations',['enabled'=>false]); }
+    public function loadSettingsFile($path): array { return $this->settings; }
+    public function normalizeSettings(array $settings): array { return $settings; }
+    public function configurationPathMetadata($path) { return null; }
+    public function writeSettingsFileUnlocked($path,array $settings,$backup): void { $this->settings=$settings;$this->writes++; }
+    public function rememberSettingsFingerprint($path): void {}
+}
+
 $checks = 0;
 $assert = static function (bool $condition, string $message) use (&$checks): void {
     $checks++;
@@ -108,6 +125,17 @@ try {
     $handles['delivery'] = $two->acquireAnnouncementActivityLock(false);
     $assert(is_resource($handles['delivery']), 'Releasing settings did not release paired activity.');
     $two->releaseNativeBackupFileLock($handles['delivery']); unset($handles['delivery']);
+
+    $enterprise=new EnterpriseActivityFixture();$start=microtime(true);$enterprise->updateEnterprise();
+    $assert(microtime(true)-$start<0.5&&$enterprise->writes===1&&$enterprise->settings['unrelated']==='preserved',
+        'Enterprise save self-blocked while acquiring a second exclusive activity descriptor.');
+    $handles['delivery']=$one->acquireAnnouncementActivityLock(false);$failed=false;
+    try{$enterprise->updateEnterprise();}catch(RuntimeException $error){$failed=true;}
+    $assert($failed&&$enterprise->writes===1,'Enterprise save replaced settings during active delivery.');
+    $one->releaseNativeBackupFileLock($handles['delivery']);unset($handles['delivery']);
+    $handles['after_enterprise']=$two->acquireAnnouncementActivityLock(false);
+    $assert(is_resource($handles['after_enterprise']),'Enterprise save failure leaked exclusive activity.');
+    $two->releaseNativeBackupFileLock($handles['after_enterprise']);unset($handles['after_enterprise']);
 
     unlink(AnnouncementActivityFixture::SETTINGS_LOCK);
     symlink(AnnouncementActivityFixture::ANNOUNCEMENT_ACTIVITY_LOCK_FILE, AnnouncementActivityFixture::SETTINGS_LOCK);

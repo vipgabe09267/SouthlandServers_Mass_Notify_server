@@ -1,5 +1,11 @@
 <?php // Southland Servers Mass Notification Module ?>
-<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 13px;margin-bottom:16px;border:1px solid #dfe5ec;border-radius:8px;background:#fff;box-shadow:0 1px 4px rgba(15,23,42,.05);">
+<style>
+/* FreePBX's table layout otherwise grows to a child table's minimum width. */
+#page_body { display:block; }
+.sls-hero { display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 13px;margin-bottom:16px;border:1px solid #dfe5ec;border-radius:8px;background:#fff;box-shadow:0 1px 4px rgba(15,23,42,.05); }
+@media(max-width:767px) { .sls-hero { flex-direction:column;align-items:stretch; } .sls-hero > div { justify-content:flex-start !important; } }
+</style>
+<div class="sls-hero">
 	<a href="https://southlandservers.xyz" target="_blank" rel="noopener noreferrer" style="display:flex;align-items:center;gap:12px;min-width:0;text-decoration:none;">
 		<img src="<?php echo htmlspecialchars($hero_image); ?>" alt="<?php echo _('Southland Servers Group'); ?>" style="width:52px;height:52px;object-fit:contain;flex:0 0 52px;">
 		<span style="min-width:0;">
