@@ -158,6 +158,8 @@ Executable runtime, including Piper and the automatic updater, is root-owned. Mu
 
 ### Installer log and runtime errors
 
+Ordinary `fwconsole reload` and Apply Config continue if the SLS phone collector is reconnecting, stopped or unable to authenticate. The reload logs a warning; SLS phone audio still requires a fresh authenticated heartbeat. Check `systemctl status sls-mass-notify-phone-events.service` and `journalctl -u sls-mass-notify-phone-events.service --no-pager -n 50`, then review SLS Help/Deployment readiness or run Repair Installation. Installation and post-restore verification still require a healthy collector. A full PBX restart is not required to diagnose this fault.
+
 `AH00112: Warning: DocumentRoot [/invalid/folder/name] does not exist` is an Apache warning. If `apache2ctl configtest` exits successfully, it does not stop installation. The installer still requires valid Apache syntax and reachable PBX/API routes. Do not create that directory or change an unrelated virtual host merely to silence the warning. Keep the complete `/tmp/slsmassnotifyserver-install.log`; its stage and resource report identify the actual stop condition.
 
 Free-space admission checks the filesystems containing the actual SLS directories, including dedicated or bind mounts. Shared filesystems are counted once. A small `/tmp` can use safe root-owned `/var/tmp` scratch space instead, and the selected location is printed in the log. There is no extra minimum on an unused parent directory. Insufficient target/scratch space still stops installation before dependency/module changes.

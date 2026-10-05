@@ -2,6 +2,7 @@
 
 ## 0.1.5-beta — 2026-10-05
 
+- Allow FreePBX reloads to finish when the SLS phone collector is unavailable or reconnecting. Keep an actionable warning and current SLS health diagnostics; retain strict installation/restore checks and authenticated-heartbeat requirements for new phone audio.
 - Restore missing previous runtime helpers from the authenticated release before taking a rollback snapshot. Quarantine recognized Python caches as recovery evidence without approving their bytecode for execution; report unknown runtime files and changed sources by name.
 - Retain installer stage messages and protected-helper errors in the protected log. Distinguish read-only filesystems, exhausted inodes and actual free-space shortages; show required and available MiB without rounding away small differences.
 - Put package-review and rollback workspaces on the selected scratch filesystem. Budget authenticated trust generations on their own mount and include measured prior runtime, API and recordings in rollback storage.

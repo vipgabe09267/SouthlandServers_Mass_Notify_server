@@ -8,10 +8,15 @@ trait SlsPhoneEventService
 	{
 		$failure = ['state' => 'fault', 'ok' => false, 'message' => _('Phone outcome collection is unavailable. New phone audio admission is blocked, and existing delivery outcomes may be unknown. Check the collector service and run Repair Installation.')];
 		$helper = self::RUNTIME_DIR . '/sls_phone_events.py';
-		if (!is_readable($helper) || is_link($helper)) { return $failure; }
+		if (!is_readable($helper) || is_link($helper) || !function_exists('posix_geteuid') || !function_exists('posix_getpwnam')) { return $failure; }
+		$account = posix_getpwnam('asterisk');
+		$uid = posix_geteuid();
+		if (!is_array($account) || !is_int($account['uid'] ?? null) || $account['uid'] <= 0
+			|| ($uid !== 0 && $uid !== $account['uid'])) { return $failure; }
+		$runAs = $uid === 0 ? '/usr/sbin/runuser -u asterisk -- ' : '';
 		$output = [];
 		$status = 1;
-		@exec('/usr/bin/timeout --kill-after=1 2 /usr/bin/python3 -I ' . escapeshellarg($helper) . ' --health 2>/dev/null', $output, $status);
+		@exec('/usr/bin/timeout --kill-after=1 2 ' . $runAs . '/usr/bin/python3 -I ' . escapeshellarg($helper) . ' --health 2>/dev/null', $output, $status);
 		$result = json_decode(implode("\n", $output), true);
 		if ($status !== 0 || !is_array($result) || ($result['ok'] ?? null) !== true || ($result['connected'] ?? null) !== true
 			|| !is_numeric($result['heartbeat_age_seconds'] ?? null) || $result['heartbeat_age_seconds'] < 0 || $result['heartbeat_age_seconds'] > 15
@@ -103,12 +108,22 @@ UNIT;
 	/** FreePBX has generated manager_additional.conf and reloaded Asterisk. */
 	public function postReloadPhoneEventCollector()
 	{
-		// A newly created AMI account cannot authenticate until Apply Config.
-		// Allow the collector's bounded restart backoff to reconnect before
-		// requiring active service state. Capability failures still propagate
-		// through FreePBX's postReload hook and fail activation verification.
-		$this->verifyPhoneEventCollectorReadiness();
-		$this->verifyPhoneEventCollectorService();
+		// Asterisk/AMI may still be reconnecting. SLS faults must not prevent
+		// the host PBX from applying configuration or completing a restart.
+		$ready = false;
+		try {
+			$health = $this->getPhoneEventCollectorHealth();
+			$ready = is_array($health) && ($health['ok'] ?? null) === true;
+		} catch (\Throwable $error) {
+			// Never log probe/configuration exceptions containing credentials.
+		}
+		if (!$ready) {
+			try {
+				@error_log(_('SLS Mass Notify: FreePBX reload continues while the phone receipt collector is unavailable. SLS phone audio requires a fresh authenticated AMI heartbeat. Check systemctl status sls-mass-notify-phone-events.service and journalctl -u sls-mass-notify-phone-events.service, then run SLS Repair Installation.'));
+			} catch (\Throwable $error) {
+				// A logging failure must not abort FreePBX reload either.
+			}
+		}
 		return true;
 	}
 
@@ -165,7 +180,7 @@ UNIT;
 		}
 		// Manager::add_manager changes the database only. Asterisk's existing
 		// permissions remain loaded until FreePBX generates its configuration.
-		// postReloadPhoneEventCollector performs the mandatory runtime checks;
+		// Installation and restore verify capabilities and heartbeat separately;
 		// new audio admission stays fail-closed until the collector is healthy.
 	}
 
