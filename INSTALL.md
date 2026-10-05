@@ -162,6 +162,10 @@ Executable runtime, including Piper and the automatic updater, is root-owned. Mu
 
 Free-space admission checks the filesystems containing the actual SLS directories, including dedicated or bind mounts. Shared filesystems are counted once. A small `/tmp` can use safe root-owned `/var/tmp` scratch space instead, and the selected location is printed in the log. There is no extra minimum on an unused parent directory. Insufficient target/scratch space still stops installation before dependency/module changes.
 
+Storage failures show required and available MiB on the affected filesystem. Read-only targets and exhausted inodes have separate errors; free space on another mount cannot satisfy these checks. Stage messages and protected-helper failures are saved in the installer log as well as displayed in the terminal.
+
+The selected scratch filesystem also holds authenticated package review and rollback snapshots. Its budget includes the measured previous runtime/API/recording files and bounded upstream verification work. The permanent trust-generation budget applies to `/var/lib/sls-mass-notify-trust` on its actual mount. After a failed installation, preserve the printed recovery locations in root-private durable storage before rebooting or cleaning temporary files.
+
 After an update-check failure, use **General Settings > Updates > Check for updates** to retry without installing, or **Retry update** to check and install a newer authenticated release. Network, TLS, GitHub rate-limit, policy and metadata failures have separate messages. These actions use saved/applied update policy and do not save other form changes.
 
 The installer accepts an existing root- or Asterisk-owned regular log at `/tmp/slsmassnotifyserver-install.log`, secures the verified file, and keeps writing through its open descriptor even if FreePBX changes ownership. It does not disable Linux `protected_regular` or follow links. The uninstaller uses the same safeguards for its two diagnostic logs before removing anything.
@@ -247,6 +251,8 @@ chmod +x sls-uninstall.sh
 The installer verifies the candidate SLS release and approves the previous release before changing protected runtime or maintenance. Existing reviewed Framework/Dashboard inventories remain authoritative. If they are missing, the installer downloads GPG-signed upstream packages at the exact installed versions, verifies the pinned FreePBX signing key, and compares deployed files with upstream bytes plus signed previous/candidate SLS widgets and the supported menu insertion. It accounts for Framework web-file mappings, installer-only omissions and the supported spinner symlink. It neither replaces stock files nor approves arbitrary live hashes.
 
 Unknown differences stop preparation before mutation. The installer prints a retained root-private review directory containing `review-required.json`; independently review each reported change before supplying an approved inventory and its digest. Existing local branding and security changes must be preserved. See [the trust inventory procedure](docs/privileged-trust.md).
+
+For the previous root runtime, missing helpers are reconstructed only from the authenticated previous release. Recognized CPython cache files for those signed sources are copied into `runtime-cache-recovery` in the review directory and removed before the rollback snapshot. Their contents are never loaded or approved for execution. Inventory-only mode performs neither operation. Changed source files, unknown leftovers, links and writable runtime entries still stop installation; `runtime-review-required.json` identifies unapproved files and changes. Preserve that report and investigate before retrying.
 
 Run only the inventory preparation stage with the matching installer and verified release assets:
 

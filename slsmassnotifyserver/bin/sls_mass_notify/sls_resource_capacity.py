@@ -62,6 +62,12 @@ MANAGED_TREES = {'runtime': '/usr/local/bin/sls_mass_notify',
                  'control_api': '/var/www/html/api/sls-mass-notify', 'operator_portal': '/var/www/html/mass-notify'}
 STATE_FILES = {'phone_ledger': 'phone-admission.json', 'weather_ledger': 'weather-delivery.json',
                'schedule_ledger': 'schedule-executions.json', 'config': 'mass-notifications.config'}
+RECOVERY_RECORDINGS = tuple('/var/lib/asterisk/sounds/en/custom/' + name + '.wav' for name in (
+    'SLS_Mass_Notify_Paging_Tone_Opening', 'SLS_Mass_Notify_Paging_Tone_Closing',
+    'SLS_Mass_Notify_NWS_Alert', 'SLS_Mass_Notify_Lightning_Alert',
+    'Paging_Tone_Opening', 'Paging_Tone_Closing', 'NWS_alert', 'Lightning_alert')) + tuple(
+    MANAGED_TREES['data'] + '/sounds/tones/' + name + '.wav' for name in (
+    'opening_Paging_Tone_Opening', 'closing_Paging_Tone_Closing', 'opening_NWS_alert', 'opening_Lightning_alert'))
 PERSISTENT_PATHS = ('/', '/var/lib/asterisk', '/usr/local', '/var/www', '/var/log')
 
 
@@ -110,9 +116,20 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
         MANAGED_TREES['operator_portal']: {'operator_portal_payload': payload(MANAGED_TREES['operator_portal'])},
         #Maintenance compacts logs sequentially, using backup+retained temporary.
         '/var/log': {'event_log_backup_and_retained_copy': 2 * 64 * MIB},
+        '/var/lib/sls-mass-notify-trust': {'new_authenticated_generation': payload('/var/lib/sls-mass-notify-trust'),
+                                         'stock_and_release_manifests': 8 * MIB},
         temporary_directory: {'release_download_and_metadata': 52 * MIB + 16 * 1024 + 4096,
                  'extracted_release': payload(temporary_directory), 'failed_release_recovery': payload(temporary_directory),
                  'old_module_recovery': size('module'), 'protected_config_snapshot': 16 * MIB,
+                 'reviewed_previous_and_candidate_sources': 2 * payload(temporary_directory),
+                 'previous_release_download_and_metadata': 64 * MIB + 16 * 1024 + 4096,
+                 # Two retained signed upstream packages and one active GPG
+                 # verification's signed/plain copies; each bounded to64MiB.
+                 'upstream_package_verification': 4 * 64 * MIB,
+                 'prior_static_runtime_and_api_snapshot': sum(size(name) for name in
+                     ('runtime', 'assets', 'sip_api', 'control_api', 'operator_portal', 'recovery_recordings')) + 32 * MIB,
+                 'missing_signed_helper_repairs': payload(temporary_directory),
+                 'quarantined_python_caches': 16 * MIB,
                  'pinned_wheel_downloads': rounded(PINNED_WHEEL_BYTES, unit(temporary_directory)),
                  'wheel_unpack_workspace': venv, 'pip_old_package_recovery': venv,
                  'one_voice_download': rounded(max(VOICE_BYTES.values()), unit(temporary_directory))},
@@ -121,7 +138,7 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
     fixed_names = ('runtime', 'voices', 'module', 'assets', 'sip_api', 'control_api')
     fixed = sum(size(name) for name in fixed_names)
     mutable = max(0, size('data') - size('voices')) + max(0, size('web') - size('assets'))
-    return {'basis': 'measured_managed_trees_and_pinned_catalog_2026-09-20',
+    return {'basis': 'measured_managed_trees_pinned_catalog_and_authenticated_recovery_2026-10-05',
             'measured_fixed_allocation_bytes': fixed, 'measured_mutable_data_and_media_bytes': mutable,
             'measured_trees': measured, 'fresh_reference_voice_bytes': voice_total,
             'pinned_runtime_reference_bytes': reference_venv, 'pinned_wheel_download_bytes': PINNED_WHEEL_BYTES,
@@ -207,6 +224,14 @@ def measure_tree(path, deadline, maximum_entries=50000):
 def probe_storage():
     deadline = time.monotonic() + 2
     measured = {name: measure_tree(path, deadline) for name, path in MANAGED_TREES.items()}
+    measured['recovery_recordings'] = {'allocated_bytes': 0}
+    for name in RECOVERY_RECORDINGS:
+        try:
+            metadata = Path(name).lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISREG(metadata.st_mode):
+            measured['recovery_recordings']['allocated_bytes'] += metadata.st_blocks * 512
     for key, name in STATE_FILES.items():
         try:
             metadata = Path(MANAGED_TREES['data'], name).lstat()
@@ -320,12 +345,18 @@ def probe_filesystems(free_budgets=None):
         record = devices.setdefault(metadata.st_dev, {
             'device': str(metadata.st_dev), 'paths': [], 'total_bytes': usage.f_blocks * usage.f_frsize,
             'available_bytes': usage.f_bavail * usage.f_frsize, 'required_free_bytes': 0, 'persistent': False,
+            'read_only': False, 'inodes_exhausted': False,
         })
         record['paths'].append(path)
         # Shared mounts and bind mounts must not count the same bytes twice.
         record['available_bytes'] = min(record['available_bytes'], usage.f_bavail * usage.f_frsize)
         record['total_bytes'] = min(record['total_bytes'], usage.f_blocks * usage.f_frsize)
         record['required_free_bytes'] += free_budgets.get(path, 0)
+        if free_budgets.get(path, 0):
+            record['read_only'] = record['read_only'] or bool(getattr(usage, 'f_flag', 0) & os.ST_RDONLY)
+            # Filesystems without a fixed inode table may report zero for both.
+            record['inodes_exhausted'] = record['inodes_exhausted'] or (
+                getattr(usage, 'f_files', 0) > 0 and getattr(usage, 'f_favail', None) == 0)
         record['persistent'] = record['persistent'] or persistent
     return list(devices.values())
 
@@ -376,7 +407,8 @@ def probe_storage_filesystems(storage, temporary_directory=None):
         filesystems = probe_filesystems(candidate['free_budgets_bytes'])
         if first is None:
             first = (candidate, filesystems)
-        if all(row['available_bytes'] >= row['required_free_bytes'] for row in filesystems):
+        if all(row['available_bytes'] >= row['required_free_bytes'] and not row.get('read_only')
+               and not row.get('inodes_exhausted') for row in filesystems):
             return candidate, filesystems
     if first is None:
         raise ResourceProbeError('temporary_directory_unavailable',
@@ -544,8 +576,14 @@ def evaluate(hardware, requested, phone_requested=PHONE_BASELINE):
     disks_ok = True
     for item in hardware['filesystems']:
         before = len(errors)
+        destinations = [path for path in item['paths'] if storage['free_budgets_bytes'].get(path, 0)] or item['paths']
+        location = ', '.join(destinations)
+        if item.get('read_only'):
+            errors.append({'code': 'storage_read_only', 'message': 'The filesystem containing ' + location + ' is read-only. Restore its writable mount before installing; available bytes cannot make a read-only target usable.', 'actual': None, 'required': None})
+        if item.get('inodes_exhausted'):
+            errors.append({'code': 'storage_inodes_exhausted', 'message': 'The filesystem containing ' + location + ' has no available file entries (inodes). Free file entries or expand that filesystem before installing.', 'actual': 0, 'required': 1})
         require('free_space_insufficient',
-                f'{item["required_free_bytes"] / GIB:.1f} GiB of additional SLS free space is required on the filesystem containing {", ".join(item["paths"])}; {item["available_bytes"] / GIB:.1f} GiB is free. Free space or expand this filesystem.',
+                f'{item["required_free_bytes"] / MIB:.2f} MiB of additional SLS free space is required on the filesystem containing {location}; {item["available_bytes"] / MIB:.2f} MiB is available. Free space or expand this filesystem.',
                 item['available_bytes'], item['required_free_bytes'])
         disks_ok = disks_ok and len(errors) == before
     eligible = 0
@@ -568,7 +606,8 @@ def evaluate(hardware, requested, phone_requested=PHONE_BASELINE):
     for name, paths in (('storage', set(storage['free_budgets_bytes']) - {temporary}), ('temporary', {temporary})):
         filesystems = [item for item in hardware['filesystems'] if paths.intersection(item['paths'])]
         covered = set(path for item in filesystems for path in item['paths'])
-        checks[name] = {'ok': all(item['available_bytes'] >= item['required_free_bytes'] for item in filesystems)
+        checks[name] = {'ok': all(item['available_bytes'] >= item['required_free_bytes'] and not item.get('read_only')
+                                and not item.get('inodes_exhausted') for item in filesystems)
                        if paths <= covered else None,
                        'filesystems': [{'paths': item['paths'], 'actual': item['available_bytes'],
                                         'required': item['required_free_bytes']} for item in filesystems]}

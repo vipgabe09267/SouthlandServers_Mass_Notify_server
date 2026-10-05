@@ -59,6 +59,13 @@ class UpgradeError(RuntimeError):
     pass
 
 
+class RuntimeReviewError(UpgradeError):
+    def __init__(self, differences):
+        self.differences = differences
+        names = ', '.join(row['path'] + ' (' + row['reason'] + ')' for row in differences[:12])
+        super().__init__('Previous root runtime contains unapproved files or changes: ' + names)
+
+
 def helper(name):
     spec = importlib.util.spec_from_file_location('_sls_upgrade_' + name, HERE / (name + '.py'))
     module = importlib.util.module_from_spec(spec)
@@ -252,24 +259,48 @@ def authenticated_generation(root):
     return data, contents
 
 
-def runtime_files(contents):
+def runtime_sources(contents):
     result = {}
-    for name, body in contents.items():
+    for name in contents:
         if name == 'bin/sign_sls_mass_notify_local_sig.sh':
-            result['/usr/local/sbin/sign_sls_mass_notify_local_sig.sh'] = TRUST.digest(body)
+            target = '/usr/local/sbin/sign_sls_mass_notify_local_sig.sh'
         elif name == 'bin/slsconsole':
-            result['/usr/local/bin/slsconsole'] = TRUST.digest(body)
+            target = '/usr/local/bin/slsconsole'
         elif name.startswith('bin/sls_mass_notify/'):
-            result[RUNTIME + '/' + name[len('bin/sls_mass_notify/'):]] = TRUST.digest(body)
+            target = RUNTIME + '/' + name[len('bin/sls_mass_notify/'):]
         elif name.startswith('bin/') and '/' not in name[4:]:
-            result[RUNTIME + '/' + name[4:]] = TRUST.digest(body)
+            target = RUNTIME + '/' + name[4:]
+        else:
+            continue
+        if target in result:
+            raise UpgradeError('Signed package has conflicting runtime destinations: ' + target)
+        result[target] = name
     return result
+
+
+def runtime_files(contents):
+    return {target: TRUST.digest(contents[name]) for target, name in runtime_sources(contents).items()}
+
+
+def runtime_cache_source(relative):
+    """Recognize only CPython cache names; their contents never grant execution."""
+    path = Path(relative)
+    match = re.fullmatch(r'([A-Za-z_][A-Za-z0-9_]*)\.cpython-[0-9]{2,3}(?:\.opt-[12])?\.pyc', path.name)
+    if path.parent.name != '__pycache__' or not match:
+        return None
+    return str(path.parent.parent / (match[1] + '.py'))
 
 
 def runtime_inventory(root):
     """Inspect root code separately from the existing protected Piper venv."""
     found = set()
-    parent = TRUST.directory(root, protected=True)
+    try:
+        parent = TRUST.directory(root, protected=True)
+    except FileNotFoundError:
+        return found
+    if os.fstat(parent).st_mode & 0o022:
+        os.close(parent)
+        raise UpgradeError('Previous runtime directory is writable by other accounts: ' + str(root))
     count = 0
     def visit(descriptor, prefix=''):
         nonlocal count
@@ -279,6 +310,8 @@ def runtime_inventory(root):
                 raise UpgradeError('Root runtime exceeds its inspection limit')
             relative = TRUST.relative(prefix + name)
             info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode) and info.st_nlink == 1):
+                raise UpgradeError('Unsafe link or special previous root runtime file: ' + relative)
             if info.st_uid != 0 or info.st_mode & 0o022:
                 raise UpgradeError('Unprotected previous root runtime entry: ' + relative)
             if stat.S_ISDIR(info.st_mode):
@@ -288,8 +321,6 @@ def runtime_inventory(root):
                         raise UpgradeError('Root runtime directory changed during inspection')
                     if relative != 'piper': visit(child, relative + '/')
                 finally: os.close(child)
-            elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                raise UpgradeError('Unsafe link or special previous root runtime file: ' + relative)
             else:
                 found.add(relative)
     try: visit(parent)
@@ -305,19 +336,28 @@ def previous_root_approval(data, contents, *, prefix=Path('/'), cron=None):
     own = {name[len(RUNTIME) + 1:] for name in expected if name.startswith(RUNTIME + '/')}
     # The root-owned dependency tree has separate validation; no other
     # executable leftovers may become part of a recovered root environment.
-    if actual != own:
-        raise UpgradeError('Previous root runtime contains missing or unapproved files; review before upgrading')
+    cache_names = {name for name in actual - own if runtime_cache_source(name) in own}
+    unknown = sorted(actual - own - cache_names)
+    if unknown:
+        raise RuntimeReviewError([{'path': RUNTIME + '/' + name, 'reason': 'not in the previous signed runtime or a recognized source cache'} for name in unknown])
+    missing = []
     for name, digest in expected.items():
         target = prefix / name[1:]
-        descriptor = TRUST.directory(target.parent, protected=True)
         try:
-            info = os.stat(target.name, dir_fd=descriptor, follow_symlinks=False)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != 0 or info.st_mode & 0o022:
-                raise UpgradeError('Previous root runtime is unsafe: ' + name)
-        finally:
-            os.close(descriptor)
-        if TRUST.digest(TRUST.read(target, TRUST.MAX_ARCHIVE, protected=True)) != digest:
-            raise UpgradeError('Previous root runtime differs from its signed release: ' + name)
+            body = TRUST.read(target, TRUST.MAX_ARCHIVE, protected=True)
+        except FileNotFoundError:
+            missing.append(name)
+            continue
+        if TRUST.digest(body) != digest:
+            raise RuntimeReviewError([{'path': name, 'reason': 'differs from its signed release'}])
+    caches = {}
+    total = 0
+    for name in sorted(cache_names):
+        body = TRUST.read(runtime / name, 1024 * 1024, protected=True)
+        total += len(body)
+        if total > 16 * 1024 * 1024:
+            raise UpgradeError('Previous Python caches exceed the 16 MiB recovery limit; review before upgrading')
+        caches[RUNTIME + '/' + name] = TRUST.digest(body)
     if cron is None:
         result = subprocess.run(['/usr/bin/crontab', '-u', 'root', '-l'], capture_output=True, timeout=15,
                                 env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C'})
@@ -332,7 +372,115 @@ def previous_root_approval(data, contents, *, prefix=Path('/'), cron=None):
         raise UpgradeError('Previous SLS root schedule needs independent review; no maintenance was disabled')
     return {'schema': 1, 'source': 'publisher-verified-previous-release', 'version': data['version'],
             'archive_sha256': data['source']['archive_sha256'], 'files': expected,
+            'missing_files': sorted(missing), 'quarantine_caches': caches,
             'root_jobs': [line.decode('ascii') for line in jobs]}
+
+
+def normalize_previous_runtime(workspace, *, prefix=Path('/')):
+    """Restore absent signed helpers and retire bytecode before recovery approval.
+
+    Cache hashes identify evidence to quarantine, never executable approval.
+    Existing source files must still match their authenticated expectations.
+    """
+    approval = json.loads(TRUST.read(workspace / 'previous-root-approval.json', TRUST.MAX_MANIFEST, protected=True))
+    expected = approval['files']
+    sources = workspace / 'previous-runtime-repairs'
+    missing = set(approval.get('missing_files', []))
+    caches = approval.get('quarantine_caches', {})
+    if approval.get('source') == 'fresh-install' and not expected and not missing and not caches:
+        return
+    runtime = prefix / RUNTIME[1:]
+    own = {name[len(RUNTIME) + 1:] for name in expected if name.startswith(RUNTIME + '/')}
+    actual = runtime_inventory(runtime)
+    if actual - own != {name[len(RUNTIME) + 1:] for name in caches}:
+        raise UpgradeError('Previous runtime changed after preflight; no additional files were approved')
+    # Verify every input and existing destination before modifying any live file.
+    payloads = {}
+    for name, digest in expected.items():
+        target = prefix / name[1:]
+        try:
+            body = TRUST.read(target, TRUST.MAX_ARCHIVE, protected=True)
+        except FileNotFoundError:
+            if name not in missing:
+                raise UpgradeError('Previous runtime file disappeared after preflight: ' + name)
+            body = TRUST.read(sources / TRUST.digest(name.encode()), TRUST.MAX_ARCHIVE, protected=True)
+            payloads[name] = body
+        if TRUST.digest(body) != digest:
+            raise UpgradeError('Previous runtime changed after preflight: ' + name)
+    cache_bodies = {}
+    for name, digest in caches.items():
+        if runtime_cache_source(name[len(RUNTIME) + 1:]) not in own:
+            raise UpgradeError('Invalid runtime cache recovery path')
+        body = TRUST.read(prefix / name[1:], 1024 * 1024, protected=True)
+        if TRUST.digest(body) != digest:
+            raise UpgradeError('Previous Python cache changed after preflight: ' + name)
+        cache_bodies[name] = body
+    evidence = workspace / 'runtime-cache-recovery'
+    if caches:
+        TRUST.prepare_root(evidence)
+        for name, body in cache_bodies.items():
+            TRUST.atomic(evidence / TRUST.digest(name.encode()), body)
+        write_json(evidence / 'inventory.json', {'schema': 1, 'execution_approved': False, 'files': caches})
+    for name, body in payloads.items():
+        target = prefix / name[1:]
+        if target.parent == runtime or target.parent.is_relative_to(runtime):
+            # Create only missing directories under the fixed runtime root.
+            # Existing ancestry is checked without following links.
+            parent = TRUST.directory(runtime.parent, protected=True)
+            try:
+                for part in target.parent.relative_to(runtime.parent).parts:
+                    try:
+                        os.mkdir(part, 0o755, dir_fd=parent)
+                    except FileExistsError:
+                        pass
+                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+                    os.close(parent)
+                    parent = child
+                    info = os.fstat(parent)
+                    if info.st_uid != 0 or info.st_mode & 0o022:
+                        raise UpgradeError('Unsafe previous runtime repair directory')
+            finally:
+                os.close(parent)
+        parent = TRUST.directory(target.parent, protected=True)
+        descriptor = -1
+        temporary = '.previous-runtime-' + os.urandom(12).hex()
+        try:
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent)
+            with os.fdopen(descriptor, 'wb') as stream:
+                descriptor = -1
+                stream.write(body)
+                stream.flush()
+                os.fchmod(stream.fileno(), 0o755)
+                os.fsync(stream.fileno())
+            # link() publishes only to an absent name; never replace a new file.
+            os.link(temporary, target.name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+            os.unlink(temporary, dir_fd=parent)
+            os.fsync(parent)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary, dir_fd=parent)
+            except FileNotFoundError:
+                pass
+            os.close(parent)
+    for name, body in cache_bodies.items():
+        target = prefix / name[1:]
+        parent = TRUST.directory(target.parent, protected=True)
+        try:
+            before = os.stat(target.name, dir_fd=parent, follow_symlinks=False)
+            if TRUST.read(target, 1024 * 1024, protected=True) != body:
+                raise UpgradeError('Python cache changed before quarantine')
+            after = os.stat(target.name, dir_fd=parent, follow_symlinks=False)
+            if (before.st_dev, before.st_ino, before.st_ctime_ns) != (after.st_dev, after.st_ino, after.st_ctime_ns):
+                raise UpgradeError('Python cache changed before quarantine')
+            os.unlink(target.name, dir_fd=parent)
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    if runtime_inventory(runtime) != own:
+        raise UpgradeError('Previous runtime normalization is incomplete; preserve the review evidence')
+    print(json.dumps({'ok': True, 'restored_signed_helpers': len(payloads), 'quarantined_caches': len(caches), 'review_directory': str(workspace)}))
 
 
 def restored_web_inventory(data, old, web):
@@ -508,7 +656,19 @@ def prepare(args):
         digest = write_json(path, approved[module])
         TRUST.enroll_reviewed(registry, path, digest)
     if previous_data:
-        write_json(workspace / 'previous-root-approval.json', previous_root_approval(previous_data, previous))
+        try:
+            root_approval = previous_root_approval(previous_data, previous)
+        except RuntimeReviewError as error:
+            report = workspace / 'runtime-review-required.json'
+            write_json(report, {'schema': 1, 'approved': False, 'differences': error.differences})
+            raise UpgradeError(str(error) + '. Review ' + str(report) + '; no runtime or maintenance was changed. Do not remove unknown files or approve live hashes blindly. See docs/privileged-trust.md.') from error
+        if root_approval['missing_files']:
+            repairs = workspace / 'previous-runtime-repairs'
+            TRUST.prepare_root(repairs)
+            sources = runtime_sources(previous)
+            for name in root_approval['missing_files']:
+                TRUST.atomic(repairs / TRUST.digest(name.encode()), previous[sources[name]])
+        write_json(workspace / 'previous-root-approval.json', root_approval)
     else:
         write_json(workspace / 'previous-root-approval.json', {'schema': 1, 'source': 'fresh-install', 'files': {}, 'root_jobs': []})
     print(json.dumps({'ok': True, 'review_directory': str(workspace), 'previous_version': previous_data['version'] if previous_data else None,
@@ -523,11 +683,16 @@ def main():
     parser.add_argument('--manifest', type=Path)
     parser.add_argument('--signature', type=Path)
     parser.add_argument('--verify-previous', action='store_true')
+    parser.add_argument('--normalize-runtime', action='store_true')
     args = parser.parse_args()
     if os.geteuid() != 0:
         raise UpgradeError('Upgrade trust preparation requires root')
     TRUST.read(HERE / 'sls_upgrade_trust.py', TRUST.MAX_ARCHIVE, protected=True)
-    if args.verify_previous:
+    if args.verify_previous and args.normalize_runtime:
+        parser.error('Select only one recovery action')
+    if args.normalize_runtime:
+        normalize_previous_runtime(args.workspace)
+    elif args.verify_previous:
         verify_previous(args.workspace)
     else:
         if args.archive is None or args.manifest is None or args.signature is None:

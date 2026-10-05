@@ -29,13 +29,41 @@ def hardware(cpu=2, memory=4, total=60, available=4):
 
 
 class ResourceCapacityTests(unittest.TestCase):
+    def test_read_only_and_inode_exhausted_targets_fail_with_specific_diagnostics(self):
+        for field, code in (('read_only', 'storage_read_only'), ('inodes_exhausted', 'storage_inodes_exhausted')):
+            measured = hardware()
+            measured['filesystems'][0][field] = True
+            report = RESOURCE.evaluate(measured, 25)
+            self.assertIn(code, [row['code'] for row in report['errors']])
+            self.assertEqual((report['eligible_limit'], report['eligible_phone_limit']), (0, 0))
+
+    def test_mount_probe_applies_read_only_and_inode_checks_only_to_write_destinations(self):
+        with patch.object(RESOURCE, 'filesystem_types', return_value=[('/', 'ext4')]), \
+             patch.object(RESOURCE.Path, 'exists', return_value=True), \
+             patch.object(RESOURCE.Path, 'resolve', lambda path: path), \
+             patch.object(RESOURCE.Path, 'stat', lambda path: SimpleNamespace(st_dev=2 if str(path) == '/tmp' else 1)), \
+             patch.object(RESOURCE.os, 'statvfs', side_effect=lambda path: SimpleNamespace(
+                 f_blocks=10, f_bavail=8, f_frsize=GIB, f_flag=0 if str(path) == '/tmp' else os.ST_RDONLY,
+                 f_favail=100 if str(path) == '/tmp' else 0)):
+            mounts = RESOURCE.probe_filesystems({'/tmp': 10})
+        parent = next(row for row in mounts if row['device'] == '1')
+        self.assertFalse(parent['read_only']); self.assertFalse(parent['inodes_exhausted'])
+        scratch = next(row for row in mounts if row['device'] == '2')
+        self.assertFalse(scratch['read_only']); self.assertFalse(scratch['inodes_exhausted'])
+
+    def test_disk_failure_message_preserves_sub_gib_precision(self):
+        measured = hardware()
+        measured['filesystems'][0].update(required_free_bytes=103 * RESOURCE.MIB, available_bytes=102 * RESOURCE.MIB)
+        message = RESOURCE.evaluate(measured, 25)['errors'][0]['message']
+        self.assertIn('103.00 MiB', message); self.assertIn('102.00 MiB', message)
+
     def test_small_tmp_moves_scratch_without_weakening_target_mount_checks(self):
         storage = RESOURCE.storage_requirements()
         def filesystems(budgets):
             scratch = '/tmp' if '/tmp' in budgets else '/var/tmp'
             return [{'device': 'data', 'paths': [p for p in budgets if p != scratch],
                      'available_bytes': 2 * GIB, 'required_free_bytes': sum(v for p, v in budgets.items() if p != scratch)},
-                    {'device': 'scratch', 'paths': [scratch], 'available_bytes': (64 * RESOURCE.MIB if scratch == '/tmp' else GIB),
+                    {'device': 'scratch', 'paths': [scratch], 'available_bytes': (64 * RESOURCE.MIB if scratch == '/tmp' else 2 * GIB),
                      'required_free_bytes': budgets[scratch]}]
         with patch.object(RESOURCE, 'trusted_temporary_directory', return_value=True), \
              patch.object(RESOURCE, 'probe_filesystems', side_effect=filesystems), \

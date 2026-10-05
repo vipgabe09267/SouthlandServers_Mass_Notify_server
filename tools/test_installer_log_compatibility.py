@@ -126,6 +126,33 @@ class InstallerLogCompatibility(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
         self.assertEqual(path.read_bytes(), b"appended diagnostic\n")
 
+    def test_helper_failure_and_stage_are_retained_in_open_log_with_original_exit_status(self):
+        path = self.sticky / 'helper-failure.log'
+        result = source_shell(
+            'INSTALL_LOG_FD=""\n'
+            'open_root_owned_file INSTALL_LOG_FD "$1" log\n'
+            'log "Stage: publisher and stock approval"\n'
+            'if run_logged /bin/bash -c \'printf "Specific trust failure\\n" >&2; exit 17\'; then exit 99; else status=$?; fi\n'
+            'exit "$status"\n', path)
+        self.assertEqual(result.returncode, 17, result.stderr)
+        self.assertEqual(path.read_text(), 'Stage: publisher and stock approval\nSpecific trust failure\n')
+        self.assertIn('Specific trust failure', result.stdout)
+
+    def test_stage_logging_uses_held_descriptor_after_path_replacement(self):
+        path = self.make_file()
+        displaced = self.sticky / 'preserved.log'
+        sentinel = self.make_file('sentinel', parent=self.root)
+        before = sentinel.read_bytes()
+        result = source_shell(
+            'INSTALL_LOG_FD=""\n'
+            'open_root_owned_file INSTALL_LOG_FD "$1" log\n'
+            'mv -- "$1" "$2"\n'
+            'ln -s -- "$3" "$1"\n'
+            'log "Retained stage detail"\n', path, displaced, sentinel)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Retained stage detail', displaced.read_text())
+        self.assertEqual(sentinel.read_bytes(), before)
+
     def test_existing_root_and_service_logs_preserve_contents_and_inode(self):
         for owner in (0, self.asterisk.pw_uid):
             for mode in (0o600, 0o640, 0o664):

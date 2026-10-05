@@ -120,6 +120,17 @@ inventory and cannot fall back to a legacy signer that trusts the current tree.
 
 ## Privileged installation phases
 
+Previous runtime approval separates signed source from generated Python caches.
+Missing helpers may be reconstructed only from the authenticated previous
+package, without overwriting existing files. Recognized CPython cache names must
+correspond to a signed source and remain bounded, root-owned regular files.
+Their contents are copied to root-private review evidence and removed before the
+rollback snapshot; cache digests never grant execution approval. Inventory-only
+preparation leaves the live runtime untouched. Changed sources and unknown files
+produce `runtime-review-required.json` and stop the upgrade before maintenance
+changes. Review them against authenticated sources; do not approve observed
+live hashes or delete unexplained executable files to bypass the check.
+
 `sls_privileged_install.py` accepts fixed phases: `plan`, `preflight`, `prepare`, `admit`,
 `dependencies`, `activate`, and `verify`. Mutating phases require `--apply`.
 There is no caller-supplied filesystem root, command, PHP payload or service name.

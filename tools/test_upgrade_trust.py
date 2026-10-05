@@ -141,6 +141,107 @@ class UpgradeTrustTests(unittest.TestCase):
         (target.parent / 'extra.py').write_bytes(b'unknown import')
         with self.assertRaisesRegex(self.upgrade.UpgradeError, 'unapproved files'): self.prepare()
         self.assert_preserved()
+        report = json.loads((self.args.workspace / 'runtime-review-required.json').read_bytes())
+        self.assertFalse(report['approved'])
+        self.assertEqual(report['differences'][0]['path'], '/usr/local/bin/sls_mass_notify/extra.py')
+
+    def test_missing_signed_helper_restored_before_snapshot_without_changing_existing_files(self):
+        target = self.fs / 'usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh'
+        target.unlink()
+        self.prepare(); self.assert_preserved()
+        self.assertFalse(target.exists(), 'Trust preparation must remain read-only')
+        approved = json.loads((self.workspace / 'previous-root-approval.json').read_bytes())
+        self.assertEqual(approved['missing_files'], ['/usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh'])
+        self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        self.assertEqual(target.read_bytes(), self.old['bin/sls_mass_notify_update.sh'])
+        self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(target.stat().st_nlink, 1)
+        self.assert_preserved()
+        self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+
+    def test_absent_runtime_rebuilt_only_from_authenticated_previous_sources(self):
+        runtime = self.fs / 'usr/local/bin/sls_mass_notify'
+        shutil.rmtree(runtime)
+        self.prepare(); self.assertFalse(runtime.exists())
+        self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        self.assertEqual(self.upgrade.runtime_inventory(runtime), {Path(name).name for name in self.upgrade.runtime_files(self.old)})
+        self.assert_preserved()
+
+    def test_cache_quarantine_keeps_bytecode_out_of_execution_approval_and_rollback(self):
+        # Extend the signed fixture with an imported helper, as in the real014 runtime.
+        self.old['bin/sls_mass_notify/sls_config.py'] = b'VALUE = 1\n'
+        self.previous = self.release('previous-python', '0.1.4-beta', self.old)
+        for name in ('bin/sls_mass_notify/sls_config.py',):
+            path = self.web / 'admin/modules/slsmassnotifyserver' / name
+            path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(self.old[name])
+        runtime = self.fs / 'usr/local/bin/sls_mass_notify'
+        (runtime / 'sls_config.py').write_bytes(self.old['bin/sls_mass_notify/sls_config.py'])
+        self.environment['SLS_MASS_NOTIFY_PREVIOUS_TGZ'], self.environment['SLS_MASS_NOTIFY_PREVIOUS_MANIFEST'], self.environment['SLS_MASS_NOTIFY_PREVIOUS_MANIFEST_SIGNATURE'] = map(str, self.previous)
+        cache = runtime / '__pycache__/sls_config.cpython-311.pyc'
+        cache.parent.mkdir(); cache.write_bytes(b'untrusted bytecode must not execute or be restored')
+        self.prepare(); self.assertTrue(cache.exists()); self.assert_preserved()
+        approved = json.loads((self.workspace / 'previous-root-approval.json').read_bytes())
+        self.assertNotIn('/usr/local/bin/sls_mass_notify/__pycache__/sls_config.cpython-311.pyc', approved['files'])
+        self.assertEqual(len(approved['quarantine_caches']), 1)
+        self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        self.assertFalse(cache.exists())
+        evidence = json.loads((self.workspace / 'runtime-cache-recovery/inventory.json').read_bytes())
+        self.assertFalse(evidence['execution_approved'])
+        digest = self.trust.digest(('/usr/local/bin/sls_mass_notify/__pycache__/' + cache.name).encode())
+        self.assertEqual((self.workspace / 'runtime-cache-recovery' / digest).read_bytes(), b'untrusted bytecode must not execute or be restored')
+        self.assert_preserved()
+
+    def test_unknown_cache_content_links_and_writable_entries_remain_blocked(self):
+        runtime = self.fs / 'usr/local/bin/sls_mass_notify'
+        cache = runtime / '__pycache__/injected.py'
+        cache.parent.mkdir(); cache.write_bytes(b'unknown code')
+        with self.assertRaisesRegex(self.upgrade.UpgradeError, 'unapproved files'): self.prepare()
+        self.assert_preserved(); cache.unlink()
+        cache.symlink_to(runtime / 'sls_mass_notify_update.sh')
+        self.args.workspace = self.root / 'link-review'
+        with self.assertRaisesRegex(self.upgrade.UpgradeError, 'Unsafe link'): self.prepare()
+        self.assert_preserved(); cache.unlink()
+        cache.write_bytes(b'unknown code'); cache.chmod(0o666)
+        self.args.workspace = self.root / 'writable-review'
+        with self.assertRaisesRegex(self.upgrade.UpgradeError, 'Unprotected previous'): self.prepare()
+        self.assert_preserved()
+
+    def test_repair_never_overwrites_a_changed_file_or_trusts_tampered_payload(self):
+        target = self.fs / 'usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh'
+        target.unlink(); self.prepare()
+        repair = self.workspace / 'previous-runtime-repairs' / self.trust.digest('/usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh'.encode())
+        original = repair.read_bytes(); repair.write_bytes(b'changed private repair payload')
+        with self.assertRaisesRegex(self.upgrade.UpgradeError, 'changed after preflight'):
+            self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        self.assertFalse(target.exists()); repair.write_bytes(original)
+        target.write_bytes(b'new unapproved destination')
+        with self.assertRaisesRegex(self.upgrade.UpgradeError, 'changed after preflight'):
+            self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        self.assertEqual(target.read_bytes(), b'new unapproved destination'); self.assert_preserved()
+
+    def test_runtime_normalization_precedes_snapshot_and_inventory_only_remains_read_only(self):
+        installer = (ROOT / 'tools/install_release.sh').read_text()
+        preparation = installer.split('prepare_authenticated_installer() {', 1)[1].split('\n# The protected log opener', 1)[0]
+        self.assertLess(preparation.index('SLS_MASS_NOTIFY_INVENTORY_ONLY'), preparation.index('--normalize-runtime'))
+        self.assertLess(preparation.index('--normalize-runtime'), preparation.index('prepare_install_recovery ||'))
+
+    def test_fresh_normalization_leaves_unrelated_runtime_untouched(self):
+        self.workspace.mkdir(mode=0o700)
+        self.upgrade.write_json(self.workspace / 'previous-root-approval.json',
+                                {'schema': 1, 'source': 'fresh-install', 'files': {}, 'root_jobs': []})
+        self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        self.assertEqual(self.upgrade.runtime_inventory(self.fs / 'usr/local/bin/sls_mass_notify'),
+                         {Path(name).name for name in self.upgrade.runtime_files(self.old)})
+
+    def test_failed_repair_write_does_not_publish_a_partial_runtime_helper(self):
+        target = self.fs / 'usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh'
+        target.unlink(); self.prepare()
+        with patch.object(self.upgrade.os, 'fsync', side_effect=OSError('fixture: no space left on device')):
+            with self.assertRaises(OSError):
+                self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        self.assertFalse(target.exists())
+        self.assertEqual(list(target.parent.glob('.previous-runtime-*')), [])
+        self.assert_preserved()
 
     def test_unknown_stock_changes_produce_review_report_without_becoming_approved(self):
         target = self.web / 'admin/modules/dashboard/install.php'; target.write_bytes(b'local reviewed work required')
