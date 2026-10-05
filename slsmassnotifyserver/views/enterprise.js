@@ -27,6 +27,9 @@
   const accept = root.querySelector('#sls-labs-danger-accept'), cancel = root.querySelector('#sls-labs-danger-cancel');
   const acknowledged = new Set(Object.keys(data.safety.receipts).filter(key => data.safety.receipts[key].revision === data.safety_revision));
   const pageFeature = 'enterprise_labs';
+  const dashboard = 'config.php?display=index';
+  const pageAccess = allowed => root.querySelectorAll('[data-labs-panel], .sls-ent-tabs').forEach(panel => { panel.inert = !allowed; });
+  pageAccess(acknowledged.has(pageFeature));
   let dangerRequest;
   function acknowledge() {
     if (acknowledged.has(pageFeature)) return Promise.resolve(true);
@@ -36,7 +39,7 @@
   async function showWarning() {
       const feature = pageFeature;
       const challenge = await post('danger_begin', { feature });
-      if (challenge.acknowledged) { acknowledged.add(feature); return true; }
+      if (challenge.acknowledged) { acknowledged.add(feature); pageAccess(true); return true; }
       root.querySelector('#sls-labs-danger-title').textContent = challenge.title;
       root.querySelector('#sls-labs-danger-body').textContent = challenge.body;
       root.querySelector('#sls-labs-danger-agreement').textContent = challenge.agreement;
@@ -48,9 +51,14 @@
         if (performance.now() >= deadline) { agree.disabled = false; clearInterval(timer); }
       }, 100);
       return await new Promise(resolve => {
-        const cleanup = result => { clearInterval(timer); danger.close(); agree.onchange = null; accept.onclick = null; cancel.onclick = null; danger.oncancel = null; resolve(result); };
+        const cleanup = result => {
+          clearInterval(timer); agree.onchange = null; accept.onclick = null; cancel.onclick = null; danger.oncancel = null; danger.onclose = null;
+          pageAccess(result); danger.close(); resolve(result);
+          if (!result) window.location.replace(dashboard);
+        };
         agree.onchange = () => accept.disabled = !agree.checked || performance.now() < deadline;
         cancel.onclick = () => cleanup(false); danger.oncancel = event => { event.preventDefault(); cleanup(false); };
+        danger.onclose = () => cleanup(false);
         accept.onclick = async () => {
           if (!agree.checked || agree.disabled || performance.now() < deadline) return;
           accept.disabled = true; cancel.disabled = true;
@@ -61,7 +69,7 @@
       });
   }
   window.SlsLabsSafety = { acknowledge };
-  acknowledge().catch(error => feedback(error.message));
+  acknowledge().catch(error => { feedback(error.message); window.location.replace(dashboard); });
   const clusterForm = root.querySelector('#sls-cluster-config');
   const clusterValues = clusterForm ? Object.fromEntries(['enabled', 'mirroring_enabled', 'mode', 'role'].map(name => {
     const control = clusterForm.elements[name]; return [name, control.type === 'checkbox' ? control.checked : control.value];

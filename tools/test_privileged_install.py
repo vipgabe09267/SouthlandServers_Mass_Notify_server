@@ -309,12 +309,77 @@ class PrivilegedInstall(unittest.TestCase):
         self.fs.mkdir(INSTALL.DATA + '/piper/venv',0o755)
         directory = self.fs.path(INSTALL.DATA + '/piper/venv')
         (directory/'approved-link').symlink_to('/unavailable/root/runtime')
-        self.action.prepare()
+        with self.assertRaises(INSTALL.InstallError): self.action.prepare()
         self.assertEqual(directory.stat().st_uid,0)
         self.assertTrue((directory/'approved-link').is_symlink())
+        self.assertFalse(self.fs.path(INSTALL.RUNTIME).exists())
     def test_no_crontab_error_does_not_overwrite_inaccessible_schedule(self):
         def bad(args,**kwargs): return subprocess.CompletedProcess(args,1,b'',b'permission denied')
         self.action.run=bad
         with self.assertRaisesRegex(INSTALL.InstallError,'read root crontab'): self.action.root_cron(apply=True)
+
+    def legacy_alias(self):
+        self.fs.mkdir(INSTALL.DATA + '/piper',0o750,user=True)
+        self.fs.mkdir(INSTALL.DATA + '/piper/venv',0o755,user=True)
+        self.fs.mkdir(INSTALL.DATA + '/piper/venv/bin',0o755,user=True)
+        directory=self.fs.path(INSTALL.DATA + '/piper/venv')
+        (directory/'bin/piper').symlink_to('/usr/local/bin/piper')
+        os.chown(directory/'bin/piper',self.fs.account.pw_uid,self.fs.account.pw_gid,follow_symlinks=False)
+        return directory
+
+    def test_exact_legacy_service_owned_alias_is_recreated_and_recovery_metadata_retained(self):
+        directory=self.legacy_alias(); old_inode=directory.stat().st_ino
+        self.fs.write(INSTALL.DATA+'/receipts.json',b'preserved current receipts',0o640,user=True)
+        self.action.preflight()
+        self.assertEqual(directory.stat().st_uid,self.fs.account.pw_uid)
+        self.action.prepare()
+        self.assertNotEqual(directory.stat().st_ino,old_inode)
+        for path in (directory,directory/'bin'):
+            self.assertEqual((path.stat().st_uid,path.stat().st_gid,stat.S_IMODE(path.stat().st_mode)),(0,0,0o755))
+        self.assertEqual(os.readlink(directory/'bin/piper'),'/usr/local/bin/piper')
+        self.assertEqual((directory/'bin/piper').lstat().st_uid,0)
+        saved=list(self.fs.path('/var/lib/sls-mass-notify-piper-migrations').glob('*.json'))
+        self.assertEqual(len(saved),1)
+        self.assertEqual(json.loads(saved[0].read_bytes())['layout']['venv']['uid'],self.fs.account.pw_uid)
+        self.assertEqual(self.fs.read(INSTALL.DATA+'/receipts.json'),b'preserved current receipts')
+        self.assertEqual(self.fs.read(INSTALL.CONFIG),self.configuration)
+        self.action.prepare(); self.assertEqual(len(list(saved[0].parent.glob('*.json'))),1)
+
+    def test_legacy_alias_with_real_environment_or_wrong_target_is_rejected_before_runtime_copy(self):
+        directory=self.legacy_alias()
+        (directory/'pyvenv.cfg').write_bytes(b'unknown executable environment')
+        with self.assertRaises(INSTALL.InstallError): self.action.prepare()
+        self.assertEqual(directory.stat().st_uid,self.fs.account.pw_uid)
+        self.assertFalse(self.fs.path(INSTALL.RUNTIME).exists())
+        (directory/'pyvenv.cfg').unlink(); (directory/'bin/piper').unlink(); (directory/'bin/piper').symlink_to('/tmp/untrusted-piper')
+        with self.assertRaises(INSTALL.InstallError): self.action.prepare()
+        self.assertEqual(os.readlink(directory/'bin/piper'),'/tmp/untrusted-piper')
+
+    def test_known_wrapper_without_execute_bit_passes_preflight_without_executing_it(self):
+        script=(BIN.parent/'sls_mass_notify_install_piper_voices.sh').read_bytes()
+        import re
+        expected=re.search(rb"expected=\"\$\(cat <<'EOF'\n(.*?)\nEOF\n\)\"",script,re.S).group(1)+b'\n'
+        self.action.contents['bin/sls_mass_notify_install_piper_voices.sh']=script
+        self.fs.write('/usr/local/bin/piper',expected,0o644)
+        self.action.preflight()
+        self.assertEqual(stat.S_IMODE(self.fs.metadata('/usr/local/bin/piper').st_mode),0o644)
+        self.assertEqual(self.services.calls,[])
+        self.fs.write('/usr/local/bin/piper',expected+b'unreviewed command\n',0o644)
+        with self.assertRaises(INSTALL.InstallError): self.action.preflight()
+
+    def test_alias_can_be_restored_after_failed_prepare_and_migrated_on_retry(self):
+        directory=self.legacy_alias()
+        recovery=module('sls_installer_recovery')
+        private=self.base/'recovery';private.mkdir(mode=0o700)
+        command=lambda args,check=True: 'LoadState=not-found\nUnitFileState=not-found\nActiveState=inactive'
+        helper=recovery.Recovery(private/'static',self.fs.prefix,cron=lambda body=None:b'',user_cron=lambda body=None:b'',command=command)
+        helper.snapshot_create()
+        self.action.prepare()
+        helper.restore()
+        self.assertEqual(directory.stat().st_uid,self.fs.account.pw_uid)
+        self.assertEqual((directory/'bin/piper').lstat().st_uid,self.fs.account.pw_uid)
+        self.action.prepare()
+        self.assertEqual(directory.stat().st_uid,0)
+        self.assertEqual(self.fs.read(INSTALL.CONFIG),self.configuration)
 
 if __name__ == '__main__': unittest.main()

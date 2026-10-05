@@ -17,7 +17,7 @@ URL="${SLS_MASS_NOTIFY_TGZ_URL:-${1:-}}"
 SHA256="${SLS_MASS_NOTIFY_SHA256:-}"
 TOKEN="${SLS_MASS_NOTIFY_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
 LOG_FILE="${SLS_MASS_NOTIFY_INSTALL_LOG:-/tmp/slsmassnotifyserver-install.log}"
-EXPECTED_TGZ_SHA256="03a3a99118ce2d1cbe9d8541d66e884e413beb5e5e1fa0b50397d8a86e5944de"
+EXPECTED_TGZ_SHA256="1427801ed3f9427241a8f8db3ce6f67d1dcc4189e4ebc9e5d98bdb3cf03eb693"
 DATA_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin"
 CONFIG_FILE="$DATA_DIR/mass-notifications.config"
 CONFIG_SNAPSHOT=""
@@ -67,6 +67,7 @@ IDLE_TOOL=""
 RECOVERY_TOOL=""
 RECOVERY_DIR=""
 STATIC_MUTATION_STARTED=0
+UPGRADE_TRUST_DIR=""
 
 # PHP/FreePBX code is maintained by the web account. It must never become a
 # root program merely because this installer is root. Privileged operations
@@ -105,9 +106,10 @@ prepare_installer_bootstrap() {
   local module_name
   INSTALL_BOOTSTRAP_DIR="$(mktemp -d /tmp/sls-mass-notify-bootstrap.XXXXXX)" || return 1
   chmod 0700 "$INSTALL_BOOTSTRAP_DIR" || return 1
-  for module_name in sls_module_trust.py sls_release_trust.py sls_privileged_install.py sls_installer_recovery.py sls_install_idle.py sls_install_guard.py sls_audio_state.py sls_config_crypto.py; do
+  for module_name in sls_module_trust.py sls_release_trust.py sls_privileged_install.py sls_installer_recovery.py sls_install_idle.py sls_install_guard.py sls_audio_state.py sls_config_crypto.py sls_upgrade_trust.py; do
     install -o root -g root -m 0700 "$STAGING_DIR/$MODULE/bin/sls_mass_notify/$module_name" "$INSTALL_BOOTSTRAP_DIR/$module_name" || return 1
   done
+  install -o root -g root -m 0600 "$STAGING_DIR/$MODULE/bin/sls_mass_notify/freepbx-mirror-signing.pub" "$INSTALL_BOOTSTRAP_DIR/freepbx-mirror-signing.pub" || return 1
   export SLS_CONFIG_CRYPTO_PHP="$STAGING_DIR/$MODULE/api/sls-mass-notify/config-crypto.php"
   initialize_configuration_keyring || return 1
   WORKER_GUARD_TOOL="$INSTALL_BOOTSTRAP_DIR/sls_install_guard.py"
@@ -122,45 +124,21 @@ prepare_installer_bootstrap() {
 prepare_authenticated_installer() {
   local manifest signature module_name inventory digest
   [ -n "$PRIVILEGED_INSTALL_BOOTSTRAP" ] && [ -f "$PRIVILEGED_INSTALL_BOOTSTRAP" ] || return 1
-  prepare_install_recovery || return 1
   manifest="$DOWNLOAD_DIR/release-manifest.json"
   signature="$DOWNLOAD_DIR/release-manifest.sig"
   [ -f "$manifest" ] && [ ! -L "$manifest" ] && [ -f "$signature" ] && [ ! -L "$signature" ] || {
     log 'The release manifest and Ed25519 signature are required for protected installation, including offline candidates. Supply SLS_MASS_NOTIFY_MANIFEST and SLS_MASS_NOTIFY_MANIFEST_SIGNATURE alongside the archive.'
     return 1
   }
-  /usr/bin/python3 -I - "$TRUST_TOOL" "$TRUST_ROOT" "${SLS_MASS_NOTIFY_DASHBOARD_INVENTORY:-}" "${SLS_MASS_NOTIFY_DASHBOARD_INVENTORY_SHA256:-}" "${SLS_MASS_NOTIFY_FRAMEWORK_INVENTORY:-}" "${SLS_MASS_NOTIFY_FRAMEWORK_INVENTORY_SHA256:-}" >"$INSTALL_BOOTSTRAP_DIR/prior-stock-approvals.json" <<'PYPRIOR' || return 1
-import importlib.util, json, sys
-from pathlib import Path
-sys.dont_write_bytecode = True
-spec = importlib.util.spec_from_file_location('sls_installer_prior_trust', sys.argv[1])
-trust = importlib.util.module_from_spec(spec); spec.loader.exec_module(trust)
-previous = {}
-for module in ('dashboard', 'framework'):
-    pointer = Path(sys.argv[2]) / (module + '.active.json')
-    if pointer.exists() or pointer.is_symlink():
-        data, source = trust.load(Path(sys.argv[2]), module)
-        if data['source']['kind'] != 'reviewed-upstream-and-overlays': raise SystemExit('Invalid prior stock approval provenance')
-        previous[module] = data
-approved = {}
-for index, module in enumerate(('dashboard', 'framework')):
-    path, expected = sys.argv[3 + index * 2:5 + index * 2]
-    if path or expected:
-        if not path or not trust.DIGEST.fullmatch(expected): raise SystemExit('Both reviewed inventory path and SHA-256 are required for ' + module)
-        body = trust.read(Path(path), trust.MAX_MANIFEST, protected=True)
-        if trust.digest(body) != expected: raise SystemExit('Reviewed inventory SHA-256 mismatch: ' + module)
-        data = trust.parse_manifest(body)
-        if data['module'] != module or data['source']['kind'] != 'reviewed-upstream-and-overlays': raise SystemExit('Reviewed inventory identity mismatch')
-        approved[module] = data
-    elif module in previous:
-        approved[module] = previous[module]
-    else:
-        raise SystemExit('An independently reviewed ' + module + ' inventory is required; no installed-file baseline will be created')
-print(json.dumps({'prior': previous, 'approved': approved}))
-PYPRIOR
+  UPGRADE_TRUST_DIR="$(mktemp -d /var/lib/sls-mass-notify-upgrade-review.XXXXXX)" || return 1
+  chmod 0700 "$UPGRADE_TRUST_DIR" || return 1
+  log "Upgrade trust and review evidence: $UPGRADE_TRUST_DIR"
+  /usr/bin/python3 -I "$INSTALL_BOOTSTRAP_DIR/sls_upgrade_trust.py" \
+    --workspace "$UPGRADE_TRUST_DIR" --trust-root "$TRUST_ROOT" \
+    --archive "$TGZ" --manifest "$manifest" --signature "$signature" || return 1
   # This only loads already approved protected inventories. It does not learn
   # expected bytes from the installed Dashboard or Framework tree.
-  /usr/bin/python3 -I - "$TRUST_TOOL" "$TRUST_ROOT" "$STAGING_DIR/$MODULE" "$INSTALL_BOOTSTRAP_DIR/prior-stock-approvals.json" <<'PY' || return 1
+  /usr/bin/python3 -I - "$TRUST_TOOL" "$TRUST_ROOT" "$STAGING_DIR/$MODULE" "$UPGRADE_TRUST_DIR/approvals.json" <<'PY' || return 1
 import importlib.util
 from pathlib import Path
 import sys
@@ -225,18 +203,20 @@ for module in ('dashboard', 'framework'):
         if trust.digest(body) not in allowed:
             raise SystemExit('Stock file differs from independently approved inventory: ' + module + '/' + name)
 PY
+  # Validate legacy state before trust pointers, runtime or maintenance change.
+  /usr/bin/python3 -I "$PRIVILEGED_INSTALL_BOOTSTRAP" --trust-root "$UPGRADE_TRUST_DIR/registry" preflight || return 1
+  if [ "${SLS_MASS_NOTIFY_INVENTORY_ONLY:-0}" = 1 ]; then
+    log "Inventory preflight passed. Review $UPGRADE_TRUST_DIR; no module, trust pointers or maintenance schedules were changed."
+    return 0
+  fi
+  prepare_install_recovery || return 1
   STATIC_MUTATION_STARTED=1
   /usr/bin/python3 -I "$TRUST_TOOL" --root "$TRUST_ROOT" enroll-sls \
     --archive "$TGZ" --manifest "$manifest" --signature "$signature" || return 1
   for module_name in dashboard framework; do
-    case "$module_name" in
-      dashboard) inventory="${SLS_MASS_NOTIFY_DASHBOARD_INVENTORY:-}"; digest="${SLS_MASS_NOTIFY_DASHBOARD_INVENTORY_SHA256:-}" ;;
-      framework) inventory="${SLS_MASS_NOTIFY_FRAMEWORK_INVENTORY:-}"; digest="${SLS_MASS_NOTIFY_FRAMEWORK_INVENTORY_SHA256:-}" ;;
-    esac
-    if [ -n "$inventory" ] || [ -n "$digest" ]; then
-      [ -n "$inventory" ] && [[ "$digest" =~ ^[a-f0-9]{64}$ ]] || { log "Both the independently reviewed $module_name inventory and its SHA-256 are required."; return 1; }
-      /usr/bin/python3 -I "$TRUST_TOOL" --root "$TRUST_ROOT" enroll-reviewed --inventory "$inventory" --sha256 "$digest" || return 1
-    fi
+    inventory="$UPGRADE_TRUST_DIR/$module_name.json"
+    digest="$(sha256sum "$inventory" | cut -d ' ' -f 1)" || return 1
+    /usr/bin/python3 -I "$TRUST_TOOL" --root "$TRUST_ROOT" enroll-reviewed --inventory "$inventory" --sha256 "$digest" || return 1
   done
   protected_install_phase plan
 }
@@ -688,7 +668,7 @@ if (strlen($encoded) > 1048576) { throw new \RuntimeException("Scoped installati
 echo $encoded;
 ' >"$RECOVERY_DIR/module-registration.json" || return 1
   chmod 0600 "$RECOVERY_DIR/module-registration.json" || return 1
-  /usr/bin/python3 -I "$RECOVERY_TOOL" --snapshot "$RECOVERY_DIR/static" snapshot || return 1
+  /usr/bin/python3 -I "$RECOVERY_TOOL" --snapshot "$RECOVERY_DIR/static" --approval "$UPGRADE_TRUST_DIR/previous-root-approval.json" snapshot || return 1
 }
 
 verify_install_idle_history() {
@@ -849,10 +829,18 @@ rollback_module_install() {
       || rollback_failure "the recovered Control API did not pass its read-only route check"
   fi
   verify_install_idle_history || rollback_failure "recovered notification idleness or retained phone history could not be verified"
-  # The recovered release may predate root privilege separation. Automatically
-  # resuming its old root jobs would reintroduce a privileged execution path.
-  # Keep the recovery evidence and report the precise remaining operator step.
-  rollback_failure "static files and registration restoration was attempted; SLS root maintenance remains disabled until the recovered release is independently authenticated and approved for root execution"
+  if [ "$ROLLBACK_FAILED" -eq 0 ]; then
+    /usr/bin/python3 -I "$INSTALL_BOOTSTRAP_DIR/sls_upgrade_trust.py" --workspace "$UPGRADE_TRUST_DIR" --verify-previous >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 \
+      || rollback_failure "the recovered SLS, Dashboard or Framework files differ from their pre-install authenticated approvals"
+  fi
+  if [ "$ROLLBACK_FAILED" -eq 0 ]; then
+    /usr/bin/python3 -I "$RECOVERY_TOOL" --snapshot "$RECOVERY_DIR/static" restore-maintenance >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 \
+      || rollback_failure "previous root maintenance could not be restored against its pre-install authenticated approval; root maintenance remains disabled"
+  fi
+  if [ "$ROLLBACK_FAILED" -eq 0 ]; then
+    log "Rollback completed. The authenticated previous runtime and its maintenance schedule were restored; active/pending settings and delivery history were preserved."
+    return 0
+  fi
   return 1
 }
 
@@ -928,7 +916,7 @@ guard_config_on_exit() {
     log "Recovery locations: module=${MODULE_BACKUP_DIR:-none}; config=${CONFIG_SNAPSHOT:-none}; pending=${PENDING_CONFIG_SNAPSHOT:-none}; stage=${STAGING_DIR:-none}; static=${RECOVERY_DIR:-none}; helper=${INSTALL_BOOTSTRAP_DIR:-none}."
     INSTALL_ERROR_CATEGORY="install_rollback_failed"
     if [ "$ROLLBACK_ATTEMPTED" -eq 1 ]; then
-      INSTALL_SOLUTION="Recovery requires review: SLS root update/maintenance jobs remain disabled pending authenticated activation. Preserve the module, config, static-state and helper locations in the log; resolve any additional restoration failures before retrying."
+      INSTALL_SOLUTION="Recovery requires review: SLS root update/maintenance jobs remain disabled if prior authenticated execution approval or restoration could not be verified. Preserve the module, config, static-state and helper locations in the log; resolve any additional restoration failures before retrying."
     else
       INSTALL_SOLUTION="Protected preflight recovery was incomplete. Preserve the recovery locations printed in the installer log and correct the specified configuration or timezone restoration failure before retrying."
     fi
@@ -4684,6 +4672,7 @@ exit(0);
     /usr/local/bin/sls_mass_notify/sls_module_trust.py
     /usr/local/bin/sls_mass_notify/sls_privileged_install.py
     /usr/local/bin/sls_mass_notify/sls_installer_recovery.py
+    /usr/local/bin/sls_mass_notify/sls_upgrade_trust.py
     /usr/local/bin/sls_mass_notify/sls_install_idle.py
     /usr/local/bin/sls_mass_notify/sls_install_guard.py
     /usr/local/bin/sls_mass_notify/sls_resource_capacity.py
@@ -4992,8 +4981,9 @@ main() {
   INSTALL_ERROR_CATEGORY="install_command_failed"
   validate_staged_central_config
   verify_staged_hardware_requirements
-  set_install_stage "publisher and stock approval" "Supply the signed candidate manifest and independently reviewed Dashboard/Framework inventories. The installer never adopts hashes from installed files."
+  set_install_stage "publisher and stock approval" "Review the upgrade evidence directory printed in the log. Standard stock modules bootstrap from signed upstream packages; local differences require independently reviewed inventories. No maintenance changes occur before approval."
   prepare_authenticated_installer
+  if [ "${SLS_MASS_NOTIFY_INVENTORY_ONLY:-0}" = 1 ]; then return 0; fi
   set_install_stage "timezone validation" "Choose a valid IANA timezone listed by timedatectl or repair the host timezone configuration."
   configure_system_timezone
   set_install_stage "protected runtime preparation" "Correct the specific protected-path or dependency error in the installer log; do not run FreePBX module hooks as root."

@@ -122,32 +122,14 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 			</div>
 		</div>
 		<div class="panel panel-default">
-			<div class="panel-heading"><h4><?php echo _('Detected Phone Endpoints'); ?></h4></div>
+			<div class="panel-heading"><h4><?php echo _('Detected Phones'); ?></h4></div>
 			<div class="panel-body">
 			<?php if (empty($endpointDiagnostics)) { ?>
 				<p class="text-muted"><?php echo _('No registered phone endpoints were detected or AMI endpoint detection is unavailable.'); ?></p>
 			<?php } else { ?>
 				<div class="sls-help-scroll-table">
 					<table class="table table-condensed table-striped sls-help-endpoint-table">
-						<thead><tr><th><?php echo _('Extension'); ?></th><th><?php echo _('Format'); ?></th><th><?php echo _('Contacts'); ?></th><th><?php echo _('User Agent'); ?></th></tr></thead>
-						<tbody>
-							<?php foreach ($endpointDiagnostics as $endpoint) { ?>
-								<tr>
-									<td><?php echo htmlspecialchars($endpoint['extension'] ?? ''); ?></td>
-									<td>
-										<?php $formats = array_values((array)($endpoint['formats'] ?? [$endpoint['format'] ?? 'unknown'])); ?>
-										<?php if (!empty($endpoint['unknown'])) { ?>
-											<span class="label label-warning">&#9733; <?php echo _('Unknown'); ?></span>
-										<?php } else { ?>
-											<span class="label label-info"><?php echo htmlspecialchars(implode(', ', $formats)); ?></span>
-										<?php } ?>
-										<?php if (!empty($endpoint['override'])) { ?><span class="label label-default"><?php echo _('override'); ?></span><?php } ?>
-									</td>
-									<td><?php echo (int)($endpoint['contacts'] ?? 1); ?></td>
-									<td><?php echo htmlspecialchars($endpoint['user_agent'] ?? ''); ?></td>
-								</tr>
-							<?php } ?>
-						</tbody>
+						<?php include __DIR__ . '/detected_phones.php'; ?>
 					</table>
 				</div>
 			<?php } ?>
@@ -386,7 +368,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 
 	<details class="sls-help-section"><summary><?php echo _('SIP NOTIFY and Desktop API'); ?></summary><div class="sls-help-section-body">
 	<p><?php echo _('Desktop stream protocol 2 preserves reconnect cursors, signals history gaps, and rechecks revoked credentials while connected. Updated desktop apps may POST an event_id to /api/sipnotify/desktop/ack using their own credentials to acknowledge a targeted event. Publication, current connection, and acknowledgement are separate states; sleeping desktops are not delivery errors.'); ?></p>
-		<p><?php echo _('Phones receive SIP NOTIFY pushes directly from Asterisk/PJSIP. Audio pages every resolved PJSIP contact through Page/ConfBridge. Mixed phone families receive contact-specific vendor payloads when URI routing is available and one safe generic endpoint payload otherwise; unknown devices also use generic XML. Asterisk submission is not handset acceptance. Desktop clients authenticate with their assigned username and password and can use either the live event stream or the JSON endpoint. Sleeping or disconnected clients are not reported as live.'); ?></p>
+		<p><?php echo _('Phones receive SIP NOTIFY pushes directly from Asterisk/PJSIP. Audio pages every resolved PJSIP contact through Page/ConfBridge. Each registered phone is listed separately. Mixed phone families receive their own vendor payloads when Asterisk contact routing is available; an unknown device does not change another phone’s detected format. If individual routing is unavailable, Asterisk receives one generic endpoint payload. Asterisk submission is not handset acceptance. Desktop clients authenticate with their assigned username and password and can use either the live event stream or the JSON endpoint. Sleeping or disconnected clients are not reported as live.'); ?></p>
 	<ul>
 		<li><code>/api/sipnotify/desktop</code> <?php echo _('returns JSON for the SLS Mass Notify desktop app. Use HTTP Basic authentication with the desktop client username and password configured in General Settings.'); ?></li>
 		<li><code>/api/sipnotify/desktop/stream</code> <?php echo _('returns a live server-sent-event stream using the same Basic authentication and per-client target filtering. The authenticated handshake is flushed through Apache immediately; clients should reconnect after the server reconnect event and may send Last-Event-ID when resuming. Expired authorized records advance the cursor without being emitted so the next valid notification is not skipped.'); ?></li>

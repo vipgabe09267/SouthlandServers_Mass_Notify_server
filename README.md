@@ -6,6 +6,8 @@
 
 Phone, desktop, weather, lightning, and scheduled notifications for FreePBX 17 / Debian 12. AGPL-3.0-or-later. Version `0.1.5-beta`.
 
+The 0.1.5-beta prerelease includes the repaired older-release upgrade path, faster Enterprise Labs account lookup and dashboard redirection when its warning is cancelled. Existing 0.1.5-beta installations must rerun the current signed installer to receive this same-version repair. See [authenticated installation and recovery](INSTALL.md#authenticated-installation-and-recovery).
+
 ## Enterprise Labs
 
 Optional enterprise tools are disabled by default and configured in **Enterprise Labs** inside the FreePBX administrator panel. The operator portal receives only assigned operational actions. Existing phone, desktop, SMS, email and webhook delivery continues through the existing SLS queues.

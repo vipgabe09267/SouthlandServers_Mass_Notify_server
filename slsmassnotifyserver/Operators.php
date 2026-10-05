@@ -94,6 +94,9 @@ trait SlsOperators
         try {
             foreach ($this->FreePBX->Userman->getAllUsers() as $row) {
                 if (count($candidates) >= 500) { $errors[] = 'The directory preview is limited to 500 accounts.'; break; }
+                if (!$this->FreePBX->Userman->getCombinedGlobalSettingByID($row['id'], 'pbx_login')) {
+                    continue;
+                }
                 $candidates[] = ['username'=>$row['username'], 'source'=>'usermanager'];
             }
         } catch (\Throwable $error) { $errors[] = 'User Management is unavailable. Local PBX accounts remain usable.'; }

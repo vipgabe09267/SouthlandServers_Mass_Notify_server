@@ -4,6 +4,7 @@ namespace SLS\MassNotify;
 /** Reported client compatibility is advisory, never an authentication decision. */
 final class DesktopFleet
 {
+    public const DEFAULT_MINIMUM = '1.0.10-beta';
     public static function validMinimum($value): bool
     {
         return is_string($value) && ($value === '' || (strlen($value) <= 40

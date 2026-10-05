@@ -4,6 +4,14 @@ The installer enrolls the verified release and explicitly reviewed stock-module
 inventories **before activating the signer**. Missing or mismatched trust refuses signing and preserves the existing
 signature. The working web tree and prior local signatures cannot enroll trust.
 
+## Installer bootstrap for older releases
+
+The installer prepares approvals in a retained root-private workspace before changing runtime, trust pointers or maintenance. Missing stock inventories are derived from exact-version FreePBX packages authenticated by the bundled public key and pinned full fingerprint. Previous SLS files and overlays must match a publisher-verified release. Framework mapping, installer-only omissions, the supported menu insertion and spinner alias are explicit; unknown live differences produce a review report without enrolling trust. Existing independently reviewed inventories preserve local branding and security fixes.
+
+Use `SLS_MASS_NOTIFY_INVENTORY_ONLY=1` for preparation without activation. Offline package paths and previous-release inputs are described in [Installation](../INSTALL.md#authenticated-installation-and-recovery). Reviewed overrides use `SLS_MASS_NOTIFY_DASHBOARD_INVENTORY` / `SLS_MASS_NOTIFY_FRAMEWORK_INVENTORY` plus each matching `_SHA256` variable. Store inventories beneath root-owned, non-writable parents and independently verify their provenance and contents. Never generate an approval merely by hashing the current web tree.
+
+Recovery captures the approved previous root runtime and canonical maintenance entries before mutation. Static restoration initially disables SLS root jobs. Only verified recovered module/Framework/Dashboard bytes and runtime permit reinstating the approved previous jobs. Failed postconditions retain recovery locations and leave maintenance disabled. Configuration and delivery history are not rewound.
+
 ## Publisher generation
 
 Install `bin/sls_mass_notify/sls_module_trust.py` as root-owned, non-writable code.
@@ -112,7 +120,7 @@ inventory and cannot fall back to a legacy signer that trusts the current tree.
 
 ## Privileged installation phases
 
-`sls_privileged_install.py` accepts fixed phases: `plan`, `prepare`, `admit`,
+`sls_privileged_install.py` accepts fixed phases: `plan`, `preflight`, `prepare`, `admit`,
 `dependencies`, `activate`, and `verify`. Mutating phases require `--apply`.
 There is no caller-supplied filesystem root, command, PHP payload or service name.
 Before mutation the helper verifies the protected publisher generation's exact

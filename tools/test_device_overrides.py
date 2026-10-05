@@ -37,6 +37,30 @@ class DeviceTests(unittest.TestCase):
         values = notify.endpoint_format_overrides(config)
         self.assertEqual(values, {'1000':'poly','device:'+'a'*32:'yealink_text'})
 
+    def test_many_brands_on_one_extension_keep_individual_formats(self):
+        agents = ['Yealink SIP-T48G', 'Polycom VVX', 'Cisco CP-8841', 'Grandstream GXP2170',
+                  'Fanvil X6', 'Snom D785', 'Mitel 6867', 'Unrecognized softphone']
+        formats = ['yealink', 'poly', 'cisco', 'grandstream', 'fanvil', 'snom', 'aastra', 'unknown']
+        events = [{'Event':'ContactList', 'Endpoint':'1000', 'Status':'Reachable',
+                   'UserAgent':agent, 'Uri':f'sip:1000@192.0.2.{index+1};transport=tls'}
+                  for index, agent in enumerate(agents)]
+        class Ami:
+            def action(self, *args): return {'Response':'Success'}, list(reversed(events))
+        inventory = notify.get_registered_endpoint_info(Ami())
+        self.assertEqual({row['contact']:row['format'] for row in inventory['1000']['contacts']},
+                         {row['Uri']:fmt for row, fmt in zip(events, formats)})
+        devices = notify.endpoint_format_summary(inventory)['1000']['devices']
+        self.assertEqual(len(devices), 8)
+        self.assertEqual(sum(row['format'] == 'unknown' for row in devices), 1)
+        self.assertEqual(len({row['key'] for row in devices}), 8)
+
+    def test_cli_order_cannot_assign_another_registered_phones_uri(self):
+        event = {'Event':'ContactList','Endpoint':'1000','UserAgent':'Yealink T48G'}
+        uris = ['sip:1000@192.0.2.1;transport=tls', 'sip:1000@192.0.2.2;transport=tcp']
+        for index in [0,1]:
+            self.assertEqual(notify.contact_uri_for_event(event, '1000', {'1000':uris}, index), '')
+        self.assertEqual(notify.contact_uri_for_event(event, '1000', {'1000':uris[:1]}), uris[0])
+
     def test_transport_labels_are_not_invented(self):
         for uri, transport in [('sip:1000@192.0.2.1','udp'), ('sips:1000@192.0.2.1','tls'),
                                ('sip:1000@192.0.2.1;transport=tcp','tcp'), ('','unresolved'),

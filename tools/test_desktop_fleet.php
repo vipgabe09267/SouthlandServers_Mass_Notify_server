@@ -13,6 +13,11 @@ foreach ([''=>'no_minimum', '1.2.2'=>'meets_minimum', '1.2.3'=>'meets_minimum', 
 }
 $changed=$seen; $changed['client_report']['version']='1.2.3-beta.2';
 fleetCheck(DesktopFleet::readiness($client,$changed,'1.2.3',$now)['compatibility']==='upgrade_required','Prerelease accepted as stable');
+$changed=$seen; $changed['client_report']['version']='1.0.10-beta';
+fleetCheck(DesktopFleet::readiness($client,$changed,DesktopFleet::DEFAULT_MINIMUM,$now)['compatibility']==='meets_minimum','Current published beta fails default version policy');
+$changed['client_report']['version']='1.0.9-beta';
+fleetCheck(DesktopFleet::readiness($client,$changed,DesktopFleet::DEFAULT_MINIMUM,$now)['compatibility']==='upgrade_required','Older beta meets current minimum');
+fleetCheck(DesktopFleet::readiness($client,$changed,'1.10.0',$now)['compatibility']==='upgrade_required','Explicit administrator minimum was weakened');
 $changed=$seen; $changed['client_report']['sse_protocol']=3;
 fleetCheck(DesktopFleet::readiness($client,$changed,'',$now)['compatibility']==='unsupported_protocol','Unknown protocol shown as supported');
 $changed=$seen; $changed['client_report']['reported_at']=gmdate('c',$now-86401);

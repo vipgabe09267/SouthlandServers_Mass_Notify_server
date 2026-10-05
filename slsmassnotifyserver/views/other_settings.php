@@ -550,7 +550,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 				<input type="hidden" name="desktop_clients_present" value="1">
 				<div class="form-group" style="max-width:420px">
 					<label for="sls-desktop-minimum-version"><?php echo _('Minimum desktop app version'); ?></label>
-					<input class="form-control" id="sls-desktop-minimum-version" name="desktop_minimum_version" type="text" maxlength="40" placeholder="1.10.0" value="<?php echo htmlspecialchars($settings['desktop_minimum_version'] ?? '', ENT_QUOTES, 'UTF-8'); ?>">
+					<input class="form-control" id="sls-desktop-minimum-version" name="desktop_minimum_version" type="text" maxlength="40" placeholder="1.0.10-beta" value="<?php echo htmlspecialchars($settings['desktop_minimum_version'] ?? '', ENT_QUOTES, 'UTF-8'); ?>">
 					<p class="help-block"><?php echo _('Optional. Help & Diagnostics flags reporting apps below this version. This advisory policy does not block delivery. Older apps that do not report their version remain marked Not reported.'); ?></p>
 				</div>
 				<input type="hidden" name="desktop_clients_json" id="sls-desktop-clients-json" value="">

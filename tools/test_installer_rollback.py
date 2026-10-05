@@ -78,7 +78,7 @@ class RollbackTests(unittest.TestCase):
             for directory in ('stage', 'download', 'recovery', 'bootstrap'):
                 (fixture / directory).mkdir()
             (fixture/'recovery/module-registration.json').write_text('{"schema":1,"row":null}')
-            (fixture/'recover.py').write_text('import pathlib,sys\np=pathlib.Path(sys.argv[2]).parent.parent\nwith (p/"commands.log").open("a") as f: f.write("static-"+sys.argv[3]+"\\n")\n')
+            (fixture/'recover.py').write_text('import pathlib,sys\np=pathlib.Path(sys.argv[2]).parent.parent\nwith (p/"commands.log").open("a") as f: f.write("static-"+sys.argv[3]+"\\n")\nif sys.argv[3]=="restore-maintenance":sys.exit(1)\n')
             (fixture/'config').write_text('changed by failed install')
             snapshot = fixture/'config.snapshot'
             snapshot.write_text('original protected config')
@@ -105,7 +105,7 @@ class RollbackTests(unittest.TestCase):
                 self.assertEqual((installed/'payload').read_text(),'original release')
             if scenario not in ('move-failure','pre-activation'):
                 self.assertEqual((backup/'failed-module/payload').read_text(),'failed new release')
-            self.assertIn('root maintenance remains disabled',(fixture/'messages.log').read_text())
+            self.assertIn('Recovery locations:',(fixture/'messages.log').read_text())
 
     def test_static_recovery_never_runs_old_module_hooks(self):
         for scenario in ('normal','fresh','pre-activation','config-failure','registration-failure','move-failure'):

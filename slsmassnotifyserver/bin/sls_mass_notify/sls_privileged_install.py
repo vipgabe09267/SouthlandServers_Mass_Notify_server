@@ -8,6 +8,8 @@ timezone, never commands, paths, service names or executable contents. No operat
 from __future__ import annotations
 
 import argparse
+import ctypes
+import hashlib
 import importlib.util
 import json
 import os
@@ -279,6 +281,119 @@ class Files:
         finally:
             os.close(parent)
 
+    def piper_compatibility(self, *, apply=False):
+        """Inspect only the three-entry compatibility alias; never adopt a venv.
+
+        A service-owned legacy alias is replaced with a newly constructed tree.
+        Original metadata is retained in root-private migration storage. The
+        real executable environment remains subject to separate strict checks.
+        """
+        try:
+            parent = self.directory(DATA + '/piper')
+        except FileNotFoundError:
+            return
+        handles = []
+        stage = None
+        try:
+            parent_info = os.fstat(parent)
+            if parent_info.st_uid not in (0, self.account.pw_uid) or parent_info.st_mode & 0o022:
+                raise InstallError('unsafe Piper state parent; preserve it and correct its ownership/permissions')
+            try:
+                before = os.stat('venv', dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            record = {}
+            directories = []
+            def inspect(fd, name, relative):
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, self.account.pw_uid)
+                        or info.st_gid not in (0, self.account.pw_gid) or info.st_mode & 0o7022
+                        or info.st_dev != parent_info.st_dev):
+                    raise InstallError('Piper compatibility path is not the supported wrapper-only layout: ' + relative)
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+                handles.append(child)
+                opened = os.fstat(child)
+                if (info.st_dev, info.st_ino, info.st_ctime_ns) != (opened.st_dev, opened.st_ino, opened.st_ctime_ns):
+                    raise InstallError('Piper compatibility directory changed during inspection')
+                directories.append((fd, name, child, info))
+                record[relative] = {'uid': info.st_uid, 'gid': info.st_gid, 'mode': stat.S_IMODE(info.st_mode)}
+                return child
+            venv = inspect(parent, 'venv', 'venv')
+            if set(os.listdir(venv)) != {'bin'}:
+                raise InstallError('Piper compatibility venv must contain only bin/piper -> /usr/local/bin/piper; unknown contents were preserved')
+            binary = inspect(venv, 'bin', 'venv/bin')
+            if set(os.listdir(binary)) != {'piper'}:
+                raise InstallError('Piper compatibility bin must contain only the known piper symlink; unknown contents were preserved')
+            link = os.stat('piper', dir_fd=binary, follow_symlinks=False)
+            if (not stat.S_ISLNK(link.st_mode) or link.st_nlink != 1 or link.st_dev != parent_info.st_dev
+                    or link.st_uid not in (0, self.account.pw_uid) or link.st_gid not in (0, self.account.pw_gid)
+                    or os.readlink('piper', dir_fd=binary) != '/usr/local/bin/piper'):
+                raise InstallError('Piper compatibility link target is unrecognized; it was not followed or changed')
+            record['venv/bin/piper'] = {'uid': link.st_uid, 'gid': link.st_gid, 'target': '/usr/local/bin/piper'}
+            if not apply or all(info.st_uid == info.st_gid == 0 and stat.S_IMODE(info.st_mode) == 0o755 for _, _, _, info in directories) and link.st_uid == link.st_gid == 0:
+                return
+            self.mkdir('/var/lib/sls-mass-notify-piper-migrations', 0o700)
+            body = (json.dumps({'schema': 1, 'layout': record}, sort_keys=True) + '\n').encode()
+            self.write('/var/lib/sls-mass-notify-piper-migrations/' + hashlib.sha256(body).hexdigest() + '.json', body, 0o600, preserve=True)
+            stage = '.sls-compat-' + os.urandom(12).hex()
+            os.mkdir(stage, 0o700, dir_fd=parent)
+            staging = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+            try:
+                os.mkdir('bin', 0o755, dir_fd=staging)
+                newbin = os.open('bin', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=staging)
+                try:
+                    os.symlink('/usr/local/bin/piper', 'piper', dir_fd=newbin)
+                    os.fchmod(newbin, 0o755)
+                    os.fsync(newbin)
+                finally:
+                    os.close(newbin)
+                os.fchmod(staging, 0o755)
+                os.fsync(staging)
+                for fd, name, child, info in directories:
+                    current = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    if (info.st_dev, info.st_ino, info.st_ctime_ns) != (current.st_dev, current.st_ino, current.st_ctime_ns):
+                        raise InstallError('Piper compatibility layout changed before migration')
+                current = os.stat('piper', dir_fd=binary, follow_symlinks=False)
+                if (link.st_dev, link.st_ino, link.st_ctime_ns) != (current.st_dev, current.st_ino, current.st_ctime_ns) or os.readlink('piper', dir_fd=binary) != '/usr/local/bin/piper':
+                    raise InstallError('Piper compatibility link changed before migration')
+                libc = ctypes.CDLL(None, use_errno=True)
+                rename = libc.renameat2
+                rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+                rename.restype = ctypes.c_int
+                if rename(parent, b'venv', parent, stage.encode(), 2):
+                    raise OSError(ctypes.get_errno(), 'Piper compatibility exchange failed')
+                moved = os.stat(stage, dir_fd=parent, follow_symlinks=False)
+                if (moved.st_dev, moved.st_ino) != (before.st_dev, before.st_ino):
+                    raise InstallError('Piper compatibility path changed during migration; retain the installer recovery snapshot')
+                # Remove only validated names through the already held descriptors.
+                os.unlink('piper', dir_fd=binary)
+                os.rmdir('bin', dir_fd=venv)
+                os.rmdir(stage, dir_fd=parent)
+                stage = None
+                os.fsync(parent)
+            finally:
+                os.close(staging)
+        finally:
+            if stage is not None:
+                # A failed exchange may leave a bounded alias behind. Remove
+                # only the known three-entry layout, without following links.
+                cleanup = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+                try:
+                    if set(os.listdir(cleanup)) == {'bin'}:
+                        cleanup_bin = os.open('bin', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=cleanup)
+                        try:
+                            if (set(os.listdir(cleanup_bin)) == {'piper'}
+                                    and stat.S_ISLNK(os.stat('piper', dir_fd=cleanup_bin, follow_symlinks=False).st_mode)
+                                    and os.readlink('piper', dir_fd=cleanup_bin) == '/usr/local/bin/piper'):
+                                os.unlink('piper', dir_fd=cleanup_bin)
+                        finally: os.close(cleanup_bin)
+                        os.rmdir('bin', dir_fd=cleanup)
+                    if not os.listdir(cleanup): os.rmdir(stage, dir_fd=parent)
+                finally: os.close(cleanup)
+            for descriptor in reversed(handles):
+                os.close(descriptor)
+            os.close(parent)
+
     def secure_tree(self, path, *, public=False):
         """Repair only ordinary SLS state; never traverse dependency links."""
         root = self.directory(path)
@@ -529,7 +644,8 @@ class PrivilegedInstall:
 
     def prepare(self):
         # Source authentication completes in __init__ before any mutation.
-        self.retention()
+        self.preflight()
+        self.files.piper_compatibility(apply=True)
         for path in (DATA, DATA + '/sipnotify', DATA + '/config-backups', DATA + '/piper'):
             self.files.mkdir(path, 0o750, user=True)
         self.files.mkdir(DATA + '/event-log-recovery', 0o700, user=True)
@@ -559,6 +675,27 @@ class PrivilegedInstall:
         self.files.write(APACHE_PATH, APACHE.encode(), 0o644, managed_prefix=b'# Southland Servers Mass Notifications Server\n')
         self.files.write(LOGROTATE_PATH, self.rotation(), 0o644, managed_prefix=b'/var/log/sls_mass_notify.log {\n')
         self.admit()
+
+    def preflight(self):
+        self.retention()
+        self.files.piper_compatibility()
+        try: wrapper = self.files.metadata('/usr/local/bin/piper')
+        except FileNotFoundError: wrapper = None
+        if wrapper is not None:
+            if stat.S_ISLNK(wrapper.st_mode) and wrapper.st_uid == 0 and wrapper.st_nlink == 1:
+                parent = self.files.directory('/usr/local/bin')
+                try: target = os.readlink('piper', dir_fd=parent)
+                finally: os.close(parent)
+                if target not in (RUNTIME + '/piper/venv/bin/piper', DATA + '/piper/venv/bin/piper'):
+                    raise InstallError('Piper wrapper link is unrecognized; it was not followed or changed')
+                return True
+            if (not self.files.regular(wrapper) or wrapper.st_uid != 0 or wrapper.st_mode & 0o022):
+                raise InstallError('Piper wrapper must be a root-owned regular SLS wrapper; no existing executable was followed')
+            script = self.contents['bin/sls_mass_notify_install_piper_voices.sh']
+            match = re.search(rb"expected=\"\$\(cat <<'EOF'\n(.*?)\nEOF\n\)\"", script, re.S)
+            if match is None or self.files.read('/usr/local/bin/piper', 16384) != match.group(1) + b'\n':
+                raise InstallError('Piper wrapper differs from its authenticated SLS implementation; preserve it and review before upgrading')
+        return True
 
     def admit(self):
         """Verify only root-executable package files, without executing any."""
@@ -626,7 +763,7 @@ class PrivilegedInstall:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--trust-root', type=Path, default=Path('/var/lib/sls-mass-notify-trust'))
-    parser.add_argument('phase', choices=('plan', 'prepare', 'admit', 'dependencies', 'activate', 'verify', 'timezone'))
+    parser.add_argument('phase', choices=('plan', 'preflight', 'prepare', 'admit', 'dependencies', 'activate', 'verify', 'timezone'))
     parser.add_argument('--apply', action='store_true', help='required for prepare/dependencies/activate')
     args = parser.parse_args()
     if os.geteuid() != 0: raise InstallError('protected installation operations require root')

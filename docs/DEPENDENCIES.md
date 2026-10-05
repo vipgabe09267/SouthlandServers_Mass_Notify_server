@@ -49,3 +49,5 @@ requires Python 3.12 and has no CPython 3.11 wheel, so compatible NumPy 2.4.6 is
 retained. This update does not change the PBX Python version or saved voice choice.
 
 The replacement workflow also passed a network-isolated offline-wheel test: canonical Python prefix and the generated Piper console entry point survived the real directory exchange, speech generation produced a valid mono 16 kHz WAV, and an invalid package lock preserved the previously validated environment. Fault fixtures cover failed builds, activation rollback, unsupported exchange, concurrent repair and partial cleanup. These tests do not simulate a PBX power failure.
+
+The installer bundles the FreePBX mirror verification public key from [FreePBX Framework](https://github.com/FreePBX/framework/blob/release/17.0/amp_conf/htdocs/admin/libraries/BMO/B53D215A755231A3.key). Its SHA-256 is `41f5c332ca0e667db72ac4c4500f3d5ad9f010f43f51a19bf07b01c9741ebd7a`; the accepted full fingerprint is `456D051E9204C27C37D4811BB53D215A755231A3`. This public key authenticates official stock upgrade packages and is separate from both SLS publisher signing and PBX-local module signing.

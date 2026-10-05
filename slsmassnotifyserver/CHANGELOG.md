@@ -4,6 +4,13 @@
 
 New enterprise features start disabled. Existing production settings and notification/API contracts are preserved.
 
+- Show every registered phone separately in Help, retaining known vendors when another registration is unknown. Preserve each contact's XML format and transport; refuse to associate unresolved mixed contacts by list position.
+- Correct the default desktop minimum to the published `1.0.10-beta` numbering. Keep custom minimum policies and protocol checks intact.
+- Bootstrap missing Framework and Dashboard trust inventories from GPG-verified upstream packages at the installed versions and publisher-verified previous/candidate SLS overlays. Preserve reviewed local changes; report unknown differences before changing maintenance or protected runtime.
+- Migrate the exact legacy Piper compatibility alias into a root-owned tree, retain original ownership/mode evidence, and repair the authenticated wrapper's execute permission. Reject additional files and unexpected links.
+- Approve the previous release before installation and restore its verified maintenance schedule after complete rollback. Preserve active/pending settings and delivery history; retain recovery evidence for failures and retries.
+- Filter User Management accounts by effective PBX login permission before constructing administrator records. Preserve downstream authorization checks and the 500-account preview limit.
+- Redirect Enterprise Labs Cancel and Escape to the FreePBX dashboard and keep page controls inactive until the required acknowledgment is saved.
 - Add `slsconsole start`, `stop`, `reboot`, `status` and help. Persist admission state in encrypted configuration; preserve staged edits, feature switches, existing calls and receipt tracking. Restart only the SLS collector; failed restarts leave notifications paused.
 - Prevent isolated phone-health commands from creating root-only Python caches that incorrectly fail storage readiness checks.
 - Treat one-way webhook response uncertainty as a neutral receipt, preserve HTTP status and failure codes, and clear historical dashboard warnings through read-only projections. Keep explicit transport/HTTP failures visible and suppress automatic replay.

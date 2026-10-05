@@ -45,7 +45,8 @@ stage_module_directory() {
  STAGING_DIR="$fixture/stage"; mkdir -m700 "$STAGING_DIR"; mkdir "$STAGING_DIR/$MODULE"
  printf candidate >"$STAGING_DIR/$MODULE/module.xml"
  mkdir -p "$STAGING_DIR/$MODULE/bin/sls_mass_notify"
- cp "$FIXTURE_HELPERS"/sls_{module_trust,release_trust,privileged_install,installer_recovery,install_idle,install_guard,audio_state,config_crypto}.py "$STAGING_DIR/$MODULE/bin/sls_mass_notify/"
+ cp "$FIXTURE_HELPERS"/sls_{module_trust,release_trust,privileged_install,installer_recovery,install_idle,install_guard,audio_state,config_crypto,upgrade_trust}.py "$STAGING_DIR/$MODULE/bin/sls_mass_notify/"
+ cp "$FIXTURE_HELPERS/freepbx-mirror-signing.pub" "$STAGING_DIR/$MODULE/bin/sls_mass_notify/"
  HAD_EXISTING_MODULE=1; MODULE_WAS_ENABLED=1
 }
 prepare_authenticated_installer() {
@@ -95,7 +96,7 @@ class TransactionTests(unittest.TestCase):
    (data/'delivery-ledger').write_text('current receipt')
    pending=data/'mass-notifications.pending.config';pending.write_text('{"staged":"preserve exact bytes"}\n')
    installer=root/'installer.sh';installer.write_text(SOURCE.replace('/var/www/html/admin/modules',str(root/'modules')))
-   (root/'recovery.py').write_text('import pathlib,sys\np=pathlib.Path(__file__).parent\nwith (p/"trace").open("a") as f:f.write("static-"+sys.argv[-1]+"\\n")\n')
+   (root/'recovery.py').write_text('import pathlib,sys\np=pathlib.Path(__file__).parent\nwith (p/"trace").open("a") as f:f.write("static-"+sys.argv[-1]+"\\n")\nif sys.argv[-1]=="restore-maintenance":sys.exit(1)\n')
    (root/'idle.py').write_text('import json\nprint(json.dumps({"ok":True}))\n')
    result=subprocess.run(['bash','-c',HARNESS,'fixture',str(installer),str(root),scenario],capture_output=True,text=True,timeout=20,env={**os.environ,'FIXTURE_HELPERS':str(ROOT/'slsmassnotifyserver/bin/sls_mass_notify')})
    self.assertEqual(result.returncode,expected,result.stdout+result.stderr)

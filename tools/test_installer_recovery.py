@@ -233,4 +233,54 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.helper.dest(r.TRUST+'/slsmassnotifyserver.active.json').read_bytes(),b'{"generation":"prior"}')
         self.assertTrue(self.helper.dest(r.TRUST+'/generations/new/inventory.json').exists())
 
+    def approved_snapshot(self):
+        import hashlib
+        code=b'authenticated prior maintenance fixture\n'
+        self.file(r.RUNTIME+'/sls_mass_notify_maintenance.sh',code,0o755)
+        job='* * * * * /usr/bin/timeout 900 '+r.RUNTIME+'/sls_mass_notify_maintenance.sh'
+        self.cron=b'12 1 * * * /usr/bin/true\n'+job.encode()+b'\n'
+        self.approval=self.private/'prior-approval.json'
+        self.approval.write_text(json.dumps({'schema':1,'source':'publisher-verified-previous-release','version':'0.1.4-beta',
+            'archive_sha256':'a'*64,'files':{r.RUNTIME+'/sls_mass_notify_maintenance.sh':hashlib.sha256(code).hexdigest()},'root_jobs':[job]}))
+        self.approval.chmod(0o600);self.helper.approval=self.approval
+        self.snapshot()
+        return code,job
+
+    def test_approved_previous_maintenance_restored_after_full_rollback_and_retry(self):
+        code,job=self.approved_snapshot()
+        self.file(r.RUNTIME+'/sls_mass_notify_maintenance.sh',b'candidate',0o755)
+        self.cron+=b'13 2 * * * /usr/bin/true\n'
+        self.helper.restore()
+        self.assertNotIn(job.encode(),self.cron)
+        self.assertTrue(self.helper.restore_maintenance()['previous_maintenance_restored'])
+        self.assertIn(job.encode(),self.cron);self.assertIn(b'13 2',self.cron)
+        self.assertTrue(self.helper.verify()['snapshot_verified'])
+        self.assertTrue(self.helper.restore_maintenance()['previous_maintenance_restored'])
+        self.assertEqual(self.cron.count(job.encode()),1)
+        self.helper.restore()
+        self.assertNotIn(job.encode(),self.cron)
+        self.assertTrue(self.helper.restore_maintenance()['previous_maintenance_restored'])
+        self.assertEqual(self.cron.count(job.encode()),1)
+
+    def test_missing_or_changed_prior_execution_approval_does_not_revive_jobs(self):
+        self.snapshot();self.helper.restore()
+        with self.assertRaises(r.RecoveryError):self.helper.restore_maintenance()
+        self.assertNotIn(b'sls_mass_notify',self.cron)
+
+    def test_prior_runtime_changed_after_restore_blocks_maintenance_before_cron_write(self):
+        _,job=self.approved_snapshot();self.helper.restore()
+        self.file(r.RUNTIME+'/sls_mass_notify_maintenance.sh',b'unapproved current code',0o755)
+        with self.assertRaises(r.RecoveryError):self.helper.restore_maintenance()
+        self.assertNotIn(job.encode(),self.cron)
+
+    def test_prior_cron_changed_between_approval_and_snapshot_is_rejected(self):
+        import hashlib
+        code=b'reviewed prior fixture';path=r.RUNTIME+'/sls_mass_notify_maintenance.sh'
+        self.file(path,code,0o755)
+        approval=self.private/'approval.json';approval.write_text(json.dumps({'schema':1,'source':'publisher-verified-previous-release',
+            'version':'0.1.4-beta','archive_sha256':'a'*64,'files':{path:hashlib.sha256(code).hexdigest()},'root_jobs':[]}));approval.chmod(0o600)
+        self.helper.approval=approval
+        with self.assertRaises(r.RecoveryError):self.snapshot()
+        self.assertFalse((self.private/'static').exists())
+
 if __name__=='__main__': unittest.main()

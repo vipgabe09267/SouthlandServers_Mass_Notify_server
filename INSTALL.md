@@ -238,9 +238,23 @@ chmod +x sls-uninstall.sh
 
 ## Authenticated installation and recovery
 
-The installer requires an independently verified SLS release generation and approved Framework/Dashboard inventories before privileged activation. Review [the trust inventory procedure](docs/privileged-trust.md) when preparing an existing PBX or accepting an upstream module update. Inventories preserve reviewed local branding and security fixes; the installer must not replace those changes with stock vendor files or learn trust from unreviewed live files. These inventories are protected installation metadata, separate from the portable `.config`.
+The installer verifies the candidate SLS release and approves the previous release before changing protected runtime or maintenance. Existing reviewed Framework/Dashboard inventories remain authoritative. If they are missing, the installer downloads GPG-signed upstream packages at the exact installed versions, verifies the pinned FreePBX signing key, and compares deployed files with upstream bytes plus signed previous/candidate SLS widgets and the supported menu insertion. It accounts for Framework web-file mappings, installer-only omissions and the supported spinner symlink. It neither replaces stock files nor approves arbitrary live hashes.
 
-Keep all recovery paths printed by a failed installer. Static recovery preserves the original snapshot and does not rewind notification or schedule execution history. If old SLS root jobs cannot be authenticated, they remain disabled and the installer reports incomplete automatic recovery until authenticated activation succeeds. A restored file tree alone is not sufficient proof of a complete repair.
+Unknown differences stop preparation before mutation. The installer prints a retained root-private review directory containing `review-required.json`; independently review each reported change before supplying an approved inventory and its digest. Existing local branding and security changes must be preserved. See [the trust inventory procedure](docs/privileged-trust.md).
+
+Run only the inventory preparation stage with the matching installer and verified release assets:
+
+```bash
+SLS_MASS_NOTIFY_INVENTORY_ONLY=1 bash ./sls-install.sh
+```
+
+For disconnected preparation, set `SLS_MASS_NOTIFY_UPSTREAM_PACKAGES` to a root-owned directory containing `dashboard-<installed-version>.tgz.gpg` and `framework-<installed-version>.tgz.gpg`. If no protected previous-release generation exists, supply all three root-protected paths: `SLS_MASS_NOTIFY_PREVIOUS_TGZ`, `SLS_MASS_NOTIFY_PREVIOUS_MANIFEST` and `SLS_MASS_NOTIFY_PREVIOUS_MANIFEST_SIGNATURE`. Otherwise the installer obtains the previous signed assets from the official release. These sources are authenticated before use; a previous local module signature does not establish trust.
+
+The supported legacy Piper compatibility layout contains only `venv/bin/piper -> /usr/local/bin/piper`. The installer validates its exact contents and safe ownership/modes, retains recovery metadata, then recreates root-owned compatibility directories. A known authenticated wrapper missing its execute bit is repaired by dependency preparation. Unknown executables, additional files, unsafe links and writable environments require investigation; do not recursively change ownership to bypass validation.
+
+The repaired 0.1.5-beta prerelease replaces the original assets under the same tag. Already installed 0.1.5-beta systems need a manual run of the current signed installer; automatic updates intentionally ignore equal versions.
+
+Keep all recovery paths printed by a failed installer. Static recovery preserves the original snapshot and does not rewind notification or schedule execution history. Rollback restores the previous maintenance schedule only after its release, recovered web files and root runtime match the approval made before installation. If any recovery check fails, SLS root jobs remain disabled and the installer reports the failed postcondition and recovery paths. A restored file tree alone is not sufficient proof of a complete repair.
 
 The installer verifies that generated image/XML requests pass through the configured [media access policy](docs/MEDIA_ACCESS.md), including legacy API aliases. It preserves existing restrictions, enables the required Apache modules idempotently, and distinguishes an intentional network denial from broken routing. Policy settings remain in the central `.config`; changing them does not restart the firewall or PBX.
 

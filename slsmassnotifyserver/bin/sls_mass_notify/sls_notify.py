@@ -1124,8 +1124,8 @@ def contact_uri_for_event(event, endpoint, inventory, contact_index=0):
     if direct:
         return direct
     candidates = inventory.get(endpoint) or []
-    if 0 <= contact_index < len(candidates):
-        return candidates[contact_index]
+    # CLI and AMI list order is not a stable identity binding. With multiple
+    # registrations, an unresolved URI must not borrow another phone's format.
     return candidates[0] if len(candidates) == 1 else ""
 
 
