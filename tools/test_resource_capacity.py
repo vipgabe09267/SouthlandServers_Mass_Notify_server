@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import stat
 from pathlib import Path
 import subprocess
 import tempfile
@@ -28,6 +29,61 @@ def hardware(cpu=2, memory=4, total=60, available=4):
 
 
 class ResourceCapacityTests(unittest.TestCase):
+    def test_small_tmp_moves_scratch_without_weakening_target_mount_checks(self):
+        storage = RESOURCE.storage_requirements()
+        def filesystems(budgets):
+            scratch = '/tmp' if '/tmp' in budgets else '/var/tmp'
+            return [{'device': 'data', 'paths': [p for p in budgets if p != scratch],
+                     'available_bytes': 2 * GIB, 'required_free_bytes': sum(v for p, v in budgets.items() if p != scratch)},
+                    {'device': 'scratch', 'paths': [scratch], 'available_bytes': (64 * RESOURCE.MIB if scratch == '/tmp' else GIB),
+                     'required_free_bytes': budgets[scratch]}]
+        with patch.object(RESOURCE, 'trusted_temporary_directory', return_value=True), \
+             patch.object(RESOURCE, 'probe_filesystems', side_effect=filesystems), \
+             patch.object(RESOURCE.os, 'statvfs', return_value=SimpleNamespace(f_frsize=4096)):
+            selected, mounts = RESOURCE.probe_storage_filesystems(storage)
+            self.assertEqual(selected['temporary_directory'], '/var/tmp')
+            self.assertNotIn('/tmp', selected['free_budgets_bytes'])
+            self.assertEqual(selected['sls_persistent_free_bytes'], storage['sls_persistent_free_bytes'])
+            self.assertTrue(all(row['available_bytes'] >= row['required_free_bytes'] for row in mounts))
+            # A staged install keeps its selected filesystem rather than moving recovery files.
+            selected, mounts = RESOURCE.probe_storage_filesystems(storage, '/tmp')
+            self.assertEqual(selected['temporary_directory'], '/tmp')
+            self.assertTrue(any(row['available_bytes'] < row['required_free_bytes'] for row in mounts))
+        def insufficient(budgets):
+            return [{'device': '1', 'paths': list(budgets), 'available_bytes': 64 * RESOURCE.MIB,
+                     'required_free_bytes': sum(budgets.values())}]
+        with patch.object(RESOURCE, 'trusted_temporary_directory', return_value=True), \
+             patch.object(RESOURCE, 'probe_filesystems', side_effect=insufficient), \
+             patch.object(RESOURCE.os, 'statvfs', return_value=SimpleNamespace(f_frsize=4096)):
+            selected, mounts = RESOURCE.probe_storage_filesystems(storage)
+            self.assertEqual(selected['temporary_directory'], '/tmp')
+            self.assertIn('free_space_insufficient', [r['code'] for r in RESOURCE.evaluate(
+                {'effective_cpu_count':2, 'effective_memory_bytes':4 * GIB, 'filesystems':mounts, 'storage':selected}, 25)['errors']])
+
+    def test_dedicated_mounts_do_not_require_unused_parent_volume_headroom(self):
+        budgets = {RESOURCE.MANAGED_TREES['runtime']: 250 * RESOURCE.MIB,
+                   RESOURCE.MANAGED_TREES['data']: 600 * RESOURCE.MIB, '/tmp': 800 * RESOURCE.MIB}
+        with patch.object(RESOURCE, 'filesystem_types', return_value=[('/', 'ext4')]), \
+             patch.object(RESOURCE.Path, 'exists', return_value=True), \
+             patch.object(RESOURCE.Path, 'resolve', lambda path: path), \
+             patch.object(RESOURCE.Path, 'stat', lambda path: SimpleNamespace(st_dev=2 if str(path) in budgets else 1)), \
+             patch.object(RESOURCE.os, 'statvfs', side_effect=lambda path: SimpleNamespace(
+                 f_blocks=4000, f_bavail=2000 if str(path) in budgets else 8, f_frsize=RESOURCE.MIB)):
+            mounts = RESOURCE.probe_filesystems(budgets)
+        parents = next(row for row in mounts if row['device'] == '1')
+        self.assertEqual(parents['required_free_bytes'], 0)
+        self.assertEqual(RESOURCE.evaluate({'effective_cpu_count':2, 'effective_memory_bytes':4 * GIB,
+            'filesystems':mounts}, 25)['errors'], [])
+        installer = (ROOT/'tools/install_release.sh').read_text()
+        platform = installer.split('preflight_platform() {',1)[1].split('\npreflight_python()',1)[0]
+        self.assertNotIn('df -Pk', platform)
+
+    def test_temporary_directory_validation_rejects_links_and_writable_nonsticky_roots(self):
+        for mode in (stat.S_IFLNK | 0o777, stat.S_IFDIR | 0o777):
+            with patch.object(RESOURCE.Path,'lstat',return_value=SimpleNamespace(st_uid=0,st_mode=mode)):
+                self.assertFalse(RESOURCE.trusted_temporary_directory('/var/tmp'))
+        self.assertFalse(RESOURCE.trusted_temporary_directory('/home/asterisk'))
+
     def test_permission_failure_identifies_the_unreadable_storage_root(self):
         with tempfile.TemporaryDirectory(prefix='sls-capacity-private-cache-') as name:
             cache = Path(name) / '__pycache__'

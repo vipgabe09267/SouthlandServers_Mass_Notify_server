@@ -4238,7 +4238,7 @@ class Slsmassnotifyserver implements \BMO
 
 	public function requestManualUpdate()
 	{
-		if (($this->getPackageUpdateStatus()['state'] ?? 'latest') !== 'update') {
+		if (!in_array(($this->getPackageUpdateStatus()['state'] ?? 'latest'), ['update', 'error'], true)) {
 			return [
 				'success' => false,
 				'message' => _('No newer Mass Notify release is currently available.'),
@@ -4251,6 +4251,19 @@ class Slsmassnotifyserver implements \BMO
 		);
 		if (!empty($result['success'])) {
 			$this->writeManualUpdateProgress('queued', _('Update queued. Waiting for the protected maintenance worker.'));
+		}
+		return $result;
+	}
+
+	public function requestUpdateCheck()
+	{
+		$result = $this->queueMaintenanceAction(
+			self::UPDATE_REQUEST_FILE,
+			_('Update check queued. The protected maintenance worker will check the saved release policy within one minute.'),
+			'check-only'
+		);
+		if (!empty($result['success'])) {
+			$this->writeManualUpdateProgress('queued', _('Update check queued. No installation was requested.'));
 		}
 		return $result;
 	}
@@ -4367,7 +4380,9 @@ class Slsmassnotifyserver implements \BMO
 		$allowed = ['update_script_syntax_error', 'protected_config_validation_failed', 'worker_start_failed',
 			'worker_bootstrap_failed', 'worker_module_load_failed', 'worker_runtime_failed', 'install_command_failed',
 			'repair_failed', 'config_invalid', 'release_check_failed', 'release_metadata_invalid', 'download_failed',
-			'release_verification_failed', 'process_failed', 'timeout', 'lock_busy', 'uninstall_failed'];
+			'release_verification_failed', 'process_failed', 'timeout', 'lock_busy', 'uninstall_failed',
+			'release_rate_limited', 'release_network_failed', 'release_tls_failed', 'release_feed_invalid',
+			'update_policy_invalid', 'release_commit_failed', 'update_request_invalid'];
 		$category = $decoded['error_category'] ?? '';
 		return ['error_category' => is_string($category) && in_array($category, $allowed, true) ? $category : '',
 			'exit_code' => isset($decoded['exit_code']) && is_int($decoded['exit_code'])
@@ -4406,11 +4421,14 @@ class Slsmassnotifyserver implements \BMO
 		return true;
 	}
 
-	private function queueMaintenanceAction($path, $successMessage)
+	private function queueMaintenanceAction($path, $successMessage, $mode = '')
 	{
+		if ($mode !== '' && ($path !== self::UPDATE_REQUEST_FILE || $mode !== 'check-only')) {
+			throw new \InvalidArgumentException('Unsupported maintenance request mode.');
+		}
 		$this->ensurePluginDataDir();
 		$temporary = $path . '.tmp.' . bin2hex(random_bytes(4));
-		if (@file_put_contents($temporary, gmdate('c') . "\n", LOCK_EX) === false) {
+		if (@file_put_contents($temporary, gmdate('c') . "\n" . ($mode === '' ? '' : $mode . "\n"), LOCK_EX) === false) {
 			return ['success' => false, 'message' => _('The maintenance action could not be queued.'), 'errors' => [_('Unable to write the protected request marker.')]];
 		}
 		$this->setPrivateOwnership($temporary);

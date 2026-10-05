@@ -300,6 +300,13 @@ class PrivilegedInstall(unittest.TestCase):
         self.assertEqual(result.stdout,b'preserved root cron input\n')
         with self.assertRaisesRegex(INSTALL.InstallError,'exit 23: concrete failure'):
             INSTALL.runner(['/usr/bin/python3','-I','-c','import sys; print("concrete failure",file=sys.stderr); sys.exit(23)'])
+    def test_protected_dependencies_receive_only_a_safe_standard_scratch_directory(self):
+        with mock.patch.dict(os.environ, {'TMPDIR':'/var/tmp'}):
+            result = INSTALL.runner(['/usr/bin/python3','-I','-c','import os; print(os.environ["TMPDIR"])'])
+            self.assertEqual(result.stdout.strip(),b'/var/tmp')
+        with mock.patch.dict(os.environ, {'TMPDIR':'/home/asterisk/writable'}):
+            with self.assertRaisesRegex(INSTALL.InstallError,'unsupported'):
+                INSTALL.runner(['/bin/true'])
     def test_bad_retention_is_rejected_before_root_changes(self):
         for value in ('1\n/etc/shadow {}', 366, True, 0):
             self.fs.write(INSTALL.CONFIG,json.dumps({'log_retention_days':value}).encode(),0o640,user=True)

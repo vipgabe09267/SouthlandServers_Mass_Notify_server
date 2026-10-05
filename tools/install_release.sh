@@ -17,7 +17,7 @@ URL="${SLS_MASS_NOTIFY_TGZ_URL:-${1:-}}"
 SHA256="${SLS_MASS_NOTIFY_SHA256:-}"
 TOKEN="${SLS_MASS_NOTIFY_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
 LOG_FILE="${SLS_MASS_NOTIFY_INSTALL_LOG:-/tmp/slsmassnotifyserver-install.log}"
-EXPECTED_TGZ_SHA256="1427801ed3f9427241a8f8db3ce6f67d1dcc4189e4ebc9e5d98bdb3cf03eb693"
+EXPECTED_TGZ_SHA256="dec42d6a9e60c569f16ded5b1309164d65503a311fa86151c3583c82634926a1"
 DATA_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin"
 CONFIG_FILE="$DATA_DIR/mass-notifications.config"
 CONFIG_SNAPSHOT=""
@@ -31,6 +31,7 @@ PENDING_CONFIG_HASH=""
 CONFIG_LOCK_FD=""
 SETTINGS_LOCK="$DATA_DIR/mass-notifications.config.lock"
 STAGING_DIR=""
+INSTALL_TEMP_ROOT="/tmp"
 DOWNLOAD_DIR=""
 MODULE_BACKUP_DIR=""
 ROLLBACK_FAILED=0
@@ -104,7 +105,7 @@ initialize_configuration_keyring() {
 
 prepare_installer_bootstrap() {
   local module_name
-  INSTALL_BOOTSTRAP_DIR="$(mktemp -d /tmp/sls-mass-notify-bootstrap.XXXXXX)" || return 1
+  INSTALL_BOOTSTRAP_DIR="$(mktemp -d "$INSTALL_TEMP_ROOT/sls-mass-notify-bootstrap.XXXXXX")" || return 1
   chmod 0700 "$INSTALL_BOOTSTRAP_DIR" || return 1
   for module_name in sls_module_trust.py sls_release_trust.py sls_privileged_install.py sls_installer_recovery.py sls_install_idle.py sls_install_guard.py sls_audio_state.py sls_config_crypto.py sls_upgrade_trust.py; do
     install -o root -g root -m 0700 "$STAGING_DIR/$MODULE/bin/sls_mass_notify/$module_name" "$INSTALL_BOOTSTRAP_DIR/$module_name" || return 1
@@ -400,7 +401,7 @@ record_install_failure() {
   local marker_tmp
   [ "$FREEPBX_CONFIRMED" -eq 1 ] || return 0
   ensure_data_directory 2>/dev/null || return 0
-  marker_tmp="$(mktemp /tmp/slsmassnotifyserver-install-failure.XXXXXX 2>/dev/null || true)"
+  marker_tmp="$(mktemp "$INSTALL_TEMP_ROOT/slsmassnotifyserver-install-failure.XXXXXX" 2>/dev/null || true)"
   [ -n "$marker_tmp" ] || return 0
   if ! /usr/bin/php -r '
 $payload = [
@@ -1947,7 +1948,7 @@ def rounded(value, unit=4096):
     return (int(value) + unit - 1) // unit * unit
 
 
-def storage_requirements(measured=None, missing_voices=None, allocation_units=None):
+def storage_requirements(measured=None, missing_voices=None, allocation_units=None, temporary_directory='/tmp'):
     """Explain each byte reservation; retained history is not a fixed quota.
 
     Installation workspaces may overlap bounded state updates/compaction.
@@ -1955,6 +1956,8 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
     is no enforced global synthesis limit or total retained-media byte quota.
     """
     measured = measured or {}
+    if temporary_directory not in ('/tmp', '/var/tmp'):
+        raise ValueError('Unsupported installation workspace')
     units = allocation_units or {}
     size = lambda name: int(measured.get(name, {}).get('allocated_bytes', 0))
     unit = lambda path: max(4096, int(units.get(path, 4096)))
@@ -1986,12 +1989,12 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
         MANAGED_TREES['operator_portal']: {'operator_portal_payload': payload(MANAGED_TREES['operator_portal'])},
         #Maintenance compacts logs sequentially, using backup+retained temporary.
         '/var/log': {'event_log_backup_and_retained_copy': 2 * 64 * MIB},
-        '/tmp': {'release_download_and_metadata': 52 * MIB + 16 * 1024 + 4096,
-                 'extracted_release': payload('/tmp'), 'failed_release_recovery': payload('/tmp'),
+        temporary_directory: {'release_download_and_metadata': 52 * MIB + 16 * 1024 + 4096,
+                 'extracted_release': payload(temporary_directory), 'failed_release_recovery': payload(temporary_directory),
                  'old_module_recovery': size('module'), 'protected_config_snapshot': 16 * MIB,
-                 'pinned_wheel_downloads': rounded(PINNED_WHEEL_BYTES, unit('/tmp')),
+                 'pinned_wheel_downloads': rounded(PINNED_WHEEL_BYTES, unit(temporary_directory)),
                  'wheel_unpack_workspace': venv, 'pip_old_package_recovery': venv,
-                 'one_voice_download': rounded(max(VOICE_BYTES.values()), unit('/tmp'))},
+                 'one_voice_download': rounded(max(VOICE_BYTES.values()), unit(temporary_directory))},
     }
     budgets = {path: sum(parts.values()) for path, parts in components.items()}
     fixed_names = ('runtime', 'voices', 'module', 'assets', 'sip_api', 'control_api')
@@ -2002,8 +2005,9 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
             'measured_trees': measured, 'fresh_reference_voice_bytes': voice_total,
             'pinned_runtime_reference_bytes': reference_venv, 'pinned_wheel_download_bytes': PINNED_WHEEL_BYTES,
             'component_budgets_bytes': components, 'free_budgets_bytes': budgets,
-            'sls_persistent_free_bytes': sum(value for path, value in budgets.items() if path != '/tmp'),
-            'temporary_free_bytes': budgets['/tmp'],
+            'temporary_directory': temporary_directory,
+            'sls_persistent_free_bytes': sum(value for path, value in budgets.items() if path != temporary_directory),
+            'temporary_free_bytes': budgets[temporary_directory],
             'additional_free_bytes': sum(budgets.values()),
             'steady_state_reserve_bytes': atomic_state + backup_growth + 2 * 64 * MIB,
             'retention_is_byte_bounded': False, 'synthesis_concurrency_is_enforced': False,
@@ -2205,6 +2209,60 @@ def probe_filesystems(free_budgets=None):
     return list(devices.values())
 
 
+def trusted_temporary_directory(path):
+    if path not in ('/tmp', '/var/tmp'):
+        return False
+    try:
+        for directory in (Path(path), *Path(path).parents):
+            info = directory.lstat()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
+                    or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
+                return False
+        return True
+    except OSError:
+        return False
+
+
+def probe_storage_filesystems(storage, temporary_directory=None):
+    """Use persistent scratch space when a small /tmp cannot hold the install.
+
+    All reservations still apply to their actual filesystem. Moving scratch
+    cannot make an insufficient data/runtime filesystem eligible.
+    """
+    choices = (temporary_directory,) if temporary_directory else ('/tmp', '/var/tmp')
+    first = None
+    for path in choices:
+        if not trusted_temporary_directory(path):
+            continue
+        if path == '/tmp':
+            candidate = storage
+        else:
+            unit = os.statvfs(path).f_frsize
+            # Preserve measured target reservations; only scratch changes mount.
+            candidate = dict(storage)
+            budgets = dict(storage['free_budgets_bytes'])
+            components = dict(storage['component_budgets_bytes'])
+            scratch = dict(components.pop('/tmp'))
+            scratch['extracted_release'] = scratch['failed_release_recovery'] = 50 * MIB + 2000 * max(4096, unit)
+            scratch['pinned_wheel_downloads'] = rounded(PINNED_WHEEL_BYTES, max(4096, unit))
+            scratch['one_voice_download'] = rounded(max(VOICE_BYTES.values()), max(4096, unit))
+            del budgets['/tmp']
+            budgets[path] = sum(scratch.values())
+            components[path] = scratch
+            candidate.update({'temporary_directory': path, 'temporary_free_bytes': budgets[path],
+                              'free_budgets_bytes': budgets, 'component_budgets_bytes': components,
+                              'additional_free_bytes': sum(budgets.values())})
+        filesystems = probe_filesystems(candidate['free_budgets_bytes'])
+        if first is None:
+            first = (candidate, filesystems)
+        if all(row['available_bytes'] >= row['required_free_bytes'] for row in filesystems):
+            return candidate, filesystems
+    if first is None:
+        raise ResourceProbeError('temporary_directory_unavailable',
+            'Neither /tmp nor /var/tmp is a safe root-owned temporary directory. Restore the standard directory ownership and sticky permissions before installing.')
+    return first
+
+
 def configured_limits(path):
     """Read only the capacity fields; never echo configuration or credentials."""
     path = Path(path)
@@ -2385,7 +2443,8 @@ def evaluate(hardware, requested, phone_requested=PHONE_BASELINE):
                       'actual': hardware['effective_cpu_count'], 'required': cpu},
               'memory': {'ok': hardware['effective_memory_bytes'] >= required_memory,
                          'actual': hardware['effective_memory_bytes'], 'required': required_memory}}
-    for name, paths in (('storage', set(storage['free_budgets_bytes']) - {'/tmp'}), ('temporary', {'/tmp'})):
+    temporary = storage.get('temporary_directory', '/tmp')
+    for name, paths in (('storage', set(storage['free_budgets_bytes']) - {temporary}), ('temporary', {temporary})):
         filesystems = [item for item in hardware['filesystems'] if paths.intersection(item['paths'])]
         covered = set(path for item in filesystems for path in item['paths'])
         checks[name] = {'ok': all(item['available_bytes'] >= item['required_free_bytes'] for item in filesystems)
@@ -2421,6 +2480,7 @@ def main(argv=None):
     parser.add_argument('--check', action='store_true')
     parser.add_argument('--config', type=Path)
     parser.add_argument('--desktop-limit', type=int)
+    parser.add_argument('--temporary-directory', choices=('/tmp', '/var/tmp'))
     phone_options = parser.add_mutually_exclusive_group()
     phone_options.add_argument('--phone-limit', type=int)
     phone_options.add_argument('--auto-phone-limit', action='store_true',
@@ -2446,8 +2506,9 @@ def main(argv=None):
         stage = 'SLS storage'
         storage = probe_storage()
         stage = 'filesystem free space'
+        storage, filesystems = probe_storage_filesystems(storage, options.temporary_directory)
         result = evaluate({'effective_cpu_count': cpu, 'effective_memory_bytes': memory,
-                           'filesystems': probe_filesystems(storage['free_budgets_bytes']), 'storage': storage}, requested, phone_requested)
+                           'filesystems': filesystems, 'storage': storage}, requested, phone_requested)
         if selection is not None:
             result['auto_phone_selection'] = selection
     except (OSError, ValueError, ZeroDivisionError, StopIteration) as error:
@@ -2475,6 +2536,7 @@ preflight_hardware_requirements() {
     arguments=(--check --config "$CONFIG_FILE")
   fi
   if report="$(bootstrap_resource_capacity "${arguments[@]}")"; then
+    select_install_temp_root "$report" || return 1
     if [ ! -e "$CONFIG_FILE" ]; then
       remember_fresh_phone_capacity "$report" || return 1
     fi
@@ -2487,6 +2549,27 @@ preflight_hardware_requirements() {
   log "The combined PBX/SLS CPU/RAM or dedicated SLS free-space requirements were not met. No dependency or module changes were started."
   log "$report"
   return "$status"
+}
+
+select_install_temp_root() {
+  local directory
+  directory="$(/usr/bin/python3 -I -c '
+import json, os, stat, sys
+path = json.loads(sys.argv[1]).get("requirements", {}).get("storage", {}).get("temporary_directory", "/tmp")
+if path not in ("/tmp", "/var/tmp"): raise SystemExit(1)
+fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    for name in path.split("/")[1:]:
+        child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        os.close(fd); fd = child
+        info = os.fstat(fd)
+        if info.st_uid != 0 or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX): raise SystemExit(1)
+finally: os.close(fd)
+print(path)
+' "$1")" || { log 'The selected temporary directory is unsafe; no module or dependency changes were started.'; return 1; }
+  INSTALL_TEMP_ROOT="$directory"
+  export TMPDIR="$directory"
+  log "Installer workspaces: $INSTALL_TEMP_ROOT (free space verified on its actual filesystem)."
 }
 
 remember_fresh_phone_capacity() {
@@ -2512,7 +2595,7 @@ verify_staged_hardware_requirements() {
   if [ -e "$CONFIG_FILE" ]; then
     arguments=(--check --config "$CONFIG_FILE")
   fi
-  report="$(/usr/bin/python3 -I "$helper" "${arguments[@]}" 2>>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}")" || {
+  report="$(/usr/bin/python3 -I "$helper" "${arguments[@]}" --temporary-directory "$INSTALL_TEMP_ROOT" 2>>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}")" || {
     log "$report"
     log "This PBX does not meet the configured desktop/phone capacities or SLS free-space requirements. See $LOG_FILE."
     return 1
@@ -2524,7 +2607,7 @@ verify_staged_hardware_requirements() {
 }
 
 preflight_platform() {
-  local apache_module apache_modules available_kb check_path required_kb utility
+  local apache_module apache_modules utility
   # Runtime and dialplan paths are conventional FreePBX paths. Detect a
   # relocated installation explicitly instead of creating a second, unused tree.
   /usr/bin/timeout 20 /usr/sbin/runuser -u asterisk -- /usr/bin/php <<'PHP' || {
@@ -2545,17 +2628,6 @@ PHP
     log "This FreePBX layout requires an explicitly supported path adapter; installation stopped before activation."
     exit 1
   }
-  for check_path in /var/lib/asterisk /usr/local /var/www /tmp; do
-    case "$check_path" in
-      /var/lib/asterisk|/usr/local) required_kb=524288 ;;
-      *) required_kb=65536 ;;
-    esac
-    available_kb="$(df -Pk "$check_path" | awk 'NR == 2 {print $4}')"
-    if ! [[ "$available_kb" =~ ^[0-9]+$ ]] || [ "$available_kb" -lt "$required_kb" ]; then
-      log "Insufficient free space on the filesystem containing $check_path."
-      exit 1
-    fi
-  done
   for utility in timeout runuser flock readlink; do
     command -v "$utility" >/dev/null || {
       log "Required system utility is unavailable: $utility"
@@ -2566,6 +2638,7 @@ PHP
     log "Apache configuration validation failed before installation. See $LOG_FILE."
     exit 1
   }
+  log 'Apache configuration accepted. DocumentRoot warnings from other virtual hosts do not fail this check; the PBX and SLS routes are verified separately.'
   systemctl is-active --quiet apache2 || {
     log "Apache is not active."
     exit 1
@@ -2930,7 +3003,7 @@ PYASSET
 
 download_tgz() {
   local original_tgz="$TGZ"
-  DOWNLOAD_DIR="$(mktemp -d /tmp/sls-mass-notify-download.XXXXXX)" || return 1
+  DOWNLOAD_DIR="$(mktemp -d "$INSTALL_TEMP_ROOT/sls-mass-notify-download.XXXXXX")" || return 1
   if [ -n "$URL" ]; then
     TGZ="$DOWNLOAD_DIR/package.tgz"
     fetch_release_asset "$URL" "$TGZ" 54525952 || return 1
@@ -3348,7 +3421,7 @@ snapshot_pending_config() {
   PENDING_CONFIG_PATH="$DATA_DIR/mass-notifications.pending.config"
   PENDING_CONFIG_STATE=absent
   if [ -e "$PENDING_CONFIG_PATH" ] || [ -L "$PENDING_CONFIG_PATH" ]; then
-    PENDING_CONFIG_SNAPSHOT="$(mktemp /tmp/slsmassnotifyserver-pending.XXXXXX)" || return 1
+    PENDING_CONFIG_SNAPSHOT="$(mktemp "$INSTALL_TEMP_ROOT/slsmassnotifyserver-pending.XXXXXX")" || return 1
     PENDING_CONFIG_HASH="$(safe_config_snapshot "$PENDING_CONFIG_PATH" "$PENDING_CONFIG_SNAPSHOT")" || {
       log 'Pending configuration is unsafe or unreadable. It was not applied or replaced.'
       return 1
@@ -3405,7 +3478,7 @@ snapshot_config() {
     exit 1
   fi
   [ -r "$CONFIG_FILE" ] || return 0
-  CONFIG_SNAPSHOT="$(mktemp /tmp/slsmassnotifyserver-config.XXXXXX)"
+  CONFIG_SNAPSHOT="$(mktemp "$INSTALL_TEMP_ROOT/slsmassnotifyserver-config.XXXXXX")"
   if ! CONFIG_HASH_BEFORE="$(safe_config_snapshot "$CONFIG_FILE" "$CONFIG_SNAPSHOT")"; then
     rm -f "$CONFIG_SNAPSHOT"
     CONFIG_SNAPSHOT=""
@@ -3511,7 +3584,7 @@ verify_config_unchanged() {
     CONFIG_SNAPSHOT=""
     return 0
   fi
-  current_snapshot="$(mktemp /tmp/slsmassnotifyserver-config-current.XXXXXX)"
+  current_snapshot="$(mktemp "$INSTALL_TEMP_ROOT/slsmassnotifyserver-config-current.XXXXXX")"
   if safe_config_snapshot "$CONFIG_FILE" "$current_snapshot" >/dev/null 2>&1; then
     describe_config_drift "$CONFIG_SNAPSHOT" "$current_snapshot"
   else
@@ -3542,7 +3615,7 @@ stage_module_directory() {
     fi
     log "Existing SLS Mass Notify module detected; preserving config and preparing a recoverable upgrade."
   fi
-  STAGING_DIR="$(mktemp -d /tmp/sls-mass-notify-stage.XXXXXX)"
+  STAGING_DIR="$(mktemp -d "$INSTALL_TEMP_ROOT/sls-mass-notify-stage.XXXXXX")"
   tar -xzf "$TGZ" -C "$STAGING_DIR"
   if [ ! -d "$STAGING_DIR/$MODULE" ] || [ ! -r "$STAGING_DIR/$MODULE/module.xml" ]; then
     log "The staged module tree is incomplete."
@@ -3569,7 +3642,7 @@ stage_module_directory() {
 }
 
 activate_staged_module() {
-  MODULE_BACKUP_DIR="$(mktemp -d /tmp/sls-mass-notify-module-backup.XXXXXX)" || return 1
+  MODULE_BACKUP_DIR="$(mktemp -d "$INSTALL_TEMP_ROOT/sls-mass-notify-module-backup.XXXXXX")" || return 1
   # Activate by descriptor-relative renames: a replaced public pathname must
   # never redirect privileged copying or ownership changes to another tree.
   /usr/bin/python3 -I - "$STAGING_DIR" "$MODULE_BACKUP_DIR" <<'PYACTIVATE' || return 1
@@ -3894,7 +3967,7 @@ PY
 
 verify_ami_with_repair() (
   local attempt probe_dir
-  probe_dir="$(mktemp -d /tmp/sls-mass-notify-ami-check.XXXXXX)" || {
+  probe_dir="$(mktemp -d "$INSTALL_TEMP_ROOT/sls-mass-notify-ami-check.XXXXXX")" || {
     log "Unable to create private AMI verification storage. Check free space and /tmp permissions."
     return 1
   }
@@ -3949,7 +4022,7 @@ verify_phone_collector() (
       log "The phone outcome collector must be enabled and active. Review systemctl status sls-mass-notify-phone-events.service, then run Repair Installation."
       return 1
     }
-  probe_dir="$(mktemp -d /tmp/sls-phone-collector-check.XXXXXX)" || return 1
+  probe_dir="$(mktemp -d "$INSTALL_TEMP_ROOT/sls-phone-collector-check.XXXXXX")" || return 1
   trap 'rm -f -- "$probe_dir/ami.json" "$probe_dir/health.json"; rmdir -- "$probe_dir" 2>/dev/null || true' EXIT
   if ! /usr/bin/timeout --kill-after=1 15 /usr/sbin/runuser -u asterisk -- /usr/bin/python3 -I \
       /usr/local/bin/sls_mass_notify/sls_phone_admission.py --probe-ami >"$probe_dir/ami.json" 2>>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" \
@@ -3971,7 +4044,7 @@ verify_phone_collector() (
 
 verify_pjsip_contact_inventory() (
   local probe_dir
-  probe_dir="$(mktemp -d /tmp/sls-mass-notify-contact-check.XXXXXX)" || {
+  probe_dir="$(mktemp -d "$INSTALL_TEMP_ROOT/sls-mass-notify-contact-check.XXXXXX")" || {
     log "Unable to create private PJSIP verification storage. Check free space and /tmp permissions."
     return 1
   }
@@ -3986,7 +4059,7 @@ verify_pjsip_contact_inventory() (
 verify_local_api_route() (
   local path="$1" expected_pattern="$2" expected_codes="$3" label="$4"
   local probe_dir code
-  probe_dir="$(mktemp -d /tmp/sls-mass-notify-api-check.XXXXXX)" || {
+  probe_dir="$(mktemp -d "$INSTALL_TEMP_ROOT/sls-mass-notify-api-check.XXXXXX")" || {
     log "Unable to create private API verification storage. Check free space and /tmp permissions."
     return 1
   }
@@ -4719,7 +4792,7 @@ PY
     exit 1
   }
   media_probe="/var/www/html/sls_mass_notify/installer-render-check-$$.png"
-  media_fetch="$(mktemp /tmp/sls-mass-notify-render-fetch.XXXXXX)"
+  media_fetch="$(mktemp "$INSTALL_TEMP_ROOT/sls-mass-notify-render-fetch.XXXXXX")"
   rm -f "$media_probe"
   if ! runuser -u asterisk -- convert -size 480x272 xc:'#991b1b' -font DejaVu-Sans-Bold \
     -fill white -gravity center -pointsize 24 -annotate +0+0 'SLS render test' \
@@ -4775,7 +4848,7 @@ PY
     exit 1
   fi
   verify_phone_collector || exit 1
-  notify_capabilities="$(mktemp /tmp/sls-mass-notify-notify-capabilities.XXXXXX)"
+  notify_capabilities="$(mktemp "$INSTALL_TEMP_ROOT/sls-mass-notify-notify-capabilities.XXXXXX")"
   if ! /usr/bin/timeout 15 /usr/sbin/runuser -u asterisk -- /usr/bin/python3 /usr/local/bin/sls_mass_notify/sls_notify.py --notify-capabilities-json >"$notify_capabilities"; then
     rm -f "$notify_capabilities"
     log "SLS could not inspect Asterisk SIP NOTIFY routing capabilities."
@@ -4810,8 +4883,8 @@ PY
   # infer whether it should run from the presentation-dependent summary line of
   # `pjsip show contacts`; community Asterisk builds format that output
   # differently, and an empty PBX is a valid installation state.
-  endpoint_inventory="$(mktemp /tmp/sls-mass-notify-endpoints.XXXXXX)"
-  endpoint_inventory_err="$(mktemp /tmp/sls-mass-notify-endpoints-error.XXXXXX)"
+  endpoint_inventory="$(mktemp "$INSTALL_TEMP_ROOT/sls-mass-notify-endpoints.XXXXXX")"
+  endpoint_inventory_err="$(mktemp "$INSTALL_TEMP_ROOT/sls-mass-notify-endpoints-error.XXXXXX")"
   if ! /usr/bin/timeout 15 /usr/sbin/runuser -u asterisk -- /usr/bin/python3 /usr/local/bin/sls_mass_notify/sls_notify.py --list-endpoints-json \
     >"$endpoint_inventory" 2>"$endpoint_inventory_err"; then
     cat "$endpoint_inventory_err" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>/dev/null || true
@@ -4916,7 +4989,7 @@ PY
     log "Scheduled-announcement worker failed its Asterisk-account self-test."
     exit 1
   fi
-  scheduler_probe="$(mktemp -d /tmp/sls-mass-notify-scheduler-check.XXXXXX)"
+  scheduler_probe="$(mktemp -d "$INSTALL_TEMP_ROOT/sls-mass-notify-scheduler-check.XXXXXX")"
   chown asterisk:asterisk "$scheduler_probe"
   chmod 0750 "$scheduler_probe"
   printf '%s\n' '{"enabled":"0","xweather":{"enabled":"0"}}' >"$scheduler_probe/disabled.config"

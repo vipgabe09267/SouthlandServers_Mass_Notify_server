@@ -80,3 +80,38 @@ foreach ([
 }
 
 echo "Update and maintenance contract tests passed.\n";
+
+// Execute the shipped request methods with an inert maintenance queue.
+$requests = '';
+foreach (['requestManualUpdate', 'requestUpdateCheck'] as $method) {
+    if (!preg_match('/\tpublic function ' . $method . '\(\)\n\t\{.*?\n\t\}/s', $moduleSource, $match)) {
+        update_contract_fail('Update request method could not be isolated.');
+    }
+    $requests .= $match[0];
+}
+eval('class UpdateRequestFixture {
+    const UPDATE_REQUEST_FILE = "/fixture/update.request";
+    public $state = "error";
+    public $requests = [];
+    private function getPackageUpdateStatus() { return ["state"=>$this->state]; }
+    private function queueMaintenanceAction($path, $message, $mode="") {
+        $this->requests[] = [$path, $mode]; return ["success"=>true];
+    }
+    private function writeManualUpdateProgress($state, $message) { return true; }
+' . $requests . '}');
+$fixture = new UpdateRequestFixture();
+if (!$fixture->requestManualUpdate()['success'] || $fixture->requests !== [['/fixture/update.request', '']]) {
+    update_contract_fail('A failed release check cannot be retried through the maintenance queue.');
+}
+$fixture->state = 'latest';
+if ($fixture->requestManualUpdate()['success'] || !$fixture->requestUpdateCheck()['success']
+    || end($fixture->requests) !== ['/fixture/update.request', 'check-only']) {
+    update_contract_fail('Check-only and installation requests were not kept separate.');
+}
+foreach (['value="check_updates" formnovalidate', "elseif ((\$packageStatus['state'] ?? '') === 'error')",
+         "button.disabled = false", "retry.formNoValidate = true"] as $control) {
+    if (strpos($settingsView, $control) === false) {
+        update_contract_fail('The update controls cannot recover after a failed or blocked form submission.');
+    }
+}
+echo "Failed-check retry and check-only request behavior passed.\n";

@@ -69,7 +69,7 @@ def rounded(value, unit=4096):
     return (int(value) + unit - 1) // unit * unit
 
 
-def storage_requirements(measured=None, missing_voices=None, allocation_units=None):
+def storage_requirements(measured=None, missing_voices=None, allocation_units=None, temporary_directory='/tmp'):
     """Explain each byte reservation; retained history is not a fixed quota.
 
     Installation workspaces may overlap bounded state updates/compaction.
@@ -77,6 +77,8 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
     is no enforced global synthesis limit or total retained-media byte quota.
     """
     measured = measured or {}
+    if temporary_directory not in ('/tmp', '/var/tmp'):
+        raise ValueError('Unsupported installation workspace')
     units = allocation_units or {}
     size = lambda name: int(measured.get(name, {}).get('allocated_bytes', 0))
     unit = lambda path: max(4096, int(units.get(path, 4096)))
@@ -108,12 +110,12 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
         MANAGED_TREES['operator_portal']: {'operator_portal_payload': payload(MANAGED_TREES['operator_portal'])},
         #Maintenance compacts logs sequentially, using backup+retained temporary.
         '/var/log': {'event_log_backup_and_retained_copy': 2 * 64 * MIB},
-        '/tmp': {'release_download_and_metadata': 52 * MIB + 16 * 1024 + 4096,
-                 'extracted_release': payload('/tmp'), 'failed_release_recovery': payload('/tmp'),
+        temporary_directory: {'release_download_and_metadata': 52 * MIB + 16 * 1024 + 4096,
+                 'extracted_release': payload(temporary_directory), 'failed_release_recovery': payload(temporary_directory),
                  'old_module_recovery': size('module'), 'protected_config_snapshot': 16 * MIB,
-                 'pinned_wheel_downloads': rounded(PINNED_WHEEL_BYTES, unit('/tmp')),
+                 'pinned_wheel_downloads': rounded(PINNED_WHEEL_BYTES, unit(temporary_directory)),
                  'wheel_unpack_workspace': venv, 'pip_old_package_recovery': venv,
-                 'one_voice_download': rounded(max(VOICE_BYTES.values()), unit('/tmp'))},
+                 'one_voice_download': rounded(max(VOICE_BYTES.values()), unit(temporary_directory))},
     }
     budgets = {path: sum(parts.values()) for path, parts in components.items()}
     fixed_names = ('runtime', 'voices', 'module', 'assets', 'sip_api', 'control_api')
@@ -124,8 +126,9 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
             'measured_trees': measured, 'fresh_reference_voice_bytes': voice_total,
             'pinned_runtime_reference_bytes': reference_venv, 'pinned_wheel_download_bytes': PINNED_WHEEL_BYTES,
             'component_budgets_bytes': components, 'free_budgets_bytes': budgets,
-            'sls_persistent_free_bytes': sum(value for path, value in budgets.items() if path != '/tmp'),
-            'temporary_free_bytes': budgets['/tmp'],
+            'temporary_directory': temporary_directory,
+            'sls_persistent_free_bytes': sum(value for path, value in budgets.items() if path != temporary_directory),
+            'temporary_free_bytes': budgets[temporary_directory],
             'additional_free_bytes': sum(budgets.values()),
             'steady_state_reserve_bytes': atomic_state + backup_growth + 2 * 64 * MIB,
             'retention_is_byte_bounded': False, 'synthesis_concurrency_is_enforced': False,
@@ -327,6 +330,60 @@ def probe_filesystems(free_budgets=None):
     return list(devices.values())
 
 
+def trusted_temporary_directory(path):
+    if path not in ('/tmp', '/var/tmp'):
+        return False
+    try:
+        for directory in (Path(path), *Path(path).parents):
+            info = directory.lstat()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
+                    or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
+                return False
+        return True
+    except OSError:
+        return False
+
+
+def probe_storage_filesystems(storage, temporary_directory=None):
+    """Use persistent scratch space when a small /tmp cannot hold the install.
+
+    All reservations still apply to their actual filesystem. Moving scratch
+    cannot make an insufficient data/runtime filesystem eligible.
+    """
+    choices = (temporary_directory,) if temporary_directory else ('/tmp', '/var/tmp')
+    first = None
+    for path in choices:
+        if not trusted_temporary_directory(path):
+            continue
+        if path == '/tmp':
+            candidate = storage
+        else:
+            unit = os.statvfs(path).f_frsize
+            # Preserve measured target reservations; only scratch changes mount.
+            candidate = dict(storage)
+            budgets = dict(storage['free_budgets_bytes'])
+            components = dict(storage['component_budgets_bytes'])
+            scratch = dict(components.pop('/tmp'))
+            scratch['extracted_release'] = scratch['failed_release_recovery'] = 50 * MIB + 2000 * max(4096, unit)
+            scratch['pinned_wheel_downloads'] = rounded(PINNED_WHEEL_BYTES, max(4096, unit))
+            scratch['one_voice_download'] = rounded(max(VOICE_BYTES.values()), max(4096, unit))
+            del budgets['/tmp']
+            budgets[path] = sum(scratch.values())
+            components[path] = scratch
+            candidate.update({'temporary_directory': path, 'temporary_free_bytes': budgets[path],
+                              'free_budgets_bytes': budgets, 'component_budgets_bytes': components,
+                              'additional_free_bytes': sum(budgets.values())})
+        filesystems = probe_filesystems(candidate['free_budgets_bytes'])
+        if first is None:
+            first = (candidate, filesystems)
+        if all(row['available_bytes'] >= row['required_free_bytes'] for row in filesystems):
+            return candidate, filesystems
+    if first is None:
+        raise ResourceProbeError('temporary_directory_unavailable',
+            'Neither /tmp nor /var/tmp is a safe root-owned temporary directory. Restore the standard directory ownership and sticky permissions before installing.')
+    return first
+
+
 def configured_limits(path):
     """Read only the capacity fields; never echo configuration or credentials."""
     path = Path(path)
@@ -507,7 +564,8 @@ def evaluate(hardware, requested, phone_requested=PHONE_BASELINE):
                       'actual': hardware['effective_cpu_count'], 'required': cpu},
               'memory': {'ok': hardware['effective_memory_bytes'] >= required_memory,
                          'actual': hardware['effective_memory_bytes'], 'required': required_memory}}
-    for name, paths in (('storage', set(storage['free_budgets_bytes']) - {'/tmp'}), ('temporary', {'/tmp'})):
+    temporary = storage.get('temporary_directory', '/tmp')
+    for name, paths in (('storage', set(storage['free_budgets_bytes']) - {temporary}), ('temporary', {temporary})):
         filesystems = [item for item in hardware['filesystems'] if paths.intersection(item['paths'])]
         covered = set(path for item in filesystems for path in item['paths'])
         checks[name] = {'ok': all(item['available_bytes'] >= item['required_free_bytes'] for item in filesystems)
@@ -543,6 +601,7 @@ def main(argv=None):
     parser.add_argument('--check', action='store_true')
     parser.add_argument('--config', type=Path)
     parser.add_argument('--desktop-limit', type=int)
+    parser.add_argument('--temporary-directory', choices=('/tmp', '/var/tmp'))
     phone_options = parser.add_mutually_exclusive_group()
     phone_options.add_argument('--phone-limit', type=int)
     phone_options.add_argument('--auto-phone-limit', action='store_true',
@@ -568,8 +627,9 @@ def main(argv=None):
         stage = 'SLS storage'
         storage = probe_storage()
         stage = 'filesystem free space'
+        storage, filesystems = probe_storage_filesystems(storage, options.temporary_directory)
         result = evaluate({'effective_cpu_count': cpu, 'effective_memory_bytes': memory,
-                           'filesystems': probe_filesystems(storage['free_budgets_bytes']), 'storage': storage}, requested, phone_requested)
+                           'filesystems': filesystems, 'storage': storage}, requested, phone_requested)
         if selection is not None:
             result['auto_phone_selection'] = selection
     except (OSError, ValueError, ZeroDivisionError, StopIteration) as error:

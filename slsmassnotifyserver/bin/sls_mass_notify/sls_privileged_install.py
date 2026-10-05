@@ -472,9 +472,17 @@ class Files:
 
 def runner(arguments, *, timeout=30, input=None, allowed=(0,)):
     """Bound stdout/stderr while a command runs, including failure/timeout paths."""
+    temporary = os.environ.get('TMPDIR', '/tmp')
+    if temporary not in ('/tmp', '/var/tmp'):
+        raise InstallError('unsupported protected installation workspace')
+    for path in (Path(temporary), *Path(temporary).parents):
+        info = path.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
+                or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
+            raise InstallError('unsafe protected installation workspace')
     process = subprocess.Popen(arguments, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
-                               env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8'})
+                               env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8', 'TMPDIR': temporary})
     output = {'stdout': bytearray(), 'stderr': bytearray()}
     deadline = time.monotonic() + timeout
     pending = memoryview(input or b'')

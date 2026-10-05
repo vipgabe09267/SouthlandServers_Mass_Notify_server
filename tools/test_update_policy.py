@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import ssl
+import urllib.error
 import unittest
 from unittest.mock import patch
 
@@ -90,6 +92,8 @@ class UpdatePolicy(unittest.TestCase):
                'GITHUB_UPDATES_PIN': '', 'GITHUB_UPDATES_WINDOW_START': '', 'GITHUB_UPDATES_WINDOW_END': '',
                'GITHUB_UPDATES_DELAY_HOURS': '0', **overrides}
         def response(request, **kwargs):
+            if isinstance(rows, BaseException):
+                raise rows
             if request.full_url == f'https://api.github.com/repos/{REPO}/releases?per_page=100':
                 return io.BytesIO(rows if isinstance(rows, bytes) else json.dumps(rows).encode())
             if request.full_url.startswith(f'https://api.github.com/repos/{REPO}/commits/slsmassnotifyserver-'):
@@ -124,6 +128,18 @@ class UpdatePolicy(unittest.TestCase):
             self.assertFalse(result['ok'])
             self.assertFalse(result['update_available'])
         self.assertFalse(self.feed([release()], GITHUB_UPDATES_DELAY_HOURS='1.0')['ok'])
+
+    def test_feed_failures_have_specific_safe_categories(self):
+        for error, expected in ((urllib.error.HTTPError('https://api.github.com/',429,'private',{},None), 'release_rate_limited'),
+                                (urllib.error.HTTPError('https://api.github.com/',403,'private',{'X-RateLimit-Remaining':'0'},None), 'release_rate_limited'),
+                                (urllib.error.URLError(ssl.SSLCertVerificationError('private')), 'release_tls_failed'),
+                                (urllib.error.URLError('private-dns-error'), 'release_network_failed'),
+                                (b'<html>private-proxy-error</html>', 'release_feed_invalid')):
+            with self.subTest(expected=expected):
+                result = self.feed(error)
+                self.assertFalse(result['ok'])
+                self.assertEqual(result['error_category'], expected)
+                self.assertNotIn('private', json.dumps(result))
 
 
 if __name__ == '__main__':

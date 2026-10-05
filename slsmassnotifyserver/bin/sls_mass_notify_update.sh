@@ -235,7 +235,10 @@ import importlib.util
 import json
 import os
 import re
+import socket
+import ssl
 import sys
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
@@ -264,6 +267,7 @@ try:
     })
 except Exception:
     print(json.dumps({'ok': False, 'checked_at': now, 'update_available': False, 'latest_version': current,
+        'error_category': 'update_policy_invalid',
         'message': 'Update policy is invalid or its protected runtime helper is unavailable.'}, separators=(',', ':')))
     raise SystemExit(0)
 
@@ -291,8 +295,16 @@ try:
         releases = json.loads(body)
         if not isinstance(releases, list) or len(releases) > 100:
             raise ValueError('invalid release feed')
-except Exception:
-    print(json.dumps({"ok": False, "checked_at": now, "update_available": False, "latest_version": current, "message": "The verified release feed could not be checked."}, separators=(",", ":")))
+except (urllib.error.URLError, OSError, ValueError) as error:
+    category = 'release_feed_invalid'
+    if isinstance(error, urllib.error.HTTPError):
+        category = 'release_rate_limited' if error.code == 429 or (error.code == 403 and error.headers.get('X-RateLimit-Remaining') == '0') else 'release_network_failed'
+    elif isinstance(error, urllib.error.URLError):
+        category = 'release_tls_failed' if isinstance(error.reason, ssl.SSLError) else 'release_network_failed'
+    elif isinstance(error, (ssl.SSLError, socket.timeout, OSError)):
+        category = 'release_tls_failed' if isinstance(error, ssl.SSLError) else 'release_network_failed'
+    print(json.dumps({"ok": False, "checked_at": now, "update_available": False, "latest_version": current,
+        'error_category': category, "message": "The verified release feed could not be checked."}, separators=(",", ":")))
     raise SystemExit(0)
 
 candidates = []
@@ -321,7 +333,8 @@ for release in releases if isinstance(releases, list) else []:
 candidates.sort(key=lambda candidate: candidate[0], reverse=True)
 if not candidates:
     message = 'No published release matches the selected channel and version pin in the latest 100 releases.' if not matching_releases else 'No matching release has the expected package and SHA-256 metadata.'
-    print(json.dumps({"ok": not matching_releases, "checked_at": now, "update_available": False, "latest_version": current, "message": message}, separators=(",", ":")))
+    print(json.dumps({"ok": not matching_releases, "checked_at": now, "update_available": False, "latest_version": current,
+        'error_category': 'release_metadata_invalid' if matching_releases else '', "message": message}, separators=(",", ":")))
     raise SystemExit(0)
 
 _, tag, tgz_url, sha256, release = candidates[0]
@@ -340,7 +353,8 @@ if available:
         if not re.fullmatch(r"[0-9a-f]{40}", installer_commit):
             raise ValueError("release commit is unavailable")
     except Exception:
-        print(json.dumps({"ok": False, "checked_at": now, "update_available": False, "latest_version": norm(tag), "message": "Release commit verification failed; no installer will run."}, separators=(",", ":")))
+        print(json.dumps({"ok": False, "checked_at": now, "update_available": False, "latest_version": norm(tag),
+            'error_category': 'release_commit_failed', "message": "Release commit verification failed; no installer will run."}, separators=(",", ":")))
         raise SystemExit(0)
 print(json.dumps({
     "ok": True,
@@ -362,9 +376,20 @@ write_status "$release_json"
 update_available="$(printf '%s' "$release_json" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("update_available") else "0")' 2>/dev/null || printf '0')"
 release_ok="$(printf '%s' "$release_json" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("ok") else "0")' 2>/dev/null || printf '0')"
 if [ "$release_ok" != "1" ]; then
+  release_category="$(printf '%s' "$release_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("error_category", ""))')"
+  case "$release_category" in
+    release_rate_limited) fail_update "$release_category" "GitHub rate-limited this PBX public IP. Wait for its API limit to reset (normally within an hour), then click Check for updates. No installer ran." ;;
+    release_tls_failed) fail_update "$release_category" "HTTPS certificate verification failed for GitHub. Check the PBX clock, CA certificates and any HTTPS inspection proxy, then retry. Certificate verification remains required." ;;
+    release_network_failed) fail_update "$release_category" "GitHub could not be reached. Check DNS, outbound HTTPS and proxy access from the PBX, then click Check for updates." ;;
+    release_feed_invalid) fail_update "$release_category" "GitHub returned an invalid or oversized release list. Retry the check; verify any proxy is returning GitHub JSON rather than a login or error page." ;;
+    update_policy_invalid) fail_update "$release_category" "The saved update policy or protected policy helper is invalid. Review Updates in General Settings and run Repair Installation if the helper is missing." ;;
+    release_metadata_invalid) fail_update "$release_category" "The selected release lacks the expected package or SHA-256 metadata. Retry after the release assets are published; no installer ran." ;;
+    release_commit_failed) fail_update "$release_category" "The selected release commit could not be verified. Check GitHub API connectivity or rate limits and retry; no installer ran." ;;
+  esac
   fail_update "release_check_failed" "The verified release feed could not be checked. Review Notification Logs for details."
 fi
 if [ "$CHECK_ONLY" = "1" ]; then
+  write_manual_progress "complete" "Update check completed. Refreshing the saved release status."
   exit 0
 fi
 if [ "$update_available" != "1" ]; then
@@ -388,7 +413,28 @@ if [ -z "$tgz_url" ] || ! [[ "$sha256" =~ ^[0-9a-f]{64}$ ]] || [ -z "$installer_
   fail_update "release_metadata_invalid" "The release metadata was incomplete or invalid."
 fi
 
-release_work="$(mktemp -d /tmp/slsmassnotifyserver-update.XXXXXX)" || fail_update "process_failed" "The update workspace could not be created."
+release_scratch="$(/usr/bin/python3 -I - <<'PY'
+import os
+from pathlib import Path
+import stat
+for name in ('/tmp', '/var/tmp'):
+    try:
+        for directory in (Path(name), *Path(name).parents):
+            info = directory.lstat()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
+                    or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
+                raise OSError('unsafe workspace')
+        usage = os.statvfs(name)
+        if usage.f_bavail * usage.f_frsize >= 56 * 1024 * 1024:
+            print(name)
+            break
+    except OSError:
+        continue
+else:
+    raise SystemExit(1)
+PY
+)" || fail_update "process_failed" "The update download needs 56 MiB free in a safe /tmp or /var/tmp directory. Free scratch space and retry; no installer ran."
+release_work="$(mktemp -d "$release_scratch/slsmassnotifyserver-update.XXXXXX")" || fail_update "process_failed" "The update workspace could not be created."
 tmp_script="$release_work/install_release.sh"
 release_manifest="$release_work/release-manifest.json"
 release_signature="$release_work/release-manifest.sig"

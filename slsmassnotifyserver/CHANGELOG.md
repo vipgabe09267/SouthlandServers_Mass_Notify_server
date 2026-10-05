@@ -1,9 +1,12 @@
 # Changelog
 
-## 0.1.5-beta — 2026-10-04
+## 0.1.5-beta — 2026-10-05
 
 New enterprise features start disabled. Existing production settings and notification/API contracts are preserved.
 
+- Check storage on the actual SLS target mounts, remove redundant parent-directory free-space floors, and move installation workspaces to `/var/tmp` when a small `/tmp` is insufficient. Keep genuine disk shortages blocked and preserve protected temporary-directory checks.
+- Add a check-only update action and restore retry controls after failures. Keep installation behind an explicit request and publisher verification; distinguish GitHub rate limits, DNS/network failures, TLS failures, invalid policy and release metadata.
+- Accept Apache DocumentRoot warnings when configuration validation succeeds; preserve fatal syntax and actual PBX/API route checks.
 - Show every registered phone separately in Help, retaining known vendors when another registration is unknown. Preserve each contact's XML format and transport; refuse to associate unresolved mixed contacts by list position.
 - Correct the default desktop minimum to the published `1.0.10-beta` numbering. Keep custom minimum policies and protocol checks intact.
 - Bootstrap missing Framework and Dashboard trust inventories from GPG-verified upstream packages at the installed versions and publisher-verified previous/candidate SLS overlays. Preserve reviewed local changes; report unknown differences before changing maintenance or protected runtime.

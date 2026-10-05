@@ -22,7 +22,7 @@ download_file() {
   local expected_sha="$3"
   local tmp
 
-  tmp="$(mktemp /tmp/sls-piper-voice.XXXXXXXX)" || return 1
+  tmp="$(mktemp "${TMPDIR:-/tmp}/sls-piper-voice.XXXXXXXX")" || return 1
   if command -v curl >/dev/null 2>&1; then
     if ! curl -fL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 900 \
       -A "SouthlandServers-Mass-Notifications-Server/0.1.5-beta" \

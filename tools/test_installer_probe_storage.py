@@ -223,7 +223,7 @@ identify() { printf '480 272 8 sRGB None'; }
         self.assertIn("verify_pjsip_contact_inventory || exit 1", SOURCE)
         self.assertEqual(len(re.findall(r"^  verify_local_api_route /api/", SOURCE, re.M)), 4)
         media = SOURCE.split('  media_probe="', 1)[1].split('  if ! runuser', 1)[0]
-        self.assertIn('media_fetch="$(mktemp /tmp/sls-mass-notify-render-fetch.XXXXXX)"', media)
+        self.assertIn('media_fetch="$(mktemp "$INSTALL_TEMP_ROOT/sls-mass-notify-render-fetch.XXXXXX")"', media)
         self.assertNotRegex(media, r'rm[^\n]*\$media_fetch')
 
 

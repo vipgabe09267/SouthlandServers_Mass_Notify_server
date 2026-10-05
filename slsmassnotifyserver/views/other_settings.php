@@ -756,10 +756,14 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						<label><?php echo _('Installed Package Version'); ?></label>
 						<p class="form-control-static"><code><?php echo htmlspecialchars($package_version ?? 'unknown'); ?></code> <span class="label <?php echo $packageStatusClass; ?>"><?php echo htmlspecialchars($packageStatus['label'] ?? 'LATEST'); ?></span></p>
 						<div class="sls-update-controls">
+							<button type="submit" class="btn btn-default btn-sm" name="slsmassnotifyserver_action" value="check_updates" formnovalidate<?php echo $updateProgressBusy ? ' disabled' : ''; ?>><i class="fa fa-search" aria-hidden="true"></i> <?php echo _('Check for updates'); ?></button>
 							<?php if ($hasPackageUpdate) { ?>
-								<button type="submit" class="btn btn-warning btn-sm" name="slsmassnotifyserver_action" value="manual_update"><i class="fa fa-refresh" aria-hidden="true"></i> <?php echo _('Install Selected Release'); ?></button>
+								<button type="submit" class="btn btn-warning btn-sm" name="slsmassnotifyserver_action" value="manual_update" formnovalidate<?php echo $updateProgressBusy ? ' disabled' : ''; ?>><i class="fa fa-refresh" aria-hidden="true"></i> <?php echo _('Install Selected Release'); ?></button>
+							<?php } elseif (($packageStatus['state'] ?? '') === 'error') { ?>
+								<button type="submit" class="btn btn-warning btn-sm" name="slsmassnotifyserver_action" value="manual_update" formnovalidate<?php echo $updateProgressBusy ? ' disabled' : ''; ?>><i class="fa fa-repeat" aria-hidden="true"></i> <?php echo _('Retry update'); ?></button>
 							<?php } ?>
 						</div>
+						<?php if (($packageStatus['message'] ?? '') !== '') { ?><p class="help-block" role="status"><?php echo htmlspecialchars($packageStatus['message'], ENT_QUOTES, 'UTF-8'); ?></p><?php } ?>
 					</div>
 				</div>
 				<div class="panel panel-default sls-update-policy" style="margin-top:16px">
@@ -998,6 +1002,17 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 		}
 		function finishUpdateDisplay(state, message) {
 			renderUpdateDisplay(state, message);
+			var controls = document.querySelector('.sls-update-controls');
+			if (controls) {
+				Array.prototype.forEach.call(controls.querySelectorAll('button'), function(button) { button.disabled = false; });
+				if (state === 'failed' && !controls.querySelector('[value="manual_update"]')) {
+					var retry = document.createElement('button');
+					retry.type = 'submit'; retry.name = 'slsmassnotifyserver_action'; retry.value = 'manual_update';
+					retry.className = 'btn btn-warning btn-sm'; retry.formNoValidate = true;
+					retry.textContent = <?php echo json_encode(_('Retry update')); ?>;
+					controls.appendChild(retry);
+				}
+			}
 			if (state === 'complete') {
 				window.setTimeout(function() {
 					var cleanUrl = new URL(window.location.href);

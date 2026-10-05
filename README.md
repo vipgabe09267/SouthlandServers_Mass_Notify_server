@@ -6,7 +6,7 @@
 
 Phone, desktop, weather, lightning, and scheduled notifications for FreePBX 17 / Debian 12. AGPL-3.0-or-later. Version `0.1.5-beta`.
 
-The 0.1.5-beta prerelease includes the repaired older-release upgrade path, faster Enterprise Labs account lookup and dashboard redirection when its warning is cancelled. Existing 0.1.5-beta installations must rerun the current signed installer to receive this same-version repair. See [authenticated installation and recovery](INSTALL.md#authenticated-installation-and-recovery).
+The 0.1.5-beta prerelease includes the repaired older-release upgrade path, storage checks for dedicated mounts and small `/tmp` filesystems, retryable update checks, faster Enterprise Labs account lookup and dashboard redirection when its warning is cancelled. Existing 0.1.5-beta installations must rerun the current signed installer to receive this same-version repair. See [authenticated installation and recovery](INSTALL.md#authenticated-installation-and-recovery).
 
 ## Enterprise Labs
 
@@ -104,6 +104,7 @@ There is no enforced global speech-synthesis concurrency limit, so passing the w
 For operational sizing, measure retained-byte growth across representative busy days and peak generation between successful cleanup runs; add that growth over the configured retention window to the measured footprint and required workspace. Terminal jobs are eligible after 30 days, generated images after 3 days, and unreferenced generated audio after 15 minutes. Active jobs, pending deliveries, and desktop history can retain media longer. Event-log retention follows the configured days; oversized or unsafe records can defer cleanup. Its temporary recovery files use the private `event-log-recovery` directory under SLS data, while live event logs keep their existing paths. Unfinished recovery files block another cleanup until reviewed. Monitor free space and deferred cleanup instead of treating those ages as disk quotas. Ordinary PBX recordings, voicemail, backups, and OS package work need their own budget.
 
 - **Platform and measurement:** FreePBX 17 / Debian 12 with supported Asterisk/PJSIP capabilities. Checks honor CPU affinity and container CPU/RAM allocations. A 5% allowance applies to reported usable RAM; CPU and free-space requirements have no allowance. Sustained CPU matters: oversubscribed virtual CPUs can delay calls and speech.
+- **Installation scratch:** workspaces use `/tmp`, or `/var/tmp` when `/tmp` is too small and the complete disk check passes there. Downloads, extracted files, recovery copies and speech dependency work use the selected location. Dedicated SLS mounts are checked directly; unused parent volumes have no separate minimum. Genuine target or scratch shortages still block installation.
 - **Admission:** installation checks both configured capacities and SLS headroom before dependency/module changes. Capacity changes use the same combined calculation. Errors identify the measured shortage and required amount. Existing clients are never deleted to satisfy a failed check.
 - **Desktop transport:** the global limit remains 32 simultaneous SSE connections, with two per desktop username. The reviewed desktop app supports five-second JSON fallback after a stalled or throttled stream. Authenticated polling, ACKs, and stream connections share a 120-request-per-minute budget per username; failed-login protection is separate, so clients behind one public IP do not share the normal traffic budget. Limiter storage supports the configured fleet up to 1,000 clients, and throttled responses include `Retry-After`. These limits and the hardware policy are not a 1,000-client load certification; test the fleet, burst rate, and PBX workload together.
 - **PBX workload:** existing calls, transcoding, conferencing, recording, codecs, and simultaneous speech jobs consume additional resources. A passing check establishes eligibility under this policy, not tested throughput. Test the intended PBX and notification workload together.
@@ -300,6 +301,8 @@ Control API audit failures are separate from action results. If audit storage ca
 
 Optional [audit forwarding](docs/AUDIT_FORWARDING.md) sends the same bounded record to the local system logger for collection by an existing remote logging agent. It defaults off. A verified successful append clears a recovered write warning while retaining historical missing-record counts; forwarding health distinguishes local acceptance from unverified remote receipt.
 
+
+**General Settings > Updates** always offers **Check for updates**, which checks the saved policy without installing. Failed checks show an actionable reason and retain **Retry update**; an explicit retry installs only a newer publisher-verified release.
 
 Manual and opt-in automatic updates verify a publisher-signed manifest covering the installer and TGZ. The updater resolves the release to a commit and installs the exact verified archive. New fixes require a new version; same-version replacements do not trigger updates. Older unsigned releases require their own tagged installer. See [installation and recovery](INSTALL.md) for offline installs, prerequisites, repair, and rollback.
 

@@ -690,12 +690,38 @@ fi
 
 if safe_request "$UPDATE_REQUEST_FILE" "manual update"; then
   ACTIVE_ACTION="update"
+  update_check_only="$(/usr/bin/python3 -I - "$UPDATE_REQUEST_FILE" <<'PY'
+import os
+import pwd
+import re
+import stat
+import sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+account = pwd.getpwnam("asterisk")
+try:
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 128
+            or info.st_uid not in (0, account.pw_uid) or info.st_mode & 0o022):
+        raise SystemExit(1)
+    body = os.read(fd, 129)
+finally:
+    os.close(fd)
+# Empty and timestamp-only markers remain compatible with prior releases.
+if body == b'' or re.fullmatch(rb'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})\n', body):
+    print('0')
+elif re.fullmatch(rb'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})\ncheck-only\n', body):
+    print('1')
+else:
+    raise SystemExit(1)
+PY
+)" || fail_maintenance "update_request_invalid" "The update request is invalid. Reload General Settings and request a new check; no updater was executed." 2
   rm -f "$UPDATE_REQUEST_FILE"
   log "Starting queued manual update"
   write_update_progress "checking" "Checking the verified release feed."
   if ! /bin/bash -n "$RUNTIME_DIR/sls_mass_notify_update.sh" >> "$LOG_FILE" 2>&1; then
     fail_maintenance "update_script_syntax_error" "The installed updater contains a shell syntax error. No updater was executed." 2
   fi
+  export SLS_MASS_NOTIFY_CHECK_ONLY="$update_check_only"
   if SLS_MASS_NOTIFY_MANUAL_UPDATE=1 /usr/bin/timeout 1800 "$RUNTIME_DIR/sls_mass_notify_update.sh" >> "$LOG_FILE" 2>&1; then
     if ! update_progress_is complete; then
       fail_maintenance "process_failed" "The update process exited without confirming completion. Review Notification Logs for details."

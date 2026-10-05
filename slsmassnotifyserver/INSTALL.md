@@ -158,6 +158,12 @@ Executable runtime, including Piper and the automatic updater, is root-owned. Mu
 
 ### Installer log and runtime errors
 
+`AH00112: Warning: DocumentRoot [/invalid/folder/name] does not exist` is an Apache warning. If `apache2ctl configtest` exits successfully, it does not stop installation. The installer still requires valid Apache syntax and reachable PBX/API routes. Do not create that directory or change an unrelated virtual host merely to silence the warning. Keep the complete `/tmp/slsmassnotifyserver-install.log`; its stage and resource report identify the actual stop condition.
+
+Free-space admission checks the filesystems containing the actual SLS directories, including dedicated or bind mounts. Shared filesystems are counted once. A small `/tmp` can use safe root-owned `/var/tmp` scratch space instead, and the selected location is printed in the log. There is no extra minimum on an unused parent directory. Insufficient target/scratch space still stops installation before dependency/module changes.
+
+After an update-check failure, use **General Settings > Updates > Check for updates** to retry without installing, or **Retry update** to check and install a newer authenticated release. Network, TLS, GitHub rate-limit, policy and metadata failures have separate messages. These actions use saved/applied update policy and do not save other form changes.
+
 The installer accepts an existing root- or Asterisk-owned regular log at `/tmp/slsmassnotifyserver-install.log`, secures the verified file, and keeps writing through its open descriptor even if FreePBX changes ownership. It does not disable Linux `protected_regular` or follow links. The uninstaller uses the same safeguards for its two diagnostic logs before removing anything.
 
 On a minimal Debian 12 FreePBX host, missing Python is installed before opening the protected log. That initial package-manager output goes to the terminal. A broken existing interpreter is not replaced automatically. AMI, contact-inventory, and unauthenticated API probes use private temporary directories that are removed after the checks; failures retain their status and diagnostic summary in the installer log.

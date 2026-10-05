@@ -112,8 +112,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 		$_SESSION['slsmassnotifyserver_other_save_result'] = $repairResult;
 		header('Location: config.php?display=slsmassnotifyserver_other' . (!empty($repairResult['success']) ? '&sls_maintenance_action=repair' : ''));
 		exit;
-	} elseif ($action === 'manual_update') {
-		$updateResult = $slsmassnotifyserver->requestManualUpdate();
+	} elseif ($action === 'manual_update' || $action === 'check_updates') {
+		$updateResult = $action === 'check_updates'
+			? $slsmassnotifyserver->requestUpdateCheck() : $slsmassnotifyserver->requestManualUpdate();
 		$_SESSION['slsmassnotifyserver_other_save_result'] = $updateResult;
 		header('Location: config.php?display=slsmassnotifyserver_other' . (!empty($updateResult['success']) ? '&sls_update_queued=1' : ''));
 		exit;

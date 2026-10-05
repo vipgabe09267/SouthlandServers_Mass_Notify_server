@@ -52,8 +52,8 @@ if len(sys.argv) > 1 and sys.argv[1].endswith("/sls_release_verify.py"):
     raise SystemExit(4 if failure == "verification" else 0)
 data = sys.stdin.read() if len(sys.argv) > 1 and sys.argv[1] == "-" else None
 if data and 'repo = os.environ.get("REPOSITORY"' in data:
-    if failure == "feed":
-        print(json.dumps({"ok": False, "message": "secret-fixture-must-not-leak"}))
+    if failure == "feed" or failure.startswith('feed:'):
+        print(json.dumps({"ok": False, "message": "secret-fixture-must-not-leak", "error_category": failure.partition(':')[2]}))
     elif failure == "unexpected":
         raise SystemExit(19)
     else:
@@ -121,6 +121,24 @@ else:
         self.assertEqual(progress.get("state"), "failed")
         self.assertFalse((self.base / "installer-called").exists())
 
+    def test_failed_check_can_be_retried_without_installing(self):
+        result, _ = self.run_update('feed', check_only=True)
+        self.assertNotEqual(result.returncode,0)
+        result, progress = self.run_update('', check_only=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(progress['state'],'complete')
+        self.assertTrue(json.loads((self.base/'status.json').read_text())['update_available'])
+        self.assertFalse((self.base/'installer-called').exists())
+
+    def test_specific_feed_failure_survives_shell_status_and_progress(self):
+        for category in ('release_rate_limited','release_tls_failed','release_network_failed',
+                         'release_feed_invalid','update_policy_invalid','release_metadata_invalid','release_commit_failed'):
+            result, progress = self.run_update('feed:'+category)
+            self.assertEqual(result.returncode,1,result.stderr)
+            self.assertEqual(progress['error_category'],category)
+            self.assertEqual(json.loads((self.base/'status.json').read_text())['error_category'],category)
+            self.assertNotIn('secret-fixture',json.dumps(progress))
+
     def test_success_and_current_report_complete(self):
         for failure in ("", "current"):
             with self.subTest(failure=failure):
@@ -143,7 +161,7 @@ else:
 
 
 class MaintenanceFailures(unittest.TestCase):
-    def run_fixture(self, updater):
+    def run_fixture(self, updater, request=''):
         with tempfile.TemporaryDirectory(prefix="sls-maintenance-regression-") as directory:
             base = Path(directory)
             runtime = base / "runtime"
@@ -151,7 +169,7 @@ class MaintenanceFailures(unittest.TestCase):
             executable(runtime / "sls_mass_notify_update.sh", updater)
             executable(runtime / "sls_storage_maintenance.py", "raise SystemExit(0)\n")
             executable(runtime / "sls_config_crypto.py", 'import json; print(json.dumps({"ok": True, "skipped": True}))\n')
-            (base / "update.request").touch()
+            (base / "update.request").write_text(request)
             source = (BIN / "sls_mass_notify_maintenance.sh").read_text()
             for old, new in {
                 "/var/lib/asterisk/SLS_Mass_Notifications_Plugin": str(base),
@@ -174,6 +192,15 @@ class MaintenanceFailures(unittest.TestCase):
             progress = json.loads((base / "update-progress.json").read_text())
             log = (base / "log").read_text()
             return result, progress, log
+
+    def test_check_only_request_is_forwarded_and_never_means_install(self):
+        updater='#!/bin/bash\n[[ "$SLS_MASS_NOTIFY_CHECK_ONLY" == 1 ]] || exit 91\nprintf \'%s\' \'{"state":"complete"}\' >"$UPDATE_PROGRESS_FILE"\n'
+        result, progress, _ = self.run_fixture(updater, '2026-10-05T00:00:00+00:00\ncheck-only\n')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(progress['state'],'complete')
+        result, progress, _ = self.run_fixture(updater, '2026-10-05T00:00:00+00:00\nrun-other-program\n')
+        self.assertEqual(result.returncode,2,result.stderr)
+        self.assertEqual(progress['error_category'],'update_request_invalid')
 
     def test_syntax_error_is_fatal_before_updater_execution(self):
         result, progress, log = self.run_fixture("#!/bin/bash\necho 'unclosed\n")
@@ -339,6 +366,17 @@ main
         result = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertNotIn("install finished", result.stdout)
+
+    def test_missing_documentroot_warning_does_not_fail_valid_syntax(self):
+        source = (ROOT / "tools" / "install_release.sh").read_text()
+        block = re.search(r'  /usr/sbin/apache2ctl configtest >>"\$\{INSTALL_LOG_OUTPUT:-\$LOG_FILE\}" 2>&1 \|\| \{.*?\n  \}', source, re.S).group()
+        command = 'log() { printf "%s\\n" "$*"; }; LOG_FILE=/dev/null;\n'
+        command += 'apache_fixture() { printf "AH00112: Warning: DocumentRoot [/invalid/folder/name] does not exist\\nSyntax OK\\n" >&2; return 0; }\n'
+        command += block.replace('/usr/sbin/apache2ctl configtest','apache_fixture')
+        command += '\nprintf "accepted\\n"\n'
+        result = subprocess.run(['bash','-c',command],capture_output=True,text=True,timeout=5)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('accepted',result.stdout)
 
 
 if __name__ == "__main__":
