@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from copy import deepcopy
 from unittest import mock
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -34,6 +35,29 @@ class Idle(unittest.TestCase):
         path=self.base/'baseline.json';path.write_text(json.dumps(self.check.inspect()));path.chmod(0o600);return path
     def process(self,args):
         directory=self.proc/'999999';directory.mkdir(exist_ok=True);(directory/'cmdline').write_bytes(b'\0'.join(value.encode() for value in args)+b'\0')
+    def test_idle_stale_collector_can_be_repaired_without_rewriting_history(self):
+        self.state['collector']['heartbeat_tick'] = 1
+        self.save('phone-admission.json', self.state)
+        before = (self.data/'phone-admission.json').read_bytes()
+        with self.assertRaises(m.IdleError): self.check.inspect()
+        report = self.check.inspect(repair_collector=True)
+        self.assertEqual(report['closed_phone_batches'], 1)
+        self.assertEqual(before, (self.data/'phone-admission.json').read_bytes())
+        self.process(['python3', 'sls_mass_notify_phone_agi.py'])
+        with self.assertRaises(m.IdleError): self.check.inspect(repair_collector=True)
+
+    def test_orphan_repair_requires_final_reconciliation_and_preserves_closed_rows(self):
+        orphan = 'd'*32
+        self.state['batches'][orphan] = {'status': 'reserved', 'created_at': 2}
+        self.save('phone-admission.json', self.state)
+        path = self.base/'repair-before.json'
+        path.write_text(json.dumps(self.check.inspect(repair_collector=True))); path.chmod(0o600)
+        with self.assertRaises(m.IdleError): self.check.inspect(path)
+        self.state['batches'][orphan]['status'] = 'closed'
+        self.state['batches'][orphan]['closed_at'] = 3
+        self.save('phone-admission.json', self.state)
+        self.check.inspect(path)
+
     def test_history_inspection_is_read_only_and_never_prints_tokens_or_destinations(self):
         path=self.data/'phone-admission.json';before=path.read_bytes();info=path.stat()
         result=self.check.inspect();encoded=json.dumps(result)
@@ -57,6 +81,51 @@ class Idle(unittest.TestCase):
         for status in ('active','reserved',None):
             self.state['batches'][self.token]['status']=status;self.save('phone-admission.json',self.state)
             with self.assertRaisesRegex(m.IdleError,'unclosed'):self.check.inspect()
+    def voicemail_batch(self):
+        return {'status':'closed','created_at':900,'closed_at':999,
+                'channels':{'contact':{'kind':'contact','dial':'PJSIP/1000','ended_at':999,
+                                       'answered_at':None,'joined_at':None,'dial_status':'NOANSWER'}},
+                'vm_fallback':{'sound':'sls-voicemail/'+self.token,'expires_at':1100,'expires_tick':200,
+                               'targets':{'1000':{'dials':['PJSIP/1000'],'claimed_token':None}}}}
+    def test_old_collector_pending_voicemail_refuses_upgrade_without_changing_history(self):
+        self.state['batches'][self.token]=self.voicemail_batch()
+        path=self.save('phone-admission.json',self.state);before=path.read_bytes();inode=path.stat().st_ino
+        for repair in (False,True):
+            with self.assertRaisesRegex(m.IdleError,'voicemail fallback is pending'):
+                self.check.inspect(repair_collector=repair)
+        self.assertEqual(path.read_bytes(),before);self.assertEqual(path.stat().st_ino,inode)
+    def test_completed_or_ineligible_voicemail_does_not_block_upgrade(self):
+        variants=[];base=self.voicemail_batch()
+        claimed=deepcopy(base);claimed['vm_fallback']['targets']['1000']['claimed_token']='d'*32;variants.append(claimed)
+        failed=deepcopy(base);failed['voicemail_failures']={'1000':'phone_voicemail_mailbox_changed'};variants.append(failed)
+        for field,value in (('answered_at',998),('joined_at',998),('outcome_uncertain',True),('ended_at',None),('dial_status','ANSWER')):
+            item=deepcopy(base);item['channels']['contact'][field]=value;variants.append(item)
+        for field,value in (('expires_at',1000),('expires_tick',100)):
+            item=deepcopy(base);item['vm_fallback'][field]=value;variants.append(item)
+        unrecorded=deepcopy(base);unrecorded['vm_fallback']['sound']=None;variants.append(unrecorded)
+        for batch in variants:
+            with self.subTest(batch=batch):
+                self.state['batches'][self.token]=batch;self.save('phone-admission.json',self.state)
+                self.assertTrue(self.check.inspect()['ok'])
+    def test_offline_contact_voicemail_is_pending_and_uninstall_exception_stays_strict(self):
+        batch=self.voicemail_batch();batch['vm_fallback']['targets']['1000']['dials']=[];batch['channels']={}
+        self.state['batches'][self.token]=batch;self.save('phone-admission.json',self.state)
+        with self.assertRaisesRegex(m.IdleError,'voicemail fallback is pending'):self.check.inspect()
+        self.assertEqual(len(self.check.phone_history(False,allow_pending_voicemail=True)),1)
+        self.state['batches'][self.token]['status']='active';self.save('phone-admission.json',self.state)
+        with self.assertRaisesRegex(m.IdleError,'unclosed'):
+            self.check.phone_history(False,allow_pending_voicemail=True)
+    def test_malformed_voicemail_expiry_targets_and_claims_fail_closed(self):
+        base=self.voicemail_batch();variants=[]
+        for value in (None,True,float('inf'),'later'):
+            item=deepcopy(base);item['vm_fallback']['expires_tick']=value;variants.append(item)
+        for key,value in (('targets',[]),('targets',{'1000':{'dials':'bad'}})):
+            item=deepcopy(base);item['vm_fallback'][key]=value;variants.append(item)
+        claim=deepcopy(base);claim['vm_fallback']['targets']['1000']['claimed_token']='bad';variants.append(claim)
+        for batch in variants:
+            self.state['batches'][self.token]=batch;path=self.save('phone-admission.json',self.state);before=path.read_bytes()
+            with self.assertRaises(m.IdleError):self.check.inspect()
+            self.assertEqual(path.read_bytes(),before)
     def test_enabled_idle_paging_is_supported_without_reading_configuration(self):
         self.save('mass-notifications.config',{'live_paging':{'enabled':'1'},'secret':'do not read'})
         self.assertTrue(self.check.inspect()['ok'])

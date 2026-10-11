@@ -41,4 +41,11 @@ foreach ([['options' => ['_test_channels' => ['sms']]], ['options' => ['_is_test
     catch (InvalidArgumentException $expected) { $checks++; continue; }
     throw new RuntimeException('An internal option or malformed announcement field was accepted.');
 }
+$named=ApiSecurity::issue(['name'=>'Labs fixture','scopes'=>['send'],'audience'=>['unrestricted'=>true]])['credential'];
+$restricted=$named;$restricted['audience']['unrestricted']=false;
+foreach(['browser_recipient_ids'=>['sub_'.str_repeat('a',24)],'connector_ids'=>['conn_'.str_repeat('b',24)]] as $field=>$ids){
+ $check(!ApiSecurity::permitsResolvedAnnouncement($restricted,[$field=>$ids],[]),'Restricted API key obtained Labs recipient access');
+ $check(ApiSecurity::permitsResolvedAnnouncement($named,[$field=>$ids],[]),'Named unrestricted API sender rejected Labs recipient selection');
+ try{ControlContract::announcementInput(['action'=>'send_announcement',$field=>[false]]);throw new RuntimeException('Malformed Labs identifier accepted');}catch(InvalidArgumentException $expected){$checks++;}
+}
 echo "Control API discovery, recipient isolation, stale identities, preview and explicit test metadata: $checks checks passed.\n";

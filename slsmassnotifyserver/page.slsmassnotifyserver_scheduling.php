@@ -44,6 +44,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 		$_POST = \SLS\MassNotify\RecipientSelection::decode($_POST);
 		if ($action === 'save_scheduled_announcement') {
 			$result = $slsmassnotifyserver->saveScheduledAnnouncement($_POST);
+		} elseif ($action === 'save_schedule_programmes') {
+			$result = $slsmassnotifyserver->saveScheduleProgrammes($_POST);
 		} elseif ($action === 'delete_scheduled_announcement') {
 			$result = $slsmassnotifyserver->deleteScheduledAnnouncement($_POST['schedule_id'] ?? '');
 		} elseif ($action === 'toggle_scheduled_announcement') {

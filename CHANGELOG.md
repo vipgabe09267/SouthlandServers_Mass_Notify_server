@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.1.6-beta — 2026-10-10
+
+- Include authenticated offline removal through `slsconsole uninstall`, including when the operational installer helper is missing. Drain notification workers before teardown and refuse active phone delivery. Preserve configuration, media, schedules, delivery history and logs by default; recover interrupted teardown using approved stock states. Refuse unexpected cron read/write failures and preserve unrelated jobs.
+- Coordinate collector voicemail submissions and expired-recording cleanup with installation and removal. Refuse still-pending fallbacks from older collectors before activation, leaving their evidence intact for a safe retry.
+- Bound all SLS email submissions with shared durable limits and local Postfix queue backpressure. Fence system-fault and Weather email handoffs before submission so interruptions or uncertain receipts cannot replay accepted mail.
+- Keep fresh-install email disabled until Postfix and recipients are configured; clarify the Delivery setup and preserve existing upgrade routes.
+- Route all five SLS cron jobs through fixed commands with bounded private diagnostics and outer output redirection, preventing worker output from generating unattended cron email.
+- Add a mandatory administrator beta warning after setup and upgrades. Require five visible seconds and a matching server-side challenge before confirmation; omit dismissal controls and save a separate acknowledgment for each FreePBX administrator account in the encrypted central configuration. A prior installation-wide acknowledgment counts only for its recorded administrator. Sequence the Enterprise Labs warning afterward. Keep the countdown running through page resizing while excluding hidden or unfocused window time.
+
+This corrected prerelease replaces the withdrawn October 10 package, addressing the reported legacy-permission upgrade failure and the two CI fixture failures. PBXs already running the earlier `0.1.6-beta` need the authenticated manual installer because automatic updates skip equal versions.
+
+- Recover recognized legacy SLS worker/admission files through root-only, no-follow descriptors after authenticating the previous release. Preserve journal bytes and existing lock inodes; reject links, unexpected ownership, oversized input and unrecognized layouts.
+- Exclude only the SLS data directory from FreePBX recursive permission normalization. Preserve unrelated native chown settings and retain recovery evidence for managed changes.
+- Verify the approved collector unit and a fresh authenticated heartbeat after permission recovery, before pausing workers. Keep unavailable collectors nonfatal during ordinary FreePBX reloads.
+- Correct the resource preflight fixture to use private Framework metadata and pin the native voicemail package in CI. Report missing native voicemail modules explicitly.
+- Add default-on, independent voicemail fallback controls for Weather, Lightning and live dial-in paging. Save prepared weather/lightning audio or the caller's recorded live page through the selected extension's native FreePBX mailbox only when no selected handset answered. Exclude the caller, prevent duplicate deposits, preserve normal mailbox length/capacity policies and report failed fallback outcomes. Manual alert tests, ordinary Dashboard TTS and external calls retain their previous handling.
+- Include the authenticated voicemail helper in installation, executable permissions and restore parity checks. Keep mailboxes optional instead of blocking installation on a PBX without voicemail enabled.
+- Report rejected or unfinished live-page recordings as voicemail failures after recording finalization, rather than leaving delivery pending until expiry.
+- Preserve authenticated recovery evidence across signals, forced termination and interrupted upgrades. Add durable transaction discovery, read-only installation diagnostics, offline support bundles and a disposable full-PBX VM qualification harness.
+- Check the actual served PHP handler, runtime account, process functions and compatible Python wheel ABI before activation. Bootstrap an absent Dashboard only from an independently verified stock package.
+- Move display-only phone discovery into a bounded background snapshot. Keep current registration and authorization checks at send time, and distinguish stale health probes from historical completed jobs.
+- Share bounded speech concurrency, queue deadlines, media workspace admission and minimum-free-space enforcement across announcement and weather producers. Protect active media and saved recording references during cleanup.
+- Replace the chart bundle containing Moment 2.24.0 with a compatible numeric chart build; inventory embedded dependencies and add advisory scanning.
+- Add searchable, paginated System Recordings with incomplete-scan warnings and shared A/B-day calendar programmes with holidays and whole-day substitutions.
+- Add optional operator access expiry in the PBX timezone, applying it to sign-ins, current sessions and queued authorization. Changing expiry revokes prior authentication bindings and reset links.
+- Add durable Control API announcement idempotency and additive queued browser-push, ntfy and Gotify delivery. Freeze exact subscriber/connector identities, preserve expiry and redact credentials.
+- Route reviewed incident language variants per recipient with immutable cohorts, aligned speech, explicit fallback, aggregate all-clear handling and per-job receipts.
+- Add provider OAuth renewal/revocation, reviewed directory mappings and large-deactivation confirmation. Archive completed Labs operations and drill reports without erasing replay protection.
+- Add offline-channel readiness, speaker firmware/acceptance records, device-enforced timed door access and local signed CAP Test/Exercise validation. These integrations remain Labs features with real-device/provider qualification required.
+- Improve account, identity, integration, schedule and operator review screens. Include generated-media and speech settings, precise health diagnostics, recipient names, connection counts and budgeted SMS cost.
+- Preserve private Enterprise Labs and idempotency journal permissions during upgrades so history remains usable and replay checks stay enforced.
+- Bound decoded System Recordings and raw synthesized speech while they are being written; reject oversized output, remove partial files and reserve the complete conversion workspace.
+- Show cached receiving-phone counts, formats and unavailable destinations on paging groups. Bind operator connection indicators to the current desktop identity.
+- Block direct browser-push and manual Weather tests from bypassing notification failover authority, including policy changes during preparation.
+- Include served PHP capabilities, authenticated collector readiness, publisher trust and durable installation-stage details in the read-only installation doctor.
+- Correct voice-catalog counts, speech-concurrency guidance, desktop minimum-version policy and enterprise integration contracts in the documentation.
+- Piper voice downloads clean private staging files after hangup, interrupt or termination, preserving the previous model.
+- Separate Weather enablement from ordinary Labs delivery and automation triggers. Preserve runtime stop at notification and actuation boundaries while allowing authorized responses, sensor health, status and read-only evidence.
+- Enforce runtime stop for standalone edge publication and direct cluster effects before consuming queued jobs or replay claims. Keep status and existing device receipts available, retaining original expiry and consumed identities on resume.
+- Accept bounded kernel reservations on nominal 4 GiB hosts while enforcing container quotas. Explain when lower capacity cannot reduce the minimum baseline.
+- Separate runtime, preparation and installation space checks. Measure authenticated destination payloads, logical recovery sizes and required inodes; reject volatile persistent paths and completely recalculate relocated scratch budgets.
+- Avoid overlapping storage scans and report unreadable paths, scan deadlines and entry limits explicitly.
+- Activate and recover modules on their own filesystem, supporting separate `/tmp` and `/var/tmp` mounts.
+- Repair independently verified idle collectors without erasing delivery history. Require final orphan reconciliation and a fresh authenticated heartbeat. Reject custom or unrestorable service states before mutation.
+- Reverify Framework/Dashboard inventories after upstream version changes. Keep unknown changes subject to independent review and approve previous releases before recovery snapshots.
+- Perform optional dependency, provider and spool repairs after release approval. Add `--inspect` without package, service, key, configuration, trust-pointer or failure-notice changes.
+- Authenticate protected root imports before loading crypto and updater policies; avoid generated bytecode. Use descriptor-based spool repairs and actionable missing-AES errors.
+- Recognize Asterisk `require` and `preload-require` directives in the modules section. Check Piper mount namespaces and atomic replacement support before optional repairs, and verify the served PHP handler separately from CLI PHP.
+- Enforce byte limits on voice and updater downloads even when a server omits the file length. Limit retries, HTTPS redirects and deadlines; clean interrupted voice downloads and preserve the prior model. Append installation logs after coordination instead of truncating concurrent evidence.
+- Use the same dial-in paging audience across PHP and Python. Verify the caller’s channel and exclude its contact while retaining other handsets and device aliases. Preserve admission and origin-binding failure codes in paging diagnostics.
+- Explain when a paging group has no available receiving phones, including registration loss during admission. Log the affected extensions without PINs or contact addresses. Page registered recipients in mixed groups and recover on the next call after registration, without changing the extension or PIN.
+- Update installation, resource, security and release documentation. Add isolated regressions for the reported RAM, separate mounts, stale collectors, service overrides, stock-version changes, unsafe paths and interrupted downloads; exercise real Asterisk PIN, AMI admission and Page dispatch.
+
 ## 0.1.5-beta — 2026-10-05
 
 - Allow FreePBX reloads to finish when the SLS phone collector is unavailable or reconnecting. Keep an actionable warning and current SLS health diagnostics; retain strict installation/restore checks and authenticated-heartbeat requirements for new phone audio.

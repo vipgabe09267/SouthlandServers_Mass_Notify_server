@@ -149,7 +149,7 @@ class ConfigFailClosedTest(unittest.TestCase):
         cls.source.chmod(0o750)
         (cls.source / "methods.json").write_text(extracted.stdout, encoding="utf-8")
         shutil.copyfile(ROOT / "slsmassnotifyserver/api/sls-mass-notify/config-crypto.php", cls.source / "config-crypto.php")
-        for name in ("EnterpriseAdministration.php", "LabsSafety.php"):
+        for name in ("EnterpriseAdministration.php", "LabsSafety.php", "BetaNotice.php"):
             shutil.copyfile(ROOT / "slsmassnotifyserver" / name, cls.source / name)
         for path in cls.source.iterdir():
             os.chown(path, 0, cls.account.pw_gid)

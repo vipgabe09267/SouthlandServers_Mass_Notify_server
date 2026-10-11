@@ -721,7 +721,7 @@ function desktop_stream_flush(): void
 {
     // Apache/FastCGI can hold small writes even after PHP flush(). Pad every
     // delivery/heartbeat batch, not only authentication, with a valid comment.
-    // This also makes a disconnected client visible on the next heartbeat.
+    // Proxy/TCP disconnect detection can require later flushes.
     echo ':' . str_repeat(' ', 8192) . "\n\n";
     @flush();
 }

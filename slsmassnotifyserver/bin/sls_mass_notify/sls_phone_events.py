@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sls_phone_admission import DATA, PhoneAdmissionError, PhoneAdmissionStore, PhoneAmi, read_settings, collector_health
 from sls_emergency_observer import EmergencyObserver
 from sls_nws_delivery_claims import _open_directory, _validate_parent_directory, _secure_file_metadata
+from sls_phone_inventory import start_refresh_worker
+from sls_voicemail import start_voicemail_worker
 
 
 def collect(store, settings, *, ami_factory=PhoneAmi, should_stop=lambda: False):
@@ -28,10 +30,13 @@ def collect(store, settings, *, ami_factory=PhoneAmi, should_stop=lambda: False)
                 record.last_error = time.monotonic()
     generation = os.urandom(16).hex()
     store.mark_event_gap()
+    display_stop = start_refresh_worker(store.directory)
+    voicemail_stop = None
     try:
         with ami_factory(settings, events=True, callback=record) as ami:
             ami.action({'Action': 'Ping'})
             store.collector_heartbeat(generation)
+            voicemail_stop = start_voicemail_worker(store.directory)
             heartbeat = time.monotonic()
             while not should_stop():
                 if time.monotonic() - heartbeat >= 5:
@@ -47,6 +52,9 @@ def collect(store, settings, *, ami_factory=PhoneAmi, should_stop=lambda: False)
                     continue
                 record(event)
     finally:
+        if voicemail_stop is not None:
+            voicemail_stop.set()
+        display_stop.set()
         store.mark_event_gap()
 
 

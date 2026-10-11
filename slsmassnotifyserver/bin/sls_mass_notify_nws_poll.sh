@@ -1022,9 +1022,18 @@ generate_tts_audio() {
   generation_timeout=$((PIPER_MAX_SECONDS * 2 + 30))
   [ "$generation_timeout" -lt 25 ] && generation_timeout=25
   [ "$generation_timeout" -gt 900 ] && generation_timeout=900
-  if ! printf '%s\n' "$text" | timeout "$generation_timeout" "$PIPER_BIN" --model "${PIPER_NWS_VOICE:-$PIPER_VOICE}" --volume "1.00" --output-file "$tmp_file" >> "$LOG" 2>&1; then
+  if printf '%s\n' "$text" | timeout "$((generation_timeout + 65))" /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_speech_admission.py --max-seconds "$PIPER_MAX_SECONDS" -- "$PIPER_BIN" --model "${PIPER_NWS_VOICE:-$PIPER_VOICE}" --volume "1.00" --output-file "$tmp_file" >> "$LOG" 2>&1; then
+    :
+  else
+    local synthesis_status=$?
     rm -f "$tmp_file"
-    echo "$(date): ERROR — Piper TTS generation failed for $event" >> "$LOG"
+    if [ "$synthesis_status" -eq 65 ]; then
+      local synthesis_error="Weather speech exceeds the configured maximum of ${PIPER_MAX_SECONDS} seconds or its reserved output bound. Shorten the message or increase Maximum Speech Duration; no speech was queued."
+      echo "ERROR: $synthesis_error" | tee -a "$LOG" >&2
+      printf '%s\n' "SLS_TTS_ERROR:$synthesis_error"
+    else
+      echo "$(date): ERROR — Piper TTS generation failed for $event (exit code $synthesis_status). Check the voice, speech queue and Storage diagnostics." >> "$LOG"
+    fi
     return 1
   fi
 
@@ -1087,8 +1096,15 @@ build_audio_sequence() {
     combined_base="$(printf '%s' "$combined_base" | tr -cd 'A-Za-z0-9_-')"
     combined_file="${SLS_TTS_DIR}/${combined_base}.wav"
     silence_file="${SLS_TTS_DIR}/${combined_base}.silence.$$.$RANDOM.wav"
-    if sox -n -r 8000 -c 1 -b 16 "$silence_file" trim 0.0 1.0 >> "$LOG" 2>&1 \
-      && sox "$silence_file" "${files[@]}" -r 8000 -c 1 -b 16 "$combined_file" >> "$LOG" 2>&1; then
+    local source_file reserve_bytes=16044 source_bytes
+    for source_file in "${files[@]}"; do
+      source_bytes="$(stat -c %s -- "$source_file")" || return 1
+      [[ "$source_bytes" =~ ^[0-9]+$ ]] || return 1
+      reserve_bytes=$((reserve_bytes + source_bytes))
+    done
+    /usr/bin/timeout --kill-after=1 8 /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_speech_admission.py --reserve-media-bytes "$((reserve_bytes * 2))" >> "$LOG" 2>&1 || return 1
+    if timeout --kill-after=2 15 sox -n -r 8000 -c 1 -b 16 "$silence_file" trim 0.0 1.0 >> "$LOG" 2>&1 \
+      && timeout --kill-after=2 30 sox "$silence_file" "${files[@]}" -r 8000 -c 1 -b 16 "$combined_file" >> "$LOG" 2>&1; then
       rm -f "$silence_file"
       chown asterisk:asterisk "$combined_file" 2>/dev/null || true
       chmod 644 "$combined_file"
@@ -1228,21 +1244,74 @@ queue_audio_to_recipients() {
     report_fault "delivery" "Shared paging queue could not reserve these recipients; no audio was submitted" "$event" "$alert_id"
     return 1
   fi
-  local admission_lines phone_token
+  local admission_lines phone_token admission_request admission_json accepted_count voicemail_copy_failed
   local -a admitted_recipients=()
-  if ! admission_lines="$(/usr/bin/timeout --signal=TERM --kill-after=2 65 /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_phone_admission.py \
-      --recipients "$reservation_recipients" --service nws --wait 20 --format lines)"; then
-    printf '%s\n' "$admission_lines" >> "$LOG"
+  if ! admission_request="$(SLS_VM_RECIPIENTS="$reservation_recipients" SLS_VM_SOUND="$sound_sequence" \
+      SLS_VM_DURATION="$page_hold_seconds" SLS_VM_ENABLED="${NWS_VOICEMAIL_ENABLED:-1}" \
+      SLS_VM_SCOPE="${NWS_ZONE_GROUP_ID_OVERRIDE:-}" SLS_VM_FEATURE="$ALERT_B64" \
+      SLS_VM_CHAIN="$ALERT_KEY" SLS_VM_EVENT="$event" SLS_VM_SEVERITY="${SEVERITY:-}" SLS_VM_EVENT_ID="$alert_id" \
+      SLS_VM_ZONE="${NWS_ZONE_OVERRIDE:-${NWS_ZONE:-}}" \
+      /usr/bin/python3 -I - "$CONFIG_JSON_FILE" <<'PY'
+import base64, hashlib, json, os, re, sys
+sys.path.insert(0, '/usr/local/bin/sls_mass_notify')
+voicemail = os.environ['SLS_VM_ENABLED'] == '1'
+scope = os.environ['SLS_VM_SCOPE'] if voicemail else ''
+zone = os.environ['SLS_VM_ZONE']
+if voicemail and not scope:
+    from sls_config_crypto import read_config
+    config = read_config(sys.argv[1])
+    groups = config.get('nws_zones') or [{'name': 'Primary Weather Zone', 'zone': config.get('nws_zone', zone)}]
+    candidates = [row for row in groups if isinstance(row, dict) and row.get('zone') == zone]
+    if len(candidates) != 1:
+        raise ValueError('The Weather voicemail source area could not be identified safely.')
+    group = candidates[0]
+    name = re.sub(r'\s+', ' ', str(group.get('name') or zone)).strip()[:64]
+    scope = str(group.get('id') or 'nws_' + hashlib.sha256(f'{name.lower()}|{zone}'.encode()).hexdigest()[:12])
+context = None
+if voicemail:
+    from sls_notification_destinations import weather_source_validity
+    feature = json.loads(base64.b64decode(os.environ['SLS_VM_FEATURE'], validate=True))
+    context = {'event': os.environ['SLS_VM_EVENT'], 'severity': os.environ['SLS_VM_SEVERITY'],
+        'source_validity': weather_source_validity('nws', scope, feature=feature,
+            chain_key=os.environ['SLS_VM_CHAIN'], zone=zone)}
+print(json.dumps({'internal': os.environ['SLS_VM_RECIPIENTS'].split(','), 'service': 'nws',
+    'correlation': 'vm-' + hashlib.sha256((scope + '|' + os.environ['SLS_VM_EVENT_ID']).encode()).hexdigest() if voicemail else '',
+    'wait_seconds': 20, 'sound': os.environ['SLS_VM_SOUND'], 'duration': int(os.environ['SLS_VM_DURATION']),
+    'voicemail': voicemail, 'voicemail_scope': scope, 'voicemail_context': context}))
+PY
+  )"; then
+    report_fault "delivery" "Weather phone admission could not validate its alert and trigger area; no audio was submitted" "$event" "$alert_id"
+    return 1
+  fi
+  if ! admission_json="$(printf '%s' "$admission_request" | /usr/bin/timeout --signal=TERM --kill-after=2 65 \
+      /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_phone_admission.py --request-stdin)"; then
+    printf '%s\n' "$admission_json" >> "$LOG"
     report_fault "delivery" "Phone device capacity or registered contacts could not be admitted; no new audio was submitted"
+    return 1
+  fi
+  if ! admission_lines="$(printf '%s' "$admission_json" | /usr/bin/python3 -c '
+import json, sys
+result = json.load(sys.stdin)
+if result.get("ok") is not True: raise ValueError("Invalid phone admission response")
+targets = result["targets"]
+fallback = result.get("voicemail_targets", []) if not result.get("voicemail_failure_code") else []
+print(result["token"])
+print(len(set(targets) | set(fallback)))
+print(1 if result.get("voicemail_failure_code") else 0)
+for extension in targets: print(extension)
+')"; then
+    report_fault "delivery" "Phone admission returned an invalid result; no new audio was submitted" "$event" "$alert_id"
     return 1
   fi
   mapfile -t admitted_recipients <<< "$admission_lines"
   phone_token="${admitted_recipients[0]:-}"
+  accepted_count="${admitted_recipients[1]:-0}"
+  voicemail_copy_failed="${admitted_recipients[2]:-0}"
   if [[ ! "$phone_token" =~ ^[a-f0-9]{32}$ ]]; then
     report_fault "delivery" "Phone admission returned an invalid ticket; no new audio was submitted"
     return 1
   fi
-  admitted_recipients=("${admitted_recipients[@]:1}")
+  admitted_recipients=("${admitted_recipients[@]:3}")
   queued_delivery_is_current || return 1
 
   for recipient in "${admitted_recipients[@]}"; do
@@ -1279,12 +1348,16 @@ CALL
     queued=$((queued + 1))
   done
 
-  if [ "$queued" -ne "${#NWS_ALERT_RECIPIENTS[@]}" ]; then
+  if [ "$voicemail_copy_failed" = "1" ]; then
+    report_fault "delivery" "Weather voicemail audio could not be retained safely. Review storage and protected audio permissions; any queued phone audio is unaffected" "$event" "$alert_id"
+    return 1
+  fi
+  if [ "$queued" -ne "${#admitted_recipients[@]}" ] || [ "$accepted_count" -ne "${#NWS_ALERT_RECIPIENTS[@]}" ]; then
     report_fault "delivery" "Not every configured NWS recipient accepted an audio job; some jobs may already be queued" "$event" "$alert_id"
     return 1
   fi
 
-  echo "$(date): Alert call files queued for $event to $queued recipient(s) — ${sound_sequence}" >> "$LOG"
+  echo "$(date): $event: $queued phone call file(s) queued; $accepted_count destination(s) admitted for phone audio or pending voicemail — ${sound_sequence}" >> "$LOG"
   return 0
 }
 
@@ -1538,13 +1611,13 @@ if [ -n "$INPUT_PAYLOAD" ]; then
 else
 	ALERTS=$(curl -fsS --retry 3 --retry-all-errors --retry-connrefused --connect-timeout 10 --max-time 30 --max-filesize 10485760 \
     -H "Accept: application/geo+json" \
-    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.5-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
+    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.6-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
     "${NWS_API_BASE_URL%/}/alerts/active?zone=${NWS_ZONE}&status=actual" 2>>"$LOG") || ALERTS=""
   if [ -z "$ALERTS" ]; then
     echo "$(date): Initial NWS request failed; retrying over IPv4" >> "$LOG"
 	  ALERTS=$(curl -4 -fsS --retry 2 --retry-all-errors --retry-connrefused --connect-timeout 10 --max-time 30 --max-filesize 10485760 \
       -H "Accept: application/geo+json" \
-	    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.5-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
+	    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.6-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
       "${NWS_API_BASE_URL%/}/alerts/active?zone=${NWS_ZONE}&status=actual" 2>>"$LOG") || ALERTS=""
   fi
 fi

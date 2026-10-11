@@ -21,6 +21,9 @@ _config_crypto_spec.loader.exec_module(_config_crypto)
 _cluster_spec = importlib.util.spec_from_file_location('sls_cluster_guard', Path(__file__).resolve().with_name('sls_cluster_guard.py'))
 _cluster_guard = importlib.util.module_from_spec(_cluster_spec)
 _cluster_spec.loader.exec_module(_cluster_guard)
+_mail_spec = importlib.util.spec_from_file_location('sls_branded_mail_admission', Path(__file__).resolve().with_name('sls_mail_admission.py'))
+_mail_admission = importlib.util.module_from_spec(_mail_spec)
+_mail_spec.loader.exec_module(_mail_admission)
 
 
 DEFAULT_CONFIG = Path("/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config")
@@ -251,6 +254,7 @@ def send_branded_email(config, subject, body, event="", severity="", recipients_
     if logo is not None:
         message.get_payload()[1].add_related(logo.read_bytes(), maintype="image", subtype="png", cid="<sls-mass-notify-logo>", filename="Southland-Servers-Group.png", disposition="inline")
     _cluster_guard.fence_legacy(config)
+    _mail_admission.reserve('system' if event == 'System Fault' else 'alert', len(recipients))
     subprocess.run(
         [str(sendmail), "-oi", "-t", "-f", from_addr],
         input=message.as_bytes(),

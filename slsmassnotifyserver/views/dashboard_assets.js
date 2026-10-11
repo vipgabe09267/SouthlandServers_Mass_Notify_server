@@ -3,7 +3,7 @@
     const script = document.currentScript;
     const $ = window.jQuery;
     if (!script || !$ || !$.ajaxPrefilter) return;
-    const localChart = new URL('../assets/vendor/chartjs/Chart.bundle-2.9.4.min.js', script.src);
+    const localChart = new URL('../assets/vendor/chartjs/Chart-2.9.4.min.js', script.src);
     if (localChart.origin !== window.location.origin) return;
     $.ajaxPrefilter('script', function (options) {
         let url;

@@ -42,7 +42,10 @@ class InstallerLogSourceContract(unittest.TestCase):
         main = SOURCE.split("\nmain() {", 1)[1]
         self.assertIn('open_root_owned_file INSTALL_LOG_FD "$LOG_FILE" log', main)
         self.assertIn('INSTALL_LOG_OUTPUT="/proc/${BASHPID}/fd/$INSTALL_LOG_FD"', main)
-        self.assertIn(': >"$INSTALL_LOG_OUTPUT"', main)
+        self.assertNotIn(': >"$INSTALL_LOG_OUTPUT"', main)
+        self.assertIn('>>"$INSTALL_LOG_OUTPUT"', main)
+        self.assertLess(main.index('acquire_update_coordination'), main.index('open_root_owned_file'))
+        self.assertLess(main.index('acquire_maintenance_coordination'), main.index('open_root_owned_file'))
         self.assertLess(main.index("open_root_owned_file"), main.index("require_freepbx"))
 
     def test_log_redirects_do_not_reopen_original_path(self):
@@ -270,12 +273,15 @@ class InstallerLogCompatibility(unittest.TestCase):
     def test_main_log_preflight_stops_before_all_real_installation(self):
         path = self.make_file(owner=self.asterisk.pw_uid, mode=0o664)
         # This is the real main log initialization only. The first platform
-        # function is replaced with a fixture and exits before any PBX, package,
-        # network, config, maintenance lock, or Dashboard operation can run.
+        # function and coordination are replaced with fixtures; no PBX, package,
+        # network, config, host lock, or Dashboard operation can run.
         result = source_shell(
             'LOG_FILE="$1"\n'
             'fixture_owner="$2:$3"\n'
             'guard_config_on_exit() { :; }\n'
+            'preflight_profile_identity() { :; }\n'
+            'acquire_update_coordination() { :; }\n'
+            'acquire_maintenance_coordination() { :; }\n'
             'preflight_hardware_requirements() { :; }\n'
             'require_freepbx() {\n'
             '  printf "preflight fixture\\n" >>"$INSTALL_LOG_OUTPUT"\n'
@@ -287,7 +293,23 @@ class InstallerLogCompatibility(unittest.TestCase):
             path, self.asterisk.pw_uid, self.asterisk.pw_gid,
         )
         self.assertEqual(result.returncode, 79, result.stderr)
-        self.assertEqual(path.read_bytes(), b"preflight fixture\nafter chown\n")
+        contents = path.read_text()
+        self.assertTrue(contents.startswith('existing diagnostic\n'))
+        self.assertIn('SLS Mass Notify installation started:', contents)
+        self.assertTrue(contents.endswith('preflight fixture\nafter chown\n'))
+
+    def test_failed_coordination_does_not_open_or_alter_existing_log(self):
+        path = self.make_file(owner=self.asterisk.pw_uid, mode=0o664)
+        before = self.identity(path)
+        result = source_shell(
+            'LOG_FILE="$1"\n'
+            'acquire_update_coordination() { return 78; }\n'
+            'preflight_profile_identity() { :; }\n'
+            'open_root_owned_file() { exit 99; }\n'
+            'main\n', path)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.identity(path), before)
+        self.assertEqual(path.read_bytes(), b'existing diagnostic\n')
 
 
 if __name__ == "__main__":

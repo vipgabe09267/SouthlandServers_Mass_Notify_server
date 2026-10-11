@@ -27,6 +27,7 @@ class AnnouncementEmail(unittest.TestCase):
         # policy only in this private transport fixture, preserving that guard.
         self.config=self.root/'disabled.config';self.config.write_text(json.dumps({'enterprise_cluster':{'enabled':False}}));self.config.chmod(0o600)
         cluster_policy=patch.object(m._cluster_guard,'CONFIG',self.config);cluster_policy.start();self.addCleanup(cluster_policy.stop)
+        admission=patch.object(m._mail_admission,'reserve',return_value={'ok':True});admission.start();self.addCleanup(admission.stop)
         self.payload = dict(recipient_id='email_'+'a'*24, address='person@example.com',
             sender={'name':'SLS notification system','address':'notify@example.com'}, title='Reading test schedules',
             message='This is an ordinary message, not classified from words.\n'+''.join(f'Field {i}: value {i} <unsafe>&\n' for i in range(20)),
@@ -121,6 +122,11 @@ class AnnouncementEmail(unittest.TestCase):
         helper.write_text(source.replace("SENDMAIL = '/usr/sbin/sendmail'",'SENDMAIL = '+repr(str(self.fake))))
         (self.root/'sls_branded_email.py').write_bytes((RUNTIME/'sls_branded_email.py').read_bytes())
         (self.root/'sls_config_crypto.py').write_bytes((RUNTIME/'sls_config_crypto.py').read_bytes())
+        queue=self.root/'postqueue';queue.write_text('#!/usr/bin/python3\n');queue.chmod(0o700)
+        admission_source=(RUNTIME/'sls_mail_admission.py').read_text()
+        admission_source=admission_source.replace("DATA = Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin')",'DATA = Path('+repr(str(self.root))+')')
+        admission_source=admission_source.replace("('/usr/sbin/postqueue', '-j')",'('+repr(str(queue))+", '-j')")
+        (self.root/'sls_mail_admission.py').write_text(admission_source)
         guard=(RUNTIME/'sls_cluster_guard.py').read_text()
         guard_constant="CONFIG = Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config')"
         self.assertIn(guard_constant,guard)

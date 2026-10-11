@@ -12,7 +12,7 @@ namespace {
     require dirname(__DIR__) . '/slsmassnotifyserver/Slsmassnotifyserver.class.php';
     $reflection = new ReflectionClass(FreePBX\modules\Slsmassnotifyserver::class);
     $source = file($reflection->getFileName()); $methods = '';
-    foreach (['install', 'installUnprivilegedPhase', 'requireRuntimeAccount', 'ensureCronJob', 'verifyUnprivilegedIntegration'] as $name) {
+    foreach (['install', 'installUnprivilegedPhase', 'requireRuntimeAccount', 'slsCronLine', 'hasCanonicalSlsUserCron', 'ensureCronJob', 'verifyUnprivilegedIntegration'] as $name) {
         $method = $reflection->getMethod($name);
         $methods .= implode('', array_slice($source, $method->getStartLine() - 1, $method->getEndLine() - $method->getStartLine() + 1));
     }
@@ -65,6 +65,23 @@ namespace {
     verify_boundary(in_array('30 2 * * * /fixture/unrelated-job', $lines, true), 'Unrelated cron entry was changed.');
     verify_boundary(strpos(implode("\n", $lines), 'sls_mass_notify_update.sh') === false
         && strpos(implode("\n", $lines), 'sls_mass_notify_maintenance.sh') === false, 'Root tasks were installed in user cron.');
+    foreach (['weather', 'scheduling', 'announcement_reconcile'] as $job) {
+        $expected='* * * * * /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_cron_runner.py '.$job.' >/dev/null 2>&1';
+        verify_boundary(count(array_keys($lines,$expected,true))===1,'Protected cron diagnostics missing for '.$job);
+    }
+    verify_boundary(count($lines)===4,'Old direct cron entries survived migration.');
+    $cronCheck = new ReflectionMethod($module, 'hasCanonicalSlsUserCron');
+    $cronCheck->setAccessible(true);
+    verify_boundary($cronCheck->invoke($module, array_merge($lines, [' # old sls_mass_notify_schedule_worker.php disabled', 'MAILTO=fixture@example.invalid'])), 'Comments or unrelated cron settings were not preserved.');
+    foreach ([
+        array_merge($lines, [$lines[1]]),
+        array_merge($lines, ['* * * * * /usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php']),
+        array_merge($lines, ['* * * * * /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_cron_runner.py maintenance >/dev/null 2>&1']),
+        array_map(static fn($line) => str_replace(' >/dev/null 2>&1', '', $line), $lines),
+        array_map(static fn($line) => str_contains($line, 'sls_cron_runner.py scheduling') ? '# '.$line : $line, $lines),
+    ] as $invalidCron) {
+        verify_boundary(!$cronCheck->invoke($module, $invalidCron), 'Post-restore cron validation accepted an unsafe or incomplete scheduler set.');
+    }
     $module->install();
     verify_boundary($module->FreePBX->cron->getAll() === $lines, 'Repeated integration duplicated or changed cron entries.');
     verify_boundary($module->verifyUnprivilegedIntegration() === true, 'Unprivileged verification failed.');

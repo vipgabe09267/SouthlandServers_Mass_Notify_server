@@ -4,6 +4,8 @@ namespace SLS\MassNotify;
 require_once __DIR__.'/EnterpriseClusterProtocol.php';
 require_once __DIR__.'/LabsSafety.php';
 require_once __DIR__.'/EnterpriseClusterPbxContract.php';
+require_once __DIR__.'/bin/sls_mass_notify/sls_runtime_state.php';
+require_once __DIR__.'/ConfigCrypto.php';
 
 /** Notification authority and remote-site jobs; heartbeats never grant authority. */
 final class EnterpriseClusterRuntime
@@ -13,9 +15,11 @@ final class EnterpriseClusterRuntime
     private EnterpriseClusterProtocol $protocol;
     private string $boot;
     private ?array $pbxEvidencePaths;
-    public function __construct(array $settings,string $directory=EnterpriseClusterStore::DIRECTORY,?string $boot=null,?array $pbxEvidencePaths=null)
+    private ?\Closure $settingsProvider;
+    public function __construct(array $settings,string $directory=EnterpriseClusterStore::DIRECTORY,?string $boot=null,?array $pbxEvidencePaths=null,?callable $settingsProvider=null)
     {
         $this->config=EnterpriseClusterConfig::normalize($settings['enterprise_cluster'] ?? []);
+        $this->settingsProvider=$settingsProvider===null ? null : \Closure::fromCallable($settingsProvider);
         $this->pbxEvidencePaths=$pbxEvidencePaths;
         if (!$this->config['enabled']) { throw new \DomainException('Enterprise cluster is disabled.'); }
         if ($this->config['mode']==='notification_ha' || $this->config['role']==='witness' || $this->config['mirroring_enabled']) { LabsSafety::requireReceipt($settings,'enterprise_cluster'); }
@@ -35,6 +39,52 @@ final class EnterpriseClusterRuntime
     public function config(): array { return $this->config; }
     public function store(): EnterpriseClusterStore { return $this->store; }
     public function initialize(): void { $this->store->initialize($this->config['spend_limit_cents']); }
+    /** Order durable admission against console stop; release before notification callbacks. */
+    private function admit(callable $claim)
+    {
+        $check=function(array $settings) use($claim) {
+            RuntimeState::requireRunning($settings);
+            if (EnterpriseClusterConfig::normalize($settings['enterprise_cluster']??[])!==$this->config) {
+                throw new \DomainException('Enterprise cluster settings changed. Reload the worker before admitting further effects.');
+            }
+            if ($this->config['mode']==='notification_ha' || $this->config['role']==='witness' || $this->config['mirroring_enabled']) {
+                LabsSafety::requireReceipt($settings,'enterprise_cluster');
+            }
+            return $claim();
+        };
+        // Private fixtures supply their own current-policy reader explicitly.
+        // Runtime endpoints and workers always use the fixed protected files.
+        if ($this->settingsProvider!==null) { return $check(($this->settingsProvider)()); }
+        $directory='/var/lib/asterisk/SLS_Mass_Notifications_Plugin';
+        $path=$directory.'/mass-notifications.config.lock';
+        clearstatcache(true,$directory);$parent=@lstat($directory);$account=posix_getpwnam('asterisk');
+        $owners=array_unique([0,posix_geteuid(),$account['uid']??-1]);
+        if (!$parent || ($parent['mode']&0170000)!==0040000 || ($parent['mode']&0022)
+            || !in_array($parent['uid'],$owners,true) || realpath($directory)!==$directory) {
+            throw new \RuntimeException('Cluster runtime configuration directory is unsafe; no effect was admitted.');
+        }
+        $regular=static fn($m): bool=>is_array($m) && ($m['mode']&0170000)===0100000 && $m['nlink']===1
+            && in_array($m['uid'],$owners,true) && ($m['mode']&0027)===0 && $m['size']<=4096;
+        clearstatcache(true,$path);$before=@lstat($path);
+        if ($before!==false && !$regular($before)) { throw new \RuntimeException('Cluster runtime configuration lock is unsafe.'); }
+        $mask=umask(0037);
+        try {
+            $handle=@fopen($path,$before===false?'x+b':'r+b');
+            if (!$handle && $before===false) { clearstatcache(true,$path);$before=@lstat($path);if ($regular($before)) { $handle=@fopen($path,'r+b'); } }
+        } finally { umask($mask); }
+        if (!is_resource($handle)) { throw new \RuntimeException('Cluster runtime configuration lock is unavailable.'); }
+        try {
+            $identity=static function() use($path,$handle,$before,$regular): bool {
+                clearstatcache(true,$path);$named=@lstat($path);$opened=fstat($handle);
+                return $regular($named)&&$regular($opened)&&$named['dev']===$opened['dev']&&$named['ino']===$opened['ino']
+                    && ($before===false||($before['dev']===$opened['dev']&&$before['ino']===$opened['ino']));
+            };
+            if (!$identity() || !@flock($handle,LOCK_SH|LOCK_NB) || !$identity()) {
+                throw new \RuntimeException('Protected runtime configuration is changing; no effect was admitted.');
+            }
+            return $check(\FreePBX\modules\SlsConfigCrypto::readFile($directory.'/mass-notifications.config',null,false));
+        } finally { @flock($handle,LOCK_UN);fclose($handle); }
+    }
     private static function keys(array $p,array $keys): void
     {
         if (array_diff(array_keys($p),$keys) || count($p)!==count($keys)) { throw new \DomainException('Invalid cluster operation schema.'); }
@@ -255,22 +305,24 @@ final class EnterpriseClusterRuntime
     }
     public function begin(array $intent): array
     {
-        if ($this->config['role']==='witness') { throw new \DomainException('An independent witness never submits delivery effects.'); }
-        $intent=self::intent($intent); $this->assertFresh($intent,time()); $id=self::effectId($intent);
-        if ($this->config['mode']==='notification_ha') {
-            $lease=$this->acquire();
-            $claim=$this->protocol->request($this->config['witness_id'],'effect.begin',['boot_id'=>$this->boot,'token'=>$lease['token'],'intent'=>$intent]);
-        } else { $claim=['id'=>$id,'admitted'=>true,'token'=>0]; }
-        // Witness first means a crash before local journaling also cannot replay.
-        $this->store->transaction(function(array &$s) use($intent,$id,$claim): void {
-            if (isset($s['effects'][$id]) || $s['control']['stopped']) { throw new \DomainException('Local effect duplicate or STOP blocked submission.'); }
-            if ($intent['site_id']!==$this->config['site_id']) { throw new \DomainException('Effect belongs to another site.'); }
-            if ($this->config['mode']==='edge' && !in_array($intent['channel'],$this->config['local_device_channels'],true)) { throw new \DomainException('An edge cannot submit phone or external provider actions.'); }
-            if ($this->config['mode']!=='notification_ha' && $s['control']['spent_cents']+$intent['estimated_cost_cents']>$s['control']['spend_limit_cents']) { throw new \DomainException('Local spending ceiling blocks this effect.'); }
-            if ($this->config['mode']!=='notification_ha') { $s['control']['spent_cents']+=$intent['estimated_cost_cents']; }
-            $s['effects'][$id]=['intent'=>$intent,'owner'=>$this->config['node_id'],'boot_id'=>$this->boot,'token'=>$claim['token'],'state'=>'uncertain','started_at'=>time(),'receipt'=>null];
+        return $this->admit(function() use($intent): array {
+            if ($this->config['role']==='witness') { throw new \DomainException('An independent witness never submits delivery effects.'); }
+            $intent=self::intent($intent); $this->assertFresh($intent,time()); $id=self::effectId($intent);
+            if ($this->config['mode']==='notification_ha') {
+                $lease=$this->acquire();
+                $claim=$this->protocol->request($this->config['witness_id'],'effect.begin',['boot_id'=>$this->boot,'token'=>$lease['token'],'intent'=>$intent]);
+            } else { $claim=['id'=>$id,'admitted'=>true,'token'=>0]; }
+            // Witness first means a crash before local journaling also cannot replay.
+            $this->store->transaction(function(array &$s) use($intent,$id,$claim): void {
+                if (isset($s['effects'][$id]) || $s['control']['stopped']) { throw new \DomainException('Local effect duplicate or STOP blocked submission.'); }
+                if ($intent['site_id']!==$this->config['site_id']) { throw new \DomainException('Effect belongs to another site.'); }
+                if ($this->config['mode']==='edge' && !in_array($intent['channel'],$this->config['local_device_channels'],true)) { throw new \DomainException('An edge cannot submit phone or external provider actions.'); }
+                if ($this->config['mode']!=='notification_ha' && $s['control']['spent_cents']+$intent['estimated_cost_cents']>$s['control']['spend_limit_cents']) { throw new \DomainException('Local spending ceiling blocks this effect.'); }
+                if ($this->config['mode']!=='notification_ha') { $s['control']['spent_cents']+=$intent['estimated_cost_cents']; }
+                $s['effects'][$id]=['intent'=>$intent,'owner'=>$this->config['node_id'],'boot_id'=>$this->boot,'token'=>$claim['token'],'state'=>'uncertain','started_at'=>time(),'receipt'=>null];
+            });
+            return $claim+['boot_id'=>$this->boot];
         });
-        return $claim+['boot_id'=>$this->boot];
     }
     public function finish(array $claim,array $receipt): void
     {
@@ -322,6 +374,7 @@ final class EnterpriseClusterRuntime
     public function request(string $peer,string $action,array $payload): array { return $this->protocol->request($peer,$action,$payload); }
     public function drain(callable $dispatch,bool $connected): array
     {
+        $this->admit(static fn()=>null);
         if ($this->config['role']==='witness') { throw new \DomainException('An independent witness never dispatches site jobs.'); }
         // A standby must not mutate queued jobs into uncertainty before it has
         // proved exclusive authority. The durable outer claim also protects
@@ -329,7 +382,7 @@ final class EnterpriseClusterRuntime
         if ($this->config['mode']==='notification_ha') { $this->acquire(); }
         $ids=array_keys($this->store->read()['queue']); $results=[];
         foreach ($ids as $id) {
-            $job=$this->store->transaction(function(array &$s) use($id,$connected): ?array {
+            $job=$this->admit(fn()=>$this->store->transaction(function(array &$s) use($id,$connected): ?array {
                 $row=$s['queue'][$id]; $j=$row['job'];
                 if ($row['state']!=='queued') { return null; }
                 if (time()>=$j['expires_at']) { $s['queue'][$id]['state']='expired'; return null; }
@@ -338,7 +391,7 @@ final class EnterpriseClusterRuntime
                 // Persist uncertainty before invoking anything. Reboot never
                 // silently resets this to queued.
                 $s['queue'][$id]['state']='uncertain'; return $j;
-            });
+            }));
             if (!$job) { continue; }
             try {
                 if ($this->config['mode']==='notification_ha') {

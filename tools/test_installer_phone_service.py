@@ -92,13 +92,137 @@ esac
                 completed = subprocess.run(['bash', '-c', 'source "$1"; validate_phone_collector_probe_file "$2" "$3"', '_', str(self.source), kind, str(path)], env=self.env, capture_output=True, text=True, timeout=10)
                 self.assertEqual(completed.returncode == 0, expected, completed.stderr)
 
-    def test_uninstallers_keep_the_same_bounded_cleanup(self):
-        helper = SOURCE.split('remove_phone_collector_service() {', 1)[1].split('\n}\n', 1)[0]
-        for filename in ['tools/uninstall_release.sh', 'slsmassnotifyserver/bin/sls_mass_notify_uninstall.sh']:
-            source = (ROOT / filename).read_text()
-            self.assertEqual(source.split('remove_phone_collector_service() {', 1)[1].split('\n}\n', 1)[0], helper)
-            main = source.split('main() {', 1)[1]
-            self.assertLess(main.index('remove_phone_collector_service'), main.index('remove_freepbx_manager_users'))
+    def test_uninstaller_twins_preserve_authenticated_worker_and_service_ordering(self):
+        # Offline teardown has stronger lifecycle requirements than installer
+        # rollback. Its actual guard, failure recovery and idle behavior are
+        # exercised by test_uninstaller_transaction.py.
+        source = (ROOT / 'tools/uninstall_release.sh').read_text()
+        self.assertEqual(source, (ROOT / 'slsmassnotifyserver/bin/sls_mass_notify_uninstall.sh').read_text())
+        main = source.split('main() {', 1)[1]
+        ordered = ['admit_root_runtime', 'snapshot_local_signer', 'verify_uninstall_inventories',
+                   'acquire_uninstall_workers', 'inspect_uninstall_idle', 'assert_uninstall_workers',
+                   'remove_phone_collector_service', 'remove_freepbx_manager_users',
+                   'remove_sls_chown_exclusion', 'remove_runtime_files', 'cleanup_recovery_signer']
+        positions = [main.index(step) for step in ordered]
+        self.assertEqual(positions, sorted(positions))
+        service = source.split('remove_phone_collector_service() {', 1)[1].split('\n}\n', 1)[0]
+        self.assertLess(service.index('verify_uninstall_collector_unit'), service.index('systemctl stop'))
+        self.assertLess(service.index('systemctl stop'), service.index('inspect_uninstall_idle'))
+        self.assertLess(service.index('inspect_uninstall_idle'), service.index('systemctl disable'))
+        self.assertLess(service.index('systemctl disable'), service.index('rm -- "$unit"'))
+        self.assertIn('/usr/bin/timeout --kill-after=2 20 systemctl stop', service)
+        self.assertIn('/usr/bin/timeout --kill-after=2 20 systemctl disable', service)
+
+    def previous_collector(self, mode='modern', enabled='enabled', active='active', overrides=False, healthy=True):
+        approval={'source':'fresh-install','files':{}} if mode=='fresh' else {
+            'source':'publisher-verified-previous-release','files':{
+                '/usr/local/bin/sls_mass_notify/sls_phone_events.py':'a'*64,
+                '/usr/local/bin/sls_mass_notify/sls_phone_admission.py':'b'*64} if mode=='modern' else {'/usr/local/bin/sls_mass_notify/old.py':'c'*64}}
+        (self.root/'previous-root-approval.json').write_text(json.dumps(approval))
+        recovery=self.root/'recovery.py'
+        recovery.write_text('import json\nprint('+repr(json.dumps({'ok':True,'service_state':{'enabled':enabled,'active':active}}))+')\n')
+        harness=r'''
+source "$1"
+UPGRADE_TRUST_DIR="$SLS_PHONE_TEST_ROOT"; RECOVERY_TOOL="$SLS_PHONE_TEST_ROOT/recovery.py"
+AUTHENTICATED_INSTALLER_APPROVED=1
+systemctl() {
+ printf '%s\n' "$*" >>"$SLS_PHONE_TEST_ROOT/previous-calls"
+ if [ "$1" = show ]; then
+  printf 'User=asterisk\nGroup=asterisk\nFragmentPath=%s/collector.service\nDropInPaths=%s\n' "$SLS_PHONE_TEST_ROOT" "$FIXTURE_OVERRIDES"
+ fi
+}
+verify_phone_collector() { printf 'probe\n' >>"$SLS_PHONE_TEST_ROOT/previous-calls"; [ "$FIXTURE_HEALTHY" = 1 ]; }
+restore_previous_phone_collector
+'''
+        result=subprocess.run(['bash','-c',harness,'_',str(self.source)],env={**self.env,
+            'FIXTURE_OVERRIDES':'/custom/override.conf' if overrides else '',
+            'FIXTURE_HEALTHY':'1' if healthy else '0'},capture_output=True,text=True,timeout=10)
+        calls=self.root/'previous-calls'
+        output=calls.read_text().splitlines() if calls.exists() else []
+        calls.unlink(missing_ok=True)
+        return result, output
+
+    def test_previous_collector_is_required_only_for_approved_collector_releases(self):
+        for mode in ('fresh','old'):
+            result,calls=self.previous_collector(mode)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(calls,[])
+
+    def test_healthy_previous_collector_is_verified_without_restart(self):
+        result,calls=self.previous_collector()
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(calls,['show sls-mass-notify-phone-events.service --property=User,Group,FragmentPath,DropInPaths','probe'])
+
+    def test_only_enabled_inactive_approved_collector_is_started(self):
+        for active in ('inactive','failed'):
+            result,calls=self.previous_collector(active=active)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(calls[-2:],['start sls-mass-notify-phone-events.service','probe'])
+        for enabled in ('disabled','not-found','masked'):
+            result,calls=self.previous_collector(enabled=enabled,active='inactive')
+            self.assertEqual(result.returncode,1,result.stderr)
+            self.assertEqual(calls,[])
+
+    def test_overridden_or_unhealthy_previous_collector_blocks_upgrade(self):
+        result,calls=self.previous_collector(active='failed',overrides=True)
+        self.assertEqual(result.returncode,1,result.stderr)
+        self.assertFalse(any(line.startswith('start ') for line in calls))
+        result,calls=self.previous_collector(healthy=False)
+        self.assertEqual(result.returncode,1,result.stderr)
+        self.assertEqual(calls[-1],'probe')
+        self.assertIn('No candidate runtime or maintenance schedule was activated',result.stdout)
+
+    @unittest.skipUnless(os.geteuid()==0,'requires root for protected chown snapshot fixtures')
+    def test_failed_pretransaction_restores_original_chown_file_or_absence(self):
+        helper=ROOT/'slsmassnotifyserver/bin/sls_mass_notify/sls_legacy_permissions.py'
+        approval=self.root/'previous-root-approval.json'
+        approval.write_text(json.dumps({'schema':1,'source':'fresh-install','files':{},'root_jobs':[]}));approval.chmod(0o600)
+        for existed in (False,True):
+            with self.subTest(existed=existed):
+                config=self.root/'freepbx_chown.conf'
+                original=b'; preserved local comment\n[blacklist]\ndirectory = /other/private\n'
+                if existed: config.write_bytes(original); config.chmod(0o640)
+                snapshot=self.root/'freepbx-chown.snapshot';snapshot.unlink(missing_ok=True)
+                harness=r'''
+source "$1"
+UPGRADE_TRUST_DIR="$SLS_PHONE_TEST_ROOT"; LEGACY_PERMISSION_TOOL="$HELPER"
+FREEPBX_CHOWN_CONFIG="$SLS_PHONE_TEST_ROOT/freepbx_chown.conf"
+AUTHENTICATED_INSTALLER_APPROVED=1; INSTALL_NOTIFICATION_SIDE_EFFECTS=0
+record_install_failure() { :; }
+protect_freepbx_chown_permissions
+trap guard_config_on_exit EXIT
+exit 37
+'''
+                result=subprocess.run(['bash','-c',harness,'_',str(self.source)],env={**self.env,'HELPER':str(helper)},capture_output=True,text=True,timeout=10)
+                self.assertEqual(result.returncode,37,result.stdout+result.stderr)
+                if existed:
+                    self.assertEqual(config.read_bytes(),original)
+                    self.assertEqual(config.stat().st_mode & 0o777,0o640)
+                    config.unlink()
+                else: self.assertFalse(config.exists())
+
+    @unittest.skipUnless(os.geteuid()==0,'requires root for protected chown snapshot fixtures')
+    def test_failed_install_preserves_snapshot_when_admin_changes_chown_file(self):
+        helper=ROOT/'slsmassnotifyserver/bin/sls_mass_notify/sls_legacy_permissions.py'
+        approval=self.root/'previous-root-approval.json'
+        approval.write_text(json.dumps({'schema':1,'source':'fresh-install','files':{},'root_jobs':[]}));approval.chmod(0o600)
+        config=self.root/'freepbx_chown.conf';config.write_bytes(b'; original\n')
+        harness=r'''
+source "$1"
+UPGRADE_TRUST_DIR="$SLS_PHONE_TEST_ROOT"; LEGACY_PERMISSION_TOOL="$HELPER"
+FREEPBX_CHOWN_CONFIG="$SLS_PHONE_TEST_ROOT/freepbx_chown.conf"
+AUTHENTICATED_INSTALLER_APPROVED=1; INSTALL_NOTIFICATION_SIDE_EFFECTS=0
+record_install_failure() { :; }
+protect_freepbx_chown_permissions
+printf '; administrator edit\n' >>"$FREEPBX_CHOWN_CONFIG"
+trap guard_config_on_exit EXIT
+exit 38
+'''
+        result=subprocess.run(['bash','-c',harness,'_',str(self.source)],env={**self.env,'HELPER':str(helper)},capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,38,result.stdout+result.stderr)
+        self.assertTrue(config.read_bytes().endswith(b'; administrator edit\n'))
+        self.assertTrue((self.root/'freepbx-chown.snapshot').exists())
+        self.assertIn('original FreePBX chown configuration could not be restored',result.stdout)
 
 
 if __name__ == '__main__':

@@ -1,6 +1,6 @@
 # SLS Mass Notifications Control API
 
-This document describes the `0.1.5-beta` candidate API. Its changes are additive
+This document describes the `0.1.6-beta` candidate API. Its changes are additive
 to the existing routes and authentication. Notification payload schema **1** and
 desktop SSE protocol **2** are retained. Features marked **Labs** in the module
 need acceptance with the actual devices, providers and desktop client before
@@ -354,6 +354,16 @@ validation details. The capacity/resource gate applies to API changes as well as
 the UI. The old global `mail_to` alert-recipient field is not writable; configure
 the relevant Weather/Lightning destinations or `system_notification_emails`.
 
+The default-on internal voicemail preferences are `nws_voicemail_enabled` and
+`xweather.voicemail_enabled`. Both accept an explicit boolean in a configuration
+patch. They apply only to actual Weather/Lightning phone deliveries, including a
+configured Lightning all-clear, for selected extensions with enabled FreePBX
+mailboxes when none of their selected handsets answered. Native mailbox limits
+and storage policies still apply. They do not add voicemail to ordinary API
+announcements or manual alert tests. `live_paging.voicemail_enabled` is the
+separate saved live-page recording preference, managed through the administrator
+Dial-in Paging page.
+
 API credentials, trusted proxy configuration, operator logins/TOTP, approved
 scripts, enrollment secrets, incident templates and schedules remain
 administrator UI operations. A named config credential cannot change the legacy
@@ -367,6 +377,8 @@ A Weather test uses `action: "test_nws"`, `mode`, optional `trigger_name`,
 `zone_scope: "all"` or `"selected"`, and `zone_ids` for the selected scope.
 Restricted test credentials must select at least one explicitly permitted saved
 zone. The test uses that zone's current routing; it is not a no-delivery probe.
+Manual Weather/Lightning tests never leave voicemail, even when the corresponding
+actual-alert voicemail preference is enabled.
 For example, only after reviewing the saved test zone's recipients:
 
 ```json
@@ -517,3 +529,75 @@ Peer traffic is a separate disabled interface requiring explicitly provisioned m
 An administrator can pause new SLS notification admission with `sudo slsconsole stop`. An announcement submitted while paused returns `success: false`, `error_code: runtime_stopped` and `delivery_started: false`; resume with `sudo slsconsole start`. Receipt ingestion, status and administrative recovery remain available. Pausing never extends a queued event's original expiry.
 
 Webhook receipts retain `http_status` and a safe `failure_code` when available. `accepted` means the webhook service accepted the HTTP request, not that a person read it. `uncertain` with `needs_attention: false` means response confirmation is unavailable for this one-way submission. It must not be replayed automatically. A definite transmission failure or HTTP rejection remains a failure; uncertainty in other channels retains its existing meaning. Historical receipts are preserved, with display-only projections clearing obsolete webhook dashboard faults.
+
+## Submission idempotency
+
+For `send_announcement`, supply a unique `Idempotency-Key` header containing
+16–128 letters, digits, underscores or hyphens. Repeating the same key, request
+and credential permissions returns the saved submission result and job ID.
+Changing the payload or permissions produces a conflict. A submission claimed
+before an interruption returns `announcement_submission_uncertain`; inspect
+its delivery history before using another key. Claims are retained for 30 days.
+This prevents duplicate submission; it does not retry a provider send.
+
+```bash
+curl --fail-with-body 'https://pbx.example.org/api/sls-mass-notify/' \
+  -H "Authorization: Bearer $SLS_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: building-test-2026-10-09-001' \
+  --data '{"action":"send_announcement","message":"Scheduled test announcement","targets":["1000"],"is_test":true}'
+```
+
+## Recording catalogue
+
+An unrestricted credential with `config` scope can read
+`?resource=recordings&query=evacuation&offset=0&limit=100`. Limits are 1–500 rows
+and offsets 0–5000. The response includes `items`, `total`, `has_more`,
+`next_offset`, `scan_complete`, `truncated`, `observed_at` and `warning`.
+A bounded scan may be incomplete; consumers must display the warning instead of
+presenting the page as a complete inventory. Filenames use the existing
+`system:` selector; paths outside approved recording directories are rejected.
+
+## Additive Labs delivery channels
+
+Ordinary announcements accept `browser_recipient_ids` and `connector_ids` at the
+top level or inside `options`. `browser_recipient_ids` accepts at most 50 distinct
+`sub_<24 hex>` IDs; `connector_ids` accepts at most 20 distinct `conn_<24 hex>` IDs.
+Both require an unrestricted named sender and
+explicitly enabled configuration. `resource=audiences` provides only the
+available authorized IDs. Legacy credentials and restricted credentials cannot
+use these channels.
+
+Browser delivery freezes exact enrolled subscription identities and encryption
+keys. Connector delivery freezes its configuration fingerprint. Changes or
+revocation before submission cancel that destination. Results use `browser_push`
+and `connector` receipt channels; `accepted` means provider acceptance, not
+confirmed display. Uncertain sends are not automatically repeated. All browser
+cohorts use the same absolute expiry, limited to ten minutes.
+
+Applicable two-person approval policies are also enforced before these channel
+effects. Approval does not bypass current authorization or permit a restricted
+credential to select them. Enrollment, VAPID key management, directory imports,
+provider renewal/revocation and journal archival are authenticated FreePBX
+administrator actions; these announcement selectors do not expose those controls
+as public API actions. See [Enterprise identity](ENTERPRISE_IDENTITY.md) and
+[device/provider administration](ENTERPRISE_INTEGRATIONS.md).
+
+## Workload settings
+
+The existing configuration update action supports these integer settings:
+
+| Field | Default | Range |
+| --- | ---: | ---: |
+| `speech_synthesis_limit` | 1 | 1–4 |
+| `speech_queue_limit` | 8 | 1–32 |
+| `speech_queue_wait_seconds` | 15 | 0–60 |
+| `generated_media_cache_mib` | 512 | 64–4096 |
+| `generated_media_min_free_mib` | 128 | 64–4096 |
+
+A full speech queue or unavailable media reservation fails before synthesis
+starts. Increasing phone capacity does not increase synthesis concurrency.
+Shared calendar definitions use `schedule_programmes` in the same encrypted
+configuration; schedules freeze their calendar snapshot at review/save time.
+Reviewed incident locale preferences and translated update inputs are documented
+in [the incident API](INCIDENT_API.md).

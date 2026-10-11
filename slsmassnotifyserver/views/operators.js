@@ -4,7 +4,7 @@
   if (!root) return;
   const data = JSON.parse(document.getElementById('sls-operator-data').textContent);
   const state = data.state;
-  const keys = ['id','username','source','name','email','role','enabled','site_ids','location_ids','group_ids','personal_members','actions','channels'];
+  const keys = ['id','username','source','name','email','role','enabled','site_ids','location_ids','group_ids','personal_members','actions','channels','expires_at','expires_local'];
   const rows = state.access.accounts.map(row => ({...row, rebind:false}));
   const list = root.querySelector('#ops-accounts');
   const modal = root.querySelector('#ops-modal');
@@ -110,7 +110,7 @@
   });
 
   function edit(index) {
-    const row = index < 0 ? {id:'',name:'',email:'',role:'viewer',enabled:true,site_ids:[],location_ids:[],group_ids:[],personal_members:{},actions:['view'],channels:Object.keys(channels),source:'portal',username:''} : rows[index];
+    const row = index < 0 ? {id:'',name:'',email:'',role:'viewer',enabled:true,site_ids:[],location_ids:[],group_ids:[],personal_members:{},actions:['view'],channels:Object.keys(channels),source:'portal',username:'',expires_at:0,expires_local:''} : rows[index];
     const local = row.source === 'portal';
     focus = document.activeElement;
     body.replaceChildren(); error.textContent = '';
@@ -138,6 +138,9 @@
     role.value = row.role;
     field(body,'Permission preset',role,'Choose a starting role, then select the allowed actions and delivery channels. Administrators have full SLS access.');
     const enabled = check(body,'Enable this login',row.enabled);
+    const expiry = field(body,'Access expires (optional)',node('input','',{type:'datetime-local',step:'60'}),'PBX timezone: '+(state.timezone || 'UTC')+'. Leave empty for no expiry. Expiry blocks sign-in, active sessions and queued delivery.');
+    expiry.value = row.expires_local || '';
+    if (row.access_expired) body.append(node('p','This account has expired. Change its expiry or clear the date to restore access.',{class:'ops-notice ops-error'}));
     const restricted = node('div'); body.append(restricted);
     const actionBox = node('div','',{class:'ops-permissions'}), channelBox = node('div','',{class:'ops-permissions'});
     actionBox.append(node('h3','Allowed actions')); channelBox.append(node('h3','Allowed channels'));
@@ -171,7 +174,9 @@
         site_ids:admin ? [] : siteIds(),location_ids:admin ? [] : locationIds(),group_ids:admin ? [] : groupIds(),personal_members:members,
         actions:admin ? Object.keys(actions) : actionChecks.filter(([,input]) => input.checked).map(([key]) => key),
         channels:admin ? Object.keys(channels) : channelChecks.filter(([,input]) => input.checked).map(([key]) => key),
+        expires_local:expiry.value,
         rebind:rebind?.checked || false,password:password?.value || '',reset_totp:reset?.checked || false};
+      delete next.access_expired;
       if (!next.channels.length) { error.textContent = 'Allow at least one delivery channel.'; return; }
       if (next.enabled && !admin && !next.site_ids.length && !next.location_ids.length && !next.group_ids.length && !Object.values(members).some(ids => ids.length)) { error.textContent = 'Assign a site, location, audience or personal device.'; return; }
       if (index < 0) rows.push(next); else rows[index] = next;
@@ -190,6 +195,8 @@
       heading.append(title,node('span',row.role+(row.enabled ? ' · enabled' : ' · disabled'),{class:'ops-badge'})); box.append(heading);
       const grants = row.role === 'administrator' ? 'All SLS actions and recipients' : [row.site_ids.length+' sites',(row.location_ids || []).length+' locations',row.group_ids.length+' audiences',Object.values(row.personal_members || {}).reduce((count,ids) => count+ids.length,0)+' personal devices'].join(' · ');
       box.append(node('p',grants,{class:'ops-muted'}));
+      const expiryText = row.expires_local ? (row.access_expired ? 'Expired ' : 'Expires ')+row.expires_local.replace('T',' ')+' · '+(state.timezone || 'UTC') : 'No account expiry';
+      box.append(node('p',expiryText,{class:row.access_expired ? 'ops-notice ops-error' : 'ops-muted'}));
       box.append(node('p',row.source === 'portal' ? ((row.totp_enrolled ? 'Authenticator enrolled' : 'Authenticator enrollment required')+(row.password_change_required ? ' · password change required' : '')) : 'Legacy PBX assignment',{class:'ops-muted'}));
       if(row.source==='portal'){
         const info=row.password_recovery || {};

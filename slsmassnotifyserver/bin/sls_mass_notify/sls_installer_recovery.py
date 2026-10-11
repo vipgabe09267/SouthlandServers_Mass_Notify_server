@@ -59,7 +59,7 @@ MAX_TOTAL = 2 * 1024 * 1024 * 1024
 MAX_MANIFEST = 32 * 1024 * 1024
 CRON_MARKERS = ('/usr/local/bin/sls_mass_notify/', '/usr/local/sbin/sign_sls_mass_notify_local_sig.sh',
                 '/var/www/html/admin/modules/slsmassnotifyserver/', 'SLS_Mass_Notifications_Plugin')
-USER_CRON_JOB = re.compile(rb'(?:^|[\s/])(?:sls_mass_notify_(?:weather_poll|nws_poll|schedule_worker|announcement_worker|update|maintenance)\.(?:sh|php)|nws_weather_alert\.sh|nwsalerts_ensure_menu_patch\.sh)(?=$|[\s\"\'])')
+USER_CRON_JOB = re.compile(rb'(?:^|[\s/])(?:sls_mass_notify_(?:weather_poll|nws_poll|schedule_worker|announcement_worker|update|maintenance)\.(?:sh|php)|sls_cron_runner\.py|nws_weather_alert\.sh|nwsalerts_ensure_menu_patch\.sh)(?=$|[\s\"\'])')
 
 def sls_user_job(line):
     return not line.lstrip().startswith(b'#') and USER_CRON_JOB.search(line) is not None
@@ -192,6 +192,22 @@ class Recovery:
 
     def service_state(self):
         return {'ok':True,'service':SERVICE,'service_state':self.load()['service_state'],'automatic_activation_safe':False}
+
+    def preflight_services(self):
+        """Reject states that cannot be restored before starting a transaction."""
+        state = self.capture_service_state()
+        if state['enabled'] not in ('enabled', 'disabled', 'not-found'):
+            raise RecoveryError('Collector service is ' + state['enabled'] + '. Review its administrator-managed enable or mask state before installation; no SLS runtime or service was changed.')
+        if state['enabled'] != 'not-found':
+            parent = self.directory(self.dest('/etc/systemd/system').absolute(), protected=True)
+            try: body, _ = self.read_at(parent, SERVICE, MAX_FILE, True)
+            finally: os.close(parent)
+            if body != SAFE_UNIT:
+                raise RecoveryError('Collector service differs from the supported recovery unit. Review its customizations before installation; no service was changed.')
+            output = self.command(['/usr/bin/systemctl', 'show', SERVICE, '--property=DropInPaths'])
+            if output.strip() != 'DropInPaths=':
+                raise RecoveryError('Collector service has administrator overrides. Review those overrides before installation; rollback cannot safely discard them.')
+        return {'ok': True, 'service_state': state, 'rollback_supported': True}
 
     def restore_services(self):
         self.verify()
@@ -416,9 +432,13 @@ class Recovery:
         if approval['root_jobs']!=original or any(not isinstance(line,str) or '\n' in line or '\r' in line for line in original):
             raise RecoveryError('Previous maintenance schedule changed after approval')
         for line in original:
-            if not re.fullmatch(r'(?:\* \* \* \* \* /usr/bin/timeout 900 '+re.escape(RUNTIME)+r'/sls_mass_notify_maintenance\.sh|17 (?:\*|\*/6) \* \* \* /usr/bin/timeout 1800 '+re.escape(RUNTIME)+r'/sls_mass_notify_update\.sh)',line):
+            runner = re.fullmatch(r'(?:\* \* \* \* \* /usr/bin/python3 -I '+re.escape(RUNTIME)+r'/sls_cron_runner\.py (maintenance)|17 \* \* \* \* /usr/bin/python3 -I '+re.escape(RUNTIME)+r'/sls_cron_runner\.py (update)) >/dev/null 2>&1', line)
+            if not runner and not re.fullmatch(r'(?:\* \* \* \* \* /usr/bin/timeout 900 '+re.escape(RUNTIME)+r'/sls_mass_notify_maintenance\.sh|17 (?:\*|\*/6) \* \* \* /usr/bin/timeout 1800 '+re.escape(RUNTIME)+r'/sls_mass_notify_update\.sh)',line):
                 raise RecoveryError('Previous maintenance entry is outside the fixed recovery allowlist')
-            script=RUNTIME+'/'+('sls_mass_notify_maintenance.sh' if line.endswith('sls_mass_notify_maintenance.sh') else 'sls_mass_notify_update.sh')
+            if runner and RUNTIME + '/sls_cron_runner.py' not in approval['files']:
+                raise RecoveryError('Previous cron runner lacks authenticated source approval')
+            maintenance = runner.group(1) is not None if runner else line.endswith('sls_mass_notify_maintenance.sh')
+            script=RUNTIME+'/'+('sls_mass_notify_maintenance.sh' if maintenance else 'sls_mass_notify_update.sh')
             if script not in approval['files']: raise RecoveryError('Previous root job lacks authenticated source approval')
 
     def restore_maintenance(self):
@@ -530,7 +550,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--snapshot',required=True)
     parser.add_argument('--approval',help='root-protected previous execution approval established before mutation')
-    parser.add_argument('action',choices=('snapshot','restore','verify','service-state','restore-services','restore-maintenance'))
+    parser.add_argument('action',choices=('snapshot','restore','verify','service-state','restore-services','restore-maintenance','preflight-services'))
     args=parser.parse_args()
     if os.geteuid()!=0: raise RecoveryError('Static recovery requires root')
     # Do not load sibling Python or installed PHP. Installer must authenticate

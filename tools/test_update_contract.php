@@ -59,8 +59,18 @@ foreach ([
 		update_contract_fail('Maintenance worker is missing manual-update progress handling.');
 	}
 }
-if (substr_count($moduleSource, "17 * * * * /usr/bin/timeout 1800 /usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh") !== 1) {
-	update_contract_fail('Root automatic-update cron is missing or duplicated in module source.');
+$expectedUpdateCron = '17 * * * * /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_cron_runner.py update >/dev/null 2>&1';
+if (!preg_match('/\tprivate function slsCronLine\(string \$job\): string\n\t\{.*?\n\t\}/s', $moduleSource, $cronMethod)) {
+	update_contract_fail('Canonical fixed cron generator could not be inspected.');
+}
+eval('class UpdateCronFixture { public function line(string $job): string { return $this->slsCronLine($job); } ' . $cronMethod[0] . '}');
+$rootHelper = file_get_contents($root . '/slsmassnotifyserver/bin/sls_mass_notify/sls_privileged_install.py');
+$cronRunner = file_get_contents($root . '/slsmassnotifyserver/bin/sls_mass_notify/sls_cron_runner.py');
+if ((new UpdateCronFixture())->line('update') !== $expectedUpdateCron
+	|| substr_count($rootHelper, $expectedUpdateCron) !== 1
+	|| strpos($moduleSource, "\$filtered[] = \$this->slsCronLine('update');") === false
+	|| strpos($cronRunner, "'update': (True, 1800, ['/bin/bash', RUNTIME + '/sls_mass_notify_update.sh'])") === false) {
+	update_contract_fail('Automatic updates must retain exactly one hourly silent cron command, fixed root account and 1800-second worker deadline.');
 }
 
 foreach ([

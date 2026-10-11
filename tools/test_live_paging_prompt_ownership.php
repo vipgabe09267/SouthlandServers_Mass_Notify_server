@@ -91,13 +91,13 @@ $fixture->assertReady($settings);
 $changedVoice = $settings; $changedVoice['announcement_piper_voice'] = 'changed-voice';
 paging_readiness_rejects(static function () use ($fixture, $changedVoice): void { $fixture->assertReady($changedVoice); }, 'Changed speech voice bypassed paging preparation');
 $files = glob(PagingPromptOwnershipFixture::SOUNDS_DIR . '/paging/*.wav');
-paging_ownership_check(count($files) === 9 && $fixture->generated === 9, 'Prepared prompts are incomplete');
+paging_ownership_check(count($files) === 10 && $fixture->generated === 10, 'Prepared prompts are incomplete');
 // Root-owned cached audio must also be repaired before dialplan activation.
 chown($files[0], 0); chgrp($files[0], 0); chmod($files[0], 0600);
 paging_readiness_rejects(static function () use ($fixture, $settings): void { $fixture->assertReady($settings); }, 'Root-only cached prompt passed the activation guard');
 $fixture->prepare($settings);
 $fixture->assertReady($settings);
-paging_ownership_check($fixture->generated === 9, 'Cached prompts were unnecessarily regenerated');
+paging_ownership_check($fixture->generated === 10, 'Cached prompts were unnecessarily regenerated');
 foreach ($files as $file) {
     clearstatcache(true, $file);
     $metadata = lstat($file);
@@ -110,7 +110,7 @@ os.setgroups([])
 os.setgid(account.pw_gid)
 os.setuid(account.pw_uid)
 paths = glob.glob(sys.argv[1] + '/paging/*.wav')
-assert len(paths) == 9
+assert len(paths) == 10
 for path in paths:
     with open(path, 'rb') as stream:
         header = stream.read(12)
@@ -123,7 +123,7 @@ paging_ownership_check($status === 0, 'The asterisk account cannot read prepared
 file_put_contents($files[0], str_repeat('invalid header ', 8));
 paging_readiness_rejects(static function () use ($fixture, $settings): void { $fixture->assertReady($settings); }, 'Invalid cached WAV passed the activation guard');
 $fixture->prepare($settings);
-paging_ownership_check($fixture->generated === 10, 'Applying configuration did not regenerate a corrupt cached prompt');
+paging_ownership_check($fixture->generated === 11, 'Applying configuration did not regenerate a corrupt cached prompt');
 $fixture->assertReady($settings);
 $extraLink = PAGING_OWNERSHIP_FIXTURE_ROOT . '/linked-prompt'; link($files[0], $extraLink);
 paging_readiness_rejects(static function () use ($fixture, $settings): void { $fixture->assertReady($settings); }, 'Hardlinked cached WAV passed the activation guard');

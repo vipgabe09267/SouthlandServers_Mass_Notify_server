@@ -83,7 +83,7 @@ final class EnterpriseOperationsConfig
     private static function dual_approval($value): array
     {
         $v=self::base($value,['channels','approver_ids','expires_seconds'],'approval');
-        $v['channels']=self::selectors($v['channels']??[], '/^(?:phones|desktops|webhooks|voice_recipient_ids|email_recipient_ids|sms_recipient_ids)$/D',6,'Approval channels');
+        $v['channels']=self::selectors($v['channels']??[], '/^(?:phones|desktops|webhooks|voice_recipient_ids|email_recipient_ids|sms_recipient_ids|browser_recipient_ids|connector_ids)$/D',8,'Approval channels');
         $v['approver_ids']=self::actors($v['approver_ids']??[]);
         if (!$v['channels'] || count($v['approver_ids'])<2) { throw new \InvalidArgumentException('Approval policies require channels and at least two distinct authorized people.'); }
         $v['expires_seconds']=$v['expires_seconds']??300;

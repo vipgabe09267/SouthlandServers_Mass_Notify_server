@@ -25,7 +25,7 @@ try {
     if (!$network['https'] || $network['error']!=='') { slsTriggerResponse(403,['ok'=>false,'error'=>'verified_https_required']); }
     $config=AutomationConfig::normalize($settings['automations'] ?? []);
     $rule=array_column($config['rules'],null,'id')[$id] ?? null;
-    if (!$rule || empty($settings['enabled']) || !AutomationInputs::authenticate($rule,$raw,
+    if (!$rule || !AutomationInputs::authenticate($rule,$raw,
         ['timestamp'=>$_SERVER['HTTP_X_SLS_TIMESTAMP'] ?? '', 'signature'=>$_SERVER['HTTP_X_SLS_SIGNATURE'] ?? ''],time())) {
         slsTriggerResponse(403,['ok'=>false,'error'=>'trigger_authentication_failed']);
     }

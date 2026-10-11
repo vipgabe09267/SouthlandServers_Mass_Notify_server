@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2034
-set -euo pipefail
+set -Eeuo pipefail
+trap 'printf "Asterisk prerequisite fixture failed at line %s\\n" "$LINENO" >&2' ERR
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -120,6 +121,15 @@ log() {
   asterisk_module_starts_persistently res_pjsip_header_funcs.so "$mock_modules"
   printf '%s\n' '[modules]' 'autoload=no' 'load => res_pjsip_header_funcs.so' >"$mock_modules"
   asterisk_module_starts_persistently res_pjsip_header_funcs.so "$mock_modules"
+  for directive in require preload-require; do
+    printf '%s\n' '[modules]' 'autoload=no' "$directive => res_pjsip_header_funcs.so" >"$mock_modules"
+    asterisk_module_starts_persistently res_pjsip_header_funcs.so "$mock_modules"
+  done
+  printf '%s\n' '[other]' 'autoload=yes' 'require = res_pjsip_header_funcs.so' >"$mock_modules"
+  if asterisk_module_starts_persistently res_pjsip_header_funcs.so "$mock_modules"; then
+    printf 'A directive outside the modules section was accepted.\n' >&2
+    exit 1
+  fi
   printf '%s\n' '[modules]' 'autoload=yes' 'noload => res_pjsip_header_funcs.so' >"$mock_modules"
   if asterisk_module_starts_persistently res_pjsip_header_funcs.so "$mock_modules"; then
     printf 'An Asterisk-style noload => provider was accepted as restart-persistent.\n' >&2
@@ -816,15 +826,15 @@ bootstrap_utility_line="$(grep -nFm1 'for bootstrap_utility in /usr/bin/flock' <
 
 main_body="$(declare -f main)"
 log_open_line="$(grep -nFm1 'open_root_owned_file INSTALL_LOG_FD "$LOG_FILE"' <<<"$main_body" | cut -d: -f1)"
-log_reset_line="$(grep -nFm1 ': > "$INSTALL_LOG_OUTPUT"' <<<"$main_body" | cut -d: -f1)"
+log_append_line="$(grep -nFm1 'SLS Mass Notify installation started:' <<<"$main_body" | cut -d: -f1)"
 failure_trap_line="$(grep -nFm1 'trap guard_config_on_exit EXIT' <<<"$main_body" | cut -d: -f1)"
 require_line="$(grep -nFm1 'require_freepbx' <<<"$main_body" | cut -d: -f1)"
 lock_line="$(grep -nFm1 'acquire_maintenance_coordination' <<<"$main_body" | cut -d: -f1)"
 dependency_line="$(grep -nFm1 'install_dependencies' <<<"$main_body" | cut -d: -f1)"
-[ "$log_open_line" -lt "$log_reset_line" ]
-[ "$log_reset_line" -lt "$require_line" ]
+[ "$log_open_line" -lt "$log_append_line" ]
+[ "$log_append_line" -lt "$require_line" ]
 [ "$failure_trap_line" -lt "$require_line" ]
-[ "$require_line" -lt "$lock_line" ]
+[ "$lock_line" -lt "$log_open_line" ]
 [ "$lock_line" -lt "$dependency_line" ]
 guard_body="$(declare -f guard_config_on_exit)"
 grep -Fq 'record_install_failure' <<<"$guard_body"

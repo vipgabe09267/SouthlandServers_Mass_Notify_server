@@ -29,7 +29,7 @@ jobs:
           gpg --batch --dearmor --output /usr/share/keyrings/sls-ci-sangoma.gpg /tmp/sangoma-key.asc
           printf '%s\n' 'deb [arch=amd64 signed-by=/usr/share/keyrings/sls-ci-sangoma.gpg] https://deb.freepbx.org/freepbx17-prod bookworm main' > /etc/apt/sources.list.d/sls-ci-sangoma.list
           apt-get update
-          apt-get install -y --no-install-recommends libedit2 libxslt1.1 liburiparser1 asterisk22-core=22.10.1-1.sng12 asterisk22-doc=22.10.1-1.sng12
+          apt-get install -y --no-install-recommends libedit2 libxslt1.1 liburiparser1 asterisk22-core=22.10.1-1.sng12 asterisk22-doc=22.10.1-1.sng12 asterisk22-voicemail=22.10.1-1.sng12
           asterisk -V
           mkdir -p /var/lib/asterisk /var/spool/asterisk /etc/asterisk /etc/sls-mass-notify /usr/local/bin/sls_mass_notify /var/www/html/admin/modules/slsmassnotifyserver
           touch /etc/freepbx.conf
@@ -42,3 +42,5 @@ jobs:
         run: bash tools/run_isolated_tests.sh
       - name: Validate dependency inventory
         run: python3 tools/build_sbom.py --output /tmp/sls-sbom.cdx.json
+      - name: Check inventoried dependencies against OSV
+        run: python3 tools/check_dependencies.py

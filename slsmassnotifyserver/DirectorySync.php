@@ -15,6 +15,17 @@ final class DirectorySync
         if(!$header||count($header)!==count(array_unique($header))||array_diff($header,$fields)||!in_array('external_id',$header,true)||!in_array('name',$header,true)){fclose($stream);throw new \DomainException('CSV needs external_id,name and optional email,location,location_id,desktop_username,active columns.');}
         $rows=[];try{while(($values=fgetcsv($stream,4096,',','"',''))!==false){if($values===[null]){continue;}if(count($values)!==count($header)){throw new \DomainException('CSV row column count does not match its header.');}$r=array_combine($header,$values);if(isset($r['active'])){if(!in_array(strtolower($r['active']),['true','false','1','0'],true)){throw new \DomainException('CSV active values must be true,false,1 or 0.');}$r['active']=in_array(strtolower($r['active']),['true','1'],true);}$rows[]=$r;if(count($rows)>1000){throw new \DomainException('Directory import exceeds 1000 people.');}}}finally{fclose($stream);}return DirectoryConfig::records($rows);
     }
+    public static function ldapActive(array $source,string $value): bool
+    {
+        $attribute=$source['ldap_attributes']['active']??'';
+        if($attribute===''){if(($source['ldap_inactive_mask']??0)>0){throw new \DomainException('LDAP inactive mask requires an account-control attribute.');}return true;}
+        if($value===''){throw new \DomainException('LDAP active/account-control attribute is missing. No import was made.');}
+        if(($source['ldap_inactive_mask']??0)>0){
+            if(!preg_match('/^[0-9]{1,10}$/D',$value)||(float)$value>4294967295){throw new \DomainException('LDAP account-control attribute is not a valid unsigned integer. No import was made.');}
+            return ((int)$value&$source['ldap_inactive_mask'])===0;
+        }
+        return !in_array(strtolower($value),array_map('strtolower',$source['ldap_inactive_values']),true);
+    }
     public static function ldap(array $s): array
     {
         if(!extension_loaded('ldap')){throw new \DomainException('PHP LDAP is required for this source.');}
@@ -32,7 +43,9 @@ final class DirectorySync
                 $entries=ldap_get_entries($conn,$result);ldap_free_result($result);
                 for($i=0;$i<$entries['count'];$i++){$r=[];foreach($s['ldap_attributes'] as $key=>$attribute){$value=$attribute===''?'':($entries[$i][strtolower($attribute)][0]??'');
                         if($key==='external_id'&&(strtolower($attribute)==='objectguid'||!preg_match('//u',$value)||preg_match('/[\x00-\x1f]/',$value))){$value='binary:'.base64_encode($value);}
-                        if($key==='active'){$r['active']=$attribute===''||!in_array(strtolower($value),array_map('strtolower',$s['ldap_inactive_values']),true);}else{$r[$key]=$value;}}
+                        if($key==='active'){
+                            $r['active']=self::ldapActive($s,$value);
+                        }else{$r[$key]=$value;}}
                     $rows[]=$r;if(count($rows)>1000){throw new \DomainException('LDAP result exceeds 1000 people; no partial import was made.');}}
                 if(!isset($returned[LDAP_CONTROL_PAGEDRESULTS]['value']['cookie'])){throw new \DomainException('LDAP server did not honor mandatory paging.');}$cookie=$returned[LDAP_CONTROL_PAGEDRESULTS]['value']['cookie'];if(++$pages>10){throw new \DomainException('LDAP paging failed to terminate.');}
             }while($cookie!=='');return DirectoryConfig::records($rows);
@@ -49,8 +62,13 @@ final class DirectorySync
             if(!in_array('urn:ietf:params:scim:api:messages:2.0:ListResponse',$d['schemas']??[],true)||!is_int($d['totalResults']??null)||$d['totalResults']<0||$d['totalResults']>1000
                 ||!is_array($d['Resources']??null)||!array_is_list($d['Resources'])||($d['startIndex']??1)!==$start||count($d['Resources'])>200){throw new \DomainException('SCIM returned an invalid or oversized complete snapshot.');}
             if($total!==null&&$total!==$d['totalResults']){throw new \DomainException('SCIM changed during paging; retry the dry run.');}$total=$d['totalResults'];
-            foreach($d['Resources'] as $u){if(!is_array($u)||!is_bool($u['active']??true)){throw new \DomainException('SCIM active flag invalid.');}$emails=$u['emails']??[];$email='';foreach($emails as $e){if(($e['primary']??false)===true){$email=$e['value']??'';break;}}if($email===''&&count($emails)===1){$email=$emails[0]['value']??'';}
-                $rows[]=['external_id'=>$u['id']??'','name'=>$u['displayName']??trim(($u['name']['givenName']??'').' '.($u['name']['familyName']??'')),'email'=>$email,'active'=>$u['active']??true];}
+            foreach($d['Resources'] as $u){if(!is_array($u)||!is_bool($u['active']??true)||!is_array($u['name']??[])||!is_string($u['name']['givenName']??'')||!is_string($u['name']['familyName']??'')){throw new \DomainException('SCIM user activity or name is invalid. No import was made.');}
+                $emails=$u['emails']??[];if(!is_array($emails)||!array_is_list($emails)){throw new \DomainException('SCIM email values must be a list. No import was made.');}$email='';$primary=0;
+                foreach($emails as $e){if(!is_array($e)||!is_string($e['value']??'')||!is_bool($e['primary']??false)){throw new \DomainException('SCIM email entry is invalid. No import was made.');}if(($e['primary']??false)===true){$email=$e['value']??'';$primary++;}}
+                if($primary>1){throw new \DomainException('SCIM primary email is ambiguous. No import was made.');}if($email===''&&count($emails)===1){$email=$emails[0]['value']??'';}
+                $record=['external_id'=>$u['id']??'','name'=>$u['displayName']??trim(($u['name']['givenName']??'').' '.($u['name']['familyName']??'')),'email'=>$email,'active'=>$u['active']??true];
+                foreach($s['scim_attributes']??[] as $field=>$pointer){if($pointer===''){$record[$field]='';continue;}$value=$u;foreach(explode('/',substr($pointer,1)) as $part){$value=is_array($value)?($value[$part]??''):'';}if(!is_string($value)){throw new \DomainException('SCIM mapped user attribute is not text. No import was made.');}$record[$field]=$field==='name'&&$pointer==='/displayName'&&$value===''?$record['name']:$value;}
+                $rows[]=$record;}
             $start+=count($d['Resources']);if(count($rows)===$total){return DirectoryConfig::records($rows);}if(!$d['Resources']||count($rows)>$total){throw new \DomainException('SCIM paging was partial. No import was made.');}
         }throw new \DomainException('SCIM paging exceeded its limit.');
     }
@@ -66,7 +84,10 @@ final class DirectorySync
         foreach($old as $id=>$row){if(!isset($new[$id])){$changes[]=['kind'=>'deactivate','external_id'=>$id,'person_id'=>DirectoryConfig::personId($source['id'],(string)$id),'name'=>$row['name']];}}
         // Reconcile now, so collisions and missing templates fail in preview.
         self::apply($settings,$source,$incoming);
-        return ['source_id'=>$source['id'],'revision'=>self::revision($settings),'records'=>$incoming,'changes'=>$changes,'active'=>count(array_filter($incoming,static fn($r)=>$r['active'])),'template_ids'=>$source['template_ids']];
+        $deactivated=count(array_filter($changes,static fn($row)=>$row['kind']==='deactivate'));$previous=count(array_filter($source['records'],static fn($row)=>$row['active']));
+        $percent=$previous?min(100,(int)ceil(100*$deactivated/$previous)):0;
+        return ['source_id'=>$source['id'],'revision'=>self::revision($settings),'records'=>$incoming,'changes'=>$changes,'active'=>count(array_filter($incoming,static fn($r)=>$r['active'])),'template_ids'=>$source['template_ids'],
+            'deactivation_count'=>$deactivated,'deactivation_percent'=>$percent,'requires_deactivation_confirmation'=>$deactivated>0&&$percent>=($source['maximum_deactivation_percent']??25)];
     }
     public static function apply(array $settings,array $source,array $incoming): array
     {

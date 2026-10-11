@@ -212,7 +212,7 @@ def collect_health_faults(worker: dict | None, storage: dict | None, *,
                     "recent_expired_weather", "recent_weather_deadline_misses")
         if any(type(storage.get(key, 0)) is not int or storage.get(key, 0) < 0 for key in counters):
             storage_issues.append("Storage health contains invalid counters. Check the maintenance log and regenerate diagnostics.")
-        elif any(type(storage.get(key, False)) is not bool for key in ("queue_scan_incomplete", "audit_at_capacity", "audit_fault_active", "audit_forwarding_active", "media_scan_incomplete", "media_over_budget")):
+        elif any(type(storage.get(key, False)) is not bool for key in ("queue_scan_incomplete", "audit_at_capacity", "audit_fault_active", "audit_forwarding_active", "media_scan_incomplete", "media_over_budget", "media_near_budget", "free_below_media_reserve")):
             storage_issues.append("Storage health contains invalid status flags. Check the maintenance log and regenerate diagnostics.")
         else:
             if "free_bytes" not in storage:
@@ -233,6 +233,10 @@ def collect_health_faults(worker: dict | None, storage: dict | None, *,
                 storage_issues.append("Generated-media storage could not be fully inspected. Check the storage maintenance log; cleanup preserves files when inspection fails.")
             if storage.get("media_over_budget"):
                 storage_issues.append("Generated media exceeds its configured cache target. Active and recent files remain protected. Review queued alerts and free space; bounded cleanup retries automatically.")
+            elif storage.get("media_near_budget"):
+                storage_issues.append("Generated media has reached 90% of its cache budget. Review retained or queued alerts before more renders are rejected.")
+            if storage.get("free_below_media_reserve"):
+                storage_issues.append("PBX data free space is below the generated-media reserve. Speech and image admission reject new renders until space is available.")
     if storage_issues:
         faults["storage"] = _candidate("storage", "storage and delivery health",
             " ".join(storage_issues), datetime.fromtimestamp(current, timezone.utc).isoformat())[1]
@@ -602,6 +606,12 @@ def process_faults(config: dict, faults: dict[str, dict], state_path: Path, *, s
         if attempt.get("fingerprint") == fingerprint and current - _integer(attempt.get("at")) < RETRY_SECONDS:
             continue
         attempts[channel] = {"fingerprint": fingerprint, "at": current}
+        # Persist the no-replay fence before entering sendmail. A crash after
+        # MTA acceptance but before receipt storage must not enqueue it again.
+        previous_history = history.get(fingerprint)
+        active[channel] = fingerprint
+        history[fingerprint] = current
+        attempts[channel]['submission_started'] = True
         state = {"version": 1, "active": active, "attempts": attempts, "history": history}
         _write_state(state_path, state)
         subject = "SLS Mass Notify system fault — " + fault["stage"]
@@ -613,14 +623,20 @@ def process_faults(config: dict, faults: dict[str, dict], state_path: Path, *, s
         ]
         if fault.get("occurred_at"):
             body_lines.append("Time: " + fault["occurred_at"])
-        accepted = sender(
-            config,
-            subject,
-            "\n".join(body_lines),
-            "System Fault",
-            "Warning",
-            recipients_override=" ".join(recipients),
-        )
+        try:
+            accepted = sender(
+                config, subject, "\n".join(body_lines), "System Fault", "Warning",
+                recipients_override=" ".join(recipients),
+            )
+        except _email_module._mail_admission.MailAdmissionBlocked:
+            # Admission refusal proves no sendmail process was started, so the
+            # ordinary fault throttle may reconsider it after transport repair.
+            active.pop(channel, None)
+            if previous_history is None: history.pop(fingerprint, None)
+            else: history[fingerprint] = previous_history
+            attempts[channel].pop('submission_started', None)
+            _write_state(state_path, {"version": 1, "active": active, "attempts": attempts, "history": history})
+            raise
         if accepted is not True:
             raise RuntimeError("system fault email was not accepted by the local mailer")
         active[channel] = fingerprint

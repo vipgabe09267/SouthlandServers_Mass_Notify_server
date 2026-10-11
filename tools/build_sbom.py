@@ -99,6 +99,22 @@ def inventory(requirements=REQUIREMENTS, site_packages=None):
                        'name': 'chart.js', 'version': '2.9.4', 'purl': 'pkg:npm/chart.js@2.9.4',
                        'licenses': [{'license': {'id': 'MIT'}}],
                        'externalReferences': [{'type': 'vcs', 'url': chart_provenance['repository'] + '/tree/v2.9.4'}]})
+    embedded = []
+    for package in chart_provenance.get('embedded_components', []):
+        if package.get('included') is False:
+            continue
+        name, release = package['name'], package['version']
+        if not re.fullmatch(r'[a-z0-9][a-z0-9.-]{0,99}', name) or not re.fullmatch(r'\d+(?:\.\d+)+', release):
+            raise ValueError('Invalid embedded browser dependency identity')
+        purl = 'pkg:npm/' + name + '@' + release
+        embedded.append(purl)
+        components.append({'type': 'library', 'bom-ref': purl, 'name': name, 'version': release, 'purl': purl,
+                           'licenses': [{'license': {'id': package['license']}}],
+                           'properties': [{'name': 'sls:embedded-in', 'value': 'pkg:npm/chart.js@2.9.4'}],
+                           'externalReferences': [{'type': 'distribution', 'url': chart_provenance['lock_source']}]})
+    chart = (charts / 'Chart-2.9.4.min.js').read_bytes()
+    if b'2.24.0' in chart or b'a.version="2.' in chart:
+        raise ValueError('Unexpected embedded Moment dependency in the numeric dashboard chart')
     identity = ROOT / 'slsmassnotifyserver/identity-libs'
     locked = json.loads((identity / 'composer.lock').read_text())
     installed = json.loads((identity / 'vendor/composer/installed.json').read_text())
@@ -121,7 +137,8 @@ def inventory(requirements=REQUIREMENTS, site_packages=None):
                         'properties': [{'name': 'sls:inventory-kind', 'value': 'installed' if site_packages else 'release-pins'},
                                        {'name': 'sls:requirements-sha256', 'value': digest},
                                        {'name': 'sls:scope', 'value': 'Piper Python environment, PHP callback validator, locked PHP identity libraries and bundled dashboard chart library; OS packages, FreePBX modules and voice models are separate inventories.'}]},
-           'components': components}
+           'components': components,
+           'dependencies': [{'ref': 'pkg:npm/chart.js@2.9.4', 'dependsOn': sorted(embedded)}]}
     seed = json.dumps(bom, sort_keys=True, separators=(',', ':'))
     bom['serialNumber'] = 'urn:uuid:' + str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
     return bom

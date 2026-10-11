@@ -160,6 +160,20 @@ if(parse_url($_SERVER['REQUEST_URI'],PHP_URL_PATH)!=='/mass-notify/'){http_respo
         self.assertNotIn('data-channel="extensions" value="2000"',body);self.assertEqual(self.request(cookie=viewer,query='?view=access')[0],403)
         settings=json.loads((self.root/'settings.json').read_text());settings['operator_access']['accounts'][0]['enabled']=False;self.write_settings(settings)
         self.assertIn('Sign in to Mass Notify',self.request(cookie=owner)[2])
+    def test_expired_account_blocks_login_and_existing_session(self):
+        cookie=self.login();body=self.request(cookie=cookie)[2];token=self.token(body)
+        settings=json.loads((self.root/'settings.json').read_text())
+        settings['operator_access']['accounts'][0]['expires_at']=int(time.time())-1
+        self.write_settings(settings)
+        status,_,body=self.request(cookie=cookie)
+        self.assertEqual(status,200);self.assertIn('Sign in to Mass Notify',body)
+        self.assertNotIn('sls-operations-data',body)
+        status,_,_=self.request('POST',{'slsmassnotifyserver_action':'send','slsmassnotifyserver_csrf':token,'payload':'{"delivery":{"extensions":["1000"]}}'},cookie)
+        self.assertEqual(status,401);self.assertFalse((self.root/'action.json').exists())
+        _,headers,body=self.request();anonymous=self.cookie(headers)
+        status,_,_=self.request('POST',{'portal_action':'login','portal_csrf':self.token(body),'username':'owner','password':'initial fixture password owner'},anonymous)
+        self.assertEqual(status,401)
+
     def test_empty_enterprise_objects_require_authenticated_csrf(self):
         owner=self.login();body=self.request(cookie=owner)[2]
         token=self.token(body)

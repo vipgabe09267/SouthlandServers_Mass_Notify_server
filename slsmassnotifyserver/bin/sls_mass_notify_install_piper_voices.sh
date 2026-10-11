@@ -11,36 +11,102 @@ LOG_FILE="/var/log/sls_mass_notify.log"
 PIPER_ARTIFACTS_CHANGED=0
 PIPER_DEPENDENCY_CHECK="/usr/local/bin/sls_mass_notify/sls_piper_dependencies.py"
 PIPER_REQUIREMENTS="/usr/local/bin/sls_mass_notify/piper-requirements.txt"
+PIPER_WHEELHOUSE=""
+PIPER_VOICE_CACHE=""
 
 log() {
   printf '%s: %s\n' "$(date)" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+declare -A voice_bytes=(
+  ["en_US-lessac-low.onnx"]="63201294"
+  ["en_US-lessac-low.onnx.json"]="4882"
+  ["en_US-lessac-medium.onnx"]="63201294"
+  ["en_US-lessac-medium.onnx.json"]="4885"
+  ["en_US-amy-low.onnx"]="63104526"
+  ["en_US-amy-low.onnx.json"]="4164"
+  ["en_US-ryan-low.onnx"]="63104526"
+  ["en_US-ryan-low.onnx.json"]="4165"
+  ["es_ES-davefx-medium.onnx"]="63201294"
+  ["es_ES-davefx-medium.onnx.json"]="4817"
+  ["fr_FR-siwis-medium.onnx"]="63201294"
+  ["fr_FR-siwis-medium.onnx.json"]="4875"
+  ["de_DE-thorsten-low.onnx"]="63104526"
+  ["de_DE-thorsten-low.onnx.json"]="4159"
+  ["pt_BR-faber-medium.onnx"]="63201294"
+  ["pt_BR-faber-medium.onnx.json"]="4855"
+)
+
+SLS_VOICE_DOWNLOAD_TMP=""
+cleanup_voice_download() { [ -z "$SLS_VOICE_DOWNLOAD_TMP" ] || rm -f -- "$SLS_VOICE_DOWNLOAD_TMP"; }
+trap cleanup_voice_download EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+bounded_voice_stream() {
+  /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_bounded_stream.py "$1" "$2"
 }
 
 download_file() {
   local url="$1"
   local target="$2"
   local expected_sha="$3"
-  local tmp
+  local expected_bytes="${voice_bytes[$(basename "$target")]:-0}"
+  [ "$expected_bytes" -gt 0 ] || return 1
+  local tmp attempt downloaded=0
 
   tmp="$(mktemp "${TMPDIR:-/tmp}/sls-piper-voice.XXXXXXXX")" || return 1
-  if command -v curl >/dev/null 2>&1; then
-    if ! curl -fL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 900 \
-      -A "SouthlandServers-Mass-Notifications-Server/0.1.5-beta" \
-      -o "$tmp" "$url"; then
-      rm -f "$tmp"
-      return 1
-    fi
-  elif command -v wget >/dev/null 2>&1; then
-    if ! wget --tries=5 --timeout=900 -O "$tmp" "$url"; then
+  SLS_VOICE_DOWNLOAD_TMP="$tmp"
+  if [ -n "$PIPER_VOICE_CACHE" ]; then
+    /usr/bin/python3 -I - "$PIPER_VOICE_CACHE/$(basename "$target")" "$tmp" "$expected_bytes" <<'PYVOICECACHE' || { rm -f -- "$tmp"; return 1; }
+import os, pathlib, stat, sys
+source,target,bound=sys.argv[1],sys.argv[2],int(sys.argv[3])
+parent=os.open('/',os.O_RDONLY|os.O_DIRECTORY)
+try:
+    for part in pathlib.Path(source).parts[1:-1]:
+        child=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+        os.close(parent);parent=child;info=os.fstat(parent)
+        if info.st_uid!=0 or info.st_mode&0o022 and not info.st_mode&stat.S_ISVTX: raise RuntimeError('Voice cache must have protected root-owned parents')
+    fd=os.open(pathlib.Path(source).name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=parent)
+    with os.fdopen(fd,'rb') as incoming:
+        info=os.fstat(incoming.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or info.st_uid!=0 or info.st_mode&0o022 or info.st_size!=bound: raise RuntimeError('Pinned offline voice is missing or unsafe')
+        out=os.open(target,os.O_WRONLY|os.O_TRUNC|os.O_NOFOLLOW)
+        with os.fdopen(out,'wb') as output:
+            remaining=bound
+            while remaining:
+                block=incoming.read(min(65536,remaining))
+                if not block: raise RuntimeError('Offline voice was truncated')
+                output.write(block);remaining-=len(block)
+            output.flush();os.fsync(output.fileno())
+finally:os.close(parent)
+PYVOICECACHE
+  elif command -v curl >/dev/null 2>&1; then
+    for attempt in 1 2; do
+      if /usr/bin/timeout --signal=TERM --kill-after=5 95 curl -fL --proto '=https' --proto-redir '=https' \
+        --max-filesize "$expected_bytes" --connect-timeout 20 --max-time 90 \
+        -A "SouthlandServers-Mass-Notifications-Server/0.1.6-beta" \
+        -o - "$url" | bounded_voice_stream "$tmp" "$expected_bytes"; then
+        downloaded=1
+        break
+      fi
+    done
+    if [ "$downloaded" -ne 1 ]; then
       rm -f "$tmp"
       return 1
     fi
   else
-    log "Piper voice download failed: curl/wget missing"
+    log "Piper voice download failed: curl missing; install curl before retrying"
     rm -f "$tmp"
     return 1
   fi
 
+  if [ "$(stat -c%s "$tmp")" -ne "$expected_bytes" ]; then
+    log "Piper voice size verification failed for $(basename "$target")"
+    rm -f "$tmp"
+    return 1
+  fi
   if ! printf '%s  %s\n' "$expected_sha" "$tmp" | sha256sum -c - >/dev/null 2>&1; then
     log "Piper voice checksum verification failed for $(basename "$target")"
     rm -f "$tmp"
@@ -242,6 +308,7 @@ ensure_piper_runtime() {
   environment_helper="/usr/local/bin/sls_mass_notify/sls_piper_environment.py"
   [ -r "$environment_helper" ] || { log "The signed Piper replacement helper is missing; no active packages were changed."; return 1; }
   [ "${PIPER_WORKERS_PAUSED:-0}" != 1 ] || replacement_args+=(--workers-paused)
+  [ -z "$PIPER_WHEELHOUSE" ] || replacement_args+=(--wheelhouse "$PIPER_WHEELHOUSE")
   /usr/bin/python3 -I "$environment_helper" "${replacement_args[@]}" >> "$LOG_FILE" 2>&1 || {
     log "Piper replacement did not complete. Review the specific namespace, dependency, activation or recovery error above. No in-place package upgrade was attempted."
     return 1
@@ -560,12 +627,17 @@ repair_piper_permissions_only() {
 
 PIPER_ACTION="all"
 PIPER_WORKERS_PAUSED=0
-for option in "$@"; do
+while [ "$#" -gt 0 ]; do
+  option="$1"; shift
   case "$option" in
     --runtime-only|--repair-permissions-only)
       [ "$PIPER_ACTION" = all ] || exit 2
       PIPER_ACTION="${option#--}" ;;
     --workers-paused) PIPER_WORKERS_PAUSED=1 ;;
+    --wheelhouse|--voice-cache)
+      [ "$#" -gt 0 ] && [[ "$1" = /* ]] || exit 2
+      if [ "$option" = --wheelhouse ]; then PIPER_WHEELHOUSE="$1"; else PIPER_VOICE_CACHE="$1"; fi
+      shift ;;
     *) exit 2 ;;
   esac
 done

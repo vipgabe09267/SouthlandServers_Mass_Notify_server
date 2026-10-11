@@ -54,7 +54,7 @@ MAX_RETRY_STATE_BYTES = 4 * 1024 * 1024
 MAX_RETRY_RECORDS_PER_RUN = 3
 COMPLETED_RETRY_RETENTION_SECONDS = 7 * 86400
 PENDING_RETRY_MAX_AGE_SECONDS = 3600
-USER_AGENT = "SouthlandServers-Mass-Notifications-Server/0.1.5-beta"
+USER_AGENT = "SouthlandServers-Mass-Notifications-Server/0.1.6-beta"
 DISCORD_HOSTS = {"discord.com", "discordapp.com", "canary.discord.com", "ptb.discord.com"}
 DISCORD_PATH = re.compile(r"^/api/webhooks/[0-9]+/[A-Za-z0-9._~-]+$")
 # Downloaded and bundled artwork; providers retrieve it from this PBX, not
@@ -1563,6 +1563,7 @@ def external_delivery_uncertain(state_path, source, correlation_key):
         record = state["deliveries"].get(delivery_key)
         return isinstance(record, dict) and bool(
             record.get("webhook_uncertain") or record.get("webhook_inflight")
+            or record.get("email_uncertain") or record.get("email_inflight")
         )
 
 
@@ -1572,7 +1573,7 @@ def external_delivery_status(state_path, source, correlation_key):
         record = _load_retry_state(locked_path)["deliveries"].get(delivery_key)
         if not isinstance(record, dict):
             return "unknown"
-        if record.get("webhook_uncertain") or record.get("webhook_inflight"):
+        if record.get("webhook_uncertain") or record.get("webhook_inflight") or record.get("email_uncertain") or record.get("email_inflight"):
             return "uncertain"
         if not record.get("completed_at"):
             return "pending"
@@ -1609,6 +1610,22 @@ def _recover_webhook_inflight(state):
     return results
 
 
+def _recover_email_inflight(state):
+    """Mail accepted before a crash must never be enqueued automatically again."""
+    results = []
+    for delivery_key, record in state['deliveries'].items():
+        if not isinstance(record, dict) or type(record.get('email_inflight', False)) is not bool:
+            raise RetryStateError('retry_state_corrupt')
+        if not record.get('email_inflight'): continue
+        receipt = {'type': 'email', 'id': 'email', 'status': 'uncertain', 'error': 'interrupted_submission'}
+        record.update(email_inflight=False, email_pending=False, email_uncertain=receipt)
+        _record_external_receipt(record, receipt)
+        results.append({'delivery': delivery_key, **receipt})
+        if not record.get('webhook_pending') and not record.get('channels_pending'):
+            record.update(completed_at=int(time.time()), terminal_status='uncertain')
+    return results
+
+
 def retry_external_deliveries(
     state_path,
     config,
@@ -1635,7 +1652,7 @@ def retry_external_deliveries(
     safe_results = []
     with _locked_retry_state(state_path) as locked_path:
         state = _load_retry_state(locked_path)
-        recovered = _recover_webhook_inflight(state)
+        recovered = _recover_webhook_inflight(state) + _recover_email_inflight(state)
         if recovered:
             _write_retry_state(locked_path, state)
             safe_results.extend(recovered)
@@ -1712,6 +1729,9 @@ def retry_external_deliveries(
                 safe_results.append({'delivery':delivery_key,**receipt});_record_external_receipt(record,receipt)
                 _write_retry_state(locked_path,state)
             if record.get("email_pending"):
+                record['email_inflight'] = True
+                _write_retry_state(locked_path, state)
+                uncertain_email = False; error_code = ''
                 try:
                     sent = email_sender(
                         config,
@@ -1721,18 +1741,29 @@ def retry_external_deliveries(
                         payload.get("severity", ""),
                         record.get("email_recipients", ""),
                     )
-                except Exception:
+                except Exception as error:
                     sent = False
-                safe_results.append({
+                    from sls_branded_email import _mail_admission
+                    if isinstance(error, _mail_admission.MailAdmissionBlocked):
+                        error_code = error.code
+                    else:
+                        uncertain_email = True; error_code = 'submission_unconfirmed'
+                if sent is not True and sent is not False:
+                    uncertain_email = True; error_code = 'submission_unconfirmed'
+                status = 'uncertain' if uncertain_email else 'accepted' if sent else 'failed'
+                receipt = {
                     "delivery": delivery_key,
                     "type": "email",
                     "id": "email",
-                    "status": "accepted" if sent else "failed",
-                    "error": "" if sent else "submission_failed",
-                })
-                _record_external_receipt(record, {"type":"email", "id":"email", "status":"accepted" if sent else "failed",
-                                                  "error":"" if sent else "submission_failed"})
-                if sent:
+                    "status": status,
+                    "error": '' if sent is True else error_code or 'submission_failed',
+                }
+                safe_results.append(receipt)
+                _record_external_receipt(record, receipt)
+                record['email_inflight'] = False
+                if uncertain_email:
+                    record['email_uncertain'] = {key: receipt[key] for key in ('type', 'id', 'status', 'error')}
+                if sent or uncertain_email:
                     record["email_pending"] = False
                 _write_retry_state(locked_path, state)
 
@@ -1812,7 +1843,7 @@ def retry_external_deliveries(
 
             if not record.get("email_pending") and not record.get("webhook_pending") and not record.get("channels_pending"):
                 record["completed_at"] = int(time.time())
-                record["terminal_status"] = ("uncertain" if record.get("webhook_uncertain") else
+                record["terminal_status"] = ("uncertain" if record.get("webhook_uncertain") or record.get('email_uncertain') else
                                              "partial_cancelled" if record.get("routing_restricted_at") else "complete")
                 _write_retry_state(locked_path, state)
         pending = sum(
@@ -1824,7 +1855,7 @@ def retry_external_deliveries(
         )
         uncertain = sum(
             1 for record in state["deliveries"].values()
-            if isinstance(record, dict) and record.get("webhook_uncertain")
+            if isinstance(record, dict) and (record.get("webhook_uncertain") or record.get('email_uncertain'))
             and str((record.get("payload") or {}).get("source") or "").lower() == normalized_source
         )
         _write_retry_state(locked_path, state)

@@ -1,6 +1,6 @@
 # Incident workflows — candidate contract 1
 
-These additions are included in `0.1.5-beta`. Notification
+These additions are included in `0.1.6-beta`. Notification
 payload schema 1, SSE protocol 2, existing authentication and existing endpoint
 paths remain compatible. The desktop app needs a coordinated UI update to offer
 human responses; its existing delivery acknowledgments retain their meaning.
@@ -96,14 +96,20 @@ boolean `reviewed: true`. Every variant must use the same declared `{{fields}}` 
 the base wording. Editing a resource or translation clears its review checkbox.
 No automatic translation, language detection or audience inference takes place.
 
-At launch, the operator previews one saved variant for the complete audience.
+At launch, the operator previews the fallback version. Recipients with a saved
+language preference receive that reviewed variant when the template contains it.
+Other recipients receive the fallback version.
 `start_incident.language_variant` selects its saved locale; omission or `""` uses
 the default wording. Unknown or invalid choices fail before creating a job.
 Incident speech supports English, Spanish, French, German and Portuguese. A
 reviewed language variant selects a matching installed model; regional variants
 use the catalog's available accent (Spanish from Spain, Portuguese from Brazil).
 Initial and supervisor deliveries freeze their internal and external voice paths.
-Later updates, all-clear, planned drills and escalations retain those selections.
+Planned drills retain those selections. Updates and all-clear require their own
+reviewed translations; an omitted translation uses the new base message and its
+matching base voice. Supervisor notices use the supplied status-count wording in
+English, Spanish, French, German or Portuguese; other text languages use the
+incident fallback version.
 Each submission checks both model/config checksums before submitting any channel.
 Missing models and unsupported spoken languages fail before the initial send;
 unsupported text variants can still use no speech or tones only for every step.
@@ -117,12 +123,84 @@ The selected title/message and locale are frozen for immediate and planned-drill
 jobs. Changing templates cannot rewrite them. Changing a language while reusing
 an already submitted request ID is rejected. Drill/test markers remain explicit;
 updates and all-clear require their own reviewed wording. Notification payload
-schema 1 and SSE protocol 2 are unchanged. Resource/language metadata stays in the
-operator incident record/report rather than changing the desktop payload contract.
+schema 1 and SSE protocol 2 are unchanged. Resources stay in the operator incident record/report. Language batches add
+explicit metadata inside the existing optional `incident` object; notification
+payload schema 1 and SSE protocol 2 remain unchanged.
+
+## Recipient language preferences and batch delivery
+
+The administrator's **Recipient languages** editor stores optional preferences in
+`incident_workflows.recipient_languages` in the encrypted central `.config`.
+Save and Apply Config before launching a new incident. Each of at most 2,000
+entries binds a destination's saved identity to a locale:
+
+```json
+{
+  "recipient_languages": [
+    {"channel": "extensions", "recipient_id": "1000", "locale": "es-mx"},
+    {"channel": "desktop_clients", "recipient_id": "gabe.desktop", "locale": "es-mx"}
+  ]
+}
+```
+
+Supported channels are `extensions`, `desktop_clients`, `voice_recipient_ids`,
+`email_recipient_ids`, `sms_recipient_ids` and `webhook_ids`. Choose saved destination
+IDs, not raw telephone numbers, email addresses or webhook URLs. A preference
+never expands an audience or grants access. Saved groups resolve first; their
+members then use individual preferences. Only reviewed template variants are
+eligible. Missing variants use `start_incident.language_variant`, or the default
+wording when it is omitted. A text-only language cohort does not inherit another
+cohort's speech requirement. Unsupported spoken languages fail before submission.
+
+The incident freezes every cohort's recipients, identity fingerprints, reviewed
+wording and voice model. New preferences or changed templates cannot redirect an
+existing incident. One operation contains up to seven `language_jobs`, each with
+`locale`, `title`, `message`, `delivery`, `state`, `job_id`, and, when needed,
+`review_id`. Each accepted job retains its own receipt results. A software receipt
+still does not imply a human response. The administrator page and report show
+individual batch outcomes.
+
+Publication adds `operation_request_id`, `language_variant`, `language_batch`,
+`language_batches` and timezone-aware `expires_at` to the existing `incident`
+object. Batches share one operation sequence and an absolute ten-minute deadline;
+a shorter configured display timeout remains shorter. Repeated requests do not
+extend that deadline. The same request ID cannot create another set of jobs.
+A verified internal sibling batch may bypass the first batch's send cooldown;
+external callers, changed wording, changed recipients and unrelated operations
+cannot use this exception.
+
+An update or all-clear accepts optional `language_messages` containing separately
+reviewed wording. For example, alongside `incident_id`, `request_id`, `kind` and
+`message` in the Control API request:
+
+```json
+{
+  "language_messages": [
+    {"locale": "es-mx", "message": "La situación ha terminado.",
+     "review_note": "Reviewed by the site safety coordinator, revision 2",
+     "reviewed": true}
+  ]
+}
+```
+
+Locales must exist in the incident's frozen reviewed template. Omitting a locale
+uses the new base message and its matching base voice; the initial translation is
+never reused as an update. SLS does not translate text or verify its meaning.
+Every language batch subject to two-person approval requires its own review.
+All-clear closes the incident only after every required batch has a durable
+accepted job. Partial or uncertain results leave it open. An unknown submission
+stops later batches and is never automatically replayed. Explicit known refusals
+are recorded separately. Inspect the batch jobs before making another send.
+
+Report pagination counts child jobs, with up to ten delivery reads per page and
+a three-second read budget. `next_job_offset` may reach 1,750 for 250 operations
+with seven batches. Continue with the returned revision; a changed incident
+requires restarting the export. Merge each batch's `delivery_result` by operation
+request ID and batch index rather than replacing an entire operation.
 
 ## Email destinations
 
-General announcement email is included in `0.1.5-beta`.
+General announcement email is included in `0.1.6-beta`.
 Validation uses isolated sender and browser fixtures; no real external mail or
 inbox receipt has been verified. Enable
 **General Settings > Announcement Email**, save named recipients, configure the

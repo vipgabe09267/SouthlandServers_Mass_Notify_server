@@ -110,7 +110,7 @@ register_shutdown_function(static function () use ($root): void {
     rmdir($root);
 });
 
-$settings = ['live_paging' => ['enabled' => '1', 'extension' => '700', 'allowed_callers' => ['1000'],
+$settings = ['live_paging' => ['enabled' => '1', 'voicemail_enabled' => '0', 'extension' => '700', 'allowed_callers' => ['1000'],
     'groups' => [['group_id' => 'grp_office', 'menu_number' => 1, 'require_pin' => '1', 'pin_length' => 4, 'pin_hash' => password_hash('0123', PASSWORD_DEFAULT)]]],
     'announcement_groups' => [['id' => 'grp_office', 'name' => 'Office', 'extensions' => ['1000', '1001', '1002'], 'desktop_clients' => ['desktop']]],
     'paging_answer_timeout' => 5];
@@ -194,6 +194,48 @@ $noPin = $settings; $noPin['live_paging']['groups'][0]['require_pin'] = '0';
 $agi = new PagingFixtureAgi($variables, ['1']);
 [$session] = $newSession($agi, $noPin, 'no-pin');
 paging_check($session->run()['status'] === 'page_ended', 'Explicit no-PIN group still required a PIN');
+
+foreach (['with-pin' => $settings, 'without-pin' => $noPin] as $name => $config) {
+    $offlineVariables = $variables;
+    $offlineVariables['${PJSIP_DIAL_CONTACTS(1001)}'] = '';
+    $offlineVariables['${PJSIP_DIAL_CONTACTS(1002)}'] = '';
+    $digits = $name === 'with-pin' ? ['1', '0123'] : ['1'];
+    $agi = new PagingFixtureAgi($offlineVariables, $digits);
+    [$session, $state, $directory] = $newSession($agi, $config, 'offline-' . $name);
+    $result = $session->run();
+    paging_check($result['status'] === 'no_reachable_recipients'
+        && $result['phone_admission_error'] === 'phone_no_registered_contacts'
+        && $result['unavailable_recipients'] === ['1001', '1002'] && $result['dialed_contacts'] === 0,
+        'Unregistered group lost its registration diagnostic');
+    paging_check(in_array(['play', LivePagingConfig::promptFiles($config)['no_receivers']], $agi->calls, true),
+        'Unregistered group played the generic PBX failure prompt');
+    paging_check(!array_filter($agi->calls, static fn($call) => in_array($call[0], ['admission', 'notify', 'page'], true))
+        && !is_file($directory . '/audio-reservations.json'), 'Offline group attempted delivery or reserved its phones');
+    $agi->variables = $variables; $agi->entered = $digits; $agi->calls = [];
+    paging_check($session->run()['status'] === 'page_ended', 'Registering phones required a group or PIN change');
+}
+
+$partialVariables = $variables; $partialVariables['${PJSIP_DIAL_CONTACTS(1002)}'] = '';
+$agi = new PagingFixtureAgi($partialVariables, ['1', '0123']);
+[$session] = $newSession($agi, $settings, 'partially-registered');
+$result = $session->run();
+paging_check($result['status'] === 'page_ended' && $result['unavailable_recipients'] === ['1002']
+    && $result['dialed_contacts'] === 2, 'One offline phone blocked the registered recipients');
+paging_check(in_array(['play', LivePagingConfig::promptFiles($settings)['partial']], $agi->calls, true), 'Mixed group lost the partial warning');
+foreach (['phone_no_registered_contacts', 'phone_event_collector_unavailable'] as $code) {
+    $agi = new PagingFixtureAgi($variables, ['1', '0123']);
+    $agi->failAdmission = true; $agi->admissionFailureCode = $code;
+    [$session, $state, $directory] = $newSession($agi, $settings, 'late-' . $code);
+    $result = $session->run();
+    paging_check($result['status'] === 'phone_admission_rejected' && $result['phone_admission_error'] === $code,
+        'Late rejection lost its accurate error code');
+    $prompt = $code === 'phone_no_registered_contacts' ? 'no_receivers' : 'unavailable';
+    paging_check(in_array(['play', LivePagingConfig::promptFiles($settings)[$prompt]], $agi->calls, true)
+        && !array_filter($agi->calls, static fn($call) => in_array($call[0], ['notify', 'page'], true)),
+        'Late rejection used the wrong prompt or contacted recipients');
+    paging_check(json_decode(file_get_contents($directory . '/audio-reservations.json'), true)['recipients'] === [],
+        'Late rejection left phones reserved');
+}
 
 $agi = new PagingFixtureAgi($variables, ['1', '0123']);
 [$session, $state, $directory] = $newSession($agi, $settings, 'busy');

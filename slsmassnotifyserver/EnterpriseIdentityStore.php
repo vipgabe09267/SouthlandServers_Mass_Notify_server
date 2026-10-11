@@ -36,7 +36,8 @@ final class EnterpriseIdentityStore
         if (!$m || !$at || ($m['mode']&0170000)!==0100000 || ($m['mode']&0077) || $m['uid']!==posix_geteuid() || $m['nlink']!==1
             || is_link($path) || $m['ino']!==$at['ino'] || $m['dev']!==$at['dev'] || ($before && ($m['ino']!==$before['ino'] || $m['dev']!==$before['dev']))) { fclose($h);throw new \RuntimeException('Enterprise state contains an unsafe file.'); }return $h;
     }
-    public function transaction(string $name,callable $work)
+    public function read(string $name): array { return $this->transaction($name,static fn(array &$rows):array=>$rows,true); }
+    public function transaction(string $name,callable $work,bool $readOnly=false)
     {
         if (!preg_match('/^[a-z_-]{1,32}$/D',$name)) { throw new \LogicException('Invalid ledger name.'); }$this->safeDirectory();
         $lock=$this->open($this->directory.'/'.$name.'.lock','c+b');$deadline=microtime(true)+2;
@@ -46,7 +47,7 @@ final class EnterpriseIdentityStore
             if($required){$h=$this->open($marker,'r+b');try{$valid=stream_get_contents($h,40)==="SLS_ENTERPRISE_LEDGER_V1\n";}finally{fclose($h);}if(!$valid||!$present){throw new \RuntimeException('Established enterprise ledger missing or damaged.');}}elseif($present){throw new \RuntimeException('Enterprise ledger initialization incomplete. Preserve its history.');}
             if (file_exists($path)||is_link($path)) { $h=$this->open($path,'r+b');try{if(fstat($h)['size']>4194304){throw new \RuntimeException('Enterprise state allocation exceeded.');}$raw=stream_get_contents($h,4194305);$rows=json_decode($raw,true,32,JSON_THROW_ON_ERROR);if(json_encode((object)$rows,JSON_THROW_ON_ERROR)!==$raw){throw new \RuntimeException('Enterprise ledger is noncanonical or has repeated keys.');}}finally{fclose($h);} }
             if (!is_array($rows) || count($rows)>20000 || ($rows && array_is_list($rows))) { throw new \RuntimeException('Enterprise state damaged.'); }
-            $result=$work($rows);$bytes=json_encode((object)$rows,JSON_THROW_ON_ERROR);if(strlen($bytes)>4194304){throw new \RuntimeException('Enterprise state allocation exceeded.');}
+            $result=$work($rows);if($readOnly){return $result;}$bytes=json_encode((object)$rows,JSON_THROW_ON_ERROR);if(strlen($bytes)>4194304){throw new \RuntimeException('Enterprise state allocation exceeded.');}
             $temp=$path.'.'.bin2hex(random_bytes(12));$h=$this->open($temp,'x+b');
             try{if(fwrite($h,$bytes)!==strlen($bytes)||!fflush($h)||!fsync($h)){throw new \RuntimeException('Enterprise state write failed.');}}finally{fclose($h);}
             try{if(!rename($temp,$path)){throw new \RuntimeException('Enterprise state replace failed.');}$this->syncDirectory($this->directory);if(!$required){$h=$this->open($marker,'x+b');try{$bytes="SLS_ENTERPRISE_LEDGER_V1\n";if(fwrite($h,$bytes)!==strlen($bytes)||!fflush($h)||!fsync($h)){throw new \RuntimeException('Enterprise ledger marker failed.');}}finally{fclose($h);}$this->syncDirectory($this->directory);}}finally{if(file_exists($temp)){unlink($temp);}}

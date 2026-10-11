@@ -40,6 +40,14 @@ EXTENSION = re.compile(r'[0-9]{1,20}')
 VOICE_ID = re.compile(r'voice_[a-f0-9]{24}')
 UNIQUEID = re.compile(r'[A-Za-z0-9_.-]{1,128}')
 SERVICES = {'announcement', 'nws', 'lightning', 'manual', 'live', 'outbound'}
+VOICEMAIL_SERVICES = {'nws', 'lightning', 'live'}
+MAILBOX = re.compile(r'([0-9]{1,20})@([A-Za-z0-9_-]{1,80})')
+VOICEMAIL_SOUND = re.compile(r'SLS_Mass_Notifications_Plugin/voicemail/[a-f0-9]{32}')
+GENERATED_SOUND = re.compile(r'SLS_Mass_Notifications_Plugin/(?:tts/)?[A-Za-z0-9_-]+')
+UNANSWERED_STATUSES = {'BUSY', 'NOANSWER', 'CANCEL', 'CONGESTION', 'CHANUNAVAIL', 'DONTCALL'}
+VOICEMAIL_REFUSALS = {'phone_voicemail_audio_invalid', 'phone_voicemail_audio_unavailable', 'phone_voicemail_audio_capacity',
+    'phone_voicemail_mailbox_duration', 'phone_voicemail_mailbox_silence', 'phone_voicemail_mailbox_policy_unavailable',
+    'phone_voicemail_mailbox_changed', 'phone_voicemail_recording_unconfirmed', 'phone_voicemail_cluster_fenced'}
 
 
 class PhoneAdmissionError(RuntimeError):
@@ -81,13 +89,20 @@ def contact_dials(value, endpoint):
     return output
 
 
-def checked_targets(targets):
+def checked_targets(targets, *, voicemail=False, retain_offline=False):
     if not isinstance(targets, dict) or not 1 <= len(targets) <= MAX_CONTACTS:
         raise PhoneAdmissionError('phone_audience_invalid')
     result = {}
     for extension, dials in targets.items():
         if not isinstance(extension, str) or not (EXTENSION.fullmatch(extension) or VOICE_ID.fullmatch(extension)) or not isinstance(dials, list):
             raise PhoneAdmissionError('phone_audience_invalid')
+        if voicemail:
+            if (not EXTENSION.fullmatch(extension) or len(dials) != 1 or not isinstance(dials[0], str)
+                    or not dials[0].startswith('VM/') or not MAILBOX.fullmatch(dials[0][3:])
+                    or MAILBOX.fullmatch(dials[0][3:]).group(1) != extension):
+                raise PhoneAdmissionError('phone_voicemail_target_invalid')
+            result[extension] = list(dials)
+            continue
         if VOICE_ID.fullmatch(extension):
             if len(dials) != 1 or not isinstance(dials[0], str) or not re.fullmatch(r'VOICE/\+[1-9][0-9]{1,14}', dials[0]):
                 raise PhoneAdmissionError('phone_outbound_target_invalid')
@@ -107,13 +122,92 @@ def checked_targets(targets):
                 normalized.append(dial)
         # Unregistered recipients remain a producer-visible partial outcome;
         # there is no endpoint-only fallback that could expand after admission.
-        if normalized:
+        if normalized or retain_offline:
             result[extension] = normalized
     if not result:
         raise PhoneAdmissionError('phone_no_registered_contacts')
     if sum(map(len, result.values())) > MAX_CONTACTS:
         raise PhoneAdmissionError('phone_audience_exceeds_limit')
     return result
+
+
+def voicemail_enabled(settings, service):
+    """The three explicit switches default on; malformed values fail closed."""
+    if service == 'nws':
+        value = settings.get('nws_voicemail_enabled', '1')
+    elif service in {'lightning', 'live'}:
+        section = settings.get('xweather' if service == 'lightning' else 'live_paging', {})
+        if not isinstance(section, dict):
+            return False
+        value = section.get('voicemail_enabled', '1')
+    else:
+        return False
+    return type(value) in {bool, int, str} and value in (True, 1, '1')
+
+
+def checked_voicemail_context(value, service, scope):
+    if service == 'live':
+        if value is not None:
+            raise PhoneAdmissionError('phone_voicemail_source_invalid')
+        return
+    if (not isinstance(value, dict) or set(value) != {'source_validity', 'event', 'severity'}
+            or any(not isinstance(value.get(key), str) or len(value[key].encode()) > 256
+                   or re.search(r'[\x00-\x1f\x7f]', value[key]) for key in ('event', 'severity'))):
+        raise PhoneAdmissionError('phone_voicemail_source_invalid')
+    validity = value.get('source_validity')
+    provider = 'nws' if service == 'nws' else 'xweather'
+    if (not isinstance(validity, dict) or type(validity.get('version')) is not int or validity['version'] != 1
+            or validity.get('provider') != provider or validity.get('group_id') != scope
+            or type(validity.get('observed_at')) is not int or not 0 <= validity['observed_at'] <= 253402300799
+            or type(validity.get('expires_at')) is not int or not 0 < validity['expires_at'] <= 253402300799
+            or len(json.dumps(validity, separators=(',', ':'), allow_nan=False).encode()) > 8192):
+        raise PhoneAdmissionError('phone_voicemail_source_invalid')
+
+
+def checked_voicemail_fallback(value, service, targets):
+    """Validate a captured mailbox/contact cohort, including offline recipients."""
+    keys = {'schema', 'scope', 'scope_hash', 'source_sound', 'sound', 'weather_context', 'live_origin', 'live_group', 'targets', 'expires_at', 'expires_tick'}
+    if (not isinstance(value, dict) or set(value) != keys or value.get('schema') != 1
+            or service not in VOICEMAIL_SERVICES or not isinstance(value.get('scope'), str)
+            or not re.fullmatch(r'[A-Za-z0-9_-]{0,64}', value['scope'])
+            or not isinstance(value.get('scope_hash'), str) or not re.fullmatch(r'[a-f0-9]{64}', value['scope_hash'])):
+        raise PhoneAdmissionError('phone_voicemail_source_invalid')
+    for name in ('expires_at', 'expires_tick'):
+        checked_time(value.get(name))
+    checked_voicemail_context(value.get('weather_context'), service, value['scope'])
+    if service != 'live' and value['expires_at'] > value['weather_context']['source_validity']['expires_at']:
+        raise PhoneAdmissionError('phone_voicemail_source_invalid')
+    sound = value.get('sound')
+    if sound is not None and (not isinstance(sound, str) or not VOICEMAIL_SOUND.fullmatch(sound)):
+        raise PhoneAdmissionError('phone_voicemail_source_invalid')
+    rows = value.get('targets')
+    if not isinstance(rows, dict) or not 1 <= len(rows) <= MAX_CONTACTS:
+        raise PhoneAdmissionError('phone_voicemail_source_invalid')
+    for recipient, row in rows.items():
+        if (not isinstance(recipient, str) or not EXTENSION.fullmatch(recipient) or not isinstance(row, dict)
+                or set(row) != {'dials', 'mailbox', 'claimed_token'} or not isinstance(row.get('mailbox'), str)
+                or not MAILBOX.fullmatch(row['mailbox']) or MAILBOX.fullmatch(row['mailbox']).group(1) != recipient):
+            raise PhoneAdmissionError('phone_voicemail_source_invalid')
+        if checked_targets({recipient: row.get('dials')}, retain_offline=True)[recipient] != row['dials']:
+            raise PhoneAdmissionError('phone_voicemail_source_invalid')
+        claimed = row.get('claimed_token')
+        if claimed is not None and (not isinstance(claimed, str) or not TOKEN.fullmatch(claimed)):
+            raise PhoneAdmissionError('phone_voicemail_source_invalid')
+    if service == 'live':
+        origin, group = value.get('live_origin'), value.get('live_group')
+        if (not isinstance(origin, str) or not EXTENSION.fullmatch(origin) or origin in rows
+                or not isinstance(group, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', group)
+                or value['scope'] != group or value.get('source_sound') is not None or set(targets) != {origin}):
+            raise PhoneAdmissionError('phone_voicemail_source_invalid')
+        original = set(targets[origin])
+        if any(not set(row['dials']).issubset(original) for row in rows.values()):
+            raise PhoneAdmissionError('phone_voicemail_source_invalid')
+    else:
+        if (value.get('live_origin') is not None or value.get('live_group') is not None
+                or not isinstance(value.get('source_sound'), str) or not GENERATED_SOUND.fullmatch(value['source_sound'])
+                or any(recipient not in targets or row['dials'] != targets[recipient] for recipient, row in rows.items())):
+            raise PhoneAdmissionError('phone_voicemail_source_invalid')
+    return value
 
 
 def accountcode(token):
@@ -236,9 +330,43 @@ class PhoneAdmissionStore:
             targets = batch.get('targets')
             if not isinstance(targets, dict) or any(not isinstance(row, dict) for row in targets.values()):
                 raise PhoneAdmissionError('phone_state_invalid')
-            normalized = checked_targets({key: row.get('dials') for key, row in targets.items()})
+            purpose = batch.get('purpose', 'audio')
+            if purpose not in {'audio', 'voicemail'}:
+                raise PhoneAdmissionError('phone_state_invalid')
+            vm_fallback = batch.get('vm_fallback')
+            if vm_fallback is not None:
+                checked_voicemail_fallback(vm_fallback, batch['service'], {key: row.get('dials') for key, row in targets.items()})
+                if purpose != 'audio':
+                    raise PhoneAdmissionError('phone_state_invalid')
+                if vm_fallback.get('sound') is not None and vm_fallback['sound'].rsplit('/', 1)[-1] != token:
+                    raise PhoneAdmissionError('phone_state_invalid')
+            if 'voicemail_failures' in batch:
+                failures = batch['voicemail_failures']
+                if (not vm_fallback or not isinstance(failures, dict) or len(failures) > MAX_CONTACTS
+                        or any(recipient not in vm_fallback['targets'] or not isinstance(code, str) or code not in VOICEMAIL_REFUSALS
+                               for recipient, code in failures.items())):
+                    raise PhoneAdmissionError('phone_state_invalid')
+            normalized = checked_targets({key: row.get('dials') for key, row in targets.items()},
+                                         voicemail=purpose == 'voicemail', retain_offline=vm_fallback is not None)
             if normalized != {key: row.get('dials') for key, row in targets.items()}:
                 raise PhoneAdmissionError('phone_state_invalid')
+            if purpose == 'voicemail':
+                proof = batch.get('voicemail')
+                if (batch['service'] not in VOICEMAIL_SERVICES or len(targets) != 1 or not isinstance(proof, dict)
+                        or set(proof) != {'source_token', 'mailbox', 'sound', 'result', 'playback_completed'}
+                        or not isinstance(proof.get('source_token'), str) or not TOKEN.fullmatch(proof['source_token'])
+                        or not isinstance(proof.get('mailbox'), str) or not MAILBOX.fullmatch(proof['mailbox'])
+                        or not isinstance(proof.get('sound'), str) or not VOICEMAIL_SOUND.fullmatch(proof['sound'])
+                        or proof['sound'].rsplit('/', 1)[-1] != proof['source_token']
+                        or type(proof.get('playback_completed')) is not bool
+                        or next(iter(targets.values()))['dials'] != ['VM/' + proof['mailbox']]):
+                    raise PhoneAdmissionError('phone_state_invalid')
+                result = proof.get('result')
+                if result is not None:
+                    if (not isinstance(result, dict) or set(result) != {'status', 'recorded_at'}
+                            or result.get('status') not in {'SUCCESS', 'FAILED', 'USEREXIT'}):
+                        raise PhoneAdmissionError('phone_state_invalid')
+                    checked_time(result.get('recorded_at'))
             for key, target in targets.items():
                 if VOICE_ID.fullmatch(key):
                     snapshot = target.get('outbound')
@@ -283,7 +411,11 @@ class PhoneAdmissionStore:
         closed = sorted((batch.get('closed_at', batch['updated_at']), token) for token, batch in state['batches'].items() if batch['status'] == 'closed')
         sizes = {token: len(json.dumps(state['batches'][token], separators=(',', ':')).encode()) for _, token in closed}
         retained_bytes = sum(sizes.values())
+        retained_sources = {batch['voicemail']['source_token'] for batch in state['batches'].values()
+                            if batch.get('purpose') == 'voicemail' and batch['status'] != 'closed'}
         for index, (ended, token) in enumerate(closed):
+            if token in retained_sources:
+                continue
             if ended < self.clock() - HISTORY_SECONDS or index < len(closed) - MAX_CLOSED or retained_bytes > MAX_CLOSED_BYTES:
                 del state['batches'][token]
                 retained_bytes -= sizes[token]
@@ -328,7 +460,10 @@ class PhoneAdmissionStore:
             if batch.get('external_event_gap') and current:
                 continue
             started = {row['recipient'] for row in batch['channels'].values() if row['kind'] == 'origin'}
-            if same_boot and batch['generation'] == health['generation'] and tick < batch['start_deadline_tick'] and started != set(batch['targets']):
+            mailbox_only_source = (batch.get('vm_fallback') is not None and batch['service'] != 'live'
+                                   and not any(target['dials'] for target in batch['targets'].values()))
+            if (not mailbox_only_source and same_boot and batch['generation'] == health['generation']
+                    and tick < batch['start_deadline_tick'] and started != set(batch['targets'])):
                 continue
             # A complete current inventory proves there is no remaining channel.
             # Missed end events become unknown outcomes, never successful plays.
@@ -346,8 +481,10 @@ class PhoneAdmissionStore:
         return sum(len(target['dials']) for batch in state['batches'].values() if batch['status'] != 'closed' for target in batch['targets'].values())
 
     def admit(self, targets, limit, inventory, *, service, correlation='', start_seconds=60, outbound=None,
-              latest_start=None, latest_start_tick=None, outbound_daily_limit=0):
-        targets = checked_targets(targets)
+              latest_start=None, latest_start_tick=None, outbound_daily_limit=0, vm_fallback=None):
+        if vm_fallback is not None:
+            checked_voicemail_fallback(vm_fallback, service, targets)
+        targets = checked_targets(targets, retain_offline=vm_fallback is not None)
         outbound = outbound or {}
         if not isinstance(outbound, dict) or {key for key in targets if VOICE_ID.fullmatch(key)} != set(outbound):
             raise PhoneAdmissionError('phone_outbound_target_invalid')
@@ -376,6 +513,9 @@ class PhoneAdmissionStore:
             if any(selected.intersection(target['dials']) for batch in state['batches'].values()
                    if batch['status'] != 'closed' for target in batch['targets'].values()):
                 raise PhoneAdmissionError('phone_recipient_busy')
+            if any(set(targets).intersection(batch['targets']) for batch in state['batches'].values()
+                   if batch['status'] != 'closed' and batch.get('purpose') == 'voicemail'):
+                raise PhoneAdmissionError('phone_recipient_busy')
             if outbound:
                 self.reserve_outbound_budget(state, len(outbound), outbound_daily_limit, now)
             token = os.urandom(16).hex()
@@ -386,6 +526,8 @@ class PhoneAdmissionStore:
                 'targets': {key: {'dials': values} for key, values in targets.items()}, 'channels': {}}
             for key, metadata in outbound.items():
                 state['batches'][token]['targets'][key].update(outbound=metadata['target'], route_proof=metadata['proof'])
+            if vm_fallback is not None:
+                state['batches'][token]['vm_fallback'] = json.loads(json.dumps(vm_fallback))
             self.validate(state)
         return token
 
@@ -422,6 +564,205 @@ class PhoneAdmissionStore:
     def bind_origin(self, token, recipient, uniqueid, channel):
         return self._bind(token, recipient, uniqueid, channel, 'origin')
 
+    def attach_voicemail_sound(self, token, source_sound, sound):
+        """Publish an immutable generated-audio copy once, without changing audio calls."""
+        return self._attach_voicemail_sound(token, sound, source_sound=source_sound)
+
+    def attach_live_voicemail_sound(self, token, channel, sound):
+        """Finalize only the admitted live caller's recording, including its hangup path."""
+        return self._attach_voicemail_sound(token, sound, channel=channel)
+
+    def _attach_voicemail_sound(self, token, sound, *, source_sound=None, channel=None):
+        accountcode(token)
+        if sound != 'SLS_Mass_Notifications_Plugin/voicemail/' + token:
+            raise PhoneAdmissionError('phone_voicemail_audio_invalid')
+        with self.locked() as state:
+            health = self.require_collector(state)
+            batch = state['batches'].get(token)
+            fallback = batch.get('vm_fallback') if batch else None
+            if (not fallback or batch.get('purpose', 'audio') != 'audio' or batch['boot_id'] != self.boot_id
+                    or batch['generation'] != health['generation'] or batch.get('outcome_uncertain')
+                    or self.monotonic() >= fallback['expires_tick'] or self.clock() < batch['created_at'] - 60):
+                raise PhoneAdmissionError('phone_voicemail_source_unavailable')
+            if batch['service'] == 'live':
+                origins = [row for row in batch['channels'].values()
+                           if row['kind'] == 'origin' and row['recipient'] == fallback['live_origin']]
+                if source_sound is not None or not isinstance(channel, str) or len(origins) != 1 or origins[0]['channel'] != channel:
+                    raise PhoneAdmissionError('phone_voicemail_source_invalid')
+            elif channel is not None or source_sound != fallback['source_sound']:
+                raise PhoneAdmissionError('phone_voicemail_source_invalid')
+            if fallback['sound'] is not None:
+                if fallback['sound'] == sound:
+                    return True
+                raise PhoneAdmissionError('phone_voicemail_source_invalid')
+            fallback['sound'] = sound
+            if batch['service'] != 'live' and not batch['channels'] and not any(row['dials'] for row in batch['targets'].values()):
+                # This original admission cannot produce an audio call file:
+                # every selected phone was offline. The separate mailbox
+                # claim still requires a fresh complete channel inventory.
+                batch.update(status='closed', closed_at=self.clock(), updated_at=self.clock(), updated_tick=self.monotonic())
+            self.validate(state)
+        return True
+
+    def admit_voicemail(self, source_token, recipient, limit, inventory, mailbox, sound):
+        """Claim one mailbox deposit after exact, complete unanswered-call evidence.
+
+        The parent claim is durable before an originate can exist. A lost response,
+        failed deposit or uncertain channel never permits a second attempt.
+        """
+        accountcode(source_token)
+        limit = checked_limit(limit)
+        if (not isinstance(recipient, str) or not EXTENSION.fullmatch(recipient)
+                or not isinstance(mailbox, str) or not MAILBOX.fullmatch(mailbox)
+                or MAILBOX.fullmatch(mailbox).group(1) != recipient
+                or sound != 'SLS_Mass_Notifications_Plugin/voicemail/' + source_token):
+            raise PhoneAdmissionError('phone_voicemail_target_invalid')
+        with self.locked() as state:
+            self.reconcile(state, inventory)
+            health = self.require_collector(state)
+            source = state['batches'].get(source_token)
+            fallback = source.get('vm_fallback') if source else None
+            selected = fallback.get('targets', {}).get(recipient) if fallback else None
+            if (not fallback or source.get('purpose', 'audio') != 'audio' or source['status'] != 'closed'
+                    or source['boot_id'] != self.boot_id or source['generation'] != health['generation']
+                    or source.get('outcome_uncertain') or source.get('external_event_gap') or source.get('runtime_fault')
+                    or not selected or fallback['sound'] != sound or selected['mailbox'] != mailbox
+                    or self.monotonic() >= fallback['expires_tick'] or self.clock() >= fallback['expires_at']
+                    or self.clock() < source['created_at'] - 60):
+                raise PhoneAdmissionError('phone_voicemail_source_unavailable')
+            if selected['claimed_token'] is not None or recipient in source.get('voicemail_failures', {}):
+                raise PhoneAdmissionError('phone_voicemail_already_attempted')
+            if (re.fullmatch(r'vm-[a-f0-9]{64}', source['correlation'])
+                    and any(batch.get('purpose') == 'voicemail' and batch['service'] == source['service']
+                            and batch['correlation'] == source['correlation'] and recipient in batch['targets']
+                            for batch in state['batches'].values())):
+                raise PhoneAdmissionError('phone_voicemail_already_attempted')
+            for dial in selected['dials']:
+                contacts = [row for row in source['channels'].values() if row['kind'] == 'contact' and row.get('dial') == dial]
+                if (len(contacts) != 1 or contacts[0].get('ended_at') is None
+                        or contacts[0].get('outcome_uncertain') or contacts[0].get('answered_at') is not None
+                        or contacts[0].get('joined_at') is not None or contacts[0].get('dial_status') not in UNANSWERED_STATUSES):
+                    raise PhoneAdmissionError('phone_voicemail_noanswer_unconfirmed')
+            if self.used_contacts(state) + 1 > limit:
+                raise PhoneAdmissionError('phone_capacity_busy')
+            if any(recipient in batch['targets'] for batch in state['batches'].values() if batch['status'] != 'closed'):
+                raise PhoneAdmissionError('phone_recipient_busy')
+            now, tick = self.clock(), self.monotonic()
+            start_window = min(60, fallback['expires_at'] - now, fallback['expires_tick'] - tick)
+            token = os.urandom(16).hex()
+            state['batches'][token] = {'status': 'reserved', 'purpose': 'voicemail', 'service': source['service'],
+                'correlation': source['correlation'], 'created_at': now, 'updated_at': now,
+                'start_deadline': now + start_window, 'created_tick': tick, 'updated_tick': tick,
+                'start_deadline_tick': tick + start_window, 'boot_id': self.boot_id, 'generation': health['generation'],
+                'targets': {recipient: {'dials': ['VM/' + mailbox]}}, 'channels': {},
+                'voicemail': {'source_token': source_token, 'mailbox': mailbox, 'sound': sound,
+                              'playback_completed': False, 'result': None}}
+            selected['claimed_token'] = token
+            self.validate(state)
+        return token
+
+    def record_voicemail_refusal(self, source_token, recipient, failure_code):
+        """Keep a bounded terminal refusal without consuming or retrying a mailbox call."""
+        _, unclaimed = self._record_voicemail_refusals(source_token, [recipient], failure_code)
+        return bool(unclaimed)
+
+    def record_voicemail_refusals(self, source_token, recipients, failure_code):
+        """Record a validated cohort's terminal failures in one ledger transaction."""
+        changed, _ = self._record_voicemail_refusals(source_token, recipients, failure_code)
+        return changed
+
+    def _record_voicemail_refusals(self, source_token, recipients, failure_code):
+        accountcode(source_token)
+        if not isinstance(failure_code, str) or failure_code not in VOICEMAIL_REFUSALS:
+            raise PhoneAdmissionError('phone_voicemail_result_invalid')
+        if (not isinstance(recipients, (list, tuple)) or not 1 <= len(recipients) <= MAX_CONTACTS
+                or any(not isinstance(recipient, str) or not EXTENSION.fullmatch(recipient) for recipient in recipients)
+                or len(set(recipients)) != len(recipients)):
+            raise PhoneAdmissionError('phone_voicemail_source_invalid')
+        with self.locked() as state:
+            source = state['batches'].get(source_token)
+            fallback = source.get('vm_fallback') if source else None
+            targets = fallback.get('targets', {}) if isinstance(fallback, dict) else {}
+            if not source or source.get('purpose', 'audio') != 'audio' or any(recipient not in targets for recipient in recipients):
+                raise PhoneAdmissionError('phone_voicemail_source_invalid')
+            changed = unclaimed = 0
+            for recipient in recipients:
+                if targets[recipient]['claimed_token'] is not None:
+                    continue
+                unclaimed += 1
+                failures = source.setdefault('voicemail_failures', {})
+                if recipient not in failures:
+                    failures[recipient] = failure_code
+                    changed += 1
+            self.validate(state)
+        return changed, unclaimed
+
+    def voicemail_target(self, token, recipient):
+        accountcode(token)
+        state = read_private_json('phone-admission.json', self.directory)
+        self.validate(state)
+        batch = state['batches'].get(token)
+        if not batch or batch.get('purpose') != 'voicemail' or recipient not in batch['targets']:
+            raise PhoneAdmissionError('phone_voicemail_target_invalid')
+        proof = json.loads(json.dumps(batch['voicemail']))
+        parent = state['batches'].get(proof['source_token'])
+        fallback = parent.get('vm_fallback') if parent else None
+        if (not fallback or fallback['targets'].get(recipient, {}).get('claimed_token') != token
+                or fallback['sound'] != proof['sound'] or fallback['targets'][recipient]['mailbox'] != proof['mailbox']):
+            raise PhoneAdmissionError('phone_voicemail_source_unavailable')
+        return {**proof, 'service': batch['service'], 'scope': fallback['scope'], 'scope_hash': fallback['scope_hash']}
+
+    def bind_voicemail(self, token, recipient, uniqueid, channel):
+        target = self.voicemail_target(token, recipient)
+        self._bind(token, recipient, uniqueid, channel, 'origin')
+        return target
+
+    def record_voicemail_result(self, token, recipient, channel, status):
+        accountcode(token)
+        if status not in {'SUCCESS', 'FAILED', 'USEREXIT'}:
+            raise PhoneAdmissionError('phone_voicemail_result_invalid')
+        with self.locked() as state:
+            health = self.require_collector(state)
+            batch = state['batches'].get(token)
+            if (not batch or batch.get('purpose') != 'voicemail' or batch['status'] not in {'active', 'closed'}
+                    or recipient not in batch['targets'] or batch['generation'] != health['generation']
+                    or batch['boot_id'] != self.boot_id or batch.get('outcome_uncertain')
+                    or self.monotonic() - batch['created_tick'] > 2400):
+                raise PhoneAdmissionError('phone_voicemail_result_unconfirmed')
+            rows = [row for row in batch['channels'].values() if row['recipient'] == recipient and row['kind'] == 'origin']
+            if len(rows) != 1 or rows[0]['channel'] != channel or rows[0].get('outcome_uncertain'):
+                raise PhoneAdmissionError('phone_voicemail_result_unconfirmed')
+            if status == 'SUCCESS' and not batch['voicemail']['playback_completed']:
+                raise PhoneAdmissionError('phone_voicemail_result_unconfirmed')
+            previous = batch['voicemail']['result']
+            if previous is not None and previous['status'] != status:
+                raise PhoneAdmissionError('phone_voicemail_result_invalid')
+            if previous is None:
+                batch['voicemail']['result'] = {'status': status, 'recorded_at': self.clock()}
+            self.validate(state)
+        return True
+
+    def record_voicemail_playback(self, token, recipient, channel, status):
+        """The exact playback Local half must finish before a saved result is trusted."""
+        accountcode(token)
+        if status not in {'SUCCESS', 'FAILED'}:
+            raise PhoneAdmissionError('phone_voicemail_result_invalid')
+        with self.locked() as state:
+            health = self.require_collector(state)
+            batch = state['batches'].get(token)
+            if (not batch or batch.get('purpose') != 'voicemail' or batch['status'] != 'active'
+                    or recipient not in batch['targets'] or batch['generation'] != health['generation']
+                    or batch['boot_id'] != self.boot_id or batch.get('outcome_uncertain')):
+                raise PhoneAdmissionError('phone_voicemail_result_unconfirmed')
+            rows = [row for row in batch['channels'].values() if row['recipient'] == recipient and row['kind'] == 'origin']
+            if (len(rows) != 1 or rows[0]['channel'][:-1] + '1' != channel
+                    or rows[0].get('ended_at') is not None or rows[0].get('outcome_uncertain')):
+                raise PhoneAdmissionError('phone_voicemail_result_unconfirmed')
+            if status == 'SUCCESS':
+                batch['voicemail']['playback_completed'] = True
+            self.validate(state)
+        return True
+
     def bind_contact(self, token, recipient, uniqueid, channel, dial):
         return self._bind(token, recipient, uniqueid, channel, 'contact', dial)
 
@@ -438,6 +779,10 @@ class PhoneAdmissionStore:
                 raise PhoneAdmissionError('phone_ticket_unavailable')
             if batch['boot_id'] != self.boot_id or batch['generation'] != health['generation']:
                 raise PhoneAdmissionError('phone_ticket_generation_changed')
+            if batch.get('purpose') == 'voicemail':
+                if (kind != 'origin' or not re.fullmatch(r'Local/' + re.escape(str(recipient))
+                        + r'@sls-alert-voicemail-[a-f0-9]{1,32};2', channel)):
+                    raise PhoneAdmissionError('phone_voicemail_origin_invalid')
             if kind == 'contact' and dial not in batch['targets'][recipient]['dials']:
                 raise PhoneAdmissionError('phone_contact_not_admitted')
             if kind == 'contact' and VOICE_ID.fullmatch(str(recipient)):
@@ -685,6 +1030,12 @@ class PhoneAdmissionStore:
 
 
 ERROR_MESSAGES = {
+    'phone_event_collector_state_missing': 'The private phone admission ledger has not been created. Check collector service status and its saved local AMI login and permissions.',
+    'phone_event_collector_state_permission': 'The collector health probe cannot read the private admission ledger. Review its asterisk ownership and protected data permissions.',
+    'phone_event_collector_never_connected': 'No authenticated collector heartbeat has been recorded. Review the collector service journal and the saved loopback AMI login and permissions.',
+    'phone_event_collector_stale': 'The authenticated collector heartbeat is older than fifteen seconds. Review service status, local AMI connectivity and CPU/storage pressure.',
+    'phone_event_collector_rebooted': 'The recorded heartbeat belongs to an earlier boot. Wait for a current authenticated heartbeat or inspect the collector service journal.',
+    'phone_event_collector_clock_invalid': 'The monotonic heartbeat is invalid or in the future. Review boot/time evidence and the collector service; do not fabricate a fresh heartbeat in the ledger.',
     'outbound_call_budget_exceeded': 'The configured daily SLS external-call limit was reached. No additional external call was authorized; internal announcements remain eligible. Admitted attempts count even if delivery later fails or is uncertain. The counter resets at 00:00 UTC; review the limit in General Settings before deliberately increasing it.',
     'outbound_budget_invalid': 'The external-call budget configuration or retained counter is invalid. External calls were withheld. Review General Settings and protected phone-admission state; do not reset delivery history to bypass the limit.',
     'outbound_budget_clock_rollback': 'The PBX clock moved backwards relative to the external-call budget. External calls were withheld to prevent resetting the daily allowance. Check time synchronization; existing calls are not interrupted.',
@@ -708,10 +1059,34 @@ ERROR_MESSAGES = {
     'phone_state_commit_uncertain': 'The phone reservation changed, but durable storage confirmation failed. No new call files were authorized; inspect storage health before retrying.',
     'phone_ticket_expired_or_used': 'This phone admission has expired or was already started. The delayed call file was rejected without redialing.',
     'phone_ticket_generation_changed': 'The phone event connection restarted after admission. This unstarted call was rejected; active calls were not replayed.',
+    'phone_voicemail_already_attempted': 'This alert already claimed its one voicemail attempt for the extension. It will not be deposited or retried again.',
+    'phone_voicemail_noanswer_unconfirmed': 'Voicemail was withheld because every admitted handset could not be confirmed unanswered. Answered calls and incomplete phone evidence do not create voicemail.',
+    'phone_voicemail_source_unavailable': 'The voicemail source is expired, incomplete, changed or affected by a phone-event gap. No mailbox deposit was authorized.',
+    'phone_voicemail_target_invalid': 'The voicemail target does not match the captured FreePBX extension mailbox. No mailbox deposit was authorized.',
+    'phone_voicemail_origin_invalid': 'The voicemail channel does not match its separately admitted Local channel. No mailbox deposit was authorized.',
+    'phone_voicemail_result_invalid': 'The voicemail application result is invalid or conflicts with the recorded attempt. It was not treated as a successful deposit.',
+    'phone_voicemail_result_unconfirmed': 'The voicemail result could not be confirmed for its active admitted channel. Delivery remains unconfirmed and is not retried.',
+    'phone_voicemail_audio_unavailable': 'The alert audio could not be retained safely for voicemail. Review storage and audio-file permissions; ordinary phone delivery may still proceed.',
+    'phone_voicemail_audio_invalid': 'The voicemail recording is missing, empty or outside the supported audio format or duration. No mailbox deposit was authorized.',
+    'phone_voicemail_audio_capacity': 'There is insufficient reserved space for the voicemail recording. Ordinary phone delivery may still proceed; review free space and retention.',
+    'phone_voicemail_mailbox_duration': 'The full alert is outside this mailbox\'s existing minimum or maximum recording duration. No truncated voicemail was deposited. Review the mailbox limits or shorten the alert.',
+    'phone_voicemail_mailbox_silence': 'This mailbox\'s silence limit could end the alert before its audio finishes. No partial voicemail was deposited. Review the recording or the existing mailbox silence settings.',
+    'phone_voicemail_mailbox_policy_unavailable': 'The native mailbox recording policy could not be verified safely. Review its static Asterisk voicemail configuration; realtime or executable profiles are not supported by this fallback. Ordinary paging remains available.',
+    'phone_voicemail_policy_changed': 'Voicemail was withheld because the feature, alert validity, quiet hours or saved audience authorization changed before deposit. Newly added recipients never receive an old alert.',
+    'phone_voicemail_mailbox_changed': 'This extension\'s mailbox was removed or changed after the alert was admitted. No voicemail was deposited into a different mailbox.',
+    'phone_voicemail_recording_not_admitted': 'The live recording does not match the admitted paging caller and ticket. No mailbox deposit was authorized.',
+    'phone_voicemail_recording_unconfirmed': 'A complete stopped recording of the live paging caller could not be confirmed. No partial or uncertain recording was deposited.',
+    'phone_voicemail_cluster_fenced': 'Notification failover or site authorization withheld this mailbox deposit. Review the active host and site lease; no separate voicemail attempt bypasses the existing notification fence.',
 }
 
 
 def operator_message(code):
+    if code == 'phone_live_contact_unidentified':
+        return 'The paging caller could not be distinguished from other registered handsets. Check the caller contact address and SIP proxy registration; no page was started.'
+    if code == 'phone_live_audience_changed':
+        return 'The paging group audience changed or differs from the saved group. Save the group again and retry; no page was started.'
+    if code == 'phone_origin_binding_failed':
+        return 'Asterisk could not bind the paging caller to its admitted phone ticket. Inspect the phone AGI error and collector journal; no page was started.'
     if code in ERROR_MESSAGES:
         return ERROR_MESSAGES[code]
     if code.startswith('phone_state_'):
@@ -766,13 +1141,23 @@ def collector_health(directory=DATA):
         store = PhoneAdmissionStore(directory)
         state = read_private_json('phone-admission.json', directory)
         store.validate(state)
+        heartbeat = state.get('collector')
+        if not isinstance(heartbeat, dict) or not heartbeat.get('generation'):
+            raise PhoneAdmissionError('phone_event_collector_never_connected')
+        if heartbeat.get('boot_id') != store.boot_id:
+            raise PhoneAdmissionError('phone_event_collector_rebooted')
+        tick=heartbeat.get('heartbeat_tick')
+        if type(tick) not in (int,float) or not math.isfinite(tick) or store.monotonic()-tick<0:
+            raise PhoneAdmissionError('phone_event_collector_clock_invalid')
+        if store.monotonic()-tick>15:
+            raise PhoneAdmissionError('phone_event_collector_stale')
         health = store.require_collector(state)
         return {'ok': True, 'connected': True,
                 'heartbeat_age_seconds': round(store.monotonic() - health['heartbeat_tick'], 3),
                 'active_batches': sum(batch['status'] != 'closed' for batch in state['batches'].values()),
                 'reserved_contacts': store.used_contacts(state)}
     except Exception as error:
-        code = str(error) if isinstance(error, PhoneAdmissionError) else 'phone_event_collector_unavailable'
+        code = str(error) if isinstance(error, PhoneAdmissionError) else ('phone_event_collector_state_missing' if isinstance(error,FileNotFoundError) else ('phone_event_collector_state_permission' if isinstance(error,PermissionError) else 'phone_event_collector_unavailable'))
         return {'ok': False, 'connected': False, 'failure_code': code, 'detail': operator_message(code)}
 
 
@@ -849,7 +1234,7 @@ class PhoneAmi:
             message[key] = value.lstrip()
         return message
 
-    def action(self, fields, complete_event=None):
+    def action(self, fields, complete_event=None, *, missing_database=False):
         action_id = os.urandom(16).hex()
         self.send({**fields, 'ActionID': action_id})
         deadline = time.monotonic() + 5
@@ -863,6 +1248,10 @@ class PhoneAmi:
                 continue
             if 'Response' in message:
                 if message.get('Response', '').lower() != 'success':
+                    if (missing_database and fields.get('Action') == 'DBGet'
+                            and message.get('Response', '').lower() == 'error'
+                            and message.get('Message') == 'Database entry not found'):
+                        return message, []
                     raise PhoneAdmissionError('phone_ami_action_rejected')
                 response = message
                 if complete_event is None:
@@ -875,9 +1264,28 @@ class PhoneAmi:
                     return response, rows
         raise PhoneAdmissionError('phone_ami_response_oversized')
 
-    def variable(self, expression):
-        response, _ = self.action({'Action': 'Getvar', 'Variable': expression})
+    def variable(self, expression, channel=None):
+        fields = {'Action': 'Getvar', 'Variable': expression}
+        if channel is not None:
+            if not isinstance(channel, str) or not re.fullmatch(r'PJSIP/[A-Za-z0-9_.-]{1,80}-[a-fA-F0-9]{8}', channel):
+                raise PhoneAdmissionError('phone_live_origin_invalid')
+            fields['Channel'] = channel
+        response, _ = self.action(fields)
         return str(response.get('Value', ''))
+
+    def database(self, family, key):
+        """Read a literal FreePBX key without enabling dangerous dialplan functions."""
+        if family != 'AMPUSER' or not isinstance(key, str) or not re.fullmatch(r'[0-9]{1,20}/voicemail', key):
+            raise PhoneAdmissionError('phone_ami_request_invalid')
+        response, events = self.action({'Action': 'DBGet', 'Family': family, 'Key': key},
+                                       'DBGetResponse', missing_database=True)
+        if response.get('Response', '').lower() == 'error':
+            return ''
+        if (len(events) != 1 or events[0].get('Event') != 'DBGetResponse' or events[0].get('Family') != family
+                or events[0].get('Key') != key or not isinstance(events[0].get('Val'), str)
+                or len(events[0]['Val'].encode()) > 4096 or re.search(r'[\x00-\x1f\x7f]', events[0]['Val'])):
+            raise PhoneAdmissionError('phone_ami_database_response_invalid')
+        return events[0]['Val']
 
     def contacts(self, extensions):
         if not isinstance(extensions, list) or not 1 <= len(extensions) <= MAX_CONTACTS or any(not isinstance(value, str) or not EXTENSION.fullmatch(value) for value in extensions):
@@ -897,6 +1305,24 @@ class PhoneAmi:
                     value = self.variable('PJSIP_DIAL_CONTACTS(' + endpoint + ')')
             targets[extension] = contact_dials(value, endpoint)
         return targets
+
+    def mailboxes(self, extensions):
+        """Use FreePBX's own extension mailbox context and Asterisk existence check."""
+        if (not isinstance(extensions, list) or len(extensions) > MAX_CONTACTS
+                or any(not isinstance(value, str) or not EXTENSION.fullmatch(value) for value in extensions)):
+            raise PhoneAdmissionError('phone_voicemail_target_invalid')
+        result = {}
+        deadline = time.monotonic() + 30
+        for extension in dict.fromkeys(extensions):
+            if time.monotonic() >= deadline:
+                raise PhoneAdmissionError('phone_ami_inventory_timeout')
+            context = self.database('AMPUSER', extension + '/voicemail')
+            if context in {'', 'novm'} or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', context):
+                continue
+            mailbox = extension + '@' + context
+            if self.variable('VM_INFO(' + mailbox + ',exists)') == '1':
+                result[extension] = mailbox
+        return result
 
     def inventory(self, generation, boot_id):
         # Fence against binds that happen DURING collection. Completion time
@@ -984,7 +1410,7 @@ def preserve_audio_media(directory, extensions, duration, sound):
             state['recipients'][extension] = max(state['recipients'].get(extension, 0), end)
 
 
-def check_live_audience(settings, extensions, live_origin, live_group, live_external=False, live_caller_number=None):
+def check_live_audience(settings, extensions, live_origin, live_group, live_external=False, live_caller_number=None, include_origin=False):
     """Bind live admission to one current group and its exact phone audience."""
     paging = settings.get('live_paging', {})
     if (not isinstance(live_origin, str) or not EXTENSION.fullmatch(live_origin)
@@ -1029,13 +1455,59 @@ def check_live_audience(settings, extensions, live_origin, live_group, live_exte
             or not isinstance(extensions, list) or not extensions
             or any(not isinstance(value, str) or not EXTENSION.fullmatch(value) for value in extensions)
             or len(extensions) != len(set(extensions))
-            or set(extensions) != set(targets) - {live_origin}):
+            or set(extensions) != (set(targets) if include_origin else set(targets) - {live_origin})):
         raise PhoneAdmissionError('phone_live_audience_changed')
+
+
+def exclude_live_contact(ami, targets, origin, channel, uniqueid):
+    """Exclude the authenticated caller's contact, retaining other handsets."""
+    import ipaddress
+    if (not isinstance(channel, str) or not re.fullmatch(r'PJSIP/[A-Za-z0-9_.-]{1,80}-[a-fA-F0-9]{8}', channel)
+            or not isinstance(uniqueid, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', uniqueid)
+            or ami.variable('UNIQUEID', channel) != uniqueid):
+        raise PhoneAdmissionError('phone_live_origin_invalid')
+    endpoint = ami.variable('CHANNEL(endpoint)', channel)
+    if not EXTENSION.fullmatch(endpoint) or ami.variable('DB(DEVICE/' + endpoint + '/dial)') != 'PJSIP/' + endpoint:
+        raise PhoneAdmissionError('phone_live_origin_invalid')
+    user = ami.variable('DB(DEVICE/' + endpoint + '/user)')
+    if (endpoint if user in ('', 'none') else user) != origin:
+        raise PhoneAdmissionError('phone_live_origin_invalid')
+
+    def address(value, sip=False):
+        if sip:
+            match = re.fullmatch(r'PJSIP/[A-Za-z0-9_.-]{1,80}/(sips?):([^;?]+)(?:[;?].*)?', value)
+            if not match: return None
+            authority = match[2].rsplit('@', 1)[-1]
+            default = 5061 if match[1] == 'sips' else 5060
+        else:
+            authority, default = value, None
+        match = re.fullmatch(r'(\[[0-9a-fA-F:]+\]|[^:\[\]]+)(?::([0-9]{1,5}))?', authority)
+        if not match: return None
+        try: host = str(ipaddress.ip_address(match[1].strip('[]')))
+        except ValueError: return None
+        port = int(match[2]) if match[2] else default
+        return (host, port) if port is not None and 1 <= port <= 65535 else None
+
+    remote = address(ami.variable('CHANNEL(pjsip,remote_addr)', channel))
+    source = ami.contacts([endpoint]).get(endpoint, [])
+    matched = [dial for dial in source if remote is not None and address(dial, True) == remote]
+    if len(matched) != 1:
+        # One registered contact can safely be excluded when a proxy hides its
+        # address. Several contacts need positive identification to avoid paging
+        # the caller or silently discarding every handset on the extension.
+        if len(source) != 1: raise PhoneAdmissionError('phone_live_contact_unidentified')
+        matched = source
+    caller_uri = matched[0].split('/', 2)[-1]
+    caller_address = address(matched[0], True)
+    return {recipient: [dial for dial in dials if dial.split('/', 2)[-1] != caller_uri
+            and (caller_address is None or address(dial, True) != caller_address)]
+            for recipient, dials in targets.items()}
 
 
 def admit_audience(extensions, *, outbound=None, service, correlation='', wait_seconds=30, duration=None, sound=None,
                    live_origin=None, live_group=None, directory=DATA, settings=None, ami_factory=PhoneAmi,
-                   latest_start=None, live_external=False, live_caller_number=None):
+                   latest_start=None, live_external=False, live_caller_number=None, live_channel=None, live_uniqueid=None,
+                   voicemail=False, voicemail_scope='', voicemail_context=None):
     if not isinstance(wait_seconds, (float, int)) or not 0 <= wait_seconds <= 300:
         raise PhoneAdmissionError('phone_wait_limit_invalid')
     if latest_start is not None and (type(latest_start) is not int or not 0 < latest_start <= 253402300799):
@@ -1048,18 +1520,56 @@ def admit_audience(extensions, *, outbound=None, service, correlation='', wait_s
     settings = settings if settings is not None else read_settings(directory)
     limit = checked_limit(settings.get('phone_device_limit', 25))
     store = PhoneAdmissionStore(directory)
+    if (type(voicemail) is not bool or not isinstance(voicemail_scope, str)
+            or not re.fullmatch(r'[A-Za-z0-9_-]{0,64}', voicemail_scope)
+            or (voicemail and service not in VOICEMAIL_SERVICES)):
+        raise PhoneAdmissionError('phone_voicemail_source_invalid')
+    voicemail = voicemail and voicemail_enabled(settings, service)
     outbound = outbound or []
     if not isinstance(extensions, list) or not isinstance(outbound, list) or len(outbound) > 1000 or (live_origin is not None and outbound):
         raise PhoneAdmissionError('phone_audience_invalid')
     if type(live_external) is not bool:
         raise PhoneAdmissionError('phone_live_origin_invalid')
-    if service == 'live' or live_origin is not None or live_group is not None or live_external or live_caller_number not in (None, ''):
+    contact_origin = live_channel is not None or live_uniqueid is not None
+    if contact_origin and (live_external or not live_channel or not live_uniqueid):
+        raise PhoneAdmissionError('phone_live_origin_invalid')
+    if service == 'live' or live_origin is not None or live_group is not None or live_external or live_caller_number not in (None, '') or contact_origin:
         if service != 'live':
             raise PhoneAdmissionError('phone_live_origin_invalid')
-        check_live_audience(settings, extensions, live_origin, live_group, live_external, live_caller_number)
+        check_live_audience(settings, extensions, live_origin, live_group, live_external, live_caller_number, contact_origin)
     with ami_factory(settings) as ami:
         targets = ami.contacts(extensions) if extensions else {}
+        if contact_origin:
+            targets = exclude_live_contact(ami, targets, live_origin, live_channel, live_uniqueid)
         offline = [key for key, values in targets.items() if not values]
+        fallback = None
+        if voicemail:
+            vm_extensions = [extension for extension in extensions if extension != live_origin]
+            mailboxes = ami.mailboxes(vm_extensions)
+            if mailboxes:
+                from sls_voicemail import scope_fingerprint
+                scope = live_group if service == 'live' else voicemail_scope
+                scope_hash = scope_fingerprint(settings, service, scope)
+                if not isinstance(scope_hash, str) or not re.fullmatch(r'[a-f0-9]{64}', scope_hash):
+                    raise PhoneAdmissionError('phone_voicemail_source_invalid')
+                if service != 'live' and (not isinstance(sound, str) or not GENERATED_SOUND.fullmatch(sound)):
+                    raise PhoneAdmissionError('phone_voicemail_audio_invalid')
+                checked_voicemail_context(voicemail_context, service, scope)
+                now, tick = store.clock(), store.monotonic()
+                retention = min(1800, math.ceil(duration)) if isinstance(duration, (int, float)) and not isinstance(duration, bool) and math.isfinite(duration) and 0 < duration <= 1800 else 1800
+                expires_at = min(now + retention + 600, latest_start) if latest_start is not None else now + retention + 600
+                if service != 'live':
+                    expires_at = min(expires_at, voicemail_context['source_validity']['expires_at'])
+                if expires_at <= now:
+                    raise PhoneAdmissionError('phone_voicemail_source_unavailable')
+                fallback = {'schema': 1, 'scope': scope, 'scope_hash': scope_hash,
+                    'source_sound': None if service == 'live' else sound, 'sound': None,
+                    'weather_context': json.loads(json.dumps(voicemail_context)),
+                    'live_origin': live_origin if service == 'live' else None,
+                    'live_group': live_group if service == 'live' else None,
+                    'expires_at': expires_at, 'expires_tick': tick + max(0, expires_at - now),
+                    'targets': {extension: {'dials': list(targets[extension]), 'mailbox': mailbox, 'claimed_token': None}
+                                for extension, mailbox in mailboxes.items()}}
         outbound_metadata = {}
         outbound_failures = []
         seen_voice_ids = set()
@@ -1088,7 +1598,7 @@ def admit_audience(extensions, *, outbound=None, service, correlation='', wait_s
         if live_origin is not None:
             live_dials = list(dict.fromkeys(dial for values in targets.values() for dial in values))
             targets = {live_origin: live_dials}
-        checked = checked_targets(targets)
+        checked = checked_targets(targets, retain_offline=fallback is not None)
         if sum(map(len, checked.values())) > limit:
             raise PhoneAdmissionError('phone_audience_exceeds_limit')
         deadline = time.monotonic() + wait_seconds
@@ -1100,12 +1610,34 @@ def admit_audience(extensions, *, outbound=None, service, correlation='', wait_s
             try:
                 token = store.admit(checked, limit, inventory, service=service, correlation=correlation, outbound=outbound_metadata,
                                     latest_start=latest_start, latest_start_tick=latest_start_tick,
-                                    outbound_daily_limit=settings.get('outbound_voice', {}).get('daily_call_limit', 0) if outbound_metadata else 0)
-                preserve_audio_media(directory, extensions, duration, sound)
+                                    outbound_daily_limit=settings.get('outbound_voice', {}).get('daily_call_limit', 0) if outbound_metadata else 0,
+                                    vm_fallback=fallback)
+                if service != 'live':
+                    preserve_audio_media(directory, extensions, duration, sound)
                 check_deadline()
-                return {'token': token, 'targets': [key for key in checked if not VOICE_ID.fullmatch(key)],
+                voicemail_error = None
+                if fallback is not None and service != 'live':
+                    try:
+                        from sls_voicemail import snapshot_audio
+                        retained_sound = snapshot_audio(token, sound, duration, directory)
+                        store.attach_voicemail_sound(token, sound, retained_sound)
+                    except (PhoneAdmissionError, OSError, ValueError, RuntimeError) as error:
+                        # The normal audio reservation already exists. Its calls
+                        # remain valid even if retaining a voicemail copy fails.
+                        voicemail_error = str(error) if isinstance(error, PhoneAdmissionError) and str(error) in VOICEMAIL_REFUSALS else 'phone_voicemail_audio_unavailable'
+                        for recipient in fallback['targets']:
+                            try:
+                                store.record_voicemail_refusal(token, recipient, voicemail_error)
+                            except (PhoneAdmissionError, OSError, ValueError):
+                                # Failure reporting cannot revoke or silently
+                                # recreate the admitted ordinary audio ticket.
+                                pass
+                return {'token': token, 'targets': [key for key in checked if not VOICE_ID.fullmatch(key) and checked[key]],
                         'outbound_targets': list(outbound_metadata), 'outbound_failures': outbound_failures, 'unavailable': offline,
-                        'contacts': sum(map(len, checked.values())), 'live_dial': '&'.join(live_dials) if live_dials is not None else ''}
+                        'contacts': sum(map(len, checked.values())), 'live_dial': '&'.join(live_dials) if live_dials is not None else '',
+                        'voicemail_targets': list(fallback['targets']) if fallback else [],
+                        'vm_only': fallback is not None and not any(checked.values()),
+                        'voicemail_failure_code': voicemail_error}
             except PhoneAdmissionError as error:
                 if outbound_metadata and str(error) in {'outbound_budget_invalid', 'outbound_budget_clock_rollback', 'outbound_call_budget_exceeded'}:
                     for recipient in outbound_metadata:
@@ -1146,13 +1678,16 @@ def main():
             if len(raw) > 1048576:
                 raise PhoneAdmissionError('phone_request_oversized')
             request = json.loads(raw)
-            if not isinstance(request, dict) or set(request) - {'internal', 'outbound', 'service', 'correlation', 'wait_seconds', 'duration', 'sound', 'live_origin', 'live_group', 'live_external', 'live_caller_number', 'latest_start'}:
+            if not isinstance(request, dict) or set(request) - {'internal', 'outbound', 'service', 'correlation', 'wait_seconds', 'duration', 'sound', 'live_origin', 'live_group', 'live_external', 'live_caller_number', 'live_channel', 'live_uniqueid', 'latest_start', 'voicemail', 'voicemail_scope', 'voicemail_context'}:
                 raise PhoneAdmissionError('phone_request_invalid')
             result = admit_audience(request.get('internal', []), outbound=request.get('outbound', []),
                 service=request.get('service', ''), correlation=request.get('correlation', ''),
                 wait_seconds=request.get('wait_seconds', 30), duration=request.get('duration'),
                 sound=request.get('sound'), live_origin=request.get('live_origin'), live_group=request.get('live_group'),
-                latest_start=request.get('latest_start'), live_external=request.get('live_external', False), live_caller_number=request.get('live_caller_number'))
+                latest_start=request.get('latest_start'), live_external=request.get('live_external', False), live_caller_number=request.get('live_caller_number'),
+                live_channel=request.get('live_channel'), live_uniqueid=request.get('live_uniqueid'),
+                voicemail=request.get('voicemail', False), voicemail_scope=request.get('voicemail_scope', ''),
+                voicemail_context=request.get('voicemail_context'))
             print(json.dumps({'ok': True, **result, 'retryable': False}))
             return 0
         if not args.recipients or not args.service:

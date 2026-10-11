@@ -113,3 +113,16 @@ never bypasses TOTP. Authentication and recovery events are recorded in the
 protected audit journal without passwords, authenticator codes or link credentials.
 Announcements retain the verified operator identity, recipients and delivery
 results in their durable jobs and activity history.
+
+## Scheduled account expiry
+
+In **Operator Access → Edit**, set an optional **Access expires** date and time.
+The editor uses the PBX timezone. Empty means no scheduled expiry. Ambiguous or
+nonexistent daylight-saving times are rejected; choose an unambiguous time.
+The central `.config` stores `expires_at` as a UTC epoch, with `0` meaning none.
+
+At the cutoff, new sign-ins, existing portal sessions and further authorization
+for queued delivery are denied. Changing or clearing the cutoff revokes old
+session/authentication bindings and outstanding reset links. Password recovery
+never changes the cutoff. An expired login can be re-enabled by a PBX
+administrator after reviewing its permissions and setting a new cutoff.

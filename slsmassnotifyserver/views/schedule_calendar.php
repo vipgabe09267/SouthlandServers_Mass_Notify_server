@@ -17,6 +17,10 @@
 @media(max-width:650px){.sls-calendar-row{grid-template-columns:1fr 1fr}.sls-calendar-row .sls-calendar-reason{grid-column:1}.sls-calendar-row button{justify-self:end}.sls-calendar-actions{align-items:flex-start;flex-direction:column}}
 </style>
 <div class="sls-calendar-panel" id="sls-calendar-panel" hidden>
+    <div class="form-group"><label for="sls-calendar-programme"><?php echo _('Calendar source'); ?></label><select class="form-control" id="sls-calendar-programme" name="schedule_programme_id"><option value=""><?php echo _('Custom calendar for this announcement'); ?></option><?php foreach (!empty($active_schedule_programmes['enabled']) ? $active_schedule_programmes['calendars'] : [] as $row): ?><option value="<?php echo htmlspecialchars($row['id'], ENT_QUOTES); ?>"><?php echo htmlspecialchars($row['name'], ENT_QUOTES); ?></option><?php endforeach; ?></select><p class="help-block"><?php echo _('Shared calendars must be saved and applied before selection. Each schedule stores its own reviewed programme dates.'); ?></p></div>
+    <div id="sls-calendar-programme-types" class="sls-calendar-weekdays" hidden></div>
+    <input type="hidden" name="schedule_programme_revision" id="sls-calendar-programme-revision">
+    <div id="sls-calendar-custom-rules">
     <p class="help-block"><i class="fa fa-calendar-check-o" aria-hidden="true"></i> <?php echo _('Choose the weekdays and final date, then add holidays or temporary start times. Dates use'); ?> <strong id="sls-calendar-zone"><?php echo htmlspecialchars($timezoneName, ENT_QUOTES); ?></strong>. <?php echo _('Saving does not replay past dates or change an announcement already submitted.'); ?></p>
     <div class="form-group" style="max-width:260px"><label for="sls-calendar-until"><?php echo _('Last calendar date'); ?></label><input type="date" class="form-control" id="sls-calendar-until" disabled></div>
     <span id="sls-calendar-days-label"><?php echo _('Repeat on'); ?></span>
@@ -36,6 +40,7 @@
     <h5><i class="fa fa-upload" aria-hidden="true"></i> <?php echo _('Import holiday dates'); ?></h5>
     <p class="help-block"><?php echo _('Choose an all-day .ics calendar or a UTF-8 CSV with the header start,end,reason. Imports add exclusions to this editor for review; they do not save or send anything. Up to 100 ranges and 256 KiB. Expand recurring events into explicit dates before importing.'); ?></p>
     <div class="sls-calendar-actions"><input type="file" id="sls-calendar-file" accept=".ics,.csv" aria-label="<?php echo htmlspecialchars(_('Holiday calendar file'), ENT_QUOTES); ?>"><button type="button" class="btn btn-default" id="sls-calendar-import"><i class="fa fa-upload" aria-hidden="true"></i> <?php echo _('Read calendar'); ?></button></div>
+    </div>
     <div class="sls-calendar-actions"><button type="button" class="btn btn-primary" id="sls-calendar-preview"><i class="fa fa-list-ol" aria-hidden="true"></i> <?php echo _('Review planned dates'); ?></button><span class="help-block"><?php echo _('Up to 366 occurrences; no automatic extension beyond the saved end date.'); ?></span></div>
     <p class="sls-calendar-status" id="sls-calendar-status" role="status" aria-live="polite"></p>
     <div class="sls-calendar-preview" id="sls-calendar-preview-results" hidden><ol></ol></div>
@@ -52,6 +57,15 @@
     var json=document.getElementById('sls-calendar-json'),complete=document.getElementById('sls-calendar-complete');
     var preview=document.getElementById('sls-calendar-preview'),importButton=document.getElementById('sls-calendar-import'),generation=0,busy=false;
     var defaultZone=<?php echo json_encode($timezoneName); ?>;
+    var programmeData=<?php echo json_encode(array_map(static function($row){$row['revision']=hash('sha256',json_encode($row,JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR));return $row;}, !empty($active_schedule_programmes['enabled']) ? $active_schedule_programmes['calendars'] : []), JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT); ?>;
+    var programmeSelect=document.getElementById('sls-calendar-programme'),programmeTypes=document.getElementById('sls-calendar-programme-types');
+    var programmeRevision=document.getElementById('sls-calendar-programme-revision'),customRules=document.getElementById('sls-calendar-custom-rules');
+    function selectedProgramme(){return programmeData.find(function(row){return row.id===programmeSelect.value;})||null;}
+    function chooseProgramme(selected){
+        programmeTypes.textContent='';var row=selectedProgramme();programmeRevision.value=row&&row.revision||'';
+        if(row){row.day_types.forEach(function(type){var label=document.createElement('label'),input=document.createElement('input');input.type='checkbox';input.name='schedule_programme_types[]';input.value=type;input.checked=(selected||row.day_types).indexOf(type)>=0;label.appendChild(input);label.appendChild(document.createTextNode(' '+type));programmeTypes.appendChild(label);});document.getElementById('sls-calendar-zone').textContent=row.timezone;}
+        customRules.hidden=programmeSelect.value!=='';programmeTypes.hidden=programmeSelect.value==='';toggle();invalidate();
+    }
     function message(text,error){status.textContent=text;status.classList.toggle('sls-calendar-error',!!error);}
     function invalidate(){generation++;output.hidden=true;message('',false);}
     function values(){
@@ -61,6 +75,7 @@
         return data;
     }
     function serialize(){
+        if(programmeSelect.value!==''){var valid=!!selectedProgramme()&&programmeTypes.querySelectorAll('input:checked').length>0;complete.value=valid?'1':'0';json.value='{}';return valid;}
         var data=values(),valid=!!data.until&&data.weekdays.length>0;
         panel.querySelectorAll('input[required]').forEach(function(input){if(!input.value||!input.checkValidity())valid=false;});
         json.value=JSON.stringify(data);complete.value=valid?'1':'0';return valid;
@@ -90,14 +105,19 @@
     }
     function toggle(){
         var enabled=recurrence.value==='calendar';panel.hidden=!enabled;
-        panel.querySelectorAll('input,button').forEach(function(input){input.disabled=!enabled;});until.required=enabled;
+        panel.querySelectorAll('input,button,select').forEach(function(input){input.disabled=!enabled;});until.required=enabled&&programmeSelect.value==='';
+        customRules.querySelectorAll('input,button').forEach(function(input){input.disabled=!enabled||programmeSelect.value!=='';});
         if(enabled){preview.disabled=busy;importButton.disabled=busy;serialize();}
     }
     function reset(calendar,zone){
         invalidate();exclusions.textContent='';overrides.textContent='';until.value=calendar&&calendar.until||'';
         document.getElementById('sls-calendar-file').value='';document.getElementById('sls-calendar-zone').textContent=zone||defaultZone;
         panel.querySelectorAll('[data-calendar-day]').forEach(function(input){input.checked=(calendar&&calendar.weekdays||[1,2,3,4,5]).indexOf(Number(input.value))>=0;});
-        ['exclusions','overrides'].forEach(function(kind){(calendar&&calendar[kind]||[]).forEach(function(row){addRow(kind,row);});});toggle();
+        ['exclusions','overrides'].forEach(function(kind){(calendar&&calendar[kind]||[]).forEach(function(row){addRow(kind,row);});});
+        programmeSelect.querySelectorAll('[data-missing-programme]').forEach(function(option){option.remove();});
+        var saved=calendar&&calendar.programme;programmeSelect.value=saved&&saved.id||'';
+        if(saved&&programmeSelect.value!==saved.id){var option=document.createElement('option');option.value=saved.id;option.textContent=saved.name+' — unavailable; choose another source';option.dataset.missingProgramme='1';programmeSelect.appendChild(option);programmeSelect.value=saved.id;}
+        chooseProgramme(saved&&saved.selected_types);toggle();
     }
     function request(data){return fetch('config.php?display=slsmassnotifyserver_scheduling',{method:'POST',credentials:'same-origin',cache:'no-store',body:data}).then(function(response){return response.json().catch(function(){throw new Error(<?php echo json_encode(_('The PBX returned an unreadable calendar response. Reload the page and check the PHP error log. HTTP status:')); ?>+' '+response.status);}).then(function(body){if(!response.ok||!body.success)throw new Error(body.message||(body.errors||[]).join(' ')||<?php echo json_encode(_('Calendar review failed. Reload the page and try again.')); ?>);return body;});});}
     function setBusy(value){busy=value;preview.disabled=value;importButton.disabled=value;panel.setAttribute('aria-busy',String(value));}
@@ -110,6 +130,7 @@
     preview.addEventListener('click',function(){
         if(busy)return;if(!serialize()){message(<?php echo json_encode(_('Choose an end date, at least one weekday, and complete each calendar row.')); ?>,true);return;}
         var data=tokenData('preview_schedule_calendar'),epoch=generation;
+        data.set('schedule_programme_id',programmeSelect.value);data.set('schedule_programme_revision',programmeRevision.value);programmeTypes.querySelectorAll('input:checked').forEach(function(input){data.append('schedule_programme_types[]',input.value);});
         data.set('schedule_id',document.getElementById('sls-schedule-id').value);data.set('schedule_calendar_json',json.value);data.set('schedule_calendar_complete','1');
         form.querySelectorAll('[name="schedule_occurrences[]"]').forEach(function(input){data.append('schedule_occurrences[]',input.value);});
         setBusy(true);message(<?php echo json_encode(_('Checking the planned dates…')); ?>,false);
@@ -133,6 +154,8 @@
         }).catch(function(error){if(epoch===generation)message(error.message||<?php echo json_encode(_('The calendar must be a valid UTF-8 file.')); ?>,true);}).finally(function(){setBusy(false);});
     });
     form.addEventListener('submit',function(event){if(recurrence.value==='calendar'&&!serialize()){event.preventDefault();event.stopImmediatePropagation();message(<?php echo json_encode(_('Complete the calendar rules before saving.')); ?>,true);}},true);
+    programmeSelect.addEventListener('change',function(){chooseProgramme();});
+    programmeTypes.addEventListener('change',function(){invalidate();serialize();});
     panel.slsCalendar={reset:reset,zone:function(){return document.getElementById('sls-calendar-zone').textContent;}};toggle();
 })();
 </script>

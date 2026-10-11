@@ -144,6 +144,20 @@ try {
 	serviceAssert(strpos(file_get_contents($directory . '/reload-warnings.log'), 'FreePBX reload continues') !== false, 'Collector fault lacks an actionable reload warning.');
 	file_put_contents($helper, "print('{\"ok\":true,\"connected\":true,\"heartbeat_age_seconds\":0}')\n");
 	serviceAssert($fixture->getPhoneEventCollectorHealth()['ok'] === false, 'Malformed health schema was accepted.');
+	foreach (['phone_event_collector_state_missing','phone_event_collector_state_permission','phone_event_collector_never_connected',
+		'phone_event_collector_stale','phone_event_collector_rebooted','phone_event_collector_clock_invalid','phone_config_unsafe'] as $code) {
+		file_put_contents($helper, "print('" . json_encode(['ok'=>false,'connected'=>false,'failure_code'=>$code,'detail'=>'private-secret-not-for-web']) . "')\nraise SystemExit(1)\n");
+		$health=$fixture->getPhoneEventCollectorHealth();
+		serviceAssert(!$health['ok'] && $health['failure_code']===$code && !str_contains($health['message'],'private-secret'), 'Precise safe collector reason was lost: '.$code);
+		if (str_contains($code,'clock') || str_contains($code,'connected')) { serviceAssert(!str_contains($health['message'],'Repair Installation'),'A credential/clock issue incorrectly suggested reinstalling.'); }
+	}
+	file_put_contents($helper,"print('{\"ok\":false,\"failure_code\":\"arbitrary-secret\"}')\n");
+	serviceAssert($fixture->getPhoneEventCollectorHealth()['failure_code']==='phone_collector_probe_failed','Unrecognized helper text was exposed.');
+	file_put_contents($helper,"import time\ntime.sleep(4)\n");
+	serviceAssert($fixture->getPhoneEventCollectorHealth()['failure_code']==='phone_collector_probe_timeout','A helper deadline was reported as a generic service failure.');
+	chmod($helper,0666);serviceAssert($fixture->getPhoneEventCollectorHealth()['failure_code']==='phone_collector_helper_unsafe','Writable helper was executed.');chmod($helper,0644);
+	unlink($helper);serviceAssert($fixture->getPhoneEventCollectorHealth()['failure_code']==='phone_collector_helper_missing','Missing helper was not identified.');
+	file_put_contents($helper,"print('{}')\n");chmod($helper,0644);
 	// Exercise the real probe as the install account and the GUI's actual
 	// PHP-FPM account. Copy only source code and fake helper data into a
 	// traversable isolated directory; never bootstrap FreePBX or contact AMI.
@@ -168,7 +182,8 @@ class ActualProbeFixture {
     }
 }
 $fixture = new ActualProbeFixture();
-echo json_encode(['ok' => $fixture->verify(), 'health_ok' => $fixture->getPhoneEventCollectorHealth()['ok'], 'uid' => posix_geteuid()]);
+$health=$fixture->getPhoneEventCollectorHealth();
+echo json_encode(['ok' => $fixture->verify(), 'health_ok' => $health['ok'], 'failure_code'=>$health['failure_code'], 'uid' => function_exists('posix_geteuid') ? posix_geteuid() : null]);
 PHP;
 	file_put_contents($directory . '/probe-runner.php', $runner); chmod($directory . '/probe-runner.php', 0644);
 	foreach (['root' => true, 'asterisk' => true, 'nobody' => false] as $user => $expected) {
@@ -183,6 +198,12 @@ PHP;
 			&& ($result['health_ok'] ?? null) === $expected,
 			'Runtime probe privilege handling failed for ' . $user);
 	}
+	foreach (['exec'=>'phone_collector_exec_disabled','posix_geteuid,posix_getpwnam'=>'phone_collector_posix_unavailable'] as $disabled=>$code) {
+		$output=[];$status=1;exec(escapeshellarg(PHP_BINARY).' -d '.escapeshellarg('disable_functions='.$disabled).' '.escapeshellarg($directory.'/probe-runner.php'),$output,$status);
+		$result=json_decode(implode("\n",$output),true);serviceAssert($status===0&&!$result['health_ok']&&$result['failure_code']===$code,'Disabled web PHP functions did not fail safely: '.$disabled);
+	}
+	$output=[];$status=1;exec('/usr/sbin/runuser -u nobody -- '.escapeshellarg(PHP_BINARY).' '.escapeshellarg($directory.'/probe-runner.php'),$output,$status);
+	$result=json_decode(implode("\n",$output),true);serviceAssert($status===0&&$result['failure_code']==='phone_collector_web_uid_mismatch','Wrong web account did not identify its handler mismatch.');
 	echo "Phone collector unit: strict install/restore, nonfatal PBX reload, credential-safe diagnostics, unsafe file rejection and heartbeat health passed.\n";
 } finally {
 	if (isset($oldErrorLog)) { ini_set('error_log', $oldErrorLog); }

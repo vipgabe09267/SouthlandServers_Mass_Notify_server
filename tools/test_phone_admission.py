@@ -58,6 +58,18 @@ class PhoneAdmissionTests(unittest.TestCase):
             with self.subTest(dial=dial), self.assertRaises(phone.PhoneAdmissionError):
                 phone.checked_targets({'1000': [dial]})
 
+    def test_unregistered_audience_has_no_reservation_and_recovers_after_registration(self):
+        before = (self.root / 'phone-admission.json').read_bytes()
+        targets = {'1001': [], '1002': []}
+        with self.assertRaisesRegex(phone.PhoneAdmissionError, '^phone_no_registered_contacts$'):
+            self.store.admit(targets, 25, self.inventory(), service='live')
+        self.assertEqual((self.root / 'phone-admission.json').read_bytes(), before)
+        targets['1002'] = ['PJSIP/1002/sip:desk@192.0.2.2:5060;transport=TCP']
+        token = self.store.admit(targets, 25, self.inventory(), service='live')
+        batch = self.contents()['batches'][token]
+        self.assertEqual(list(batch['targets']), ['1002'])
+        self.assertEqual(batch['targets']['1002']['dials'], targets['1002'])
+
     def test_active_capacity_does_not_expire_after_nominal_duration(self):
         token = self.admit()
         self.store.bind_origin(token, '1000', '1.1', 'Local/1000@sls-alert-audio-1;2')
@@ -521,6 +533,32 @@ class PhoneAdmissionTests(unittest.TestCase):
 
 
 class LiveGroupAdmissionTests(unittest.TestCase):
+    def test_contact_origin_excludes_only_the_caller_on_shared_endpoint_and_alias(self):
+        caller = 'PJSIP/6000/sip:desk@192.0.2.1:5060;transport=UDP'
+        second = 'PJSIP/6000/sips:laptop@[2001:db8::1]:5061;transport=TLS'
+        class Ami:
+            def variable(self, value, channel=None):
+                return {'UNIQUEID': '123.4', 'CHANNEL(endpoint)': '6000',
+                    'DB(DEVICE/6000/dial)': 'PJSIP/6000', 'DB(DEVICE/6000/user)': '5000',
+                    'CHANNEL(pjsip,remote_addr)': '192.0.2.1:5060'}.get(value, '')
+            def contacts(self, extensions): return {'6000': [caller, second]}
+        targets = {'5000': [caller, second], '6000': [caller, second], '7000': ['PJSIP/7000/sip:x@192.0.2.3']}
+        result = phone.exclude_live_contact(Ami(), targets, '5000', 'PJSIP/6000-00000001', '123.4')
+        self.assertEqual(result, {'5000': [second], '6000': [second], '7000': targets['7000']})
+        for identity in ('spoofed', '5000'):
+            with self.assertRaises(phone.PhoneAdmissionError):
+                phone.exclude_live_contact(Ami(), targets, identity, 'PJSIP/6000-00000001', 'different-uid')
+        ami = Ami()
+        with mock.patch.object(ami, 'variable', side_effect=lambda value, channel=None:
+                '192.0.2.99:5060' if value == 'CHANNEL(pjsip,remote_addr)' else Ami().variable(value, channel)):
+            with self.assertRaisesRegex(phone.PhoneAdmissionError, 'contact_unidentified'):
+                phone.exclude_live_contact(ami, targets, '5000', 'PJSIP/6000-00000001', '123.4')
+
+    def test_contact_audience_is_exact_and_cannot_weaken_the_saved_group(self):
+        phone.check_live_audience(self.settings(), ['1000', '1001', '1002'], '1000', 'paging_staff', include_origin=True)
+        with self.assertRaisesRegex(phone.PhoneAdmissionError, 'audience_changed'):
+            phone.check_live_audience(self.settings(), ['1001', '1002'], '1000', 'paging_staff', include_origin=True)
+
     def test_external_group_requires_both_opt_ins_exact_origin_and_exact_members(self):
         settings = self.settings()
         paging = settings['live_paging']

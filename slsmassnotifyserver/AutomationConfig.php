@@ -129,7 +129,7 @@ final class AutomationConfig
     {
         $config=self::normalize($settings['automations'] ?? []);
         $rule=array_column($config['rules'],null,'id')[$id] ?? null;
-        if (!$rule || !$rule['enabled'] || empty($settings['enabled'])) { throw new \DomainException('Trigger is disabled, removed, or Mass Notify is disabled.'); }
+        if (!$rule || !$rule['enabled']) { throw new \DomainException('Trigger is disabled or removed.'); }
         $template=$rule['template_id'] !== '' ? (array_column($settings['incident_workflows']['templates'] ?? [],null,'id')[$rule['template_id']] ?? null) : null;
         if ($rule['template_id'] !== '' && !$template) { throw new \DomainException('The trigger’s incident template is unavailable.'); }
         $location=array_column(LocationDirectory::effective($settings['location_directory'] ?? [])['nodes'],null,'id')[$rule['location_id']] ?? null;

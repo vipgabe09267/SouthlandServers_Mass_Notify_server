@@ -4,26 +4,74 @@ namespace FreePBX\modules;
 /** Root-only service integration; the collector itself runs without root. */
 trait SlsPhoneEventService
 {
+	protected function phoneCollectorFailure(string $code): array
+	{
+		$messages = [
+			'phone_collector_helper_missing' => 'The installed phone collector helper is missing. Restore the signed runtime with SLS Repair Installation.',
+			'phone_collector_helper_unsafe' => 'The phone collector helper has unsafe ownership, permissions or links. Preserve it for review; restore the verified signed runtime.',
+			'phone_collector_posix_unavailable' => 'This web PHP handler lacks posix_geteuid or posix_getpwnam. Enable the POSIX extension for the actual web PHP version and reload that PHP handler.',
+			'phone_collector_exec_disabled' => 'The web PHP handler disables exec. Review its disable_functions setting; CLI PHP and web PHP may use different configuration files.',
+			'phone_collector_runtime_account_missing' => 'The local asterisk runtime account could not be resolved. Review the PBX account setup; do not run notification workers as an unrelated web account.',
+			'phone_collector_web_uid_mismatch' => 'This web PHP handler runs as a different account from asterisk. Review the selected Apache/PHP-FPM pool identity and its PBX configuration. No privilege escalation was attempted.',
+			'phone_collector_probe_binary_missing' => 'A required local timeout, Python or root-only runuser executable is unavailable. Restore that dependency before probing the collector.',
+			'phone_collector_probe_timeout' => 'The collector health helper exceeded its two-second deadline. Check CPU/storage pressure and protected phone-admission storage access.',
+			'phone_collector_probe_failed' => 'The local collector health helper did not return a valid result. Check journalctl -u sls-mass-notify-phone-events.service and protected runtime/data permissions.',
+			'phone_collector_health_invalid' => 'The collector health response has invalid fields. Restore the matching verified module and runtime together; preserve phone admission history.',
+			'phone_event_collector_state_missing' => 'The private phone admission ledger has not been created. Check whether sls-mass-notify-phone-events.service is running and authenticating to local AMI.',
+			'phone_event_collector_state_permission' => 'The runtime cannot read the private phone admission ledger. Review its asterisk ownership and protected data-directory permissions without changing unrelated PBX files.',
+			'phone_event_collector_never_connected' => 'No authenticated collector heartbeat has been recorded. Check the collector service journal and the saved loopback AMI login and permissions.',
+			'phone_event_collector_stale' => 'The authenticated collector heartbeat is older than fifteen seconds. Check service status, AMI connectivity and CPU/storage pressure.',
+			'phone_event_collector_rebooted' => 'The recorded heartbeat belongs to an earlier boot. Wait for a current authenticated AMI heartbeat; if it does not arrive, inspect the collector service journal.',
+			'phone_event_collector_clock_invalid' => 'The recorded monotonic heartbeat is invalid or in the future. Inspect boot/time evidence and the collector journal; do not edit the ledger to fabricate a heartbeat.',
+			'phone_config_unsafe' => 'Phone admission data has unsafe ownership, permissions or links. Preserve it and review protected data access before accepting more phone audio.',
+			'phone_config_invalid' => 'Phone admission data could not be decoded or validated. Preserve the ledger for recovery and inspect the collector journal.',
+			'phone_event_collector_unavailable' => 'A fresh authenticated collector heartbeat is unavailable. Check the collector service journal, its loopback AMI connection and protected admission ledger.',
+		];
+		if (!isset($messages[$code]) && str_starts_with($code, 'phone_state_')) {
+			$code = 'phone_config_invalid';
+		}
+		if (!isset($messages[$code])) { $code = 'phone_collector_probe_failed'; }
+		$message = _($messages[$code]) . ' ' . _('New phone audio admission is blocked; existing call outcomes may be unknown.') . ' ' . _('Code:') . ' ' . $code;
+		return ['state'=>'fault', 'ok'=>false, 'failure_code'=>$code, 'message'=>$message, 'issues'=>[$message]];
+	}
+
+	protected function phoneCollectorRunHealthProbe(string $helper, string $runAs): array
+	{
+		$output=[]; $status=1;
+		try { @exec('/usr/bin/timeout --kill-after=1 2 ' . $runAs . '/usr/bin/python3 -I ' . escapeshellarg($helper) . ' --health 2>/dev/null', $output, $status); }
+		catch (\Throwable $error) { return ['status'=>1, 'result'=>null]; }
+		return ['status'=>$status, 'result'=>json_decode(implode("\n",$output),true)];
+	}
+
 	public function getPhoneEventCollectorHealth()
 	{
-		$failure = ['state' => 'fault', 'ok' => false, 'message' => _('Phone outcome collection is unavailable. New phone audio admission is blocked, and existing delivery outcomes may be unknown. Check the collector service and run Repair Installation.')];
-		$helper = self::RUNTIME_DIR . '/sls_phone_events.py';
-		if (!is_readable($helper) || is_link($helper) || !function_exists('posix_geteuid') || !function_exists('posix_getpwnam')) { return $failure; }
-		$account = posix_getpwnam('asterisk');
-		$uid = posix_geteuid();
-		if (!is_array($account) || !is_int($account['uid'] ?? null) || $account['uid'] <= 0
-			|| ($uid !== 0 && $uid !== $account['uid'])) { return $failure; }
-		$runAs = $uid === 0 ? '/usr/sbin/runuser -u asterisk -- ' : '';
-		$output = [];
-		$status = 1;
-		@exec('/usr/bin/timeout --kill-after=1 2 ' . $runAs . '/usr/bin/python3 -I ' . escapeshellarg($helper) . ' --health 2>/dev/null', $output, $status);
-		$result = json_decode(implode("\n", $output), true);
-		if ($status !== 0 || !is_array($result) || ($result['ok'] ?? null) !== true || ($result['connected'] ?? null) !== true
-			|| !is_numeric($result['heartbeat_age_seconds'] ?? null) || $result['heartbeat_age_seconds'] < 0 || $result['heartbeat_age_seconds'] > 15
-			|| !is_int($result['active_batches'] ?? null) || $result['active_batches'] < 0
-			|| !is_int($result['reserved_contacts'] ?? null) || $result['reserved_contacts'] < 0) { return $failure; }
-		return ['state' => 'ok', 'ok' => true, 'message' => _('Phone outcome collector has a current authenticated AMI heartbeat.'),
-			'heartbeat_age_seconds' => (float)$result['heartbeat_age_seconds'], 'active_batches' => $result['active_batches'], 'reserved_contacts' => $result['reserved_contacts']];
+		$helper=self::RUNTIME_DIR.'/sls_phone_events.py';
+		clearstatcache(true,$helper); $meta=@lstat($helper);
+		if (!$meta) { return $this->phoneCollectorFailure('phone_collector_helper_missing'); }
+		if (($meta['mode']&0170000)!==0100000 || $meta['nlink']!==1 || $meta['uid']!==0 || ($meta['mode']&0022) || !is_readable($helper)) {
+			return $this->phoneCollectorFailure('phone_collector_helper_unsafe');
+		}
+		if (!function_exists('posix_geteuid') || !function_exists('posix_getpwnam')) { return $this->phoneCollectorFailure('phone_collector_posix_unavailable'); }
+		if (!function_exists('exec')) { return $this->phoneCollectorFailure('phone_collector_exec_disabled'); }
+		$account=posix_getpwnam('asterisk');$uid=posix_geteuid();
+		if (!is_array($account) || !is_int($account['uid'] ?? null) || $account['uid']<=0) { return $this->phoneCollectorFailure('phone_collector_runtime_account_missing'); }
+		if ($uid!==0 && $uid!==$account['uid']) { return $this->phoneCollectorFailure('phone_collector_web_uid_mismatch'); }
+		foreach (array_merge(['/usr/bin/timeout','/usr/bin/python3'],$uid===0 ? ['/usr/sbin/runuser'] : []) as $binary) {
+			if (!is_executable($binary)) { return $this->phoneCollectorFailure('phone_collector_probe_binary_missing'); }
+		}
+		$probe=$this->phoneCollectorRunHealthProbe($helper,$uid===0 ? '/usr/sbin/runuser -u asterisk -- ' : '');
+		$result=$probe['result'] ?? null;$status=$probe['status'] ?? 1;
+		if ($status===124 || $status===137) { return $this->phoneCollectorFailure('phone_collector_probe_timeout'); }
+		if (is_array($result) && ($result['ok'] ?? null)===false && is_string($result['failure_code'] ?? null)) { return $this->phoneCollectorFailure($result['failure_code']); }
+		if (!is_array($result) || $status!==0) { return $this->phoneCollectorFailure('phone_collector_probe_failed'); }
+		if (($result['ok'] ?? null)!==true || ($result['connected'] ?? null)!==true
+			|| !is_numeric($result['heartbeat_age_seconds'] ?? null) || !is_finite((float)$result['heartbeat_age_seconds'])
+			|| !is_int($result['active_batches'] ?? null) || $result['active_batches']<0
+			|| !is_int($result['reserved_contacts'] ?? null) || $result['reserved_contacts']<0) { return $this->phoneCollectorFailure('phone_collector_health_invalid'); }
+		if ($result['heartbeat_age_seconds']<0) { return $this->phoneCollectorFailure('phone_event_collector_clock_invalid'); }
+		if ($result['heartbeat_age_seconds']>15) { return $this->phoneCollectorFailure('phone_event_collector_stale'); }
+		return ['state'=>'ok', 'ok'=>true, 'failure_code'=>'', 'issues'=>[], 'message'=>_('Phone outcome collector has a current authenticated AMI heartbeat.'),
+			'heartbeat_age_seconds'=>(float)$result['heartbeat_age_seconds'], 'active_batches'=>$result['active_batches'], 'reserved_contacts'=>$result['reserved_contacts']];
 	}
 
 	protected function phoneEventServiceContents()
@@ -61,6 +109,7 @@ UNIT;
 
 	protected function phoneEventSystemctl(array $arguments)
 	{
+		if (!function_exists('exec')) { return false; }
 		$output = [];
 		$status = 1;
 		@exec('/usr/bin/timeout --kill-after=2 20 /usr/bin/systemctl '
@@ -71,11 +120,13 @@ UNIT;
 	protected function phoneEventRuntimeProbe($filename, $flag)
 	{
 		if (!in_array([$filename, $flag], [['sls_phone_admission.py', '--probe-ami'], ['sls_phone_events.py', '--health']], true)
-			|| !function_exists('posix_geteuid') || !function_exists('posix_getpwnam')) { return false; }
+			|| !function_exists('posix_geteuid') || !function_exists('posix_getpwnam') || !function_exists('exec')) { return false; }
 		$account = posix_getpwnam('asterisk');
 		if (!is_array($account) || !is_int($account['uid'] ?? null) || $account['uid'] <= 0) { return false; }
 		$uid = posix_geteuid();
 		if ($uid !== 0 && $uid !== $account['uid']) { return false; }
+		$helper=self::RUNTIME_DIR.'/'.$filename;clearstatcache(true,$helper);$meta=@lstat($helper);
+		if (!$meta || ($meta['mode']&0170000)!==0100000 || $meta['nlink']!==1 || $meta['uid']!==0 || ($meta['mode']&0022)) { return false; }
 		// GUI Apply Config inherits the Asterisk PHP-FPM account. runuser is
 		// root-only; installation uses it to drop privilege, while GUI reloads
 		// already have exactly the runtime account required by these probes.
@@ -95,14 +146,15 @@ UNIT;
 		if (!$this->phoneEventRuntimeProbe('sls_phone_admission.py', '--probe-ami')) {
 			$settings = $this->getActiveSettings();
 			$ami = is_array($settings['ami'] ?? null) ? $settings['ami'] : [];
-			throw new \RuntimeException(_('The phone runtime cannot verify AMI Ping and ShowDialPlan. Check the local AMI connection and reporting permission, then run Repair Installation.') . ' ' . $this->amiEndpointDiagnostic($ami));
+			throw new \RuntimeException(_('The phone runtime cannot verify AMI Ping and ShowDialPlan. Check the local AMI login, loopback endpoint and reporting permission; inspect the collector service journal.') . ' ' . $this->amiEndpointDiagnostic($ami));
 		}
 		$deadline = microtime(true) + 10;
 		do {
 			if ($this->phoneEventRuntimeProbe('sls_phone_events.py', '--health')) { return; }
 			usleep(200000);
 		} while (microtime(true) < $deadline);
-		throw new \RuntimeException(_('The phone collector has no fresh authenticated AMI heartbeat. Review the collector service journal and protected data permissions before sending phone audio.'));
+		$health=$this->getPhoneEventCollectorHealth();
+		throw new \RuntimeException(is_string($health['message'] ?? null) ? $health['message'] : _('The phone collector has no fresh authenticated AMI heartbeat. Review the collector service journal and protected data permissions before sending phone audio.'));
 	}
 
 	/** FreePBX has generated manager_additional.conf and reloaded Asterisk. */

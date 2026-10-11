@@ -75,7 +75,7 @@ trait SlsEnterpriseOperations
             if(!$assigned||!$this->enterpriseCanReview($p,$r['request'])){continue;}
             $rows[]=['id'=>$r['id'],'state'=>$r['state'],'requested_by'=>$r['requested_by'],'expires_at'=>gmdate('c',$r['expires_at']),
                 'message'=>$r['request']['message'],'title'=>$r['request']['title'],'is_test'=>($r['request']['is_test']??false)===true,
-                'recipients'=>array_intersect_key($r['request'],array_flip(['phones','desktops','webhooks','voice_recipient_ids','email_recipient_ids','sms_recipient_ids'])),
+                'recipients'=>array_intersect_key($r['request'],array_flip(['phones','desktops','webhooks','voice_recipient_ids','email_recipient_ids','sms_recipient_ids','browser_recipient_ids','connector_ids'])),
                 'approvals'=>$r['approvals'],'history'=>$r['history']];
         }
         return ['success'=>true,'reviews'=>$rows];
@@ -96,6 +96,7 @@ trait SlsEnterpriseOperations
             if(!$send){throw new \DomainException('Another announcement is being admitted. Retry this approved request shortly.');}
             $request=$service->claim($id,$this->getActiveSettings(),$person,$authorize);
             if(!$this->enterpriseApprovalPermitted($request)){$result=['success'=>false,'delivery_started'=>false,'message'=>'An approver was revoked or its identity changed. Submit a new review.'];}
+            elseif(method_exists($this,'incidentLanguageApprovalMaySubmit')&&!$this->incidentLanguageApprovalMaySubmit($request)){$result=['success'=>false,'delivery_started'=>false,'message'=>'The reviewed incident batch expired, was consumed, or no longer matches its open incident. No channels were submitted.'];}
             else{
                 $request['force_queue']=true;$this->announcementAdmissionLock=$send;
                 $result=$this->withOperator($p,fn():array=>$this->deliverResolvedAnnouncement($request));
@@ -111,6 +112,7 @@ trait SlsEnterpriseOperations
     private function recordEnterpriseIncidentApproval(array $request,array $result): void
     {
         $context=$request['incident_context']??null;if(!is_array($context)){return;}
+        if(method_exists($this,'recordIncidentLanguageApproval')&&$this->recordIncidentLanguageApproval($request,$result)){return;}
         $this->incidentStore()->transaction($context['incident_id'],static function(array $record)use($context,$request,$result):array{
             foreach($record['operations'] as &$operation){
                 if(($operation['sequence']??null)!==$context['sequence']||($operation['review_id']??'')!==($request['_enterprise_approval']['id']??'')){continue;}
@@ -209,7 +211,9 @@ trait SlsEnterpriseOperations
         $start=['template_id'=>$assignment['template_id'],'request_id'=>$request,'fields'=>$input['fields']??[],'is_test'=>true];
         if(isset($input['planned_at'])){$start['planned_at']=$input['planned_at'];}
         $fingerprint=hash('sha256',json_encode([$start,$assignment,$person],JSON_THROW_ON_ERROR));
-        $claim=$this->enterpriseOperationsStore()->transaction(static function(array &$state)use($run,$fingerprint,$assignment,$person):array{
+        $claim=$this->enterpriseOperationsStore()->transaction(function(array &$state)use($run,$fingerprint,$assignment,$person):array{
+            $archived=$this->enterpriseOperationsStore()->archived('drills',$run);
+            if($archived!==null){if(!hash_equals($archived['fingerprint'],$fingerprint)){throw new \DomainException('This drill request was already used for different archived details.');}return ['new'=>false,'record'=>$archived];}
             if(isset($state['drills'][$run])){if(!hash_equals($state['drills'][$run]['fingerprint'],$fingerprint)){throw new \DomainException('This drill request was already used for different details.');}return ['new'=>false,'record'=>$state['drills'][$run]];}
             $state['drills'][$run]=['id'=>$run,'assignment'=>$assignment,'owner'=>$person,'fingerprint'=>$fingerprint,'state'=>'submitting','created_at'=>gmdate('c'),'reviews'=>[]];return ['new'=>true];
         });
@@ -253,7 +257,8 @@ trait SlsEnterpriseOperations
     {
         $p=$this->currentOperator();$person=$this->enterprisePerson($p);$cfg=EnterpriseOperationsConfig::normalize($this->getActiveSettings()['enterprise_operations']??[]);
         if(!$cfg['enabled']||!$cfg['drills']['enabled']){return ['success'=>true,'assignments'=>[]];}
-        $runs=$this->enterpriseOperationsStore()->transaction(static fn(array &$state):array=>$state['drills']);$rows=[];
+        $runs=$this->enterpriseOperationsStore()->transaction(static fn(array &$state):array=>$state['drills']);
+        $runs=array_replace($this->enterpriseOperationsStore()->archiveReport('drills'),$runs);$rows=[];
         // Project current incident admission without replaying a drill or changing its frozen report.
         foreach($runs as &$run){
             if(!in_array($run['state']??'',['planned','awaiting_approval','submitting'],true)||empty($run['incident_id'])){continue;}
@@ -273,6 +278,7 @@ trait SlsEnterpriseOperations
     }
     public function enterpriseOperationsAction(string $action,array $input): array
     {
+        if($action==='operations_archive'){$this->assertEnterpriseAdministrator();$days=$input['retention_days']??30;if(array_diff(array_keys($input),['retention_days'])||!is_int($days)||$days<1||$days>365){throw new \InvalidArgumentException('Retention must be 1–365 days.');}return $this->enterpriseOperationsStore()->maintain(time(),$days*86400);}
         if($action==='operations_save'){return $this->saveEnterpriseOperations($input);}
         if($action==='approval_list'){return $this->listEnterpriseApprovals();}
         if(in_array($action,['approval_approve','approval_submit','approval_reject'],true)){return $this->actEnterpriseApproval(substr($action,9),$input['review_id']??'');}

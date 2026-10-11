@@ -1,6 +1,7 @@
 <?php
 declare(strict_types=1);
 namespace SLS\MassNotify;
+require_once __DIR__.'/EnterpriseIdentityStore.php';
 if (!class_exists('SlsAnnouncementJobStore',false)) { require_once __DIR__.'/bin/sls_mass_notify/sls_announcement_jobs.php'; }
 
 /** Reuses delivery's guarded, synchronized file primitives without running a worker. */
@@ -9,10 +10,11 @@ final class EnterpriseOperationsStore
     public const DIRECTORY='/var/lib/asterisk/SLS_Mass_Notifications_Plugin/enterprise-operations';
     private \SlsAnnouncementJobStore $files;
     private string $parentMarker;
+    private string $directory;
     private const MARKER="SLS_ENTERPRISE_OPERATIONS_V1\n";
     public function __construct(string $directory=self::DIRECTORY)
     {
-        $directory=rtrim($directory,'/');$this->parentMarker=dirname($directory).'/.'.basename($directory).'-required';
+        $directory=rtrim($directory,'/');$this->directory=$directory;$this->parentMarker=dirname($directory).'/.'.basename($directory).'-required';
         $required=$this->parentRequired();
         if($required&&(!is_dir($directory)||is_link($directory))){throw new \RuntimeException('Established Enterprise operations storage is missing. Restore its replay history; do not recreate it.');}
         if(!$required&&(@lstat($directory.'/worker-state.json')||is_link($directory.'/worker-state.json'))){throw new \RuntimeException('Enterprise operations lost its parent initialization marker. Preserve the journal for recovery.');}
@@ -62,5 +64,35 @@ final class EnterpriseOperationsStore
             if ($marker==='') { rewind($lock);if(fwrite($lock,self::MARKER)!==strlen(self::MARKER)||!fflush($lock)||!fsync($lock)){throw new \RuntimeException('Enterprise operations initialization could not be synchronized.');} }
             return $result;
         } finally { \SlsAnnouncementJobStore::unlock($lock); }
+    }
+    public function archived(string $kind,string $id): ?array
+    {
+        if(!in_array($kind,['approvals','drills'],true)){throw new \InvalidArgumentException('Invalid operations archive kind.');}
+        if(!is_dir($this->directory.'/archive')&&!is_link($this->directory.'/archive')&&!file_exists($this->directory.'/.archive-required')){return null;}
+        return (new EnterpriseIdentityStore($this->directory.'/archive'))->read($kind)[$id]??null;
+    }
+    public function archiveReport(string $kind): array
+    {
+        if(!in_array($kind,['approvals','drills'],true)){throw new \InvalidArgumentException('Invalid operations report kind.');}
+        if(!is_dir($this->directory.'/archive')&&!is_link($this->directory.'/archive')&&!file_exists($this->directory.'/.archive-required')){return [];}
+        return (new EnterpriseIdentityStore($this->directory.'/archive'))->read($kind);
+    }
+    public function maintain(int $now,int $retentionSeconds=2592000): array
+    {
+        if($now<1||$retentionSeconds<86400||$retentionSeconds>31536000){throw new \InvalidArgumentException('Archive retention must be one day through one year.');}
+        return $this->transaction(function(array &$state)use($now,$retentionSeconds):array{
+            $archive=new EnterpriseIdentityStore($this->directory.'/archive');$counts=[];
+            foreach(['approvals','drills'] as $kind){
+                $eligible=array_filter($state[$kind],static function(array $row)use($kind,$now,$retentionSeconds):bool{
+                    $created=is_int($row['created_at']??null)?$row['created_at']:strtotime($row['created_at']??'');
+                    return $created!==false&&$created<=$now-$retentionSeconds&&($kind==='approvals'
+                        ?in_array($row['state']??'',['submitted','rejected','not_submitted'],true)&&($row['expires_at']??PHP_INT_MAX)<=$now
+                        :!empty($row['reviews'])&&in_array($row['state']??'',['queued','submitted','not_submitted'],true));
+                });
+                if($eligible){$archive->transaction($kind,static function(array &$rows)use($eligible):void{foreach($eligible as $id=>$row){if(isset($rows[$id])&&$rows[$id]!==$row){throw new \RuntimeException('Operations archive conflict. Live history was preserved.');}$rows[$id]=$row;}});foreach($eligible as $id=>$row){unset($state[$kind][$id]);}}
+                $counts[$kind]=count($eligible);
+            }
+            return ['success'=>true,'archived'=>$counts,'meaning'=>'Permanent review and drill history retained privately; unfinished and uncertain work remains active.'];
+        });
     }
 }

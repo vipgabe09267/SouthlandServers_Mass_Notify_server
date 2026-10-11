@@ -44,6 +44,10 @@ rejected(fn()=>EnterpriseOperationsConfig::normalize(array_replace($default,['ex
 $policy=['id'=>'approval_'.str_repeat('4',24),'name'=>'Phone review','enabled'=>true,'channels'=>['phones'],
     'approver_ids'=>['pbx:alice','pbx:bob'],'expires_seconds'=>300];
 $settings=['enterprise_operations'=>array_replace($default,['enabled'=>true,'dual_approval'=>['enabled'=>true,'policies'=>[$policy]]])];
+$labsPolicy=$policy;$labsPolicy['channels']=['browser_recipient_ids','connector_ids'];$labsSettings=$settings;$labsSettings['enterprise_operations']['dual_approval']['policies']=[$labsPolicy];
+check(count(EnterpriseOperationsConfig::policies($labsSettings,['browser_recipient_ids'=>['sub_'.str_repeat('7',24)]]))===1,'browser approval policy omitted');
+check(count(EnterpriseOperationsConfig::policies($labsSettings,['connector_ids'=>['conn_'.str_repeat('7',24)]]))===1,'connector approval policy omitted');
+check(EnterpriseOperationsConfig::policies($labsSettings,['phones'=>['1000']])===[],'Labs policy matched another channel');
 $store=new EnterpriseOperationsStore($base.'/journal');$now=10000;$service=new EnterpriseApprovalService($store,static function()use(&$now):int{return $now;});
 $request=['message'=>'Evacuate the east wing.','title'=>'Evacuate','phones'=>['1000'],'desktops'=>[],'is_test'=>true,'force_queue'=>false,
     'email_targets'=>['email_'.str_repeat('5',24)=>['address'=>'fixture@example.invalid']]];

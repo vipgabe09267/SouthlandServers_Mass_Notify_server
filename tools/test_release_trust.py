@@ -13,6 +13,7 @@ import tempfile
 import tarfile
 import time
 import unittest
+import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('publisher_trust_fixture', ROOT / 'slsmassnotifyserver/bin/sls_mass_notify/sls_release_trust.py')
@@ -180,9 +181,10 @@ class PublisherTrustTests(unittest.TestCase):
         installer, package = self.root / 'installer', self.root / 'package'
         installer.write_bytes(b'fixture installer'); package.write_bytes(b'fixture archive')
         now = int(time.time())
+        version = ET.parse(ROOT / 'slsmassnotifyserver/module.xml').getroot().findtext('version').strip()
         def execute(number=0, expired=False):
-            value = {'schema':1, 'version':'0.1.5-beta', 'tag':'slsmassnotifyserver-0.1.5-beta',
-                     'package':'slsmassnotifyserver-0.1.5-beta.tgz',
+            value = {'schema':1, 'version':version, 'tag':'slsmassnotifyserver-'+version,
+                     'package':'slsmassnotifyserver-'+version+'.tgz',
                      'installer_sha256':hashlib.sha256(installer.read_bytes()).hexdigest(),
                      'package_sha256':hashlib.sha256(package.read_bytes()).hexdigest(),
                      'signing':{'key_id':self.keys[number][2]['id'],'issued_at':now-30,'expires_at':now-1 if expired else now+86400}}
@@ -197,6 +199,13 @@ class PublisherTrustTests(unittest.TestCase):
         self.overlap()
         helper.write_text((ROOT/'slsmassnotifyserver/bin/sls_mass_notify/sls_release_trust.py').read_text()
                           .replace("DIRECTORY = Path('/var/lib/sls-mass-notify-trust')", 'DIRECTORY = Path(' + repr(str(self.directory)) + ')'))
+        # A timestamp-valid legacy cache must never replace the protected source.
+        import importlib._bootstrap_external
+        cache = Path(importlib.util.cache_from_source(str(helper)))
+        cache.parent.mkdir(mode=0o700)
+        before = helper.stat()
+        payload = compile("raise SystemExit('untrusted_bytecode_executed')", str(helper), 'exec')
+        cache.write_bytes(importlib._bootstrap_external._code_to_timestamp_pyc(payload, int(before.st_mtime), before.st_size))
         self.assertEqual(execute(1).returncode, 0)
         policy = copy.deepcopy(self.store.load()[0]['policy']); policy['sequence']=2; policy['keys'][0]['revoked_at']=self.now
         # Use the actual current clock for installer key validity.

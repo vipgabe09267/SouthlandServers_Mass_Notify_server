@@ -18,6 +18,10 @@ SIGNING_FINGERPRINT=""
 KEEP_SIGNING_TRUST=0
 RECOVERY_SIGNER_DIR=""
 RECOVERY_SIGNER=""
+UNINSTALL_APPROVED_SOURCE=""
+CONFIGURED_AMI_USERNAME=""
+RECOVERY_DECODER_DIR=""
+RECOVERY_CONFIG_DECODER="/usr/local/bin/sls_mass_notify/sls_config_crypto.php"
 UNINSTALL_MAINTENANCE_LOCK_FD=""
 STOCK_RESTORE_LOG_PATH="/tmp/slsmassnotifyserver-uninstall-stock-modules.log"
 MODULE_UNINSTALL_LOG_PATH="/tmp/slsmassnotifyserver-uninstall-module.log"
@@ -25,6 +29,12 @@ STOCK_RESTORE_LOG="$STOCK_RESTORE_LOG_PATH"
 MODULE_UNINSTALL_LOG="$MODULE_UNINSTALL_LOG_PATH"
 STOCK_RESTORE_LOG_FD=""
 MODULE_UNINSTALL_LOG_FD=""
+MODULE_REGISTRY_PRESENT=0
+PBX_RUNNING=0
+PBX_RELOAD_WARNING=0
+UNINSTALL_WORKER_PID=""
+UNINSTALL_WORKER_PIPE=""
+UNINSTALL_GUARD_REQUIRED=0
 
 # Open only a root-owned regular file through trusted directories. Creation is
 # exclusive; an existing file is never truncated or written before fd identity
@@ -131,7 +141,7 @@ require_freepbx() {
     log "Run the uninstaller as root."
     exit 1
   }
-	  for required_command in /usr/sbin/fwconsole /usr/sbin/asterisk /usr/bin/php /usr/bin/python3 /usr/bin/gpg /usr/bin/crontab /usr/bin/flock /usr/bin/readlink /usr/bin/timeout /usr/bin/base64 /usr/bin/sha256sum /usr/bin/systemctl /usr/bin/su; do
+	  for required_command in /usr/sbin/fwconsole /usr/sbin/asterisk /usr/sbin/runuser /usr/bin/php /usr/bin/python3 /usr/bin/gpg /usr/bin/crontab /usr/bin/flock /usr/bin/readlink /usr/bin/timeout /usr/bin/base64 /usr/bin/sha256sum /usr/bin/systemctl /usr/bin/su; do
 	    [ -x "$required_command" ] || {
 	      log "Required uninstall prerequisite is unavailable: $required_command. No uninstall changes were made."
 	      exit 1
@@ -196,6 +206,68 @@ snapshot_local_signer() {
   local candidate=""
   local trust_helper="${SLS_MASS_NOTIFY_TRUST_HELPER_SOURCE:-/usr/local/bin/sls_mass_notify/sls_module_trust.py}"
   local -a candidates=()
+
+  if [ -n "$UNINSTALL_APPROVED_SOURCE" ]; then
+    RECOVERY_SIGNER_DIR="$(mktemp -d /tmp/sls-uninstall-signer.XXXXXX)" || return 1
+    chmod 0700 "$RECOVERY_SIGNER_DIR" || return 1
+    RECOVERY_DECODER_DIR="$(mktemp -d /tmp/sls-uninstall-decoder.XXXXXX)" || return 1
+    chown root:asterisk "$RECOVERY_DECODER_DIR" && chmod 0750 "$RECOVERY_DECODER_DIR" || return 1
+    /usr/bin/python3 -I - "$UNINSTALL_APPROVED_SOURCE/bin/sls_mass_notify/sls_module_trust.py" "$UNINSTALL_APPROVED_SOURCE" "$RECOVERY_SIGNER_DIR" "$RECOVERY_DECODER_DIR" <<'PYAPPROVEDSNAPSHOT' || return 1
+from pathlib import Path
+import os, pwd, re, sys, types
+path, source, target, decoder = map(Path, sys.argv[1:])
+module = types.ModuleType('sls_uninstall_snapshot_trust'); module.__file__ = str(path)
+exec(compile(path.read_bytes(), str(path), 'exec'), module.__dict__)
+data, generation = module.load(Path('/var/lib/sls-mass-notify-trust'), 'slsmassnotifyserver')
+if source != generation / 'module' or data['source']['kind'] != 'publisher-ed25519':
+    raise SystemExit('Uninstall source is not the approved publisher generation')
+names = {'bin/sign_sls_mass_notify_local_sig.sh':'sign_sls_mass_notify_local_sig.sh',
+         'bin/sls_mass_notify/sls_module_trust.py':'sls_module_trust.py',
+         'bin/sls_mass_notify/sls_install_guard.py':'sls_install_guard.py',
+         'bin/sls_mass_notify/sls_install_idle.py':'sls_install_idle.py',
+         'bin/sls_mass_notify/sls_audio_state.py':'sls_audio_state.py',
+         'bin/sls_mass_notify/sls_config_crypto.py':'sls_config_crypto.py',
+         'PhoneEventService.php':'PhoneEventService.php'}
+optional = 'bin/sls_mass_notify/sls_legacy_permissions.py'
+if optional in data['files']: names[optional] = 'sls_legacy_permissions.py'
+for name, filename in names.items():
+    entry = data['files'].get(name)
+    if not entry: raise SystemExit('Signed uninstall helper is missing: ' + name)
+    body = module.read(source / name, 2 * 1024 * 1024, protected=True)
+    if module.digest(body) != entry['sha256']:
+        raise SystemExit('Signed uninstall helper changed: ' + name)
+    fd = os.open(target / filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700)
+    with os.fdopen(fd, 'wb') as output:
+        output.write(body); output.flush(); os.fsync(output.fileno())
+service = (target / 'PhoneEventService.php').read_bytes()
+templates = re.findall(rb"return <<<'UNIT'\n(.*?)\nUNIT;", service, re.S)
+if len(templates) != 1 or not templates[0].startswith(b'# Managed by SLS Mass Notify Server\n[Unit]\n'):
+    raise SystemExit('The signed collector unit template is unavailable or ambiguous')
+fd = os.open(target / 'collector-unit.txt', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+with os.fdopen(fd, 'wb') as output:
+    # PHP excludes the line break introducing its heredoc terminator.
+    output.write(templates[0]); output.flush(); os.fsync(output.fileno())
+approval = {'schema': 1, 'source': 'publisher-verified-previous-release', 'version': data['version'],
+            'archive_sha256': data['source']['archive_sha256'],
+            'files': {str(source / name): entry['sha256'] for name, entry in data['files'].items()}}
+fd = os.open(target / 'uninstall-approval.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+with os.fdopen(fd, 'wb') as output:
+    output.write(__import__('json').dumps(approval, separators=(',', ':')).encode()); output.flush(); os.fsync(output.fileno())
+name = 'bin/sls_mass_notify/sls_config_crypto.php'
+entry = data['files'].get(name)
+if not entry: raise SystemExit('Signed configuration decoder is missing')
+body = module.read(source / name, 2 * 1024 * 1024, protected=True)
+if module.digest(body) != entry['sha256']: raise SystemExit('Signed configuration decoder changed')
+fd = os.open(decoder / 'sls_config_crypto.php', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
+with os.fdopen(fd, 'wb') as output:
+    os.fchown(output.fileno(), 0, pwd.getpwnam('asterisk').pw_gid)
+    output.write(body); output.flush(); os.fsync(output.fileno())
+PYAPPROVEDSNAPSHOT
+    RECOVERY_SIGNER="$RECOVERY_SIGNER_DIR/sign_sls_mass_notify_local_sig.sh"
+    RECOVERY_CONFIG_DECODER="$RECOVERY_DECODER_DIR/sls_config_crypto.php"
+    bash -n "$RECOVERY_SIGNER" || return 1
+    return 0
+  fi
 
   if [ -n "${SLS_MASS_NOTIFY_SIGNER_SOURCE:-}" ]; then
     candidates+=("$SLS_MASS_NOTIFY_SIGNER_SOURCE")
@@ -262,12 +334,120 @@ PYTRUSTCOPY
 }
 
 cleanup_recovery_signer() {
+  release_uninstall_workers
   if [ -n "$RECOVERY_SIGNER_DIR" ] && [ -d "$RECOVERY_SIGNER_DIR" ]; then
     find "$RECOVERY_SIGNER_DIR" -depth -delete 2>/dev/null || true
   fi
   RECOVERY_SIGNER_DIR=""
   RECOVERY_SIGNER=""
+  if [ -n "$RECOVERY_DECODER_DIR" ] && [ -d "$RECOVERY_DECODER_DIR" ]; then
+    find "$RECOVERY_DECODER_DIR" -depth -delete 2>/dev/null || true
+  fi
+  RECOVERY_DECODER_DIR=""
 }
+
+release_uninstall_workers() {
+  if [ -n "${UNINSTALL_WORKER_PIPE:-}" ]; then
+    # A rejected/dead child may have already closed its pipe. Contain SIGPIPE
+    # in this subshell so EXIT cleanup still preserves the original result.
+    ( trap '' PIPE; printf 'release\n' >&"$UNINSTALL_WORKER_PIPE" ) 2>/dev/null || true
+    exec {UNINSTALL_WORKER_PIPE}>&-
+    UNINSTALL_WORKER_PIPE=""
+  fi
+  if [ -n "${UNINSTALL_WORKER_PID:-}" ]; then
+    wait "$UNINSTALL_WORKER_PID" 2>/dev/null || true
+    UNINSTALL_WORKER_PID=""
+  fi
+}
+
+assert_uninstall_workers() {
+  [ "$UNINSTALL_GUARD_REQUIRED" != 1 ] || {
+    [ -n "$UNINSTALL_WORKER_PID" ] && kill -0 "$UNINSTALL_WORKER_PID" 2>/dev/null || {
+      log 'The protected uninstall worker guard exited. Teardown stopped; preserve the signed recovery evidence and retry when SLS workers are idle.'
+      return 1
+    }
+  }
+}
+
+acquire_uninstall_workers() {
+  local guard_input guard_output status helper="$RECOVERY_SIGNER_DIR/sls_install_guard.py"
+  UNINSTALL_GUARD_REQUIRED=0
+  if [ -e "$DATA_DIR" ] || [ -L "$DATA_DIR" ]; then
+    # The optional narrow migration uses authenticated retained sources and
+    # changes only recognized legacy modes; bytes and lock inodes are retained.
+    if [ -f "$RECOVERY_SIGNER_DIR/sls_legacy_permissions.py" ]; then
+      /usr/bin/python3 -I "$RECOVERY_SIGNER_DIR/sls_legacy_permissions.py" --data "$DATA_DIR" \
+        --approval "$RECOVERY_SIGNER_DIR/uninstall-approval.json" repair || return 1
+    fi
+    UNINSTALL_GUARD_REQUIRED=1
+    coproc SLS_UNINSTALL_GUARD {
+      /usr/bin/python3 -I "$helper" --data "$DATA_DIR" --timeout 120 hold
+    }
+    UNINSTALL_WORKER_PID="${SLS_UNINSTALL_GUARD_PID:-}"
+    guard_input="${SLS_UNINSTALL_GUARD[1]:-}"; guard_output="${SLS_UNINSTALL_GUARD[0]:-}"
+    if [ -z "$UNINSTALL_WORKER_PID" ] || [ -z "$guard_input" ] || [ -z "$guard_output" ] \
+      || ! exec {UNINSTALL_WORKER_PIPE}>&"$guard_input" \
+      || ! IFS= read -r -t 125 status <&"$guard_output" || [ "$status" != ready ]; then
+      release_uninstall_workers
+      log 'Unable to drain SLS workers safely. Wait for announcements/pages to finish, stop external SLS supervisors and review the named unsafe lock before retrying. No teardown was started.'
+      return 1
+    fi
+    assert_uninstall_workers || return 1
+  else
+    # A late explicit-purge retry has no locks to acquire. Require the already
+    # removed module/registry and public runtime before allowing this state.
+    inspect_module_registry || return 1
+    [ "$MODULE_REGISTRY_PRESENT" != 1 ] || {
+      log 'SLS data is missing while its module registry entry remains. Preserve the signed evidence and review this incomplete teardown; no removal was started.'
+      return 1
+    }
+    local entry
+    for entry in /var/www/html/admin/modules/slsmassnotifyserver /usr/local/bin/sls_mass_notify \
+      /var/www/html/api/sipnotify /var/www/html/api/sls-mass-notify /var/www/html/mass-notify; do
+      if [ -e "$entry" ] || [ -L "$entry" ]; then
+        log 'SLS data is missing while delivery entry points remain. Preserve the signed evidence and review this incomplete teardown; no removal was started.'
+        return 1
+      fi
+    done
+  fi
+}
+
+inspect_uninstall_idle() (
+  if [ -n "${UNINSTALL_WORKER_PIPE:-}" ]; then exec {UNINSTALL_WORKER_PIPE}>&-; fi
+  /usr/bin/python3 -I - "$RECOVERY_SIGNER_DIR/sls_install_idle.py" "$DATA_DIR" "$PBX_RUNNING" <<'PYUNINSTALLIDLE'
+from pathlib import Path
+import importlib.util, inspect, os, sys
+path, data, running = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+spec = importlib.util.spec_from_file_location('sls_uninstall_idle', path)
+idle = importlib.util.module_from_spec(spec); spec.loader.exec_module(idle)
+try:
+    check = idle.IdleCheck(data)
+    if running == '0':
+        # Failed CLI access is not evidence that an existing Asterisk is idle.
+        # Only a genuinely absent Asterisk process permits the empty inventory.
+        proc = idle.directory(Path('/proc'))
+        try:
+            for name in idle.entries(proc, 32768, 3):
+                if not name.isdigit(): continue
+                try:
+                    executable = os.readlink('/proc/' + name + '/exe')
+                except (FileNotFoundError, ProcessLookupError): continue
+                if Path(executable.removesuffix(' (deleted)')).name == 'asterisk':
+                    raise idle.IdleError('Asterisk is running but its channel inventory is unavailable. Restore local control-socket access before removing SLS.')
+        finally: os.close(proc)
+        check.channels = lambda: ''
+    check.no_processes(); check.no_pending(); check.no_playback()
+    # Teardown does not require a healthy collector. Existing admission state
+    # still must be valid and closed; unknown/live batches are not erased.
+    # Prior signed helpers have no pending-voicemail keyword and already
+    # perform the strict batch check without requiring collector health.
+    parameters = inspect.signature(check.phone_history).parameters
+    options = {'allow_pending_voicemail': True} if 'allow_pending_voicemail' in parameters else {}
+    check.phone_history(False, False, **options)
+except (idle.IdleError, OSError, ValueError, TypeError) as error:
+    raise SystemExit('SLS uninstall safety check: ' + str(error) + '. No teardown was started; allow delivery to finish and preserve unknown state for review.')
+PYUNINSTALLIDLE
+)
 
 close_inherited_maintenance_lock_fds() {
   local lock_file="${SLS_MASS_NOTIFY_MAINTENANCE_LOCK:-/run/lock/sls-mass-notify-maintenance.lock}"
@@ -288,6 +468,7 @@ run_fwconsole() (
   # The parent uninstaller or maintenance worker retains the transaction lock;
   # descendants must not inherit it and accidentally extend its lifetime.
   close_inherited_maintenance_lock_fds
+  if [ -n "${UNINSTALL_WORKER_PIPE:-}" ]; then exec {UNINSTALL_WORKER_PIPE}>&-; fi
   # PCRE JIT allocation can be denied by otherwise healthy unprivileged LXC
   # containers. Limit this compatibility override to the uninstall process.
   /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 /usr/sbin/fwconsole "$@"
@@ -303,17 +484,30 @@ exit((int)$statement->fetchColumn() > 0 ? 0 : 1);
 '
 }
 
+inspect_module_registry() {
+  local result=0
+  module_registry_exists || result=$?
+  case "$result" in
+    0) MODULE_REGISTRY_PRESENT=1 ;;
+    1) MODULE_REGISTRY_PRESENT=0 ;;
+    *) log "FreePBX module registry could not be read. Module files were not deleted; restore database access and retry."; return 1 ;;
+  esac
+}
+
 remove_module_registration() {
-  if module_registry_exists; then
+  inspect_module_registry || return 1
+  if [ "$MODULE_REGISTRY_PRESENT" = 1 ]; then
     if ! run_fwconsole ma uninstall "$MODULE" >"$MODULE_UNINSTALL_LOG" 2>&1; then
       log "FreePBX reported an error while uninstalling $MODULE; checking whether its registry row was removed."
     fi
   fi
-  if module_registry_exists; then
+  inspect_module_registry || return 1
+  if [ "$MODULE_REGISTRY_PRESENT" = 1 ]; then
     run_fwconsole ma disable "$MODULE" >>"$MODULE_UNINSTALL_LOG" 2>&1 || true
     run_fwconsole ma delete "$MODULE" >>"$MODULE_UNINSTALL_LOG" 2>&1 || true
   fi
-  if module_registry_exists; then
+  inspect_module_registry || return 1
+  if [ "$MODULE_REGISTRY_PRESENT" = 1 ]; then
     log "FreePBX left the $MODULE registry row behind; removing that single stale row before deleting module files."
     SLS_MODULE_NAME="$MODULE" /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 -r '
 $bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
@@ -323,7 +517,8 @@ $statement->execute([(string)getenv("SLS_MODULE_NAME")]);
 exit(0);
 '
   fi
-  if module_registry_exists; then
+  inspect_module_registry || return 1
+  if [ "$MODULE_REGISTRY_PRESENT" = 1 ]; then
     log "Unable to remove the $MODULE registry row. Module files were not deleted."
     return 1
   fi
@@ -332,7 +527,79 @@ exit(0);
 
 capture_signing_fingerprint() {
   [ -d "$SIGN_HOME" ] || return 0
-  SIGNING_FINGERPRINT="$(GNUPGHOME="$SIGN_HOME" gpg --batch --with-colons --list-keys 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')"
+  SIGNING_FINGERPRINT="$(GNUPGHOME="$SIGN_HOME" gpg --batch --with-colons --list-keys 2>/dev/null | awk -F: '/^fpr:/ && !found {print $10; found=1}')" || {
+    log "The existing signing keyring could not be inspected safely. Preserve it for review before uninstalling."
+    return 1
+  }
+}
+
+capture_pbx_running_state() {
+  local response=""
+  PBX_RUNNING=0
+  if response="$(/usr/bin/timeout --signal=TERM 10 /usr/sbin/asterisk -rx 'core show uptime' 2>/dev/null)" \
+    && grep -Fq 'System uptime:' <<<"$response"; then
+    PBX_RUNNING=1
+  fi
+}
+
+reload_removed_pbx_integration() {
+  if [ "$PBX_RUNNING" != 1 ]; then
+    PBX_RELOAD_WARNING=1
+    log "SLS removal was verified. Asterisk is stopped or its control socket is unavailable; run fwconsole reload after PBX service is available. No PBX service was started."
+    return 0
+  fi
+  if ! run_fwconsole reload >>"$MODULE_UNINSTALL_LOG" 2>&1; then
+    PBX_RELOAD_WARNING=1
+    log "SLS removal was verified, but the PBX integration reload failed. Review $MODULE_UNINSTALL_LOG_PATH, resolve the PBX reload error, and run fwconsole reload."
+  fi
+}
+
+capture_configured_ami_username() {
+  CONFIGURED_AMI_USERNAME="$(SLS_CONFIG="$DATA_DIR/mass-notifications.config" SLS_UNINSTALL_CONFIG_DECODER="$RECOVERY_CONFIG_DECODER" /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 <<'PHPAMI'
+<?php
+$path = (string)getenv('SLS_CONFIG');
+if ($path === '' || (!file_exists($path) && !is_link($path))) { exit(0); }
+$metadata = lstat($path);
+if (is_link($path) || !is_file($path) || !is_array($metadata) || $metadata['nlink'] !== 1 || $metadata['size'] > 3 * 1024 * 1024) {
+    fwrite(STDERR, "The central configuration is unsafe; preserve it for review before uninstalling.\n"); exit(1);
+}
+require_once (string)getenv('SLS_UNINSTALL_CONFIG_DECODER');
+$body = file_get_contents($path);
+clearstatcache(true, $path);
+$after = lstat($path);
+if (!is_string($body) || !is_array($after) || strlen($body) !== $metadata['size']
+    || array_intersect_key($metadata, array_flip(['dev', 'ino', 'size', 'mtime', 'ctime'])) !== array_intersect_key($after, array_flip(['dev', 'ino', 'size', 'mtime', 'ctime']))) {
+    fwrite(STDERR, "The central configuration changed while being read; no manager account was removed.\n"); exit(1);
+}
+$settings = \FreePBX\modules\SlsConfigCrypto::decode($body);
+$username = (string)($settings['ami']['username'] ?? '');
+if ($username !== '' && !preg_match('/^[A-Za-z0-9_.-]{1,80}$/D', $username)) {
+    fwrite(STDERR, "The configured SLS AMI username is invalid; no manager account was removed.\n"); exit(1);
+}
+echo $username;
+PHPAMI
+)" || return 1
+}
+
+validate_retained_user_data() {
+  /usr/bin/python3 -I - "$DATA_DIR" <<'PYRETAIN'
+from pathlib import Path
+import os, pwd, stat, sys
+path = Path(sys.argv[1]); account = pwd.getpwnam('asterisk')
+if not path.is_absolute() or '..' in path.parts:
+    raise SystemExit('Invalid retained SLS data path')
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+fd = os.open('/', flags)
+try:
+    for part in path.parts[1:]:
+        try: child = os.open(part, flags, dir_fd=fd)
+        except FileNotFoundError: raise SystemExit(0)
+        os.close(fd); fd = child
+        info = os.fstat(fd)
+        if info.st_uid not in (0, account.pw_uid) or info.st_mode & 0o002 and not (info.st_uid == 0 and info.st_mode & stat.S_ISVTX):
+            raise SystemExit('Retained SLS data has an unsafe owner or writable parent; no data was deleted')
+finally: os.close(fd)
+PYRETAIN
 }
 
 preserve_user_data() {
@@ -695,28 +962,88 @@ with open(path, "w", encoding="utf-8") as handle:
 PY
 }
 
-remove_phone_collector_service() {
-  local unit="/etc/systemd/system/sls-mass-notify-phone-events.service" active_state
-  [ -e "$unit" ] || [ -L "$unit" ] || return 0
-  python3 -I - "$unit" <<'PY'
-import os
-import stat
-import sys
-path = sys.argv[1]
-metadata = os.lstat(path)
-if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
-        or metadata.st_uid != 0 or metadata.st_mode & 0o022):
-    raise SystemExit("Refusing to remove an unsafe phone collector service file.")
-with open(path, encoding="utf-8") as handle:
-    if handle.read(128).splitlines()[:2] != ["# Managed by SLS Mass Notify Server", "[Unit]"]:
-        raise SystemExit("Refusing to remove an unrelated phone collector service.")
+verify_uninstall_collector_unit() {
+  /usr/bin/python3 -I - "$1" "$RECOVERY_SIGNER_DIR/collector-unit.txt" <<'PY'
+import os, stat, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+with os.fdopen(fd, 'rb') as handle:
+    before = os.fstat(handle.fileno())
+    if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_uid != 0
+            or before.st_mode & 0o022 or before.st_size > 65536):
+        raise SystemExit('Refusing an unsafe collector service file; no service was changed.')
+    body = handle.read(65537); after = os.fstat(handle.fileno()); named = os.lstat(sys.argv[1])
+    identity = lambda row: (row.st_dev, row.st_ino, row.st_size, row.st_mtime_ns, row.st_ctime_ns, row.st_nlink)
+    if identity(before) != identity(after) or identity(after) != identity(named) or body != open(sys.argv[2], 'rb').read():
+        raise SystemExit('Collector service differs from its retained signed template. Preserve custom changes for review; no service was changed.')
 PY
-  [ "$?" -eq 0 ] || return 1
-  /usr/bin/timeout --kill-after=2 20 systemctl disable --now sls-mass-notify-phone-events.service || return 1
-  active_state="$(/usr/bin/timeout --kill-after=2 10 systemctl show --property=ActiveState --value sls-mass-notify-phone-events.service)" || return 1
-  case "$active_state" in inactive|failed) ;; *) log "The phone collector has not stopped; its service file was preserved."; return 1 ;; esac
-  rm -- "$unit" || return 1
-  /usr/bin/timeout --kill-after=2 10 systemctl daemon-reload || return 1
+}
+
+restore_uninstall_collector() {
+  local unit="$1" previous="$2" enabled="$3" current
+  if ! verify_uninstall_collector_unit "$unit"; then
+    log 'Uninstall stopped before removing module files, but the collector service changed during recovery. Preserve its definition and history for review.'
+    return 1
+  fi
+  current="$(/usr/bin/timeout --kill-after=2 10 systemctl show --property=UnitFileState --value sls-mass-notify-phone-events.service)" || return 1
+  if [ "$enabled" = enabled ] && [ "$current" = disabled ]; then
+    /usr/bin/timeout --kill-after=2 20 systemctl enable sls-mass-notify-phone-events.service || {
+      log 'Uninstall stopped before removing module files, but the collector enablement could not be restored. Preserve its unit/history and restore its previous enabled state after reviewing systemd.'
+      return 1
+    }
+  elif [ "$current" != "$enabled" ]; then
+    log 'Collector enablement changed unexpectedly; no further service state was adopted. Preserve the unit and review systemd before retrying.'
+    return 1
+  fi
+  [ "$previous" = active ] || return 0
+  if ! /usr/bin/timeout --kill-after=2 20 systemctl start sls-mass-notify-phone-events.service \
+    || [ "$(/usr/bin/timeout --kill-after=2 10 systemctl show --property=ActiveState --value sls-mass-notify-phone-events.service)" != active ]; then
+    log 'Uninstall stopped before removing module files, but the previously active collector could not be restored. Preserve its service definition and history; review systemctl status/journalctl and restart the approved collector after resolving the named fault.'
+    return 1
+  fi
+  log 'Uninstall stopped before removing module files; the previously active collector was restored without changing its enablement.'
+}
+
+remove_phone_collector_service() {
+  local unit="/etc/systemd/system/sls-mass-notify-phone-events.service" active_state previous_state fragment dropins enabled_state
+  [ -e "$unit" ] || [ -L "$unit" ] || return 0
+  verify_uninstall_collector_unit "$unit" || return 1
+  previous_state="$(/usr/bin/timeout --kill-after=2 10 systemctl show --property=ActiveState --value sls-mass-notify-phone-events.service)" || return 1
+  fragment="$(/usr/bin/timeout --kill-after=2 10 systemctl show --property=FragmentPath --value sls-mass-notify-phone-events.service)" || return 1
+  dropins="$(/usr/bin/timeout --kill-after=2 10 systemctl show --property=DropInPaths --value sls-mass-notify-phone-events.service)" || return 1
+  enabled_state="$(/usr/bin/timeout --kill-after=2 10 systemctl show --property=UnitFileState --value sls-mass-notify-phone-events.service)" || return 1
+  case "$previous_state:$enabled_state" in active:enabled|active:disabled|inactive:enabled|inactive:disabled|failed:enabled|failed:disabled) ;; *) log 'Collector enablement or process state is unsupported. No service was changed; review masks or custom supervision before retrying.'; return 1 ;; esac
+  if [ "$fragment" != "$unit" ] || [ -n "$dropins" ]; then
+    log 'Collector systemd fragments or overrides differ from the signed service. No service was changed; preserve custom supervision for review.'
+    return 1
+  fi
+  if ! /usr/bin/timeout --kill-after=2 20 systemctl stop sls-mass-notify-phone-events.service; then
+    restore_uninstall_collector "$unit" "$previous_state" "$enabled_state" || true
+    return 1
+  fi
+  active_state="$(/usr/bin/timeout --kill-after=2 10 systemctl show --property=ActiveState --value sls-mass-notify-phone-events.service)" || {
+    restore_uninstall_collector "$unit" "$previous_state" "$enabled_state" || true
+    return 1
+  }
+  case "$active_state" in inactive|failed) ;; *) log "The phone collector has not stopped; its service file was preserved."; restore_uninstall_collector "$unit" "$previous_state" "$enabled_state" || true; return 1 ;; esac
+  # Confirm shutdown did not leave a last voicemail call. Keep the service
+  # definition and all runtime/history available if this final check fails.
+  if ! assert_uninstall_workers || ! inspect_uninstall_idle; then
+    restore_uninstall_collector "$unit" "$previous_state" "$enabled_state" || true
+    return 1
+  fi
+  if ! /usr/bin/timeout --kill-after=2 20 systemctl disable sls-mass-notify-phone-events.service; then
+    log 'The collector stopped but its enablement could not be removed. Its service and module files remain; review systemd and retry.'
+    restore_uninstall_collector "$unit" "$previous_state" "$enabled_state" || true
+    return 1
+  fi
+  if ! rm -- "$unit"; then
+    restore_uninstall_collector "$unit" "$previous_state" "$enabled_state" || true
+    return 1
+  fi
+  /usr/bin/timeout --kill-after=2 10 systemctl daemon-reload || {
+    log 'The collector service was removed but systemd reload failed. Module and history remain; preserve signed recovery evidence, resolve systemd and retry the included uninstaller.'
+    return 1
+  }
 }
 
 disable_apache_conf() {
@@ -730,20 +1057,13 @@ disable_apache_conf() {
 }
 
 remove_freepbx_manager_users() {
-  SLS_CONFIG="$DATA_DIR/mass-notifications.config" /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 <<'PHP'
+  SLS_CONFIGURED_AMI_USERNAME="$CONFIGURED_AMI_USERNAME" /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 <<'PHP'
 <?php
 $bootstrap_settings = ['freepbx_auth' => false, 'skip_astman' => true];
 require '/etc/freepbx.conf';
 $candidates = ['slsmassnotify', 'sls_mass_notify', 'nws_push'];
-$path = (string)getenv('SLS_CONFIG');
-if ($path !== '' && is_readable($path)) {
-    require_once '/usr/local/bin/sls_mass_notify/sls_config_crypto.php';
-    $settings = \FreePBX\modules\SlsConfigCrypto::decode((string)file_get_contents($path));
-    $configured = is_array($settings) ? (string)($settings['ami']['username'] ?? '') : '';
-    if ($configured !== '') {
-        $candidates[] = $configured;
-    }
-}
+$configured = (string)getenv('SLS_CONFIGURED_AMI_USERNAME');
+if ($configured !== '') { $candidates[] = $configured; }
 $candidates = array_values(array_unique(array_filter($candidates)));
 try {
     $manager = \FreePBX::Manager();
@@ -777,6 +1097,8 @@ $recordings = [
     ['custom/SLS_Mass_Notify_Lightning_Alert', '/var/lib/asterisk/sounds/en/custom/SLS_Mass_Notify_Lightning_Alert.wav', $dataDir . '/sounds/tones/opening_Lightning_alert.wav', 'SLS Mass Notify - Lightning Alert', 'Default Southland Servers cloud-to-ground lightning warning opening tone.'],
 ];
 $database = \FreePBX::Database();
+$tables = $database->query("SHOW TABLES LIKE 'recordings'");
+if ($tables->fetchColumn() === false) { exit(0); }
 $lookup = $database->prepare('SELECT displayname, description FROM recordings WHERE filename = ? LIMIT 1');
 $delete = $database->prepare('DELETE FROM recordings WHERE filename = ?');
 foreach ($recordings as [$filename, $path, $tone, $name, $description]) {
@@ -801,24 +1123,18 @@ PHP
 }
 
 verify_freepbx_cleanup() {
-	  if module_registry_exists; then
+      inspect_module_registry || return 1
+	  if [ "$MODULE_REGISTRY_PRESENT" = 1 ]; then
 	    log "Uninstall verification failed; the $MODULE FreePBX registry row remains."
 	    return 1
 	  fi
-  SLS_CONFIG="$DATA_DIR/mass-notifications.config" /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 <<'PHP'
+  SLS_CONFIGURED_AMI_USERNAME="$CONFIGURED_AMI_USERNAME" /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 <<'PHP'
 <?php
 $bootstrap_settings = ['freepbx_auth' => false, 'skip_astman' => true];
 require '/etc/freepbx.conf';
 $candidates = ['slsmassnotify', 'sls_mass_notify', 'nws_push'];
-$path = (string)getenv('SLS_CONFIG');
-if ($path !== '' && is_readable($path)) {
-    require_once '/usr/local/bin/sls_mass_notify/sls_config_crypto.php';
-    $settings = \FreePBX\modules\SlsConfigCrypto::decode((string)file_get_contents($path));
-    $configured = is_array($settings) ? (string)($settings['ami']['username'] ?? '') : '';
-    if ($configured !== '') {
-        $candidates[] = $configured;
-    }
-}
+$configured = (string)getenv('SLS_CONFIGURED_AMI_USERNAME');
+if ($configured !== '') { $candidates[] = $configured; }
 $candidates = array_values(array_unique(array_filter($candidates)));
 $database = \FreePBX::Database();
 $statement = $database->prepare('SELECT COUNT(*) FROM manager WHERE name = ?');
@@ -871,11 +1187,7 @@ PHP
       return 1
     fi
   done
-  if crontab -l 2>/dev/null | grep -Eq 'sls_mass_notify_(update|maintenance)\.sh' \
-    || crontab -u asterisk -l 2>/dev/null | grep -Eq 'sls_mass_notify_(weather_poll|nws_poll)\.sh|sls_mass_notify_schedule_worker\.php'; then
-    log "Uninstall verification failed; an SLS scheduled job remains."
-    return 1
-  fi
+  verify_removed_cron || return 1
   if grep -Fq 'SLS Mass Notifications menu placement:' /var/www/html/admin/views/menu_items.php 2>/dev/null; then
     log "Uninstall verification failed; the managed FreePBX menu placement remains."
     return 1
@@ -916,12 +1228,13 @@ locally_sign_stock_module() {
       log "The protected uninstall signer snapshot is missing or unsafe."
       return 1
     }
-    if ! SLS_LOCAL_SIGN_HOME="$SIGN_HOME" \
+    if ! ( if [ -n "${UNINSTALL_WORKER_PIPE:-}" ]; then exec {UNINSTALL_WORKER_PIPE}>&-; fi
+      SLS_LOCAL_SIGN_HOME="$SIGN_HOME" \
       SLS_LOCAL_SIGN_LOCK="/run/lock/sls-mass-notify-signing.lock" \
       SLS_LOCAL_TRUST_HELPER="$RECOVERY_SIGNER_DIR/sls_module_trust.py" \
       SLS_LOCAL_TRUST_MODE="uninstalled" \
       /usr/bin/timeout --signal=TERM 360 "$RECOVERY_SIGNER" "$stock_module" \
-        >>"$STOCK_RESTORE_LOG" 2>&1; then
+        >>"$STOCK_RESTORE_LOG" 2>&1 ); then
       log "The protected local signer could not verify the cleaned $stock_module module."
       return 1
     fi
@@ -986,10 +1299,12 @@ remove_runtime_files() {
   rm -rf /var/www/html/mass-notify
   rm -rf /var/www/html/sls_mass_notify
   rm -rf /etc/asterisk/slsmassnotify
-  rm -rf "$DATA_DIR"
-  rm -f /var/log/sls_mass_notify.log
-  rm -f /var/log/sls_mass_notify_events.jsonl
-  rm -f /var/log/sls_mass_notify_push.log
+  if [ "$PURGE_CONFIG" = 1 ]; then
+    rm -rf "$DATA_DIR"
+    rm -f /var/log/sls_mass_notify.log
+    rm -f /var/log/sls_mass_notify_events.jsonl
+    rm -f /var/log/sls_mass_notify_push.log
+  fi
   rm -f /tmp/slsmassnotifyserver-*.tgz
   rm -f /tmp/slsmassnotifyserver-install.log
   rm -f /tmp/sls-install.sh /tmp/sls-install.sh.bak-*
@@ -998,16 +1313,92 @@ remove_runtime_files() {
   rm -f /var/tmp/nws_last_clear.ts
 }
 
+read_uninstall_crontab() {
+  local user="$1" target="$2" error_file result=0 diagnostic
+  [[ "$user" = root || "$user" = asterisk ]] || return 1
+  error_file="$(mktemp /tmp/slsmassnotifyserver-cron-errors.XXXXXX)" || return 1
+  LC_ALL=C crontab -u "$user" -l >"$target" 2>"$error_file" || result=$?
+  diagnostic="$(cat "$error_file")"
+  rm -f "$error_file"
+  if [ "$result" = 0 ]; then return 0; fi
+  if [ "$result" = 1 ] && [ "$diagnostic" = "no crontab for $user" ]; then
+    : >"$target"
+    return 0
+  fi
+  log "The $user crontab could not be read. No cron replacement was authorized; restore cron access and retry."
+  return 1
+}
+
+filter_uninstall_crontab() {
+  /usr/bin/python3 -I - "$1" "$2" <<'PYCRON'
+from pathlib import Path
+import re, sys
+source, target = map(Path, sys.argv[1:])
+pattern = re.compile(rb'/usr/local/bin/sls_mass_notify/sls_cron_runner\.py|sls_mass_notify_(?:weather_poll|nws_poll|update|maintenance)\.sh|sls_mass_notify_(?:schedule|announcement)_worker\.php|sls_announcement_worker\.py|nwsalerts_ensure_menu_patch\.sh')
+body = source.read_bytes()
+if len(body) > 8 * 1024 * 1024: raise SystemExit('The crontab exceeds the bounded uninstall review size')
+lines = body.splitlines(keepends=True)
+target.write_bytes(b''.join(line for line in lines if line.lstrip().startswith(b'#') or not pattern.search(line)))
+PYCRON
+}
+
 remove_cron() {
-  local user
-  local tmp
+  local user work
+  work="$(mktemp -d /tmp/slsmassnotifyserver-cron.XXXXXX)" || return 1
+  # Both reads succeed before either user's crontab may be replaced.
   for user in root asterisk; do
-    tmp="$(mktemp /tmp/slsmassnotifyserver-cron.XXXXXX)"
-    crontab -u "$user" -l 2>/dev/null \
-      | grep -vE 'sls_mass_notify_(weather_poll|nws_poll|update|maintenance)\.sh|sls_mass_notify_schedule_worker\.php|nwsalerts_ensure_menu_patch\.sh' > "$tmp" || true
-    crontab -u "$user" "$tmp" 2>/dev/null || true
-    rm -f "$tmp"
+    if ! read_uninstall_crontab "$user" "$work/$user.before" \
+      || ! filter_uninstall_crontab "$work/$user.before" "$work/$user.after"; then
+      rm -rf "$work"
+      return 1
+    fi
   done
+  for user in root asterisk; do
+    if ! read_uninstall_crontab "$user" "$work/$user.current" \
+      || ! cmp -s "$work/$user.before" "$work/$user.current"; then
+      log "The $user crontab changed during uninstall preparation. No replacement was started; preserve the administrator's edits and retry."
+      rm -rf "$work"
+      return 1
+    fi
+  done
+  for user in root asterisk; do
+    cmp -s "$work/$user.before" "$work/$user.after" && continue
+    if ! crontab -u "$user" "$work/$user.after" 2>/dev/null; then
+      log "The $user SLS cron entries could not be removed. Original crontabs were retained in $work; review cron permissions and retry."
+      return 1
+    fi
+  done
+  rm -rf "$work"
+}
+
+verify_uninstall_cron_access() {
+  local user work
+  work="$(mktemp -d /tmp/slsmassnotifyserver-cron-preflight.XXXXXX)" || return 1
+  for user in root asterisk; do
+    if ! read_uninstall_crontab "$user" "$work/$user.before"; then
+      rm -rf "$work"
+      return 1
+    fi
+  done
+  rm -rf "$work"
+}
+
+verify_removed_cron() {
+  local user work
+  work="$(mktemp -d /tmp/slsmassnotifyserver-cron-verify.XXXXXX)" || return 1
+  for user in root asterisk; do
+    if ! read_uninstall_crontab "$user" "$work/$user.before" \
+      || ! filter_uninstall_crontab "$work/$user.before" "$work/$user.after"; then
+      rm -rf "$work"
+      return 1
+    fi
+    if ! cmp -s "$work/$user.before" "$work/$user.after"; then
+      rm -rf "$work"
+      log "Uninstall verification failed; an SLS scheduled job remains in the $user crontab."
+      return 1
+    fi
+  done
+  rm -rf "$work"
 }
 
 restore_stock_modules() {
@@ -1089,44 +1480,130 @@ remove_trusted_signing_key() {
 }
 
 admit_root_runtime() {
-  /usr/bin/python3 -I - "/usr/local/bin/sls_mass_notify/sls_privileged_install.py" <<'PYGUARD' || return 1
-import os
+  UNINSTALL_APPROVED_SOURCE="$(/usr/bin/python3 -I - <<'PYGUARD'
+import hashlib, json, os, re, stat, sys, types
 from pathlib import Path
-import stat
-import sys
-path = Path(sys.argv[1])
-for file in (path, path.with_name('sls_module_trust.py')):
-    for item in [file] + list(file.parents)[:-1]:
-        info = item.lstat()
-        if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
-            raise SystemExit('Untrusted SLS protected runtime path: ' + str(item))
-    info = file.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-        raise SystemExit('Unsafe SLS protected helper file')
+sys.dont_write_bytecode = True
+root = Path('/var/lib/sls-mass-notify-trust')
+def read(path, maximum):
+    for parent in reversed(path.parents):
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
+            raise RuntimeError('Uninstall evidence has an unprotected parent')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or info.st_nlink != 1 or info.st_size > maximum:
+            raise RuntimeError('Uninstall evidence is unsafe: ' + str(path))
+        body = stream.read(maximum + 1); after = os.fstat(stream.fileno())
+        if len(body) != info.st_size or (info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise RuntimeError('Uninstall evidence changed during inspection')
+        return body
+reference = json.loads(read(root / 'slsmassnotifyserver.active.json', 1024))
+if not isinstance(reference, dict): raise SystemExit('Invalid protected SLS publisher reference')
+digest = reference.get('sha256', '')
+if not isinstance(digest, str) or not re.fullmatch('[a-f0-9]{64}', digest) or reference.get('generation') != 'slsmassnotifyserver-' + digest:
+    raise SystemExit('Invalid protected SLS publisher generation')
+generation = root / reference['generation']
+raw = read(generation / 'inventory.json', 8 * 1024 * 1024)
+if hashlib.sha256(raw).hexdigest() != digest: raise SystemExit('Protected SLS publisher inventory changed')
+inventory = json.loads(raw)
+if not isinstance(inventory, dict) or not isinstance(inventory.get('files'), dict): raise SystemExit('Invalid protected SLS publisher inventory')
+name = 'bin/sls_mass_notify/sls_module_trust.py'
+entry = inventory.get('files', {}).get(name)
+path = generation / 'module' / name
+body = read(path, 2 * 1024 * 1024)
+if not isinstance(entry, dict) or hashlib.sha256(body).hexdigest() != entry.get('sha256'):
+    raise SystemExit('Protected SLS trust helper changed')
+trust = types.ModuleType('sls_uninstall_trust'); trust.__file__ = str(path)
+exec(compile(body, str(path), 'exec'), trust.__dict__)
+data, approved_generation = trust.load(root, 'slsmassnotifyserver')
+if approved_generation != generation or data['source']['kind'] != 'publisher-ed25519':
+    raise SystemExit('Uninstall requires an existing publisher-approved generation')
+required = {
+    'bin/sls_mass_notify_uninstall.sh':'/usr/local/bin/sls_mass_notify/sls_mass_notify_uninstall.sh',
+    'bin/sign_sls_mass_notify_local_sig.sh':'/usr/local/sbin/sign_sls_mass_notify_local_sig.sh',
+    'bin/sls_mass_notify/sls_module_trust.py':'/usr/local/bin/sls_mass_notify/sls_module_trust.py',
+    'bin/sls_mass_notify/sls_config_crypto.php':'/usr/local/bin/sls_mass_notify/sls_config_crypto.php',
+    'bin/sls_mass_notify/sls_install_guard.py':'/usr/local/bin/sls_mass_notify/sls_install_guard.py',
+    'bin/sls_mass_notify/sls_install_idle.py':'/usr/local/bin/sls_mass_notify/sls_install_idle.py',
+    'bin/sls_mass_notify/sls_audio_state.py':'/usr/local/bin/sls_mass_notify/sls_audio_state.py',
+    'bin/sls_mass_notify/sls_config_crypto.py':'/usr/local/bin/sls_mass_notify/sls_config_crypto.py',
+}
+optional = 'bin/sls_mass_notify/sls_legacy_permissions.py'
+if optional in data['files']: required[optional] = '/usr/local/bin/sls_mass_notify/sls_legacy_permissions.py'
+for name, installed in required.items():
+    entry = data['files'].get(name)
+    if not entry: raise SystemExit('Required signed uninstall helper is absent: ' + name)
+    approved = trust.read(generation / 'module' / name, 2 * 1024 * 1024, protected=True)
+    if trust.digest(approved) != entry['sha256']: raise SystemExit('Required signed uninstall helper changed: ' + name)
+    try: actual = read(Path(installed), 2 * 1024 * 1024)
+    except FileNotFoundError: continue
+    if actual != approved: raise SystemExit('Installed uninstall helper differs from its signed release: ' + installed)
+print(generation / 'module')
 PYGUARD
-  /usr/bin/python3 -I "/usr/local/bin/sls_mass_notify/sls_privileged_install.py" admit
+)" || return 1
+}
+
+remove_sls_chown_exclusion() {
+  # The complete root runtime was publisher-verified before teardown. Remove
+  # only this module's exact managed native exclusion before deleting its helper.
+  local helper="$RECOVERY_SIGNER_DIR/sls_legacy_permissions.py"
+  if [ -f "$helper" ] && [ ! -L "$helper" ]; then
+    /usr/bin/python3 -I "$helper" --chown-config /etc/asterisk/freepbx_chown.conf remove-chown
+  elif grep -Fq 'BEGIN SLS MASS NOTIFY DATA PERMISSIONS' /etc/asterisk/freepbx_chown.conf 2>/dev/null; then
+    log 'The installed release does not approve a helper for this newer chown exclusion. Preserve the native configuration for review.'
+    return 1
+  fi
+}
+
+verify_uninstall_inventories() {
+  local module_dir='/var/www/html/admin/modules/slsmassnotifyserver' reviewed_module
+  local helper="$RECOVERY_SIGNER_DIR/sls_module_trust.py"
+  inspect_module_registry || return 1
+  if [ -e "$module_dir" ] || [ -L "$module_dir" ]; then
+    /usr/bin/python3 -I "$helper" --root /var/lib/sls-mass-notify-trust check --module slsmassnotifyserver --web-root /var/www/html || {
+      log "The installed SLS module differs from its signed inventory. Preserve the changed files for review before retrying."
+      return 1
+    }
+  elif [ "$MODULE_REGISTRY_PRESENT" = 1 ]; then
+    log "The SLS directory is missing but its FreePBX registry row remains. Preserve the signed release evidence and repair this incomplete removal before retrying."
+    return 1
+  fi
+  for reviewed_module in dashboard framework; do
+    if /usr/bin/python3 -I "$helper" --root /var/lib/sls-mass-notify-trust check --module "$reviewed_module" --web-root /var/www/html >/dev/null 2>&1; then
+      continue
+    fi
+    /usr/bin/python3 -I "$helper" --root /var/lib/sls-mass-notify-trust check --module "$reviewed_module" --web-root /var/www/html --uninstalled || {
+      log "The $reviewed_module files match neither their approved installed nor approved uninstall inventory. Preserve local changes for independent review."
+      return 1
+    }
+  done
 }
 
 main() {
-  admit_root_runtime || { log "Protected publisher runtime verification failed; restore using the verified installer before uninstalling."; return 1; }
   require_freepbx
+  admit_root_runtime || { log "Signed uninstall evidence is missing or changed. Preserve the trust store and review the named file; no uninstall changes were made. Missing stock inventories require independently verified local packages, not approval of live hashes."; return 1; }
   acquire_maintenance_coordination
   prepare_uninstall_logs
   trap restore_user_data_on_exit EXIT
   snapshot_local_signer
   [ -n "$RECOVERY_SIGNER" ] || { log "An approved-inventory signer is required before uninstall can preserve the reviewed FreePBX modules."; return 1; }
-  local reviewed_module
-  for reviewed_module in slsmassnotifyserver dashboard framework; do
-    /usr/bin/python3 -I "$RECOVERY_SIGNER_DIR/sls_module_trust.py" check --module "$reviewed_module" --web-root /var/www/html || {
-      log "The installed $reviewed_module files differ from their reviewed inventory. No module teardown was started; review the protected baseline before retrying."
-      return 1
-    }
-  done
+  verify_uninstall_inventories
+  verify_uninstall_cron_access
   capture_signing_fingerprint
-  preserve_user_data
+  validate_retained_user_data
+  capture_pbx_running_state
+  acquire_uninstall_workers
+  inspect_uninstall_idle
+  capture_configured_ami_username
+  assert_uninstall_workers
   remove_phone_collector_service
+	  assert_uninstall_workers
 	  remove_freepbx_manager_users
+	  assert_uninstall_workers
 	  remove_module_registration
+  assert_uninstall_workers
   remove_bundled_system_recordings
   remove_cron
   remove_menu_patch
@@ -1137,22 +1614,25 @@ main() {
   disable_apache_conf
   restore_stock_modules
   refresh_dashboard_hook_index
+  remove_sls_chown_exclusion
+  assert_uninstall_workers
   remove_runtime_files
   restore_user_data
   remove_trusted_signing_key
-  asterisk -rx "dialplan reload" >/dev/null 2>&1 || true
-  asterisk -rx "module reload res_pjsip_notify.so" >/dev/null 2>&1 || true
-  asterisk -rx "manager reload" >/dev/null 2>&1 || true
-	  run_fwconsole reload
-	  remove_freepbx_manager_users
-	  asterisk -rx "manager reload" >/dev/null 2>&1 || true
-	  verify_freepbx_cleanup
+  verify_freepbx_cleanup
+  reload_removed_pbx_integration
+  remove_freepbx_manager_users
+  if [ "$PBX_RUNNING" = 1 ]; then
+    asterisk -rx "manager reload" >/dev/null 2>&1 || true
+  fi
+  verify_freepbx_cleanup
+  assert_uninstall_workers
   cleanup_recovery_signer
   trap - EXIT
   if [ "$PURGE_CONFIG" = "1" ]; then
     log "SLS Mass Notify uninstall cleanup finished. Configuration and user data were purged."
   else
-    log "SLS Mass Notify uninstall cleanup finished. Central config, config backups, and uploaded tones were preserved."
+    log "SLS Mass Notify uninstall cleanup finished. Central config, media, delivery history and audit logs were preserved."
   fi
   if [ -e /etc/sls-mass-notify/config-keys.json ] || [ -L /etc/sls-mass-notify/config-keys.json ]; then
     log "Configuration recovery keys were retained at /etc/sls-mass-notify/config-keys.json, including after a data purge. Keep this protected keyring while older encrypted configurations or backups may still be needed."

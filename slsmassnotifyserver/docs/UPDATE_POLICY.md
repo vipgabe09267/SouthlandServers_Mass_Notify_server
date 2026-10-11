@@ -5,7 +5,7 @@ General Settings → Updates and Retention stores these preferences in `updates`
 | Field | Behavior |
 | --- | --- |
 | `channel` | `beta` accepts beta and stable releases; `stable` accepts only stable releases. Existing beta installations retain their channel. Selecting stable can intentionally wait until a stable release exists. |
-| `pinned_version` | Blank selects the newest eligible release. An exact version such as `0.1.5-beta` holds that version. The updater never downgrades a newer installed version. A beta pin requires the beta channel. |
+| `pinned_version` | Blank selects the newest eligible release. An exact version such as `0.1.6-beta` holds that version. The updater never downgrades a newer installed version. A beta pin requires the beta channel. |
 | `window_start`, `window_end` | Optional `HH:MM` start-inclusive/end-exclusive window in the PBX operating-system timezone. Set both or neither. Overnight windows work. The window must cover at least one hour because checks run hourly at minute 17. It controls installation start; an active installation can finish after the window ends. |
 | `rollout_delay_hours` | Integer 0–168. Automatic installation waits this long after the release's verified-format, timezone-aware publication timestamp. Different delays across PBXs provide an administrator-managed staged rollout. Missing or future timestamps defer automatic installation. |
 

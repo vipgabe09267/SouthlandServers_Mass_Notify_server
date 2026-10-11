@@ -15,7 +15,7 @@ assert.equal(typeof filter, 'function');
 for (const url of ['https://cdnjs.cloudflare.com/ajax/libs/Chart.js/2.6.0/Chart.bundle.min.js',
     '//cdnjs.cloudflare.com/ajax/libs/Chart.js/2.6.0/Chart.bundle.min.js?cache=1']) {
     const options = {url, async: false, crossDomain: true}; filter(options);
-    assert.equal(options.url, origin + '/admin/modules/slsmassnotifyserver/assets/vendor/chartjs/Chart.bundle-2.9.4.min.js');
+    assert.equal(options.url, origin + '/admin/modules/slsmassnotifyserver/assets/vendor/chartjs/Chart-2.9.4.min.js');
     assert.equal(options.crossDomain, false); assert.equal(options.cache, true); assert.equal(options.async, false);
 }
 for (const url of ['http://cdnjs.cloudflare.com/ajax/libs/Chart.js/2.6.0/Chart.bundle.min.js',

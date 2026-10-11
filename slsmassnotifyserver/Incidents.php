@@ -2,6 +2,7 @@
 declare(strict_types=1);
 namespace FreePBX\modules;
 require_once __DIR__ . '/IncidentService.php';
+require_once __DIR__ . '/IncidentLanguages.php';
 require_once __DIR__ . '/EnterpriseClusterIncidentStore.php';
 require_once __DIR__ . '/api/sls-mass-notify/security.php';
 use SLS\MassNotify\IncidentConfig;
@@ -13,6 +14,7 @@ trait SlsIncidents
 {
     private ?array $incidentSubmissionContext = null;
     private ?string $incidentSpeechSubmissionVoice = null;
+    private ?array $incidentLanguageSubmissionProof = null;
     public static function validateIncidentContext($value): array { return IncidentConfig::context($value); }
     protected function currentIncidentAnnouncementContext(): ?array { return $this->incidentSubmissionContext; }
     protected function currentIncidentSpeechVoice(): ?string { return $this->incidentSpeechSubmissionVoice; }
@@ -53,7 +55,84 @@ trait SlsIncidents
         }, function (array $delivery, string $locale = ''): array { return $this->freezeIncidentDelivery($delivery, $locale); },
         function (array $delivery, string $message, string $title, array $context, array $actor): array {
             return $this->submitIncidentAnnouncement($delivery, $message, $title, $context, $actor);
-        }, function (string $job): array { return $this->getAnnouncementJob($job); });
+        }, function (string $job): array { return $this->getAnnouncementJob($job); }, null,
+        function(array $template, array $delivery, array $fields, string $fallback, bool $drill): array {
+            $settings = $this->getActiveSettings();
+            return \SLS\MassNotify\IncidentLanguages::plan($template, $delivery,
+                IncidentConfig::normalize($settings['incident_workflows'] ?? [])['recipient_languages'] ?? [],
+                $fields, $fallback, $drill, function(array $targets, string $locale) use($settings): array {
+                    unset($targets['_speech']);
+                    if (in_array($targets['audio_mode'], ['tts','tones_tts'], true)) { $targets['_speech']=$this->incidentSpeechSnapshot($locale,$settings); }
+                    return $targets;
+                });
+        });
+    }
+
+    protected function incidentLanguageBatchMayBypassCooldown(): bool
+    {
+        $context = $this->incidentSubmissionContext; $proof = $this->incidentLanguageSubmissionProof;
+        if (!is_array($context) || !is_array($proof) || ($context['language_batch'] ?? 0) < 2) { return false; }
+        try {
+            IncidentConfig::context($context);
+            $record=$this->incidentStore()->read($context['incident_id']);
+            $operation=$record['operations'][$context['operation_request_id']] ?? null;
+            $batch=$operation['language_jobs'][$context['language_batch']-1] ?? null;
+            $prior=is_array($operation) ? array_slice($operation['language_jobs'] ?? [],0,$context['language_batch']-1) : [];
+            return is_array($operation) && is_array($batch) && $operation['state']==='submitting'
+                && (bool)array_filter($prior,static fn(array $row):bool=>$row['state']==='queued' && preg_match('/^job_[a-f0-9]{32}$/D',$row['job_id']))
+                && $batch['state']==='submitting' && $operation['sequence']===$context['sequence']
+                && $operation['kind']===$context['kind'] && count($operation['language_jobs'])===$context['language_batches']
+                && $batch['locale']===$context['language_variant'] && $batch['delivery']===$proof['delivery']
+                && $batch['message']===$proof['message'] && $batch['title']===$proof['title']
+                && $operation['actor']===$proof['actor'] && strtotime($context['expires_at'])>time()
+                && $context['expires_at']===gmdate('c',strtotime($operation['claimed_at'])+600);
+        } catch (\Throwable $error) { return false; }
+    }
+
+    protected function recordIncidentLanguageApproval(array $request, array $result): bool
+    {
+        $context=$request['incident_context'] ?? null;
+        if (!is_array($context) || !isset($context['operation_request_id'])) { return false; }
+        IncidentConfig::context($context);
+        $this->incidentStore()->transaction($context['incident_id'],static function(array $record) use($context,$request,$result): array {
+            if (!isset($record['operations'][$context['operation_request_id']]['language_jobs'][$context['language_batch']-1])) { throw new \InvalidArgumentException('Language approval does not match its frozen incident batch.'); }
+            $operation=&$record['operations'][$context['operation_request_id']];
+            $index=$context['language_batch']-1;$batch=&$operation['language_jobs'][$index];
+            if (!is_array($operation) || !is_array($batch) || $operation['sequence']!==$context['sequence']
+                || $operation['kind']!==$context['kind'] || count($operation['language_jobs'])!==$context['language_batches'] || $batch['locale']!==$context['language_variant']
+                || ($batch['review_id'] ?? '')!==($request['_enterprise_approval']['id'] ?? '') || $batch['state']!=='awaiting_approval') { throw new \InvalidArgumentException('Language approval does not match its frozen incident batch.'); }
+            $job=$result['job_id'] ?? '';
+            $batch['state']=is_string($job) && preg_match('/^job_[a-f0-9]{32}$/D',$job) ? 'queued' : (($result['delivery_started'] ?? null)===false ? 'not_submitted' : 'uncertain');
+            $batch['job_id']=$batch['state']==='queued' ? $job : '';
+            $batch['error']=$batch['state']==='queued' ? '' : 'Reviewed language submission failed or could not confirm a durable job.';
+            $queued=array_values(array_filter($operation['language_jobs'],static fn(array $row):bool=>$row['state']==='queued'));
+            $states=array_column($operation['language_jobs'],'state');
+            $operation['state']=count($queued)===count($states) ? 'queued' : (in_array('uncertain',$states,true) ? 'uncertain' : (in_array('awaiting_approval',$states,true) ? 'awaiting_approval' : ($queued ? 'uncertain' : 'not_submitted')));
+            $operation['job_id']=$queued[0]['job_id'] ?? '';$operation['finished_at']=gmdate('c');
+            $operation['error']=$operation['state']==='queued' ? '' : 'Some language batches remain unsubmitted, uncertain or awaiting approval.';
+            if ($queued && $record['opened_at']==='' && $operation['kind']==='initial') { $record['opened_at']=gmdate('c'); }
+            if ($operation['kind']==='all_clear' && $operation['state']==='queued') { $record['state']='closed';$record['closed_at']=gmdate('c'); }
+            $record['updated_at']=gmdate('c');$record['timeline'][]=['at'=>gmdate('c'),'kind'=>'language_approval_'.$batch['state'],
+                'actor'=>['identity'=>'Two-person review','source'=>'approval'],'details'=>['request_id'=>$context['operation_request_id'],'language_batch'=>$index+1,'job_id'=>$batch['job_id']]];
+            return $record;
+        });
+        return true;
+    }
+
+    protected function incidentLanguageApprovalMaySubmit(array $request): bool
+    {
+        $context=$request['incident_context'] ?? null;
+        if (!is_array($context) || !isset($context['operation_request_id'])) { return true; }
+        try {
+            IncidentConfig::context($context);$record=$this->incidentStore()->read($context['incident_id']);
+            $operation=$record['operations'][$context['operation_request_id']] ?? null;
+            $batch=$operation['language_jobs'][$context['language_batch']-1] ?? null;
+            return is_array($record) && $record['state']==='open' && is_array($operation) && is_array($batch)
+                && $operation['sequence']===$context['sequence'] && $operation['kind']===$context['kind']
+                && count($operation['language_jobs'])===$context['language_batches'] && $batch['locale']===$context['language_variant']
+                && $batch['state']==='awaiting_approval' && ($batch['review_id'] ?? '')===($request['_enterprise_approval']['id'] ?? '')
+                && strtotime($context['expires_at'])>time() && $context['expires_at']===gmdate('c',strtotime($operation['claimed_at'])+600);
+        } catch (\Throwable $error) { return false; }
     }
     /** Resolve saved groups once, without permitting subsequent group additions. */
     protected function freezeIncidentDelivery(array $delivery, string $locale = '', bool $freezeSpeech = true): array
@@ -168,6 +247,7 @@ trait SlsIncidents
     }
     private function submitIncidentAnnouncementWithActivity(array $delivery, string $message, string $title, array $context, array $actor): array
     {
+        $originalDelivery = $delivery;
         if (!defined(static::class . '::INCIDENT_JOB_CONTRACT') || self::INCIDENT_JOB_CONTRACT !== 1) {
             return ['success' => false, 'delivery_started' => false, 'message' => 'Incident delivery integration is unavailable. Install the matching module and announcement worker together.'];
         }
@@ -222,6 +302,9 @@ trait SlsIncidents
         if ($triggerContext !== null) { $this->automationSubmissionContext=$triggerContext; }
         $previousContext = $this->incidentSubmissionContext;
         $previousVoice = $this->incidentSpeechSubmissionVoice;
+        $previousLanguageProof = $this->incidentLanguageSubmissionProof;
+        $this->incidentLanguageSubmissionProof = ['delivery'=>$originalDelivery,
+            'message'=>$message, 'title'=>$title, 'actor'=>$actor];
         $this->incidentSubmissionContext = $validatedContext;
         $this->incidentSpeechSubmissionVoice = $speech['external_path'] ?? null;
         try { return $this->sendSipNotifyAnnouncement($delivery['extensions'], $message, true,
@@ -236,6 +319,7 @@ trait SlsIncidents
                 '_is_test' => $context['is_test']]);
         } finally {
             $this->incidentSubmissionContext = $previousContext;
+            $this->incidentLanguageSubmissionProof = $previousLanguageProof;
             $this->incidentSpeechSubmissionVoice = $previousVoice;
             if ($triggerContext !== null) { $this->automationSubmissionContext=$previousAutomationContext; }
             if ($hadPrincipal) { $GLOBALS['sls_control_principal'] = $previousPrincipal; }
@@ -286,6 +370,18 @@ trait SlsIncidents
             $workflow['retention'] = IncidentConfig::retention($input); $settings['incident_workflows'] = $workflow;
             $this->persistPendingSettings($this->normalizeSettings($settings));
             return ['success' => true, 'message' => 'Archival settings saved. Apply Config to activate them. Reports and previous request identities are retained permanently.'];
+        });
+    }
+    public function saveIncidentRecipientLanguages(array $input): array
+    {
+        return $this->incidentResult(function() use($input): array {
+            $input=IncidentConfig::object($input,['recipient_languages'],'Recipient languages');
+            $settings=$this->getPendingSettings() ?? $this->getActiveSettings();
+            $workflow=IncidentConfig::normalize($settings['incident_workflows'] ?? []);
+            $workflow['recipient_languages']=IncidentConfig::recipientLanguages($input['recipient_languages'] ?? []);
+            $settings['incident_workflows']=IncidentConfig::normalize($workflow);
+            $this->persistPendingSettings($this->normalizeSettings($settings));
+            return ['success'=>true,'message'=>'Recipient languages saved. Apply Config before launching new incidents; existing incidents keep their frozen language batches.'];
         });
     }
     public function listIncidents(int $limit = 50, string $cursor = '', bool $archived = false): array { return $this->incidentResult(fn(): array => $this->incidentService()->listing($limit, $cursor, $archived)); }
@@ -377,7 +473,7 @@ trait SlsIncidents
         foreach (\SLS\MassNotify\Sms\Service::targets($settings) as $id=>$row) { $choices['sms_recipient_ids'][]=['id'=>$id,'name'=>$row['name']]; }
         return load_view(__DIR__ . '/views/incidents.php', ['templates' => $this->incidentTemplates(true), 'active_templates' => $this->incidentTemplates(),
             'choices' => $choices + ['locations'=>array_map(static fn(array $row): array => ['id'=>$row['id'], 'name'=>\SLS\MassNotify\LocationDirectory::path(\SLS\MassNotify\LocationDirectory::effective($settings['location_directory'] ?? []), $row['id'])], \SLS\MassNotify\LocationDirectory::effective($settings['location_directory'] ?? [])['nodes'])], 'tones' => $this->getAvailableTones(), 'listing' => $this->listIncidents(50, is_string($params['cursor'] ?? null) ? $params['cursor'] : '', ($params['archived'] ?? false) === true),
-            'retention' => IncidentConfig::retention($settings['incident_workflows']['retention'] ?? []), 'show_archived' => ($params['archived'] ?? false) === true,
+            'retention' => IncidentConfig::retention($settings['incident_workflows']['retention'] ?? []), 'recipient_languages'=>IncidentConfig::recipientLanguages($settings['incident_workflows']['recipient_languages'] ?? []), 'active_recipient_languages'=>IncidentConfig::recipientLanguages($this->getActiveSettings()['incident_workflows']['recipient_languages'] ?? []), 'show_archived' => ($params['archived'] ?? false) === true,
             'incident' => !empty($params['incident_id']) ? $this->getIncident((string)$params['incident_id']) : null,
             'save_result' => $params['save_result'] ?? null, 'csrf_token' => $this->getCsrfToken(), 'hero_image' => self::HERO_IMAGE]);
     }

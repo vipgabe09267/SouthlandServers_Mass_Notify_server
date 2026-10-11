@@ -10,16 +10,11 @@ from __future__ import annotations
 import argparse
 import ctypes
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
 
-import sys as _config_sys
-_config_sys.dont_write_bytecode = True
-_config_crypto_spec = importlib.util.spec_from_file_location("sls_config_crypto", Path(__file__).resolve().with_name("sls_config_crypto.py"))
-_config_crypto = importlib.util.module_from_spec(_config_crypto_spec)
-_config_crypto_spec.loader.exec_module(_config_crypto)
+import types
 import pwd
 import re
 import selectors
@@ -44,8 +39,8 @@ LOGROTATE_PATH = '/etc/logrotate.d/sls-mass-notify'
 SIGNER_PATH = '/usr/local/sbin/sign_sls_mass_notify_local_sig.sh'
 CONSOLE_PATH = '/usr/local/bin/slsconsole'
 CRON_LINES = (
-    '* * * * * /usr/bin/timeout 900 /usr/local/bin/sls_mass_notify/sls_mass_notify_maintenance.sh',
-    '17 * * * * /usr/bin/timeout 1800 /usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh',
+    '* * * * * /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_cron_runner.py maintenance >/dev/null 2>&1',
+    '17 * * * * /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_cron_runner.py update >/dev/null 2>&1',
 )
 UNIT = '''# Managed by SLS Mass Notify Server
 [Unit]
@@ -110,9 +105,22 @@ class InstallError(RuntimeError):
 
 def load_trust():
     path = Path(__file__).with_name('sls_module_trust.py')
-    spec = importlib.util.spec_from_file_location('_sls_root_module_trust', path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or info.st_nlink != 1 or info.st_size > 256 * 1024:
+            raise InstallError('unsafe root trust helper')
+        body = bytearray()
+        while len(body) <= 256 * 1024:
+            chunk = os.read(descriptor, 65536)
+            if not chunk: break
+            body.extend(chunk)
+        after = os.fstat(descriptor)
+        if len(body) != info.st_size or (info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise InstallError('root trust helper changed during inspection')
+    finally: os.close(descriptor)
+    module = types.ModuleType('_sls_root_module_trust'); module.__file__ = str(path)
+    exec(compile(body, str(path), 'exec'), module.__dict__)
     return module
 
 
@@ -398,6 +406,17 @@ class Files:
         """Repair only ordinary SLS state; never traverse dependency links."""
         root = self.directory(path)
         visited = 0
+        private_roots = ('event-log-recovery', 'sms', 'recovery-archives', 'enterprise-state',
+                         'control-idempotency', 'enterprise-operations', 'enterprise-integrations',
+                         'enterprise-cluster', 'enterprise-floorplans', 'incidents/archive', 'sounds/voicemail')
+        private_markers = {'.enterprise-state-required', '.control-idempotency-required',
+                           '.enterprise-operations-required', '.enterprise-integrations-required',
+                           '.enterprise-cluster-required.json', '.incident-replay-required',
+                           '.audit-separation-required', 'incidents/admission.lock',
+                           'incidents/.archive-required'}
+        def private(relative):
+            return relative in private_markers or relative.startswith('.freepbx-restore-stage-') or any(
+                relative == name or relative.startswith(name + '/') for name in private_roots)
         def visit(fd, relative=''):
             nonlocal visited
             info = os.fstat(fd)
@@ -430,13 +449,13 @@ class Files:
                         if not self.regular(opened): raise InstallError('unsafe SLS state file: ' + rel)
                         os.fchown(child, self.account.pw_uid, self.account.pw_gid)
                         mode = 0o644 if public or rel.startswith(('sounds/', 'piper/voices/')) else 0o640
-                        if not public and rel.startswith(('event-log-recovery/', 'sms/', 'recovery-archives/', '.freepbx-restore-stage-')):
+                        if not public and private(rel):
                             mode = 0o600
                         os.fchmod(child, mode)
                 finally: os.close(child)
             os.fchown(fd, self.account.pw_uid, self.account.pw_gid)
-            mode = 0o755 if public or relative not in ('', 'sipnotify', 'config-backups', 'piper') else 0o750
-            if not public and (relative in ('event-log-recovery', 'sms', 'recovery-archives') or relative.startswith(('event-log-recovery/', 'sms/', 'recovery-archives/', '.freepbx-restore-stage-'))):
+            mode = 0o755 if public or relative not in ('', 'sipnotify', 'config-backups', 'piper', 'cron-diagnostics') else 0o750
+            if not public and private(relative):
                 mode = 0o700
             os.fchmod(fd, mode)
         try: visit(root)
@@ -516,9 +535,13 @@ def runner(arguments, *, timeout=30, input=None, allowed=(0,)):
             if remaining <= 0: raise subprocess.TimeoutExpired(arguments, timeout)
             code = process.wait(timeout=remaining)
     except BaseException:
-        try: os.killpg(process.pid, signal.SIGKILL)
+        try: os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError: pass
-        process.wait()
+        try: process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try: os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+            process.wait()
         raise
     finally:
         for stream in (process.stdin, process.stdout, process.stderr):
@@ -548,11 +571,27 @@ class PrivilegedInstall:
                 raise InstallError('immutable publisher generation changed: ' + name)
             self.contents[name] = body
         required = ('bin/sls_mass_notify_maintenance.sh', 'bin/sls_mass_notify_update.sh',
+                    'bin/sls_mass_notify/sls_cron_runner.py',
                     'bin/slsconsole', 'bin/sls_mass_notify/sls_console.py', 'bin/sls_mass_notify/sls_runtime_state.php',
                     'bin/sls_mass_notify_install_piper_voices.sh', 'bin/sign_sls_mass_notify_local_sig.sh',
-                    'bin/sls_mass_notify/sls_phone_events.py', 'api/sipnotify/index.php', 'api/sls-mass-notify/index.php')
+                    'bin/sls_mass_notify/sls_phone_events.py', 'bin/sls_mass_notify/sls_voicemail.py',
+                    'api/sipnotify/index.php', 'api/sls-mass-notify/index.php')
         missing = [name for name in required if name not in self.contents]
         if missing: raise InstallError('authenticated generation is incomplete: ' + ', '.join(missing))
+        self._crypto = None
+
+    @property
+    def crypto(self):
+        """Compile verified publisher bytes, never an adjacent file or bytecode."""
+        if self._crypto is None:
+            name = 'bin/sls_mass_notify/sls_config_crypto.py'
+            if name not in self.contents:
+                raise InstallError('authenticated generation lacks configuration encryption support')
+            module = types.ModuleType('_sls_authenticated_config_crypto')
+            module.__file__ = str(self.source / name)
+            exec(compile(self.contents[name], module.__file__, 'exec'), module.__dict__)
+            self._crypto = module
+        return self._crypto
 
     def copies(self):
         result = []
@@ -607,9 +646,12 @@ class PrivilegedInstall:
         return sorted(directories.items(), key=lambda row: (len(Path(row[0]).parts), row[0]))
 
     def retention(self):
-        try: raw = self.files.read(CONFIG, _config_crypto.MAX_FILE_BYTES)
+        try: raw = self.files.read(CONFIG, 3 * 1024 * 1024)
         except FileNotFoundError: return 90
-        data = _config_crypto.decode_config(raw)
+        data = json.loads(raw)
+        if not isinstance(data, dict): raise InstallError('central configuration must be an object')
+        if any(key in data for key in ('format', 'ciphertext', 'key_id', 'nonce')):
+            data = self.crypto.decode_config(raw)
         if not isinstance(data, dict): raise InstallError('protected configuration root is invalid')
         value = data.get('log_retention_days', 90)
         if isinstance(value, bool) or not isinstance(value, (str, int)) or not re.fullmatch(r'[0-9]{1,4}', str(value)):
@@ -626,7 +668,7 @@ class PrivilegedInstall:
         account = pwd.getpwnam('asterisk')
         if info is None or not self.files.regular(info) or info.st_nlink != 1 or info.st_uid != account.pw_uid or stat.S_IMODE(info.st_mode) != 0o640:
             raise InstallError('timezone requires the protected current configuration')
-        value = _config_crypto.decode_config(self.files.read(CONFIG, _config_crypto.MAX_FILE_BYTES)).get('pbx_timezone')
+        value = self.crypto.decode_config(self.files.read(CONFIG, self.crypto.MAX_FILE_BYTES)).get('pbx_timezone')
         if not isinstance(value, str) or value not in available_timezones():
             raise InstallError('select an existing IANA timezone in the setup wizard')
         ZoneInfo(value)
@@ -644,6 +686,7 @@ class PrivilegedInstall:
         kept = [line for line in before.splitlines() if not any(name in line for name in (
             '/usr/local/bin/sls_mass_notify/sls_mass_notify_maintenance.sh',
             '/usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh',
+            '/usr/local/bin/sls_mass_notify/sls_cron_runner.py',
             '/usr/local/bin/nwsalerts_ensure_menu_patch.sh', '/usr/local/bin/nws_weather_alert.sh'))]
         after = ('\n'.join(kept + list(CRON_LINES)) + '\n').encode()
         if apply and before.encode() != after:
@@ -654,9 +697,10 @@ class PrivilegedInstall:
         # Source authentication completes in __init__ before any mutation.
         self.preflight()
         self.files.piper_compatibility(apply=True)
-        for path in (DATA, DATA + '/sipnotify', DATA + '/config-backups', DATA + '/piper'):
+        for path in (DATA, DATA + '/sipnotify', DATA + '/config-backups', DATA + '/piper', DATA + '/cron-diagnostics'):
             self.files.mkdir(path, 0o750, user=True)
         self.files.mkdir(DATA + '/event-log-recovery', 0o700, user=True)
+        self.files.mkdir(DATA + '/sounds/voicemail', 0o700, user=True)
         for path in (DATA + '/sounds', DATA + '/sounds/tones', DATA + '/sounds/tts', DATA + '/piper/voices',
                      WEB + '/sls_mass_notify', WEB + '/sls_mass_notify/assets', WEB + '/api/sipnotify', WEB + '/api/sls-mass-notify', WEB + '/mass-notify',
                      '/var/lib/asterisk/sounds/en/custom'):
@@ -714,13 +758,20 @@ class PrivilegedInstall:
                     or stat.S_IMODE(info.st_mode) != mode or self.files.read(target) != self.contents[source]):
                 raise InstallError('root runtime differs from authenticated release: ' + target)
 
-    def dependencies(self):
+    def dependencies(self, offline_assets=None):
         self.admit()
         # Existing authenticated root script performs dependency/hash/voice
         # checks and private compatibility-path repair. No PHP is loaded.
         script = RUNTIME + '/sls_mass_notify_install_piper_voices.sh'
-        self.run(['/bin/bash', script, '--runtime-only', '--workers-paused'], timeout=930)
-        self.run(['/bin/bash', script, '--workers-paused'], timeout=1830)
+        assets=[]
+        if offline_assets is not None:
+            offline_assets=Path(offline_assets)
+            for directory in (offline_assets, offline_assets/'wheels', offline_assets/'voices'):
+                descriptor=self.trust.directory(directory,protected=True)
+                os.close(descriptor)
+            assets=['--wheelhouse',str(offline_assets/'wheels'),'--voice-cache',str(offline_assets/'voices')]
+        self.run(['/bin/bash', script, '--runtime-only', '--workers-paused',*assets], timeout=930)
+        self.run(['/bin/bash', script, '--workers-paused',*assets], timeout=1830)
         self.run(['/bin/bash', script, '--repair-permissions-only'], timeout=130)
 
     def activate(self):
@@ -773,15 +824,20 @@ def main():
     parser.add_argument('--trust-root', type=Path, default=Path('/var/lib/sls-mass-notify-trust'))
     parser.add_argument('phase', choices=('plan', 'preflight', 'prepare', 'admit', 'dependencies', 'activate', 'verify', 'timezone'))
     parser.add_argument('--apply', action='store_true', help='required for prepare/dependencies/activate')
+    parser.add_argument('--offline-assets',type=Path,help='Root-protected directory containing hash-locked wheels and pinned voices; dependencies phase only.')
     args = parser.parse_args()
     if os.geteuid() != 0: raise InstallError('protected installation operations require root')
     protect_entrypoint()
     trust = load_trust()
     action = PrivilegedInstall(trust, args.trust_root)
+    if args.offline_assets is not None and args.phase != 'dependencies': raise InstallError('--offline-assets is only supported by the dependencies phase')
     if args.phase in ('prepare', 'dependencies', 'activate', 'timezone') and not args.apply:
         raise InstallError('mutating phase requires --apply; use plan to review fixed operations')
     if args.phase == 'plan':
         print(json.dumps(action.plan(), indent=2))
+    elif args.phase == 'dependencies':
+        action.dependencies(args.offline_assets)
+        print(json.dumps({'ok':True,'phase':args.phase,'generation':action.source.parent.name}))
     else:
         getattr(action, args.phase)()
         print(json.dumps({'ok': True, 'phase': args.phase, 'generation': action.source.parent.name}))

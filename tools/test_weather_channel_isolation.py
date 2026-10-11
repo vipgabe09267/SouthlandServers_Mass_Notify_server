@@ -39,7 +39,7 @@ class IsolationTests(unittest.TestCase):
              read_state=mock.Mock(return_value=observation or {'last_observed_at': time.time(), 'active': True, 'cluster_started': 1}),
              send_visual=mock.Mock(side_effect=lambda *args: order.append('desktop')),
              generate_audio=mock.Mock(side_effect=audio),
-             submit_local_channels=mock.Mock(side_effect=lambda *args: (order.append('phone') or 1, [])),
+             submit_local_channels=mock.Mock(side_effect=lambda *args, **kwargs: (order.append('phone') or 1, [])),
              queue_external_delivery=mock.Mock(side_effect=lambda *args, **kwargs: order.append('external-queue')),
              append_event=mock.Mock(), record_xweather_outcome=mock.Mock(),
              atomic_json_update=mock.Mock(side_effect=AssertionError('Dispatcher must not rewrite observer state'))):

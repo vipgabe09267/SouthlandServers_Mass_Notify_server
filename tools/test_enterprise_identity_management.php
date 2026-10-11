@@ -2,6 +2,7 @@
 declare(strict_types=1);
 require_once __DIR__.'/../slsmassnotifyserver/EnterpriseIdentityManagement.php';
 require_once __DIR__.'/../slsmassnotifyserver/ConfigCrypto.php';
+require_once __DIR__.'/../slsmassnotifyserver/BrowserPush.php';
 use SLS\MassNotify\{EnterpriseIdentityConfig,DirectoryConfig,SubscriberConfig,IncidentConfig,IncidentStore,IncidentService,OperatorAuth,DirectoryConfig as DC};
 use FreePBX\modules\SlsConfigCrypto;
 function emcheck($ok,string $message):void{if(!$ok){throw new RuntimeException($message);}}
@@ -43,7 +44,7 @@ $public=$module->getActiveSettings()['subscriber_browser'];$person=$public['peop
 $public=$save['config'];$public['people'][0]['email']='changed@example.test';$public['people'][0]['registered_at']=1;$public['people'][0]['version']=str_repeat('0',64);$save=$module->enterpriseLabsAction('subscriber_save',['config'=>$public,'revision'=>emrevision($module,'subscriber_browser')]);emcheck($save['success']&&$save['config']['people'][0]['registered_at']>1&&$save['config']['people'][0]['version']!==str_repeat('0',64),'Client selected identity version or backdated enrollment: '.json_encode($save));
 $provider=['id'=>'idp_'.str_repeat('e',24),'vendor'=>'okta','protocol'=>'oidc','enabled'=>true,'name'=>'Fixture IdP','issuer'=>'https://idp.example.test','callback_url'=>'https://pbx.example.test/mass-notify/sso.php','discovery_url'=>'https://idp.example.test/discovery','client_id'=>'fixture-client','client_secret'=>'never-display-secret','token_auth'=>'client_secret_basic','endpoint_hosts'=>['idp.example.test']];
 $identity=['schema'=>1,'enabled'=>true,'providers'=>[$provider],'grants'=>[['provider_id'=>$provider['id'],'subject'=>'stable-42','operator_account_id'=>$account['id'],'enabled'=>true]]];$save=$module->enterpriseLabsAction('identity_save',['config'=>$identity,'revision'=>emrevision($module,'enterprise_identity')]);emcheck($save['success']&&!str_contains(json_encode($save),'never-display-secret'),'Identity setting response leaked private secret');$resave=$module->enterpriseLabsAction('identity_save',['config'=>$save['config'],'revision'=>emrevision($module,'enterprise_identity')]);emcheck($resave['success']&&$module->getActiveSettings()['enterprise_identity']['providers'][0]['client_secret']==='never-display-secret','Blank redacted secret was not preserved');
-$disable=$module->getActiveSettings()['directory_sync'];$disable['sources'][0]['enabled']=false;emcheck($module->enterpriseLabsAction('directory_save',['config'=>$disable,'revision'=>emrevision($module,'directory_sync')])['success'],'Disabling directory source failed');$deprovision=$module->enterpriseLabsAction('directory_preview',['source_id'=>$source['id'],'deprovision_all'=>true]);emcheck($deprovision['success'],'Disabled source deprovision dry run failed');emcheck($module->enterpriseLabsAction('directory_apply',['plan_id'=>$deprovision['plan_id']])['success'],'Explicit deprovision failed');$active=$module->getActiveSettings();emcheck(count($active['incident_workflows']['templates'][0]['roster'])===1,'Deprovision did not preserve only the manual active row');$staged=SlsConfigCrypto::readFile(EnterpriseIdentityFixture::PENDING_SETTINGS_JSON);emcheck(count($staged['incident_workflows']['templates'][0]['roster'])===2,'Deprovision removed pending local row');emcheck(!$module->sent,'Settings or directory actions sent an invitation');
+$disable=$module->getActiveSettings()['directory_sync'];$disable['sources'][0]['enabled']=false;emcheck($module->enterpriseLabsAction('directory_save',['config'=>$disable,'revision'=>emrevision($module,'directory_sync')])['success'],'Disabling directory source failed');$deprovision=$module->enterpriseLabsAction('directory_preview',['source_id'=>$source['id'],'deprovision_all'=>true]);emcheck($deprovision['success'],'Disabled source deprovision dry run failed');emcheck($deprovision['plan']['requires_deactivation_confirmation'],'Large deprovision omitted explicit confirmation');emcheck(!$module->enterpriseLabsAction('directory_apply',['plan_id'=>$deprovision['plan_id']])['success'],'Large deprovision accepted without confirmation');$deprovision=$module->enterpriseLabsAction('directory_preview',['source_id'=>$source['id'],'deprovision_all'=>true]);emcheck($module->enterpriseLabsAction('directory_apply',['plan_id'=>$deprovision['plan_id'],'confirm_deactivation'=>true])['success'],'Explicit deprovision failed');$active=$module->getActiveSettings();emcheck(count($active['incident_workflows']['templates'][0]['roster'])===1,'Deprovision did not preserve only the manual active row');$staged=SlsConfigCrypto::readFile(EnterpriseIdentityFixture::PENDING_SETTINGS_JSON);emcheck(count($staged['incident_workflows']['templates'][0]['roster'])===2,'Deprovision removed pending local row');emcheck(!$module->sent,'Settings or directory actions sent an invitation');
 // Every full namespace save rechecks the actual file while holding the settings lock.
 foreach(['identity_save'=>'enterprise_identity','directory_save'=>'directory_sync','subscriber_save'=>'subscriber_browser'] as $action=>$key){
  $old=$module->getActiveSettings()[$key];$revision=emrevision($module,$key);
@@ -60,4 +61,25 @@ foreach(['identity_save'=>'enterprise_identity','directory_save'=>'directory_syn
 $before=$module->getActiveSettings();$module->busy=true;$order=count($module->order);
 $blocked=$module->enterpriseLabsAction('subscriber_save',['config'=>$before['subscriber_browser'],'revision'=>emrevision($module,'subscriber_browser')]);
 emcheck(!$blocked['success']&&$module->getActiveSettings()===$before&&array_slice($module->order,$order)===['activity'],'A missing exclusive activity lease reached settings or mutation');$module->busy=false;
+class EnterpriseIdentityPushFixture extends EnterpriseIdentityFixture
+{
+ public int $pushServiceCalls=0;
+ protected function subscriberService():\SLS\MassNotify\SubscriberService{$this->pushServiceCalls++;return new \SLS\MassNotify\SubscriberService($this->enterpriseLabsStore(),$this->incidentStore());}
+}
+$pushModule=new EnterpriseIdentityPushFixture();$pushSettings=$module->getActiveSettings();$pushSettings['subscriber_browser']['enabled']=true;$pushSettings['subscriber_browser']['people'][0]['enabled']=true;
+$key=\SLS\MassNotify\BrowserPush::generateKey();$pushSettings['subscriber_browser']['push']=['enabled'=>true,'private_key_pem'=>$key['private_key_pem'],'subject'=>'mailto:admin@example.test'];
+$pushInput=['subscriber_id'=>$pushSettings['subscriber_browser']['people'][0]['id'],'request_id'=>str_repeat('a',32)];
+foreach([true,'1'] as $enabled){
+ $pushSettings['enterprise_cluster']=['enabled'=>$enabled,'mode'=>'notification_ha'];file_put_contents(EnterpriseIdentityFixture::SETTINGS_JSON,SlsConfigCrypto::encode($pushSettings));
+ $denied=$pushModule->enterpriseLabsAction('subscriber_push_test',$pushInput);
+ emcheck(!$denied['success']&&str_contains($denied['message'],'witness authority')&&$pushModule->pushServiceCalls===0,'Direct browser test bypassed cluster effect authority');
+ emcheck(!file_exists($dir.'/enterprise-state/browser_test_events.json'),'Refused cluster browser test reserved a direct event');
+}
+$pushSettings['enterprise_cluster']['enabled']=false;$pushSettings['runtime_enabled']=false;file_put_contents(EnterpriseIdentityFixture::SETTINGS_JSON,SlsConfigCrypto::encode($pushSettings));
+$stopped=$pushModule->enterpriseLabsAction('subscriber_push_test',$pushInput);
+emcheck(!$stopped['success']&&str_contains($stopped['message'],'notifications are stopped')&&$pushModule->pushServiceCalls===0&&!file_exists($dir.'/enterprise-state/browser_test_events.json'),'Stopped notifications permitted a direct browser test');
+$pushSettings['runtime_enabled']=true;file_put_contents(EnterpriseIdentityFixture::SETTINGS_JSON,SlsConfigCrypto::encode($pushSettings));
+$allowed=$pushModule->enterpriseLabsAction('subscriber_push_test',$pushInput);
+emcheck($allowed['success']&&$pushModule->pushServiceCalls===1&&$allowed['result']['state']==='no_enrolled_browser','Standalone browser test did not reach its existing safe service path');
+emcheck(array_slice($pushModule->order,-1)===['activity'],'Direct browser test omitted its activity lease');
 echo "Enterprise management: PBX admin gate, ordered locks, stale/replayed plans, pending edits, stable enrollment, redacted secrets and explicit deprovision passed.\n";

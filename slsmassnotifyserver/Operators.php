@@ -138,9 +138,11 @@ trait SlsOperators
         foreach ($config['accounts'] as &$row) {
             $row['identity_current'] = $row['source']==='portal' || OperatorAccess::localIdentityCurrent($row);
             $row=\SLS\MassNotify\OperatorAuth::publicAccount($row);
+            $row['expires_local'] = $row['expires_at'] === 0 ? '' : (new \DateTimeImmutable('@'.$row['expires_at']))->setTimezone($this->getPbxDateTimeZone())->format('Y-m-d\TH:i');
+            $row['access_expired'] = !OperatorAccess::activeAccount($row);
         } unset($row);
         foreach ($directory['accounts'] as &$row) { unset($row['identity']); } unset($row);
-        return ['access'=>$config, 'directory'=>$directory, 'revision'=>$this->operatorRevision($settings),
+        return ['access'=>$config, 'directory'=>$directory, 'timezone'=>$this->getPbxDateTimeZone()->getName(), 'revision'=>$this->operatorRevision($settings),
             'security_activity'=>\SLS\MassNotify\SecurityAudit::recent(dirname(self::SETTINGS_JSON).'/security-audit.jsonl',($settings['control_api']['audit_syslog']??'0')==='1'),
             'sites'=>array_values(array_filter(LocationDirectory::effective($settings['location_directory'] ?? [])['nodes'], static fn(array $row): bool => $row['type'] === 'site')),
             'locations'=>array_values(array_filter(LocationDirectory::effective($settings['location_directory'] ?? [])['nodes'], static fn(array $row): bool => $row['type'] !== 'site')),
@@ -154,7 +156,7 @@ trait SlsOperators
         $config=OperatorAccess::normalize($this->getActiveSettings()['operator_access']??[]);
         if ($source==='portal' && !$config['portal_enabled']) { return null; }
         foreach ($config['accounts'] as $account) {
-            if (strcasecmp($account['username'],$username)===0 && $account['source']===$source && $account['enabled']) { return $account; }
+            if (strcasecmp($account['username'],$username)===0 && $account['source']===$source && $account['enabled'] && OperatorAccess::activeAccount($account)) { return $account; }
         }
         return null;
     }
@@ -180,7 +182,7 @@ trait SlsOperators
             foreach ($directory['accounts'] as $row) { $available[$row['source'].':'.$row['username']]=$row; }
             $hashes=[];
             foreach ($input['accounts'] as $index=>$row) {
-                if (!is_array($row) || array_diff(array_keys($row),['id','username','source','name','email','role','enabled','site_ids','location_ids','group_ids','personal_members','actions','channels','rebind','password','reset_totp'])) { throw new \DomainException('An operator row contains unsupported fields.'); }
+                if (!is_array($row) || array_diff(array_keys($row),['id','username','source','name','email','role','enabled','site_ids','location_ids','group_ids','personal_members','actions','channels','rebind','password','reset_totp','expires_at','expires_local'])) { throw new \DomainException('An operator row contains unsupported fields.'); }
                 if (!is_string($row['password']??'') || !is_bool($row['reset_totp']??false)) { throw new \DomainException('An operator password or authenticator reset has an invalid type.'); }
                 if (($row['password']??'')!=='') { $hashes[$index]=\SLS\MassNotify\OperatorAuth::password($row['password']); }
             }
@@ -192,6 +194,18 @@ trait SlsOperators
                 if (($row['id']??'')!=='' && !$old) { throw new \DomainException('An operator was removed. Reload before saving.'); }
                 if ($old && ($old['username']!==($row['username']??'') || $old['source']!==($row['source']??''))) { throw new \DomainException('An existing login cannot be moved to another person. Remove it and create a new login.'); }
                 $row['id']=$old['id']??'api_'.bin2hex(random_bytes(12));
+                if (array_key_exists('expires_local', $row)) {
+                    if (!is_string($row['expires_local'])) { throw new \DomainException('Choose an expiry date and time in the PBX timezone, or leave it empty.'); }
+                    $value = trim($row['expires_local']);
+                    if ($value === '') { $row['expires_at'] = 0; }
+                    else {
+                        $resolved = $this->resolveScheduleLocalDateTime($value, $this->getPbxDateTimeZone());
+                        if (!$resolved['success']) { throw new \DomainException('Operator expiry: '.$resolved['message']); }
+                        $row['expires_at'] = $resolved['timestamp'];
+                    }
+                    unset($row['expires_local']);
+                } else { $row['expires_at'] = array_key_exists('expires_at', $row) ? $row['expires_at'] : ($old['expires_at'] ?? 0); }
+                if (!is_int($row['expires_at']) || $row['expires_at'] < 0 || $row['expires_at'] > 253402300799) { throw new \DomainException('The operator expiry timestamp is invalid.'); }
                 if (($row['source']??'')==='portal') {
                     if (!$old && !isset($hashes[$index])) { throw new \DomainException('Enter an initial password for the new operator login.'); }
                     $auth=$old['auth']??null;
@@ -208,10 +222,10 @@ trait SlsOperators
                     if (($input['portal_enabled']??false)!==($active['operator_access']['portal_enabled']??false)) {
                         $auth['version']=bin2hex(random_bytes(32));
                     }
-                    if ($old && (($row['enabled']??false)!==$old['enabled'] || ($row['email']??'')!==($old['email']??''))) {
+                    if ($old && (($row['enabled']??false)!==$old['enabled'] || ($row['email']??'')!==($old['email']??'') || $row['expires_at']!==$old['expires_at'])) {
                         $auth['version']=bin2hex(random_bytes(32));
                     }
-                    if (isset($auth['password_recovery']) && $old && (($row['email']??'')!==($old['email']??'') || ($row['enabled']??false)!==$old['enabled'])) {
+                    if (isset($auth['password_recovery']) && $old && (($row['email']??'')!==($old['email']??'') || ($row['enabled']??false)!==$old['enabled'] || $row['expires_at']!==$old['expires_at'])) {
                         $auth['password_recovery']['token']=null;
                     }
                     $row['auth']=\SLS\MassNotify\OperatorAuth::normalize($auth);
@@ -255,7 +269,7 @@ trait SlsOperators
             $active=$this->loadSettingsFile(self::SETTINGS_JSON); $config=OperatorAccess::normalize($active['operator_access']??[]);
             if (!$config['portal_enabled']) { throw new \DomainException('The operator portal has not been enabled.'); }
             foreach ($config['accounts'] as &$account) {
-                if ($account['id']!==$id || !$account['enabled'] || $account['source']!=='portal') { continue; }
+                if ($account['id']!==$id || !$account['enabled'] || !OperatorAccess::activeAccount($account) || $account['source']!=='portal') { continue; }
                 if (!hash_equals(\SLS\MassNotify\OperatorAuth::identity($account),$identity)) { throw new \DomainException('This login changed. Sign in again.'); }
                 $auth=$account['auth']; $codes=[];
                 if ($action==='password') {
@@ -372,8 +386,24 @@ trait SlsOperators
         foreach ($settings['scheduled_announcements'] ?? [] as $schedule) {
             if (($schedule['operator_credential_id'] ?? '') === $principal['id']) { $schedules[] = array_intersect_key($schedule, array_flip(['id', 'name', 'message', 'enabled', 'occurrences', 'timezone'])); }
         }
-        return ['principal'=>array_intersect_key($principal, array_flip(['name', 'username', 'operator_role'])), 'choices'=>$choices, 'tones'=>$this->getAvailableTones(), 'recordings'=>$this->getAvailableSystemSounds(),
-            'tone_defaults'=>['opening_tone'=>$settings['opening_tone']??'', 'closing_tone'=>$settings['closing_tone']??''],
+        $inventory=$this->phoneDisplayInventory();$presence=$this->announcementDesktopPresence();
+        $registered=0;$connected=0;
+        foreach($choices['extensions']??[] as $row){if(isset($inventory['endpoints'][$row['id']])){++$registered;}}
+        $desktopIds = array_column($settings['desktop_clients'] ?? [], 'client_id', 'username'); $now = time();
+        foreach ($choices['desktop_clients'] ?? [] as $row) {
+            $seen = $presence[$row['id']] ?? [];
+            if (is_array($seen) && is_string($desktopIds[$row['id']] ?? null) && $desktopIds[$row['id']] !== ''
+                && ($seen['client_id'] ?? '') === $desktopIds[$row['id']]
+                && is_int($seen['connected_until'] ?? null) && $seen['connected_until'] >= $now && $seen['connected_until'] <= $now + 120) { ++$connected; }
+        }
+        $readiness=['inventory_available'=>!empty($inventory['available']),'observed_at'=>$inventory['observed_at'],
+            'phone_registered'=>$registered,'phone_selected_available'=>count($choices['extensions']??[]),
+            'desktop_connected'=>$connected,'desktop_available'=>count($choices['desktop_clients']??[]),
+            'sms_segment_cost_micros'=>(int)($settings['announcement_sms']['segment_cost_micros']??0),
+            'sms_format'=>(string)($settings['announcement_sms']['message_format']??'sms'),
+            'sms_mms_cost_micros'=>(int)($settings['announcement_sms']['mms_cost_micros']??0)];
+        return ['principal'=>array_intersect_key($principal, array_flip(['name', 'username', 'operator_role'])), 'choices'=>$choices, 'tones'=>$this->getAvailableTones(), 'recordings'=>$this->getAvailableSystemSounds(), 'recording_catalogue'=>$this->getSystemRecordingCatalogue('', 0, 500),
+            'readiness'=>$readiness, 'tone_defaults'=>['opening_tone'=>$settings['opening_tone']??'', 'closing_tone'=>$settings['closing_tone']??''],
             'can_send'=>OperatorAccess::may($principal, 'send'), 'can_schedule'=>OperatorAccess::may($principal, 'schedule'), 'can_roll_call'=>OperatorAccess::may($principal, 'roll_call'),
             'templates'=>$templates, 'incidents'=>$incidents, 'next_cursor'=>$listing['next_cursor'], 'schedules'=>$schedules, 'timezone'=>$this->getPbxDateTimeZone()->getName(),
             'enterprise'=>$this->operatorEnterpriseProjection($principal, $settings, $templates)];
@@ -484,6 +514,12 @@ trait SlsOperators
     public function operatorAction(string $action, array $input): array
     {
         try {
+            if ($action === 'recording_catalogue') {
+                $principal=$this->currentOperator();
+                if (!OperatorAccess::may($principal,'send') && !OperatorAccess::may($principal,'schedule')) { throw new \DomainException('This role cannot select announcement recordings.'); }
+                if (array_diff(array_keys($input),['query','offset']) || !is_string($input['query']??'') || !is_int($input['offset']??0)) { throw new \InvalidArgumentException('Recording search fields are invalid.'); }
+                return $this->getSystemRecordingCatalogue($input['query']??'', $input['offset']??0, 100);
+            }
             $principal = $this->currentOperator();
             if (in_array($action, ['approval_list','approval_approve','approval_submit','approval_reject','drill_start','drill_review','drill_report','floorplan_overlay','floorplan_image'], true)) {
                 if (!method_exists($this, 'enterpriseOperationsAction') || ($this->getActiveSettings()['enterprise_operations']['enabled'] ?? false) !== true) {
@@ -562,8 +598,8 @@ trait SlsOperators
             }
             if (in_array($action, ['start_incident', 'update_incident'], true)) {
                 if (!OperatorAccess::may($principal, 'send')) { throw new \DomainException('Your current role cannot send incident announcements.'); }
-                $state = $this->operatorOperationsState();
                 if ($action === 'start_incident') {
+                    $state = $this->operatorOperationsState();
                     if (!in_array($input['template_id'] ?? '', array_column($state['templates'], 'id'), true)) { throw new \DomainException('The incident template exceeds your current audience permissions.'); }
                     return $this->withOperator($principal, function () use ($input, $principal): array {
                         $result = $this->startIncident($input);

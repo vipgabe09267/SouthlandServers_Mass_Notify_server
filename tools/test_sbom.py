@@ -12,9 +12,14 @@ class InventoryTests(unittest.TestCase):
         a = sbom.inventory(); self.assertEqual(a, sbom.inventory())
         self.assertEqual(a['specVersion'], '1.6')
         lock = json.loads((sbom.ROOT / 'slsmassnotifyserver/identity-libs/composer.lock').read_text())
-        self.assertEqual(len(a['components']), 12 + len(lock['packages']))
+        self.assertEqual(len(a['components']), 17 + len(lock['packages']))
         by_name = {row['name']: row for row in a['components']}
         self.assertEqual(by_name['chart.js']['version'], '2.9.4')
+        self.assertNotIn('moment', by_name)
+        embedded = {row['purl'] for row in a['components'] if any(prop['name'] == 'sls:embedded-in' for prop in row.get('properties', []))}
+        self.assertEqual(embedded, set(a['dependencies'][0]['dependsOn']))
+        self.assertIn('pkg:npm/color-name@1.1.3', embedded)
+        self.assertIn('pkg:npm/color-name@1.1.4', embedded)
         for package in lock['packages']:
             self.assertEqual(by_name[package['name']]['version'], package['version'])
             self.assertEqual(by_name[package['name']]['properties'][0]['value'], package['source']['reference'])

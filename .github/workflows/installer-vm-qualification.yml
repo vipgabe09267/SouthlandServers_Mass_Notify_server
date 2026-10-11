@@ -1,0 +1,96 @@
+name: Qualify installer on a disposable FreePBX VM
+on:
+  workflow_dispatch:
+    inputs:
+      image_url:
+        description: Sanitized qcow2 image in a GitHub release, with the qualification marker
+        required: true
+        type: string
+      image_sha256:
+        description: Independently reviewed image SHA-256
+        required: true
+        type: string
+      bundle_url:
+        description: Signed offline support bundle tar.gz in a GitHub release
+        required: true
+        type: string
+      bundle_sha256:
+        description: Independently reviewed support bundle SHA-256
+        required: true
+        type: string
+      baseline:
+        description: Installed SLS version in the sanitized image
+        required: true
+        type: choice
+        options:
+          - fresh
+          - 0.1.4-beta
+          - 0.1.5-beta
+permissions:
+  contents: read
+jobs:
+  freepbx-vm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      LIBGUESTFS_BACKEND: direct
+      LIBGUESTFS_MEMSIZE: '512'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7, pinned
+        with:
+          persist-credentials: false
+      - name: Install tools on the disposable runner
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils libguestfs-tools openssh-client python3-pip openssl gnupg
+      - name: Download and verify reviewed qualification inputs
+        env:
+          QUAL_IMAGE_URL: ${{ inputs.image_url }}
+          QUAL_IMAGE_SHA: ${{ inputs.image_sha256 }}
+          QUAL_BUNDLE_URL: ${{ inputs.bundle_url }}
+          QUAL_BUNDLE_SHA: ${{ inputs.bundle_sha256 }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, pathlib, re, subprocess
+          for kind, maximum in [('IMAGE', 8*1024**3), ('BUNDLE', 2*1024**3)]:
+              url=os.environ['QUAL_'+kind+'_URL']; digest=os.environ['QUAL_'+kind+'_SHA']
+              if not re.fullmatch(r'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/download/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+',url): raise SystemExit('Use an HTTPS GitHub release asset URL.')
+              if not re.fullmatch(r'[a-f0-9]{64}',digest): raise SystemExit('Use a reviewed lowercase SHA-256.')
+              path=pathlib.Path('/tmp/sls-qualification-'+kind.lower()+('.tar.gz' if kind=='BUNDLE' else ''))
+              subprocess.run(['curl','--fail','--location','--proto','=https','--proto-redir','=https','--max-time','1800','--max-filesize',str(maximum),'-o',str(path),url],check=True)
+              with path.open('rb') as stream:
+                  if hashlib.file_digest(stream,'sha256').hexdigest()!=digest: raise SystemExit('Qualification input digest mismatch.')
+          PY
+      - name: Extract the support bundle without links or traversal
+        run: |
+          sudo python3 - <<'PY'
+          import pathlib, tarfile, shutil
+          root=pathlib.Path('/tmp/sls-qualification-bundle');root.mkdir(mode=0o700)
+          total=0
+          with tarfile.open('/tmp/sls-qualification-bundle.tar.gz','r:gz') as archive:
+              members=archive.getmembers()
+              if len(members)>30000:raise SystemExit('Bundle entry count exceeded.')
+              for member in members:
+                  path=pathlib.PurePosixPath(member.name)
+                  if path.is_absolute() or '..' in path.parts or not(member.isdir() or member.isfile()) or member.mode&0o6000:raise SystemExit('Unsafe bundle entry.')
+                  total+=member.size
+                  if total>2*1024**3:raise SystemExit('Bundle expansion exceeds its limit.')
+                  target=root.joinpath(*path.parts)
+                  if member.isdir():target.mkdir(mode=0o700,parents=True,exist_ok=True)
+                  else:
+                      target.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+                      with target.open('xb') as output:shutil.copyfileobj(archive.extractfile(member),output,65536)
+                      target.chmod(0o600)
+          PY
+      - name: Exercise the full PBX installation and recovery lifecycle
+        env:
+          QUAL_IMAGE_SHA: ${{ inputs.image_sha256 }}
+          QUAL_BASELINE: ${{ inputs.baseline }}
+        run: |
+          scenarios='install inactive-cron term int hup power-loss'
+          if [ "$QUAL_BASELINE" = fresh ]; then scenarios="$scenarios missing-dashboard"; fi
+          sudo --preserve-env=LIBGUESTFS_BACKEND,LIBGUESTFS_MEMSIZE python3 tools/qualify_installer_vm.py \
+            --allow-disposable-vm --image /tmp/sls-qualification-image --image-sha256 "$QUAL_IMAGE_SHA" \
+            --bundle /tmp/sls-qualification-bundle --baseline "$QUAL_BASELINE" \
+            --scenarios $scenarios --report /tmp/sls-vm-qualification.json
+          sudo cat /tmp/sls-vm-qualification.json

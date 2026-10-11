@@ -94,7 +94,11 @@ class OperatorFixture {
     public function outboundVoiceTargets($settings){return [];}
     public function normalizeWebhookDestinations($settings,$kind){return [];}
     public function getAvailableTones(){return [];}
+    public array $inventory = ['available'=>false,'observed_at'=>'','endpoints'=>[]], $presence = [];
+    private function phoneDisplayInventory():array{return $this->inventory;}
+    public function announcementDesktopPresence():array{return $this->presence;}
     public function getAvailableSystemSounds(){return [['value'=>'system:custom/test.wav','label'=>'Saved test recording']];}
+    public function getSystemRecordingCatalogue($query='', $offset=0, $limit=100):array{return ['items'=>$this->getAvailableSystemSounds(),'next_offset'=>null,'has_more'=>false,'warning'=>''];}
     public array $recordingImports=[];
     private function announcementTone($selection,$label,array &$errors):string{$this->recordingImports[]=$selection;return 'recording_fixture';}
     private function acquireAnnouncementActivityLock(...$args){return null;}
@@ -112,6 +116,22 @@ class OperatorFixture {
 eval('class LocalOperatorFixture extends OperatorFixture { const PLUGIN_DATA_DIR='.var_export($root,true).'; const SETTINGS_JSON= self::PLUGIN_DATA_DIR."/mass-notifications.config"; const PENDING_SETTINGS_JSON=self::PLUGIN_DATA_DIR."/mass-notifications.pending.config"; }');
 try {
     $m=new LocalOperatorFixture();$m->settings=$settings;$_SESSION['AMP_user']=new ampuser('alex');
+    $m->inventory = ['available'=>true,'observed_at'=>gmdate('c'),'endpoints'=>['1000'=>['contacts'=>[[],[]]],'2000'=>['contacts'=>[[]]]]];
+    $m->presence = ['alex_pc'=>['client_id'=>'cli_alex','connected_until'=>time()+60], 'other_pc'=>['client_id'=>'cli_other','connected_until'=>time()+60]];
+    $m->settings['announcement_sms'] = ['segment_cost_micros'=>12000,'mms_cost_micros'=>35000,'message_format'=>'sms'];
+    $readiness = $m->operatorOperationsState()['readiness'];
+    operatorCheck($readiness['phone_registered']===1 && $readiness['phone_selected_available']===1 && $readiness['inventory_available'], 'Readiness crossed the authorized phone scope or lost registration evidence');
+    operatorCheck($readiness['desktop_connected']===1 && $readiness['desktop_available']===1, 'Readiness crossed authorized desktop scope');
+    operatorCheck($readiness['sms_segment_cost_micros']===12000 && $readiness['sms_mms_cost_micros']===35000 && $readiness['sms_format']==='sms', 'Review budget lost the configured USD micro-costs or selected format');
+    foreach ([['client_id'=>'cli_previous','connected_until'=>time()+60], ['connected_until'=>time()+60],
+        ['client_id'=>'cli_alex','connected_until'=>time()-1], ['client_id'=>'cli_alex','connected_until'=>time()+121],
+        ['client_id'=>'cli_alex','connected_until'=>(string)(time()+60)]] as $invalidPresence) {
+        $m->presence['alex_pc']=$invalidPresence;
+        operatorCheck($m->operatorOperationsState()['readiness']['desktop_connected']===0, 'Readiness inherited replaced, missing, expired, future or invalid device evidence');
+    }
+    $m->inventory = ['available'=>false,'observed_at'=>'','endpoints'=>[]]; $m->presence=[];
+    operatorCheck(!$m->operatorOperationsState()['readiness']['inventory_available'], 'Unavailable inventory was presented as current readiness');
+    $m->settings=$settings;
     operatorCheck(!$m->operatorPageAllowed('slsmassnotifyserver_other') && $m->operatorPageAllowed('slsmassnotifyserver_operations'),'Restricted user accessed configuration.');
     $GLOBALS['sls_control_principal']=['id'=>'original'];
     operatorCheck($m->operatorAction('send',['delivery'=>['extensions'=>['1000']],'title'=>'Notice','message'=>'Fixture'])['success'],'Scoped announcement failed.');
@@ -202,7 +222,7 @@ try {
     operatorCheck(in_array('1000',array_column($state['devices']['extensions'],'id'),true),'Device-choice projection changed the numeric extension identity.');
     operatorCheck(!str_contains($projected,$secret)&&!str_contains($projected,$used['account']['auth']['password_hash'])&&!isset($state['access']['accounts'][0]['auth']),'Editor exposed MFA/password material.');
     $public=$state['access']['accounts'][0];
-    foreach(['identity_current','totp_enrolled','recovery_remaining','password_change_required','password_recovery'] as $key)unset($public[$key]);
+    foreach(['identity_current','totp_enrolled','recovery_remaining','password_change_required','password_recovery','access_expired'] as $key)unset($public[$key]);
     operatorCheck($m->saveOperatorAccess(['revision'=>$m->accessRevision(),'enabled'=>false,'portal_enabled'=>false,'accounts'=>[$public]])['success'],'Portal disable failed.');
     operatorCheck($m->portalAccount('portal_person')===null && \SLS\MassNotify\ApiSecurity::currentCredential($m->settings,$id)===null,'Disabled portal retained login or queued authority.');
     operatorReject(fn()=>$m->operatorAuthUpdate($id,$identity,'totp',$enrolled['recovery_codes'][1]));

@@ -41,12 +41,14 @@ final class OperatorAccess
         if (!is_array($rows) || !array_is_list($rows) || count($rows) > 100) { throw new \DomainException('Operator access supports up to 100 local accounts.'); }
         $accounts = []; $ids = []; $users = [];
         foreach ($rows as $row) {
-            if (!is_array($row) || array_diff(array_keys($row), ['id', 'username', 'name', 'email', 'role', 'enabled', 'site_ids', 'location_ids', 'group_ids', 'personal_members', 'actions', 'channels', 'source', 'identity', 'auth'])
+            if (!is_array($row) || array_diff(array_keys($row), ['id', 'username', 'name', 'email', 'role', 'enabled', 'site_ids', 'location_ids', 'group_ids', 'personal_members', 'actions', 'channels', 'source', 'identity', 'auth', 'expires_at'])
                 || !is_string($row['id'] ?? null) || !preg_match('/^api_[a-f0-9]{24}$/D', $row['id']) || isset($ids[$row['id']])
                 || !is_string($row['username'] ?? null) || !preg_match('/^[A-Za-z0-9_.@-]{1,80}$/D', $row['username']) || isset($users[strtolower($row['username'])])
                 || !in_array($row['role'] ?? null, self::ROLES, true) || !is_bool($row['enabled'] ?? null)
                 || !in_array($row['source'] ?? null, ['portal', 'database', 'usermanager'], true)
                 || !is_string($row['identity'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $row['identity'])) { throw new \DomainException('An operator account has invalid or duplicate identity or role fields.'); }
+            $expiry = array_key_exists('expires_at', $row) ? $row['expires_at'] : 0;
+            if (!is_int($expiry) || $expiry < 0 || $expiry > 253402300799) { throw new \DomainException('Operator expiry must be a UTC timestamp, or zero for no expiry.'); }
             $sites = self::ids($row['site_ids'] ?? [], '/^loc_[a-f0-9]{24}$/D', 500);
             $groups = self::ids($row['group_ids'] ?? [], '/^grp_[a-f0-9]{12,32}$/D', 20);
             $locations=self::ids($row['location_ids']??[], '/^loc_[a-f0-9]{24}$/D',500);
@@ -62,12 +64,19 @@ final class OperatorAccess
             if ($row['source']==='portal' && $auth===null) { throw new \DomainException('A portal login needs a protected password record.'); }
             $accounts[] = ['id'=>$row['id'], 'username'=>$row['username'], 'name'=>LocationDirectory::text(($row['name'] ?? '') ?: $row['username'], 100, 'Operator name'),
                 'email'=>OperatorRecovery::email($row['email']??''),
-                'role'=>$row['role'], 'enabled'=>$row['enabled'], 'site_ids'=>$sites, 'group_ids'=>$groups,
+                'role'=>$row['role'], 'enabled'=>$row['enabled'], 'expires_at'=>$expiry, 'site_ids'=>$sites, 'group_ids'=>$groups,
                 'location_ids'=>$locations,'personal_members'=>$members,'actions'=>$actions,'channels'=>$channels,
                 'source'=>$row['source'], 'identity'=>$row['identity']] + ($auth===null?[]:['auth'=>$auth]);
             $ids[$row['id']] = true; $users[strtolower($row['username'])] = true;
         }
         return ['schema'=>1, 'enabled'=>$value['enabled'] ?? false, 'portal_enabled'=>$value['portal_enabled'] ?? false, 'accounts'=>$accounts];
+    }
+
+    /** Saved past dates remain valid configuration but grant no access. */
+    public static function activeAccount(array $account, ?int $now = null): bool
+    {
+        $expiry = array_key_exists('expires_at', $account) ? $account['expires_at'] : 0;
+        return is_int($expiry) && $expiry >= 0 && ($expiry === 0 || $expiry > ($now ?? time()));
     }
 
     /** A reused username or changed login credential needs administrator review. */
@@ -99,13 +108,13 @@ final class OperatorAccess
         } catch (\Throwable $error) { return false; }
     }
 
-    public static function principal(array $settings, string $id): ?array
+    public static function principal(array $settings, string $id, ?int $now = null): ?array
     {
         try {
             $config = self::normalize($settings['operator_access'] ?? []);
             if (array_intersect(array_column($config['accounts'], 'id'), array_column($settings['control_api']['credentials'] ?? [], 'id'))) { return null; }
             foreach ($config['accounts'] as $account) {
-                if ($account['id'] !== $id || !$account['enabled']) { continue; }
+                if ($account['id'] !== $id || !$account['enabled'] || !self::activeAccount($account, $now)) { continue; }
                 if ($account['source']==='portal' ? !$config['portal_enabled'] : !$config['enabled']) { return null; }
                 $members = $account['personal_members'];
                 $directory = LocationDirectory::effective($settings['location_directory'] ?? []);
@@ -124,7 +133,7 @@ final class OperatorAccess
                 foreach ($members as $key=>$values) { $audience[$key] = array_values(array_unique($values)); }
                 return ['id'=>$account['id'], 'name'=>$account['name'], 'username'=>$account['username'], 'operator_role'=>$account['role'],
                     'site_ids'=>$account['site_ids'], 'location_ids'=>$account['location_ids'],'group_ids'=>$account['group_ids'], 'scopes'=>$scopes, 'audience'=>$audience,
-                    'actions'=>$account['actions'],'allowed_channels'=>$account['channels'],
+                    'expires_at'=>$account['expires_at'], 'actions'=>$account['actions'],'allowed_channels'=>$account['channels'],
                     'source'=>$account['source'], 'identity'=>$account['identity'],'portal_auth_ready'=>$account['source']==='portal' && OperatorAuth::ready($account)];
             }
         } catch (\Throwable $error) { return null; }
@@ -141,6 +150,7 @@ final class OperatorAccess
 
     public static function may(array $principal, string $operation): bool
     {
+        if (!self::activeAccount($principal)) { return false; }
         $role = $principal['operator_role'] ?? '';
         if ($role === 'administrator') { return true; }
         if (isset($principal['actions'])) { return in_array($operation,$principal['actions'],true); }
@@ -151,6 +161,7 @@ final class OperatorAccess
 
     public static function delivery(array $principal, array $delivery, array $settings): bool
     {
+        if (!self::activeAccount($principal)) { return false; }
         if (($principal['audience']['unrestricted'] ?? false) === true) { return true; }
         $allowed = ApiSecurity::allowedAudience($principal, $settings);
         $mapping = ['extensions'=>'phones', 'desktop_clients'=>'desktops', 'voice_recipient_ids'=>'voice_recipient_ids',
@@ -163,6 +174,7 @@ final class OperatorAccess
 
     public static function person(array $principal, array $person, array $settings, array $identities): bool
     {
+        if (!self::activeAccount($principal)) { return false; }
         if (($principal['audience']['unrestricted'] ?? false) === true) { return true; }
         $username = $person['desktop_username'] ?? '';
         if ($username !== '') {

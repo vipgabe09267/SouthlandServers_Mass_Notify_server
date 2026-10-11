@@ -146,7 +146,7 @@ acquire_mutation_coordination() {
     release_mutation_coordination
     return 1
   fi
-  if ! run_without_maintenance_lock /usr/bin/python3 -I "$RUNTIME_DIR/sls_install_idle.py" --data "${CONFIG_FILE%/*}" inspect >"$MUTATION_BASELINE_DIR/before.json"; then
+  if ! run_without_maintenance_lock /usr/bin/python3 -I "$RUNTIME_DIR/sls_install_idle.py" --data "${CONFIG_FILE%/*}" inspect --repair-collector >"$MUTATION_BASELINE_DIR/before.json"; then
     release_mutation_coordination
     return 1
   fi
@@ -567,9 +567,6 @@ case "$encryption_result" in
   *'"rotated":true'*|*'"encrypted_files":'[1-9]*) log "$encryption_result" ;;
 esac
 
-# Generated speech and composite audio are short-lived delivery artifacts.
-/usr/sbin/runuser -u asterisk -- /usr/bin/python3 -I "$RUNTIME_DIR/sls_storage_maintenance.py" >> "$LOG_FILE" 2>&1 || log "Some storage retention stages were deferred; inspect the preceding retention detail."
-
 # Reconciliation never sends an announcement. Probe worker bootstrap/storage as
 # its service account, so a root-only success cannot mask delivery failures.
 announcement_worker="$RUNTIME_DIR/sls_mass_notify_announcement_worker.php"
@@ -585,6 +582,10 @@ if [ -r "$announcement_worker" ]; then
       || log "Announcement worker health probe failed; inspect the sanitized worker status."
   fi
 fi
+
+
+# Generated speech and composite audio are short-lived delivery artifacts.
+/usr/sbin/runuser -u asterisk -- /usr/bin/python3 -I "$RUNTIME_DIR/sls_storage_maintenance.py" >> "$LOG_FILE" 2>&1 || log "Some storage retention stages were deferred; inspect the preceding retention detail."
 
 # Dashboard and Framework upgrades can replace the two managed widget files or
 # the menu ordering hook. Detect that drift and restore only those integration

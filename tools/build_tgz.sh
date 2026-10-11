@@ -4,6 +4,23 @@ set -euo pipefail
 umask 027
 export PYTHONDONTWRITEBYTECODE=1
 
+UNSIGNED=0
+if [[ "${1:-}" == --unsigned ]]; then UNSIGNED=1; shift; fi
+if [[ -r /etc/freepbx.conf ]]; then
+  [[ "${SLS_TEST_NAMESPACE:-}" == entered ]] || {
+    printf 'Building on a PBX requires tools/run_isolated_tests.sh --build; direct builds cannot use production state as a fixture.\n' >&2
+    exit 2
+  }
+  for kind in MOUNT NET PID; do
+    variable="SLS_TEST_PARENT_${kind}_NS"
+    case "$kind" in MOUNT) path=mnt ;; NET) path=net ;; PID) path=pid ;; esac
+    if [[ -z "${!variable:-}" || "${!variable}" == "$(readlink "/proc/self/ns/$path")" ]]; then
+      printf 'Build isolation verification failed for %s namespace; no tests were started.\n' "$kind" >&2
+      exit 2
+    fi
+  done
+fi
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODULE="slsmassnotifyserver"
 VERSION="$(php -r '$x=simplexml_load_file($argv[1]); if (!$x) exit(1); echo (string)$x->version;' "${ROOT_DIR}/${MODULE}/module.xml")"
@@ -52,6 +69,34 @@ bash "${ROOT_DIR}/tools/test_local_signer.sh"
 bash "${ROOT_DIR}/tools/test_uninstaller_signer_snapshot.sh"
 php "${ROOT_DIR}/tools/test_scheduling_contract.php"
 php "${ROOT_DIR}/tools/test_schedule_calendar.php"
+php "${ROOT_DIR}/tools/test_schedule_programmes.php"
+php "${ROOT_DIR}/tools/test_directory_mapping.php"
+php "${ROOT_DIR}/tools/test_enterprise_continuity.php"
+php "${ROOT_DIR}/tools/test_incident_languages.php"
+php "${ROOT_DIR}/tools/test_operator_expiry.php"
+node "${ROOT_DIR}/tools/test_subscriber_worker.js"
+php "${ROOT_DIR}/tools/test_enterprise_provider_lifecycle.php"
+php "${ROOT_DIR}/tools/test_enterprise_journal_maintenance.php"
+php "${ROOT_DIR}/tools/test_enterprise_announcement_channels.php"
+php "${ROOT_DIR}/tools/test_browser_push.php"
+python3 "${ROOT_DIR}/tools/test_installation_doctor.py"
+php "${ROOT_DIR}/tools/test_phone_inventory.php"
+php "${ROOT_DIR}/tools/test_paging_readiness.php"
+php "${ROOT_DIR}/tools/test_control_idempotency.php"
+python3 "${ROOT_DIR}/tools/test_control_idempotency_http.py"
+php "${ROOT_DIR}/tools/test_announcement_worker_health.php"
+python3 "${ROOT_DIR}/tools/test_enterprise_browser_ui.py"
+python3 "${ROOT_DIR}/tools/test_schedule_recording_browser_ui.py"
+python3 "${ROOT_DIR}/tools/test_installer_interruptions.py"
+python3 "${ROOT_DIR}/tools/test_legacy_runtime_permissions.py"
+python3 "${ROOT_DIR}/tools/test_mail_admission.py"
+php "${ROOT_DIR}/tools/test_operator_mail_admission.php"
+php "${ROOT_DIR}/tools/test_beta_notice.php"
+python3 "${ROOT_DIR}/tools/test_beta_notice_ui.py"
+python3 "${ROOT_DIR}/tools/test_cron_runner.py"
+python3 "${ROOT_DIR}/tools/test_speech_admission.py"
+python3 "${ROOT_DIR}/tools/test_phone_inventory.py"
+python3 "${ROOT_DIR}/tools/test_dependency_advisories.py"
 php "${ROOT_DIR}/tools/test_announcement_delivery_contract.php"
 php "${ROOT_DIR}/tools/test_announcement_snapshot.php"
 php "${ROOT_DIR}/tools/test_speech_duration.php"
@@ -78,16 +123,21 @@ php "${ROOT_DIR}/tools/test_incident_email.php"
 php "${ROOT_DIR}/tools/test_phone_collector_service.php"
 python3 "${ROOT_DIR}/tools/test_installer_phone_service.py"
 python3 "${ROOT_DIR}/tools/test_phone_admission.py"
+python3 "${ROOT_DIR}/tools/test_phone_voicemail_admission.py"
+python3 "${ROOT_DIR}/tools/test_voicemail_runtime.py"
 python3 "${ROOT_DIR}/tools/test_outbound_playback_asterisk.py"
 python3 "${ROOT_DIR}/tools/test_phone_outcomes.py"
 python3 "${ROOT_DIR}/tools/test_outbound_routes.py"
 php "${ROOT_DIR}/tools/test_phone_producers.php"
 python3 "${ROOT_DIR}/tools/test_resource_capacity.py"
+python3 "${ROOT_DIR}/tools/test_installer_preparation.py"
+python3 "${ROOT_DIR}/tools/test_served_php_probe.py"
 php "${ROOT_DIR}/tools/test_system_recordings.php"
 python3 "${ROOT_DIR}/tools/test_weather_channels.py"
 python3 "${ROOT_DIR}/tools/test_lightning_providers.py"
 python3 "${ROOT_DIR}/tools/test_piper_dependencies.py"
 python3 "${ROOT_DIR}/tools/test_piper_environment.py"
+python3 "${ROOT_DIR}/tools/test_voice_download_bounds.py"
 python3 "${ROOT_DIR}/tools/test_sbom.py"
 python3 "${ROOT_DIR}/tools/test_release_source_scan.py"
 python3 "${ROOT_DIR}/tools/test_update_policy.py"
@@ -158,6 +208,7 @@ php "${ROOT_DIR}/tools/test_operator_recovery.php"
 python3 "${ROOT_DIR}/tools/test_operator_portal_http.py"
 python3 "${ROOT_DIR}/tools/test_phone_visual_owner.py"
 php "${ROOT_DIR}/tools/test_weather_delivery_receipts.php"
+php "${ROOT_DIR}/tools/test_weather_voicemail_receipts.php"
 python3 "${ROOT_DIR}/tools/test_weather_email_details.py"
 bash "${ROOT_DIR}/tools/test_installer_dependencies.sh"
 python3 "${ROOT_DIR}/tools/test_automation_http.py"
@@ -168,6 +219,8 @@ python3 "${ROOT_DIR}/tools/test_emergency_observer.py"
 php "${ROOT_DIR}/tools/test_incidents.php"
 php "${ROOT_DIR}/tools/test_incident_escalation.php"
 node --check "${ROOT_DIR}/slsmassnotifyserver/views/incident_escalation_editor.js"
+node --check "${ROOT_DIR}/slsmassnotifyserver/views/schedule_programmes.js"
+node --check "${ROOT_DIR}/slsmassnotifyserver/views/system_recording_browser.js"
 php "${ROOT_DIR}/tools/test_incident_bounds.php"
 php "${ROOT_DIR}/tools/test_incident_retirement.php"
 python3 "${ROOT_DIR}/tools/test_external_monitor.py"
@@ -198,6 +251,7 @@ php "${ROOT_DIR}/tools/test_announcement_visual_concurrency.php"
 python3 "${ROOT_DIR}/tools/test_installer_download_safety.py"
 python3 "${ROOT_DIR}/tools/test_installer_rollback.py"
 python3 "${ROOT_DIR}/tools/test_uninstaller_safe_logs.py"
+python3 "${ROOT_DIR}/tools/test_uninstaller_transaction.py"
 python3 "${ROOT_DIR}/tools/test_external_delivery_retry.py"
 python3 "${ROOT_DIR}/tools/test_system_notifications.py"
 python3 "${ROOT_DIR}/tools/test_system_health_notifications.py"
@@ -228,8 +282,13 @@ node "${ROOT_DIR}/tools/test_phone_contact_editor.js"
 python3 "${ROOT_DIR}/tools/test_desktop_api_delivery.py"
 python3 "${ROOT_DIR}/tools/test_desktop_editor.py"
 php "${ROOT_DIR}/tools/test_live_paging.php"
+php "${ROOT_DIR}/tools/test_voicemail_controls.php"
+php "${ROOT_DIR}/tools/test_voicemail_settings.php"
+python3 "${ROOT_DIR}/tools/test_voicemail_controls_ui.py"
+python3 "${ROOT_DIR}/tools/test_weather_voicemail_producers.py"
 php "${ROOT_DIR}/tools/test_paging_pending_dialplan.php"
 python3 "${ROOT_DIR}/tools/test_live_paging_asterisk.py"
+python3 "${ROOT_DIR}/tools/test_voicemail_asterisk.py"
 php "${ROOT_DIR}/tools/test_live_audio_durability.php"
 php "${ROOT_DIR}/tools/test_live_paging_notify.php"
 php "${ROOT_DIR}/tools/test_live_paging_prompt_ownership.php"
@@ -340,9 +399,13 @@ fi
 python3 "${ROOT_DIR}/tools/scan_release_source.py" "${ROOT_DIR}/${MODULE}" "${ROOT_DIR}/tools"
 
 for required in \
+  EnterpriseContinuity.php \
+  docs/INSTALLER_OPERATIONS.md docs/ENTERPRISE_ACCEPTANCE.md docs/READINESS_REVIEW_0.1.6.md PhoneInventory.php ScheduleProgrammes.php ControlIdempotency.php BrowserPush.php EnterpriseAnnouncementChannels.php EnterpriseDeliveryConnector.php IncidentLanguages.php \
+  views/identity_labs.css views/schedule_programmes.php views/schedule_programmes.js views/schedule_programmes.css views/installation_profile.php views/system_recording_browser.js portal/subscriber-worker.js \
+  bin/sls_mass_notify/sls_speech_admission.py bin/sls_mass_notify/sls_phone_inventory.py bin/sls_mass_notify/sls_install_transaction.py bin/sls_mass_notify/sls_install_doctor.py \
   docs/OPERATORS.md docs/TRIGGERS.md docs/RELEASE_TRUST.md docs/PAGING.md \
   docs/ENTERPRISE_OPERATIONS.md docs/ENTERPRISE_LABS_PLAN.md docs/ENTERPRISE_CLUSTER.md docs/ENTERPRISE_IDENTITY.md docs/ENTERPRISE_INTEGRATIONS.md \
-  LabsSafety.php EnterpriseAdministration.php EnterpriseOperations.php EnterpriseOperationsConfig.php EnterpriseOperationsStore.php EnterpriseApprovalService.php EnterpriseFloorplanStore.php page.slsmassnotifyserver_enterprise.php views/enterprise.php views/enterprise.css views/enterprise.js \
+  LabsSafety.php BetaNotice.php BetaNoticeService.php views/beta_notice.php views/beta_notice.css views/beta_notice.js EnterpriseAdministration.php EnterpriseOperations.php EnterpriseOperationsConfig.php EnterpriseOperationsStore.php EnterpriseApprovalService.php EnterpriseFloorplanStore.php page.slsmassnotifyserver_enterprise.php views/enterprise.php views/enterprise.css views/enterprise.js \
   EnterpriseCluster.php EnterpriseClusterConfig.php EnterpriseClusterIntegration.php EnterpriseClusterRuntime.php EnterpriseClusterProtocol.php EnterpriseClusterStore.php EnterpriseClusterEdge.php EnterpriseClusterPbxContract.php EnterpriseClusterIncidentStore.php api/sls-mass-notify/peer.php api/sls-mass-notify/edge.php api/sls-mass-notify/edge-view.php bin/sls_mass_notify_cluster_worker.php bin/sls_mass_notify_cluster_effect.php bin/sls_mass_notify/sls_cluster_guard.py \
   EnterpriseIdentity.php EnterpriseIdentityConfig.php EnterpriseIdentityHttp.php EnterpriseIdentityManagement.php EnterpriseIdentityOidc.php EnterpriseIdentitySaml.php EnterpriseIdentityStore.php DirectoryConfig.php DirectorySync.php SubscriberConfig.php SubscriberService.php identity-libs/.htaccess identity-libs/composer.json identity-libs/composer.lock identity-libs/vendor/autoload.php portal/sso.php portal/subscriber.php \
   EnterpriseIntegrations.php EnterpriseIntegrationsConfig.php EnterpriseIntegrationsProvider.php EnterpriseIntegrationsService.php EnterpriseIntegrationsStore.php EnterprisePublicWarning.php views/integrations.php views/integrations.css views/integrations.js bin/sls_mass_notify/sls_mass_notify_incident_response.php \
@@ -355,7 +418,7 @@ for required in \
   IncidentConfig.php IncidentStore.php IncidentArchive.php IncidentService.php Incidents.php page.slsmassnotifyserver_incidents.php views/incidents.php views/incident_retention.php views/incident_escalation_editor.js \
   page.slsmassnotifyserver_scheduling.php views/scheduling.php \
   AudiencePicker.php views/audience_source_picker.php views/audience_source_picker.js views/audiences.php views/audiences.js views/audience_webhook_selector.php views/labs.php views/settings_navigation.php views/device_capacity.js LocationDirectory.php GeographicTargeting.php Locations.php page.slsmassnotifyserver_locations.php views/locations.php views/locations.css views/locations.js views/location_map.php views/geographic.js assets/location-basemap.svg \
-  Paging.php functions.inc.php page.slsmassnotifyserver_paging.php views/paging.php \
+  Paging.php VoicemailConfig.php functions.inc.php page.slsmassnotifyserver_paging.php views/paging.php \
   page.slsmassnotifyserver_lightning.php views/lightning.php \
   api/sipnotify/index.php \
   api/sls-mass-notify/media.php api/sls-mass-notify/media-policy.php \
@@ -372,11 +435,13 @@ for required in \
   bin/sls_mass_notify/sls_installer_recovery.py \
   bin/sls_mass_notify/sls_install_idle.py \
   bin/sls_mass_notify/sls_install_guard.py \
+  bin/sls_mass_notify/sls_legacy_permissions.py \
+  bin/sls_mass_notify/sls_mail_admission.py bin/sls_mass_notify/sls_cron_runner.py \
   bin/sls_mass_notify/piper-requirements.txt bin/sls_mass_notify/piper-requirements.lock \
   bin/sls_mass_notify/piper-packaging.lock bin/sls_mass_notify/piper-artifacts.json \
   bin/sls_mass_notify/sls_audio_queue.py bin/sls_mass_notify/sls_audio_state.py bin/sls_mass_notify/sls_storage_maintenance.py bin/sls_mass_notify/sls_audit_separation.py bin/sls_mass_notify/sls_operational_backup.py \
-  bin/sls_mass_notify/sls_resource_capacity.py bin/sls_mass_notify/sls_piper_dependencies.py bin/sls_mass_notify/sls_piper_environment.py bin/sls_mass_notify/sls_update_policy.py \
-  bin/sls_mass_notify/sls_phone_admission.py bin/sls_mass_notify/sls_phone_events.py \
+  bin/sls_mass_notify/sls_resource_capacity.py bin/sls_mass_notify/sls_bounded_stream.py bin/sls_mass_notify/sls_piper_dependencies.py bin/sls_mass_notify/sls_piper_environment.py bin/sls_mass_notify/sls_update_policy.py \
+  bin/sls_mass_notify/sls_phone_admission.py bin/sls_mass_notify/sls_voicemail.py bin/sls_mass_notify/sls_phone_events.py \
   bin/sls_mass_notify/sls_phone_outcomes.py bin/sls_mass_notify/sls_outbound_routes.py bin/sls_mass_notify_phone_agi.py \
   bin/sls_mass_notify/external-acknowledgement.wav \
   bin/sls_mass_notify/sls_weather_queue.py \
@@ -455,5 +520,5 @@ if [ -z "${EXPECTED_INSTALLER_HASH}" ] || [ "${ACTUAL_PACKAGE_HASH}" != "${EXPEC
 fi
 
 sha256sum "${PACKAGE}"
-python3 "${ROOT_DIR}/tools/sign_release.py"
+if [[ "$UNSIGNED" == 0 ]]; then python3 "${ROOT_DIR}/tools/sign_release.py"; fi
 printf '%s\n' "${PACKAGE}"

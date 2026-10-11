@@ -82,6 +82,16 @@ class RetentionTests(unittest.TestCase):
         self.now += 904; self.clean(); self.assertTrue(path.exists())
         self.now += 1; self.clean(); self.assertFalse(path.exists())
 
+    def test_imported_recordings_are_budgeted_and_current_selections_protected(self):
+        tones=self.data/'sounds/tones'
+        selected=self.stale(tones,'recording_'+'a'*32+'.wav',age=8*86400)
+        orphan=self.stale(tones,'recording_'+'b'*32+'.wav',age=8*86400)
+        custom=self.stale(tones,'administrator-tone.wav',age=8*86400)
+        self.config.write_text(json.dumps({'announcement_opening_tone':selected.stem}))
+        self.assertEqual(len(storage.generated_inventory(self.data,self.web)),2)
+        self.assertEqual(self.clean()['audio_removed'],1)
+        self.assertTrue(selected.exists() and custom.exists());self.assertFalse(orphan.exists())
+
     def sized_image(self, suffix, mib, age):
         path = self.stale(self.web, 'alert_' + suffix * 12 + '.png', age=age)
         with path.open('r+b') as output: output.truncate(mib * 1024 * 1024)

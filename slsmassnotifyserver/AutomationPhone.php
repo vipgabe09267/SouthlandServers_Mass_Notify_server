@@ -17,7 +17,7 @@ final class AutomationPhone
         foreach ($config['rules'] as $candidate) {
             if ($candidate['kind']==='panic' && $candidate['enabled'] && $candidate['dial_extension']!=='' && $candidate['dial_extension']===($environment['agi_extension'] ?? '')) { $rule=$candidate; break; }
         }
-        if (!$rule || ($environment['agi_context'] ?? '')!=='sls-trigger-panic' || empty($settings['enabled'])) { return ['state'=>'disabled']; }
+        if (!$rule || ($environment['agi_context'] ?? '')!=='sls-trigger-panic' || !RuntimeState::running($settings)) { return ['state'=>'disabled']; }
         $caller=$this->agi->variable('${CHANNEL(endpoint)}');
         if (!preg_match('/^[0-9]{1,20}$/D',$caller) || !in_array($caller,$rule['callers'],true)
             || !preg_match('/^PJSIP\/'.preg_quote($caller,'/').'-[a-f0-9]{8,16}$/Di',$environment['agi_channel'] ?? '')

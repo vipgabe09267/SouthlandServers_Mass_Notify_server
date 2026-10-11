@@ -5,6 +5,155 @@ namespace SLS\MassNotify;
 /** Read-only projection of weather transport evidence; never exposes addresses or URLs. */
 final class WeatherDeliveryReceipts
 {
+    private static array $phoneCache = [];
+
+    private static function phoneState(string $path, int $owner, int $group): array
+    {
+        clearstatcache(true, $path);
+        $before = @lstat($path);
+        if (!$before) { return []; }
+        if (($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1 || ($before['mode'] & 0137)
+            || !in_array($before['uid'], [0, $owner], true) || $before['gid'] !== $group || $before['size'] > 16777216) {
+            throw new \RuntimeException('Unsafe phone delivery record.');
+        }
+        $fields = ['dev', 'ino', 'uid', 'gid', 'mode', 'nlink', 'size', 'mtime', 'ctime'];
+        $identity = array_map(static fn(string $field): int => $before[$field], $fields);
+        // The native writer atomically replaces the ledger. Reuse only this
+        // request's protected inode snapshot; no permission decision is cached.
+        if ((self::$phoneCache[$path]['identity'] ?? null) === $identity) { return self::$phoneCache[$path]['state']; }
+        $limit = trim((string)ini_get('memory_limit'));
+        if (preg_match('/^([0-9]+)([KMG]?)$/iD', $limit, $match)) {
+            $factor = [''=>1, 'K'=>1024, 'M'=>1048576, 'G'=>1073741824][strtoupper($match[2])];
+            if ((int)$match[1] * $factor - memory_get_usage(true) < $before['size'] * 20 + 1048576) {
+                throw new \RuntimeException('Phone history exceeds this request memory budget.');
+            }
+        }
+        $handle = @fopen($path, 'rb');
+        if (!$handle) { throw new \RuntimeException('Phone delivery record could not be opened.'); }
+        try {
+            $opened = fstat($handle);
+            $after = @lstat($path);
+            if (!$opened || !$after || !flock($handle, LOCK_SH | LOCK_NB)) {
+                throw new \RuntimeException('Phone delivery record is unavailable.');
+            }
+            foreach ($fields as $field) {
+                if ($before[$field] !== $opened[$field] || $opened[$field] !== $after[$field]) {
+                    throw new \RuntimeException('Phone delivery record identity changed.');
+                }
+            }
+            $raw = stream_get_contents($handle, 16777217);
+            clearstatcache(true, $path); $opened = fstat($handle); $after = @lstat($path);
+            foreach ($fields as $field) {
+                if (!$opened || !$after || $before[$field] !== $opened[$field] || $opened[$field] !== $after[$field]) {
+                    throw new \RuntimeException('Phone delivery record changed while reading.');
+                }
+            }
+            if (!is_string($raw) || strlen($raw) !== $before['size'] || strlen($raw) > 16777216) {
+                throw new \RuntimeException('Phone delivery record is incomplete.');
+            }
+            $state = json_decode($raw, true, 32, JSON_THROW_ON_ERROR);
+            if (!is_array($state) || ($state['schema'] ?? null) !== 1 || !is_array($state['batches'] ?? null)
+                || count($state['batches']) > 2000) {
+                throw new \RuntimeException('Invalid phone delivery record.');
+            }
+            foreach ($state['batches'] as $token => $batch) {
+                if (!is_string($token) || !preg_match('/^[a-f0-9]{32}$/D', $token) || !is_array($batch)) {
+                    throw new \RuntimeException('Invalid phone delivery batch.');
+                }
+            }
+            if (count(self::$phoneCache) >= 4) { array_shift(self::$phoneCache); }
+            self::$phoneCache[$path] = ['identity'=>$identity, 'state'=>$state];
+            return $state;
+        } finally { fclose($handle); }
+    }
+
+    private static function voicemailRows(string $directory, array $parent, array $event, string $provider,
+                                          string $identifier, array $groups, int $deadline, array &$result): void
+    {
+        try { $state = self::phoneState($directory.'/phone-admission.json', $parent['uid'], $parent['gid']); }
+        catch (\Throwable $error) {
+            $result['warnings'][] = 'Voicemail delivery evidence is unavailable. Review protected phone history and its size.';
+            return;
+        }
+        foreach ($state['batches'] ?? [] as $sourceToken => $source) {
+            if (hrtime(true) > $deadline) {
+                $result['warnings'][] = 'Voicemail delivery history reached its read limit. Some results may be missing.';
+                return;
+            }
+            $fallback = $source['vm_fallback'] ?? null;
+            $scope = is_array($fallback) ? ($fallback['scope'] ?? '') : '';
+            $context = is_array($fallback) ? ($fallback['weather_context']['source_validity'] ?? null) : null;
+            if (($source['purpose'] ?? 'audio') !== 'audio' || ($source['status'] ?? '') !== 'closed'
+                || ($source['service'] ?? '') !== ($provider === 'nws' ? 'nws' : 'lightning')
+                || !is_string($scope) || !preg_match('/^[A-Za-z0-9_-]{1,64}$/D', $scope)
+                || !is_array($context) || ($context['provider'] ?? '') !== $provider || ($context['group_id'] ?? '') !== $scope
+                || ($context['version'] ?? null) !== 1 || ($fallback['schema'] ?? null) !== 1
+                || !is_string($source['generation'] ?? null) || !preg_match('/^[a-f0-9]{32}$/D', $source['generation'])
+                || !is_string($source['boot_id'] ?? null) || !preg_match('/^[A-Za-z0-9-]{1,64}$/D', $source['boot_id'])
+                || ($source['correlation'] ?? '') !== 'vm-'.hash('sha256', $scope.'|'.$identifier)
+                || !is_array($fallback['targets'] ?? null) || count($fallback['targets']) > 1000) { continue; }
+            if ($provider === 'nws' && (($context['provider_event_id'] ?? '') !== $identifier
+                || ($context['zone'] ?? '') !== ($event['zone'] ?? ''))) { continue; }
+            foreach ($fallback['targets'] as $extension => $selected) {
+                if (count($result['rows']) >= 100) {
+                    $result['warnings'][] = 'Only the first 100 matching destination results are shown.';
+                    return;
+                }
+                $recipient = (string)$extension;
+                $claim = is_array($selected) ? ($selected['claimed_token'] ?? null) : null;
+                $label = is_string($groups[$scope] ?? null) ? substr($groups[$scope], 0, 100) : $scope;
+                $refusal = $source['voicemail_failures'][$extension] ?? '';
+                if (preg_match('/^[0-9]{1,20}$/D', $recipient) && $claim === null && is_string($refusal)
+                    && in_array($refusal, ['phone_voicemail_audio_invalid', 'phone_voicemail_audio_unavailable', 'phone_voicemail_audio_capacity',
+                        'phone_voicemail_mailbox_duration', 'phone_voicemail_mailbox_silence', 'phone_voicemail_mailbox_policy_unavailable',
+                        'phone_voicemail_mailbox_changed', 'phone_voicemail_recording_unconfirmed', 'phone_voicemail_cluster_fenced'], true)) {
+                    $result['rows'][] = ['channel'=>'FreePBX voicemail', 'group'=>$label.' · Extension '.$recipient,
+                        'status'=>'failed', 'http_status'=>null, 'error'=>$refusal, 'recorded_at'=>'', 'queue_state'=>'not_submitted'];
+                    continue;
+                }
+                if (!preg_match('/^[0-9]{1,20}$/D', $recipient) || !is_string($claim)
+                    || !preg_match('/^[a-f0-9]{32}$/D', $claim)) { continue; }
+                $child = $state['batches'][$claim] ?? [];
+                $proof = is_array($child) ? ($child['voicemail'] ?? null) : null;
+                $expectedSound = 'SLS_Mass_Notifications_Plugin/voicemail/'.$sourceToken;
+                $valid = is_array($proof) && ($child['purpose'] ?? '') === 'voicemail'
+                    && ($child['service'] ?? '') === $source['service'] && ($child['correlation'] ?? '') === $source['correlation']
+                    && ($child['generation'] ?? null) === ($source['generation'] ?? null)
+                    && ($child['boot_id'] ?? null) === ($source['boot_id'] ?? null)
+                    && ($proof['source_token'] ?? '') === $sourceToken && ($proof['sound'] ?? '') === $expectedSound
+                    && ($fallback['sound'] ?? '') === $expectedSound
+                    && is_string($selected['mailbox'] ?? null)
+                    && preg_match('/^'.preg_quote($recipient, '/').'@[A-Za-z0-9_-]{1,80}$/D', $selected['mailbox'])
+                    && ($proof['mailbox'] ?? '') === $selected['mailbox'] && is_array($child['targets'] ?? null)
+                    && count($child['targets']) === 1 && ($child['targets'][$extension]['dials'] ?? null) === ['VM/'.$selected['mailbox']]
+                    && is_array($child['channels'] ?? null) && count($child['channels']) <= 4000;
+                $native = $valid && is_array($proof['result'] ?? null) ? $proof['result'] : [];
+                $nativeStatus = $native['status'] ?? '';
+                $recorded = $native['recorded_at'] ?? null;
+                $nativeValid = (is_int($recorded) || is_float($recorded)) && is_finite((float)$recorded)
+                    && $recorded > 0 && $recorded <= 253402300799;
+                $origins = [];
+                foreach ($valid && is_array($child['channels'] ?? null) ? $child['channels'] : [] as $channel) {
+                    if (is_array($channel) && ($channel['kind'] ?? '') === 'origin'
+                        && (string)($channel['recipient'] ?? '') === $recipient) { $origins[] = $channel; }
+                }
+                $certain = $valid && empty($source['outcome_uncertain']) && empty($child['outcome_uncertain'])
+                    && empty($source['external_event_gap']) && empty($source['runtime_fault']) && empty($child['runtime_fault'])
+                    && count($origins) === 1 && empty($origins[0]['outcome_uncertain'])
+                    && is_string($origins[0]['channel'] ?? null)
+                    && preg_match('/^Local\/'.preg_quote($recipient, '/').'@sls-alert-voicemail-[a-f0-9]{1,32};2$/D', $origins[0]['channel']);
+                $saved = $certain && $nativeValid && $nativeStatus === 'SUCCESS' && ($proof['playback_completed'] ?? false) === true;
+                $failed = $valid && $nativeValid && in_array($nativeStatus, ['FAILED', 'USEREXIT'], true);
+                $pending = $valid && !$native && in_array($child['status'] ?? '', ['reserved', 'active'], true);
+                $result['rows'][] = ['channel'=>'FreePBX voicemail', 'group'=>$label.' · Extension '.$recipient,
+                    'status'=>$saved ? 'saved_in_FreePBX_voicemail' : ($failed ? 'failed' : ($pending ? 'queued' : 'unconfirmed')),
+                    'http_status'=>null, 'error'=>$failed ? 'voicemail_deposit_failed' : ($saved || $pending ? '' : 'voicemail_evidence_unavailable'),
+                    'recorded_at'=>$nativeValid ? gmdate('c', (int)$recorded) : '',
+                    'queue_state'=>in_array($child['status'] ?? '', ['reserved', 'active', 'closed'], true) ? $child['status'] : 'unknown'];
+            }
+        }
+    }
+
     private static function read(string $path, int $owner, bool $weather = true): array
     {
         $before = @lstat($path);
@@ -132,6 +281,7 @@ final class WeatherDeliveryReceipts
                 }
             }
         }
+        self::voicemailRows($directory, $parent, $event, $provider, $identifier, $groups, $deadline, $result);
         $result['warnings'] = array_values(array_unique($result['warnings']));
         return $result;
     }

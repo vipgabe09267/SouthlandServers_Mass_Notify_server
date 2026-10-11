@@ -53,6 +53,7 @@ LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-90}"
 CONFIG_JSON_FILE="${CONFIG_JSON_FILE:-${CONFIG_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config}}"
 CONFIG_LOADER="${CONFIG_LOADER:-/usr/local/bin/sls_mass_notify/sls_config.py}"
 AUDIO_QUEUE_HELPER="/usr/local/bin/sls_mass_notify/sls_audio_queue.py"
+CLUSTER_GUARD="/usr/local/bin/sls_mass_notify/sls_cluster_guard.py"
 VISUAL_PUSH_SCRIPT="${VISUAL_PUSH_SCRIPT:-/usr/local/bin/sls_mass_notify/sls_notify.py}"
 BRANDED_EMAIL_SCRIPT="${BRANDED_EMAIL_SCRIPT:-/usr/local/bin/sls_mass_notify/sls_branded_email.py}"
 BRANDED_DISCORD_SCRIPT="${BRANDED_DISCORD_SCRIPT:-/usr/local/bin/sls_mass_notify/sls_branded_discord.py}"
@@ -98,6 +99,16 @@ Time: {{time}}"
 
 timestamp_now() {
   date --iso-8601=seconds
+}
+
+require_direct_test_authority() {
+  if /usr/bin/timeout --kill-after=1 5 /usr/bin/python3 -I "$CLUSTER_GUARD" --check-legacy "$CONFIG_JSON_FILE" >> "$LOG" 2>&1; then
+    return 0
+  fi
+  local message="Direct Weather testing was blocked by SLS runtime or cluster policy. Check slsconsole status; HA/edge deployments must use a queued witness-authorized test. No additional channel was submitted."
+  printf 'ERROR: %s\n' "$message" >&2
+  report_fault "cluster_authority" "$message"
+  return 1
 }
 
 refresh_api_test_permissions() {
@@ -340,9 +351,18 @@ generate_test_tts_audio() {
   generation_timeout=$((PIPER_MAX_SECONDS * 2 + 30))
   [ "$generation_timeout" -lt 25 ] && generation_timeout=25
   [ "$generation_timeout" -gt 900 ] && generation_timeout=900
-  if ! printf '%s\n' "$text" | timeout "$generation_timeout" "$PIPER_BIN" --model "${PIPER_NWS_VOICE:-$PIPER_VOICE}" --volume "1.00" --output-file "$tmp_file" >> "$LOG" 2>&1; then
+  if printf '%s\n' "$text" | timeout "$((generation_timeout + 65))" /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_speech_admission.py --max-seconds "$PIPER_MAX_SECONDS" -- "$PIPER_BIN" --model "${PIPER_NWS_VOICE:-$PIPER_VOICE}" --volume "1.00" --output-file "$tmp_file" >> "$LOG" 2>&1; then
+    :
+  else
+    local synthesis_status=$?
     rm -f "$tmp_file"
-    echo "$(date): ERROR — Piper TTS generation failed for manual test" >> "$LOG"
+    if [ "$synthesis_status" -eq 65 ]; then
+      local synthesis_error="Weather test speech exceeds the configured maximum of ${PIPER_MAX_SECONDS} seconds or its reserved output bound. Shorten the message or increase Maximum Speech Duration; no speech was queued."
+      echo "ERROR: $synthesis_error" | tee -a "$LOG" >&2
+      printf '%s\n' "SLS_TTS_ERROR:$synthesis_error"
+    else
+      echo "$(date): ERROR — Piper TTS generation failed for manual test (exit code $synthesis_status). Check the voice, speech queue and Storage diagnostics." >> "$LOG"
+    fi
     return 1
   fi
 
@@ -405,8 +425,15 @@ build_audio_sequence() {
     combined_base="$(printf '%s' "$combined_base" | tr -cd 'A-Za-z0-9_-')"
     combined_file="${SLS_TTS_DIR}/${combined_base}.wav"
     silence_file="${SLS_TTS_DIR}/${combined_base}.silence.$$.$RANDOM.wav"
-    if sox -n -r 8000 -c 1 -b 16 "$silence_file" trim 0.0 1.0 >> "$LOG" 2>&1 \
-      && sox "$silence_file" "${files[@]}" -r 8000 -c 1 -b 16 "$combined_file" >> "$LOG" 2>&1; then
+    local source_file reserve_bytes=16044 source_bytes
+    for source_file in "${files[@]}"; do
+      source_bytes="$(stat -c %s -- "$source_file")" || return 1
+      [[ "$source_bytes" =~ ^[0-9]+$ ]] || return 1
+      reserve_bytes=$((reserve_bytes + source_bytes))
+    done
+    /usr/bin/timeout --kill-after=1 8 /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_speech_admission.py --reserve-media-bytes "$((reserve_bytes * 2))" >> "$LOG" 2>&1 || return 1
+    if timeout --kill-after=2 15 sox -n -r 8000 -c 1 -b 16 "$silence_file" trim 0.0 1.0 >> "$LOG" 2>&1 \
+      && timeout --kill-after=2 30 sox "$silence_file" "${files[@]}" -r 8000 -c 1 -b 16 "$combined_file" >> "$LOG" 2>&1; then
       rm -f "$silence_file"
       chown asterisk:asterisk "$combined_file" 2>/dev/null || true
       chmod 644 "$combined_file"
@@ -488,6 +515,7 @@ trigger_visual_test() {
   fi
 
   echo "$(date): Submitting manual Weather visual to requested phone/desktop channels — Event: $event" >> "$LOG"
+  require_direct_test_authority || return 1
   if ! "${command[@]}" >> "$LOG" 2>&1; then
     echo "$(date): ERROR — Manual Weather visual channel submission failed" >> "$LOG"
     return 1
@@ -540,6 +568,7 @@ queue_test_audio_to_recipients() {
 
   TEST_CALL_QUEUE_FAILURES=0
   refresh_api_test_permissions || return 1
+  require_direct_test_authority || return 1
 
   if [ "${#NWS_ALERT_RECIPIENTS[@]}" -eq 0 ]; then
     echo "$(date): ERROR — No NWS alert recipient extensions configured" >> "$LOG"
@@ -639,6 +668,10 @@ CALL
       rm -f "$callfile" 2>/dev/null || true
       TEST_CALL_QUEUE_FAILURES=$((TEST_CALL_QUEUE_FAILURES + 1))
       continue
+    fi
+    if ! require_direct_test_authority; then
+      rm -f "$callfile" 2>/dev/null || true
+      return 1
     fi
     if ! mv "$callfile" "$SPOOL/"; then
       echo "$(date): ERROR — Unable to move test call file for $recipient into $SPOOL" >> "$LOG"
@@ -777,6 +810,7 @@ if [ "${NWS_ALERTS_ENABLED:-1}" != "1" ]; then
   exit 0
 fi
 
+require_direct_test_authority || exit 79
 prune_tts_cache
 
 COOLDOWN_RESULT=""

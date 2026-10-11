@@ -16,7 +16,7 @@ $root=sys_get_temp_dir().'/sls-panic-'.bin2hex(random_bytes(8));mkdir($root,0700
 $action=AutomationConfig::action(['id'=>'act_'.str_repeat('a',24),'name'=>'Fixture screen','kind'=>'brightsign_udp','enabled'=>true,'host'=>'192.168.20.2','port'=>5000,'message'=>'emergency']);
 $rule=AutomationConfig::rule(['id'=>'trg_'.str_repeat('b',24),'name'=>'Desk shortcut','enabled'=>true,'kind'=>'panic','secret'=>str_repeat('c',64),
     'location_id'=>'loc_'.str_repeat('d',24),'dial_extension'=>'8998','callers'=>['1000'],'action_ids'=>[$action['id']]]);
-$settings=['enabled'=>'1','automations'=>['schema'=>1,'rules'=>[$rule],'actions'=>[$action]],'location_directory'=>['nodes'=>[['id'=>$rule['location_id'],'name'=>'Office','type'=>'site']]]];
+$settings=['enabled'=>'0','runtime_enabled'=>true,'automations'=>['schema'=>1,'rules'=>[$rule],'actions'=>[$action]],'location_directory'=>['nodes'=>[['id'=>$rule['location_id'],'name'=>'Office','type'=>'site']]]];
 $env=['agi_extension'=>'8998','agi_context'=>'sls-trigger-panic','agi_channel'=>'PJSIP/1000-0000001a','agi_uniqueid'=>'fixture.1'];
 $workers=[];
 $run=static function(PanicAgiFixture $agi,array $environment,string $name)use(&$settings,$root,&$workers):array {
@@ -38,6 +38,7 @@ $agi=new PanicAgiFixture();panicCheck($run($agi,array_replace($env,['agi_context
 $agi=new PanicAgiFixture();$agi->onDigits=static function()use(&$settings){$settings['automations']['rules'][0]['enabled']=false;};
 panicCheck($run($agi,$env,'revoked')['state']==='unconfirmed' && count($workers)===1,'Revocation during the confirmation prompt still activated panic.');
 $settings['automations']['rules'][0]['enabled']=true;
+$settings['runtime_enabled']=false;$agi=new PanicAgiFixture();panicCheck($run($agi,$env,'paused')['state']==='disabled'&&count($workers)===1&&$agi->calls===[],'Stopped runtime admitted a phone panic or answered its call.');$settings['runtime_enabled']=true;
 $prompts=LivePagingConfig::promptFiles($settings);
 panicCheck(isset($prompts['panic_'.$rule['id']],$prompts['panic_queued'],$prompts['panic_failed']),'Panic confirmation/outcome prompts were not included in the protected prompt manifest.');
 $settings['automations']['rules'][0]['confirmation_prompt']='Different approved wording. Press one to activate.';

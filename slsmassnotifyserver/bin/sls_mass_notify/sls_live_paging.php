@@ -11,7 +11,7 @@ final class LivePagingConfig
 {
     public static function defaults(): array
     {
-        return ['enabled' => '0', 'extension' => '', 'allowed_callers' => [],
+        return ['enabled' => '0', 'voicemail_enabled' => '1', 'extension' => '', 'allowed_callers' => [],
             'menu_prompt' => 'Select a paging group. Enter its number followed by the pound key.',
             'pin_prompt' => 'Please enter the paging PIN, followed by the pound key.',
             'max_duration_seconds' => 300, 'groups' => [], 'external_ivr_ids' => []];
@@ -40,6 +40,7 @@ final class LivePagingConfig
             throw new \InvalidArgumentException('Unknown live paging configuration field.');
         }
         $config['enabled'] = self::flag($config['enabled']);
+        $config['voicemail_enabled'] = self::flag($config['voicemail_enabled']);
         if (!is_array($config['external_ivr_ids']) || !array_is_list($config['external_ivr_ids']) || count($config['external_ivr_ids']) > 100) {
             throw new \InvalidArgumentException('Select at most 100 existing IVRs for external paging.');
         }
@@ -242,6 +243,7 @@ final class LivePagingConfig
             'text_failure' => 'The paging text notification could not be confirmed. Audio paging will continue.',
             'invalid' => 'That selection or PIN was not accepted.',
             'busy' => 'The selected paging group is busy. Please hang up and try again later.',
+            'no_receivers' => 'No receiving phones are available in this paging group. Check that a recipient phone is signed in and registered, then try again.',
             'unavailable' => 'Paging is unavailable. Please contact your PBX administrator.',
             'denied' => 'You are not authorized to perform that function.'];
         if (($config['external_access'] ?? '0') === '1') {
@@ -283,6 +285,20 @@ class LivePagingAgi
     private bool $returnedToIvr = false;
     protected bool $externalIngress = false;
     protected string $externalCallerNumber = '';
+    private array $originEnvironment = [];
+    private bool $voicemailEnabled = false;
+    private int $voicemailDuration = 300;
+
+    public function setOriginEnvironment(array $environment): void { $this->originEnvironment = $environment; }
+    public function configureVoicemail(bool $enabled, int $duration): void
+    {
+        $this->voicemailEnabled = $enabled;
+        $this->voicemailDuration = $duration;
+    }
+    public function usesContactOrigin(): bool
+    {
+        return !$this->externalIngress && !empty($this->originEnvironment['agi_channel']) && !empty($this->originEnvironment['agi_uniqueid']);
+    }
 
     public function setExternalIngress(bool $external, string $number = ''): void
     {
@@ -395,6 +411,43 @@ class LivePagingAgi
         $this->command('EXEC Page ' . self::quote($dial . ',b(sls-live-paging-autoanswer^s^1)i,' . $answerTimeout), $duration + 15);
     }
 
+    public function recordOnly(int $duration): void
+    {
+        $this->command('EXEC Wait ' . self::quote((string)$duration), $duration + 15);
+    }
+
+    public function startVoicemailRecording(array $admission, int $duration): array
+    {
+        $token = (string)($admission['token'] ?? '');
+        if (!$this->voicemailEnabled || empty($admission['voicemail_targets'])) { return ['status' => 'not_requested']; }
+        if (!preg_match('/^[a-f0-9]{32}$/D', $token)) { return ['status' => 'unavailable']; }
+        $request = json_encode(['action' => 'prepare', 'token' => $token,
+            'channel' => (string)($this->originEnvironment['agi_channel'] ?? ''), 'seconds' => $duration], JSON_THROW_ON_ERROR);
+        $pipes = [];
+        $process = proc_open(['/usr/bin/timeout', '--kill-after=1', '8', '/usr/bin/python3', '-I',
+            '/usr/local/bin/sls_mass_notify/sls_voicemail.py', '--live-request'],
+            [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']], $pipes, null, null, ['bypass_shell' => true]);
+        if (!is_resource($process)) { return ['status' => 'unavailable']; }
+        $sent = fwrite($pipes[0], $request); fclose($pipes[0]);
+        $raw = stream_get_contents($pipes[1], 4097); fclose($pipes[1]);
+        if (strlen((string)$raw) > 4096) { proc_terminate($process); }
+        $exit = proc_close($process); $result = json_decode((string)$raw, true);
+        $base = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sounds/voicemail/' . $token;
+        if ($sent !== strlen($request) || $exit !== 0 || !is_array($result) || ($result['ok'] ?? false) !== true
+            || ($result['token'] ?? '') !== $token || ($result['receive_path'] ?? '') !== $base . '-receive.wav'
+            || ($result['mix_path'] ?? '') !== $base . '-mix.wav') { return ['status' => 'unavailable']; }
+        $this->command('SET VARIABLE SLS_VM_RECORD_TOKEN ' . self::quote($token));
+        $this->command('SET VARIABLE SLS_VM_MIX_ID ""');
+        $this->command('SET VARIABLE SLS_VM_STOPPED "0"');
+        $this->command('SET VARIABLE CHANNEL(hangup_handler_push) "sls-live-recording-ended,s,1"');
+        $reply = $this->command('EXEC MixMonitor ' . self::quote($base . '-mix.wav,r(' . $base . '-receive.wav)i(SLS_VM_MIX_ID)'));
+        $id = $this->variable('${SLS_VM_MIX_ID}');
+        if (!str_starts_with($reply, '200 result=0') || !preg_match('/^[A-Za-z0-9_-]{1,80}$/D', $id)) {
+            return ['status' => 'unavailable'];
+        }
+        return ['status' => 'recording', 'mailboxes' => count($admission['voicemail_targets'])];
+    }
+
     public function notifyGroup(array $group, string $caller, array $settings): array
     {
         $targets = array_values(array_diff((array)($group['notify_extensions'] ?? []), [$caller]));
@@ -410,7 +463,11 @@ class LivePagingAgi
         $known = ['phone_live_origin_invalid', 'phone_live_group_invalid', 'phone_live_audience_changed',
             'phone_audience_exceeds_limit', 'phone_capacity_busy', 'phone_recipient_busy',
             'phone_event_collector_unavailable', 'phone_no_registered_contacts', 'phone_channel_inventory_unavailable',
-            'phone_state_commit_uncertain', 'phone_ticket_expired_or_used', 'phone_ticket_generation_changed'];
+            'phone_state_commit_uncertain', 'phone_ticket_expired_or_used', 'phone_ticket_generation_changed',
+            'phone_live_contact_unidentified', 'phone_runtime_unavailable', 'phone_ami_action_rejected',
+            'phone_channel_inventory_stale', 'phone_channel_inventory_generation_changed',
+            'phone_orphaned_channels_active', 'phone_legacy_channels_active', 'phone_state_invalid',
+            'phone_contact_inventory_invalid', 'phone_ami_inventory_timeout', 'phone_origin_binding_failed'];
         $this->admissionFailure = is_string($code) && in_array($code, $known, true) ? $code : '';
         return [];
     }
@@ -418,8 +475,18 @@ class LivePagingAgi
     public function admitPhones(array $recipients, string $caller, string $groupId = ''): array
     {
         $this->admissionFailure = '';
-        $request = json_encode(['internal' => $recipients, 'service' => 'live', 'live_origin' => $caller, 'live_group' => $groupId,
-            'live_external' => $this->externalIngress, 'live_caller_number' => $this->externalCallerNumber, 'wait_seconds' => 0]);
+        $fields = ['internal' => $recipients, 'service' => 'live', 'live_origin' => $caller, 'live_group' => $groupId,
+            'live_external' => $this->externalIngress, 'live_caller_number' => $this->externalCallerNumber, 'wait_seconds' => 0];
+        if ($this->voicemailEnabled) {
+            $fields['voicemail'] = true;
+            $fields['voicemail_scope'] = $groupId;
+            $fields['duration'] = $this->voicemailDuration;
+        }
+        if ($this->usesContactOrigin()) {
+            $fields['live_channel'] = $this->originEnvironment['agi_channel'];
+            $fields['live_uniqueid'] = $this->originEnvironment['agi_uniqueid'];
+        }
+        $request = json_encode($fields, JSON_THROW_ON_ERROR);
         $pipes = [];
         $process = proc_open(['/usr/bin/timeout', '--kill-after=2', '40', '/usr/bin/python3', '-I',
             '/usr/local/bin/sls_mass_notify/sls_phone_admission.py', '--request-stdin'],
@@ -434,11 +501,16 @@ class LivePagingAgi
             || !preg_match('/^[a-f0-9]{32}$/D', (string)($result['token'] ?? ''))
             || !is_string($result['live_dial'] ?? null) || strlen($result['live_dial']) > 32768
             || !is_array($result['unavailable'] ?? null)) { return $this->rejectAdmission($result); }
+        if (($result['live_dial'] ?? '') === '' && ($result['vm_only'] ?? false) !== true) {
+            return $this->rejectAdmission(['failure_code' => 'phone_no_registered_contacts']);
+        }
         $this->command('SET VARIABLE __SLS_PHONE_TOKEN ' . self::quote($result['token']));
         $this->command('SET VARIABLE __SLS_PHONE_RECIPIENT ' . self::quote($caller));
         $this->command('SET VARIABLE SLS_PHONE_ALLOW "0"');
         $this->command('EXEC AGI "/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,origin"');
-        if ($this->variable('${SLS_PHONE_ALLOW}') !== '1' || $this->variable('${SLS_DIAL}') !== $result['live_dial']) { return []; }
+        if ($this->variable('${SLS_PHONE_ALLOW}') !== '1' || $this->variable('${SLS_DIAL}') !== $result['live_dial']) {
+            return $this->rejectAdmission(['failure_code' => $this->variable('${SLS_PHONE_ERROR}') ?: 'phone_origin_binding_failed']);
+        }
         $this->command('SET VARIABLE CHANNEL(hangup_handler_push) "sls-phone-ended,s,1"');
         return $result;
     }
@@ -819,6 +891,7 @@ final class LivePagingSession
     {
         $this->agi = $agi; $this->state = $state; $this->settingsLoader = $settingsLoader; $this->soundExists = $soundExists;
         $this->environment = $environment;
+        $agi->setOriginEnvironment($environment);
     }
 
     public static function loadSettings(string $path): array
@@ -879,6 +952,7 @@ final class LivePagingSession
         if (!RuntimeState::running($settings)) { return ['status' => 'runtime_stopped']; }
         $config = LivePagingConfig::normalize((array)($settings['live_paging'] ?? []));
         if ($config['enabled'] !== '1') { return ['status' => 'disabled']; }
+        $this->agi->configureVoicemail(($config['voicemail_enabled'] ?? '1') === '1', $config['max_duration_seconds']);
         $external = ($this->environment['agi_context'] ?? '') === 'sls-live-paging-external';
         if ($external && (($config['external_access'] ?? '0') !== '1' || ($this->environment['agi_extension'] ?? '') !== 's')) { return ['status' => 'external_access_disabled']; }
         $this->returnIvr = '';
@@ -961,7 +1035,7 @@ final class LivePagingSession
             $this->agi->play($prompts['unavailable']);
             return ['status' => 'configuration_changed'];
         }
-        $recipients = array_values(array_diff($group['extensions'], [$caller['extension'], $caller['endpoint']]));
+        $recipients = $this->agi->usesContactOrigin() ? $group['extensions'] : array_values(array_diff($group['extensions'], [$caller['extension']]));
         $dial = []; $unavailable = [];
         foreach ($recipients as $recipient) {
             $contacts = $this->dialContacts($recipient);
@@ -969,9 +1043,11 @@ final class LivePagingSession
             $dial = array_merge($dial, $contacts);
         }
         $dial = array_values(array_unique($dial));
-        if (!$dial) {
-            $this->agi->play($prompts['unavailable']);
-            return ['status' => 'no_reachable_recipients'];
+        if (!$dial && ($config['voicemail_enabled'] ?? '1') !== '1') {
+            $this->agi->play($prompts['no_receivers']);
+            return ['status' => 'no_reachable_recipients', 'group_id' => $group['group_id'],
+                'phone_admission_error' => 'phone_no_registered_contacts', 'requested_recipients' => count($recipients),
+                'unavailable_recipients' => $unavailable, 'dialed_contacts' => 0];
         }
         if (strlen(implode('&', $dial)) > 32768) {
             $this->agi->play($prompts['unavailable']);
@@ -988,12 +1064,12 @@ final class LivePagingSession
             }
             $admission = $this->agi->admitPhones($recipients, $caller['extension'], $group['group_id']);
             if (!$admission) {
-                $this->agi->play($prompts['unavailable']);
+                $this->agi->play($prompts[$this->agi->admissionFailure() === 'phone_no_registered_contacts' ? 'no_receivers' : 'unavailable']);
                 $result = ['status' => 'phone_admission_rejected'];
                 if ($this->agi->admissionFailure() !== '') { $result['phone_admission_error'] = $this->agi->admissionFailure(); }
                 return $result;
             }
-            $dial = explode('&', $admission['live_dial']);
+            $dial = $admission['live_dial'] === '' ? [] : explode('&', $admission['live_dial']);
             $unavailable = $admission['unavailable'];
             try { $notification = $this->agi->notifyGroup($group, $caller['extension'], $settings); }
             catch (\Throwable $error) {
@@ -1009,7 +1085,16 @@ final class LivePagingSession
             $this->agi->autoHangup($config['max_duration_seconds']);
             if ($unavailable) { $this->agi->play($prompts['partial']); }
             $this->agi->play($prompts['ready']);
-            $this->agi->page(implode('&', $dial), min(5, max(1, (int)($settings['paging_answer_timeout'] ?? 5))), $config['max_duration_seconds']);
+            $voicemail = $this->agi->startVoicemailRecording($admission, $config['max_duration_seconds']);
+            if (!$dial) {
+                if (($voicemail['status'] ?? '') !== 'recording') {
+                    $this->agi->play($prompts['unavailable']);
+                    return ['status' => 'voicemail_recording_unavailable', 'voicemail' => $voicemail];
+                }
+                $this->agi->recordOnly($config['max_duration_seconds']);
+            } else {
+                $this->agi->page(implode('&', $dial), min(5, max(1, (int)($settings['paging_answer_timeout'] ?? 5))), $config['max_duration_seconds']);
+            }
         } finally {
             try { $completion = $this->agi->finishGroupNotification(); }
             catch (\Throwable $error) { $completion = ['status' => 'failed']; }
@@ -1017,7 +1102,7 @@ final class LivePagingSession
         }
         return ['status' => 'page_ended', 'group_id' => $group['group_id'], 'requested_recipients' => count($recipients),
             'unavailable_recipients' => $unavailable, 'dialed_contacts' => count($dial), 'text_notification' => $notification,
-            'text_completion' => $completion];
+            'text_completion' => $completion, 'voicemail' => $voicemail ?? ['status' => 'not_requested']];
         } finally { $this->state->releaseCallSlot(); }
     }
 }

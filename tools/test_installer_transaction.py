@@ -19,7 +19,7 @@ trace() { printf '%s\n' "$*" >>"$fixture/trace"; }
 mktemp() {
  case "$*" in
   '-d /tmp/sls-mass-notify-bootstrap.XXXXXX') command mktemp -d "$fixture/bootstrap.XXXXXX" ;;
-  '-d /tmp/sls-mass-notify-module-backup.XXXXXX') command mktemp -d "$fixture/module-backup.XXXXXX" ;;
+  *'.sls-mass-notify-recovery.XXXXXX') command mktemp -d "$fixture/modules/.sls-mass-notify-recovery.XXXXXX" ;;
   '/tmp/slsmassnotifyserver-config.XXXXXX') command mktemp "$fixture/config-backup.XXXXXX" ;;
   '/tmp/slsmassnotifyserver-pending.XXXXXX') command mktemp "$fixture/pending-backup.XXXXXX" ;;
   *) command mktemp "$@" ;;
@@ -33,6 +33,13 @@ acquire_maintenance_coordination() { trace maintenance-lock; }
 install_dependencies() { :; }
 preflight_platform() { :; }
 preflight_python() { :; }
+detect_served_php_profiles() { :; }
+verify_served_php_configuration() { :; }
+bootstrap_missing_dashboard() { :; }
+begin_install_transaction() { :; }
+retain_configuration_snapshots() { :; }
+check_interrupted_installation() { :; }
+preflight_profile_identity() { :; }
 ensure_freepbx_prerequisites() { :; }
 initialize_configuration_keyring() { trace config-keyring-init; }
 download_tgz() { DOWNLOAD_DIR="$fixture/download"; mkdir "$DOWNLOAD_DIR"; }
@@ -42,10 +49,10 @@ validate_preserved_config_prerequisites() { :; }
 validate_staged_central_config() { :; }
 verify_staged_hardware_requirements() { :; }
 stage_module_directory() {
- STAGING_DIR="$fixture/stage"; mkdir -m700 "$STAGING_DIR"; mkdir "$STAGING_DIR/$MODULE"
+ STAGING_DIR="${FIXTURE_STAGING:-$fixture/stage}"; mkdir -m700 "$STAGING_DIR"; mkdir "$STAGING_DIR/$MODULE"
  printf candidate >"$STAGING_DIR/$MODULE/module.xml"
  mkdir -p "$STAGING_DIR/$MODULE/bin/sls_mass_notify"
- cp "$FIXTURE_HELPERS"/sls_{module_trust,release_trust,privileged_install,installer_recovery,install_idle,install_guard,audio_state,config_crypto,upgrade_trust}.py "$STAGING_DIR/$MODULE/bin/sls_mass_notify/"
+ cp "$FIXTURE_HELPERS"/sls_{module_trust,release_trust,privileged_install,installer_recovery,install_transaction,install_idle,install_guard,audio_state,config_crypto,upgrade_trust,legacy_permissions}.py "$STAGING_DIR/$MODULE/bin/sls_mass_notify/"
  cp "$FIXTURE_HELPERS/freepbx-mirror-signing.pub" "$STAGING_DIR/$MODULE/bin/sls_mass_notify/"
  HAD_EXISTING_MODULE=1; MODULE_WAS_ENABLED=1
 }
@@ -58,6 +65,11 @@ prepare_authenticated_installer() {
  chmod 0600 "$RECOVERY_DIR/idle-before.json"
  STATIC_MUTATION_STARTED=1
 }
+commit_authenticated_installer() { trace approved-snapshot; }
+protect_freepbx_chown_permissions() { trace chown-protected; }
+repair_authenticated_legacy_permissions() { trace legacy-permissions-repaired; }
+preflight_authenticated_prerequisites() { trace approved-prerequisites; }
+restore_previous_phone_collector() { trace previous-collector-healthy; }
 configure_system_timezone() { trace timezone; }
 protected_install_phase() {
  trace "protected-$*"
@@ -76,6 +88,7 @@ sls_as_asterisk() { trace "asterisk-fixed-command"; }
 verify_runtime_shell_syntax() { :; }
 verify_announcement_worker_health() { :; }
 verify_piper_voices() { :; }
+verify_served_php_runtime() { trace served-php; }
 verify_install() { trace verification; if [ "$scenario" = pending-drift ]; then printf modified >"$DATA_DIR/mass-notifications.pending.config"; fi; [ "$scenario" != final-failed ] || return 34; }
 verify_confirmed_system_timezone() { :; }
 clear_install_failure() { trace success; }
@@ -89,7 +102,7 @@ main
 
 @unittest.skipUnless(os.geteuid()==0,'requires root for protected staging/worker lock fixtures')
 class TransactionTests(unittest.TestCase):
- def run_case(self,scenario,expected):
+ def run_case(self,scenario,expected,cross_mount=False):
   with tempfile.TemporaryDirectory(prefix='sls-installer-transaction-') as name:
    root=Path(name); data=root/'data';data.mkdir();config=data/'mass-notifications.config';config.write_text('{"preserve":"exact bytes"}\n')
    module=root/'modules/slsmassnotifyserver';module.mkdir(parents=True);(module/'module.xml').write_text('original')
@@ -98,7 +111,13 @@ class TransactionTests(unittest.TestCase):
    installer=root/'installer.sh';installer.write_text(SOURCE.replace('/var/www/html/admin/modules',str(root/'modules')))
    (root/'recovery.py').write_text('import pathlib,sys\np=pathlib.Path(__file__).parent\nwith (p/"trace").open("a") as f:f.write("static-"+sys.argv[-1]+"\\n")\nif sys.argv[-1]=="restore-maintenance":sys.exit(1)\n')
    (root/'idle.py').write_text('import json\nprint(json.dumps({"ok":True}))\n')
-   result=subprocess.run(['bash','-c',HARNESS,'fixture',str(installer),str(root),scenario],capture_output=True,text=True,timeout=20,env={**os.environ,'FIXTURE_HELPERS':str(ROOT/'slsmassnotifyserver/bin/sls_mass_notify')})
+   environment={**os.environ,'FIXTURE_HELPERS':str(ROOT/'slsmassnotifyserver/bin/sls_mass_notify')}
+   if cross_mount:
+    separate=Path(tempfile.mkdtemp(prefix='sls-stage-parent-',dir='/run'))
+    self.addCleanup(__import__('shutil').rmtree,separate,True)
+    self.assertNotEqual(separate.stat().st_dev,module.stat().st_dev,'cross-mount regression requires the isolated test namespaces')
+    environment['FIXTURE_STAGING']=str(separate/'stage')
+   result=subprocess.run(['bash','-c',HARNESS,'fixture',str(installer),str(root),scenario],capture_output=True,text=True,timeout=20,env=environment)
    self.assertEqual(result.returncode,expected,result.stdout+result.stderr)
    self.assertEqual(config.read_text(),'{"preserve":"exact bytes"}\n')
    self.assertEqual((data/'delivery-ledger').read_text(),'current receipt')
@@ -110,20 +129,30 @@ class TransactionTests(unittest.TestCase):
     self.assertLess(trace.index('protected-activate --apply'),trace.index('asterisk-fwconsole-reload'))
     self.assertLess(trace.index('asterisk-fwconsole-reload'),trace.index('protected-verify'))
     self.assertEqual(trace[-1],'success')
+    phases=['approval-preflight','chown-protected','legacy-permissions-repaired','approved-prerequisites','previous-collector-healthy','approved-snapshot','protected-prepare --apply']
+    self.assertEqual([trace.index(item) for item in phases],sorted(trace.index(item) for item in phases))
     self.assertFalse((root/'recovery').exists())
    else:
     self.assertEqual((module/'module.xml').read_text(),'original')
     if scenario=='approval-rejected':
      self.assertFalse(any(x.startswith('static-') for x in trace))
      self.assertIn('failure-31-install_command_failed',trace)
+     self.assertNotIn('chown-protected',trace)
+     self.assertNotIn('legacy-permissions-repaired',trace)
     else:
      self.assertIn('static-restore',trace);self.assertIn('static-restore-services',trace);self.assertIn('db-restored',trace)
      self.assertTrue((root/'recovery/idle-before.json').exists())
      self.assertIn('failure-'+str(expected)+'-install_rollback_failed',trace)
    # The EXIT guard always releases worker slots, including every failure path.
    import fcntl
-   with (data/'schedule-runner.lock').open('r+') as handle:fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
+   if scenario!='approval-rejected':
+    with (data/'schedule-runner.lock').open('r+') as handle:fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
+   else:
+    self.assertFalse((data/'schedule-runner.lock').exists())
  def test_successful_candidate_transaction(self):self.run_case('success',0)
+ def test_separate_scratch_mount_supports_activation_and_rollback(self):
+  self.run_case('success',0,True)
+  self.run_case('final-failed',34,True)
  def test_prerequisite_rejection_does_not_restore_or_disable_old_automation(self):self.run_case('approval-rejected',31)
  def test_failure_stages_preserve_old_module_config_and_operational_records(self):
   for scenario,code in [('prepare-failed',32),('install-failed',33),('final-failed',34),('pending-drift',1)]:

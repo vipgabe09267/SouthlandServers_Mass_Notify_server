@@ -285,7 +285,7 @@ with tempfile.TemporaryDirectory(prefix="sls-system-email-retry-") as directory:
 
     def rejected_sender(*_args, **_kwargs):
         rejected_calls.append(True)
-        return False
+        raise MODULE._email_module._mail_admission.MailAdmissionBlocked('mail_queue_full')
 
     try:
         MODULE.process_faults(
@@ -296,7 +296,7 @@ with tempfile.TemporaryDirectory(prefix="sls-system-email-retry-") as directory:
             now=2_000_000,
         )
     except RuntimeError as exc:
-        if "not accepted" not in str(exc):
+        if "backlog" not in str(exc):
             raise
     else:
         fail("a local mailer rejection was recorded as successful delivery")

@@ -55,6 +55,7 @@ trait SlsLivePaging
             }
             $next = array_replace(LivePagingConfig::defaults(), $input);
             $next['enabled'] = LivePagingConfig::flag($next['enabled']);
+            $next['voicemail_enabled'] = LivePagingConfig::flag($input['voicemail_enabled'] ?? $previous['voicemail_enabled'] ?? '1');
             $next['max_duration_seconds'] = $this->livePagingInteger($next['max_duration_seconds']);
             // Large recipient selectors travel as bounded JSON fields so PHP's
             // max_input_vars cannot silently discard any configured recipient.
@@ -243,6 +244,7 @@ trait SlsLivePaging
             'active_paging_enabled' => $active['enabled'] === '1', 'active_paging_extension' => $active['extension'],
             'has_pending_changes' => $this->getPendingSettings() !== null,
             'announcement_groups' => $settings['announcement_groups'] ?? [], 'available_extensions' => $extensions,
+            'phone_inventory' => $this->phoneDisplayInventory(),
             'available_ivrs' => $this->getLivePagingIvrs(),
             'save_result' => $params['save_result'] ?? null, 'csrf_token' => $this->getCsrfToken(), 'hero_image' => self::HERO_IMAGE]);
     }

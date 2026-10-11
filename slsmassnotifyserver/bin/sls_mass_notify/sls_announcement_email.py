@@ -23,6 +23,9 @@ sys.dont_write_bytecode = True
 _cluster_spec = importlib.util.spec_from_file_location('sls_cluster_guard', Path(__file__).resolve().with_name('sls_cluster_guard.py'))
 _cluster_guard = importlib.util.module_from_spec(_cluster_spec)
 _cluster_spec.loader.exec_module(_cluster_guard)
+_mail_spec = importlib.util.spec_from_file_location('sls_announcement_mail_admission', Path(__file__).resolve().with_name('sls_mail_admission.py'))
+_mail_admission = importlib.util.module_from_spec(_mail_spec)
+_mail_spec.loader.exec_module(_mail_admission)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sls_branded_email import (LOGO_PATHS, build_announcement_html,
@@ -156,6 +159,7 @@ def submit(payload, *, sendmail=SENDMAIL, timeout=TIMEOUT, logo_paths=LOGO_PATHS
     wire = build_message(payload, logo_paths=logo_paths)
     claim = None
     try:
+        _mail_admission.reserve('alert', 1)
         created_at = int(datetime.fromisoformat(payload['created_at'].replace('Z', '+00:00')).timestamp())
         claim = _cluster_guard.begin('email', payload['recipient_id'], payload,
                                      delivery_id='email-' + __import__('hashlib').sha256(payload['message_id'].encode()).hexdigest(),
@@ -165,6 +169,10 @@ def submit(payload, *, sendmail=SENDMAIL, timeout=TIMEOUT, logo_paths=LOGO_PATHS
                     start_new_session=True, close_fds=True, env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C'})
     except _cluster_guard.ClusterFenced:
         return outcome(payload, 'rejected', 'cluster_authority_unavailable', 'Cluster exclusive authority is unavailable; no email process was started.', False)
+    except _mail_admission.MailAdmissionBlocked as error:
+        result = outcome(payload, 'rejected', error.code, str(error), False)
+        result['submission_started'] = False
+        return result
     except OSError:
         return outcome(payload, 'rejected', 'sendmail_unavailable', 'The PBX mail submission program could not start. Check local mail service installation and permissions.', True)
     try:

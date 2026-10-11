@@ -41,6 +41,24 @@ class DesktopHttpFleetTests(unittest.TestCase):
         cls.runtime=pwd.getpwnam('asterisk'); cls.root.chmod(0o750); os.chown(cls.root,cls.runtime.pw_uid,cls.runtime.pw_gid)
         cls.server_root=cls.root/'apache';cls.server_root.mkdir(mode=0o700);os.chown(cls.server_root,cls.runtime.pw_uid,cls.runtime.pw_gid)
         api=cls.root/'api';shutil.copytree(ROOT/'slsmassnotifyserver/api',api)
+        module=cls.root/'module';shutil.copytree(ROOT/'slsmassnotifyserver',module)
+        for target in [module,*module.rglob('*')]:
+            if target.is_symlink():continue
+            target.chmod(0o755 if target.is_dir() else 0o644)
+            os.chown(target,0,0)
+        # Exercise the module's inventory read during polling, without a real
+        # FreePBX database/theme. This is a dashboard-path surrogate, not full
+        # PBX dashboard or sustained 1000-client workload certification.
+        (api/'dashboard.php').write_text('''<?php
+interface BMO {}
+require '''+repr(str(module/'Slsmassnotifyserver.class.php'))+''';
+$class=new ReflectionClass(FreePBX\\modules\\Slsmassnotifyserver::class);
+$module=$class->newInstanceWithoutConstructor();
+$extensions=$class->getMethod('getRegisteredPjsipExtensions')->invoke($module);
+header('Content-Type: application/json');header('Cache-Control: no-store');
+echo json_encode(['ok'=>true,'registered'=>count($extensions)]);
+''')
+        (api/'dashboard.php').chmod(0o644)
         # Only synthetic data is writable in the namespace. All host files and
         # the repository are mounted read-only by the required wrapper.
         DATA.mkdir(parents=True,exist_ok=True);os.chown(DATA,cls.runtime.pw_uid,cls.runtime.pw_gid);DATA.chmod(0o750)
@@ -105,6 +123,9 @@ php_admin_value error_log "{cls.server_root}/php-error.log"
         ''')
         raw=subprocess.check_output(['php',str(encrypt),str(cls.count),str(cls.port)],timeout=5)
         cls.write_state('mass-notifications.config',raw);cls.events([])
+        cls.write_state('phone-endpoint-inventory.json',json.dumps({'schema':1,'display_only':True,
+            'observed_at':dt.datetime.now(dt.timezone.utc).isoformat(),'expires_at':time.time()+90,
+            'endpoints':{'1000':{'formats':['yealink'],'contacts':[{'format':'yealink'}]}}}).encode())
         cls.context=ssl.create_default_context(cafile=str(cert))
         cls.process=subprocess.Popen(['/usr/sbin/apache2','-f',str(config),'-DFOREGROUND'],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,start_new_session=True)
         try:
@@ -112,7 +133,9 @@ php_admin_value error_log "{cls.server_root}/php-error.log"
             while time.monotonic()<deadline:
                 if cls.process.poll() is not None:raise RuntimeError(cls.process.stderr.read().decode())
                 try:
-                    if cls.request(0)[0]==200:break
+                    if cls.request(0)[0]==200:
+                        if cls.request(0,'/dashboard.php')[0]!=200:raise RuntimeError('Private dashboard surrogate was unavailable.')
+                        break
                 except (OSError,http.client.HTTPException):pass
                 time.sleep(.05)
             else:raise RuntimeError('Private Apache did not become ready.')
@@ -153,7 +176,12 @@ php_admin_value error_log "{cls.server_root}/php-error.log"
             response=connection.getresponse()
             if raw:return connection,response
             body=response.read(1024*1024)
-            return response.status,json.loads(body),time.monotonic()-started,dict(response.headers)
+            try: value=json.loads(body)
+            except ValueError:
+                log=cls.server_root/'php-error.log'
+                detail=log.read_text(errors='replace')[-4000:] if log.is_file() else body[:500].decode(errors='replace')
+                raise RuntimeError('Private fixture endpoint returned non-JSON: '+path+' HTTP '+str(response.status)+' '+detail) from None
+            return response.status,value,time.monotonic()-started,dict(response.headers)
         finally:
             if not raw:connection.close()
 
@@ -161,10 +189,19 @@ php_admin_value error_log "{cls.server_root}/php-error.log"
         recipients=['fixture-'+str(i) for i in range(self.count)]
         self.events([self.event('fixture-first',recipients),self.event('fixture-private',['fixture-0']),self.event('fixture-second',recipients)])
         timings=[]
+        dashboard=[]
+        initial_cpu=self.apache_resources()
         with ThreadPoolExecutor(max_workers=8) as pool:
             for round_number in range(3):
                 started=time.monotonic()
-                results=list(pool.map(lambda client:self.request(client,'/api/sipnotify/desktop?last_event_id=%40sls%3Aempty'),range(self.count)))
+                def poll(client):
+                    value=self.request(client,'/api/sipnotify/desktop?last_event_id=%40sls%3Aempty')
+                    if client % max(1,self.count//10)==0:
+                        probe=self.request(client,'/dashboard.php')
+                        self.assertEqual(probe[0],200,probe[1]);self.assertTrue(probe[1]['ok'])
+                        dashboard.append(probe[2])
+                    return value
+                results=list(pool.map(poll,range(self.count)))
                 for client,(status,body,elapsed,headers) in enumerate(results):
                     self.assertEqual(status,200,(client,body));self.assertTrue(body['ok']);self.assertIn('no-store',headers['Cache-Control'])
                     ids=[event['id'] for event in body['events']]
@@ -186,10 +223,27 @@ php_admin_value error_log "{cls.server_root}/php-error.log"
         self.assertEqual(len({row['username'] for row in actual if row['event_id']=='fixture-second'}),self.count)
         print(json.dumps({'clients':self.count,'poll_requests':self.count*3,'receipt_requests':self.count+2,
                           'poll_p95_ms':round(sorted(timings)[int(len(timings)*.95)-1]*1000,3),
-                          'poll_mean_ms':round(statistics.mean(timings)*1000,3),'production_requests':0,'protocol':'actual private HTTPS Apache/mod_php'}),flush=True)
+                          'poll_mean_ms':round(statistics.mean(timings)*1000,3),
+                          'dashboard_surrogate_p95_ms':round(sorted(dashboard)[int(len(dashboard)*.95)-1]*1000,3),
+                          'resources_before':initial_cpu,'resources_after':self.apache_resources(),
+                          'parallel_poll_workers':8,'sustained_load_certification':False,
+                          'production_requests':0,'protocol':'actual private HTTPS Apache/mod_php'}),flush=True)
+
+    @classmethod
+    def apache_resources(cls):
+        records=[]
+        for entry in Path('/proc').iterdir():
+            if not entry.name.isdigit():continue
+            try:
+                fields=(entry/'stat').read_text().split()
+                if int(entry.name)!=cls.process.pid and int(fields[3])!=cls.process.pid:continue
+                records.append((int(fields[13])+int(fields[14]),int(fields[23])))
+            except (OSError,ValueError,IndexError):continue
+        return {'processes':len(records),'cpu_ticks':sum(row[0] for row in records),
+                'rss_bytes':sum(row[1] for row in records)*os.sysconf('SC_PAGE_SIZE')}
 
     def test_actual_http_sse_heartbeat_disconnect_and_reuse(self):
-        connection,response=self.request(0,'/api/sipnotify/desktop/stream?stream_seconds=20',raw=True)
+        connection,response=self.request(0,'/api/sipnotify/desktop/stream?stream_seconds=300',raw=True)
         try:
             self.assertEqual(response.status,200);self.assertIn('text/event-stream',response.getheader('Content-Type'))
             def frame():
@@ -204,11 +258,21 @@ php_admin_value error_log "{cls.server_root}/php-error.log"
             self.assertIn(b'"protocol_version":2',got);began=time.monotonic();got=b''
             while b': keepalive ' not in got:got+=frame()
             self.assertGreater(time.monotonic()-began,10);self.assertLess(time.monotonic()-began,18)
-        finally:response.close();connection.close()
-        # Output on the next heartbeat detects a disconnected socket. A slot
-        # must become reusable by the normal endpoint lifetime, without repair.
-        deadline=time.monotonic()+22
+        finally:
+            # HTTPResponse can own the transport after HTTPConnection detaches
+            # it. Closing only the wrapper need not close that active socket.
+            active=connection.sock
+            if active is None and response.fp is not None:
+                active=getattr(getattr(response.fp,'raw',None),'_sock',None)
+            self.assertIsNotNone(active,'The disconnect fixture lost its active transport.')
+            try:active.shutdown(socket.SHUT_RDWR)
+            except OSError:pass
+            response.close();connection.close()
+        # Check actual early-disconnect cleanup, not the natural 300-second
+        # endpoint deadline. Proxy/TCP propagation can require later flushes.
+        deadline=time.monotonic()+50
         paths=list((DATA/'sipnotify/stream-slots').glob('*.lock'))
+        self.assertGreaterEqual(len(paths),2,'The stream never created its capacity slots.')
         while time.monotonic()<deadline:
             reusable=True
             for path in paths:
@@ -217,9 +281,19 @@ php_admin_value error_log "{cls.server_root}/php-error.log"
                     except BlockingIOError:reusable=False
             if reusable:break
             time.sleep(.1)
-        self.assertTrue(reusable,'SSE slots survived an actual HTTP disconnect.')
+        self.assertTrue(reusable,'SSE slots remained occupied 50 seconds after an actual early HTTP disconnect.')
         _,replacement=self.request(0,'/api/sipnotify/desktop/stream?stream_seconds=1',raw=True)
         self.assertEqual(replacement.status,200);replacement.read();replacement.close()
 
 
-if __name__=='__main__':unittest.main(verbosity=2)
+if __name__=='__main__':
+    matrix=os.environ.get('SLS_FLEET_MATRIX')
+    if matrix:
+        counts=[int(value) for value in matrix.split(',')]
+        if not counts or len(counts)>4 or any(value not in (100,250,500,1000) for value in counts):
+            raise SystemExit('Fleet matrix accepts up to four populations:100,250,500,1000.')
+        for count in counts:
+            os.environ['SLS_FLEET_CLIENTS']=str(count)
+            result=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(DesktopHttpFleetTests))
+            if not result.wasSuccessful():raise SystemExit(1)
+    else:unittest.main(verbosity=2)

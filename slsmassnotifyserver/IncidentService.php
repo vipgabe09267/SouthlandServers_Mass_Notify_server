@@ -8,11 +8,12 @@ require_once __DIR__ . '/IncidentStore.php';
 final class IncidentService
 {
     private IncidentStore $store;
-    private $template; private $freeze; private $send; private $job; private $clock;
-    public function __construct(IncidentStore $store, callable $template, callable $freeze, callable $send, callable $job, ?callable $clock = null)
+    private $template; private $freeze; private $send; private $job; private $clock; private $languages;
+    public function __construct(IncidentStore $store, callable $template, callable $freeze, callable $send, callable $job, ?callable $clock = null, ?callable $languages = null)
     {
         $this->store = $store; $this->template = $template; $this->freeze = $freeze; $this->send = $send; $this->job = $job;
         $this->clock = $clock ?? static fn(): int => time();
+        $this->languages = $languages;
     }
     private function now(): int { return (int)($this->clock)(); }
     private function at(): string { return gmdate('c', $this->now()); }
@@ -67,8 +68,14 @@ final class IncidentService
             $planned = gmdate('c', $timestamp);
         }
         $template['delivery'] = ($this->freeze)($template['delivery'], $language);
+        if ($this->languages !== null) {
+            $template['_language_delivery'] = ($this->languages)($template, $template['delivery'], $input['fields'] ?? [], $language, $test);
+        }
         if ($template['escalation']['enabled']) {
-            foreach ($template['escalation']['steps'] as &$step) { $step['delivery'] = ($this->freeze)($step['delivery'], $language); } unset($step);
+            foreach ($template['escalation']['steps'] as &$step) {
+                $step['delivery'] = ($this->freeze)($step['delivery'], $language);
+                if ($this->languages !== null) { $step['_language_delivery'] = ($this->languages)($template, $step['delivery'], $input['fields'] ?? [], $language, $test); }
+            } unset($step);
             $template['escalation']['delivery'] = $template['escalation']['steps'][0]['delivery'];
         }
         foreach ($template['roster'] as $person) {
@@ -104,7 +111,7 @@ final class IncidentService
         }
         foreach ($record['operations'] as $operation) {
             if ($operation['state'] === 'submitting') { throw new \RuntimeException('An incident submission has not confirmed its job. Refresh the incident and review uncertainty before sending again.'); }
-            if ($operation['state'] === 'awaiting_approval') { throw new \DomainException('This incident has a message awaiting approval. Submit or reject that review before sending another update.'); }
+            if ($operation['state'] === 'awaiting_approval' || in_array('awaiting_approval',array_column($operation['language_jobs'] ?? [],'state'),true)) { throw new \DomainException('This incident has a message awaiting approval. Submit or reject that review before sending another update.'); }
         }
         if ($record['is_test'] && !str_starts_with($message, 'DRILL / TEST. ')) { $message = IncidentConfig::text('DRILL / TEST. ' . $message, 500, 'Drill message including its required label'); }
         $record['operations'][$request] = ['request_id' => $request, 'fingerprint' => $fingerprint,
@@ -124,6 +131,9 @@ final class IncidentService
         }
         $context = ['schema' => 1, 'incident_id' => $id, 'sequence' => $operation['sequence'], 'kind' => $operation['kind'],
             'severity' => $record['severity'], 'is_test' => $record['is_test']];
+        $batches = $record['template']['_language_delivery'] ?? [];
+        if ($operation['kind'] === 'escalation') { $batches = $steps[$number - 1]['_language_delivery'] ?? []; }
+        if ($batches) { return $this->dispatchLanguages($record, $request, $delivery, $batches, $context); }
         try {
             $result = ($this->send)($delivery, $operation['message'], $record['title'], $context, $operation['actor']);
             if (!is_array($result)) { throw new \RuntimeException('Invalid announcement response.'); }
@@ -151,21 +161,102 @@ final class IncidentService
             return $record;
         });
     }
+
+    private function dispatchLanguages(array $record, string $request, array $fallbackDelivery, array $batches, array $context): array
+    {
+        if (!array_is_list($batches) || count($batches) > 7) { throw new \RuntimeException('Frozen incident language batches are invalid. No automatic replay is allowed.'); }
+        $operation = $record['operations'][$request];
+        foreach ($batches as &$batch) {
+            if($operation['kind']==='escalation'){
+                if(!in_array(explode('-',$batch['locale'])[0],['en','es','fr','de','pt'],true)&&$batch['locale']!==''){
+                    $batch['locale']=$record['language_variant'];$batch['title']=$record['title'];
+                    if(isset($fallbackDelivery['_speech'])&&in_array($batch['delivery']['audio_mode'],['tts','tones_tts'],true))$batch['delivery']['_speech']=$fallbackDelivery['_speech'];
+                }
+                $batch['message']=IncidentConfig::escalationMessage($batch['title'],$this->counts($record),$batch['locale']);
+            }
+            if (!in_array($operation['kind'], ['initial','escalation'], true)) {
+                // Updates need their own reviewed translation. Without one,
+                // send the operator's base wording and matching base voice.
+                $translation = $operation['language_messages'][$batch['locale']] ?? null;
+                $batch['message'] = $translation['message'] ?? $operation['message'];
+                if ($translation === null) {
+                    $batch['locale'] = $record['language_variant']; $batch['title'] = $record['title'];
+                    if (isset($fallbackDelivery['_speech']) && in_array($batch['delivery']['audio_mode'],['tts','tones_tts'],true)) { $batch['delivery']['_speech'] = $fallbackDelivery['_speech']; }
+                }
+            }
+            if ($record['is_test'] && !str_starts_with($batch['message'], 'DRILL / TEST. ')) { $batch['message'] = IncidentConfig::text('DRILL / TEST. '.$batch['message'], 500, 'Drill message'); }
+            $batch += ['state'=>'not_submitted','job_id'=>'','error'=>''];
+        } unset($batch);
+        $this->store->transaction($record['id'], function(array $current) use ($request, $batches): array {
+            $current['operations'][$request]['language_jobs'] = $batches;
+            return $current;
+        });
+        $expiry = gmdate('c', (strtotime($operation['claimed_at']) ?: $this->now()) + 600);
+        foreach ($batches as $index => $batch) {
+            $childContext = $context + ['operation_request_id'=>$request, 'language_variant'=>$batch['locale'],
+                'language_batch'=>$index+1, 'language_batches'=>count($batches), 'expires_at'=>$expiry];
+            $this->store->transaction($record['id'], function(array $current) use($request,$index): array {
+                $current['operations'][$request]['language_jobs'][$index]['state'] = 'submitting'; return $current;
+            });
+            try {
+                $result = ($this->send)($batch['delivery'], $batch['message'], $batch['title'], $childContext, $operation['actor']);
+                if (!is_array($result)) { throw new \RuntimeException('Invalid language submission response.'); }
+            }
+            catch (\Throwable $error) { $result = ['success'=>false,'message'=>'Language submission result could not be confirmed. Inspect its jobs; do not replay automatically.']; }
+            $state = 'uncertain'; $job = $result['job_id'] ?? ''; $review = '';
+            if (is_string($job) && preg_match('/^job_[a-f0-9]{32}$/D', $job)) { $state = 'queued'; }
+            elseif (($result['awaiting_approval'] ?? false) === true && is_string($result['review_id'] ?? null) && preg_match('/^review_[a-f0-9]{32}$/D', $result['review_id'])) { $state = 'awaiting_approval'; $review = $result['review_id']; }
+            elseif (($result['delivery_started'] ?? null) === false) { $state = 'not_submitted'; }
+            $this->store->transaction($record['id'], function(array $current) use($request,$index,$state,$job,$review,$result): array {
+                $row = &$current['operations'][$request]['language_jobs'][$index]; $row['state'] = $state;
+                $row['job_id'] = $state === 'queued' ? $job : '';
+                if ($review !== '') { $row['review_id'] = $review; }
+                $row['error'] = $state === 'queued' ? '' : IncidentConfig::text(is_string($result['message'] ?? null) ? $result['message'] : 'Language batch was not submitted.',1000,'Language delivery error');
+                return $current;
+            });
+            if ($state === 'uncertain') { break; }
+        }
+        return $this->store->transaction($record['id'], function(array $current) use($request): array {
+            $operation = &$current['operations'][$request]; $jobs = $operation['language_jobs'];
+            $queued = array_values(array_filter($jobs, static fn(array $row): bool => $row['state'] === 'queued'));
+            $operation['job_id'] = $queued[0]['job_id'] ?? '';
+            $operation['state'] = count($queued) === count($jobs) ? 'queued' : ($queued ? 'uncertain' : 'not_submitted');
+            $states=array_column($jobs,'state');
+            if (in_array('uncertain',$states,true)) { $operation['state']='uncertain'; }
+            elseif (in_array('awaiting_approval',$states,true)) { $operation['state']='awaiting_approval';foreach ($jobs as $row) { if ($row['state']==='awaiting_approval') { $operation['review_id']=$row['review_id'];break; } } }
+            $operation['error'] = $operation['state'] === 'queued' ? '' : 'Not every language batch has a durable accepted job. Inspect each batch before any further send.';
+            $operation['finished_at'] = $this->at();
+            if ($queued && $current['opened_at'] === '' && $operation['kind'] === 'initial') { $current['opened_at']=$this->at(); }
+            if ($operation['kind'] === 'all_clear' && $operation['state'] === 'queued') { $current['state']='closed';$current['closed_at']=$this->at(); }
+            $this->event($current,'language_submission_'.$operation['state'],$operation['actor'],['request_id'=>$request,'batches'=>count($jobs),'accepted'=>count($queued)]);
+            return $current;
+        });
+    }
     public function update(string $id, array $input, array $actor): array
     {
-        $input = IncidentConfig::object($input, ['request_id', 'kind', 'message'], 'Incident update');
+        $input = IncidentConfig::object($input, ['request_id', 'kind', 'message', 'language_messages'], 'Incident update');
         $request = self::requestId($input['request_id'] ?? ''); $actor = self::actor($actor);
         $kind = $input['kind'] ?? 'update';
         if (!in_array($kind, ['update', 'all_clear'], true)) { throw new \InvalidArgumentException('Send a separate update or explicit all-clear. Sent announcements cannot be edited or cancelled.'); }
         $message = IncidentConfig::text($input['message'] ?? '', 500, 'Update message');
+        $translations = [];
+        foreach (IncidentConfig::listOf($input['language_messages'] ?? [], 6, 'Reviewed update languages') as $row) {
+            $row = IncidentConfig::object($row, ['locale','message','review_note','reviewed'], 'Reviewed update language');
+            $locale = strtolower(IncidentConfig::identifier($row['locale'] ?? '', '/^[a-zA-Z]{2,3}(?:-[a-zA-Z0-9]{2,8}){0,3}$/D', 'Update language'));
+            if (isset($translations[$locale]) || !IncidentConfig::flag($row['reviewed'] ?? false, 'Update language review')) { throw new \InvalidArgumentException('Update languages must be unique and reviewed.'); }
+            $translations[$locale] = ['message'=>IncidentConfig::text($row['message'] ?? '',500,'Reviewed update'), 'review_note'=>IncidentConfig::text($row['review_note'] ?? '',100,'Reviewer and revision')];
+        }
         $fingerprint = self::fingerprint($input + ['actor' => $actor]); $claimed = false;
-        $record = $this->store->transaction($id, function (array $record) use (&$claimed, $request, $kind, $message, $actor, $fingerprint): array {
+        $record = $this->store->transaction($id, function (array $record) use (&$claimed, $request, $kind, $message, $actor, $fingerprint, $translations): array {
             if (isset($record['operations'][$request])) {
                 if (!hash_equals($record['operations'][$request]['fingerprint'], $fingerprint)) { throw new \InvalidArgumentException('Request identifier already belongs to another update.'); }
                 return $record;
             }
             if ($record['state'] !== 'open') { throw new \InvalidArgumentException('Only an open incident accepts new announcements.'); }
+            $locales=array_column($record['template']['language_variants'] ?? [],'locale');
+            if (array_diff(array_keys($translations),$locales)) { throw new \InvalidArgumentException('Update translations must use a reviewed language in the frozen incident template.'); }
             $this->claim($record, $request, $kind, $message, $actor, $fingerprint); $claimed = true;
+            if ($translations) { $record['operations'][$request]['language_messages'] = $translations; }
             return $record;
         });
         if ($claimed) { $record = $this->dispatch($id, $request); }
@@ -254,6 +345,15 @@ final class IncidentService
                 try { $operation['delivery'] = ($this->job)($operation['job_id']); }
                 catch (\Throwable $error) { $operation['delivery'] = ['success' => false, 'message' => 'Announcement job details are temporarily unavailable.']; }
             }
+            if ($jobs && isset($operation['language_jobs'])) {
+                foreach ($operation['language_jobs'] as &$batch) {
+                    if ($batch['job_id'] === '') { continue; }
+                    if ($batch['job_id'] === $operation['job_id']) { if(isset($operation['delivery'])){$batch['delivery_result']=$operation['delivery'];}continue; }
+                    if (++$count > 10 || microtime(true) > $deadline) { $out['delivery_details_incomplete']=true; break; }
+                    try { $batch['delivery_result']=($this->job)($batch['job_id']); }
+                    catch (\Throwable $error) { $batch['delivery_result']=['success'=>false,'state'=>'missing','message'=>'Language delivery details are unavailable.']; }
+                } unset($batch);
+            }
         }
         unset($operation); return $out;
     }
@@ -264,7 +364,13 @@ final class IncidentService
         if (!$person || !in_array($username, $record['template']['delivery']['desktop_clients'], true)) { throw new \InvalidArgumentException('This desktop is not a participant in the incident.'); }
         $events = [];
         foreach ($record['operations'] as $operation) {
-            if ($operation['kind'] !== 'escalation') { $events[] = array_intersect_key($operation, array_flip(['sequence', 'kind', 'message', 'state', 'claimed_at', 'job_id'])); }
+            if ($operation['kind'] !== 'escalation') {
+                $event=array_intersect_key($operation,array_flip(['sequence','kind','message','state','claimed_at','job_id']));
+                foreach ($operation['language_jobs'] ?? [] as $batch) {
+                    if(in_array($username,$batch['delivery']['desktop_clients'],true)){$event['message']=$batch['message'];$event['state']=$batch['state'];$event['job_id']=$batch['job_id'];$event['language_variant']=$batch['locale'];break;}
+                }
+                $events[]=$event;
+            }
         }
         return ['success' => true, 'schema' => 1, 'id' => $record['id'], 'title' => $record['title'], 'severity' => $record['severity'],
             'state' => $record['state'], 'is_test' => $record['is_test'], 'created_at' => $record['created_at'],
@@ -312,7 +418,7 @@ final class IncidentService
     /** Complete report data in bounded pages; a revision prevents mixed incident histories. */
     public function report(string $id, int $offset = 0, string $revision = ''): array
     {
-        if ($offset < 0 || $offset > 250 || ($revision !== '' && !preg_match('/^[a-f0-9]{64}$/D', $revision))) {
+        if ($offset < 0 || $offset > 1750 || ($revision !== '' && !preg_match('/^[a-f0-9]{64}$/D', $revision))) {
             throw new \InvalidArgumentException('Incident report position or revision is invalid.');
         }
         $record = $this->store->read($id); if (!$record) { throw new \InvalidArgumentException('Incident was not found.'); }
@@ -320,16 +426,24 @@ final class IncidentService
         if (($offset > 0 && $revision === '') || ($revision !== '' && !hash_equals($current, $revision))) {
             throw new \InvalidArgumentException('Incident history changed during export. Restart the export for a consistent report.');
         }
-        $out = $this->summary($record); $keys = array_keys($out['operations']);
+        $out = $this->summary($record); $keys = [];
+        foreach ($out['operations'] as $key=>$operation) {
+            if (isset($operation['language_jobs'])) {
+                foreach ($operation['language_jobs'] as $index=>$batch) { $keys[]=[$key,$index]; }
+            } else { $keys[]=[$key,null]; }
+        }
         if ($offset > count($keys)) { throw new \InvalidArgumentException('Incident report position is beyond its history.'); }
         $deadline = microtime(true) + 3; $read = 0; $next = $offset; $available = true;
         while ($next < count($keys)) {
             if ($read >= 10 || ($read > 0 && microtime(true) >= $deadline)) { break; }
-            $operation = &$out['operations'][$keys[$next]];
-            if ($operation['job_id'] !== '') {
-                try { $operation['delivery'] = ($this->job)($operation['job_id']); }
-                catch (\Throwable $error) { $operation['delivery'] = ['success' => false, 'state' => 'missing', 'message' => 'Delivery history is unavailable; it may have expired under its separate retention policy.']; }
-                if (($operation['delivery']['job_id'] ?? '') !== $operation['job_id']) { $available = false; }
+            [$key,$batchIndex]=$keys[$next];$operation = &$out['operations'][$key];
+            $jobId=$batchIndex===null ? $operation['job_id'] : $operation['language_jobs'][$batchIndex]['job_id'];
+            if ($jobId !== '') {
+                try { $delivery = ($this->job)($jobId); }
+                catch (\Throwable $error) { $delivery = ['success' => false, 'state' => 'missing', 'message' => 'Delivery history is unavailable; it may have expired under its separate retention policy.']; }
+                if (($delivery['job_id'] ?? '') !== $jobId) { $available = false; }
+                if ($batchIndex===null || $jobId===$operation['job_id']) { $operation['delivery']=$delivery; }
+                if ($batchIndex!==null) { $operation['language_jobs'][$batchIndex]['delivery_result']=$delivery; }
                 $read++;
             }
             unset($operation); $next++;

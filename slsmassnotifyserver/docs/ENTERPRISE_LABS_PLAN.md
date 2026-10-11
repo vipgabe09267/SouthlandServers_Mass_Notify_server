@@ -24,7 +24,7 @@ Introduced in `0.1.5-beta`. All additions are disabled by default. Existing PBX 
 
 ## Excluded scope
 
-Managed mustering, mobile push, dynamic geofencing, temporary visitors, wearable panic badges and camera threat detection. Full FreePBX telephone-service clustering is separate from SLS notification failover.
+Managed mustering, native mobile app push, dynamic geofencing, temporary visitors, wearable panic badges and camera threat detection. Verified browser Web Push is included; it uses the browser's push service and does not require a native SLS application. Full FreePBX telephone-service clustering is separate from SLS notification failover.
 
 ## Dangerous-feature acknowledgment
 
@@ -40,14 +40,14 @@ The checkbox remains disabled for five seconds and displays the remaining time. 
 
 ## Completion evidence
 
-Implemented candidate: **0.1.5-beta**, unpublished. The following describes available software checks, not provider/hardware qualification or a production SLA. Every new master and subordinate feature remains disabled until explicitly configured and enabled.
+Current candidate: **0.1.6-beta**, under review. The following describes available software checks, not provider/hardware qualification or a production SLA. Every new master and subordinate feature remains disabled until explicitly configured and enabled.
 
 | Area | Implemented behavior and isolated checks | Remaining qualification |
 | --- | --- | --- |
 | Cluster and mirroring | Mutual TLS plus certificate pins, signed requests, witness authority, durable effect intent, queue/incident/schedule snapshots, takeover refusal after uncertainty, persistent replay fences and worker upgrade coordination. Real loopback TLS and disposable-node fault tests. | Separate PBXs/witness, real network partitions and power failure, carrier fencing and operational recovery. Full FreePBX telephony HA is outside this feature. |
 | Remote sites | Standalone PBX, site ownership and independent Linux/Pi browser/audio edge modes; explicit approved local cache, expiry, deduplication and bounded receipts. | Actual site hardware, WAN loss and browser audio policies. Cloud channels and new weather data require connectivity. |
 | Identity and directory | Explicit SAML/OIDC account grants for Entra, Okta, Google, Keycloak and OneLogin; maintained signature libraries, nonce/PKCE/issuer/audience checks; CSV, LDAP-TLS and SCIM preview/apply with stable identities. | Tenant credentials, actual IdP/directory policy, certificate rotation and deprovisioning acceptance. |
-| Subscribers | Hashed expiring email-verification proofs, person-bound browser responses, CSRF and durable replay protection. | Actual email-domain delivery and subscriber acceptance. |
+| Subscribers | Hashed expiring email-verification proofs, person-bound browser responses, optional RFC 8291 encrypted Web Push with VAPID, immutable queued browser recipients, CSRF and durable replay protection. | Actual email-domain delivery, browser push-service acceptance and subscriber acceptance. |
 | Speakers and physical systems | Registered PJSIP speaker profiles for Algo, CyberData, Axis, Valcom and AtlasIED; signed sensor/heartbeat examples and constrained Axis VAPIX door requests. | Exact models/firmware and physical alarm/door behavior. No automatic fire-alarm certification or generic access-control compatibility claim. |
 | Meetings and public warning | Fixed Zoom/Meet/Webex OAuth adapters, immutable request identities, CAP export and authority-provisioned SOAP bridge checks. | Provider credentials and real meetings; authorized warning authority, supplied WSDL/certificates and authority acceptance. No IPAWS certification claim. |
 | Human responses | Verified Twilio/Telnyx SMS callbacks and opt-in voice DTMF after completed playback; actual disposable Asterisk playback/DTMF tests. | Real provider/carrier behavior. Unsigned BulkVS callbacks cannot authorize human responses. Transport receipts remain separate. |

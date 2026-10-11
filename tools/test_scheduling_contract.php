@@ -214,7 +214,7 @@ foreach ([
 	'persistAppliedSettings($normalized, true, true)' => $class,
 	'$currentPendingFingerprint = $this->settingsFileFingerprint(self::PENDING_SETTINGS_JSON)' => $class,
 	'Another request changed the staged Mass Notifications settings.' => $class,
-	'/usr/bin/timeout 1200 /usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php' => $class,
+	"\$this->slsCronLine('scheduling')" => $class,
 	'data-schedule-metric="upcoming"' => $view,
 	'data-rendered-state=' => $view,
 	'Schedule recovery:' => $view,

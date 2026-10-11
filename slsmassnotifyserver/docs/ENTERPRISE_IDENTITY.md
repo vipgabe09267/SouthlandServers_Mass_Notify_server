@@ -1,4 +1,4 @@
-# Enterprise identity, directory sync and browser responses (Labs)
+# Enterprise identity, directory sync and browser subscribers (Labs)
 
 **DO NOT USE ON PRODUCTION SERVERS.** These independent Labs features start disabled. No provider registration, directory credential or recipient invitation is supplied automatically. Tenant-specific acceptance remains necessary: no Entra, Okta, Google Workspace, Keycloak or OneLogin credentials were available during development.
 
@@ -38,11 +38,15 @@ employee-42,Alex Morgan,alex@example.org,North building,alex.desktop,true
 employee-87,Jordan Lee,jordan@example.org,Workshop,,false
 ```
 
-LDAP is pull-only, using LDAPS or LDAP with mandatory StartTLS, a certificate-verifying TLS 1.2 minimum, explicit bind/search settings, disabled referrals, connection/search timeouts and mandatory bounded paging. A failed/partial/size-limited search never becomes an empty snapshot. Map an immutable `entryUUID` or `objectGUID`; binary GUIDs are encoded consistently before deriving local IDs. A configured filter is passed literally, with no interpolated user input. Map name/email/location/desktop fields only to the saved attribute names. For Active Directory, use an explicit filter excluding disabled accounts, for example `(&(objectCategory=person)(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))`; its bit flags are not interpreted by a generic string active-attribute mapping. Verify the server CA is trusted by the PHP/OpenLDAP runtime. LDAP runtime options/paging follow [PHP LDAP options](https://www.php.net/manual/en/function.ldap-set-option.php) and [PHP paged searches](https://www.php.net/manual/en/function.ldap-search.php).
+LDAP is pull-only, using LDAPS or LDAP with mandatory StartTLS, a certificate-verifying TLS 1.2 minimum, explicit bind/search settings, disabled referrals, connection/search timeouts and mandatory bounded paging. A failed/partial/size-limited search never becomes an empty snapshot. Map an immutable `entryUUID` or `objectGUID`; binary GUIDs are encoded consistently before deriving local IDs. A configured filter is passed literally, with no interpolated user input. Map name/email/location/desktop fields only to the saved attribute names. Map Active Directory's `userAccountControl` to the active field and set `ldap_inactive_mask: 2` to interpret its disabled bit; mask 0 uses the saved inactive string values. A configured active attribute must be present and valid. Alternatively, use an explicit disabled-account exclusion filter. Verify the server CA is trusted by the PHP/OpenLDAP runtime. LDAP runtime options/paging follow [PHP LDAP options](https://www.php.net/manual/en/function.ldap-set-option.php) and [PHP paged searches](https://www.php.net/manual/en/function.ldap-search.php).
 
 SCIM reads a configured HTTPS SCIM 2.0 service's `/Users?startIndex=<n>&count=200` with an encrypted bearer read token. It requires a valid complete ListResponse, stable total count across pages, boolean `active`, unique stable `id` values and at most 1000 users. Email is the primary address, or the sole address when no primary is marked. It does not expose an inbound SCIM provisioning server and does not claim that identity providers which only push SCIM offer a readable `/Users` service. No Entra/Google/Okta directory API is silently substituted. Protocol assumptions follow [SCIM 2.0 RFC 7644](https://www.rfc-editor.org/rfc/rfc7644.html).
 
+`scim_attributes` maps `external_id`, `name`, `location` and `desktop_username` through supported core/enterprise JSON pointers. Defaults use `/id` and `/displayName`; optional location/desktop mappings start empty. Ambiguous primary emails, malformed activity or mapped values, changing page counts and partial results reject the import.
+
 Run **dry run** to obtain an expiring operational plan and visible add/update/deactivate diff. Apply consumes that plan once and validates the current active configuration revision under the settings lock. Concurrent edits or expired plans require a new preview. The same reviewed records are reconciled into pending templates while retaining pending wording, delivery and manually managed roster edits. Collisions with local IDs or duplicate desktop assignments fail before writes. Empty complete snapshots deprovision prior imported people; they do not remove manual participants. An explicit **Preview all source deprovisioning** option supports disabling/removing any source without contacting its provider. Apply that reviewed empty snapshot before deleting a source or changing its template assignments.
+
+Each source sets `maximum_deactivation_percent` from 1–100, default 25. The preview returns `deactivation_count`, `deactivation_percent` and `requires_deactivation_confirmation`. When confirmation is required, Apply must include boolean `confirm_deactivation: true`. A missing confirmation consumes the one-use plan without changing rosters; run another preview, review its current diff and explicitly confirm. A preview expires after fifteen minutes.
 
 ## Browser subscribers
 
@@ -52,33 +56,51 @@ An administrator explicitly selects one subscriber and one open incident, then c
 
 The public `/mass-notify/subscriber.php` endpoint has a separate Secure/HttpOnly/SameSite=Strict session, verified HTTPS requirement, no public signup, no account enumeration, no cross-person roster listing, CSRF/origin checks, attempt limits, HTML escaping, no-referrer policy and no-store responses. Verified email possession opens only the bound participant's current incident wording and response. Supported human responses are `received`, `safe`, `needs_assistance` (“I need help”). Notes are bounded to 500 characters. Responses update the existing incident human response field with `source=human_browser_response`; delivery receipt records remain separate. Repeated response request IDs are idempotent; a reused ID for different details is rejected. Closed incidents reject new responses.
 
-SMS login, public enrollment, managed mustering, visitors, geofencing and mobile push are outside this feature.
+## Optional browser Web Push
+
+`subscriber_browser.push` contains `enabled` (default false), `private_key_pem` and `subject`. Generate the P-256 VAPID key once in Enterprise Labs; its private key remains in encrypted `.config`, and public settings expose only its public key and configured status. Preserve it with backups. Set a `mailto:` or HTTPS contact and explicitly enable both subscribers and push before enrollment. No native mobile application is supplied.
+
+After opening a verified email session, the subscriber grants browser notification permission and enrolls through the CSRF-protected subscriber page. Only that bound person can add or remove their endpoint. Enrollment is limited to four browsers/person and 1000 endpoints overall. Identity revocation, removal and changed subscription keys prevent older queued snapshots from authorizing replacement endpoints.
+
+Payloads use RFC 8291 AES-GCM encryption and RFC 8292 VAPID with OpenSSL and the pinned JWT library. Supported HTTPS push-service origins are limited to Google, Mozilla, Apple and Microsoft. Cloud push requires Internet connectivity; it is not an offline LAN service. Browser and operating-system policy can suppress display. Apple mobile-browser enrollment and background behavior require deployment-specific acceptance.
+
+Queued announcements use explicit `browser_recipient_ids`, freeze exact enrolled endpoint/key fingerprints, and recheck current permission, enrollment and expiry before effects. Newly enrolled browsers do not receive older jobs. Announcements retain their absolute expiry, at most ten minutes; duplicates and expired events are discarded by the worker. The `browser_push` receipt reports push-service acceptance, not browser display or a human response. Unknown completion never triggers automatic resend.
+
+SMS login, public enrollment, managed mustering, visitors, geofencing and native mobile application push remain outside this feature. See [Enterprise acceptance](ENTERPRISE_ACCEPTANCE.md) for browser qualification steps.
 
 ## Runtime state, dependencies and integration
 
 `PLUGIN_DATA_DIR/enterprise-state` is created only for enabled feature actions and must be owned by the runtime account, mode 0700. Files are regular single-link mode 0600. `.enterprise-state-required` in its parent permanently marks initialized storage. Every ledger has its own `.required` marker; missing established JSON fails closed instead of resetting replay protection. Symlinks, FIFOs, hardlinks, writable/unowned directories, corrupt/noncanonical JSON and duplicate keys are rejected before state use. Ledger updates take a protected lock, replace a bounded file atomically and synchronize file/directory state.
 
-Operational ledgers are `login`, `replay`, `identity_audit`, `directory_plans`, and `subscriber_tokens` (`.json`, `.required`, `.lock`). Login proofs expire after five minutes; directory plans after fifteen minutes. Successful SSO audit rows contain only provider/protocol/local-account ID/time. Do not copy transient login transactions or subscriber bearer proofs into a restored active deployment. Preserve replay history and required markers, and invalidate transient proofs/plans after restore. The operational backup system must account for this directory and parent marker. None is a replacement configuration authority.
+Operational ledgers are `login`, `replay`, `identity_audit`, `directory_plans`, `subscriber_tokens`, `browser_subscriptions`, `browser_push_claims`, `browser_test_events`, `connector_claims` and `oauth_refresh` (`.json`, `.required`, `.lock`). Login proofs expire after five minutes; directory plans after fifteen minutes. Browser/connector claims prevent automatic replay; bounded test-event records keep timestamps stable across duplicate test requests. Successful SSO audit rows contain only provider/protocol/local-account ID/time. Do not copy transient login transactions or subscriber bearer proofs into a restored active deployment. Preserve replay history and required markers, and invalidate transient proofs/plans after restore. Native operational backups include this evidence; restored Labs features remain disabled. None is a replacement configuration authority.
 
-Composer dependencies are isolated under `slsmassnotifyserver/identity-libs`, pinned by its `composer.lock`, shipped with their licenses, denied public HTTP access, and loaded lazily by protocol adapters. Normal dashboard loads do not initialize Composer or contact providers. The lock currently resolves OneLogin php-saml 4.3.2, xmlseclibs 3.1.5, Firebase PHP-JWT 7.2.1 and League OAuth2 client 2.9.1 plus dependencies. Update and audit this dedicated lock during module dependency maintenance, then rerun the signature fixtures; do not run Composer on the PBX during login.
+Enabling a saved LDAP source requires LDAP in the PHP runtime serving FreePBX. Browser key generation requires cURL, OpenSSL P-256 ECDH and AES-GCM in that runtime. Missing dependencies produce an actionable error rather than enabling an unusable connector.
 
-Integration entrypoints: `EnterpriseIdentityConfig`, `DirectoryConfig`, `SubscriberConfig` expose `defaults()` and `normalize()`. Identity/directory `publicConfig()` redact secrets. `SlsEnterpriseLabs` exposes `renderEnterpriseLabsPage($endpoint,$csrf)` and `enterpriseLabsAction($action,$input)`. The central authenticated page sends `payload={action,input}` with its existing CSRF field.
+Composer dependencies are isolated under `slsmassnotifyserver/identity-libs`, pinned by its `composer.lock`, shipped with their licenses and denied public HTTP access. Protocol and push adapters use the shipped autoloader; rendering settings contacts no provider and starts no delivery. The lock currently resolves OneLogin php-saml 4.3.2, xmlseclibs 3.1.5, Firebase PHP-JWT 7.2.1 and League OAuth2 client 2.9.1 plus dependencies. Update and audit this dedicated lock during module dependency maintenance, then rerun the signature fixtures; do not run Composer on the PBX during login.
+
+Integration entrypoints: `EnterpriseIdentityConfig`, `DirectoryConfig`, `SubscriberConfig` expose `defaults()` and `normalize()`. Their `publicConfig()` methods redact secrets. `SlsEnterpriseLabs` exposes `renderEnterpriseLabsPage($endpoint,$csrf)` and `enterpriseLabsAction($action,$input)`. The central authenticated administrator page sends `payload={action,input}` with its existing CSRF field. These actions are not public enrollment or unrestricted remote Control API endpoints.
 
 | Action | Input | Effect |
 | --- | --- | --- |
 | `identity_save` / `directory_save` / `subscriber_save` | `{config:<namespace object>,revision:<normalized namespace SHA256>}` | Revision checked under activity/settings locks; stale grants, secrets and revocations are preserved. No provider contact or invitation. |
 | `directory_preview` | `{source_id,csv?}` or `{source_id,deprovision_all:true}` | Reads a complete source or explicit empty deprovision snapshot, returns diff and one-use `plan_id`. |
-| `directory_apply` | `{plan_id}` | Applies reviewed snapshot to future active/pending templates; preserves previous incidents/jobs. |
+| `directory_apply` | `{plan_id,confirm_deactivation?:boolean}` | Consumes the preview; requires explicit true for a large deactivation. Preserves previous incidents/jobs. |
 | `subscriber_invite` | `{subscriber_id,incident_id}` | One explicit email to the saved address; does not return bearer proof to the browser. |
 | `subscriber_revoke` | `{subscriber_id}` | Revokes proofs and rotates saved subscriber session identity. |
+| `subscriber_push_key` | `{}` | Generates one VAPID key in encrypted configuration; refuses replacement of an existing key and leaves push disabled. |
+| `subscriber_push_test` | `{subscriber_id,request_id,title?,message?}` | Standalone-only marked browser test; 32-hex request identity freezes its content and five-minute expiry. Cluster-enabled deployments must use the queued test so witness authority is enforced. |
 
-Validation commands (all passed in private mount/network/PID namespaces, with masked PBX config/state and inert transports):
+On `/mass-notify/subscriber.php`, `push_enroll` accepts a browser `subscription` and `push_remove` its hashed `endpoint_id`. Both require the verified subscriber session, HTTPS, same-origin checks and `portal_csrf`; callers cannot select another person's identity. The Devices and providers queued test also uses `integrations_labs_send` with explicit saved subscriber IDs.
+
+Fixture commands use private mount/network/PID namespaces, masked PBX config/state and inert transports:
 
 ```sh
 bash tools/run_isolated_tests.sh tools/test_enterprise_identity.php tools/test_enterprise_identity_management.php tools/test_enterprise_identity_http.py
 bash tools/run_isolated_tests.sh tools/test_operator_portal_http.py
-php /tmp/sls-composer.phar audit --working-dir=slsmassnotifyserver/identity-libs --no-dev --format=plain
+bash tools/run_isolated_tests.sh tools/test_browser_push.php tools/test_enterprise_announcement_channels.php tools/test_subscriber_worker.js tools/test_directory_mapping.php
 ```
+
+For dependency maintenance, run `composer audit --working-dir=slsmassnotifyserver/identity-libs --no-dev --format=plain` in a development checkout with Composer available. The PBX login flow does not install or update packages.
 
 The first command covers five synthetic signed OIDC provider flows, real SAML signatures plus request/issuer/audience/destination/time/XXE/wrapping/tamper/replay attacks, durable-state corruption/FIFO/symlink/deletion guards, stable directory snapshots/deprovisioning, pending edits/concurrent plans, secret redaction, server-controlled subscriber identity versions, and six real HTTP tests including byte-identical copied deployment entrypoints, OIDC callback/local grant/revocation and email-proof recipient privacy/CSRF/replay. The existing operator HTTP regression suite passes fifteen tests. Composer audit reported no vulnerability advisories at verification time. LDAP/SCIM server interoperability, real tenant certificate rollover/MFA policies and real email delivery were not exercised because provider credentials and deployment test endpoints were unavailable.
 

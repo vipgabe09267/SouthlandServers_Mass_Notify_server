@@ -31,6 +31,9 @@ def run_case(
     pick_up=True,
     active_while_queued=False,
     preseed_cooldown_seconds_ago=None,
+    cluster=None,
+    runtime_enabled=True,
+    cluster_after_tts=None,
 ):
     with tempfile.TemporaryDirectory(prefix="sls-weather-test-contract-") as directory:
         scratch = pathlib.Path(directory)
@@ -60,11 +63,34 @@ def run_case(
         phone_helper = scratch / 'phone-fixture.py'
         phone_helper.write_text("import sys\nprint('a' * 32)\nprint(sys.argv[sys.argv.index('--recipients') + 1].replace(',', '\\n'))\n")
         worker_source = worker_source.replace('/usr/local/bin/sls_mass_notify/sls_phone_admission.py', shlex.quote(str(phone_helper)))
+        # This fixture tests channel routing with an inert Piper transport.
+        # test_speech_admission.py exercises real queue, quota and executable checks.
+        speech_helper = scratch / 'speech-fixture.py'
+        speech_helper.write_text('import subprocess,sys\n'
+            'if "--reserve-media-bytes" in sys.argv: raise SystemExit(0)\n'
+            'raise SystemExit(subprocess.call(sys.argv[sys.argv.index("--")+1:]))\n')
+        speech_path = '/usr/local/bin/sls_mass_notify/sls_speech_admission.py'
+        if worker_source.count(speech_path) != 2:
+            fail('manual Weather fixture could not isolate speech/media admission')
+        worker_source = worker_source.replace(speech_path, shlex.quote(str(speech_helper)))
+        cluster_helper = scratch / 'sls_cluster_guard.py'
+        cluster_source = (ROOT / 'slsmassnotifyserver/bin/sls_mass_notify/sls_cluster_guard.py').read_text(encoding='utf-8')
+        cluster_marker = "CONFIG = Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config')"
+        if cluster_source.count(cluster_marker) != 1:
+            fail('manual Weather fixture could not isolate cluster policy')
+        cluster_helper.write_text(cluster_source.replace(cluster_marker,
+            f"CONFIG = Path({str(scratch / 'mass-notifications.config')!r})"), encoding='utf-8')
+        (scratch / 'sls_config_crypto.py').write_bytes((ROOT / 'slsmassnotifyserver/bin/sls_mass_notify/sls_config_crypto.py').read_bytes())
+        guard_marker = 'CLUSTER_GUARD="/usr/local/bin/sls_mass_notify/sls_cluster_guard.py"'
+        if worker_source.count(guard_marker) != 1:
+            fail('manual Weather fixture could not isolate the cluster guard')
+        worker_source = worker_source.replace(guard_marker, 'CLUSTER_GUARD=' + shlex.quote(str(cluster_helper)))
         fixture_worker.write_text(worker_source.replace(worker_marker,
             'AUDIO_QUEUE_HELPER=' + shlex.quote(str(queue_helper))), encoding='utf-8')
 
         config = scratch / "mass-notifications.config"
-        config.write_text("{}\n", encoding="utf-8")
+        config.write_text(json.dumps({'runtime_enabled': runtime_enabled, 'enterprise_cluster': cluster or {'enabled': False}}) + '\n', encoding='utf-8')
+        config.chmod(0o640)
         model = scratch / "voice.onnx"
         model.write_bytes(b"test-model")
         piper_marker = scratch / "piper-ran"
@@ -75,6 +101,7 @@ def run_case(
             piper,
             """#!/usr/bin/python3
 import os
+import json
 import pathlib
 import sys
 import wave
@@ -87,6 +114,11 @@ with wave.open(str(output), "wb") as handle:
     handle.setframerate(8000)
     handle.writeframes(b"\\0\\0" * 800)
 pathlib.Path(os.environ["PIPER_MARKER"]).write_text("ran\\n", encoding="utf-8")
+if os.environ.get("CLUSTER_AFTER_TTS"):
+    config = pathlib.Path(os.environ["CONFIG_JSON_FILE"])
+    settings = json.loads(config.read_text())
+    settings['enterprise_cluster'] = json.loads(os.environ['CLUSTER_AFTER_TTS'])
+    config.write_text(json.dumps(settings))
 """,
         )
 
@@ -153,6 +185,7 @@ print(os.environ.get("MOCK_ASTERISK_CHANNELS", ""))
                 "ASTERISK_CLI_BIN": str(asterisk_cli),
                 "CONFIG_JSON_FILE": str(config),
                 "CONFIG_LOADER": str(config_loader),
+                "CLUSTER_AFTER_TTS": json.dumps(cluster_after_tts) if cluster_after_tts else '',
                 "COOLDOWN_FILE": str(cooldown_file),
                 "EVENTS_LOG": str(scratch / "events.jsonl"),
                 "FAULT_STATE_FILE": str(scratch / "fault.state"),
@@ -236,6 +269,30 @@ if desktop["status"].get("last_test_desktop_count") != 1:
     fail("desktop-only Weather test status did not record its channel count")
 if desktop["status"].get("last_test_stage") != "":
     fail("successful Weather test retained a stale failure stage")
+
+for authority in (
+    {'enabled': True, 'mode': 'notification_ha', 'role': 'node'},
+    {'enabled': '1', 'mode': 'edge', 'role': 'node'},
+    {'enabled': True, 'mode': 'standalone', 'role': 'witness'},
+):
+    fenced = run_case(['1000'], ['desk_ops'], cluster=authority)
+    if fenced['returncode'] != 79 or fenced['visual_calls'] or fenced['piper_ran'] or fenced['calls'] or fenced['reservation'] is not None:
+        fail(f'HA/edge/witness manual test reached an external channel or audio reservation: {fenced}')
+    if fenced['cooldown_lock_exists'] or fenced['status'].get('last_test_stage') != 'cluster_authority' or 'queued witness-authorized test' not in fenced['stderr']:
+        fail('fenced manual test consumed cooldown or omitted actionable authority instructions')
+
+stopped = run_case(['1000'], ['desk_ops'], runtime_enabled=False)
+if stopped['returncode'] != 79 or stopped['calls'] or stopped['visual_calls'] or stopped['piper_ran']:
+    fail('stopped runtime reached a manual Weather channel')
+
+# Enabling only configuration mirroring leaves standalone delivery available.
+mirror = run_case([], ['desk_ops'], cluster={'enabled': True, 'mode': 'standalone', 'role': 'node', 'mirroring_enabled': True})
+if mirror['returncode'] != 0 or len(mirror['visual_calls']) != 1:
+    fail('standalone configuration mirroring incorrectly blocked a direct Weather test')
+
+changed = run_case(['1000'], ['desk_ops'], cluster_after_tts={'enabled': True, 'mode': 'notification_ha', 'role': 'node'})
+if changed['returncode'] == 0 or changed['calls'] or changed['reservation'] is not None or len(changed['visual_calls']) != 1:
+    fail('new HA policy after speech preparation did not fence remaining phone audio and SIP NOTIFY')
 
 phone = run_case(["1000"], [])
 if phone["returncode"] != 0:

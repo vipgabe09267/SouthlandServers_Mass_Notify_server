@@ -48,12 +48,15 @@ class PrivilegedInstall(unittest.TestCase):
         self.services = Services()
         self.store = self.base / 'trust'
         self.package = {
+            'bin/sls_mass_notify/sls_config_crypto.py': (ROOT / 'slsmassnotifyserver/bin/sls_mass_notify/sls_config_crypto.py').read_bytes(),
+            'bin/sls_mass_notify/sls_cron_runner.py': (BIN / 'sls_cron_runner.py').read_bytes(),
             'module.xml': b'<module><rawname>slsmassnotifyserver</rawname><version>0.1.5-beta</version></module>',
             'bin/sls_mass_notify_maintenance.sh': b'#!/bin/bash\n# authenticated maintenance\n',
             'bin/sls_mass_notify_update.sh': b'#!/bin/bash\n# authenticated updater\n',
             'bin/sls_mass_notify_install_piper_voices.sh': b'#!/bin/bash\n# authenticated dependency operations\n',
             'bin/sign_sls_mass_notify_local_sig.sh': b'#!/bin/bash\n# authenticated signer\n',
             'bin/sls_mass_notify/sls_phone_events.py': b'# authenticated collector\n',
+            'bin/sls_mass_notify/sls_voicemail.py': b'# authenticated native voicemail fallback\n',
             'bin/slsconsole': b'#!/usr/bin/python3 -I\n# authenticated console\n',
             'bin/sls_mass_notify/sls_console.py': b'# authenticated runtime controller\n',
             'bin/sls_mass_notify/sls_runtime_state.php': b'<?php /* authenticated admission */',
@@ -144,6 +147,64 @@ class PrivilegedInstall(unittest.TestCase):
             self.fs.secure_tree(INSTALL.DATA)
             self.assertEqual(stat.S_IMODE(self.fs.path(INSTALL.DATA + '/' + folder).stat().st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(self.fs.path(INSTALL.DATA + '/' + folder + '/evidence').stat().st_mode), 0o600)
+
+    def test_recorded_voicemail_remains_private_and_unchanged_after_repair(self):
+        directory = INSTALL.DATA + '/sounds/voicemail'
+        self.fs.mkdir(directory, 0o700, user=True)
+        for name in ('b' * 32 + '.wav', 'b' * 32 + '.json', 'recording-reserve.lock'):
+            self.fs.write(directory + '/' + name, b'private recording evidence', 0o600, user=True)
+        self.fs.secure_tree(INSTALL.DATA)
+        self.assertEqual(stat.S_IMODE(self.fs.path(directory).stat().st_mode), 0o700)
+        for name in ('b' * 32 + '.wav', 'b' * 32 + '.json', 'recording-reserve.lock'):
+            path = self.fs.path(directory + '/' + name)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(path.read_bytes(), b'private recording evidence')
+
+    def test_enterprise_private_ledgers_survive_upgrade_permission_repair(self):
+        for folder in ('enterprise-state', 'control-idempotency', 'enterprise-operations',
+                       'enterprise-integrations', 'enterprise-cluster', 'enterprise-floorplans'):
+            self.fs.mkdir(INSTALL.DATA+'/'+folder,0o700,user=True)
+            self.fs.mkdir(INSTALL.DATA+'/'+folder+'/archive',0o700,user=True)
+            self.fs.write(INSTALL.DATA+'/'+folder+'/archive/history.json',b'preserved ledger',0o600,user=True)
+            self.fs.write(INSTALL.DATA+'/'+folder+'/archive/.archive-required',b'preserved fence',0o600,user=True)
+        markers=('.enterprise-state-required','.control-idempotency-required','.enterprise-operations-required',
+                 '.enterprise-integrations-required','.enterprise-cluster-required.json','.incident-replay-required','.audit-separation-required')
+        for name in markers:self.fs.write(INSTALL.DATA+'/'+name,b'preserved parent fence',0o600,user=True)
+        self.fs.secure_tree(INSTALL.DATA)
+        for folder in ('enterprise-state', 'control-idempotency', 'enterprise-operations',
+                       'enterprise-integrations', 'enterprise-cluster', 'enterprise-floorplans'):
+            path=self.fs.path(INSTALL.DATA+'/'+folder)
+            for directory in (path,path/'archive'):self.assertEqual(stat.S_IMODE(directory.stat().st_mode),0o700)
+            for name in ('history.json','.archive-required'):
+                child=path/'archive'/name
+                self.assertEqual(stat.S_IMODE(child.stat().st_mode),0o600)
+                self.assertEqual(child.stat().st_uid,self.fs.account.pw_uid)
+            self.assertEqual((path/'archive/history.json').read_bytes(),b'preserved ledger')
+        for name in markers:
+            path=self.fs.path(INSTALL.DATA+'/'+name)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode),0o600)
+            self.assertEqual(path.read_bytes(),b'preserved parent fence')
+
+    def test_incident_archive_and_admission_fences_remain_private_after_upgrade(self):
+        self.fs.mkdir(INSTALL.DATA+'/incidents',0o750,user=True)
+        self.fs.mkdir(INSTALL.DATA+'/incidents/archive',0o700,user=True)
+        files={'incidents/archive/reports.sqlite':b'SQLite format 3\x00preserved report',
+               'incidents/archive/reports.sqlite-journal':b'preserved SQLite recovery',
+               'incidents/archive/initialized':b'SLS_INCIDENT_ARCHIVE_V1\n',
+               'incidents/archive/storage.lock':b'',
+               'incidents/admission.lock':b'',
+               'incidents/.archive-required':b'SLS_INCIDENT_ARCHIVE_V1\n'}
+        for name,body in files.items():self.fs.write(INSTALL.DATA+'/'+name,body,0o600,user=True)
+        self.fs.write(INSTALL.DATA+'/incidents/ordinary.json',b'operational history',0o640,user=True)
+        self.fs.secure_tree(INSTALL.DATA)
+        self.assertEqual(stat.S_IMODE(self.fs.path(INSTALL.DATA+'/incidents/archive').stat().st_mode),0o700)
+        self.assertEqual(stat.S_IMODE(self.fs.path(INSTALL.DATA+'/incidents').stat().st_mode),0o755)
+        for name,body in files.items():
+            path=self.fs.path(INSTALL.DATA+'/'+name)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode),0o600,name)
+            self.assertEqual(path.stat().st_uid,self.fs.account.pw_uid,name)
+            self.assertEqual(path.read_bytes(),body,name)
+        self.assertEqual(stat.S_IMODE(self.fs.path(INSTALL.DATA+'/incidents/ordinary.json').stat().st_mode),0o640)
 
     def test_nested_api_directories_are_traversable_under_restrictive_umask(self):
         # Apache's existing document-root ancestors belong to the platform.
@@ -252,6 +313,30 @@ class PrivilegedInstall(unittest.TestCase):
         self.assertTrue(any(args == ['/usr/bin/systemctl','restart',INSTALL.SERVICE] for args,_ in self.services.calls))
         self.assertFalse(any(any('php' in item or 'fwconsole' in item for item in args) for args,_ in self.services.calls))
         self.assertEqual(self.fs.read(INSTALL.CONFIG),self.configuration)
+    def test_cron_migrates_only_owned_jobs_and_keeps_private_diagnostics(self):
+        self.services.cron += b'* * * * * /usr/bin/timeout 900 /usr/local/bin/sls_mass_notify/sls_mass_notify_maintenance.sh\n'
+        self.services.cron += b'17 */6 * * * /usr/bin/timeout 1800 /usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh\n'
+        self.action.prepare(); self.action.root_cron(apply=True)
+        before = self.services.cron; self.action.root_cron(apply=True)
+        self.assertEqual(self.services.cron, before)
+        self.assertIn(b'/root/independent-backup', before)
+        self.assertNotIn(b'/usr/bin/timeout', before)
+        self.assertTrue(all(line.endswith(' >/dev/null 2>&1') for line in INSTALL.CRON_LINES))
+        self.assertTrue(all(before.count(line.encode()) == 1 for line in INSTALL.CRON_LINES))
+        metadata = self.fs.path(INSTALL.DATA + '/cron-diagnostics').stat()
+        self.assertEqual((metadata.st_uid,metadata.st_gid,stat.S_IMODE(metadata.st_mode)),
+                         (self.fs.account.pw_uid,self.fs.account.pw_gid,0o750))
+    def test_offline_assets_are_protected_and_passed_to_fixed_piper_operations(self):
+        self.action.prepare()
+        assets=self.base/'offline-assets';assets.mkdir(mode=0o700)
+        for name in ('wheels','voices'):(assets/name).mkdir(mode=0o700)
+        self.action.dependencies(assets)
+        operations=[args for args,_ in self.services.calls if args and args[0]=='/bin/bash' and '--repair-permissions-only' not in args]
+        self.assertEqual(len(operations),2)
+        for args in operations:
+            self.assertEqual(args[-4:],['--wheelhouse',str(assets/'wheels'),'--voice-cache',str(assets/'voices')])
+        (assets/'wheels').rmdir();(assets/'wheels').symlink_to(assets/'voices',target_is_directory=True)
+        with self.assertRaises((OSError,self.action.trust.TrustError)):self.action.dependencies(assets)
     def test_root_runtime_rejects_service_owned_or_writable_parent(self):
         parent = self.fs.path('/usr/local/bin')
         parent.mkdir(parents=True)

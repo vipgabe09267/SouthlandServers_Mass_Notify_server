@@ -40,6 +40,7 @@ class SlsMassNotifyAnnouncement {
 				'announcement_state' => $module->getAnnouncementDashboardState(),
 				'announcement_tones' => $module->getAvailableTones(),
 				'available_system_sounds' => $module->getAvailableSystemSounds(),
+				'recording_catalogue' => method_exists($module, 'getSystemRecordingCatalogue') ? $module->getSystemRecordingCatalogue('', 0, 500) : [],
                 'system_recording_options_view' => dirname((new \ReflectionClass($module))->getFileName()) . '/views/system_recording_options.php',
 				'csrf_token' => $module->getCsrfToken(),
 			]);

@@ -23,9 +23,10 @@ final class DirectoryConfig
         if(!is_array($v)||($v&&array_is_list($v))||array_diff(array_keys($v),['schema','enabled','sources'])||($v['schema']??1)!==1||!is_bool($v['enabled']??false)){throw new \DomainException('Directory settings must use schema 1.');}
         $out=self::defaults();$out['enabled']=$v['enabled']??false;$seen=[];$sources=$v['sources']??[];
         if(!is_array($sources)||!array_is_list($sources)||count($sources)>10){throw new \DomainException('Configure at most ten directory sources.');}
-        foreach($sources as $s){$allowed=['id','name','type','enabled','template_ids','sync_subscribers','records','ldap_url','ldap_starttls','ldap_bind_dn','ldap_password','ldap_base_dn','ldap_filter','ldap_attributes','ldap_inactive_values','scim_base_url','scim_token'];
+        foreach($sources as $s){$allowed=['id','name','type','enabled','template_ids','sync_subscribers','records','ldap_url','ldap_starttls','ldap_bind_dn','ldap_password','ldap_base_dn','ldap_filter','ldap_attributes','ldap_inactive_values','ldap_inactive_mask','scim_base_url','scim_token','scim_attributes','maximum_deactivation_percent'];
             if(!is_array($s)||array_diff(array_keys($s),$allowed)||!preg_match('/^dir_[a-f0-9]{24}$/D',$s['id']??'')||isset($seen[$s['id']])||!in_array($s['type']??'',['csv','ldap','scim'],true)||!is_bool($s['enabled']??false)||!is_bool($s['sync_subscribers']??false)){throw new \DomainException('Directory source fields invalid.');}
             $r=['id'=>$s['id'],'name'=>EnterpriseIdentityConfig::text($s['name']??'',80,'Source name'),'type'=>$s['type'],'enabled'=>$s['enabled']??false,'sync_subscribers'=>$s['sync_subscribers']??false,'template_ids'=>$s['template_ids']??[],'records'=>self::records($s['records']??[])];
+            $r['maximum_deactivation_percent']=$s['maximum_deactivation_percent']??25;if(!is_int($r['maximum_deactivation_percent'])||$r['maximum_deactivation_percent']<1||$r['maximum_deactivation_percent']>100){throw new \DomainException('Directory deactivation review threshold must be 1–100 percent.');}
             if(!is_array($r['template_ids'])||!array_is_list($r['template_ids'])||count($r['template_ids'])>50){throw new \DomainException('Directory template list invalid.');}
             foreach($r['template_ids'] as $id){if(!is_string($id)||!preg_match('/^tpl_[a-f0-9]{24}$/D',$id)){throw new \DomainException('Select saved incident templates.');}}$r['template_ids']=array_values(array_unique($r['template_ids']));
             if($r['type']==='ldap'){
@@ -37,7 +38,14 @@ final class DirectoryConfig
                 if(!is_array($r['ldap_attributes'])||array_diff(array_keys($r['ldap_attributes']),['external_id','name','email','location','desktop_username','active'])){throw new \DomainException('LDAP attribute mapping invalid.');}
                 foreach(['external_id','name','email','location','desktop_username','active'] as $k){$a=$r['ldap_attributes'][$k]??'';if(!is_string($a)||!preg_match('/^[A-Za-z][A-Za-z0-9;-]{0,63}$|^$/D',$a)||($a===''&&in_array($k,['external_id','name'],true))){throw new \DomainException('LDAP requires stable ID/name attribute mappings.');}$r['ldap_attributes'][$k]=$a;}
                 if(!is_array($r['ldap_inactive_values'])||!array_is_list($r['ldap_inactive_values'])||count($r['ldap_inactive_values'])>10){throw new \DomainException('LDAP inactive values invalid.');}foreach($r['ldap_inactive_values'] as $x){EnterpriseIdentityConfig::text($x,80,'LDAP inactive value');}
-            }elseif($r['type']==='scim'){$r['scim_base_url']=rtrim(EnterpriseIdentityConfig::url($s['scim_base_url']??'','SCIM base URL'),'/');$r['scim_token']=EnterpriseIdentityConfig::text($s['scim_token']??'',2048,'SCIM read token');}
+                $r['ldap_inactive_mask']=$s['ldap_inactive_mask']??0;if(!is_int($r['ldap_inactive_mask'])||$r['ldap_inactive_mask']<0||$r['ldap_inactive_mask']>2147483647){throw new \DomainException('LDAP inactive mask must be a non-negative integer.');}
+            }elseif($r['type']==='scim'){$r['scim_base_url']=rtrim(EnterpriseIdentityConfig::url($s['scim_base_url']??'','SCIM base URL'),'/');$r['scim_token']=EnterpriseIdentityConfig::text($s['scim_token']??'',2048,'SCIM read token');
+                if(isset($s['scim_attributes'])&&!is_array($s['scim_attributes'])){throw new \DomainException('SCIM mapping must be an object.');}
+                $r['scim_attributes']=array_replace(['external_id'=>'/id','name'=>'/displayName','location'=>'','desktop_username'=>''],$s['scim_attributes']??[]);
+                if(array_diff(array_keys($r['scim_attributes']),['external_id','name','location','desktop_username'])){throw new \DomainException('Unsupported SCIM mapping.');}
+                $paths=['','/id','/externalId','/userName','/displayName','/name/formatted','/urn:ietf:params:scim:schemas:extension:enterprise:2.0:User/department','/urn:ietf:params:scim:schemas:extension:enterprise:2.0:User/organization','/urn:ietf:params:scim:schemas:extension:enterprise:2.0:User/employeeNumber'];
+                foreach($r['scim_attributes'] as $key=>$path){if(!is_string($path)||!in_array($path,$paths,true)||($path===''&&in_array($key,['external_id','name'],true))){throw new \DomainException('Choose a documented SCIM user mapping.');}}
+            }
             $out['sources'][]=$r;$seen[$r['id']]=true;
         }return $out;
     }

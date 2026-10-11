@@ -116,6 +116,7 @@ class FreePBX{public static function create(){return (object)['Slsmassnotifyserv
   self.assertEqual(self.request('/mass-notify/sso.php')[0],404)
   self.settings['subscriber_browser']['enabled']=False;self.write_settings();self.assertEqual(self.request()[0],404);self.assertEqual(self.request(post=post,cookie=cookie)[0],404)
  def test_oidc_actual_http_callback_local_grant_and_revocation(self):
+  control_path=self.root/'control-api-audit.jsonl';control_before=control_path.read_bytes() if control_path.exists() else None
   self.settings['enterprise_identity']['enabled']=True;self.write_settings()
   status,h,body=self.request('/fixture-login');self.assertEqual(status,200);cookie=h['Set-Cookie'].split(';',1)[0];csrf=json.loads(body)['csrf']
   status,h,_=self.request('/mass-notify/sso.php',post={'provider_id':self.settings['enterprise_identity']['providers'][0]['id'],'portal_csrf':csrf},cookie=cookie);self.assertEqual(status,303);self.assertIn('SameSite=None',h['Set-Cookie']);browser=h['Set-Cookie'].split(';',1)[0]
@@ -127,7 +128,7 @@ class FreePBX{public static function create(){return (object)['Slsmassnotifyserv
   status,_,body=self.request('/fixture-current',cookie=portal);self.assertEqual(status,200);self.assertEqual(json.loads(body)['principal']['operator_role'],'viewer')
   audit=[json.loads(row) for row in (self.root/'security-audit.jsonl').read_text().splitlines()]
   self.assertEqual(len(audit),1);self.assertEqual(audit[0]['action'],'operator_sign_in_completed');self.assertEqual(audit[0]['operator_id'],self.settings['operator_access']['accounts'][0]['id'])
-  self.assertEqual(audit[0]['actor'],'operator:fixture-viewer');self.assertEqual(audit[0]['method'],'GET');self.assertNotIn('stable-42',json.dumps(audit));self.assertNotIn(token,json.dumps(audit));self.assertFalse((self.root/'control-api-audit.jsonl').exists())
+  self.assertEqual(audit[0]['actor'],'operator:fixture-viewer');self.assertEqual(audit[0]['method'],'GET');self.assertNotIn('stable-42',json.dumps(audit));self.assertNotIn(token,json.dumps(audit));self.assertEqual(control_path.read_bytes() if control_path.exists() else None,control_before)
   self.assertEqual(self.request(callback,cookie=browser)[0],401)
   self.assertEqual(len((self.root/'security-audit.jsonl').read_text().splitlines()),1)
   self.settings['enterprise_identity']['grants'][0]['enabled']=False;self.write_settings();self.assertEqual(self.request('/fixture-current',cookie=portal)[0],401)

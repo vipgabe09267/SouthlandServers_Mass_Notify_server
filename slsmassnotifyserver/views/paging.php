@@ -5,6 +5,16 @@ foreach (($paging['groups'] ?? []) as $index => $group) {
     unset($paging['groups'][$index]['pin_hash'], $paging['groups'][$index]['pin']);
 }
 $extensions = array_values((array)($available_extensions ?? []));
+$inventory = is_array($phone_inventory ?? null) ? $phone_inventory : [];
+$readinessInventory = ['available'=>($inventory['available'] ?? false) === true, 'observed_at'=>(string)($inventory['observed_at'] ?? ''),
+    'expires_at'=>(int)($inventory['expires_at'] ?? 0), 'endpoints'=>[]];
+// Project display-only metadata; contact addresses and device keys stay private.
+foreach (($inventory['endpoints'] ?? []) as $extension=>$endpoint) {
+    if (!preg_match('/^[0-9]{1,20}$/D', (string)$extension) || !is_array($endpoint)) { continue; }
+    $contacts = array_values(array_filter((array)($endpoint['contacts'] ?? []), 'is_array'));
+    $readinessInventory['endpoints'][(string)$extension] = ['contacts'=>count($contacts),
+        'formats'=>array_values(array_map(static fn($contact)=>(string)($contact['format'] ?? 'unknown'), $contacts))];
+}
 $result = is_array($save_result ?? null) ? $save_result : null;
 $escape = static function ($value) { return htmlspecialchars((string)$value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); };
 $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT;
@@ -53,6 +63,11 @@ $help = static function (string $id, string $text) use ($escape): void {
 #sls-live-paging .sls-paging-group .sls-paging-badge {padding:4px 8px;font-size:11px}
 #sls-live-paging .sls-paging-meta {display:flex;flex-wrap:wrap;gap:8px 16px;color:#475569;font-size:12px;line-height:1.6}
 #sls-live-paging .sls-paging-meta .fa {margin-right:4px;color:#64748b}
+#sls-live-paging .sls-paging-readiness {margin-top:12px;padding:10px 12px;border-radius:6px;background:#f8fafc;border:1px solid #dfe5ec;font-size:12px;line-height:1.5;overflow-wrap:anywhere}
+#sls-live-paging .sls-paging-readiness p {margin:0 0 4px}
+#sls-live-paging .sls-paging-readiness p:last-child {margin-bottom:0}
+#sls-live-paging .sls-paging-readiness-ready {border-color:#bbdfca;background:#f1faf4}
+#sls-live-paging .sls-paging-readiness-warning {border-color:#ead2a2;background:#fff8e7}
 #sls-live-paging .sls-paging-group-footer {display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:14px;padding-top:12px;border-top:1px solid #edf1f5}
 #sls-live-paging .sls-paging-empty {padding:30px 20px;border:1px dashed #cbd5e1;border-radius:8px;background:#f8fafc;text-align:center;color:#64748b}
 #sls-live-paging .sls-paging-empty>i {display:block;margin-bottom:10px;font-size:30px;color:#94a3b8}
@@ -137,6 +152,11 @@ $help = static function (string $id, string $text) use ($escape): void {
                     <div class="sls-paging-unit sls-paging-short"><input class="form-control" type="number" id="sls-paging-duration" name="live_paging[max_duration_seconds]" min="30" max="1800" required value="<?php echo (int)($paging['max_duration_seconds'] ?? 300); ?>" aria-describedby="sls-paging-duration-unit"><span id="sls-paging-duration-unit"><?php echo _('seconds'); ?></span></div>
                     <span class="help-block"><?php echo _('Hang up to finish sooner.'); ?></span>
                 </div>
+                <div class="form-group">
+                    <input type="hidden" name="live_paging[voicemail_enabled]" value="0">
+                    <label class="sls-paging-pin-toggle" for="sls-paging-voicemail"><input type="checkbox" id="sls-paging-voicemail" name="live_paging[voicemail_enabled]" value="1" <?php echo in_array($paging['voicemail_enabled'] ?? '1', [true, 1, '1'], true) ? 'checked' : ''; ?> aria-describedby="sls-paging-voicemail-help"> <i class="fa fa-envelope-o" aria-hidden="true"></i> <?php echo _('Record live pages for voicemail'); ?></label>
+                    <p class="help-block" id="sls-paging-voicemail-help"><?php echo _('Enabled by default. Records the caller’s live page and saves it after hangup to selected extensions with enabled FreePBX mailboxes that did not answer. The caller is excluded. Turn this off to prevent recording.'); ?></p>
+                </div>
             </div>
         </section>
         <section class="sls-paging-card" aria-labelledby="sls-paging-ivr-title"><div class="sls-paging-card-title"><h2 id="sls-paging-ivr-title"><i class="fa fa-globe text-primary" aria-hidden="true"></i> <?php echo _('External access through an IVR'); ?> <?php include __DIR__ . '/labs.php'; ?></h2></div><div class="sls-paging-card-body">
@@ -190,7 +210,7 @@ $help = static function (string $id, string $text) use ($escape): void {
                 </div>
                 <div id="sls-paging-independent-fields" data-sls-picker="paging">
                     <div class="sls-paging-editor-section"><h3><i class="fa fa-bullhorn text-primary" aria-hidden="true"></i> <?php echo _('Recipients and phone text'); ?></h3><div class="sls-paging-grid">
-                        <div><div class="sls-paging-label"><label id="sls-paging-audio-label"><?php echo _('Live audio recipients'); ?></label><?php $help('sls-paging-audio-tip', _('Choose at least one internal phone to hear live audio. The caller’s own phone is excluded during a page. Search by extension number or name. Up to 1,000 recipients.')); ?></div><div id="sls-paging-audio-selector"></div><span class="help-block"><?php echo _('Phones that hear the caller’s voice. At least one required.'); ?></span></div>
+                        <div><div class="sls-paging-label"><label id="sls-paging-audio-label"><?php echo _('Live audio recipients'); ?></label><?php $help('sls-paging-audio-tip', _('Choose at least one internal phone to hear live audio. Receiving phones must be registered with the PBX. If none are available, the caller is told to check registration; mixed groups page the available phones. The caller’s own phone is excluded during a page. Search by extension number or name. Up to 1,000 recipients.')); ?></div><div id="sls-paging-audio-selector"></div><span class="help-block"><?php echo _('Phones that hear the caller’s voice. At least one required.'); ?></span></div>
                         <div><div class="sls-paging-label"><label id="sls-paging-notify-label"><?php echo _('Phone text recipients'); ?></label><?php $help('sls-paging-notify-tip', _('Optional: send this group’s saved message to selected phones using SIP NOTIFY when paging starts. These phones may differ from the audio recipients. Display support depends on the phone. Up to 1,000 recipients.')); ?></div><div id="sls-paging-notify-selector"></div><span class="help-block"><?php echo _('Optional phones that display the saved message.'); ?></span></div>
                     </div></div>
                     <div class="sls-paging-editor-section">
@@ -229,6 +249,7 @@ $help = static function (string $id, string $text) use ($escape): void {
     var announcementGroups = <?php echo json_encode(array_values((array)($announcement_groups ?? [])), $jsonFlags); ?>;
     var phones = <?php echo json_encode($extensions, $jsonFlags); ?>;
     var legacyCallers = <?php echo json_encode(array_values((array)($paging['allowed_callers'] ?? [])), $jsonFlags); ?>;
+    var readinessInventory = <?php echo json_encode($readinessInventory, $jsonFlags); ?>;
     var labels = <?php echo json_encode([
         'edit' => _('Edit group'), 'remove' => _('Remove group'), 'add' => _('New paging group'), 'menu' => _('Menu'),
         'selected' => _('selected'), 'groups' => _('of 10 groups'), 'linked' => _('Linked announcement group'),
@@ -252,6 +273,12 @@ $help = static function (string $id, string $text) use ($escape): void {
         'enabled' => _('Add at least one paging group and enter a paging extension before enabling paging.'),
         'legacy' => _('Audio phones and authorized callers follow the linked announcement group and shared caller list until you convert this group.'),
         'removeConfirm' => _('Remove this paging group? Submit the page to save the removal.'),
+        'snapshotUnavailable' => _('Registration snapshot unavailable or stale. Check the phone-event collector in Help.'),
+        'registeredExtensions' => _('receiving extensions registered'), 'contacts' => _('registered contacts'),
+        'detectedDevices' => _('Detected devices'), 'unknownContacts' => _('unknown contacts'), 'offlineRecipients' => _('Unavailable extensions'),
+        'noReceivers' => _('No receiving phones are registered. Sign in a recipient phone before dialing.'),
+        'registrationRechecked' => _('Registration is checked again when dialing; the caller’s phone is excluded.'),
+        'snapshotObserved' => _('Snapshot'),
         'unsaved' => _('New PIN pending save'), 'defaultMessage' => _('Live page in progress.')
     ], $jsonFlags); ?>;
     var editor = $('#sls-paging-editor'), draft = null, editing = -1, opener = null, pinRequest = null;
@@ -267,6 +294,35 @@ $help = static function (string $id, string $text) use ($escape): void {
         if (message) { target[0].focus(); target[0].scrollIntoView({block:'nearest'}); }
     }
     function icon(name) { return $('<i>', {'class':'fa ' + name, 'aria-hidden':'true'}); }
+    function readinessForRecipients(values) {
+        var recipients = Array.from(new Set((values || []).map(String)));
+        var result = {available:readinessInventory.available === true && readinessInventory.expires_at * 1000 > Date.now(),
+            configured:recipients.length, registered:0, contacts:0, formats:[], unknown:0, unavailable:[]};
+        if (!result.available) return result;
+        var brands = {yealink:'Yealink',yealink_text:'Yealink',poly:'Polycom',cisco:'Cisco',grandstream:'Grandstream',fanvil:'Fanvil',snom:'Snom'};
+        recipients.forEach(function (extension) {
+            var endpoint = readinessInventory.endpoints[extension];
+            if (!endpoint || !Number.isInteger(endpoint.contacts) || endpoint.contacts < 1) { result.unavailable.push(extension); return; }
+            result.registered++; result.contacts += endpoint.contacts;
+            (endpoint.formats || []).forEach(function (format) {
+                if (brands[format]) { if (result.formats.indexOf(brands[format]) < 0) result.formats.push(brands[format]); }
+                else result.unknown++;
+            });
+        });
+        result.formats.sort(); return result;
+    }
+    function renderReadiness(panel, recipients) {
+        var state = readinessForRecipients(recipients);
+        panel.empty().removeClass('sls-paging-readiness-ready sls-paging-readiness-warning');
+        if (!state.available) { panel.append($('<p>').append(icon('fa-question-circle'), ' ' + labels.snapshotUnavailable)); return; }
+        panel.addClass(state.registered === state.configured && state.registered ? 'sls-paging-readiness-ready' : 'sls-paging-readiness-warning');
+        panel.append($('<p>').append(icon(state.registered ? 'fa-check-circle' : 'fa-exclamation-circle'), ' ' + state.registered + ' / ' + state.configured + ' ' + labels.registeredExtensions + ' · ' + state.contacts + ' ' + labels.contacts));
+        if (!state.registered) panel.append($('<p>').text(labels.noReceivers));
+        if (state.formats.length || state.unknown) panel.append($('<p>').text(labels.detectedDevices + ': ' + state.formats.join(', ') + (state.unknown ? (state.formats.length ? ' · ' : '') + state.unknown + ' ' + labels.unknownContacts : '')));
+        if (state.unavailable.length) panel.append($('<p>').text(labels.offlineRecipients + ': ' + state.unavailable.slice(0, 20).join(', ') + (state.unavailable.length > 20 ? ' … (+' + (state.unavailable.length - 20) + ')' : '')));
+        var observed = new Date(readinessInventory.observed_at);
+        panel.append($('<p>', {'class':'help-block'}).text((Number.isFinite(observed.getTime()) ? labels.snapshotObserved + ': ' + observed.toLocaleString() + '. ' : '') + labels.registrationRechecked));
+    }
     function createSelector(target, titleId, chosen) {
         var selected = new Set((chosen || []).map(String)), id = 'sls-paging-selector-' + (++selectorSerial);
         var map = {}, options = [];
@@ -323,6 +379,9 @@ $help = static function (string $id, string $text) use ($escape): void {
             stats.append($('<span>').append(icon('fa-phone'), ' ' + (independent ? row.allowed_callers : shared.values()).length + ' ' + labels.callers));
             if (row.allow_external === '1') { stats.append($('<span>').append(icon('fa-globe'), ' ' + (row.external_callers || []).length + ' ' + labels.externalCallers)); }
             card.append(stats);
+            var recipients = independent ? row.extensions : group.extensions || [];
+            var readiness = $('<div>', {'class':'sls-paging-readiness',role:'status','aria-live':'polite'}).data('recipients', recipients);
+            renderReadiness(readiness, recipients); card.append(readiness);
             var pinStatus = row.require_pin !== '0' ? labels.pinOn : labels.pinOff;
             if (row.pin) { pinStatus += ' · ' + labels.unsaved; }
             if (row.allow_external === '1') { pinStatus += ' · ' + labels.externalPin; }
@@ -339,6 +398,7 @@ $help = static function (string $id, string $text) use ($escape): void {
         $('#sls-paging-legacy-callers').prop('hidden', legacyCount === 0);
         $('#sls-paging-form-complete').val('0');
     }
+    window.setInterval(function () { $('#sls-paging-rows .sls-paging-readiness').each(function () { renderReadiness($(this), $(this).data('recipients')); }); }, 30000);
     function renderIndependent() {
         var independent = standalone(draft);
         $('#sls-paging-independent-fields').prop('hidden', !independent);

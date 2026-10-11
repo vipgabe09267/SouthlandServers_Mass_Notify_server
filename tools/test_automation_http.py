@@ -32,7 +32,7 @@ with tempfile.TemporaryDirectory(prefix='sls-trigger-http-') as temporary:
     sensor = 'trg_' + 'b' * 24
     panic = 'trg_' + 'c' * 24
     action = 'act_' + 'd' * 24
-    settings = {'enabled': '1', 'automations': {'schema': 1, 'rules': [
+    settings = {'enabled': '0', 'runtime_enabled': True, 'enterprise_integrations': {'enabled':'1','sensors':{'enabled':'1'}}, 'automations': {'schema': 1, 'rules': [
         {'id': sensor, 'name': 'Signed sensor', 'enabled': True, 'kind': 'sensor', 'secret': secret,
          'event': 'door', 'action_ids': [action], 'cooldown_seconds': 10},
         {'id': panic, 'name': 'Desk panic', 'enabled': True, 'kind': 'panic', 'secret': secret,
@@ -47,8 +47,11 @@ with tempfile.TemporaryDirectory(prefix='sls-trigger-http-') as temporary:
     bootstrap = root / 'freepbx.php'
     bootstrap.write_text('''<?php
 require_once '/var/www/html/admin/modules/slsmassnotifyserver/Automations.php';
+require_once '/var/www/html/admin/modules/slsmassnotifyserver/EnterpriseIntegrations.php';
 class FixtureModule {
     use \\FreePBX\\modules\\SlsAutomations;
+    use \\FreePBX\\modules\\SlsEnterpriseIntegrations;
+    public const PLUGIN_DATA_DIR = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin';
     private function getActiveSettings() { return json_decode(file_get_contents('/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config'), true, 32, JSON_THROW_ON_ERROR); }
     protected function automationStoreDirectory(): string { return '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/http-fixture'; }
     private function startAutomationWorker(string $id): void { /* Durable admission only; never run an action. */ }
@@ -116,11 +119,21 @@ require '/var/www/html/admin/modules/slsmassnotifyserver/api/sls-mass-notify/tri
             expect(422, rule=panic, body={'operation': 'status', 'event_id': accepted[2]['event_id']})
             challenge = expect(200, rule=panic, body={'operation': 'challenge', 'request_id': '2' * 32})
             assert challenge[2]['ok'] and 'challenge' in challenge[2]
+            settings['runtime_enabled'] = False; save_config()
+            stopped = expect(422, body={**payload, 'request_id': '3' * 32})
+            assert 'stopped' in stopped[2]['message']
+            assert expect(200, body={'operation': 'status', 'event_id': accepted[2]['event_id']})[2]['state'] == 'queued'
+            heartbeat = expect(200, body={'operation': 'heartbeat', 'request_id': '4' * 32,
+                'sent_at': now, 'expires_at': now + 120, 'is_test': True})
+            assert heartbeat[2]['ok'] and heartbeat[2]['state'] == 'healthy'
+            history = json.loads((data / 'http-fixture' / 'worker-state.json').read_text())
+            assert len(history['events']) == 1, 'Stopped activation created a queued effect.'
+            settings['runtime_enabled'] = True; save_config()
             settings['automations']['rules'][0]['enabled'] = False; save_config()
             expect(403, body={'operation': 'status', 'event_id': accepted[2]['event_id']})
             config_file.chmod(0o666)
             failure = expect(503, body=payload)
             assert failure[1]['Retry-After'] == '5'
-            print('Trigger HTTP: HTTPS/proxy policy, HMAC, bounds, durable/idempotent admission, cooldown, identity isolation, panic challenge and revocation passed; zero actions executed.')
+            print('Trigger HTTP: Weather-independent HTTPS/HMAC admission, paused status/heartbeat, stopped activation, bounds, idempotency, cooldown and revocation passed; zero actions executed.')
         finally:
             server.terminate(); server.wait(timeout=5)

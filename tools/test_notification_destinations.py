@@ -657,9 +657,11 @@ assert 'SLS_WEATHER_QUEUE_ENABLED' in weather_queue_source
 assert "/usr/bin/timeout 50" not in weather_scheduler_source
 
 class_source = (ROOT / "slsmassnotifyserver" / "Slsmassnotifyserver.class.php").read_text(encoding="utf-8")
-assert "* * * * * /usr/bin/timeout 5500 /usr/local/bin/sls_mass_notify/sls_mass_notify_weather_poll.sh" in class_source
-assert "$weatherCronLine = '* * * * * /usr/bin/timeout 5500 /usr/local/bin/sls_mass_notify/sls_mass_notify_weather_poll.sh';" in class_source
-assert "trim($line) !== $weatherCronLine" in class_source
+assert "$this->slsCronLine($job)" in class_source
+cron_runner_source = (RUNTIME / 'sls_cron_runner.py').read_text()
+assert "'weather': (False, 5500," in cron_runner_source
+assert "'/sls_mass_notify_weather_poll.sh'" in cron_runner_source
+assert "' >/dev/null 2>&1'" in class_source
 assert "strpos((string)$line, '/usr/bin/timeout 1200')" not in class_source
 assert "/usr/bin/timeout 55 /usr/local/bin/sls_mass_notify/sls_mass_notify_weather_poll.sh" not in class_source
 

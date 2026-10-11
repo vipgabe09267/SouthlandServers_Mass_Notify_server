@@ -7,11 +7,14 @@ require_once __DIR__ . '/AnnouncementDelivery.php';
 require_once __DIR__ . '/AnnouncementPreview.php';
 require_once __DIR__ . '/SpeechRules.php';
 require_once __DIR__ . '/SystemRecordings.php';
+require_once __DIR__ . '/PhoneInventory.php';
+require_once __DIR__ . '/VoicemailConfig.php';
 require_once __DIR__ . '/StatusHealth.php';
 require_once __DIR__ . '/AnnouncementAdmission.php';
 require_once __DIR__ . '/ScheduledDelivery.php';
 require_once __DIR__ . '/SchedulePresentation.php';
 require_once __DIR__ . '/ScheduleCalendar.php';
+require_once __DIR__ . '/ScheduleProgrammes.php';
 require_once __DIR__ . '/UpdatePolicy.php';
 require_once __DIR__ . '/TestProfiles.php';
 require_once __DIR__ . '/SupportDiagnostics.php';
@@ -39,6 +42,7 @@ require_once __DIR__ . '/ApiCredentialManagement.php';
 require_once __DIR__ . '/ApiPermissionGuards.php';
 require_once __DIR__ . '/api/sls-mass-notify/media-policy.php';
 require_once __DIR__ . '/EnterpriseAdministration.php';
+require_once __DIR__ . '/BetaNoticeService.php';
 require_once __DIR__ . '/EnterpriseOperations.php';
 require_once __DIR__ . '/EnterpriseCluster.php';
 require_once __DIR__ . '/EnterpriseIdentityManagement.php';
@@ -83,11 +87,12 @@ class Slsmassnotifyserver implements \BMO
 	use SlsApiCredentialManagement;
 	use SlsApiPermissionGuards;
 	use SlsEnterpriseAdministration;
+	use SlsBetaNotice;
 	use SlsEnterpriseOperations;
 	use SlsEnterpriseCluster;
 	use SlsEnterpriseLabs;
 	use SlsEnterpriseIntegrations;
-	const MODULE_VERSION = '0.1.5-beta';
+	const MODULE_VERSION = '0.1.6-beta';
 	const INCIDENT_JOB_CONTRACT = 1;
 	const EVENTS_LOG = '/var/log/sls_mass_notify_events.jsonl';
 	const LEGACY_EVENTS_LOG = '/var/log/nws_weather_alert_events.jsonl';
@@ -173,6 +178,9 @@ class Slsmassnotifyserver implements \BMO
 	private $settingsActivityLocks = [];
 	/** Request-local endpoint inventory caches avoid repeated AMI/database discovery. */
 	private $registeredPjsipExtensionsCache = null;
+	private $phoneInventoryCache = null;
+	private $recordingLabelCache = null;
+	private $phoneInventoryForSending = false;
 	private $extensionNameMapCache = null;
 	private $allPjsipExtensionsCache = null;
 	private $sipNotifyTargetsCache = null;
@@ -281,6 +289,9 @@ class Slsmassnotifyserver implements \BMO
 	/** Fixed root teardown is performed separately by the signed uninstaller. */
 	public function uninstallUnprivilegedPhase()
 	{
+		if (function_exists('posix_geteuid') && posix_geteuid() === 0) {
+			throw new \RuntimeException(_('Run the bundled uninstaller as root: /usr/local/bin/sls_mass_notify/sls_mass_notify_uninstall.sh. It removes SLS without running web-writable module PHP as root.'));
+		}
 		$this->requireRuntimeAccount();
 		$this->removeFreePbxBackupEnrollment();
 		$this->removeCronJob();
@@ -791,7 +802,10 @@ class Slsmassnotifyserver implements \BMO
 		}
 		return $health;
 	}
-	public function myConfigPageInits() { return ['index']; }
+	public function myConfigPageInits() { return ['index', 'slsmassnotifyserver', 'slsmassnotifyserver_other',
+		'slsmassnotifyserver_help', 'slsmassnotifyserver_operators', 'slsmassnotifyserver_enterprise',
+		'slsmassnotifyserver_scheduling', 'slsmassnotifyserver_paging', 'slsmassnotifyserver_locations',
+		'slsmassnotifyserver_incidents', 'slsmassnotifyserver_automations', 'slsmassnotifyserver_nws', 'slsmassnotifyserver_lightning']; }
 	public function doConfigPageInit($page)
 	{
 		if ($page === 'index') {
@@ -800,6 +814,9 @@ class Slsmassnotifyserver implements \BMO
 			echo '<script src="modules/slsmassnotifyserver/views/dashboard_assets.js?v=' . $revision . '"></script>';
 		} elseif (is_string($page) && str_starts_with($page, 'slsmassnotifyserver')) {
 			$this->enforceOperatorPageAccess($page);
+		}
+		if ($page === 'index' || (is_string($page) && str_starts_with($page, 'slsmassnotifyserver'))) {
+			echo $this->renderBetaNotice();
 		}
 	}
 	public function getRightNav($request) {}
@@ -885,6 +902,7 @@ class Slsmassnotifyserver implements \BMO
 				return load_view(__DIR__ . '/views/settings.php', [
 					'available_tones' => $this->getAvailableTones(),
 					'available_system_sounds' => $this->getAvailableSystemSounds(),
+					'recording_catalogue' => $this->getSystemRecordingCatalogue('', 0, 500),
 					'available_voices' => $this->getAvailablePiperVoices(),
 					'available_extensions' => $this->getAllPjsipExtensions(),
 					'available_desktop_clients' => $this->getDesktopClients($pendingSettings ?? $activeSettings),
@@ -905,6 +923,7 @@ class Slsmassnotifyserver implements \BMO
 				return load_view(__DIR__ . '/views/settings.php', [
 					'available_tones' => $this->getAvailableTones(),
 					'available_system_sounds' => $this->getAvailableSystemSounds(),
+					'recording_catalogue' => $this->getSystemRecordingCatalogue('', 0, 500),
 					'available_voices' => $this->getAvailablePiperVoices(),
 					'available_extensions' => $this->getAllPjsipExtensions(),
 					'available_desktop_clients' => $this->getDesktopClients($pendingSettings ?? $activeSettings),
@@ -935,6 +954,7 @@ class Slsmassnotifyserver implements \BMO
 					'weather_sms_recipients' => $this->getAnnouncementSmsRecipients($pendingSettings ?? $activeSettings),
 					'available_tones' => $this->getAvailableTones(),
 					'available_system_sounds' => $this->getAvailableSystemSounds(),
+					'recording_catalogue' => $this->getSystemRecordingCatalogue('', 0, 500),
 					'save_result' => $params['save_result'] ?? null,
 					'apply_result' => $params['apply_result'] ?? null,
 					'test_result' => $params['test_result'] ?? null,
@@ -949,6 +969,8 @@ class Slsmassnotifyserver implements \BMO
 				return load_view(__DIR__ . '/views/scheduling.php', [
 					'settings' => $activeSettings,
 					'schedules' => $this->getScheduledAnnouncements(true),
+					'schedule_programmes' => $this->getScheduleProgrammes(),
+					'active_schedule_programmes' => \SLS\MassNotify\ScheduleProgrammes::normalize($activeSettings['schedule_programmes'] ?? []),
 					'schedule_execution_state' => $this->getScheduleExecutionState(),
 					'available_extensions' => $this->getAllPjsipExtensions(),
 					'announcement_groups' => $this->getAnnouncementGroups(),
@@ -959,6 +981,7 @@ class Slsmassnotifyserver implements \BMO
 					'available_voices' => $this->getAvailablePiperVoices(),
 					'available_tones' => $this->getAvailableTones(),
 					'available_system_sounds' => $this->getAvailableSystemSounds(),
+					'recording_catalogue' => $this->getSystemRecordingCatalogue('', 0, 500),
 					'pbx_timezone' => $this->getPbxDateTimeZone()->getName(),
 					'save_result' => $params['save_result'] ?? null,
 					'hero_image' => self::HERO_IMAGE,
@@ -979,6 +1002,7 @@ class Slsmassnotifyserver implements \BMO
 					'available_voices' => $this->getAvailablePiperVoices(),
 					'available_tones' => $this->getAvailableTones(),
 					'available_system_sounds' => $this->getAvailableSystemSounds(),
+					'recording_catalogue' => $this->getSystemRecordingCatalogue('', 0, 500),
 					'desktop_clients' => $this->getDesktopClients($pendingSettings ?? $activeSettings, true),
 					'outbound_voice_trunks' => $this->getOutboundVoiceTrunks(),
 					'outbound_voice_dids' => $this->getOutboundVoiceDids(),
@@ -994,6 +1018,8 @@ class Slsmassnotifyserver implements \BMO
 				]);
 			case 'help':
 				return load_view(__DIR__ . '/views/help.php', [
+					'csrf_token' => $csrfToken,
+					'can_export_installation_profile' => ($this->currentOperator()['operator_role'] ?? '') === 'administrator',
 					'settings' => $activeSettings,
 					'control_api_url' => $this->getControlApiUrl($activeSettings),
 					'diagnostics' => $this->getDiagnosticsSummary(),
@@ -1056,6 +1082,7 @@ class Slsmassnotifyserver implements \BMO
 			'available_voices' => $this->getAvailablePiperVoices(),
 			'available_tones' => $this->getAvailableTones(),
 			'available_system_sounds' => $this->getAvailableSystemSounds(),
+					'recording_catalogue' => $this->getSystemRecordingCatalogue('', 0, 500),
 			'project_url' => 'https://southlandservers.xyz/projects',
 			'pbx_timezone' => $this->getPbxDateTimeZone()->getName(),
 			'discord_url' => 'https://southlandservers.xyz/discord',
@@ -1346,6 +1373,26 @@ class Slsmassnotifyserver implements \BMO
 			return ['success'=>false, 'message'=>_('Generated-media cache target must be a whole number from 64 through 4096 MiB.')];
 		}
 		$settings['generated_media_cache_mib'] = (int)$mediaLimit;
+		$value = $input['speech_synthesis_limit'] ?? $settings['speech_synthesis_limit'] ?? 1;
+		if (filter_var($value, FILTER_VALIDATE_INT, ['options'=>['min_range'=>1, 'max_range'=>4]]) === false) {
+			return ['success'=>false, 'message'=>_('Speech synthesis limit must be a whole number from 1 through 4.')];
+		}
+		$settings['speech_synthesis_limit'] = (int)$value;
+		$value = $input['speech_queue_limit'] ?? $settings['speech_queue_limit'] ?? 8;
+		if (filter_var($value, FILTER_VALIDATE_INT, ['options'=>['min_range'=>1, 'max_range'=>32]]) === false) {
+			return ['success'=>false, 'message'=>_('Speech queue limit must be a whole number from 1 through 32.')];
+		}
+		$settings['speech_queue_limit'] = (int)$value;
+		$value = $input['speech_queue_wait_seconds'] ?? $settings['speech_queue_wait_seconds'] ?? 15;
+		if (filter_var($value, FILTER_VALIDATE_INT, ['options'=>['min_range'=>0, 'max_range'=>60]]) === false) {
+			return ['success'=>false, 'message'=>_('Speech queue wait seconds must be a whole number from 0 through 60.')];
+		}
+		$settings['speech_queue_wait_seconds'] = (int)$value;
+		$value = $input['generated_media_min_free_mib'] ?? $settings['generated_media_min_free_mib'] ?? 128;
+		if (filter_var($value, FILTER_VALIDATE_INT, ['options'=>['min_range'=>64, 'max_range'=>4096]]) === false) {
+			return ['success'=>false, 'message'=>_('Generated media min free mib must be a whole number from 64 through 4096.')];
+		}
+		$settings['generated_media_min_free_mib'] = (int)$value;
 		$settings['setup'] = [
 			'completed' => empty($errors) ? '1' : '0',
 			'beta_accepted' => empty($input['beta_agree']) ? '0' : '1',
@@ -1530,6 +1577,11 @@ class Slsmassnotifyserver implements \BMO
 		$settings['nws_piper_voice'] = isset($voiceLookup[$nwsVoice]) ? $nwsVoice : (isset($voiceLookup[self::PIPER_AMY_VOICE]) ? self::PIPER_AMY_VOICE : self::PIPER_VOICE);
 		$settings['piper_voice'] = $settings['nws_piper_voice'];
 		$settings['nws_tts_volume'] = $this->normalizeTtsVolume($input['nws_tts_volume'] ?? $currentSettings['nws_tts_volume'] ?? 25, 25);
+		try {
+			$settings['nws_voicemail_enabled'] = \SLS\MassNotify\VoicemailConfig::flag($input['nws_voicemail_enabled'] ?? $currentSettings['nws_voicemail_enabled'] ?? '1');
+		} catch (\InvalidArgumentException $error) {
+			$errors[] = $error->getMessage();
+		}
 
 		if (!empty($errors)) {
 			return [
@@ -1565,6 +1617,11 @@ class Slsmassnotifyserver implements \BMO
 		$settings = $this->getPendingSettings() ?? $this->getActiveSettings();
 		$current = is_array($settings['xweather'] ?? null) ? $settings['xweather'] : [];
 		$incoming = is_array($input['xweather'] ?? null) ? $input['xweather'] : [];
+		try {
+			$incoming['voicemail_enabled'] = \SLS\MassNotify\VoicemailConfig::flag($incoming['voicemail_enabled'] ?? $current['voicemail_enabled'] ?? '1');
+		} catch (\InvalidArgumentException $error) {
+			return ['success' => false, 'message' => _('Lightning settings were not saved.'), 'errors' => [$error->getMessage()]];
+		}
 		foreach (['adaptive_gate_failure_policy' => 'standby', 'adaptive_fallback_minutes' => 30] as $field => $default) {
 			if (!array_key_exists($field, $incoming)) { $incoming[$field] = $current[$field] ?? $default; }
 		}
@@ -1814,6 +1871,26 @@ class Slsmassnotifyserver implements \BMO
 			return ['success'=>false, 'message'=>_('Generated-media cache target must be a whole number from 64 through 4096 MiB.')];
 		}
 		$settings['generated_media_cache_mib'] = (int)$mediaLimit;
+		$value = $input['speech_synthesis_limit'] ?? $settings['speech_synthesis_limit'] ?? 1;
+		if (filter_var($value, FILTER_VALIDATE_INT, ['options'=>['min_range'=>1, 'max_range'=>4]]) === false) {
+			return ['success'=>false, 'message'=>_('Speech synthesis limit must be a whole number from 1 through 4.')];
+		}
+		$settings['speech_synthesis_limit'] = (int)$value;
+		$value = $input['speech_queue_limit'] ?? $settings['speech_queue_limit'] ?? 8;
+		if (filter_var($value, FILTER_VALIDATE_INT, ['options'=>['min_range'=>1, 'max_range'=>32]]) === false) {
+			return ['success'=>false, 'message'=>_('Speech queue limit must be a whole number from 1 through 32.')];
+		}
+		$settings['speech_queue_limit'] = (int)$value;
+		$value = $input['speech_queue_wait_seconds'] ?? $settings['speech_queue_wait_seconds'] ?? 15;
+		if (filter_var($value, FILTER_VALIDATE_INT, ['options'=>['min_range'=>0, 'max_range'=>60]]) === false) {
+			return ['success'=>false, 'message'=>_('Speech queue wait seconds must be a whole number from 0 through 60.')];
+		}
+		$settings['speech_queue_wait_seconds'] = (int)$value;
+		$value = $input['generated_media_min_free_mib'] ?? $settings['generated_media_min_free_mib'] ?? 128;
+		if (filter_var($value, FILTER_VALIDATE_INT, ['options'=>['min_range'=>64, 'max_range'=>4096]]) === false) {
+			return ['success'=>false, 'message'=>_('Generated media min free mib must be a whole number from 64 through 4096.')];
+		}
+		$settings['generated_media_min_free_mib'] = (int)$value;
 		$updates = is_array($input['updates'] ?? null) ? $input['updates'] : [];
 		try { $settings['updates'] = \SLS\MassNotify\UpdatePolicy::form($updates, (array)($settings['updates'] ?? [])); }
 		catch (\DomainException $error) { return ['success'=>false, 'message'=>$error->getMessage(), 'errors'=>[$error->getMessage()]]; }
@@ -2272,6 +2349,10 @@ class Slsmassnotifyserver implements \BMO
 	private function validateConfigValueTypes(array $settings)
 	{
 		$errors = $this->validateDesktopCapacityConfig($settings);
+		if (array_key_exists('speech_synthesis_limit', $settings) && (!is_int($settings['speech_synthesis_limit']) || $settings['speech_synthesis_limit'] < 1 || $settings['speech_synthesis_limit'] > 4)) { $errors[] = _('Speech synthesis limit must be an integer from 1 through 4.'); }
+		if (array_key_exists('speech_queue_limit', $settings) && (!is_int($settings['speech_queue_limit']) || $settings['speech_queue_limit'] < 1 || $settings['speech_queue_limit'] > 32)) { $errors[] = _('Speech queue limit must be an integer from 1 through 32.'); }
+		if (array_key_exists('speech_queue_wait_seconds', $settings) && (!is_int($settings['speech_queue_wait_seconds']) || $settings['speech_queue_wait_seconds'] < 0 || $settings['speech_queue_wait_seconds'] > 60)) { $errors[] = _('Speech queue wait seconds must be an integer from 0 through 60.'); }
+		if (array_key_exists('generated_media_min_free_mib', $settings) && (!is_int($settings['generated_media_min_free_mib']) || $settings['generated_media_min_free_mib'] < 64 || $settings['generated_media_min_free_mib'] > 4096)) { $errors[] = _('Generated media min free mib must be an integer from 64 through 4096.'); }
 		if (isset($settings['xweather']['provider']) && !in_array($settings['xweather']['provider'], ['xweather', 'tempest', 'meteomatics'], true)) { $errors[] = _('Select Xweather, Tempest or Meteomatics for Lightning.'); }
 		if (isset($settings['pbx_timezone']) && $settings['pbx_timezone'] !== '' && (!is_string($settings['pbx_timezone']) || !in_array($settings['pbx_timezone'], \DateTimeZone::listIdentifiers(\DateTimeZone::ALL_WITH_BC), true))) { $errors[] = _('PBX timezone must be a valid IANA timezone.'); }
 		if (array_key_exists('generated_media_cache_mib', $settings) && (!is_int($settings['generated_media_cache_mib']) || $settings['generated_media_cache_mib'] < 64 || $settings['generated_media_cache_mib'] > 4096)) {
@@ -2309,10 +2390,11 @@ class Slsmassnotifyserver implements \BMO
 			try { \SLS\MassNotify\IncidentConfig::normalize($settings['incident_workflows']); }
 			catch (\InvalidArgumentException $error) { $errors[] = $error->getMessage(); }
 		}
-		foreach (['labs_safety'=>\SLS\MassNotify\LabsSafety::class,'enterprise_operations'=>\SLS\MassNotify\EnterpriseOperationsConfig::class,
+		foreach (['beta_notice'=>\SLS\MassNotify\BetaNotice::class,'labs_safety'=>\SLS\MassNotify\LabsSafety::class,'enterprise_operations'=>\SLS\MassNotify\EnterpriseOperationsConfig::class,
 			'enterprise_cluster'=>\SLS\MassNotify\EnterpriseClusterConfig::class,'enterprise_identity'=>\SLS\MassNotify\EnterpriseIdentityConfig::class,
 			'directory_sync'=>\SLS\MassNotify\DirectoryConfig::class,'subscriber_browser'=>\SLS\MassNotify\SubscriberConfig::class,
-			'enterprise_integrations'=>\SLS\MassNotify\EnterpriseIntegrationsConfig::class] as $key=>$class) {
+			'enterprise_integrations'=>\SLS\MassNotify\EnterpriseIntegrationsConfig::class,
+			'schedule_programmes'=>\SLS\MassNotify\ScheduleProgrammes::class] as $key=>$class) {
 			if(array_key_exists($key,$settings)){try{$class::normalize($settings[$key]);}catch(\Throwable $error){$errors[]=$error->getMessage();}}
 		}
 		if (array_key_exists('announcement_email', $settings)) { $errors = array_merge($errors, $this->validateAnnouncementEmail($settings['announcement_email'])); }
@@ -2327,19 +2409,19 @@ class Slsmassnotifyserver implements \BMO
 			'nws_api_base_url', 'nws_zone', 'quiet_hours_enabled', 'quiet_hours_start', 'quiet_hours_end',
 			'mail_from_name', 'mail_from_local_part', 'mail_from_domain', 'mail_from_addr',
 			'alert_email_subject', 'alert_email_body', 'test_email_subject', 'test_email_body',
-			'opening_tone', 'closing_tone', 'nws_opening_tone', 'nws_closing_tone', 'email_html_enabled',
+			'opening_tone', 'closing_tone', 'nws_opening_tone', 'nws_closing_tone', 'email_html_enabled', 'nws_voicemail_enabled',
 			'piper_bin', 'piper_voice', 'nws_piper_voice', 'announcement_piper_voice',
 			'announcement_timeout_mode', 'desktop_auth_key', 'desktop_minimum_version', 'sound_dir', 'asterisk_sound_prefix',
 		];
 		$integerFields = [
 			'tts_max_seconds', 'nws_tts_volume', 'announcement_tts_volume', 'announcement_cooldown_seconds',
-			'announcement_timeout_seconds', 'log_retention_days', 'generated_media_cache_mib', 'paging_answer_timeout', 'desktop_client_limit', 'phone_device_limit',
+			'announcement_timeout_seconds', 'log_retention_days', 'generated_media_cache_mib', 'speech_synthesis_limit', 'speech_queue_limit', 'speech_queue_wait_seconds', 'generated_media_min_free_mib', 'paging_answer_timeout', 'desktop_client_limit', 'phone_device_limit',
 		];
 		$listFields = [
 			'alert_recipients', 'nws_zones', 'quiet_critical_events', 'announcement_groups', 'desktop_clients',
 			'scheduled_announcements', 'discord_webhooks', 'generic_webhooks', 'announcement_webhooks', 'test_profiles',
 		];
-		$objectFields = ['operator_access', 'device_acceptance', 'automations', 'control_api', 'updates', 'setup', 'sipnotify', 'ami', 'xweather', 'live_paging', 'outbound_voice', 'announcement_email', 'announcement_sms', 'labs_safety', 'enterprise_operations', 'enterprise_cluster', 'enterprise_identity', 'directory_sync', 'subscriber_browser', 'enterprise_integrations'];
+		$objectFields = ['operator_access', 'device_acceptance', 'automations', 'control_api', 'updates', 'setup', 'sipnotify', 'ami', 'xweather', 'live_paging', 'outbound_voice', 'announcement_email', 'announcement_sms', 'beta_notice', 'labs_safety', 'enterprise_operations', 'enterprise_cluster', 'enterprise_identity', 'directory_sync', 'subscriber_browser', 'enterprise_integrations'];
 		foreach ($stringFields as $field) {
 			if (array_key_exists($field, $settings) && !is_string($settings[$field])) {
 				$errors[] = sprintf(_('%s must be a string.'), $field);
@@ -2361,7 +2443,7 @@ class Slsmassnotifyserver implements \BMO
 				$errors[] = sprintf(_('%s must be an object.'), $field);
 			}
 		}
-		foreach (['enabled', 'quiet_hours_enabled', 'email_html_enabled'] as $field) {
+		foreach (['enabled', 'quiet_hours_enabled', 'email_html_enabled', 'nws_voicemail_enabled'] as $field) {
 			if (is_string($settings[$field] ?? null) && !in_array($settings[$field], ['0', '1'], true)) {
 				$errors[] = sprintf(_('%s must be 0 or 1.'), $field);
 			}
@@ -2386,9 +2468,9 @@ class Slsmassnotifyserver implements \BMO
 				'string' => ['pbx_host', 'base_url', 'media_scheme', 'media_base_url'], 'integer' => [], 'flag' => [], 'array' => ['format_overrides', 'device_format_overrides'],
 			],
 			'xweather' => [
-				'string' => ['enabled', 'provider', 'client_id', 'client_secret', 'location', 'adaptive_free_tier', 'adaptive_gate_failure_policy', 'adaptive_nws_zone_id', 'opening_tone', 'closing_tone', 'all_clear', 'strike_type', 'quiet_hours_enabled', 'quiet_hours_start', 'quiet_hours_end'],
+				'string' => ['enabled', 'provider', 'client_id', 'client_secret', 'location', 'adaptive_free_tier', 'adaptive_gate_failure_policy', 'adaptive_nws_zone_id', 'opening_tone', 'closing_tone', 'all_clear', 'strike_type', 'quiet_hours_enabled', 'quiet_hours_start', 'quiet_hours_end', 'voicemail_enabled'],
 				'integer' => ['radius_miles', 'query_interval_minutes', 'adaptive_grace_minutes', 'adaptive_fallback_minutes', 'tts_volume'],
-				'flag' => ['enabled', 'adaptive_free_tier', 'quiet_hours_enabled'], 'array' => ['recipients', 'groups'],
+				'flag' => ['enabled', 'adaptive_free_tier', 'quiet_hours_enabled', 'voicemail_enabled'], 'array' => ['recipients', 'groups'],
 			],
 		];
 		foreach ($nestedSchemas as $objectField => $schema) {
@@ -2939,7 +3021,8 @@ class Slsmassnotifyserver implements \BMO
 			}
 			$this->announcementAdmissionLock = $announcementLock;
 			$cooldown = $this->getAnnouncementCooldownState();
-			if ($cooldown['remaining'] > 0 && empty($options['preview'])) {
+			if ($cooldown['remaining'] > 0 && empty($options['preview'])
+				&& !(method_exists($this,'incidentLanguageBatchMayBypassCooldown') && $this->incidentLanguageBatchMayBypassCooldown())) {
 				return ['success' => false, 'message' => sprintf(_('SIP NOTIFY announcements are on cooldown. Wait %s seconds and try again.'), $cooldown['remaining']),
 					'cooldown_remaining' => $cooldown['remaining'], 'error_code' => 'cooldown', 'delivery_started' => false];
 			}
@@ -2975,7 +3058,18 @@ class Slsmassnotifyserver implements \BMO
 				'cooldown_remaining' => 0, 'error_code' => 'message_too_long', 'delivery_started' => false];
 		}
 
-		$allowedTargets = $this->getSipNotifyTargets();
+		foreach (['browser_recipient_ids'=>'/^sub_[a-f0-9]{24}$/D', 'connector_ids'=>'/^conn_[a-f0-9]{24}$/D'] as $field=>$pattern) {
+			$ids = $options[$field] ?? [];
+			if (!is_array($ids) || !array_is_list($ids) || count($ids) > 50) {
+				return ['success'=>false, 'message'=>_('Choose at most 50 saved Labs recipients per channel.'), 'delivery_started'=>false];
+			}
+			foreach ($ids as $id) { if (!is_string($id) || !preg_match($pattern, $id)) { return ['success'=>false, 'message'=>_('A Labs recipient identifier is invalid.'), 'delivery_started'=>false]; } }
+			if (count(array_unique($ids)) !== count($ids)) { return ['success'=>false, 'message'=>_('Labs recipient identifiers must be distinct.'), 'delivery_started'=>false]; }
+		}
+		$this->phoneInventoryForSending = empty($options['preview']);
+		$this->sipNotifyTargetsCache = null;
+		try { $allowedTargets = $this->getSipNotifyTargets(); }
+		finally { $this->phoneInventoryForSending = false; $this->sipNotifyTargetsCache = null; }
 		$unavailableTargets = [];
 		$allowed = [];
 		foreach ($allowedTargets as $target) {
@@ -3135,7 +3229,7 @@ class Slsmassnotifyserver implements \BMO
 				}
 			}
 
-			if (empty($selected) && !$desktopRequested && !$webhookRequested && !$selectedVoiceIds && !$selectedEmailIds && !$selectedSmsIds) {
+			if (empty($selected) && !$desktopRequested && !$webhookRequested && !$selectedVoiceIds && !$selectedEmailIds && !$selectedSmsIds && empty($options['browser_recipient_ids']) && empty($options['connector_ids'])) {
 				if ($unavailableTargets) {
 					return ['success' => false,
 						'message' => sprintf(_('None of the %d selected phone(s) is registered or available. No channels were submitted. Check phone registration before sending again.'), count($unavailableTargets)),
@@ -3203,6 +3297,8 @@ class Slsmassnotifyserver implements \BMO
                 'email_severity' => ($incidentContext['severity'] ?? 'information') === 'information' ? 'info' : $incidentContext['severity'],
                 'email_recipient_ids' => array_keys($selectedEmailIds),
                 'sms_recipient_ids' => array_keys($selectedSmsIds),
+                'browser_recipient_ids' => $options['browser_recipient_ids'] ?? [],
+                'connector_ids' => $options['connector_ids'] ?? [],
                 'priority' => $priority,
                 'message' => $message, 'sender' => $this->announcementSender($options),
                 'only_channels' => $options['_test_channels'] ?? null,
@@ -3590,13 +3686,19 @@ class Slsmassnotifyserver implements \BMO
 			}
 			$generationTimeout = min(900, max(25, ($maxSeconds * 2) + 30));
 			if (!empty($settings['_tts_preview'])) { $generationTimeout = min(30, $generationTimeout); }
-			$cmd = '/usr/bin/timeout ' . (int)$generationTimeout . ' '
+			$admission = self::RUNTIME_DIR . '/sls_speech_admission.py';
+			$meta = @lstat($admission);
+			if (!$meta || ($meta['mode'] & 0170000) !== 0100000 || $meta['uid'] !== 0 || ($meta['mode'] & 0022) || $meta['nlink'] !== 1) { throw new \DomainException(_('The protected speech admission helper is missing or unsafe. Run Repair Installation.')); }
+			$cmd = '/usr/bin/timeout --kill-after=2 ' . (int)($generationTimeout + (int)($settings['speech_queue_wait_seconds'] ?? 15) + 3) . ' /usr/bin/python3 -I ' . escapeshellarg($admission) . ' --max-seconds ' . (int)$maxSeconds . ' -- '
 				. escapeshellarg($settings['piper_bin'] ?? self::PIPER_BIN)
 				. ' --model ' . escapeshellarg($settings['announcement_piper_voice'] ?? $settings['piper_voice'] ?? self::PIPER_VOICE)
 				. ' --volume 1.00 --input-file ' . escapeshellarg($textFile)
 				. ' --output-file ' . escapeshellarg($tmpWav) . ' 2>&1';
 			$output = [];
 			exec($cmd, $output, $exitCode);
+			if ($exitCode === 65) { throw new \DomainException(sprintf(_('Speech exceeds the configured maximum of %d seconds or its output-size limit. Audio was rejected. Shorten the message or increase Maximum Speech Duration in General Settings.'), $maxSeconds)); }
+			if ($exitCode === 75) { throw new \DomainException(_('Speech generation is busy: the bounded queue is full or its wait time expired. Wait for current speech jobs to finish before sending again.')); }
+			if ($exitCode === 73) { throw new \DomainException(_('Generated-media storage cannot accept this job. Check the media budget, free-space reserve and retained active alerts in General Settings.')); }
 			if ($exitCode === 124) {
 				throw new \DomainException(sprintf(_('Speech generation exceeded its %d-second processing timeout. Check PBX load or shorten the message.'), $generationTimeout));
 			}
@@ -3724,6 +3826,18 @@ class Slsmassnotifyserver implements \BMO
 		return $format && $data && $offset === $length;
 	}
 
+	private function reserveGeneratedMedia(int $bytes): void
+	{
+		if ($bytes < 1 || $bytes > 20*1048576) { throw new \DomainException(_('This render requires more than the 20 MiB per-job media allocation. Shorten the audio or select smaller recordings.')); }
+		$helper=self::RUNTIME_DIR.'/sls_speech_admission.py';$info=@lstat($helper);
+		if (!$info || ($info['mode'] & 0170000) !== 0100000 || $info['uid'] !== 0 || ($info['mode'] & 0022) || $info['nlink'] !== 1) {
+			throw new \DomainException(_('The protected media admission helper is missing or unsafe. Run Repair Installation.'));
+		}
+		$output=[];$code=1;
+		exec('/usr/bin/timeout --kill-after=1 10 /usr/bin/python3 -I '.escapeshellarg($helper).' --reserve-media-bytes '.$bytes.' 2>/dev/null',$output,$code);
+		if ($code !== 0) { throw new \DomainException(_('Media storage cannot accept this render. Check the generated-media budget, remaining free-space reserve and active references in General Settings.')); }
+	}
+
 	private function combineAudioParts($baseName, array $files, $prefix)
 	{
 		if (!is_executable('/usr/bin/sox') || count($files) < 1) {
@@ -3747,6 +3861,9 @@ class Slsmassnotifyserver implements \BMO
 		if ($this->isValidAnnouncementAudioCache($target) && (int)@filemtime($target) >= $sourceMtime) {
 			return $name;
 		}
+		$bytes = 32768;
+		foreach ($files as $file) { $bytes += (int)filesize($file); }
+		$this->reserveGeneratedMedia(max(65536, $bytes));
 		$tmp = $target . '.tmp.' . bin2hex(random_bytes(3)) . '.wav';
 		$silence = $target . '.silence.' . bin2hex(random_bytes(3)) . '.wav';
 		$silenceCmd = '/usr/bin/timeout --kill-after=2 30 /usr/bin/sox -n -r 8000 -c 1 -b 16 ' . escapeshellarg($silence) . ' trim 0.0 1.0 2>&1';
@@ -3795,6 +3912,7 @@ class Slsmassnotifyserver implements \BMO
 			return $quietBase;
 		}
 
+		$this->reserveGeneratedMedia(max(65536, (int)filesize($source) + 4096));
 			$tmp = $target . '.tmp.' . bin2hex(random_bytes(3)) . '.wav';
 		$cmd = '/usr/bin/timeout --kill-after=2 30 /usr/bin/sox -v ' . escapeshellarg($this->volumePercentToScalar($volumePercent, 25)) . ' '
 			. escapeshellarg($source)
@@ -4455,8 +4573,8 @@ class Slsmassnotifyserver implements \BMO
 		$phoneCollector = $this->getPhoneEventCollectorHealth();
 		$checks[] = $this->diagnosticCheck(_('Phone admission and outcome collector'), $phoneCollector['ok'], $phoneCollector['message']);
 		$checks[] = $this->diagnosticCheck(_('General announcement worker'), $announcementWorker['ok'],
-			sprintf(_('Latest state: %s. '), $announcementWorker['latest_state']) . ($announcementWorker['failure_reason'] !== '' ? $announcementWorker['failure_reason']
-				: ($announcementWorker['ok'] ? _('FreePBX/SLS bootstrap and protected job storage verified.') : _('Worker health check is missing, stale, or failed. Run protected repair.'))));
+			sprintf(_('Last job: %s. '), $announcementWorker['latest_state']) . ($announcementWorker['failure_reason'] !== '' ? $announcementWorker['failure_reason']
+				: ($announcementWorker['ok'] ? _('Current worker bootstrap and protected job storage verified.') : ($announcementWorker['health_reason'] ?? _('Worker health could not be confirmed. Check the installation doctor and maintenance log.')))));
 		$checks[] = $this->diagnosticCheck(_('Xweather poller'), is_executable('/usr/local/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py'), '/usr/local/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py');
 		$checks[] = $this->diagnosticCheck(_('Branded email sender'), is_executable('/usr/local/bin/sls_mass_notify/sls_branded_email.py'), '/usr/local/bin/sls_mass_notify/sls_branded_email.py');
 		$checks[] = $this->diagnosticCheck(_('Branded Discord sender'), is_executable('/usr/local/bin/sls_mass_notify/sls_branded_discord.py'), '/usr/local/bin/sls_mass_notify/sls_branded_discord.py');
@@ -4471,13 +4589,15 @@ class Slsmassnotifyserver implements \BMO
 		$checks[] = $this->diagnosticCheck(_('Notification log'), is_writable(self::EVENTS_LOG) || (is_writable(dirname(self::EVENTS_LOG)) && !file_exists(self::EVENTS_LOG)), self::EVENTS_LOG);
 		$checks[] = $this->diagnosticCheck(_('Desktop journal'), is_writable(self::PLUGIN_DATA_DIR . '/sipnotify') || is_writable(self::PLUGIN_DATA_DIR), self::PLUGIN_DATA_DIR . '/sipnotify/sipnotify_events.jsonl');
 		$mailConfigured = $this->hasConfiguredNotificationEmailRecipients($settings);
-		$checks[] = $this->diagnosticCheck(_('Local email transport'), !$mailConfigured || is_executable('/usr/sbin/sendmail'), $mailConfigured ? '/usr/sbin/sendmail' : _('Not required until an email recipient is configured'));
+		$checks[] = $this->diagnosticCheck(_('Local email transport'), !$mailConfigured || (is_executable('/usr/sbin/sendmail') && is_executable('/usr/sbin/postqueue')), $mailConfigured ? _('Local Postfix sendmail and postqueue are required; SLS checks the queue before submission.') : _('Not required until an email recipient is configured'));
 		$controlEnabled = !empty($settings['control_api']['enabled']);
 		$controlKeyValid = preg_match('/^[A-Za-z0-9_-]{24,128}$/', (string)($settings['control_api']['api_key'] ?? '')) === 1;
 		$checks[] = $this->diagnosticCheck(_('Control API'), !$controlEnabled || $controlKeyValid, $controlEnabled ? _('Enabled') : _('Disabled (optional)'));
 		$storage = $this->loadJsonFile(self::PLUGIN_DATA_DIR . '/storage-summary.json');
 		if ($storage) {
 			$queueFaults = SlsStatusHealth::queueFaults($storage);
+			$checks[] = $this->diagnosticCheck(_('Generated-media admission'), empty($storage['media_scan_incomplete']) && empty($storage['free_below_media_reserve']) && empty($storage['media_near_budget']),
+				sprintf(_('%s MiB generated; %s MiB budget; %s MiB minimum remaining free space. Protected references are retained. New renders stop if their workspace cannot be reserved.'), number_format((int)($storage['media_bytes'] ?? 0)/1048576,1), number_format((int)($storage['media_cache_limit_bytes'] ?? 536870912)/1048576), number_format((int)($storage['media_free_reserve_bytes'] ?? 134217728)/1048576)));
 			$checks[] = $this->diagnosticCheck(_('Storage free-space measurement'), is_int($storage['free_bytes'] ?? null) && $storage['free_bytes'] >= 0,
 				sprintf(_('%s MiB free on the PBX data filesystem. This reports the measurement only; installation/capacity checks calculate SLS workspace separately, and retention requires additional provisioning.'), number_format((int)($storage['free_bytes'] ?? 0) / 1048576)));
 			$checks[] = $this->diagnosticCheck(_('External delivery queue'), !$queueFaults['external'],
@@ -4514,22 +4634,12 @@ class Slsmassnotifyserver implements \BMO
 	private function getDetectedEndpointFormats()
 	{
 		$this->deviceInventoryError = '';
-		if (!is_executable(self::VISUAL_PUSH_SCRIPT)) {
-			$this->deviceInventoryError = _('Device discovery runtime is unavailable.');
+		$inventory = $this->phoneDisplayInventory();
+		if (empty($inventory['available'])) {
+			$this->deviceInventoryError = _('Phone inventory is unavailable or older than 90 seconds. Check the phone-event collector in Help. Registration is checked again when sending.');
 			return [];
 		}
-		$output = [];
-		$code = 1;
-		exec('/usr/bin/timeout --signal=TERM --kill-after=2 20 /usr/bin/python3 ' . escapeshellarg(self::VISUAL_PUSH_SCRIPT) . ' --list-endpoints-json 2>/dev/null', $output, $code);
-		if ($code !== 0 || empty($output)) {
-			$this->deviceInventoryError = _('Device discovery did not complete. Check Asterisk Manager connectivity and try again.');
-			return [];
-		}
-		$decoded = json_decode(implode('', $output), true);
-		if (!is_array($decoded)) {
-			$this->deviceInventoryError = _('Device discovery returned an invalid response.');
-			return [];
-		}
+		$decoded = $inventory['endpoints'];
 		$endpoints = [];
 		foreach ($decoded as $extension => $info) {
 			if (!is_array($info)) {
@@ -4542,8 +4652,12 @@ class Slsmassnotifyserver implements \BMO
 				'format' => $format,
 				'formats' => $formats,
 				'user_agent' => (string)($info['user_agent'] ?? ''),
-				'contacts' => (int)($info['contacts'] ?? 1),
-				'devices' => array_values(array_filter((array)($info['devices'] ?? []), 'is_array')),
+				'contacts' => count((array)($info['contacts'] ?? [])),
+				'devices' => array_map(static function(array $device): array {
+					$device['key'] = (string)($device['device_key'] ?? '');
+					return array_intersect_key($device, array_flip(['key','status','user_agent','detected_format','format','override','capability']));
+				}, array_values(array_filter((array)($info['contacts'] ?? []), 'is_array'))),
+				'observed_at' => $inventory['observed_at'],
 				'override' => !empty($info['override']),
 				'unknown' => in_array('unknown', $formats, true),
 			];
@@ -4948,7 +5062,7 @@ class Slsmassnotifyserver implements \BMO
 		if (!$phoneCollector['ok']) { $critical[] = $phoneCollector['message']; }
 		$announcementWorker = $this->getAnnouncementWorkerHealth();
 		if (!$announcementWorker['ok']) {
-			$critical[] = _('General announcement worker health check is missing, stale, or failed. Run protected repair.');
+			$critical[] = $announcementWorker['health_reason'] ?? _('General announcement worker health could not be confirmed. Check the installation doctor and maintenance log.');
 		} elseif (!empty($announcementWorker['active_delivery_failure']) && $announcementWorker['failure_reason'] !== '') {
 			$warnings[] = $announcementWorker['failure_reason'];
 		}
@@ -4981,9 +5095,10 @@ class Slsmassnotifyserver implements \BMO
 				$critical[] = _('Scheduled-announcement worker is missing or not executable');
 			}
 			$scheduleCronLines = [];
-			$canonicalScheduleCron = '* * * * * /usr/bin/timeout 1200 /usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php';
+			$canonicalScheduleCron = $this->slsCronLine('scheduling');
 			foreach ($this->FreePBX->Cron()->getAll() as $cronLine) {
-				if (strpos((string)$cronLine, 'sls_mass_notify_schedule_worker.php') !== false) {
+				if (strpos((string)$cronLine, 'sls_mass_notify_schedule_worker.php') !== false
+					|| strpos((string)$cronLine, 'sls_cron_runner.py scheduling') !== false) {
 					$scheduleCronLines[] = trim((string)$cronLine);
 				}
 			}
@@ -5011,8 +5126,8 @@ class Slsmassnotifyserver implements \BMO
 		if (!is_executable($settings['piper_bin'] ?? self::PIPER_BIN)) {
 			$critical[] = _('Piper TTS binary is missing or not executable');
 		}
-		if ($this->hasConfiguredNotificationEmailRecipients($settings) && !is_executable('/usr/sbin/sendmail')) {
-			$critical[] = _('Notification email recipients are configured, but the local sendmail transport is unavailable');
+		if ($this->hasConfiguredNotificationEmailRecipients($settings) && (!is_executable('/usr/sbin/sendmail') || !is_executable('/usr/sbin/postqueue'))) {
+			$critical[] = _('Notification email recipients are configured, but local Postfix sendmail or postqueue is unavailable');
 		}
 
 		foreach ([$settings['nws_piper_voice'] ?? '', $settings['announcement_piper_voice'] ?? ''] as $voice) {
@@ -5366,14 +5481,58 @@ class Slsmassnotifyserver implements \BMO
 		return $tones;
 	}
 
+	public function getInstallationProfile(): array
+	{
+		if (($this->currentOperator()['operator_role'] ?? '') !== 'administrator') {
+			return ['success'=>false,'message'=>_('An SLS administrator is required to export the installation profile.')];
+		}
+		if (!function_exists('proc_open')) {
+			return ['success'=>false,'message'=>_('PHP process execution is disabled. Run slsconsole doctor from the PBX CLI and review the served PHP compatibility report.')];
+		}
+		$settings=$this->getActiveSettings();
+		$desktopLimit=filter_var($settings['desktop_client_limit'] ?? 25,FILTER_VALIDATE_INT,['options'=>['min_range'=>1,'max_range'=>1000]]);
+		$phoneLimit=filter_var($settings['phone_device_limit'] ?? 25,FILTER_VALIDATE_INT,['options'=>['min_range'=>1,'max_range'=>1000]]);
+		if ($desktopLimit === false || $phoneLimit === false) {
+			return ['success'=>false,'message'=>_('The saved desktop or phone capacity is invalid. Review General Settings before exporting its installation profile.')];
+		}
+		$helper=self::RUNTIME_DIR . '/sls_install_doctor.py';
+		$meta=@lstat($helper);
+		if (!$meta || ($meta['mode'] & 0170000) !== 0100000 || $meta['uid'] !== 0 || ($meta['mode'] & 0022) || $meta['nlink'] !== 1) {
+			return ['success'=>false,'message'=>_('The protected installation doctor is unavailable. Install the complete signed candidate or use its read-only CLI doctor before upgrading.')];
+		}
+		$process=@proc_open(['/usr/bin/timeout','--kill-after=1','10','/usr/bin/python3','-I',$helper,'--json','--desktop-limit',(string)$desktopLimit,'--phone-limit',(string)$phoneLimit],
+			[0=>['file','/dev/null','r'],1=>['pipe','w'],2=>['file','/dev/null','w']],$pipes);
+		if (!is_resource($process)) { return ['success'=>false,'message'=>_('The installation doctor could not start. Check PHP process execution permissions.')]; }
+		$raw=stream_get_contents($pipes[1],131073);fclose($pipes[1]);$code=proc_close($process);
+		$value=is_string($raw)&&strlen($raw)<=131072?json_decode($raw,true):null;
+		if (!is_array($value) || !in_array($code,[0,1,2],true)) { return ['success'=>false,'message'=>_('The installation doctor did not return a bounded report. Run slsconsole doctor from the PBX CLI.')]; }
+		return ['success'=>true,'module_version'=>self::MODULE_VERSION,'profile'=>$value];
+	}
+
 	public function getAvailableSystemSounds()
 	{
-		$labels = [];
+		return $this->getSystemRecordingCatalogue('', 0, 500)['items'];
+	}
+
+	public function getSystemRecordingCatalogue(string $query = '', int $offset = 0, int $limit = 100): array
+	{
+		if ($this->recordingLabelCache !== null) { [$labels,$metadataTruncated] = $this->recordingLabelCache; }
+		else {
+		$labels = []; $metadataTruncated = false;
 		try {
-			$rows = $this->FreePBX->Database()->query('SELECT displayname, filename FROM recordings LIMIT 501')->fetchAll(\PDO::FETCH_ASSOC);
-			foreach ($rows as $row) { foreach (explode('&', (string)$row['filename']) as $file) { $labels[$file] = (string)$row['displayname']; } }
-		} catch (\Throwable $error) { /* Files remain available without recording metadata. */ }
-		return \SLS\MassNotify\SystemRecordings::catalogue('/var/lib/asterisk/sounds', $labels);
+			$rows = $this->FreePBX->Database()->query('SELECT displayname, filename FROM recordings ORDER BY displayname, filename LIMIT 5001')->fetchAll(\PDO::FETCH_ASSOC);
+			$metadataTruncated = count($rows) > 5000;
+			foreach (array_slice($rows, 0, 5000) as $row) {
+				foreach (array_slice(explode('&', mb_substr((string)$row['filename'], 0, 8192)), 0, 100) as $file) {
+					$labels[$file] = mb_substr((string)$row['displayname'], 0, 200);
+				}
+			}
+		} catch (\Throwable $error) { /* Recording files can be listed without database labels. */ }
+		$this->recordingLabelCache = [$labels,$metadataTruncated];
+		}
+		$page = \SLS\MassNotify\SystemRecordings::cataloguePage('/var/lib/asterisk/sounds', $labels, $query, $offset, $limit, self::PLUGIN_DATA_DIR . '/system-recordings-cache.json');
+		if ($metadataTruncated) { $page['warning'] = trim($page['warning'] . ' ' . _('Only the first 5000 recording labels were read. Search also matches recording filenames.')); }
+		return ['success'=>true] + $page;
 	}
 
 	private function importSystemSoundAsTone($selection, $prefix, array &$errors)
@@ -5441,7 +5600,7 @@ class Slsmassnotifyserver implements \BMO
 
 	public function previewScheduleCalendar(array $input): array
 	{
-		$calendar = \SLS\MassNotify\ScheduleCalendar::fromForm($input);
+		$calendar = $this->resolveScheduleCalendarInput($input);
 		$id = $input['schedule_id'] ?? '';
 		if (!is_string($id) || ($id !== '' && !preg_match('/^[A-Za-z0-9_-]{1,64}$/D', $id))) {
 			throw new \DomainException(_('The selected schedule identity is invalid.'));
@@ -5455,9 +5614,53 @@ class Slsmassnotifyserver implements \BMO
 			}
 		}
 		if (!$found) { throw new \DomainException(_('The selected schedule no longer exists.')); }
+		if (isset($calendar['programme'])) { $timezone = new \DateTimeZone($calendar['programme']['timezone']); }
 		$plan = $this->buildScheduledOccurrences($id ?: 'calendar_preview', array_values((array)($input['schedule_occurrences'] ?? [])),
 			'calendar', $timezone, $existing, time() - 60, time() + self::MAX_SCHEDULE_YEARS * 366 * 86400, $calendar);
 		return ['success'=>!$plan['errors'], 'errors'=>$plan['errors'], 'timezone'=>$timezone->getName(), 'occurrences'=>$plan['occurrences']];
+	}
+
+	public function getScheduleProgrammes(): array
+	{
+		$settings = $this->getPendingSettings() ?? $this->getActiveSettings();
+		return \SLS\MassNotify\ScheduleProgrammes::normalize($settings['schedule_programmes'] ?? []);
+	}
+
+	public function saveScheduleProgrammes(array $input): array
+	{
+		if (($this->currentOperator()['operator_role'] ?? '') !== 'administrator') { throw new \DomainException(_('Only an SLS administrator can change shared calendars.')); }
+		if (!is_string($input['programmes_json'] ?? null) || strlen($input['programmes_json']) > 262144) {
+			throw new \DomainException(_('Shared calendar settings exceed their 256 KiB limit.'));
+		}
+		try { $value = json_decode($input['programmes_json'], true, 16, JSON_THROW_ON_ERROR); }
+		catch (\JsonException $error) { throw new \DomainException(_('Shared calendar settings could not be read. Reload the page.')); }
+		$settings = $this->getPendingSettings() ?? $this->getActiveSettings();
+		$current = \SLS\MassNotify\ScheduleProgrammes::normalize($settings['schedule_programmes'] ?? []);
+		$revision = hash('sha256', json_encode($current, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
+		if (!is_string($input['programmes_revision'] ?? null) || !hash_equals($revision, $input['programmes_revision'])) {
+			throw new \DomainException(_('Shared calendars changed while this editor was open. Reload before saving.'));
+		}
+		$settings['schedule_programmes'] = \SLS\MassNotify\ScheduleProgrammes::normalize($value);
+		$this->persistPendingSettings($this->normalizeSettings($settings));
+		return ['success'=>true, 'message'=>_('Shared calendars saved. Existing schedules retain their reviewed dates; reopen a schedule to use the revised programme.')];
+	}
+
+	private function resolveScheduleCalendarInput(array $input): array
+	{
+		$id = $input['schedule_programme_id'] ?? '';
+		if (!is_string($id)) { throw new \DomainException(_('Select an available shared calendar.')); }
+		if ($id === '') { return \SLS\MassNotify\ScheduleCalendar::fromForm($input); }
+		$types = $input['schedule_programme_types'] ?? [];
+		if (!is_array($types)) { throw new \DomainException(_('Select programme day types.')); }
+		$settings = \SLS\MassNotify\ScheduleProgrammes::normalize($this->getActiveSettings()['schedule_programmes'] ?? []);
+		foreach ($settings['calendars'] as $row) {
+			if ($row['id'] !== $id) { continue; }
+			$revision = hash('sha256', json_encode($row, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
+			if (!is_string($input['schedule_programme_revision'] ?? null) || !hash_equals($revision, $input['schedule_programme_revision'])) {
+				throw new \DomainException(_('The shared calendar changed. Reload Scheduling and review its dates before saving.'));
+			}
+		}
+		return \SLS\MassNotify\ScheduleProgrammes::snapshot($settings, $id, array_values($types));
 	}
 
 	public function saveScheduledAnnouncement(array $input)
@@ -5521,9 +5724,10 @@ class Slsmassnotifyserver implements \BMO
 		$recurrenceMode = $this->normalizeScheduleRecurrenceMode($requestedRecurrenceMode);
 		$calendar = [];
 		if ($recurrenceMode === 'calendar') {
-			try { $calendar = \SLS\MassNotify\ScheduleCalendar::fromForm($input); }
+			try { $calendar = $this->resolveScheduleCalendarInput($input); }
 			catch (\DomainException $error) { $errors[] = $error->getMessage(); }
 			if (($existing['recurrence']['mode'] ?? '') === 'calendar') { $timezone = new \DateTimeZone($existing['timezone']); }
+			if (isset($calendar['programme'])) { $timezone = new \DateTimeZone($calendar['programme']['timezone']); }
 		}
 		$occurrenceBuild = $this->buildScheduledOccurrences(
 			$id,
@@ -6081,6 +6285,7 @@ class Slsmassnotifyserver implements \BMO
 		if (array_key_exists('voice_recipient_ids', $payload)) { $options['voice_recipient_ids'] = $payload['voice_recipient_ids']; }
 		if (array_key_exists('email_recipient_ids', $payload)) { $options['email_recipient_ids'] = $payload['email_recipient_ids']; }
 		if (array_key_exists('sms_recipient_ids', $payload)) { $options['sms_recipient_ids'] = $payload['sms_recipient_ids']; }
+		foreach (['browser_recipient_ids','connector_ids'] as $field) { if (array_key_exists($field,$payload)) { $options[$field]=$payload[$field]; } }
 		if (array_key_exists('desktop_clients', $payload) || array_key_exists('desktop_targets', $payload)) {
 			$options['desktop_clients'] = $payload['desktop_clients'] ?? $payload['desktop_targets'];
 		}
@@ -6150,7 +6355,7 @@ class Slsmassnotifyserver implements \BMO
 			];
 		}
 		$settingsPatch = is_array($payload['settings'] ?? null) ? $payload['settings'] : (is_array($payload['config'] ?? null) ? $payload['config'] : []);
-		if (array_intersect(array_keys($settingsPatch), ['labs_safety','enterprise_cluster','enterprise_identity','directory_sync','subscriber_browser','enterprise_integrations','enterprise_operations'])) {
+		if (array_intersect(array_keys($settingsPatch), ['beta_notice','labs_safety','enterprise_cluster','enterprise_identity','directory_sync','subscriber_browser','enterprise_integrations','enterprise_operations'])) {
 			return ['success'=>false,'message'=>'Configure Enterprise Labs in the FreePBX administrator panel. Control API keys cannot activate or acknowledge experimental security features.', 'errors'=>['Enterprise Labs configuration is administrator-only.']];
 		}
 		if (empty($settingsPatch)) {
@@ -6314,6 +6519,13 @@ class Slsmassnotifyserver implements \BMO
 	{
 		$errors = [];
 		foreach ([$payload, is_array($payload['options'] ?? null) ? $payload['options'] : []] as $fields) {
+			foreach (['browser_recipient_ids'=>'/^sub_[a-f0-9]{24}$/D', 'connector_ids'=>'/^conn_[a-f0-9]{24}$/D'] as $field=>$pattern) {
+				if (!array_key_exists($field,$fields)) { continue; }
+				$ids=$fields[$field];
+				if (!is_array($ids) || !array_is_list($ids) || count($ids)>50) { $errors[]=_('Labs recipients must be arrays of at most 50 saved identifiers.'); continue; }
+				foreach ($ids as $id) { if (!is_string($id) || !preg_match($pattern,$id)) { $errors[]=_('A Labs recipient identifier is invalid.'); } }
+				if (count(array_filter($ids,'is_string'))===count($ids) && count(array_unique($ids))!==count($ids)) { $errors[]=_('Labs recipient identifiers must be distinct.'); }
+			}
 			if (array_key_exists('voice_recipient_ids', $fields)) { $errors = array_merge($errors, $this->validateVoiceRecipientIds($fields['voice_recipient_ids'])); }
 			if (array_key_exists('email_recipient_ids', $fields)) { $errors = array_merge($errors, $this->validateAnnouncementEmailRecipientIds($fields['email_recipient_ids'])); }
 			if (array_key_exists('sms_recipient_ids', $fields)) { $errors = array_merge($errors, $this->validateSmsRecipientIds($fields['sms_recipient_ids'])); }
@@ -6498,6 +6710,7 @@ class Slsmassnotifyserver implements \BMO
 	private function redactConfigSecrets(array $settings)
 	{
 		if (isset($settings['enterprise_identity'])) { $settings['enterprise_identity'] = \SLS\MassNotify\EnterpriseIdentityConfig::publicConfig($settings['enterprise_identity']); }
+		if (isset($settings['subscriber_browser'])) { $settings['subscriber_browser'] = \SLS\MassNotify\SubscriberConfig::publicConfig($settings['subscriber_browser']); }
 		if (isset($settings['directory_sync'])) { $settings['directory_sync'] = \SLS\MassNotify\DirectoryConfig::publicConfig($settings['directory_sync']); }
 		if (isset($settings['enterprise_integrations'])) { $settings['enterprise_integrations'] = \SLS\MassNotify\EnterpriseIntegrationsConfig::redacted($settings['enterprise_integrations']); }
 		foreach ($settings['enterprise_cluster']['peers'] ?? [] as $index=>$peer) { $settings['enterprise_cluster']['peers'][$index]['hmac_secret']='[redacted]'; }
@@ -6596,11 +6809,11 @@ class Slsmassnotifyserver implements \BMO
 			'quiet_hours_enabled', 'quiet_hours_start', 'quiet_hours_end', 'quiet_critical_events',
 			'nws_api_base_url', 'nws_zone', 'nws_zones', 'alert_email_subject', 'alert_email_body',
 			'test_email_subject', 'test_email_body', 'opening_tone', 'closing_tone',
-			'nws_opening_tone', 'nws_closing_tone',
-			'email_html_enabled', 'xweather',
+			'nws_opening_tone', 'nws_closing_tone', 'schedule_programmes',
+			'email_html_enabled', 'nws_voicemail_enabled', 'xweather',
 			'nws_piper_voice', 'announcement_piper_voice', 'nws_tts_volume',
 				'announcement_tts_volume', 'tts_max_seconds', 'announcement_timeout_mode',
-				'announcement_timeout_seconds', 'log_retention_days', 'generated_media_cache_mib', 'control_api',
+				'announcement_timeout_seconds', 'log_retention_days', 'generated_media_cache_mib', 'speech_synthesis_limit', 'speech_queue_limit', 'speech_queue_wait_seconds', 'generated_media_min_free_mib', 'control_api',
 				'sipnotify', 'announcement_groups', 'updates', 'test_profiles', 'paging_answer_timeout', 'desktop_client_limit', 'desktop_minimum_version', 'phone_device_limit', 'outbound_voice', 'announcement_email', 'announcement_sms', 'announcement_pronunciation',
 		];
 	}
@@ -6608,6 +6821,10 @@ class Slsmassnotifyserver implements \BMO
 	private function validateAndNormalizeControlConfigPatch(array $patch)
 	{
 		$errors = [];
+		if (array_key_exists('speech_synthesis_limit', $patch) && (!is_int($patch['speech_synthesis_limit']) || $patch['speech_synthesis_limit'] < 1 || $patch['speech_synthesis_limit'] > 4)) { $errors[] = _('Speech synthesis limit must be an integer from 1 through 4.'); }
+		if (array_key_exists('speech_queue_limit', $patch) && (!is_int($patch['speech_queue_limit']) || $patch['speech_queue_limit'] < 1 || $patch['speech_queue_limit'] > 32)) { $errors[] = _('Speech queue limit must be an integer from 1 through 32.'); }
+		if (array_key_exists('speech_queue_wait_seconds', $patch) && (!is_int($patch['speech_queue_wait_seconds']) || $patch['speech_queue_wait_seconds'] < 0 || $patch['speech_queue_wait_seconds'] > 60)) { $errors[] = _('Speech queue wait seconds must be an integer from 0 through 60.'); }
+		if (array_key_exists('generated_media_min_free_mib', $patch) && (!is_int($patch['generated_media_min_free_mib']) || $patch['generated_media_min_free_mib'] < 64 || $patch['generated_media_min_free_mib'] > 4096)) { $errors[] = _('Generated media min free mib must be an integer from 64 through 4096.'); }
 		if (array_key_exists('generated_media_cache_mib', $patch) && (!is_int($patch['generated_media_cache_mib']) || $patch['generated_media_cache_mib'] < 64 || $patch['generated_media_cache_mib'] > 4096)) {
 			$errors[] = _('Generated-media cache target must be an integer from 64 through 4096 MiB.');
 		}
@@ -6660,8 +6877,8 @@ class Slsmassnotifyserver implements \BMO
 			}
 		}
 
-		$booleanFields = ['enabled', 'quiet_hours_enabled', 'email_html_enabled'];
-		$integerFields = ['nws_tts_volume', 'announcement_tts_volume', 'tts_max_seconds', 'announcement_timeout_seconds', 'log_retention_days', 'generated_media_cache_mib', 'paging_answer_timeout', 'desktop_client_limit', 'phone_device_limit'];
+		$booleanFields = ['enabled', 'quiet_hours_enabled', 'email_html_enabled', 'nws_voicemail_enabled'];
+		$integerFields = ['nws_tts_volume', 'announcement_tts_volume', 'tts_max_seconds', 'announcement_timeout_seconds', 'log_retention_days', 'generated_media_cache_mib', 'speech_synthesis_limit', 'speech_queue_limit', 'speech_queue_wait_seconds', 'generated_media_min_free_mib', 'paging_answer_timeout', 'desktop_client_limit', 'phone_device_limit'];
 		$stringFields = [
 			'system_notification_emails', 'mail_to', 'mail_from_local_part', 'mail_from_domain', 'quiet_hours_start', 'quiet_hours_end',
 			'nws_api_base_url', 'nws_zone', 'alert_email_subject', 'alert_email_body', 'test_email_subject',
@@ -6709,7 +6926,7 @@ class Slsmassnotifyserver implements \BMO
 
 		$nestedSchemas = [
 			'xweather' => [
-				'boolean' => ['enabled', 'adaptive_free_tier', 'quiet_hours_enabled'],
+				'boolean' => ['enabled', 'adaptive_free_tier', 'quiet_hours_enabled', 'voicemail_enabled'],
 				'integer' => ['radius_miles', 'query_interval_minutes', 'adaptive_grace_minutes', 'adaptive_fallback_minutes', 'tts_volume'],
 				'array' => ['recipients', 'groups'],
 				'string' => ['provider', 'client_id', 'client_secret', 'location', 'adaptive_gate_failure_policy', 'adaptive_nws_zone_id', 'opening_tone', 'closing_tone', 'all_clear', 'strike_type', 'quiet_hours_start', 'quiet_hours_end'],
@@ -6958,6 +7175,7 @@ class Slsmassnotifyserver implements \BMO
 			'announcement_piper_voice' => self::PIPER_VOICE,
 			'announcement_pronunciation' => [],
 			'nws_tts_volume' => 25,
+			'nws_voicemail_enabled' => '1',
 			'announcement_tts_volume' => 25,
 			'announcement_cooldown_seconds' => self::ANNOUNCEMENT_COOLDOWN_SECONDS,
 			'announcement_timeout_mode' => 'none',
@@ -6966,6 +7184,7 @@ class Slsmassnotifyserver implements \BMO
 			'live_paging' => \SLS\MassNotify\LivePagingConfig::defaults(),
 			'incident_workflows' => \SLS\MassNotify\IncidentConfig::defaults(),
 			'labs_safety' => \SLS\MassNotify\LabsSafety::defaults(),
+			'beta_notice' => \SLS\MassNotify\BetaNotice::defaults(),
 			'enterprise_operations' => \SLS\MassNotify\EnterpriseOperationsConfig::defaults(),
 			'enterprise_cluster' => \SLS\MassNotify\EnterpriseClusterConfig::defaults(),
 			'enterprise_identity' => \SLS\MassNotify\EnterpriseIdentityConfig::defaults(),
@@ -6977,6 +7196,10 @@ class Slsmassnotifyserver implements \BMO
 			'test_profiles' => [],
 			'log_retention_days' => 90,
 			'generated_media_cache_mib' => 512,
+			'speech_synthesis_limit' => 1,
+			'speech_queue_limit' => 8,
+			'speech_queue_wait_seconds' => 15,
+			'generated_media_min_free_mib' => 128,
 			'desktop_auth_key' => $this->generateDesktopAuthKey(),
 			'desktop_client_limit' => 25,
 			'desktop_minimum_version' => \SLS\MassNotify\DesktopFleet::DEFAULT_MINIMUM,
@@ -7017,8 +7240,10 @@ class Slsmassnotifyserver implements \BMO
 			],
 			'announcement_groups' => [],
 			'scheduled_announcements' => [],
+			'schedule_programmes' => \SLS\MassNotify\ScheduleProgrammes::defaults(),
 			'xweather' => [
 				'enabled' => '0',
+				'voicemail_enabled' => '1',
 				'client_id' => '',
 				'client_secret' => '',
 				'location' => '',
@@ -7833,43 +8058,27 @@ PY;
 		$this->writeAnnouncementCooldownTimestamp(time());
 	}
 
+	private function phoneDisplayInventory(): array
+	{
+		if ($this->phoneInventoryCache === null) {
+			$this->phoneInventoryCache = \SLS\MassNotify\PhoneInventory::read(self::PLUGIN_DATA_DIR . '/phone-endpoint-inventory.json');
+		}
+		return $this->phoneInventoryCache;
+	}
+
 	private function getRegisteredPjsipExtensions()
 	{
-		if (is_array($this->registeredPjsipExtensionsCache)) {
-			return $this->registeredPjsipExtensionsCache;
+		if ($this->phoneInventoryForSending) {
+			if (!is_executable(self::VISUAL_PUSH_SCRIPT)) { return []; }
+			$output = []; $code = 1;
+			exec('/usr/bin/timeout --kill-after=2 15 /usr/bin/python3 -I ' . escapeshellarg(self::VISUAL_PUSH_SCRIPT) . ' --list-endpoints-json 2>/dev/null', $output, $code);
+			$inventory = $code === 0 ? json_decode(implode('', $output), true) : null;
+			if (!is_array($inventory)) { throw new \DomainException(_('Current phone registration could not be verified. Check the phone-event collector and Asterisk Manager connectivity in Help. No announcement was submitted.')); }
+			return array_values(array_filter(array_map('strval', array_keys($inventory)), static fn($extension)=>preg_match('/^[0-9]{1,20}$/D', $extension) === 1));
 		}
-		if (is_executable(self::VISUAL_PUSH_SCRIPT)) {
-			$output = [];
-			$exitCode = 0;
-			exec('/usr/bin/timeout 15 /usr/bin/python3 ' . escapeshellarg(self::VISUAL_PUSH_SCRIPT) . ' --list-endpoints-json 2>/dev/null', $output, $exitCode);
-			if ($exitCode === 0) {
-				$inventory = json_decode(implode("\n", $output), true);
-				if (is_array($inventory)) {
-					$registered = [];
-					foreach (array_keys($inventory) as $extension) {
-						$extension = preg_replace('/[^0-9]/', '', (string)$extension);
-						if ($extension !== '') {
-							$registered[$extension] = $extension;
-						}
-					}
-					if (!empty($registered)) {
-						$this->registeredPjsipExtensionsCache = array_values($registered);
-						return $this->registeredPjsipExtensionsCache;
-					}
-				}
-			}
+		if ($this->registeredPjsipExtensionsCache === null) {
+			$this->registeredPjsipExtensionsCache = array_map('strval', array_keys($this->phoneDisplayInventory()['endpoints']));
 		}
-
-		$output = [];
-		exec("/usr/bin/timeout --kill-after=1 5 /usr/sbin/asterisk -rx 'pjsip show contacts' 2>/dev/null", $output);
-		$registered = [];
-		foreach ($output as $line) {
-			if (!preg_match('/Contact:\s+([0-9]+)\/.*\s(Avail|Available|NonQual|Reachable|Unknown)\s+[-0-9na.]+$/i', $line, $matches)) {
-				continue;
-			}
-			$registered[$matches[1]] = $matches[1];
-		}
-		$this->registeredPjsipExtensionsCache = array_values($registered);
 		return $this->registeredPjsipExtensionsCache;
 	}
 
@@ -8190,6 +8399,7 @@ PY;
 		$settings['announcement_piper_voice'] = isset($voices[$announcementVoice]) ? $announcementVoice : self::PIPER_VOICE;
 		$settings['piper_voice'] = $settings['nws_piper_voice'];
 		$settings['nws_tts_volume'] = $this->normalizeTtsVolume($settings['nws_tts_volume'] ?? 25, 25);
+		$settings['nws_voicemail_enabled'] = \SLS\MassNotify\VoicemailConfig::flag($settings['nws_voicemail_enabled'] ?? '1');
 		$settings['announcement_tts_volume'] = $this->normalizeTtsVolume($settings['announcement_tts_volume'] ?? 25, 25);
 		$settings['announcement_cooldown_seconds'] = $this->normalizeAnnouncementCooldownSeconds($settings['announcement_cooldown_seconds'] ?? self::ANNOUNCEMENT_COOLDOWN_SECONDS);
 		$settings['announcement_timeout_mode'] = $this->normalizeAnnouncementTimeoutMode($settings['announcement_timeout_mode'] ?? 'none');
@@ -8198,6 +8408,10 @@ PY;
 		$settings['test_profiles'] = $this->normalizeTestProfiles($settings['test_profiles'] ?? []);
 		$settings['log_retention_days'] = $this->normalizeRetentionDays($settings['log_retention_days'] ?? 90);
 		$settings['generated_media_cache_mib'] = $settings['generated_media_cache_mib'] ?? 512;
+		$settings['speech_synthesis_limit'] = $settings['speech_synthesis_limit'] ?? 1;
+		$settings['speech_queue_limit'] = $settings['speech_queue_limit'] ?? 8;
+		$settings['speech_queue_wait_seconds'] = $settings['speech_queue_wait_seconds'] ?? 15;
+		$settings['generated_media_min_free_mib'] = $settings['generated_media_min_free_mib'] ?? 128;
 		unset($settings['desktop_api_token']);
 		$ami = is_array($settings['ami'] ?? null) ? $settings['ami'] : [];
 		$settings['ami'] = [
@@ -8240,7 +8454,7 @@ PY;
 		$settings['announcement_groups'] = $this->normalizeAnnouncementGroups($settings['announcement_groups'] ?? []);
 		$settings['live_paging'] = $this->normalizeLivePagingSettings($settings['live_paging'] ?? []);
 		$settings['incident_workflows'] = \SLS\MassNotify\IncidentConfig::normalize($settings['incident_workflows'] ?? []);
-		foreach (['labs_safety'=>\SLS\MassNotify\LabsSafety::class,'enterprise_operations'=>\SLS\MassNotify\EnterpriseOperationsConfig::class,
+		foreach (['beta_notice'=>\SLS\MassNotify\BetaNotice::class,'labs_safety'=>\SLS\MassNotify\LabsSafety::class,'enterprise_operations'=>\SLS\MassNotify\EnterpriseOperationsConfig::class,
 			'enterprise_cluster'=>\SLS\MassNotify\EnterpriseClusterConfig::class,'enterprise_identity'=>\SLS\MassNotify\EnterpriseIdentityConfig::class,
 			'directory_sync'=>\SLS\MassNotify\DirectoryConfig::class,'subscriber_browser'=>\SLS\MassNotify\SubscriberConfig::class,
 			'enterprise_integrations'=>\SLS\MassNotify\EnterpriseIntegrationsConfig::class] as $key=>$class) {
@@ -8251,6 +8465,7 @@ PY;
 		if (array_key_exists('automations', $settings)) { $settings['automations'] = \SLS\MassNotify\AutomationConfig::normalize($settings['automations']); }
 		$settings['location_directory'] = \SLS\MassNotify\LocationDirectory::normalize(array_key_exists('location_directory', $settings) ? $settings['location_directory'] : []);
 		$settings['scheduled_announcements'] = $this->normalizeScheduledAnnouncements($settings['scheduled_announcements'] ?? []);
+		$settings['schedule_programmes'] = \SLS\MassNotify\ScheduleProgrammes::normalize($settings['schedule_programmes'] ?? []);
 		$settings['xweather'] = $this->normalizeXweatherSettings($settings['xweather'] ?? [], $settings['nws_tts_volume'] ?? 25);
 		if (!empty($legacyLiveEmailRecipients)) {
 			foreach ($settings['xweather']['groups'] as $groupIndex => $group) {
@@ -10117,6 +10332,7 @@ executables = {
             'sls_mass_notify_weather_channels.php',
     'sls_mass_notify_phone_agi.py',
     'sls_phone_admission.py',
+    'sls_voicemail.py',
     'sls_phone_events.py',
     'sls_emergency_observer.py',
     'sls_phone_outcomes.py',
@@ -10126,6 +10342,11 @@ executables = {
     'sls_operational_backup.py',
     'sls_external_monitor.py',
     'sls_resource_capacity.py',
+    'sls_speech_admission.py',
+    'sls_phone_inventory.py',
+    'sls_install_doctor.py',
+    'sls_install_transaction.py',
+    'sls_bounded_stream.py',
     'sls_piper_dependencies.py',
     'sls_piper_environment.py',
     'sls_update_policy.py',
@@ -10137,6 +10358,9 @@ executables = {
     'sls_upgrade_trust.py',
     'sls_install_idle.py',
     'sls_install_guard.py',
+    'sls_legacy_permissions.py',
+    'sls_mail_admission.py',
+    'sls_cron_runner.py',
     'sls_weather_queue.py',
     'sls_audio_queue.py',
     'sls_audio_state.py',
@@ -10617,6 +10841,31 @@ PY;
 				. " same => n,AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,ack)\n"
 				. " same => n(incident-response),AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,incident-response)\n"
 				. " same => n(done),Hangup()\n\n"
+				. "[sls-alert-voicemail]\n"
+				. "exten => _X!,1,Set(SLS_PHONE_ALLOW=0)\n"
+				. " same => n,AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,voicemail)\n"
+				. " same => n,GotoIf($[\"\${SLS_PHONE_ALLOW}\"!=\"1\"]?done)\n"
+				. " same => n,Set(CHANNEL(hangup_handler_push)=sls-voicemail-ended,s,1)\n"
+				. " same => n,VoiceMail(\${SLS_VM_BOX},est())\n"
+				. " same => n(done),Hangup()\n\n"
+				. "[sls-voicemail-playback]\n"
+				. "exten => s,1,Set(SLS_PHONE_ALLOW=0)\n"
+				. " same => n,AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,voicemail-playback)\n"
+				. " same => n,GotoIf($[\"\${SLS_PHONE_ALLOW}\"!=\"1\"]?done)\n"
+				. " same => n,Playback(\${SLS_SAFE_SOUND})\n"
+				. " same => n,AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,voicemail-playback-result)\n"
+				. " same => n(done),Hangup()\n\n"
+				. "[sls-voicemail-ended]\n"
+				. "exten => s,1,AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,voicemail-result)\n"
+				. " same => n,AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,end)\n"
+				. " same => n,Return()\n\n"
+				. "[sls-live-recording-ended]\n"
+				. "exten => s,1,GotoIf($[\"\${SLS_VM_MIX_ID}\"=\"\"]?done)\n"
+				. " same => n,TryExec(StopMixMonitor(\${SLS_VM_MIX_ID}))\n"
+				. " same => n,GotoIf($[\"\${TRYSTATUS}\"!=\"SUCCESS\"]?done)\n"
+				. " same => n,Set(SLS_VM_STOPPED=1)\n"
+				. " same => n,AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,live-recording-end)\n"
+				. " same => n(done),Return()\n\n"
 				. "[sls-phone-ended]\n"
 				. "exten => s,1,AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,end)\n"
 				. " same => n,Return()\n";
@@ -11143,42 +11392,45 @@ PY;
 		}
 	}
 
+	private function slsCronLine(string $job): string
+	{
+		$jobs = ['weather', 'scheduling', 'announcement_reconcile', 'maintenance', 'update'];
+		if (!in_array($job, $jobs, true)) { throw new \LogicException('Unknown fixed SLS cron job.'); }
+		$schedule = $job === 'update' ? '17 * * * * ' : '* * * * * ';
+		return $schedule . '/usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_cron_runner.py '
+			. $job . ' >/dev/null 2>&1';
+	}
+
+	private function hasCanonicalSlsUserCron(array $lines): bool
+	{
+		$actual = [];
+		foreach ($lines as $line) {
+			$line = (string)$line;
+			if (preg_match('/^\s*#/', $line)) { continue; }
+			if (preg_match('~(?:/usr/local/bin/sls_mass_notify/|sls_mass_notify_[A-Za-z_]+\.(?:sh|php)|sls_cron_runner\.py|nws_weather_alert\.sh|nwsalerts_ensure_menu_patch\.sh)~', $line)) {
+				$actual[] = $line;
+			}
+		}
+		$expected = array_map(function ($job) { return $this->slsCronLine($job); }, ['weather', 'scheduling', 'announcement_reconcile']);
+		sort($actual, SORT_STRING);
+		sort($expected, SORT_STRING);
+		return $actual === $expected;
+	}
+
 	private function ensureCronJob()
 	{
 		$this->removeLegacyNwsCronJob();
 		$cron = $this->FreePBX->Cron();
-		$weatherCronLine = '* * * * * /usr/bin/timeout 5500 /usr/local/bin/sls_mass_notify/sls_mass_notify_weather_poll.sh';
-		$hasPoll = false;
 		foreach ($cron->getAll() as $line) {
 			$line = (string)$line;
-			if (strpos($line, 'sls_mass_notify_nws_poll.sh') !== false) {
-				$cron->remove($line);
-				continue;
-			}
-			if (strpos($line, 'sls_mass_notify_weather_poll.sh') !== false) {
-				if (trim($line) !== $weatherCronLine) {
-					$cron->remove($line);
-					continue;
-				}
-				$hasPoll = true;
-			}
-			if (strpos($line, 'sls_mass_notify_update.sh') !== false) {
-				$cron->remove($line);
-			}
-			if (strpos($line, 'sls_mass_notify_schedule_worker.php') !== false) {
-				// Remove every old/canonical copy, then add exactly one protected line.
-				$cron->remove($line);
+			foreach (['sls_mass_notify_nws_poll.sh', 'sls_mass_notify_weather_poll.sh', 'sls_mass_notify_update.sh',
+				'sls_mass_notify_schedule_worker.php', 'sls_mass_notify_announcement_worker.php', 'sls_cron_runner.py'] as $marker) {
+				if (strpos($line, $marker) !== false) { $cron->remove($line); break; }
 			}
 		}
-		if (!$hasPoll) {
-			$cron->addLine($weatherCronLine);
+		foreach (['weather', 'scheduling', 'announcement_reconcile'] as $job) {
+			$cron->addLine($this->slsCronLine($job));
 		}
-		$cron->addLine('* * * * * /usr/bin/timeout 1200 /usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php');
-		$announcementWorkerLine = '* * * * * /usr/bin/timeout 900 /usr/bin/php /usr/local/bin/sls_mass_notify/sls_mass_notify_announcement_worker.php --reconcile';
-		foreach ($cron->getAll() as $line) {
-			if (strpos((string)$line, 'sls_mass_notify_announcement_worker.php') !== false) { $cron->remove($line); }
-		}
-		$cron->addLine($announcementWorkerLine);
 		// Root maintenance/update entries are installed by the authenticated root helper.
 	}
 
@@ -11192,7 +11444,9 @@ PY;
 			if (strpos((string)$line, '/usr/local/bin/nws_weather_alert.sh') !== false
 				|| strpos((string)$line, 'nwsalerts_ensure_menu_patch.sh') !== false
 				|| strpos((string)$line, 'sls_mass_notify_update.sh') !== false
-				|| strpos((string)$line, 'sls_mass_notify_maintenance.sh') !== false) {
+				|| strpos((string)$line, 'sls_mass_notify_maintenance.sh') !== false
+				|| strpos((string)$line, 'sls_cron_runner.py maintenance') !== false
+				|| strpos((string)$line, 'sls_cron_runner.py update') !== false) {
 				$changed = true;
 				continue;
 			}
@@ -11216,13 +11470,15 @@ PY;
 		exec('/usr/bin/crontab -l 2>/dev/null', $current);
 		$filtered = [];
 		foreach ($current as $line) {
-			if (strpos((string)$line, 'sls_mass_notify_update.sh') !== false) {
+			if (strpos((string)$line, 'sls_mass_notify_update.sh') !== false
+				|| strpos((string)$line, 'sls_mass_notify_maintenance.sh') !== false
+				|| strpos((string)$line, 'sls_cron_runner.py') !== false) {
 				continue;
 			}
 			$filtered[] = $line;
 		}
-		$filtered[] = '* * * * * /usr/bin/timeout 900 /usr/local/bin/sls_mass_notify/sls_mass_notify_maintenance.sh';
-		$filtered[] = '17 * * * * /usr/bin/timeout 1800 /usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh';
+		$filtered[] = $this->slsCronLine('maintenance');
+		$filtered[] = $this->slsCronLine('update');
 		$tmp = tempnam(sys_get_temp_dir(), 'sls-root-cron.');
 		if ($tmp === false) {
 			return;
@@ -11237,7 +11493,7 @@ PY;
 	{
 		$cron = $this->FreePBX->Cron();
 		foreach ($cron->getAll() as $line) {
-			if (strpos((string)$line, 'sls_mass_notify_nws_poll.sh') !== false || strpos((string)$line, 'sls_mass_notify_weather_poll.sh') !== false || strpos((string)$line, 'sls_mass_notify_schedule_worker.php') !== false || strpos((string)$line, 'sls_mass_notify_announcement_worker.php') !== false || strpos((string)$line, 'sls_mass_notify_update.sh') !== false) {
+			if (strpos((string)$line, 'sls_mass_notify_nws_poll.sh') !== false || strpos((string)$line, 'sls_mass_notify_weather_poll.sh') !== false || strpos((string)$line, 'sls_mass_notify_schedule_worker.php') !== false || strpos((string)$line, 'sls_mass_notify_announcement_worker.php') !== false || strpos((string)$line, 'sls_mass_notify_update.sh') !== false || strpos((string)$line, 'sls_cron_runner.py') !== false) {
 				$cron->remove($line);
 			}
 		}
@@ -12121,6 +12377,7 @@ PY;
 		return [
 			'enabled' => empty($value['enabled']) ? '0' : '1',
 			'provider' => in_array($value['provider'] ?? 'xweather', ['xweather', 'tempest', 'meteomatics'], true) ? ($value['provider'] ?? 'xweather') : 'xweather',
+			'voicemail_enabled' => \SLS\MassNotify\VoicemailConfig::flag($value['voicemail_enabled'] ?? '1'),
 			'client_id' => $cleanSecret($value['client_id'] ?? ''),
 			'client_secret' => $cleanSecret($value['client_secret'] ?? ''),
 			'location' => $location,
@@ -13875,7 +14132,9 @@ PY;
 			self::RUNTIME_DIR . '/sls_operational_backup.py' => true,
 			self::RUNTIME_DIR . '/sls_external_monitor.py' => true,
 			self::RUNTIME_DIR . '/sls_resource_capacity.py' => true,
+			self::RUNTIME_DIR . '/sls_bounded_stream.py' => true,
 			self::RUNTIME_DIR . '/sls_phone_admission.py' => true,
+			self::RUNTIME_DIR . '/sls_voicemail.py' => true,
 			self::RUNTIME_DIR . '/sls_phone_events.py' => true,
 			self::RUNTIME_DIR . '/sls_phone_outcomes.py' => true,
 			self::RUNTIME_DIR . '/sls_outbound_routes.py' => true,
@@ -13896,6 +14155,9 @@ PY;
 			self::RUNTIME_DIR . '/freepbx-mirror-signing.pub' => false,
 			self::RUNTIME_DIR . '/sls_install_idle.py' => true,
 			self::RUNTIME_DIR . '/sls_install_guard.py' => true,
+			self::RUNTIME_DIR . '/sls_legacy_permissions.py' => true,
+			self::RUNTIME_DIR . '/sls_mail_admission.py' => true,
+			self::RUNTIME_DIR . '/sls_cron_runner.py' => true,
 			self::RUNTIME_DIR . '/sls_weather_queue.py' => true,
 			self::RUNTIME_DIR . '/sls_audio_queue.py' => true,
 			self::RUNTIME_DIR . '/sls_audio_state.py' => true,
@@ -13987,7 +14249,9 @@ PY;
 			__DIR__ . '/bin/sls_mass_notify/sls_operational_backup.py' => self::RUNTIME_DIR . '/sls_operational_backup.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_external_monitor.py' => self::RUNTIME_DIR . '/sls_external_monitor.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_resource_capacity.py' => self::RUNTIME_DIR . '/sls_resource_capacity.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_bounded_stream.py' => self::RUNTIME_DIR . '/sls_bounded_stream.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_phone_admission.py' => self::RUNTIME_DIR . '/sls_phone_admission.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_voicemail.py' => self::RUNTIME_DIR . '/sls_voicemail.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_phone_events.py' => self::RUNTIME_DIR . '/sls_phone_events.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_emergency_observer.py' => self::RUNTIME_DIR . '/sls_emergency_observer.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_phone_outcomes.py' => self::RUNTIME_DIR . '/sls_phone_outcomes.py',
@@ -14012,6 +14276,9 @@ PY;
 			__DIR__ . '/bin/sls_mass_notify/freepbx-mirror-signing.pub' => self::RUNTIME_DIR . '/freepbx-mirror-signing.pub',
 			__DIR__ . '/bin/sls_mass_notify/sls_install_idle.py' => self::RUNTIME_DIR . '/sls_install_idle.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_install_guard.py' => self::RUNTIME_DIR . '/sls_install_guard.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_legacy_permissions.py' => self::RUNTIME_DIR . '/sls_legacy_permissions.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_mail_admission.py' => self::RUNTIME_DIR . '/sls_mail_admission.py',
+			__DIR__ . '/bin/sls_mass_notify/sls_cron_runner.py' => self::RUNTIME_DIR . '/sls_cron_runner.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_weather_queue.py' => self::RUNTIME_DIR . '/sls_weather_queue.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_audio_queue.py' => self::RUNTIME_DIR . '/sls_audio_queue.py',
 			__DIR__ . '/bin/sls_mass_notify/sls_audio_state.py' => self::RUNTIME_DIR . '/sls_audio_state.py',
@@ -14247,9 +14514,7 @@ PY;
 		foreach ((array)$this->FreePBX->Cron()->getAll() as $line) {
 			$cronLines[] = (string)$line;
 		}
-		$cronText = implode("\n", $cronLines);
-		if (substr_count($cronText, '* * * * * /usr/bin/timeout 5500 /usr/local/bin/sls_mass_notify/sls_mass_notify_weather_poll.sh') !== 1
-			|| substr_count($cronText, '* * * * * /usr/bin/timeout 1200 /usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php') !== 1) {
+		if (!$this->hasCanonicalSlsUserCron($cronLines)) {
 			throw new \RuntimeException(_('Post-restore verification found an incomplete scheduler integration.'));
 		}
 		$commands = [

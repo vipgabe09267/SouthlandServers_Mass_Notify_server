@@ -384,6 +384,11 @@ $placeholderHelp = "{{event}}, {{severity}}, {{message_type}}, {{audio}}, {{page
 					<div class="col-md-3"><div class="form-group"><label for="nws_tts_volume"><?php echo _('Weather Volume'); ?></label><div class="input-group"><input class="form-control" id="nws_tts_volume" name="nws_tts_volume" type="number" min="1" max="200" value="<?php echo (int)($settings['nws_tts_volume'] ?? 25); ?>"><span class="input-group-addon">%</span></div><p class="help-block"><?php echo _('Default 25%.'); ?></p></div></div>
 					<div class="col-md-3"><div class="form-group"><label for="nws_tts_max_seconds"><?php echo _('Maximum Summary'); ?></label><div class="input-group"><input class="form-control" id="nws_tts_max_seconds" name="tts_max_seconds" type="number" min="1" max="600" value="<?php echo (int)($settings['tts_max_seconds'] ?? 30); ?>"><span class="input-group-addon"><?php echo _('sec'); ?></span></div></div></div>
 				</div>
+				<div class="form-group">
+					<input type="hidden" name="nws_voicemail_enabled" value="0">
+					<div class="checkbox"><label for="sls-weather-voicemail"><input type="checkbox" id="sls-weather-voicemail" name="nws_voicemail_enabled" value="1" <?php echo in_array($settings['nws_voicemail_enabled'] ?? '1', [true, 1, '1'], true) ? 'checked' : ''; ?> aria-describedby="sls-weather-voicemail-help"> <i class="fa fa-envelope-o" aria-hidden="true"></i> <?php echo _('Leave voicemail for unanswered extensions'); ?></label></div>
+					<p class="help-block" id="sls-weather-voicemail-help"><?php echo _('Enabled by default. Weather alert audio is saved to each selected extension’s enabled FreePBX mailbox if its phones do not answer. External numbers are unchanged.'); ?></p>
+				</div>
 				</div></div>
 
 				<div class="sls-sticky-actions">

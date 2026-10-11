@@ -17,6 +17,7 @@ import time
 
 from sls_phone_admission import DATA
 from sls_nws_delivery_claims import _open_directory, _validate_parent_directory, _account_ids
+from sls_cluster_guard import runtime_running
 
 
 def dial_number(event):
@@ -35,7 +36,7 @@ def dial_number(event):
 
 
 def observations(event, settings, digest, now):
-    if not isinstance(event, dict) or event.get('Event') != 'DialBegin' or str(settings.get('enabled')) != '1':
+    if not isinstance(event, dict) or event.get('Event') != 'DialBegin' or not runtime_running(settings):
         return []
     channel = event.get('Channel', '')
     match = re.fullmatch(r'PJSIP/([0-9]{1,20})-[a-fA-F0-9]{8,16}', channel) if isinstance(channel,str) else None

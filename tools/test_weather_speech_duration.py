@@ -33,6 +33,7 @@ import os, sys, wave
 from pathlib import Path
 text = sys.stdin.read()
 Path(os.environ["SLS_SPEECH_CAPTURE"]).write_text(text)
+if os.environ.get("SLS_SYNTHESIS_CODE"):sys.exit(int(os.environ["SLS_SYNTHESIS_CODE"]))
 path = sys.argv[sys.argv.index("--output-file") + 1]
 with wave.open(path, "wb") as output:
     output.setnchannels(1); output.setsampwidth(2); output.setframerate(8000)
@@ -53,6 +54,10 @@ with wave.open(path, "wb") as output:
                             ("sls_mass_notify_test.sh", "generate_test_tts_audio")):
         source = (RUNTIME.parent / filename).read_text()
         definitions = function(source, entry)
+        assert 'sls_speech_admission.py' in definitions, 'Weather producer bypasses shared speech admission'
+        # This fixture measures duration rather than process admission. Separate
+        # admission tests exercise the fixed-executable boundary and quotas.
+        definitions = definitions.replace('timeout "$((generation_timeout + 65))" /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_speech_admission.py --max-seconds "$PIPER_MAX_SECONDS" --', 'timeout "$generation_timeout"')
         if entry == "generate_tts_audio":
             definitions = function(source, "build_tts_text") + definitions
         # Permission changes are irrelevant to this media-only fixture.
@@ -77,10 +82,27 @@ with wave.open(path, "wb") as output:
             if entry == "generate_tts_audio":
                 assert capture.read_text().strip() == expected
 
+        # Exercise the producer's real shared-admission error classification,
+        # rather than its later duration check, with a transport returning65.
+        for audio in Path(variables['SLS_TTS_DIR']).glob('*.wav'):audio.unlink()
+        guarded = subprocess.run(['bash','-c',definitions+'PIPER_MAX_SECONDS=1\n'+entry+arguments],
+            env={**environment,'SLS_SYNTHESIS_CODE':'65'},capture_output=True,text=True,timeout=15)
+        assert guarded.returncode == 1 and guarded.stdout.startswith('SLS_TTS_ERROR:')
+        assert 'configured maximum of 1 seconds or its reserved output bound' in guarded.stderr
+        assert not list(Path(variables['SLS_TTS_DIR']).glob('*.wav'))
+
+    actual_run = subprocess.run
+    def media_run(command, *args, **kwargs):
+        if any(str(arg).endswith('sls_speech_admission.py') for arg in command):
+            if '--reserve-media-bytes' in command:
+                return subprocess.CompletedProcess(command, 0)
+            command = command[command.index('--') + 1:]
+        return actual_run(command, *args, **kwargs)
     with mock.patch.object(lightning, "PIPER_BIN", piper), \
          mock.patch.object(lightning, "TTS_DIR", directory / "lightning"), \
          mock.patch.object(lightning, "safe_tone", return_value=None), \
-         mock.patch.dict(os.environ, environment):
+         mock.patch.dict(os.environ, environment), \
+         mock.patch.object(lightning.subprocess, 'run', side_effect=media_run):
         config = {"nws_piper_voice": str(voice), "tts_max_seconds": 1}
         try:
             lightning.generate_audio(config, {}, expected, "overlimit")
@@ -94,5 +116,12 @@ with wave.open(path, "wb") as output:
         with wave.open(str(directory / "lightning/xweather_tts_boundary.wav")) as generated:
             assert generated.getnframes() / generated.getframerate() == 2
         assert capture.read_text().strip() == expected
+        for audio in (directory/'lightning').glob('*.wav'):audio.unlink()
+        with mock.patch.dict(os.environ, {'SLS_SYNTHESIS_CODE':'65'}):
+            try:lightning.generate_audio(config, {}, expected, 'output-bound')
+            except RuntimeError as error:
+                assert 'configured maximum of 2 seconds or its reserved output bound' in str(error)
+            else:raise AssertionError('Lightning accepted a shared speech output-bound rejection')
+        assert not list((directory/'lightning').glob('*.wav'))
 
 print("Weather/Lightning complete speech, measured rejection, and duration boundary checks passed.")

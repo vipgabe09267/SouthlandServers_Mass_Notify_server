@@ -12,7 +12,7 @@ STATUS_FILE="${STATUS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/upda
 UPDATE_PROGRESS_FILE="${UPDATE_PROGRESS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/update-progress.json}"
 LOG_FILE="${LOG_FILE:-/var/log/sls_mass_notify.log}"
 LOCK_FILE="${LOCK_FILE:-/run/lock/sls-mass-notify-update.lock}"
-CURRENT_VERSION="${SLS_MASS_NOTIFY_CURRENT_VERSION:-0.1.5-beta}"
+CURRENT_VERSION="${SLS_MASS_NOTIFY_CURRENT_VERSION:-0.1.6-beta}"
 
 GITHUB_UPDATES_ENABLED="0"
 GITHUB_UPDATES_CHANNEL="beta"
@@ -154,6 +154,36 @@ with open(lock_path, "a+", encoding="utf-8") as lock_handle:
 PY
 }
 
+admit_update_runtime() {
+  /usr/bin/python3 -I - <<'PY'
+import os, stat, types
+from pathlib import Path
+path = Path('/usr/local/bin/sls_mass_notify/sls_privileged_install.py')
+for entry in (path, *path.parents):
+    info = entry.lstat()
+    if info.st_uid != 0 or info.st_mode & 0o022 or stat.S_ISLNK(info.st_mode):
+        raise SystemExit('Updater admission refused an unprotected root helper')
+fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+try:
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 256 * 1024:
+        raise SystemExit('Updater admission refused an unsafe root helper')
+    body = bytearray()
+    while len(body) <= 256 * 1024:
+        block = os.read(fd, 65536)
+        if not block: break
+        body.extend(block)
+    after = os.fstat(fd)
+    if len(body) != before.st_size or (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+        raise SystemExit('Updater admission helper changed during inspection')
+finally: os.close(fd)
+module = types.ModuleType('sls_update_admission'); module.__file__ = str(path)
+exec(compile(body, str(path), 'exec'), module.__dict__)
+module.protect_entrypoint()
+module.PrivilegedInstall(module.load_trust(), Path('/var/lib/sls-mass-notify-trust')).admit()
+PY
+}
+
 load_update_config() {
   local dump_file
   local key
@@ -171,6 +201,13 @@ load_update_config() {
     esac
   done < "$dump_file"
   rm -f "$dump_file"
+}
+
+fetch_update_asset() {
+  local url="$1" output="$2" limit="$3" seconds="$4"
+  curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 15 \
+    --max-time "$seconds" --max-filesize "$limit" -o - "$url" \
+    | /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_bounded_stream.py "$output" "$limit"
 }
 
 # All operational failures are nonzero, including check-only requests. Messages
@@ -225,13 +262,16 @@ if ! flock -n 9; then
   exit 0
 fi
 
+if ! admit_update_runtime; then
+  fail_update "root_runtime_unapproved" "Installed root helpers do not match the authenticated release. Run the signed installer to repair them before updating." 2
+fi
+
 if ! load_update_config; then
   fail_update "protected_config_validation_failed" "The protected central configuration is invalid or unavailable." 2
 fi
 
 export GITHUB_UPDATES_CHANNEL GITHUB_UPDATES_PIN GITHUB_UPDATES_WINDOW_START GITHUB_UPDATES_WINDOW_END GITHUB_UPDATES_DELAY_HOURS
 release_json="$(CURRENT_VERSION="$CURRENT_VERSION" REPOSITORY="$GITHUB_UPDATES_REPOSITORY" python3 - <<'PY'
-import importlib.util
 import json
 import os
 import re
@@ -247,16 +287,18 @@ from datetime import datetime, timezone
 sys.dont_write_bytecode = True
 
 repo = os.environ.get("REPOSITORY", "")
-current = os.environ.get("CURRENT_VERSION", "0.1.5-beta")
+current = os.environ.get("CURRENT_VERSION", "0.1.6-beta")
 now = datetime.now(timezone.utc).astimezone().isoformat()
 if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
     print(json.dumps({"ok": False, "checked_at": now, "update_available": False, "latest_version": current, "message": "Configured GitHub repository is invalid."}, separators=(",", ":")))
     raise SystemExit(0)
 
 try:
-    spec = importlib.util.spec_from_file_location('sls_update_policy', '/usr/local/bin/sls_mass_notify/sls_update_policy.py')
-    policy_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(policy_module)
+    import types
+    from pathlib import Path
+    path = Path('/usr/local/bin/sls_mass_notify/sls_update_policy.py')
+    policy_module = types.ModuleType('sls_update_policy'); policy_module.__file__ = str(path)
+    exec(compile(path.read_bytes(), str(path), 'exec'), policy_module.__dict__)
     delay = os.environ['GITHUB_UPDATES_DELAY_HOURS']
     if not re.fullmatch(r'(?:0|[1-9][0-9]{0,2})', delay):
         raise ValueError('invalid delay')
@@ -286,7 +328,7 @@ def version_key(value):
 try:
     request = urllib.request.Request(
         f"https://api.github.com/repos/{repo}/releases?per_page=100",
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "SouthlandServers-Mass-Notifications-Updater/0.1.5-beta"},
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "SouthlandServers-Mass-Notifications-Updater/0.1.6-beta"},
     )
     with urllib.request.urlopen(request, timeout=20) as response:
         body = response.read(2097153)
@@ -440,14 +482,14 @@ release_manifest="$release_work/release-manifest.json"
 release_signature="$release_work/release-manifest.sig"
 release_package="$release_work/package.tgz"
 write_manual_progress "installing" "Downloading and installing Mass Notify ${latest}."
-if ! curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 15 --max-time 120 --max-filesize 1048576 -o "$tmp_script" "$installer_url" >> "$LOG_FILE" 2>&1; then
+if ! fetch_update_asset "$installer_url" "$tmp_script" 1048576 120 >> "$LOG_FILE" 2>&1; then
   log "Automatic update could not download the tagged installer for $latest"
   fail_update "download_failed" "The verified installer could not be downloaded."
 fi
 release_base="${tgz_url%/*}"
-if ! curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 120 --max-filesize 16384 -o "$release_manifest" "$release_base/release-manifest.json" >> "$LOG_FILE" 2>&1 \
-  || ! curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 120 --max-filesize 64 -o "$release_signature" "$release_base/release-manifest.sig" >> "$LOG_FILE" 2>&1 \
-  || ! curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 900 --max-filesize 52428800 -o "$release_package" "$tgz_url" >> "$LOG_FILE" 2>&1 \
+if ! fetch_update_asset "$release_base/release-manifest.json" "$release_manifest" 16384 120 >> "$LOG_FILE" 2>&1 \
+  || ! fetch_update_asset "$release_base/release-manifest.sig" "$release_signature" 64 120 >> "$LOG_FILE" 2>&1 \
+  || ! fetch_update_asset "$tgz_url" "$release_package" 52428800 900 >> "$LOG_FILE" 2>&1 \
   || ! /usr/bin/python3 /usr/local/bin/sls_mass_notify/sls_release_verify.py \
       --manifest "$release_manifest" --signature "$release_signature" --installer "$tmp_script" --package "$release_package" --version "$latest" >> "$LOG_FILE" 2>&1; then
   log "Update rejected: publisher signature or artifact verification failed for $latest"

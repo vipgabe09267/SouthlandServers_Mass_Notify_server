@@ -181,6 +181,136 @@
       "version": "2.9.4"
     },
     {
+      "bom-ref": "pkg:npm/chartjs-color@2.4.1",
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://raw.githubusercontent.com/chartjs/Chart.js/v2.9.4/package-lock.json"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "chartjs-color",
+      "properties": [
+        {
+          "name": "sls:embedded-in",
+          "value": "pkg:npm/chart.js@2.9.4"
+        }
+      ],
+      "purl": "pkg:npm/chartjs-color@2.4.1",
+      "type": "library",
+      "version": "2.4.1"
+    },
+    {
+      "bom-ref": "pkg:npm/chartjs-color-string@0.6.0",
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://raw.githubusercontent.com/chartjs/Chart.js/v2.9.4/package-lock.json"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "chartjs-color-string",
+      "properties": [
+        {
+          "name": "sls:embedded-in",
+          "value": "pkg:npm/chart.js@2.9.4"
+        }
+      ],
+      "purl": "pkg:npm/chartjs-color-string@0.6.0",
+      "type": "library",
+      "version": "0.6.0"
+    },
+    {
+      "bom-ref": "pkg:npm/color-convert@1.9.3",
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://raw.githubusercontent.com/chartjs/Chart.js/v2.9.4/package-lock.json"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "color-convert",
+      "properties": [
+        {
+          "name": "sls:embedded-in",
+          "value": "pkg:npm/chart.js@2.9.4"
+        }
+      ],
+      "purl": "pkg:npm/color-convert@1.9.3",
+      "type": "library",
+      "version": "1.9.3"
+    },
+    {
+      "bom-ref": "pkg:npm/color-name@1.1.4",
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://raw.githubusercontent.com/chartjs/Chart.js/v2.9.4/package-lock.json"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "color-name",
+      "properties": [
+        {
+          "name": "sls:embedded-in",
+          "value": "pkg:npm/chart.js@2.9.4"
+        }
+      ],
+      "purl": "pkg:npm/color-name@1.1.4",
+      "type": "library",
+      "version": "1.1.4"
+    },
+    {
+      "bom-ref": "pkg:npm/color-name@1.1.3",
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://raw.githubusercontent.com/chartjs/Chart.js/v2.9.4/package-lock.json"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "color-name",
+      "properties": [
+        {
+          "name": "sls:embedded-in",
+          "value": "pkg:npm/chart.js@2.9.4"
+        }
+      ],
+      "purl": "pkg:npm/color-name@1.1.3",
+      "type": "library",
+      "version": "1.1.3"
+    },
+    {
       "bom-ref": "pkg:composer/firebase/php-jwt@v7.2.1",
       "externalReferences": [
         {
@@ -493,6 +623,18 @@
       "version": "v1.43.0"
     }
   ],
+  "dependencies": [
+    {
+      "dependsOn": [
+        "pkg:npm/chartjs-color-string@0.6.0",
+        "pkg:npm/chartjs-color@2.4.1",
+        "pkg:npm/color-convert@1.9.3",
+        "pkg:npm/color-name@1.1.3",
+        "pkg:npm/color-name@1.1.4"
+      ],
+      "ref": "pkg:npm/chart.js@2.9.4"
+    }
+  ],
   "metadata": {
     "component": {
       "licenses": [
@@ -502,7 +644,7 @@
       ],
       "name": "slsmassnotifyserver",
       "type": "application",
-      "version": "0.1.5-beta"
+      "version": "0.1.6-beta"
     },
     "properties": [
       {
@@ -519,7 +661,7 @@
       }
     ]
   },
-  "serialNumber": "urn:uuid:38a13523-1c14-5c32-92f3-9fe23bc59584",
+  "serialNumber": "urn:uuid:85f79108-5bd3-506f-ad87-7be1545d938e",
   "specVersion": "1.6",
   "version": 1
 }

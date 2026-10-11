@@ -1,5 +1,13 @@
 # Security Policy
 
+SLS is beta software for noncritical testing, not a safety or emergency service. The administrator beta warning is separate from Labs activation. It uses a one-use, administrator/session-bound challenge and a server-enforced five-second delay. Each FreePBX administrator has a separate acknowledgment in encrypted configuration; one administrator cannot acknowledge it for another. Existing single receipts apply only to their recorded actor. Portal users and Control API keys cannot acknowledge it.
+
+All SLS email producers reserve capacity in a bounded private journal before entering the local Postfix transport. Queue inspection is read-only, bounded and refuses a backlog of 200 messages or unavailable evidence. Shared submission caps also cover recovery email; uncertain handoffs are not replayed. SLS cron output uses bounded private diagnostics and cannot generate cron mail. These controls do not manage other PBX mail producers or delete queued messages.
+
+The bundled root uninstaller authenticates retained publisher helpers and reviewed stock inventories. It drains notification workers under private leases before teardown and refuses active phone delivery. It never executes web-writable module PHP as root, installs dependencies or approves arbitrary live hashes. Default removal retains encrypted settings, media and delivery history. Failed cron reads cannot replace unrelated jobs; interrupted teardown accepts only approved installed or uninstall states. Destructive data purging requires a separate explicit request.
+
+Collector voicemail submission and expired-recording cleanup take a nonblocking shared worker lease before reading delivery state, entering AMI or changing media. Installation and removal take the exclusive lease, draining existing submissions and preventing new ones while retaining pending evidence. A busy lease leaves the collector free to continue heartbeats. Upgrade preflight also refuses a still-eligible pending fallback from an older collector that predates this lease.
+
 SLS Mass Notifications Server is beta-stage FreePBX software that can send PBX alerts, desktop notifications, SIP NOTIFY messages, webhooks, and optional TTS audio pages. Treat it like infrastructure software: test changes on a non-critical PBX first, restrict administrative access, and keep FreePBX, Asterisk, Debian packages, and this module updated.
 
 ## Runtime console
@@ -26,6 +34,12 @@ Upgrade preparation verifies the previous publisher generation before approving 
 
 SLS collector faults cannot abort an ordinary FreePBX reload. That hook uses a bounded read-only health probe and logs only a fixed diagnostic. Installation and restore remain strict, and phone-audio admission still requires fresh authenticated collector evidence. The reload hook neither restarts services nor bypasses admission checks.
 
+Speech synthesis and System Recording conversion enforce output-file limits while decoding, in addition to their process deadlines and workspace reservations. Output at the bound or beyond the configured speech duration is rejected and removed; it is never treated as a complete announcement. These child-process limits do not apply to the parent admission journals or existing logs.
+
+Direct browser-push tests are unavailable when notification cluster coordination is enabled. Manual Weather tests recheck the protected legacy-delivery gate before channel submission and call-file activation. Coordinated tests use the queued path and its witness authority; a successful transport request does not establish a valid failover lease.
+
+Standalone edge dispatch and direct cluster-effect admission enforce the protected boolean runtime policy before claiming queued jobs or effects. A stopped or malformed runtime policy blocks publication without resetting replay history or extending expiry. Read-only status, administrative recovery and authorized receipts for existing published events remain available. Every new edge queue or cluster-effect claim reads current encrypted settings under the shared configuration lock; console stop commits under its exclusive counterpart. The claim releases that lock before notification callbacks. Runtime stop does not revoke an effect already admitted or retract an already published event.
+
 Root installer/uninstaller logs and maintenance locks use exclusive, no-follow creation and descriptor identity checks before writes. Only log files have a legacy-ownership migration: a single-link regular file owned by root or the Asterisk service account can be secured through its verified descriptor. All later log writes use that held descriptor, including after FreePBX ownership changes. Lock ownership remains strictly root-only. Symlinks, hardlinks, special files, unexpected owners, and unsafe parent directories are rejected; kernel temporary-directory protections and shared lock-directory permissions are not weakened. Configuration compatibility migration is narrow and precedes strict type/key validation; it does not relax unknown-field rejection. Shared delivery activity locks and exclusive configuration/backup locks coordinate general announcements without serializing independent workers.
 
 These checks do not establish handset display, human receipt, or compatibility with every PBX deployment. Real-device testing and disposable install/restore testing remain necessary.
@@ -38,7 +52,8 @@ Version `0.1.2-beta` pins the private Piper environment to pip `26.2.0`, address
 
 | Version | Supported |
 | --- | --- |
-| `0.1.5-beta` | Supported prerelease |
+| `0.1.6-beta` | Current corrected prerelease; noncritical testing only |
+| `0.1.5-beta` | Superseded; upgrade to the corrected 0.1.6-beta prerelease |
 | `0.1.4-beta` | Upgrade recommended |
 | `0.1.3-beta` | Upgrade recommended |
 | `0.1.2-beta` | Upgrade recommended |
@@ -146,6 +161,10 @@ The module does not replace FreePBX system hardening. Firewall rules, TLS certif
 
 ## Delivery state and resource limits
 
+Internal voicemail fallback is scoped to applied Weather/Lightning recipients and authenticated live paging groups. Each service has an independent default-on preference in encrypted configuration. Live paging may record the caller's page; disabling its voicemail option prevents that recording. Manual alert tests and ordinary Dashboard TTS do not deposit voicemail, and external carrier mailboxes are outside this feature.
+
+The protected voicemail helper uses bounded private media and the authenticated phone admission/outcome journal. It rechecks current service policy, recipient identity and mailbox mapping before admission, excludes the paging caller and allows at most one deposit per extension when no selected handset answered. Interrupted or uncertain submissions are not automatically repeated. Native Asterisk voicemail writes the mailbox and handles message-waiting indications; SLS neither writes arbitrary mailbox paths nor changes the PBX's mailbox length/capacity policies. Recordings and mailbox messages contain alert or live speech and should be protected like other PBX voicemail data. A successful deposit is storage evidence, not human receipt.
+
 Desktop authentication is throttled before expensive credential work. Live streams are capped per client and globally; active credentials are rechecked during a stream. Event acknowledgments are authenticated and restricted to eligible targeted events. Password encryption remains portable by design and is not protection against theft of the complete configuration.
 
 Announcement and weather jobs use bounded, protected journals and claims made before irreversible submission. Known failed announcement destinations can be retried deliberately; uncertain or interrupted submissions are not automatically repeated. This prevents duplicate alerts at the cost of requiring operator review after some crashes. Separate observation, delivery, and external-retry workers prevent slow recipients from holding the observation lock.
@@ -156,7 +175,7 @@ The weather outbox is limited to 1,000 jobs and 16 MiB. Pending jobs and externa
 
 The `0.1.2-beta` updater verifies an Ed25519-signed release manifest using the already installed publisher public key. The manifest binds the version, tag, installer checksum, and TGZ checksum. The verified archive is passed locally to the installer to avoid a second mutable download. Release signing keys are kept outside the source tree and package; back them up securely before publication. This mechanism is separate from PBX-local FreePBX module signing. A fresh bootstrap still requires trusting the initially downloaded installer and its embedded public key.
 
-Corrections normally receive a new version and signed assets. The owner-authorized 0.1.5-beta installer repair is a same-version reissue with a new signed manifest and checksums; installed 0.1.5-beta systems require the current installer because the updater intentionally ignores an equal version. Signed manifests authenticate bytes, not code quality, and do not protect against a compromised publisher signing key.
+Corrections receive a new version and signed assets. 0.1.6-beta supersedes the earlier owner-authorized 0.1.5-beta reissue; the updater still ignores equal versions. Signed manifests authenticate bytes, not code quality, and do not protect against a compromised publisher signing key.
 
 The installer detects native prerequisites and installs only missing Debian packages, creates a dedicated Piper virtual environment with pinned packaging tools and `piper-tts`, and downloads Piper voice models from a pinned repository revision with exact SHA-256 verification. It validates a loopback-only FreePBX AMI host/port, verifies required Asterisk modules will remain available after restart, refuses an unrelated `/usr/local/bin/piper` wrapper, and refuses conflicting reserved SLS System Recording ownership. Release TGZ paths and metadata are validated before extraction, while the build gate rejects credentials, private keys, models, logs, caches, backups, signatures, nested archives, and generated artifacts. Use a trusted network for installation, verify release checksums, and run installers only from the official project source.
 
@@ -248,3 +267,64 @@ OIDC/SAML uses locked upstream protocol libraries, validated signatures/issuer/a
 Private floor plans are bounded, decoded and re-encoded PNG/JPEG files outside document roots. Plans and incident responses are projected through current site/audience permissions. Door mutations and public-warning origination require explicit configured capabilities and their own warning acceptance. Provider operations preserve uncertainty rather than repeating an unconfirmed action. These interfaces have isolated adversarial checks; no hardware certification, authority approval or independent external penetration test is claimed.
 
 The legacy FreePBX Sysadmin disk-space widget uses the signed module’s local Chart.js 2.9.4 bundle. Only its exact legacy CDN script URL is redirected; other AJAX requests are unaffected. The upstream MIT license, source URL and file hashes are included in the dependency inventory.
+
+## 0.1.6-beta installer boundaries
+
+Root helpers are admitted against authenticated release bytes before configuration or update-policy imports. Protected imports compile checked source rather than using generated bytecode. Crypto loads only after generation authentication. Missing AES prerequisites produce a specific error without exposing configuration or keys.
+
+Spool ownership repairs use held directory descriptors and refuse symlinks or replaced entries. Module activation and rollback rename only within the module filesystem. Voice transfers enforce catalog size, checksum, HTTPS redirects and elapsed-time limits, preserve the previous model on failure and remove interrupted temporary downloads. Updater installer, manifest, signature and package transfers enforce their own byte limits through a shared protected stream writer, independently of response headers. Downloaded code remains subject to publisher verification before execution.
+
+Inspection collects root-private evidence without mutating installed settings, services, packages, keys, trust pointers or failure notices. It may require network access for signed artifacts; offline evidence is supported. Unsupported collector service states are rejected before normalization or maintenance changes. Repair-mode idle inspection does not waive active-call, pending-spool or worker checks, and final verification requires orphan reconciliation and unchanged closed history.
+
+Dial-in paging checks the caller’s current Asterisk channel unique ID, device-to-user mapping and registered contact before excluding that contact. The saved group audience is identical in PHP and Python. Unknown or ambiguous identity fails closed. Public notification schema 1 and SSE protocol 2 remain unchanged. The served-PHP installer probe accepts only direct loopback GET requests and returns prerequisite names; it exposes no settings, credentials or administrative actions.
+
+## Additional 0.1.6-beta controls
+
+Interrupted installations use a root-private, synchronized transaction journal.
+Only authenticated saved installer/runtime generations can perform recovery.
+Unfinished evidence is retained and blocks a new mutation until reviewed
+recovery succeeds. Signal handling cannot convert an interrupted install into a
+successful cleanup. A completed journal marker is preserved even when its bulky
+recovery data is retired. Stock Dashboard bootstrap verifies official signatures;
+unknown local differences still require review.
+
+Served PHP prerequisites are checked independently of CLI PHP. The protected
+job/collector profile requires PHP to run as the Asterisk service account with
+`exec`, `proc_open` and the documented extensions available. The installer does
+not grant a different web account root access or change global PHP policy to
+circumvent this requirement.
+
+Phone display inventory is private, size-bounded and expires after 90 seconds.
+It is never an authorization grant or the final registration check for delivery.
+Shared speech admission limits concurrent synthesis, waiting work, generated
+bytes and remaining free space. Cached media cannot bypass validation, and
+active references are protected during cleanup.
+
+`Idempotency-Key` protects ordinary Control API announcement submission for
+30 days. Keys bind to the authenticated credential, canonical request and its
+current permissions. A claimed submission with an unknown result is not replayed.
+Recovery retains replay fences and archives delivery evidence without restoring
+work into execution.
+
+Optional operator expiry is enforced on authentication, existing sessions,
+current permissions and queued delivery authorization. Changing the expiry
+revokes the old authentication binding and reset links. Password recovery does
+not extend account access; full FreePBX administrators retain recovery access.
+
+Web Push uses RFC 8291 authenticated payload encryption and RFC 8292 VAPID.
+Enrollment requires the current email-verified subscriber identity. Queue
+snapshots bind to exact subscription identities and keys; changed or revoked
+endpoints cannot receive an older queued alert. VAPID and connector credentials
+stay in the encrypted `.config` and are redacted from public projections.
+Provider acceptance remains separate from display and human-response evidence.
+
+The dependency inventory includes embedded JavaScript and vendored PHP/Python
+components. Numeric dashboard charts no longer include Moment 2.24.0. OSV checks
+fail on reported advisories or an incomplete scan. A point-in-time advisory scan
+and isolated tests are not an external penetration test or a security guarantee.
+
+## Legacy runtime permissions
+
+Authenticated upgrades can tighten recognized legacy worker and phone-admission files from mode0644 to0640. Recovery runs only as root, opens relative to validated directory descriptors with no-follow semantics, and checks ownership, regular-file type, single-link identity and bounded size before changing permissions. It preserves contents and lock inodes. Recognized central configuration is authenticated and decoded before changing its mode; recovery does not rewrite settings or rotate keys. Unknown layouts require review; runtime readers continue rejecting unsafe files.
+
+The installer uses FreePBX's native chown blacklist for the SLS data directory, preventing recursive startup normalization from exposing private journals. Existing unrelated directives are preserved; conflicting custom SLS directives require review. The collector must regain a fresh authenticated heartbeat before worker pause and upgrade activation. Ordinary FreePBX reloads continue with a warning if the collector is unavailable, while new SLS phone-audio admission remains blocked.

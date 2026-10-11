@@ -10,7 +10,7 @@ file_put_contents($directory . '/beep.wav', 'isolated readable fixture');
 $reflection = new ReflectionClass(\FreePBX\modules\Slsmassnotifyserver::class);
 $source = file($reflection->getFileName());
 $methods = '';
-foreach (['saveScheduledAnnouncement', 'previewScheduleCalendar', 'getScheduledAnnouncements', 'normalizeScheduledAnnouncements', 'findLiveScheduledOccurrence', 'scheduleExecutionRecord',
+foreach (['saveScheduledAnnouncement', 'previewScheduleCalendar', 'resolveScheduleCalendarInput', 'getScheduledAnnouncements', 'normalizeScheduledAnnouncements', 'findLiveScheduledOccurrence', 'scheduleExecutionRecord',
     'validateScheduledAnnouncementRecurrences', 'sanitizeScheduleText', 'normalizeScheduleRecurrenceMode',
     'scheduleRecurrenceIntervalDays', 'buildScheduledOccurrences', 'scheduleRecurrenceMatchesOccurrences',
     'resolveScheduleLocalDateTime', 'parseScheduleUtcTimestamp', 'normalizeAnnouncementAudioMode', 'normalizeToneName', 'announcementTone', 'validateAudienceWebhookIds'] as $name) {

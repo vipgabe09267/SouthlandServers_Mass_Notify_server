@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 import copy
-import importlib.util
+import types
 import io
 import json
 import os
@@ -52,7 +52,9 @@ MENU = b'''\t// SLS Mass Notifications menu placement: keep Mass Notify after UC
 '''
 ROOT_JOB = re.compile(rb'(?:\* \* \* \* \* /usr/bin/timeout 900 ' + RUNTIME.encode() +
                       rb'/sls_mass_notify_maintenance\.sh|17 (?:\*|\*/6) \* \* \* /usr/bin/timeout 1800 ' +
-                      RUNTIME.encode() + rb'/sls_mass_notify_update\.sh)\Z')
+                      RUNTIME.encode() + rb'/sls_mass_notify_update\.sh|(?:\* \* \* \* \* /usr/bin/python3 -I ' +
+                      RUNTIME.encode() + rb'/sls_cron_runner\.py maintenance|17 \* \* \* \* /usr/bin/python3 -I ' +
+                      RUNTIME.encode() + rb'/sls_cron_runner\.py update) >/dev/null 2>&1)\Z')
 
 
 class UpgradeError(RuntimeError):
@@ -67,9 +69,9 @@ class RuntimeReviewError(UpgradeError):
 
 
 def helper(name):
-    spec = importlib.util.spec_from_file_location('_sls_upgrade_' + name, HERE / (name + '.py'))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    path = HERE / (name + '.py')
+    module = types.ModuleType('_sls_upgrade_' + name); module.__file__ = str(path)
+    exec(compile(path.read_bytes(), str(path), 'exec'), module.__dict__)
     return module
 
 
@@ -151,7 +153,7 @@ def upstream_contents(package, module, version, workspace):
         private = Path(temporary)
         (private / 'key.asc').write_bytes(key)
         (private / 'package.gpg').write_bytes(signed)
-        command = ['/usr/bin/gpg', '--no-options', '--homedir', str(private), '--batch', '--no-tty', '--no-auto-key-retrieve']
+        command = ['/usr/bin/gpg', '--no-options', '--homedir', str(private), '--batch', '--no-tty', '--no-auto-key-retrieve', '--no-autostart']
         subprocess.run(command + ['--import', str(private / 'key.asc')], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
         plain = private / 'package.tgz'
         result = subprocess.run(command + ['--status-fd', '1', '--output', str(plain), '--decrypt', str(private / 'package.gpg')],
@@ -235,6 +237,81 @@ def upstream_inventory(contents, source, module, version, candidate, previous, w
         if spinner.is_symlink():
             files[SPINNER]['link_target'] = 'admin/modules/core/images/spinner.gif'
     return data, prior
+
+
+def bootstrap_dashboard(workspace, version):
+    """Stage only an absent Dashboard from an independently signed stock package.
+
+    FreePBX registration/hooks are subsequently run as its service account by
+    the shell installer. This is a stock prerequisite, not SLS trust enrollment.
+    """
+    if not VERSION.fullmatch(version): raise UpgradeError('Choose an exact supported 17.x Dashboard version')
+    modules = WEB / 'admin/modules'
+    parent = TRUST.directory(modules)
+    try:
+        try: os.stat('dashboard', dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError: pass
+        else: raise UpgradeError('Dashboard bootstrap only supports an absent module; existing files must be reviewed, never replaced')
+    finally: os.close(parent)
+    TRUST.prepare_root(workspace)
+    package = workspace / ('dashboard-' + version + '.tgz.gpg')
+    offline = os.environ.get('SLS_MASS_NOTIFY_UPSTREAM_PACKAGES', '')
+    if offline: TRUST.atomic(package, TRUST.read(Path(offline) / package.name, TRUST.MAX_ARCHIVE, protected=True))
+    else: download('https://mirror.freepbx.org/modules/packages/dashboard/' + package.name, package, TRUST.MAX_ARCHIVE)
+    contents, provenance = upstream_contents(package, 'dashboard', version, workspace)
+    # Persist authenticated package provenance before exposing any stock files.
+    write_json(workspace / 'stock-bootstrap.json', {'schema': 1, 'module': 'dashboard', 'version': version, 'source': provenance})
+    import pwd
+    account = pwd.getpwnam('asterisk')
+    if account.pw_uid == 0: raise UpgradeError('FreePBX service account must be unprivileged')
+    parent = TRUST.directory(modules)
+    temporary = '.sls-stock-dashboard-' + os.urandom(12).hex()
+    descriptor = -1
+    try:
+        os.mkdir(temporary, 0o700, dir_fd=parent)
+        descriptor = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        for relative, body in sorted(contents.items()):
+            parts = TRUST.relative(relative).split('/')
+            current = os.dup(descriptor)
+            try:
+                for part in parts[:-1]:
+                    try: os.mkdir(part, 0o700, dir_fd=current)
+                    except FileExistsError: pass
+                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+                    os.close(current); current = child
+                fd = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=current)
+                with os.fdopen(fd, 'wb') as output: output.write(body); output.flush(); os.fsync(output.fileno())
+                os.fsync(current)
+            finally: os.close(current)
+        # Ownership changes apply only to descriptor-checked newly created files.
+        def expose(fd):
+            for name in os.listdir(fd):
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode):
+                    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                    try: expose(child)
+                    finally: os.close(child)
+                elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                    child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+                    try: os.fchown(child, account.pw_uid, account.pw_gid); os.fchmod(child, 0o644)
+                    finally: os.close(child)
+                else: raise UpgradeError('Unexpected stock bootstrap file type')
+            os.fchown(fd, account.pw_uid, account.pw_gid); os.fchmod(fd, 0o755); os.fsync(fd)
+        try: os.stat('dashboard', dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError: pass
+        else: raise UpgradeError('Dashboard appeared during bootstrap; preserve the authenticated source and review')
+        # Atomic non-replacing rename prevents an intervening local module from
+        # being overwritten, even if the public parent is writable by FreePBX.
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.renameat2(parent, temporary.encode(), parent, b'dashboard', 1):
+            raise OSError(ctypes.get_errno(), 'Dashboard bootstrap destination changed')
+        os.fsync(parent)
+        expose(descriptor)
+    finally:
+        if descriptor >= 0: os.close(descriptor)
+        os.close(parent)
+    print(json.dumps({'ok': True, 'stock_bootstrap': 'dashboard', 'version': version, 'evidence': str(workspace)}))
 
 
 def authenticated_generation(root):
@@ -370,6 +447,8 @@ def previous_root_approval(data, contents, *, prefix=Path('/'), cron=None):
     jobs = [line for line in cron.splitlines() if any(marker.encode() in line for marker in recovery.CRON_MARKERS)]
     if any(not ROOT_JOB.fullmatch(line) for line in jobs) or len(jobs) != len(set(jobs)):
         raise UpgradeError('Previous SLS root schedule needs independent review; no maintenance was disabled')
+    if any(b'/sls_cron_runner.py ' in line for line in jobs) and RUNTIME + '/sls_cron_runner.py' not in expected:
+        raise UpgradeError('Previous SLS cron runner lacks publisher-authenticated source approval')
     return {'schema': 1, 'source': 'publisher-verified-previous-release', 'version': data['version'],
             'archive_sha256': data['source']['archive_sha256'], 'files': expected,
             'missing_files': sorted(missing), 'quarantine_caches': caches,
@@ -619,7 +698,7 @@ def prepare(args):
                 raise UpgradeError('Reviewed ' + module + ' inventory digest mismatch')
             data = TRUST.parse_manifest(body)
             old = TRUST.load(args.trust_root, module)[0] if pointer.exists() or pointer.is_symlink() else copy.deepcopy(data)
-        elif pointer.exists() or pointer.is_symlink():
+        elif (pointer.exists() or pointer.is_symlink()) and TRUST.load(args.trust_root, module)[0]['version'] == version:
             data = copy.deepcopy(TRUST.load(args.trust_root, module)[0])
             old = copy.deepcopy(data)
         else:
@@ -684,13 +763,16 @@ def main():
     parser.add_argument('--signature', type=Path)
     parser.add_argument('--verify-previous', action='store_true')
     parser.add_argument('--normalize-runtime', action='store_true')
+    parser.add_argument('--bootstrap-dashboard-version')
     args = parser.parse_args()
     if os.geteuid() != 0:
         raise UpgradeError('Upgrade trust preparation requires root')
     TRUST.read(HERE / 'sls_upgrade_trust.py', TRUST.MAX_ARCHIVE, protected=True)
-    if args.verify_previous and args.normalize_runtime:
+    if sum(bool(item) for item in (args.verify_previous, args.normalize_runtime, args.bootstrap_dashboard_version)) > 1:
         parser.error('Select only one recovery action')
-    if args.normalize_runtime:
+    if args.bootstrap_dashboard_version:
+        bootstrap_dashboard(args.workspace, args.bootstrap_dashboard_version)
+    elif args.normalize_runtime:
         normalize_previous_runtime(args.workspace)
     elif args.verify_previous:
         verify_previous(args.workspace)

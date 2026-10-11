@@ -4,7 +4,7 @@ The release pins are in `bin/sls_mass_notify/piper-requirements.txt` inside the 
 
 `piper-artifacts.json` records the reviewed filenames, sizes, upstream URLs and hashes for all non-yanked wheel variants available when the lock was generated. This supports multiple wheel-compatible platforms without silently trusting newly uploaded artifacts. Regenerate locks deliberately when changing pins; test the affected Python/platform and speech output before release.
 
-The packaged `docs/piper-sbom.cdx.json` is a reproducible CycloneDX 1.6 inventory of the declared Piper environment, Twilio callback validator, locked PHP identity libraries and bundled Chart.js library. Its scope explicitly excludes OS packages, other FreePBX modules and voice models. It is an inventory, not vulnerability clearance or proof that an arbitrary host installed those exact artifacts.
+The packaged `docs/piper-sbom.cdx.json` is a reproducible CycloneDX 1.6 inventory of the declared Piper environment, Twilio callback validator, locked PHP identity libraries, bundled Chart.js and its embedded color libraries. Its scope explicitly excludes OS packages, other FreePBX modules and voice models. It is an inventory, not vulnerability clearance or proof that an arbitrary host installed those exact artifacts.
 
 From a repository checkout, inspect the actual installed environment without importing or executing its package code:
 

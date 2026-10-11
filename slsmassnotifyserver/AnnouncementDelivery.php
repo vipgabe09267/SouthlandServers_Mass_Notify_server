@@ -215,6 +215,7 @@ trait SlsAnnouncementDelivery
         if (method_exists($this, 'snapshotEnterpriseIntegrationResponses')) {
             $request = $this->snapshotEnterpriseIntegrationResponses($request, $settings);
         }
+        if(method_exists($this,'snapshotEnterpriseAnnouncementChannels')){$request=$this->snapshotEnterpriseAnnouncementChannels($request,$settings);}
         return $request;
     }
 
@@ -577,6 +578,7 @@ trait SlsAnnouncementDelivery
         $request['delivery_id'] = 'announcement-' . bin2hex(random_bytes(16));
         $request['delivery_timestamp'] = gmdate('c');
         if (!empty($request['sms_recipient_ids'])) { $request['force_queue']=true; $request['sms_expires_at']=time()+900; }
+        if(!empty($request['browser_targets'])||!empty($request['connector_fingerprints'])){$request['force_queue']=true;}
         if (!empty($request['email_recipient_ids'])) {
             $request['force_queue'] = true;
             $request['email_expires_at'] = time() + 900;
@@ -733,6 +735,23 @@ trait SlsAnnouncementDelivery
             $result['bootstrap_ok'] = !empty($probe['ok']) && !empty($probe['bootstrap']) && !empty($probe['module_loaded']);
             $now = time(); $probeAt = strtotime($probe['checked_at'] ?? '') ?: 0;
             $result['probe_fresh'] = $probeAt > $now - 600 && $probeAt <= $now + 60;
+            $result['probe_checked_at'] = $probeAt > 0 ? gmdate('c',$probeAt) : '';
+            $result['health_failure_code'] = !$result['worker_exists'] ? 'worker_helper_missing'
+                : (!$result['php_cli_exists'] ? 'php_cli_missing'
+                : (!$result['storage_writable'] ? 'worker_storage_unwritable'
+                : (!$probe ? 'worker_probe_missing'
+                : (!$result['bootstrap_ok'] ? 'worker_probe_failed'
+                : (!$result['probe_fresh'] ? ($probeAt > $now+60 ? 'worker_probe_future' : 'worker_probe_stale') : '')))));
+            $healthReasons = [
+                'worker_helper_missing'=>'The protected announcement worker is missing or not executable. Run Repair Installation after reviewing the installer compatibility report.',
+                'php_cli_missing'=>'/usr/bin/php is unavailable. Check the installer compatibility report and the installed PHP CLI package.',
+                'worker_storage_unwritable'=>'Announcement job storage is unreadable or not writable by the PBX service account. Preserve delivery history and review its ownership with the installation doctor.',
+                'worker_probe_missing'=>'No announcement-worker health report exists. Check the SLS root maintenance cron and maintenance log; the last job state is separate from current worker readiness.',
+                'worker_probe_failed'=>'The announcement worker health check failed. Check the recorded failure category and maintenance log; a previous completed job does not prove current readiness.',
+                'worker_probe_future'=>'The announcement-worker health timestamp is in the future. Check the PBX clock and time synchronization.',
+                'worker_probe_stale'=>'The announcement-worker health report is older than ten minutes. Check the SLS root maintenance cron, its lock and maintenance log. The last completed job is historical.'
+            ];
+            $result['health_reason'] = $healthReasons[$result['health_failure_code']] ?? '';
             $result['latest_state'] = in_array($state['state'] ?? '', ['prepared', 'queued', 'worker_starting', 'running', 'complete', 'failed', 'expired'], true) ? $state['state'] : 'idle';
             $result['active_delivery_failure'] = SlsStatusHealth::announcementFailure($state, $probe, time());
             $category = !$result['bootstrap_ok'] ? ($probe['failure_category'] ?? '') : ($state['failure_category'] ?? '');
@@ -745,7 +764,7 @@ trait SlsAnnouncementDelivery
                     $result['failure_reason'] = '';
                 }
             }
-        } catch (\Throwable $error) { $result['failure_reason'] = 'Announcement job storage is unavailable or unsafe.'; }
+        } catch (\Throwable $error) { $result['failure_reason'] = 'Announcement job storage is unavailable or unsafe.'; $result['health_failure_code']='worker_storage_unavailable'; $result['health_reason']='Announcement job storage is unavailable or unsafe. Preserve its delivery history and run slsconsole doctor as root for ownership and recovery diagnostics.'; }
         $result['ok'] = $result['worker_exists'] && $result['php_cli_exists'] && $result['storage_writable']
             && $result['bootstrap_ok'] && $result['probe_fresh'];
         return $result;
@@ -753,9 +772,9 @@ trait SlsAnnouncementDelivery
 
     private function executeResolvedAnnouncement(array $request, $progress = null)
     {
-        if ((!empty($request['email_recipient_ids']) || !empty($request['sms_recipient_ids'])) && !is_callable($progress)) {
+        if ((!empty($request['email_recipient_ids']) || !empty($request['sms_recipient_ids']) || !empty($request['browser_targets']) || !empty($request['connector_fingerprints'])) && !is_callable($progress)) {
             return ['success' => false, 'receipts' => [], 'delivery_started' => false, 'partial_delivery' => false,
-                'submission_uncertain' => false, 'message' => 'Email and SMS announcements require the durable queue; no channels were submitted.'];
+                'submission_uncertain' => false, 'message' => 'Email, SMS, browser push and connector delivery require the durable queue. No channels were submitted.'];
         }
         try {
             $activity = $this->acquireAnnouncementActivityLock(false, 30);
@@ -1244,6 +1263,7 @@ trait SlsAnnouncementDelivery
         });
         if (!empty($request['email_recipient_ids'])) { $this->deliverAnnouncementEmailTargets($request, $receipts, $progress); }
         if (!empty($request['sms_recipient_ids'])) { $this->deliverAnnouncementSmsTargets($request, $receipts, $progress); }
+        if(method_exists($this,'deliverEnterpriseAnnouncementChannels')){$this->deliverEnterpriseAnnouncementChannels($request,$record,$scheduleDeadline);}
         $receiptResult = $this->refreshAnnouncementDesktopReceipts(['receipts' => $receipts], $request['delivery_timestamp'] ?? '');
         $receipts = $receiptResult['receipts'];
         $failed = array_filter($receipts, [\SlsAnnouncementJobStore::class, 'receiptNeedsAttention']);
@@ -1325,6 +1345,15 @@ trait SlsAnnouncementDelivery
         }
         if (($result['state'] ?? '') === 'rejected' && $result['ok'] === false) {
             $code = $result['error_code'] ?? '';
+            $mailAdmissionErrors = [
+                'mail_queue_full' => 'The PBX mail queue is full. Check Postfix delivery and available storage before sending again.',
+                'mail_queue_unavailable' => 'The PBX mail queue could not be checked. Check Postfix and its postqueue command before sending again.',
+                'mail_rate_limited' => 'The SLS mail submission limit was reached. Wait for capacity before sending again.',
+                'mail_admission_unavailable' => 'SLS mail capacity could not be reserved safely. Check the private mail admission files before sending again.',
+            ];
+            if (isset($mailAdmissionErrors[$code]) && ($result['submission_started'] ?? null) === false && $result['retryable'] === false) {
+                return ['state' => 'failed', 'retryable' => false, 'submission_started' => false, 'detail' => $mailAdmissionErrors[$code]];
+            }
             if (!in_array($code, ['sendmail_unavailable', 'sendmail_temporary_failure', 'sendmail_rejected'], true)) { return $uncertain; }
             return ['state' => 'failed', 'retryable' => $result['retryable'] === true && in_array($code, ['sendmail_unavailable', 'sendmail_temporary_failure'], true),
                 'detail' => 'PBX mail service rejected this submission. Review PBX mail logs before an eligible explicit retry.'];

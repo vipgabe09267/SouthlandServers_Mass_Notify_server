@@ -18,6 +18,26 @@ as an invalid-number handler, allowing unused codes such as 799 or 7999 to save.
 Actual extensions, outbound patterns, custom routes and modified fallbacks remain
 conflicts. Saving does not activate paging: Save and Apply Config are both required.
 
+## Live-page voicemail
+
+**Paging access > Record live pages for voicemail** starts enabled. It records the
+caller's live page and, after the page ends, leaves one message per selected
+extension with an enabled FreePBX mailbox when none of that extension's selected
+handsets answered. The caller is excluded. An offline group can receive the
+recording even when no recipient phone is registered, provided eligible mailboxes
+exist. With voicemail disabled, no live-page recording is made and at least one
+recipient phone must be registered.
+
+Save and Apply Config after changing the preference. Asterisk's native voicemail
+application handles mailbox storage and message-waiting indication. Mailbox
+length/capacity limits still apply; SLS does not create a mailbox, expand its limits
+or alter ordinary PBX call handling. Interrupted or uncertain deposit attempts are
+not automatically replayed. Receiving a voicemail does not confirm listening.
+
+Weather and Lightning have separate default-on voicemail controls for their
+prepared audio. Manual alert tests do not deposit voicemail. Ordinary Dashboard
+TTS announcements and external carrier voicemail are unchanged.
+
 ## External callers through an IVR
 
 1. Enable paging and **Offer an external paging destination**.

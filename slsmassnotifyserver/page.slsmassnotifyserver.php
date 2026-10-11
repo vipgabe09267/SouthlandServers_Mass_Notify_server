@@ -27,7 +27,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$slsmassnotifyserver->validateCsrf
 		'cooldown_remaining' => 0,
 	];
 	$csrfAction = (string)($_POST['slsmassnotifyserver_action'] ?? '');
-	if (in_array($csrfAction, ['deployment_readiness', 'preview_announcement', 'send_announcement', 'retry_announcement', 'run_test_profile', 'save_announcement_group', 'delete_announcement_group'], true)) {
+	if (in_array($csrfAction, ['beta_notice_begin', 'beta_notice_accept', 'deployment_readiness', 'preview_announcement', 'send_announcement', 'retry_announcement', 'run_test_profile', 'save_announcement_group', 'delete_announcement_group'], true)) {
 		slsmassnotifyserver_json_response($csrfResult, 403);
 	}
 	$_SESSION['slsmassnotifyserver_setup_result'] = $csrfResult;
@@ -39,6 +39,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_once __DIR__ . '/RecipientSelection.php';
     try { $_POST = \SLS\MassNotify\RecipientSelection::decode($_POST); }
     catch (\DomainException $error) { slsmassnotifyserver_json_response(['success' => false, 'message' => $error->getMessage(), 'delivery_started' => false], 400); }
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && in_array($_POST['slsmassnotifyserver_action'] ?? '', ['beta_notice_begin', 'beta_notice_accept'], true)) {
+	try {
+		$result = $slsmassnotifyserver->betaNoticeAction($_POST['slsmassnotifyserver_action'],
+			$_POST['slsmassnotifyserver_action'] === 'beta_notice_begin' ? [] : [
+				'challenge' => $_POST['challenge'] ?? '', 'agree' => ($_POST['agree'] ?? '') === '1',
+			]);
+		slsmassnotifyserver_json_response($result);
+	} catch (\DomainException | \InvalidArgumentException $error) {
+		slsmassnotifyserver_json_response(['success' => false, 'message' => $error->getMessage()], 403);
+	} catch (\Throwable $error) {
+		slsmassnotifyserver_json_response(['success' => false, 'message' => 'The beta warning acknowledgment could not be saved. Reload this page and try again.'], 503);
+	}
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action'] ?? '') === 'deployment_readiness') {

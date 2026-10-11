@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real publisher and authenticated desktop incident routing, wholly disposable."""
 import configparser
+from datetime import datetime, timedelta, timezone
 import importlib.util
 import json
 import re
@@ -19,6 +20,18 @@ CONTEXT = {'schema': 1, 'incident_id': 'inc_' + 'a' * 32, 'sequence': 1, 'kind':
 
 
 class PublisherTests(unittest.TestCase):
+    def test_language_context_absolute_expiry_is_shared_and_strict(self):
+        expiry=(datetime.now(timezone.utc)+timedelta(seconds=590)).replace(microsecond=0).isoformat()
+        language=CONTEXT | {'operation_request_id':'b'*32,'language_variant':'es','language_batch':1,'language_batches':2,'expires_at':expiry}
+        first=notify.announcement_api_record('first','Fixture Spanish','',[],desktop_targets=['spanish'],incident=language,is_test=True)
+        second=notify.announcement_api_record('second','Fixture English','',[],desktop_targets=['english'],incident=language | {'language_batch':2,'language_variant':''},is_test=True)
+        self.assertEqual(first['display_expires_at'],second['display_expires_at'])
+        self.assertEqual(first['display_expires_at'],expiry.replace('+00:00','Z'))
+        self.assertEqual(first['incident'],language)
+        for mutation in ({'expires_at':'2026-02-30T10:00:00+00:00'},{'language_batch':True},{'language_batches':8},{'language_variant':'../settings'}):
+            with self.subTest(mutation=mutation),self.assertRaises(ValueError):notify.normalize_incident_context(language | mutation)
+        with self.assertRaises(ValueError):notify.announcement_api_record('expired','Fixture','',[],incident=language | {'expires_at':'2020-01-01T00:00:00+00:00'},is_test=True)
+
     def test_actual_api_only_publication_preserves_context_expiry_and_recipients(self):
         with tempfile.TemporaryDirectory(prefix='sls-incident-publisher-') as folder:
             events = Path(folder) / 'journal.jsonl'

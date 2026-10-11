@@ -47,6 +47,24 @@ class Fixture(unittest.TestCase):
     def file(self,path,body,mode=0o644):
         dest=self.helper.dest(path); dest.parent.mkdir(parents=True,exist_ok=True); dest.write_bytes(body); dest.chmod(mode); return dest
     def snapshot(self): return self.helper.snapshot_create()
+    def test_unsupported_service_state_is_rejected_before_snapshot_or_changes(self):
+        for enabled in ('masked', 'static', 'enabled-runtime', 'indirect'):
+            self.service = {'enabled': enabled, 'active': 'inactive'}
+            with self.assertRaisesRegex(r.RecoveryError, 'administrator-managed'):
+                self.helper.preflight_services()
+            self.assertFalse((self.private/'static').exists())
+            self.assertFalse(any(row[1] in ('stop', 'disable', 'restart') for row in self.commands))
+
+    def test_service_override_requires_review_before_mutation(self):
+        self.service = {'enabled': 'enabled', 'active': 'active'}
+        self.file('/etc/systemd/system/'+r.SERVICE, r.SAFE_UNIT)
+        def command(args, check=True):
+            if args[1] == 'show' and args[-1] == '--property=DropInPaths':
+                return 'DropInPaths=/etc/systemd/system/sls-mass-notify-phone-events.service.d/custom.conf'
+            return self.command(args, check)
+        self.helper.command = command
+        with self.assertRaisesRegex(r.RecoveryError, 'override'): self.helper.preflight_services()
+        self.assertFalse((self.private/'static').exists())
     def test_roundtrip_preserves_data_config_images_and_concurrent_unrelated_cron(self):
         self.snapshot()
         self.file(r.RUNTIME+'/worker.py',b'new worker\n',0o755)
@@ -266,6 +284,28 @@ class Fixture(unittest.TestCase):
         self.snapshot();self.helper.restore()
         with self.assertRaises(r.RecoveryError):self.helper.restore_maintenance()
         self.assertNotIn(b'sls_mass_notify',self.cron)
+
+    def test_cron_runner_restoration_requires_runner_and_underlying_signed_job(self):
+        import hashlib
+        scripts={r.RUNTIME+'/sls_cron_runner.py':b'authenticated fixed runner',r.RUNTIME+'/sls_mass_notify_maintenance.sh':b'authenticated maintenance'}
+        for path,code in scripts.items():self.file(path,code,0o755)
+        job='* * * * * /usr/bin/python3 -I '+r.RUNTIME+'/sls_cron_runner.py maintenance >/dev/null 2>&1'
+        self.cron=b'12 1 * * * /usr/bin/true\n'+job.encode()+b'\n'
+        self.approval=self.private/'prior-approval.json'
+        approval={'schema':1,'source':'publisher-verified-previous-release','version':'0.1.5-beta',
+            'archive_sha256':'a'*64,'files':{path:hashlib.sha256(code).hexdigest() for path,code in scripts.items()},'root_jobs':[job]}
+        self.approval.write_text(json.dumps(approval));self.approval.chmod(0o600);self.helper.approval=self.approval
+        self.snapshot();self.helper.restore();self.assertNotIn(job.encode(),self.cron)
+        self.assertTrue(self.helper.restore_maintenance()['previous_maintenance_restored']);self.assertIn(job.encode(),self.cron)
+        manifest=self.helper.load()
+        for removed in scripts:
+            unsafe={**approval,'files':{path:digest for path,digest in approval['files'].items() if path!=removed}}
+            with self.assertRaisesRegex(r.RecoveryError,'authenticated source approval'):
+                self.helper.validate_activation_approval(unsafe,manifest['records'],self.cron)
+
+    def test_user_cron_recognizes_new_runner_without_matching_unrelated_jobs(self):
+        self.assertTrue(r.USER_CRON_JOB.search(b'* * * * * /usr/bin/python3 -I '+r.RUNTIME.encode()+b'/sls_cron_runner.py weather >/dev/null 2>&1'))
+        self.assertFalse(r.USER_CRON_JOB.search(b'* * * * * /root/unrelated_sls_cron_runner.py_not_owned'))
 
     def test_prior_runtime_changed_after_restore_blocks_maintenance_before_cron_write(self):
         _,job=self.approved_snapshot();self.helper.restore()

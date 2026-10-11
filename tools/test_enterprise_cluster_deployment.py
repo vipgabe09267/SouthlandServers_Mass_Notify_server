@@ -15,6 +15,7 @@ import ssl
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -33,7 +34,7 @@ class CopiedCluster(unittest.TestCase):
         cls.addClassCleanup(subprocess.run,['umount',str(cls.deployment)],check=True,capture_output=True)
         cls.module=cls.deployment/'admin/modules/slsmassnotifyserver';cls.api=cls.deployment/'api/sls-mass-notify'
         cls.module.mkdir(parents=True);cls.api.mkdir(parents=True)
-        names=['module.xml','EnterpriseClusterConfig.php','EnterpriseClusterRuntime.php','EnterpriseClusterProtocol.php','EnterpriseClusterStore.php','EnterpriseClusterPbxContract.php','EnterpriseClusterEdge.php','LabsSafety.php','ConfigCrypto.php','api/sls-mass-notify/config-crypto.php','bin/sls_mass_notify/sls_announcement_jobs.php']
+        names=['module.xml','EnterpriseClusterConfig.php','EnterpriseClusterRuntime.php','EnterpriseClusterProtocol.php','EnterpriseClusterStore.php','EnterpriseClusterPbxContract.php','EnterpriseClusterEdge.php','LabsSafety.php','ConfigCrypto.php','api/sls-mass-notify/config-crypto.php','bin/sls_mass_notify/sls_runtime_state.php','bin/sls_mass_notify/sls_announcement_jobs.php']
         for name in names:
             target=cls.module/name;target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(SOURCE/name,target)
         for name in ['index.php','peer.php','edge.php','edge-view.php','security.php','contract.php','event-log.php','config-crypto.php']:
@@ -184,5 +185,50 @@ class CopiedCluster(unittest.TestCase):
             guard.stdout.close();guard.stderr.close()
         restarted=subprocess.run(['php',str(self.runtime),'--status'],capture_output=True,text=True,timeout=3)
         self.assertEqual(restarted.returncode,0,restarted.stderr)
+    def test_runtime_policy_is_current_at_each_claim(self):
+        original=json.loads(json.dumps(self.settings));state_path=self.data/'enterprise-cluster/worker-state.json'
+        original_state=state_path.read_bytes();process=None
+        intent={'message':'Private fixture content','title':'Runtime admission'}
+        encoded=json.dumps(intent,separators=(',',':'),sort_keys=True).encode();content_hash=hashlib.sha256(encoded).hexdigest()
+        now=int(time.time());jobs=[{'id':'runtime-'+suffix,'delivery_id':'runtime-delivery-'+suffix,'site_id':'site-a',
+            'created_at':now,'expires_at':now+60,'recipients':['device-a'],'channels':['desktop'],'intent':intent,
+            'content_sha256':content_hash,'offline_approved':True} for suffix in ['first','second']]
+        self.settings['runtime_enabled']=True
+        self.settings['enterprise_cluster'].update({'offline_cache_enabled':True,'approved_cache':[content_hash],
+            'peers':[{'node_id':'coordinator','site_id':'site-a','role':'coordinator','https_url':'https://localhost/peer',
+                'cert_sha256':'a'*64,'hmac_secret':'b'*64}]})
+        bootstrap='require '+json.dumps(str(self.module/'EnterpriseClusterRuntime.php'))+'; $s=FreePBX\\modules\\SlsConfigCrypto::readFile('+json.dumps(str(self.data/'mass-notifications.config'))+'); $r=new SLS\\MassNotify\\EnterpriseClusterRuntime($s); '
+        enqueue='$jobs=json_decode('+json.dumps(json.dumps(jobs))+',true);foreach($jobs as $job){$r->dispatch(["source"=>"coordinator","action"=>"site.enqueue","payload"=>$job]);} '
+        dispatch='try{$r->drain(static function(array $job):array {echo json_encode(["callback"=>$job["id"]])."\\n";flush();fgets(STDIN);return ["uncertain"=>false,"state"=>"accepted"];},false);echo "{\\"stopped\\":false}\\n";}catch(DomainException $e){echo json_encode(["stopped"=>str_contains($e->getMessage(),"stopped")])."\\n";}'
+        try:
+            self.write_settings()
+            process=subprocess.Popen(['runuser','-u','asterisk','--','php','-r',bootstrap+enqueue+dispatch],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            self.assertTrue(select.select([process.stdout],[],[],5)[0],'First private queue callback was not admitted.')
+            self.assertEqual(json.loads(process.stdout.readline()),{'callback':'runtime-first'})
+            # The real admission releases its shared config lock before an
+            # admitted callback, so stop can commit before the next claim.
+            with (self.data/'mass-notifications.config.lock').open('r+b') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                self.settings['runtime_enabled']=False;self.write_settings()
+                fcntl.flock(lock,fcntl.LOCK_UN)
+            output,error=process.communicate('continue\n',timeout=5)
+            self.assertEqual(process.returncode,0,error);self.assertEqual(json.loads(output),{'stopped':True})
+            state=json.loads(state_path.read_text())
+            self.assertEqual(state['queue']['runtime-first']['state'],'complete')
+            self.assertEqual(state['queue']['runtime-second']['state'],'queued')
+            self.assertEqual(state['queue']['runtime-second']['job']['expires_at'],now+60)
+            for policy in [False,'0',None]:
+                self.settings['runtime_enabled']=policy;self.write_settings();before=state_path.read_bytes()
+                fenced=subprocess.run(['php',str(self.runtime),'--edge-once'],capture_output=True,text=True,timeout=5)
+                self.assertEqual(fenced.returncode,1);self.assertEqual(fenced.stdout,'');self.assertEqual(state_path.read_bytes(),before)
+            status=subprocess.run(['php',str(self.runtime),'--status'],capture_output=True,text=True,timeout=5)
+            self.assertEqual(status.returncode,0,status.stderr)
+            self.settings['runtime_enabled']=True;self.write_settings()
+            resume='echo json_encode($r->drain(static fn(array $job):array=>["uncertain"=>false,"state"=>"accepted"],false));'
+            resumed=subprocess.run(['runuser','-u','asterisk','--','php','-r',bootstrap+resume],capture_output=True,text=True,timeout=5)
+            self.assertEqual(resumed.returncode,0,resumed.stderr);self.assertEqual(list(json.loads(resumed.stdout)),['runtime-second'])
+        finally:
+            if process is not None and process.poll() is None:process.kill();process.communicate(timeout=5)
+            self.settings.clear();self.settings.update(original);self.write_settings();state_path.write_bytes(original_state)
 
 if __name__=='__main__':unittest.main()

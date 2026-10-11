@@ -1,0 +1,17 @@
+name: Check dependency advisories
+on:
+  schedule:
+    - cron: '23 8 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  advisories:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Check the release dependency inventory against OSV
+        run: python3 tools/check_dependencies.py

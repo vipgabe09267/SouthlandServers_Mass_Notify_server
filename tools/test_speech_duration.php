@@ -8,13 +8,13 @@ mkdir($directory, 0700);
 $reflection = new ReflectionClass(\FreePBX\modules\Slsmassnotifyserver::class);
 $source = file($reflection->getFileName());
 $methods = '';
-foreach (['generateAnnouncementTtsFile', 'buildAnnouncementTtsText', 'normalizeTtsMaxSeconds', 'normalizeTtsVolume', 'volumePercentToScalar', 'readNativeBackupFile', 'announcementAudioFileMetadata', 'isValidAnnouncementAudioCache', 'combineAudioParts', 'createQuietAnnouncementTone', 'normalizeToneName', 'getAnnouncementSequenceDuration'] as $name) {
+foreach (['generateAnnouncementTtsFile', 'buildAnnouncementTtsText', 'normalizeTtsMaxSeconds', 'normalizeTtsVolume', 'volumePercentToScalar', 'readNativeBackupFile', 'announcementAudioFileMetadata', 'isValidAnnouncementAudioCache', 'reserveGeneratedMedia', 'combineAudioParts', 'createQuietAnnouncementTone', 'normalizeToneName', 'getAnnouncementSequenceDuration'] as $name) {
     $method = $reflection->getMethod($name);
     $methods .= implode('', array_slice($source, $method->getStartLine() - 1, $method->getEndLine() - $method->getStartLine() + 1));
 }
 // Use the real methods with a disposable output directory, never PBX state.
 eval('class SpeechFixture { use \\FreePBX\\modules\\SlsAnnouncementPreview; const TTS_DIR = ' . var_export($directory, true) . '; const PLUGIN_DATA_DIR = self::TTS_DIR;
-const SOUNDS_DIR = self::TTS_DIR; const TONES_DIR = self::TTS_DIR; const ASTERISK_SOUND_PREFIX = "fixture_audio";
+const RUNTIME_DIR = self::TTS_DIR; const SOUNDS_DIR = self::TTS_DIR; const TONES_DIR = self::TTS_DIR; const ASTERISK_SOUND_PREFIX = "fixture_audio";
 const PIPER_BIN = "unused"; const PIPER_VOICE = "unused"; public $settings = []; public $invalidVoices = [];
 private function getActiveSettings() { return $this->settings; }
 public function getAvailablePiperVoices() { return [["path"=>"2"],["path"=>"3"],["path"=>"30.25"]]; }
@@ -22,6 +22,9 @@ private function isValidPiperVoiceFile($voice) { return !in_array($voice, $this-
 private function acquireAnnouncementActivityLock($exclusive, $timeout) { return null; }
 private function releaseNativeBackupFileLock($handle) {}
 ' . $methods . '}');
+// Transport shim only: admission concurrency/quota/security is exercised by test_speech_admission.py.
+file_put_contents($directory.'/sls_speech_admission.py', "import subprocess, sys\nif '--reserve-media-bytes' in sys.argv: raise SystemExit(0)\nraise SystemExit(subprocess.call(sys.argv[sys.argv.index('--')+1:]))\n");
+chmod($directory.'/sls_speech_admission.py',0755);
 $fixture = new SpeechFixture();
 $generate = new ReflectionMethod($fixture, 'generateAnnouncementTtsFile');
 $build = new ReflectionMethod($fixture, 'buildAnnouncementTtsText');
@@ -36,6 +39,7 @@ p = argparse.ArgumentParser()
 p.add_argument('--model'); p.add_argument('--volume'); p.add_argument('--input-file'); p.add_argument('--output-file')
 a = p.parse_args()
 if a.model == 'failure': sys.exit(7)
+if a.model == 'output_bound': sys.exit(65)
 assert Path(a.input_file).read_text().strip().endswith('finalword'), 'speech input was truncated'
 with wave.open(a.output_file, 'wb') as out:
     out.setnchannels(1); out.setsampwidth(2); out.setframerate(8000)
@@ -68,7 +72,7 @@ try {
         if (!is_file($directory . '/' . $base . '.wav')) { throw new RuntimeException('Speech within limit was rejected.'); }
         unlink($directory . '/' . $base . '.wav');
     }
-    foreach (['30.25' => '30.25 seconds', '0' => 'empty duration', 'failure' => 'exit code 7'] as $model => $expected) {
+    foreach (['30.25' => '30.25 seconds', '0' => 'empty duration', 'failure' => 'exit code 7', 'output_bound' => 'configured maximum of 30 seconds'] as $model => $expected) {
         $settings['announcement_piper_voice'] = $model;
         try {
             $generate->invoke($fixture, $message, $settings);

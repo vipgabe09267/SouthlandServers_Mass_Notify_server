@@ -1,20 +1,14 @@
-**SLS Mass Notifications 0.1.5-beta — Paging, SMS/MMS and Enterprise Labs**
+**SLS Mass Notifications 0.1.6-beta**
 
-A major update for FreePBX 17 is available. Bring phone, desktop, email and webhook alerts together with clearer delivery details and more control over who receives each message.
+- Safer FreePBX upgrades: corrected 4 GB RAM checks, measured disk/inode requirements, durable recovery after interruption and a read-only installation doctor.
+- Faster phone discovery on the dashboard, bounded speech jobs and clearer collector/worker diagnostics.
+- Dial-in paging fixes for multiple handsets, device aliases and offline receiving phones.
+- Searchable System Recordings and shared A/B-day schedules with holidays and date substitutions.
+- Operator access that expires at a selected date and time, plus clearer audience and delivery review.
+- New disabled-by-default Labs options: encrypted browser Web Push, ntfy/Gotify delivery, reviewed multilingual incident messages, directory deactivation review and meeting credential renewal.
+- Archived Labs reports, channel-outage review, speaker qualification records and device-enforced timed door access.
+- Stronger API replay protection, installer permission checks and dependency inventory.
 
-**Highlights**
-- Organize sites, buildings and people's devices into saved audiences for announcements, weather alerts and schedules.
-- Dial one paging extension, choose from up to 10 groups and page live. Each group has its own callers, recipients, optional PIN and SIP text; selected IVRs support approved external callers with mandatory PINs.
-- Give operators a separate dark-mode portal with scoped permissions, mandatory TOTP and controlled password recovery.
-- See exact desktop-app receipts and steadier live streams. External calls start speech only after each destination answers.
-- Preview phone images, speech and SMS; use multilingual voices, richer weather emails and updated Discord artwork.
-- Protect configuration with AES-256 encryption, annual key rotation and native FreePBX backup/restore. Updated API controls, clearer errors and responsive SLS pages round out the update.
+Labs integrations require qualification with your own providers and devices. Notification failover remains experimental; it is not complete PBX failover. Minor fixes are in the changelog and commit history.
 
-**🧪 Labs — optional, disabled by default**
-SMS/MMS for Twilio, Telnyx and BulkVS; OIDC/SAML, directory sync and verified browser subscribers; five SIP-speaker profiles and signed sensors; private floor plans, drills, shift routing and two-person approval; Zoom/Meet/Webex meetings; notification peers, mirroring, cached local edge delivery and public-warning adapters.
-
-Labs require provider/device testing. Dangerous failover/mirroring, door actions and public-warning submission are **NON-PRODUCTION LABS ONLY**. Notification failover is not full PBX failover.
-
-Minor fixes are covered in the release notes and commit history.
-
-https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/tag/slsmassnotifyserver-0.1.5-beta
+https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/tag/slsmassnotifyserver-0.1.6-beta

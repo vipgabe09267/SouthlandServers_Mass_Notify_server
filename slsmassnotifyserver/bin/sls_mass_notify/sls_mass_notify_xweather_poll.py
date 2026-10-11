@@ -75,7 +75,7 @@ CURRENT_GROUP_ID = ""
 CURRENT_GROUP_NAME = ""
 CURRENT_GROUP_INDEX = 0
 CURRENT_GROUP_LEGACY = False
-NWS_USER_AGENT = "SouthlandServers-Mass-Notifications-Server/0.1.5-beta (https://southlandservers.xyz)"
+NWS_USER_AGENT = "SouthlandServers-Mass-Notifications-Server/0.1.6-beta (https://southlandservers.xyz)"
 NWS_FORECAST_CACHE_SECONDS = 10 * 60
 NWS_FORECAST_STALE_SECONDS = 30 * 60
 NWS_POINT_CACHE_SECONDS = 24 * 60 * 60
@@ -404,7 +404,7 @@ def fetch_payload(xweather):
         "client_secret": xweather["client_secret"],
     }
     url = "https://data.api.xweather.com/lightning/closest?" + urllib.parse.urlencode(params)
-    request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "SouthlandServers-Mass-Notifications-Server/0.1.5-beta"})
+    request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "SouthlandServers-Mass-Notifications-Server/0.1.6-beta"})
     last_error = None
     maximum_attempts = 1 if xweather.get("_bounded_gate_fallback") else 3
     for attempt in range(maximum_attempts):
@@ -1041,10 +1041,14 @@ def generate_audio(config, xweather, message, alert_id):
     tts = TTS_DIR / f"xweather_tts_{alert_id}.wav"
     try:
         maximum = max(1, min(600, int(config.get("tts_max_seconds", 30) or 30)))
-        subprocess.run(["/usr/bin/timeout", str(min(900, maximum * 2 + 30)), str(PIPER_BIN), "--model", str(voice), "--volume", "1.00", "--output-file", str(raw)], input=message + "\n", text=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        synthesis = subprocess.run(["/usr/bin/timeout", str(min(900, maximum * 2 + 30) + 65), "/usr/bin/python3", "-I", str(Path(__file__).with_name("sls_speech_admission.py")), "--max-seconds", str(maximum), "--", str(PIPER_BIN), "--model", str(voice), "--volume", "1.00", "--output-file", str(raw)], input=message + "\n", text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if synthesis.returncode == 65:
+            raise RuntimeError(f"Lightning speech exceeds the configured maximum of {maximum} seconds or its reserved output bound. Shorten the message or increase Maximum Speech Duration; no speech was queued.")
+        if synthesis.returncode:
+            raise RuntimeError(f"Lightning speech generation failed (exit code {synthesis.returncode}). Check the selected voice, speech queue and Storage diagnostics; no speech was queued.")
         volume_value = xweather.get("tts_volume", config.get("nws_tts_volume", 25))
         volume = min(2.0, max(0.01, int(volume_value) / 100))
-        subprocess.run(["/usr/bin/sox", "-v", f"{volume:.2f}", str(raw), "-r", "8000", "-c", "1", "-b", "16", str(tts)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["/usr/bin/sox", "-v", f"{volume:.2f}", str(raw), "-r", "8000", "-c", "1", "-b", "16", str(tts)], check=True, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             with wave.open(str(tts), "rb") as generated:
                 duration = generated.getnframes() / generated.getframerate()
@@ -1068,8 +1072,10 @@ def generate_audio(config, xweather, message, alert_id):
     silence = Path(name)
     target = TTS_DIR / f"xweather_sequence_{alert_id}.wav"
     try:
-        subprocess.run(["/usr/bin/sox", "-n", "-r", "8000", "-c", "1", "-b", "16", str(silence), "trim", "0", "1"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["/usr/bin/sox", str(silence), *map(str, sources), "-r", "8000", "-c", "1", "-b", "16", str(target)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        reserve = 2 * (16044 + sum(path.stat().st_size for path in sources))
+        subprocess.run(["/usr/bin/python3", "-I", str(Path(__file__).with_name("sls_speech_admission.py")), "--reserve-media-bytes", str(reserve)], check=True, timeout=8, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["/usr/bin/sox", "-n", "-r", "8000", "-c", "1", "-b", "16", str(silence), "trim", "0", "1"], check=True, timeout=15, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["/usr/bin/sox", str(silence), *map(str, sources), "-r", "8000", "-c", "1", "-b", "16", str(target)], check=True, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     finally:
         silence.unlink(missing_ok=True)
     os.chmod(target, 0o644)
@@ -1099,15 +1105,22 @@ def audio_page_hold_seconds(sound):
     return math.ceil(duration) + 2
 
 
-def queue_audio(recipients, sound, archive=False):
+def queue_audio(recipients, sound, archive=False, voicemail_context=None, delivery_report=None):
     if not sound:
         return 0, [], 0
     page_hold_seconds = audio_page_hold_seconds(sound)
     if recipients:
         wait_for_slot(recipients, page_hold_seconds, sound)
     from sls_phone_admission import admit_internal
-    correlation = os.environ.get('SLS_TEST_DELIVERY_ID', '') if archive else ''
-    admission = admit_internal(list(recipients), service='lightning', correlation=correlation, duration=page_hold_seconds, sound=sound)
+    correlation = os.environ.get('SLS_TEST_DELIVERY_ID', '') if archive else (
+        'vm-' + hashlib.sha256((CURRENT_GROUP_ID + '|' + voicemail_context['event_id']).encode()).hexdigest()
+        if voicemail_context else '')
+    admission_context = {key: voicemail_context[key] for key in ('source_validity', 'event', 'severity')} if voicemail_context else None
+    admission = admit_internal(list(recipients), service='lightning', correlation=correlation,
+        duration=page_hold_seconds, sound=sound, voicemail=not archive and voicemail_context is not None,
+        voicemail_scope=CURRENT_GROUP_ID, voicemail_context=admission_context)
+    fallback_targets = admission.get('voicemail_targets', []) if not admission.get('voicemail_failure_code') else []
+    accepted = set(admission['targets']) | set(fallback_targets)
     recipients = admission['targets']
     call_wait_seconds = page_hold_seconds + 30
     queued = 0
@@ -1152,6 +1165,8 @@ def queue_audio(recipients, sound, archive=False):
         if archive:
             archived_results.append((SPOOL_DONE_DIR / target.name, extension))
         queued += 1
+    if delivery_report is not None:
+        delivery_report.update(accepted_count=len(accepted), voicemail_failure_code=admission.get('voicemail_failure_code'))
     return queued, archived_results, page_hold_seconds
 
 
@@ -1248,15 +1263,20 @@ def send_visual(recipients, desktop_clients, message, is_test=False, phone_delay
         raise RuntimeError("; ".join(failures))
 
 
-def submit_local_channels(recipients, desktop_clients, message, sound, is_test=False, preparation_error=""):
+def submit_local_channels(recipients, desktop_clients, message, sound, is_test=False, preparation_error="", voicemail_context=None):
     """Attempt independent local channels; never infer display from queue acceptance."""
     errors = [preparation_error] if preparation_error else []
     queued, archived_results, page_hold_seconds = 0, [], 0
     if recipients and sound:
         try:
-            queued, archived_results, page_hold_seconds = queue_audio(recipients, sound, archive=is_test)
-            if queued < len(set(recipients)):
-                errors.append(f'audio submission: only {queued} of {len(set(recipients))} selected phone destinations had admitted registered contacts; answer and playback remain unverified')
+            delivery_report = {}
+            queued, archived_results, page_hold_seconds = queue_audio(recipients, sound, archive=is_test,
+                voicemail_context=voicemail_context, delivery_report=delivery_report)
+            accepted = delivery_report.get('accepted_count', queued)
+            if accepted < len(set(recipients)):
+                errors.append(f'audio submission: only {accepted} of {len(set(recipients))} selected destinations were admitted for phone audio or pending voicemail; delivery remains unverified')
+            if delivery_report.get('voicemail_failure_code'):
+                errors.append('Voicemail audio could not be retained safely. Review storage and protected audio permissions; any queued phone audio is unaffected.')
         except Exception as exc:
             errors.append(f"audio submission: {exc}")
     try:
@@ -1856,7 +1876,11 @@ def main():
     try:
         if not dry_run and has_local_destination:
             queued, channel_errors = submit_local_channels(
-                recipients, desktop_clients, message, sound, is_test, preparation_error)
+                recipients, desktop_clients, message, sound, is_test, preparation_error,
+                voicemail_context=None if is_test or config.get('xweather', {}).get('voicemail_enabled', '1') not in (True, 1, '1') else {'event': event_name, 'severity': severity, 'event_id': f'xweather-{alert_id}',
+                    'source_validity': weather_source_validity('xweather', CURRENT_GROUP_ID,
+                        observed_at=now, event_kind=event_kind, cluster_started=cluster_started,
+                        configuration_identity=area_identity)})
             if channel_errors:
                 raise RuntimeError("; ".join(channel_errors))
     except Exception as exc:
@@ -1972,7 +1996,11 @@ def deliver_queued_event(record):
         if quiet_hours_active(area):
             errors.append('Quiet hours began during speech preparation; phone submission was suppressed.')
         else:
-            queued, local_errors = submit_local_channels(recipients, [], record['message'], sound)
+            queued, local_errors = submit_local_channels(recipients, [], record['message'], sound,
+                voicemail_context=None if config.get('xweather', {}).get('voicemail_enabled', '1') not in (True, 1, '1') else {'event': record['event_name'], 'severity': record['severity'], 'event_id': 'xweather-' + record['alert_id'],
+                    'source_validity': weather_source_validity('xweather', CURRENT_GROUP_ID,
+                        observed_at=record['observed_at'], event_kind=record['event_kind'],
+                        cluster_started=record['cluster_started'], configuration_identity=record['configuration_identity'])})
             errors.extend(local_errors)
     fields = [('Trigger Area', CURRENT_GROUP_NAME), ('Storm State', record['state_label']),
               ('Detection Radius', str(area['radius_miles']) + ' miles')]

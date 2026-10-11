@@ -73,6 +73,12 @@ try{
     $a='email_'.str_repeat('a',24);$b='email_'.str_repeat('b',24);
     $email=['enabled'=>'1','recipients'=>[['id'=>$a,'name'=>'Enabled saved recipient','address'=>'one@example.com','enabled'=>'1'],['id'=>$b,'name'=>'Disabled saved recipient','address'=>'two@example.com','enabled'=>'0']]];
     $defaults=$call('getDefaultSettings');$check(($defaults['announcement_email']??null)===['enabled'=>'0','recipients'=>[]],'Fresh email defaults must be disabled and empty');
+    $check($defaults['system_notification_emails']==='' && $defaults['mail_to']==='', 'Fresh settings seeded system or legacy email recipients');
+    $check($defaults['nws_zones']===[] && $defaults['xweather']['groups']===[] && $defaults['xweather']['enabled']==='0', 'Fresh weather/lightning settings seeded delivery routes');
+    $check(!$call('hasConfiguredNotificationEmailRecipients',$defaults) && $raw->getAnnouncementEmailRecipients($defaults)===[], 'Fresh settings admitted email delivery');
+    $weather=$call('normalizeNwsZoneGroups',[],'TXC491',['1000']);
+    $lightning=$call('normalizeXweatherGroups',null,['location'=>'30.0,-97.0','recipients'=>['1000']]);
+    $check(count($weather)===1 && $weather[0]['email_recipients']===[] && count($lightning)===1 && $lightning[0]['email_recipients']===[], 'Creating a weather/lightning phone route enabled email');
     $defaults['desktop_clients']=[];
     $base=$defaults;$base['announcement_email']=$email;$base['mail_from_name']='Fixture';$base['mail_from_domain']='example.com';$base['mail_from_local_part']='notify';
     $base['announcement_groups']=[];$base['scheduled_announcements']=[];$base['opening_tone']='';$base['closing_tone']='';

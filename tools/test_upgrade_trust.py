@@ -104,6 +104,21 @@ class UpgradeTrustTests(unittest.TestCase):
         self.environment = {'SLS_MASS_NOTIFY_UPSTREAM_PACKAGES': str(self.offline),
                             'SLS_MASS_NOTIFY_PREVIOUS_TGZ': str(self.previous[0]), 'SLS_MASS_NOTIFY_PREVIOUS_MANIFEST': str(self.previous[1]), 'SLS_MASS_NOTIFY_PREVIOUS_MANIFEST_SIGNATURE': str(self.previous[2])}
 
+    def test_cron_runner_jobs_require_exact_fixed_commands_and_signed_source(self):
+        contents={**self.old,'bin/sls_mass_notify/sls_cron_runner.py':b'authenticated fixed cron runner\n'}
+        path=self.fs/(self.upgrade.RUNTIME+'/sls_cron_runner.py')[1:]
+        path.write_bytes(contents['bin/sls_mass_notify/sls_cron_runner.py']);path.chmod(0o755)
+        data={'version':'0.1.5-beta','source':{'archive_sha256':'a'*64}}
+        jobs=b'* * * * * /usr/bin/python3 -I '+self.upgrade.RUNTIME.encode()+b'/sls_cron_runner.py maintenance >/dev/null 2>&1\n17 * * * * /usr/bin/python3 -I '+self.upgrade.RUNTIME.encode()+b'/sls_cron_runner.py update >/dev/null 2>&1\n'
+        approved=self.original_root_approval(data,contents,prefix=self.fs,cron=jobs)
+        self.assertEqual(len(approved['root_jobs']),2)
+        self.assertIn(self.upgrade.RUNTIME+'/sls_cron_runner.py',approved['files'])
+        for altered in (jobs.replace(b'maintenance ',b'weather ',1),jobs.replace(b' >/dev/null 2>&1',b'',1),jobs+b'* * * * * /bin/sh -c evil\n'+jobs.splitlines()[0]+b'\n'):
+            with self.assertRaises(self.upgrade.UpgradeError): self.original_root_approval(data,contents,prefix=self.fs,cron=altered)
+        path.unlink()
+        with self.assertRaisesRegex(self.upgrade.UpgradeError,'runner lacks'):
+            self.original_root_approval(data,self.old,prefix=self.fs,cron=jobs)
+
     def release(self, directory, version, contents):
         root = self.root / directory; root.mkdir(mode=0o700)
         archive = root / ('slsmassnotifyserver-' + version + '.tgz'); package(archive, 'slsmassnotifyserver', contents)
@@ -130,6 +145,23 @@ class UpgradeTrustTests(unittest.TestCase):
         self.assertNotIn('amp_conf/bin/fwconsole', framework['files'])
         self.assertEqual(framework['files'][self.upgrade.MENU_NAME]['target'], 'admin/views/menu_items.php')
         with patch.object(self.upgrade, 'WEB', self.web): self.upgrade.verify_previous(self.workspace)
+
+    def test_changed_stock_version_rebuilds_signed_inventory_and_rejects_unknown_changes(self):
+        self.prepare()
+        approvals = json.loads((self.workspace/'approvals.json').read_bytes())
+        for name in ('dashboard', 'framework'):
+            old = approvals['approved'][name]
+            old['version'] = '17.0.4'
+            body = json.dumps(old).encode()
+            self.trust.store_manifest(self.args.trust_root, self.trust.parse_manifest(body), body)
+        self.args.workspace = self.root/'version-review'
+        self.prepare()
+        current = json.loads((self.args.workspace/'approvals.json').read_bytes())
+        self.assertEqual(current['approved']['framework']['version'], '17.0.5')
+        self.assertEqual(current['approved']['dashboard']['version'], '17.0.5')
+        (self.web/'admin/modules/dashboard/install.php').write_bytes(b'unreviewed customization')
+        self.args.workspace = self.root/'unknown-version-review'
+        with self.assertRaisesRegex(self.upgrade.UpgradeError, 'Unreviewed PBX differences'): self.prepare()
 
     def test_previous_root_mismatch_and_unknown_executable_stop_before_mutation(self):
         target = self.fs / 'usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh'
@@ -296,6 +328,22 @@ class UpgradeTrustTests(unittest.TestCase):
     def test_mismatched_installed_previous_module_is_not_auto_approved(self):
         target = self.web / 'admin/modules/slsmassnotifyserver/bin/sls_mass_notify_update.sh'; target.write_bytes(b'unknown live code')
         with self.assertRaisesRegex(self.upgrade.UpgradeError, 'Installed previous SLS file differs'): self.prepare()
+        self.assert_preserved()
+
+    def test_absent_dashboard_bootstraps_only_independently_signed_stock(self):
+        shutil.rmtree(self.web/'admin/modules/dashboard')
+        with patch.object(self.upgrade,'WEB',self.web),patch.dict(os.environ,self.environment,clear=True):
+            self.upgrade.bootstrap_dashboard(self.root/'stock-bootstrap','17.0.5')
+        for name,body in self.stock['dashboard'].items():
+            self.assertEqual((self.web/'admin/modules/dashboard'/name).read_bytes(),body)
+        self.assertFalse(self.args.trust_root.exists())
+        self.assert_preserved()
+
+    def test_existing_dashboard_is_never_replaced_by_stock_bootstrap(self):
+        path=self.web/'admin/modules/dashboard/module.xml';before=path.read_bytes()
+        with patch.object(self.upgrade,'WEB',self.web),self.assertRaisesRegex(self.upgrade.UpgradeError,'absent'):
+            self.upgrade.bootstrap_dashboard(self.root/'stock-bootstrap','17.0.5')
+        self.assertEqual(path.read_bytes(),before)
         self.assert_preserved()
 
 

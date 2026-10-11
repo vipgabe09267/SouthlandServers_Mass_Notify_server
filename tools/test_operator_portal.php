@@ -20,6 +20,9 @@ foreach ([9999,11800,38800] as $now) { portalCheck(!Portal::current($binding,$id
 foreach (['username'=>'reused','mode'=>'usermanager','password_sha1'=>str_repeat('b',40)] as $key=>$value) {
     portalCheck(!Portal::current($binding,array_replace($identity,[$key=>$value]),1800,10001),'Changed login identity survived');
 }
+portalCheck(Portal::current($binding,$identity+['expires_at'=>10002],1800,10001),'Future account expiry denied an active session');
+portalCheck(!Portal::current($binding,$identity+['expires_at'=>10001],1800,10001),'Account expiry survived the exact boundary');
+portalCheck(!Portal::current($binding,$identity+['expires_at'=>9999],1800,10001),'Expired account retained an existing session');
 $root=sys_get_temp_dir().'/sls-portal-unit-'.bin2hex(random_bytes(8));mkdir($root,0700);
 try {
     $prefix=$root.'/password-work'; $calls=0;

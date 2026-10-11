@@ -9,8 +9,10 @@ final class EnterpriseIntegrationsConfig
     public static function defaults(): array
     {
         return ['enabled'=>'0','speakers'=>['enabled'=>'0','devices'=>[]],
+            'connectors'=>['enabled'=>'0','destinations'=>[]],
             'access_control'=>['enabled'=>'0','provider'=>'axis_vapix','origin'=>'','pinned_ipv4'=>'','username'=>'','password'=>'','doors'=>[]],
-            'meetings'=>['enabled'=>'0','provider'=>'zoom','zoom_user'=>'me','zoom_access_token'=>'','google_access_token'=>'','webex_access_token'=>''],
+            'meetings'=>['enabled'=>'0','provider'=>'zoom','zoom_user'=>'me','zoom_access_token'=>'','google_access_token'=>'','webex_access_token'=>'',
+                'oauth_refresh_enabled'=>'0','oauth_client_id'=>'','oauth_client_secret'=>'','oauth_refresh_token'=>'','oauth_expires_at'=>0],
             'responses'=>['enabled'=>'0','ttl_seconds'=>900,'bindings'=>[]],
             'sensors'=>['enabled'=>'0','heartbeat_timeout_seconds'=>180],
             'public_warning'=>['enabled'=>'0','ipaws_enabled'=>'0','endpoint'=>'','soap_action'=>'','logon_user'=>'','cog_id'=>'','certificate_pem'=>'','private_key_pem'=>'','private_key_password'=>'','authority_confirmed'=>false]];
@@ -76,8 +78,10 @@ final class EnterpriseIntegrationsConfig
             $out[$kind]['enabled']=self::flag($out[$kind]['enabled']);
         }
         $ids=[]; $extensions=[]; $devices=[];
+        require_once __DIR__.'/EnterpriseDeliveryConnector.php';$connectorIds=[];$destinations=[];
+        foreach(IncidentConfig::listOf($out['connectors']['destinations'],20,'Notification connectors') as $row){$row=EnterpriseDeliveryConnector::normalize($row);if(isset($connectorIds[$row['id']])){throw new \InvalidArgumentException('Duplicate notification connector.');}$connectorIds[$row['id']]=true;$destinations[]=$row;}$out['connectors']['destinations']=$destinations;
         foreach (IncidentConfig::listOf($out['speakers']['devices'],100,'SIP speakers') as $row) {
-            $row=IncidentConfig::object($row,['id','name','enabled','brand','model','extension','telemetry_origin','telemetry_ipv4','telemetry_username','telemetry_password'],'SIP speaker');
+            $row=IncidentConfig::object($row,['id','name','enabled','brand','model','firmware','acceptance_notes','extension','telemetry_origin','telemetry_ipv4','telemetry_username','telemetry_password'],'SIP speaker');
             $id=self::id($row['id']??'','spk'); if (isset($ids[$id])) { throw new \InvalidArgumentException('Duplicate speaker identifier.'); } $ids[$id]=true;
             $brand=$row['brand']??''; if (!isset(self::catalog()[$brand])) { throw new \InvalidArgumentException('Choose a documented representative speaker brand.'); }
             $extension=IncidentConfig::identifier($row['extension']??'','/^[0-9]{1,12}$/D','Existing PBX extension');
@@ -85,7 +89,9 @@ final class EnterpriseIntegrationsConfig
             $origin=$row['telemetry_origin']??''; $ip=$row['telemetry_ipv4']??''; self::origin($origin,$ip);
             if ($origin!=='' && $brand!=='axis') { throw new \InvalidArgumentException('This release has a documented read-only telemetry adapter only for Axis speakers.'); }
             $devices[]=['id'=>$id,'name'=>IncidentConfig::text($row['name']??'',100,'Speaker name'),'enabled'=>self::flag($row['enabled']??'0'),'brand'=>$brand,
-                'model'=>IncidentConfig::text($row['model']??self::catalog()[$brand]['model'],100,'Speaker model'),'extension'=>$extension,
+                'model'=>IncidentConfig::text($row['model']??self::catalog()[$brand]['model'],100,'Speaker model'),
+                'firmware'=>IncidentConfig::text($row['firmware']??'',100,'Speaker firmware',true),
+                'acceptance_notes'=>IncidentConfig::text($row['acceptance_notes']??'',1000,'Speaker acceptance notes',true),'extension'=>$extension,
                 'telemetry_origin'=>$origin,'telemetry_ipv4'=>$ip,'telemetry_username'=>self::secret($row['telemetry_username']??'',100),'telemetry_password'=>self::secret($row['telemetry_password']??'')];
         }
         $out['speakers']['devices']=$devices;
@@ -93,17 +99,23 @@ final class EnterpriseIntegrationsConfig
         self::origin($access['origin'],$access['pinned_ipv4']); $access['username']=self::secret($access['username'],100); $access['password']=self::secret($access['password']);
         $doors=[]; $ids=[]; $tokens=[];
         foreach (IncidentConfig::listOf($access['doors'],50,'Allowed doors') as $row) {
-            $row=IncidentConfig::object($row,['id','name','token','allow_read','allow_lock','allow_unlock'],'Door permission'); $id=self::id($row['id']??'','door');
+            $row=IncidentConfig::object($row,['id','name','token','allow_read','allow_lock','allow_unlock','allow_access','maximum_access_seconds'],'Door permission'); $id=self::id($row['id']??'','door');
             $token=IncidentConfig::text($row['token']??'',256,'Device door token');
             if (isset($ids[$id]) || isset($tokens[$token])) { throw new \InvalidArgumentException('Door identifiers and controller tokens must be distinct.'); } $ids[$id]=true; $tokens[$token]=true;
             $doors[]=['id'=>$id,'name'=>IncidentConfig::text($row['name']??'',100,'Door name'),'token'=>$token,
                 'allow_read'=>IncidentConfig::flag($row['allow_read']??true,'Door read permission'),
                 'allow_lock'=>IncidentConfig::flag($row['allow_lock']??false,'Door lock permission'),
-                'allow_unlock'=>IncidentConfig::flag($row['allow_unlock']??false,'Door unlock permission')];
+                'allow_unlock'=>IncidentConfig::flag($row['allow_unlock']??false,'Door unlock permission'),
+                'allow_access'=>IncidentConfig::flag($row['allow_access']??false,'Timed door access permission'),
+                'maximum_access_seconds'=>self::integer($row['maximum_access_seconds']??10,1,60,'Maximum device access time')];
         } $access['doors']=$doors; unset($access);
         $meeting=&$out['meetings']; if (!in_array($meeting['provider'],['zoom','google_meet','webex'],true)) { throw new \InvalidArgumentException('Choose Zoom, Google Meet or Webex.'); }
         $meeting['zoom_user']=IncidentConfig::identifier($meeting['zoom_user'],'/^[A-Za-z0-9_.@+-]{1,128}$/D','Zoom host');
         foreach (['zoom_access_token','google_access_token','webex_access_token'] as $field) { $meeting[$field]=self::secret($meeting[$field]); if (preg_match('/[\r\n]/',$meeting[$field])) { throw new \InvalidArgumentException('OAuth access tokens cannot contain line breaks.'); } } unset($meeting);
+        $meeting=&$out['meetings'];$meeting['oauth_refresh_enabled']=self::flag($meeting['oauth_refresh_enabled']);
+        foreach(['oauth_client_id','oauth_client_secret','oauth_refresh_token'] as $field){$meeting[$field]=self::secret($meeting[$field],8192);if(preg_match('/[\r\n]/',$meeting[$field])){throw new \InvalidArgumentException('OAuth credentials cannot contain line breaks.');}}
+        $meeting['oauth_expires_at']=self::integer($meeting['oauth_expires_at'],0,4102444800,'OAuth expiry timestamp');
+        if($meeting['oauth_refresh_enabled']==='1'&&($meeting['oauth_client_id']===''||$meeting['oauth_client_secret']===''||$meeting['oauth_refresh_token']==='')){throw new \InvalidArgumentException('Automatic OAuth refresh requires client ID, client secret and refresh token.');}unset($meeting);
         $response=&$out['responses']; $response['ttl_seconds']=self::integer($response['ttl_seconds'],60,86400,'Human response validity');
         $bindings=[]; $seen=[];
         foreach (IncidentConfig::listOf($response['bindings'],1000,'Participant response bindings') as $row) {
@@ -131,7 +143,8 @@ final class EnterpriseIntegrationsConfig
         $hide=static function(array &$row,string $field): void { $row[$field.'_configured']=$row[$field]!==''; unset($row[$field]); };
         $hide($value['access_control'],'password');
         foreach ($value['speakers']['devices'] as &$row) { $hide($row,'telemetry_password'); } unset($row);
-        foreach (['zoom_access_token','google_access_token','webex_access_token'] as $field) { $hide($value['meetings'],$field); }
+        foreach ($value['connectors']['destinations'] as &$row) { $hide($row,'token'); } unset($row);
+        foreach (['zoom_access_token','google_access_token','webex_access_token','oauth_client_secret','oauth_refresh_token'] as $field) { $hide($value['meetings'],$field); }
         foreach (['certificate_pem','private_key_pem','private_key_password'] as $field) { $hide($value['public_warning'],$field); }
         return $value;
     }

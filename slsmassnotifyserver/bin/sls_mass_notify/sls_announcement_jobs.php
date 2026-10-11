@@ -83,7 +83,7 @@ final class SlsAnnouncementJobStore
         $channels = [];
         foreach (array_slice($receipts, 0, 5000) as $row) {
             if (!is_array($row) || !self::receiptNeedsAttention($row)
-                || !in_array($row['channel'] ?? '', ['desktop', 'audio', 'external_voice', 'sip_notify', 'webhook', 'email', 'sms'], true)) { continue; }
+                || !in_array($row['channel'] ?? '', ['desktop', 'audio', 'external_voice', 'sip_notify', 'webhook', 'email', 'sms', 'browser_push', 'connector'], true)) { continue; }
             $channel = $row['channel']; $channels[$channel] = $channels[$channel] ?? [];
             $code = $row['failure_code'] ?? $row['failure_category'] ?? '';
             // Older external receipts retained this fixed code only in their detail.
@@ -107,7 +107,7 @@ final class SlsAnnouncementJobStore
             return self::reason($category);
         }
         $labels = ['desktop' => 'Desktop', 'audio' => 'Phone audio', 'external_voice' => 'External voice',
-            'sip_notify' => 'Phone display', 'webhook' => 'Webhook', 'email' => 'Email', 'sms' => 'SMS'];
+            'sip_notify' => 'Phone display', 'webhook' => 'Webhook', 'email' => 'Email', 'sms' => 'SMS', 'browser_push' => 'Browser push', 'connector' => 'Notification connector'];
         $channels = [];
         foreach (self::failureChannels($receipts) as $row) { $channels[$row['channel']][] = $row['failure_code']; }
         $parts = [];

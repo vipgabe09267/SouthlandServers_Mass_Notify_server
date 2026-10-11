@@ -20,10 +20,32 @@ def project(state, correlation):
     batches = [batch for batch in state['batches'].values() if batch.get('correlation') == correlation]
     batches.sort(key=lambda batch: batch['created_at'])
     result = {'ok': True, 'available': bool(batches), 'active': False, 'uncertain': not bool(batches),
-              'truncated': False, 'targets': [], 'evidence': 'asterisk_channel_events', 'playback_confirmed': False}
+              'truncated': False, 'targets': [], 'evidence': 'asterisk_channel_events', 'playback_confirmed': False,
+              'voicemail_saved_count': 0}
     for attempt, batch in enumerate(batches, 1):
         result['active'] = result['active'] or batch['status'] != 'closed'
         for recipient, target in batch['targets'].items():
+            if batch.get('purpose') == 'voicemail':
+                if len(result['targets']) >= MAX_RESULTS:
+                    result.update(truncated=True, uncertain=True)
+                    return result
+                origins = [row for row in batch['channels'].values()
+                           if row.get('recipient') == recipient and row.get('kind') == 'origin']
+                row = origins[0] if len(origins) == 1 else {}
+                native_result = batch['voicemail'].get('result') or {}
+                saved = native_result.get('status') == 'SUCCESS'
+                uncertain = bool(batch.get('outcome_uncertain') or row.get('outcome_uncertain') or not native_result)
+                result['uncertain'] = result['uncertain'] or uncertain
+                result['voicemail_saved_count'] += int(saved)
+                result['targets'].append({'recipient_id': recipient, 'attempt': attempt, 'contact_index': 1,
+                    'delivery_kind': 'voicemail', 'evidence': 'asterisk_voicemail_application',
+                    'dial_status': '', 'answered': False, 'joined': False, 'ended': row.get('ended_at') is not None,
+                    'uncertain': uncertain, 'playback_completed': False, 'keypad_acknowledged': False,
+                    'acknowledgement_status': '', 'acknowledged_at': None,
+                    'voicemail_saved': saved,
+                    'voicemail_status': 'stored' if saved else ('failed' if native_result else 'unconfirmed'),
+                    'voicemail_saved_at': native_result.get('recorded_at') if saved else None})
+                continue
             channels = [(uid, row) for uid, row in batch['channels'].items()
                         if row.get('recipient') == recipient and row.get('kind') == 'contact']
             channels.sort(key=lambda pair: (pair[1]['created_at'], pair[0]))

@@ -2,6 +2,8 @@
 declare(strict_types=1);
 namespace SLS\MassNotify;
 
+require_once __DIR__ . '/ScheduleProgrammes.php';
+
 /** Bounded calendar expansion. Configuration only; no delivery or file access. */
 final class ScheduleCalendar
 {
@@ -39,7 +41,7 @@ final class ScheduleCalendar
 
     public static function validate(array $calendar): array
     {
-        if (array_diff(array_keys($calendar), ['until', 'weekdays', 'exclusions', 'overrides'])) {
+        if (array_diff(array_keys($calendar), ['until', 'weekdays', 'exclusions', 'overrides', 'programme'])) {
             throw new \DomainException('The calendar contains unsupported settings.');
         }
         $until = self::date($calendar['until'] ?? null);
@@ -81,6 +83,10 @@ final class ScheduleCalendar
             }
             usort($result[$kind], static fn($a, $b) => strcmp($a['date'] ?? $a['start'], $b['date'] ?? $b['start']));
         }
+        if (array_key_exists('programme', $calendar)) {
+            $result['programme'] = ScheduleProgrammes::snapshotProgramme($calendar['programme']);
+            ScheduleProgrammes::validateDateSubstitutions($result);
+        }
         return $result;
     }
 
@@ -91,6 +97,10 @@ final class ScheduleCalendar
         try {
             if (count($inputs) !== 1 || !is_string($inputs[0])) { throw new \DomainException('A calendar pattern needs one starting date and time.'); }
             $calendar = self::validate($calendar); $start = $inputs[0];
+            $programmeDates = isset($calendar['programme']) ? ScheduleProgrammes::dateTypes($calendar) : null;
+            if ($programmeDates !== null && $calendar['programme']['timezone'] !== $timezone->getName()) {
+                throw new \DomainException('The schedule timezone must match its shared programme.');
+            }
             if (!preg_match('/^(\d{4}-\d{2}-\d{2})T([0-2]\d:[0-5]\d)$/D', $start, $parts)) { throw new \DomainException('Choose a valid starting date and time for the calendar pattern.'); }
             $first = self::date($parts[1]); $baseTime = $parts[2];
             if ((int)substr($baseTime, 0, 2) > 23) { throw new \DomainException('The starting hour must be from 00 through 23.'); }
@@ -106,8 +116,9 @@ final class ScheduleCalendar
                 foreach ($calendar['exclusions'] as $range) {
                     if ($date >= $range['start'] && $date <= $range['end']) { continue 2; }
                 }
-                $local = $date . 'T' . ($overrides[$date]['time'] ?? $baseTime);
                 if (isset($overrides[$date])) { $used[$date] = true; }
+                if ($programmeDates !== null && !in_array($programmeDates[$date] ?? '', $calendar['programme']['selected_types'], true)) { continue; }
+                $local = $date . 'T' . ($overrides[$date]['time'] ?? $baseTime);
                 $resolved = $resolve($local, $timezone);
                 if (empty($resolved['success'])) { throw new \DomainException((string)($resolved['message'] ?? 'A calendar time is invalid.')); }
                 $timestamp = (int)$resolved['timestamp']; $utc = gmdate('Y-m-d\TH:i:s\Z', $timestamp);

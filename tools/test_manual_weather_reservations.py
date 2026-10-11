@@ -11,6 +11,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / 'slsmassnotifyserver/bin/sls_mass_notify_test.sh').read_text()
 FUNCTION = SOURCE[SOURCE.index('queue_test_audio_to_recipients() {'):SOURCE.index('\nwait_for_test_call_pickup() {')]
+AUTHORITY_FUNCTION = SOURCE[SOURCE.index('require_direct_test_authority() {'):SOURCE.index('refresh_api_test_permissions() {')]
 PERMISSION_FUNCTION = SOURCE[SOURCE.index('refresh_api_test_permissions() {'):SOURCE.index('claim_test_cooldown() {')]
 HELPER_MODULES = ROOT / 'slsmassnotifyserver/bin/sls_mass_notify'
 
@@ -21,6 +22,17 @@ class ManualWeatherReservationTests(unittest.TestCase):
             root = Path(directory)
             (root / 'outgoing').mkdir()
             (root / 'tmp').mkdir()
+            # Include the queue function's actual policy dependency. The full
+            # manual-test contract separately exercises HA and stopped rejection.
+            config = root / 'mass-notifications.config'
+            config.write_text(json.dumps({'runtime_enabled': True, 'enterprise_cluster': {'enabled': False}}))
+            config.chmod(0o640)
+            guard = root / 'sls_cluster_guard.py'
+            guard_source = (HELPER_MODULES / 'sls_cluster_guard.py').read_text()
+            guard_marker = "CONFIG = Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config')"
+            self.assertEqual(guard_source.count(guard_marker), 1)
+            guard.write_text(guard_source.replace(guard_marker, f'CONFIG = Path({str(config)!r})'))
+            (root / 'sls_config_crypto.py').write_bytes((HELPER_MODULES / 'sls_config_crypto.py').read_bytes())
             # An existing live page reserves this phone until virtual time1005.
             (root / 'audio-reservations.json').write_text(json.dumps({
                 'recipients': {'1000': 1005}, 'media': {}, 'waiting': {}}))
@@ -58,6 +70,8 @@ finally:
                 'SPOOL=' + shlex.quote(str(root / 'outgoing')),
                 'SPOOL_TMP=' + shlex.quote(str(root / 'tmp')),
                 'LOG=' + shlex.quote(str(root / 'log')),
+                'CLUSTER_GUARD=' + shlex.quote(str(guard)),
+                'CONFIG_JSON_FILE=' + shlex.quote(str(config)),
                 'AUDIO_QUEUE_HELPER=' + shlex.quote(str(helper)),
                 'SLS_AUDIO_CONTEXT=sls-alert-audio',
                 'SLS_CALLERID_NAME=Fixture SLS_CALLERID_NUM=SLS',
@@ -67,6 +81,7 @@ finally:
                 'audio_page_hold_seconds() { printf "15\\n"; }',
                 'report_fault() { printf "FAULT %s\\n" "$*"; }',
                 'chown() { :; }',
+                AUTHORITY_FUNCTION,
                 PERMISSION_FUNCTION,
                 isolated_function,
                 'status=0',

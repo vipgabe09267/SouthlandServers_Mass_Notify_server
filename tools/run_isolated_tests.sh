@@ -24,7 +24,17 @@ for kind in MOUNT NET PID; do
     exit 2
   fi
 done
+# Enable only the loopback interface in this already verified private network.
+# Real HTTP/AMI fixtures need it; the namespace has no route to the PBX or WAN.
+ip link set lo up
 mount --make-rprivate /
+BUILD_OUTPUT=""
+if [[ "${1:-}" == --build ]]; then
+  BUILD_OUTPUT="$ROOT_DIR/dist"
+  mkdir -p "$BUILD_OUTPUT"
+  # Keep only the artifact destination writable after the root bind is read-only.
+  mount --bind "$BUILD_OUTPUT" "$BUILD_OUTPUT"
+fi
 mount --bind / /
 mount -o remount,bind,ro /
 mount -t tmpfs -o mode=1777,size=768M tmpfs /tmp
@@ -41,6 +51,12 @@ mount -t tmpfs -o mode=755,size=32M tmpfs /var/spool/asterisk
 mount -t tmpfs -o mode=755,size=16M tmpfs /etc/asterisk
 mount -t tmpfs -o mode=750,size=4M,gid="$(id -g asterisk)" tmpfs /etc/sls-mass-notify
 mount -t tmpfs -o mode=755,size=32M tmpfs /var/log
+if [[ -d /var/lib/sls-mass-notify-trust ]]; then
+  mount -t tmpfs -o mode=700,size=64M tmpfs /var/lib/sls-mass-notify-trust
+fi
+if [[ -d /var/lib/sls-mass-notify-installer ]]; then
+  mount -t tmpfs -o mode=700,size=64M tmpfs /var/lib/sls-mass-notify-installer
+fi
 mount --bind /dev/null /etc/freepbx.conf
 mount -t tmpfs -o mode=755,size=32M tmpfs /usr/local/bin/sls_mass_notify
 cp -a "$ROOT_DIR/slsmassnotifyserver/bin/sls_mass_notify/." /usr/local/bin/sls_mass_notify/
@@ -67,6 +83,17 @@ if path.exists() or path.is_symlink():
 account=pwd.getpwnam('asterisk')
 crypto._atomic_write(path,crypto.encode_config({'enterprise_cluster':{'enabled':False}}),account.pw_uid,account.pw_gid)
 SLS_FIXTURE_POLICY
+if [[ "${1:-}" == --build ]]; then
+  workspace="$(mktemp -d /tmp/sls-isolated-build.XXXXXXXX)"
+  chmod 0755 "$workspace"
+  tar -C "$ROOT_DIR" --exclude='./.git' --exclude='./dist' --exclude='__pycache__' --exclude='*.pyc' -cf - . \
+    | tar -C "$workspace" -xf -
+  chown -R root:root "$workspace"
+  bash "$workspace/tools/build_tgz.sh" --unsigned
+  cp "$workspace"/dist/slsmassnotifyserver-*.tgz "$BUILD_OUTPUT/"
+  printf 'Isolated build passed; unsigned candidate copied to %s. Sign and verify the release manifest before publication.\n' "$BUILD_OUTPUT"
+  exit 0
+fi
 python3 - "$@" <<'PY'
 import pathlib
 import re

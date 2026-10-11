@@ -2,7 +2,9 @@
 declare(strict_types=1);
 namespace FreePBX\modules;
 require_once __DIR__ . '/LabsSafety.php';
+require_once __DIR__ . '/BetaNotice.php';
 use SLS\MassNotify\LabsSafety;
+use SLS\MassNotify\BetaNotice;
 
 /** Labs configuration uses the same protected writer as ordinary module settings. */
 trait SlsEnterpriseAdministration
@@ -30,7 +32,7 @@ trait SlsEnterpriseAdministration
     protected function saveEnterpriseNamespaces(array $changes,array $expected=[]): void
     {
         $this->assertEnterpriseAdministrator();
-        if (!$changes || array_diff(array_keys($changes), ['labs_safety','enterprise_cluster','enterprise_identity','directory_sync',
+        if (!$changes || array_diff(array_keys($changes), ['beta_notice','labs_safety','enterprise_cluster','enterprise_identity','directory_sync',
             'subscriber_browser','enterprise_integrations','enterprise_operations','incident_workflows'])) {
             throw new \InvalidArgumentException('Unsupported Enterprise Labs configuration section.');
         }
@@ -46,13 +48,21 @@ trait SlsEnterpriseAdministration
                 $latest=$this->normalizeSettings($active)[$key]??($this->getDefaultSettings()[$key]??[]);
                 if (!hash_equals(hash('sha256',json_encode($latest,JSON_THROW_ON_ERROR)),$revision)) { throw new \DomainException('These Enterprise Labs settings changed in another request. Reload before saving.'); }
             }
-            $active = array_replace($active, $changes);
+            $activeChanges = $changes;
+            if (isset($changes['beta_notice'])) {
+                $activeChanges['beta_notice'] = BetaNotice::merge($active['beta_notice'] ?? [], $changes['beta_notice']);
+            }
+            $active = array_replace($active, $activeChanges);
             $active = $this->normalizeSettings($active);
             $this->assertEnterpriseActivationSafe($active);
             $pending = null;
             if ($this->configurationPathMetadata(self::PENDING_SETTINGS_JSON) !== null) {
                 $pending = $this->loadSettingsFile(self::PENDING_SETTINGS_JSON);
-                $pending = array_replace($pending, $changes);
+                $pendingChanges = $changes;
+                if (isset($changes['beta_notice'])) {
+                    $pendingChanges['beta_notice'] = BetaNotice::merge($pending['beta_notice'] ?? [], $active['beta_notice']);
+                }
+                $pending = array_replace($pending, $pendingChanges);
                 $pending = $this->normalizeSettings($pending);
                 $this->assertEnterpriseActivationSafe($pending);
             }
@@ -80,7 +90,7 @@ trait SlsEnterpriseAdministration
         $integrations = $settings['enterprise_integrations'] ?? [];
         if (!empty($integrations['enabled']) && !empty($integrations['access_control']['enabled'])) {
             foreach ($integrations['access_control']['doors'] ?? [] as $door) {
-                if (!empty($door['allow_lock']) || !empty($door['allow_unlock'])) { LabsSafety::requireReceipt($settings, 'access_control_actuation'); break; }
+                if (!empty($door['allow_lock']) || !empty($door['allow_unlock']) || !empty($door['allow_access'])) { LabsSafety::requireReceipt($settings, 'access_control_actuation'); break; }
             }
         }
         if (!empty($integrations['enabled']) && !empty($integrations['public_warning']['enabled']) && !empty($integrations['public_warning']['ipaws_enabled'])) {
@@ -113,10 +123,10 @@ trait SlsEnterpriseAdministration
         $this->assertEnterpriseAdministrator();
         if ($action==='danger_begin') { return $this->beginEnterpriseDangerWarning($input['feature']??''); }
         if ($action==='danger_accept') { return $this->acceptEnterpriseDangerWarning($input); }
-        if (in_array($action,['identity_save','directory_save','directory_preview','directory_apply','subscriber_save','subscriber_invite','subscriber_revoke'],true)) {
+        if (in_array($action,['identity_save','directory_save','directory_preview','directory_apply','subscriber_save','subscriber_invite','subscriber_revoke','subscriber_push_key','subscriber_push_test'],true)) {
             return $this->enterpriseLabsAction($action,$input);
         }
-        if (in_array($action,['operations_save','approval_list','approval_approve','approval_submit','approval_reject','floorplan_overlay','drill_start','drill_review','drill_report'],true)) {
+        if (in_array($action,['operations_save','operations_archive','approval_list','approval_approve','approval_submit','approval_reject','floorplan_overlay','drill_start','drill_review','drill_report'],true)) {
             return $this->enterpriseOperationsAction($action,$input);
         }
         switch ($action) {
@@ -132,10 +142,17 @@ trait SlsEnterpriseAdministration
             case 'cluster_recovery': return $this->enterpriseClusterRecoveryState();
             case 'cluster_reconcile': return $this->enterpriseClusterReconcile($input);
             case 'integrations_save': return $this->saveEnterpriseIntegrations($input);
+            case 'integrations_continuity': return $this->getEnterpriseContinuityReport();
+            case 'integrations_report': return $this->exportEnterpriseIntegrationReport();
+            case 'integrations_archive': return $this->maintainEnterpriseIntegrationJournal($input);
+            case 'integrations_oauth_refresh': return $this->refreshEnterpriseMeetingToken();
+            case 'integrations_oauth_revoke': return $this->revokeEnterpriseMeetingToken();
             case 'integrations_meeting':
                 $id=$input['incident_id']??'';unset($input['incident_id']);return $this->createIncidentMeeting($id,$input['input']??$input);
             case 'integrations_door': return $this->controlIntegrationDoor($input);
             case 'integrations_speaker_telemetry': return $this->readIntegrationSpeakerTelemetry($input['speaker_id']??'');
+            case 'integrations_labs_send': return $this->sendIntegrationLabsAnnouncement($input);
+            case 'integrations_cap_validate': return $this->validatePublicWarningAcceptance($input);
             case 'integrations_speaker_send': return $this->sendIntegrationSpeakerAnnouncement($input);
             case 'integrations_cap_export': return $this->exportPublicWarning($input);
             case 'integrations_cap_submit': return $this->submitPublicWarning($input);
@@ -155,7 +172,9 @@ trait SlsEnterpriseAdministration
     /** A recovered PBX cannot resume peer authority or experimental automation. */
     protected function disableEnterpriseAfterRecovery(array &$settings): bool
     {
-        $changed=false;
+        $pushChanged=!empty($settings['subscriber_browser']['push']['enabled']);
+        if(isset($settings['subscriber_browser']['push'])){$settings['subscriber_browser']['push']['enabled']=false;}
+        $changed=$pushChanged;
         foreach (['enterprise_cluster','enterprise_identity','directory_sync','subscriber_browser','enterprise_operations'] as $key) {
             if(isset($settings[$key])&&!empty($settings[$key]['enabled'])){$settings[$key]['enabled']=false;$changed=true;}
         }

@@ -72,7 +72,7 @@ def capture_sendmail(command, input, check, timeout):
 
 with patch.dict(email.os.environ, {"SLS_WORKER_DEADLINE_EPOCH": ""}), patch.object(email.Path, "is_file", return_value=True), patch.object(email.os, "access", return_value=True), patch.object(
     email.subprocess, "run", side_effect=capture_sendmail
-), patch.object(email, "LOGO_PATHS", ()):
+), patch.object(email, "LOGO_PATHS", ()), patch.object(email._mail_admission, "reserve", return_value={"ok": True}):
     assert email.send_branded_email(
         {
             "mail_from_domain": "example.com",

@@ -23,6 +23,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['sls_maintenance_status'] ?? 
 	exit;
 }
 
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action'] ?? '') === 'recording_catalogue') {
+	while (ob_get_level() > 0) { @ob_end_clean(); }
+	header('Content-Type: application/json; charset=utf-8'); header('Cache-Control: private, no-store'); header('X-Content-Type-Options: nosniff');
+	if (!$slsmassnotifyserver->validateCsrfToken($_POST['slsmassnotifyserver_csrf'] ?? '')) {
+		http_response_code(403); echo json_encode(['success'=>false,'message'=>'The security token expired. Reload this page.']); exit;
+	}
+	if (session_status() === PHP_SESSION_ACTIVE) { session_write_close(); }
+	try {
+		$query = $_POST['query'] ?? ''; $offset = $_POST['offset'] ?? '0';
+		if (!is_string($query) || !is_string($offset) || !preg_match('/^[0-9]{1,4}$/D',$offset)) { throw new \InvalidArgumentException('Recording search fields are invalid.'); }
+		$result = $slsmassnotifyserver->getSystemRecordingCatalogue($query, (int)$offset, 100);
+	} catch (\InvalidArgumentException $error) { http_response_code(400); $result=['success'=>false,'message'=>$error->getMessage()]; }
+	echo json_encode($result, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE); exit;
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$slsmassnotifyserver->validateCsrfToken($_POST['slsmassnotifyserver_csrf'] ?? '')) {
 	if (($_POST['slsmassnotifyserver_action'] ?? '') === 'check_bulkvs_sender') {
 		http_response_code(403); header('Content-Type: application/json; charset=utf-8'); header('Cache-Control: no-store');

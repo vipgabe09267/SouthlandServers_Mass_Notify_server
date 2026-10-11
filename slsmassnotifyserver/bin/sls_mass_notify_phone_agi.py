@@ -86,10 +86,41 @@ def handle(mode, agi, store):
     if mode == 'end':
         cause = agi.variable('${HANGUPCAUSE}')
         return store.ended(token, uid, int(cause) if cause.isdigit() else None)
-    agi.set('SLS_PHONE_ALLOW', '0')
+    if mode == 'live-recording-end':
+        from sls_voicemail import finalize_live_recording
+        if agi.variable('${SLS_VM_RECORD_TOKEN}') != token or agi.variable('${SLS_VM_STOPPED}') != '1':
+            raise PhoneAdmissionError('phone_voicemail_recording_unconfirmed')
+        return finalize_live_recording(token, agi.environment.get('agi_channel', ''), store.directory)
     recipient = agi.variable('${SLS_PHONE_RECIPIENT}')
-    agi.set('CHANNEL(accountcode)', accountcode(token))
     channel = agi.environment.get('agi_channel', '')
+    if mode == 'voicemail-result':
+        result = agi.variable('${VMSTATUS}')
+        return store.record_voicemail_result(token, recipient, channel, result if result in {'SUCCESS', 'FAILED', 'USEREXIT'} else 'FAILED')
+    if mode == 'voicemail-playback-result':
+        return store.record_voicemail_playback(token, recipient, channel, agi.variable('${PLAYBACKSTATUS}'))
+    agi.set('SLS_PHONE_ALLOW', '0')
+    agi.set('CHANNEL(accountcode)', accountcode(token))
+    if mode in {'voicemail', 'voicemail-playback'}:
+        from sls_voicemail import check_native_target
+        settings = read_settings(store.directory)
+        with PhoneAmi(settings) as ami:
+            target = check_native_target(store, token, recipient, settings, ami)
+        if mode == 'voicemail':
+            store.bind_voicemail(token, recipient, uid, channel)
+        else:
+            with store.locked() as state:
+                health = store.require_collector(state)
+                batch = state['batches'].get(token, {})
+                origins = [row for row in batch.get('channels', {}).values() if row.get('kind') == 'origin']
+                if (batch.get('purpose') != 'voicemail' or batch.get('status') != 'active'
+                        or batch.get('generation') != health['generation'] or batch.get('boot_id') != store.boot_id
+                        or len(origins) != 1 or origins[0].get('ended_at') is not None
+                        or not channel.endswith(';1') or origins[0]['channel'] != channel[:-1] + '2'):
+                    raise PhoneAdmissionError('phone_voicemail_playback_unconfirmed')
+        agi.set('SLS_VM_BOX', target['mailbox'])
+        agi.set('SLS_SAFE_SOUND', target['sound'])
+        agi.set('SLS_PHONE_ALLOW', '1')
+        return True
     if mode == 'incident-response':
         target = store.outbound_target(token, recipient)
         binding = target.get('outbound', {}).get('incident_response')
@@ -200,13 +231,20 @@ def handle(mode, agi, store):
 
 
 def main():
+    agi = None
     try:
-        if len(sys.argv) != 2 or sys.argv[1] not in {'origin', 'contact', 'outbound', 'playback', 'playback-result', 'ack', 'incident-response', 'end'}:
+        if len(sys.argv) != 2 or sys.argv[1] not in {'origin', 'contact', 'outbound', 'playback', 'playback-result', 'ack', 'incident-response', 'end',
+                'voicemail', 'voicemail-playback', 'voicemail-result', 'voicemail-playback-result', 'live-recording-end'}:
             raise PhoneAdmissionError('phone_agi_mode_invalid')
-        handle(sys.argv[1], PhoneAgi(), PhoneAdmissionStore())
+        agi = PhoneAgi()
+        agi.set('SLS_PHONE_ERROR', '')
+        handle(sys.argv[1], agi, PhoneAdmissionStore())
         return 0
     except Exception as error:
         code = str(error) if isinstance(error, PhoneAdmissionError) else 'phone_runtime_unavailable'
+        if agi is not None and re.fullmatch(r'phone_[a-z_]{1,80}', code):
+            try: agi.set('SLS_PHONE_ERROR', code)
+            except Exception: pass
         print('SLS phone admission: ' + operator_message(code), file=sys.stderr)
         return 1
 

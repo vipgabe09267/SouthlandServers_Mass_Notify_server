@@ -67,6 +67,7 @@ class HealthSnapshots(unittest.TestCase):
         (self.base/'sls_branded_email.py').write_bytes((RUNTIME/'sls_branded_email.py').read_bytes())
         (self.base/'sls_config_crypto.py').write_bytes((RUNTIME/'sls_config_crypto.py').read_bytes())
         (self.base/'sls_cluster_guard.py').write_bytes((RUNTIME/'sls_cluster_guard.py').read_bytes())
+        (self.base/'sls_mail_admission.py').write_bytes((RUNTIME/'sls_mail_admission.py').read_bytes())
         env=dict(os.environ);env.pop('PYTHONDONTWRITEBYTECODE',None)
         result=subprocess.run(['/usr/bin/python3','-I',str(entry)],env=env,capture_output=True,text=True,timeout=3)
         self.assertEqual(result.returncode,37,result.stderr)
@@ -257,7 +258,7 @@ class HealthEmailPolicy(unittest.TestCase):
         self.process({}, NOW + 240)
         self.assertEqual(self.process(faults, NOW + 86401)["sent"], 2)
 
-    def test_failed_mail_retries_only_after_existing_delay(self):
+    def test_unconfirmed_mail_does_not_replay_after_existing_retry_delay(self):
         faults = MODULE.collect_health_faults(worker(ok=False), storage(), now=NOW)
         attempted = []
         def failed_sender(*args, **kwargs):
@@ -267,7 +268,32 @@ class HealthEmailPolicy(unittest.TestCase):
             MODULE.process_faults(self.config, faults, self.state, sender=failed_sender, now=NOW)
         self.assertEqual(self.process(faults, NOW + MODULE.RETRY_SECONDS - 1)["sent"], 0)
         self.assertEqual(self.calls, [])
-        self.assertEqual(self.process(faults, NOW + MODULE.RETRY_SECONDS)["sent"], 1)
+        self.assertEqual(self.process(faults, NOW + MODULE.RETRY_SECONDS)["sent"], 0)
+        self.assertEqual(self.process(faults, NOW + MODULE.RETRY_SECONDS * 2)["sent"], 0)
+        self.assertEqual(self.calls, [])
+        saved = json.loads(self.state.read_bytes())
+        fingerprint = next(iter(faults.values()))['fingerprint']
+        self.assertIn(fingerprint, saved['history'])
+        self.assertTrue(next(iter(saved['attempts'].values()))['submission_started'])
+        self.assertEqual(len(attempted), 1)
+
+    def test_known_pre_submission_refusal_retries_only_after_existing_delay(self):
+        faults = MODULE.collect_health_faults(worker(ok=False), storage(), now=NOW)
+        attempted = []
+        admission_error = MODULE._email_module._mail_admission.MailAdmissionBlocked
+        def blocked_sender(*args, **kwargs):
+            attempted.append(True)
+            raise admission_error('mail_queue_full')
+        with self.assertRaises(admission_error):
+            MODULE.process_faults(self.config, faults, self.state, sender=blocked_sender, now=NOW)
+        saved = json.loads(self.state.read_bytes())
+        self.assertEqual(saved['active'], {})
+        self.assertEqual(saved['history'], {})
+        self.assertNotIn('submission_started', next(iter(saved['attempts'].values())))
+        self.assertEqual(self.process(faults, NOW + MODULE.RETRY_SECONDS - 1)['sent'], 0)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.process(faults, NOW + MODULE.RETRY_SECONDS)['sent'], 1)
+        self.assertEqual(len(self.calls), 1)
         self.assertEqual(len(attempted), 1)
 
     def test_missing_weather_status_preserves_dedup_while_health_sends(self):

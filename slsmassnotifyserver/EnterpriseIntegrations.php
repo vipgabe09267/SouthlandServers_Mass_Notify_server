@@ -2,10 +2,12 @@
 declare(strict_types=1);
 namespace FreePBX\modules;
 require_once __DIR__.'/EnterpriseIntegrationsConfig.php';
+require_once __DIR__.'/EnterpriseAnnouncementChannels.php';
 use SLS\MassNotify\{EnterpriseIntegrationsConfig,EnterpriseIntegrationsService,EnterpriseIntegrationsStore,EnterprisePublicWarning,IncidentConfig,AutomationConfig};
 
 trait SlsEnterpriseIntegrations
 {
+    use SlsEnterpriseAnnouncementChannels;
     protected function enterpriseIntegrationsStoreDirectory(): string { return self::PLUGIN_DATA_DIR.'/enterprise-integrations'; }
     private function enterpriseIntegrationsService(): EnterpriseIntegrationsService
     {
@@ -14,18 +16,20 @@ trait SlsEnterpriseIntegrations
     }
     private function enterpriseIntegrationsConfig(?array $settings=null): array
     { return EnterpriseIntegrationsConfig::normalize(($settings??$this->getActiveSettings())['enterprise_integrations']??[]); }
-    private function enabledEnterpriseIntegration(string $section): array
+    private function enabledEnterpriseIntegration(string $section,bool $requiresRunning=true): array
     {
         $settings=$this->getActiveSettings(); $config=$this->enterpriseIntegrationsConfig($settings);
-        if (empty($settings['enabled']) || $config['enabled']!=='1' || $config[$section]['enabled']!=='1') { throw new \DomainException('This Enterprise Labs integration is disabled.'); }
+        if ($config['enabled']!=='1' || $config[$section]['enabled']!=='1') { throw new \DomainException('This Enterprise Labs integration is disabled.'); }
+        if($requiresRunning){\SLS\MassNotify\RuntimeState::requireRunning($settings);}
         return $config[$section];
     }
     public function getEnterpriseIntegrationState(): array
     {
-        $this->assertEnterpriseAdministrator(); $config=$this->enterpriseIntegrationsConfig(); $history=[]; $health=[]; $error='';
+        $this->assertEnterpriseAdministrator(); $config=$this->enterpriseIntegrationsConfig(); $history=[]; $health=[]; $error='';$usage=[];
         if (is_dir($this->enterpriseIntegrationsStoreDirectory())) {
             try {
                 require_once __DIR__.'/EnterpriseIntegrationsStore.php'; $state=(new EnterpriseIntegrationsStore($this->enterpriseIntegrationsStoreDirectory()))->read();
+                $usage=(new EnterpriseIntegrationsStore($this->enterpriseIntegrationsStoreDirectory()))->usage();
                 foreach (array_slice(array_reverse($state['operations']),0,50) as $row) { $history[]=array_diff_key($row,['fingerprint'=>true]); }
                 $rules=array_column(AutomationConfig::normalize($this->getActiveSettings()['automations']??[])['rules'],null,'id');
                 foreach ($state['sensors'] as $id=>$row) {
@@ -37,11 +41,13 @@ trait SlsEnterpriseIntegrations
             } catch (\Throwable $exception) { $error='Protected integration history is unavailable. Check storage before submitting another provider action.'; }
         }
         return ['config'=>EnterpriseIntegrationsConfig::redacted($config),'revision'=>hash('sha256',json_encode($config,JSON_THROW_ON_ERROR)),
-            'catalog'=>EnterpriseIntegrationsConfig::catalog(),'history'=>$history,'sensor_health'=>$health,'storage_error'=>$error,
+            'catalog'=>EnterpriseIntegrationsConfig::catalog(),'history'=>$history,'sensor_health'=>$health,'storage_error'=>$error,'journal_usage'=>$usage,
             'extensions'=>array_map('strval',$this->getConfiguredPjsipExtensionNumbers()),
             'sms_recipients'=>array_map(static fn($r)=>['id'=>$r['id'],'name'=>$r['name']??$r['id']],$this->getActiveSettings()['announcement_sms']['recipients']??[]),
             'voice_recipients'=>array_map(static fn($r)=>['id'=>$r['id'],'name'=>$r['name']??$r['id']],$this->getActiveSettings()['outbound_voice']['recipients']??[]),
             'people'=>$this->integrationRosterChoices(),
+            'browser_people'=>array_map(static fn($person)=>['id'=>$person['id'],'name'=>$person['name']],array_values(array_filter(($this->getActiveSettings()['subscriber_browser']['people']??[]),static fn($person)=>!empty($person['enabled'])))),
+            'runtime_dependencies'=>['curl'=>extension_loaded('curl'),'openssl'=>extension_loaded('openssl'),'dom'=>extension_loaded('dom')],
             'incidents'=>array_values(array_map(static fn($row)=>['id'=>$row['id'],'name'=>$row['title']],array_filter(($this->listIncidents(50)['incidents']??[]),static fn($row)=>($row['state']??'')==='open'))),
             'qualification'=>'Labs · isolated protocol fixtures only; hardware, OAuth accounts and FEMA authority acceptance are pending.',
             'ipaws_qualification'=>'Requires an authorized COG, current certificate/key, issued WSDL-generated signed envelope and CDTE acceptance. No FEMA certification is claimed.'];
@@ -61,7 +67,7 @@ trait SlsEnterpriseIntegrations
         $value=$input['config']??[]; if (!is_array($value)) { throw new \InvalidArgumentException('Integration settings must be an object.'); }
         $clear=IncidentConfig::listOf($input['clear_secrets']??[],120,'Clear provider credentials');
         $merged=array_replace($current,$value);
-        foreach (['access_control'=>['password'],'meetings'=>['zoom_access_token','google_access_token','webex_access_token'],
+        foreach (['access_control'=>['password'],'meetings'=>['zoom_access_token','google_access_token','webex_access_token','oauth_client_secret','oauth_refresh_token'],
             'public_warning'=>['certificate_pem','private_key_pem','private_key_password']] as $section=>$fields) {
             if (!is_array($merged[$section]??null)) { throw new \InvalidArgumentException('Integration settings must contain provider objects.'); }
             $merged[$section]=array_replace($current[$section],$merged[$section]);
@@ -81,8 +87,19 @@ trait SlsEnterpriseIntegrations
                 elseif (($row['telemetry_password']??'')==='') { $row['telemetry_password']=$old[$row['id']]['telemetry_password']??''; }
             } unset($row);
         }
+        if(isset($value['connectors']['destinations'])){
+            $old=array_column($current['connectors']['destinations'],null,'id');foreach($merged['connectors']['destinations'] as &$row){
+                if(!is_array($row)){throw new \InvalidArgumentException('Connector entries must be objects.');}if(($row['id']??'')===''){$row['id']='conn_'.bin2hex(random_bytes(12));}
+                unset($row['token_configured']);if(in_array('connectors.'.$row['id'].'.token',$clear,true)){$row['token']='';}elseif(($row['token']??'')===''){$row['token']=$old[$row['id']]['token']??'';}
+            }unset($row);
+        }
         if (isset($value['access_control']['doors'])) { foreach ($merged['access_control']['doors'] as &$row) { if (is_array($row) && ($row['id']??'')==='') { $row['id']='door_'.bin2hex(random_bytes(12)); } } unset($row); }
-        $config=EnterpriseIntegrationsConfig::normalize($merged); $extensions=array_map('strval',$this->getConfiguredPjsipExtensionNumbers());
+        $config=EnterpriseIntegrationsConfig::normalize($merged);
+        if($config['enabled']==='1'){
+            foreach(['meetings','access_control','connectors'] as $section){if($config[$section]['enabled']==='1'&&(!extension_loaded('curl')||!extension_loaded('openssl'))){throw new \DomainException('Enable PHP cURL and OpenSSL in the runtime serving FreePBX before enabling '.$section.'.');}}
+            if($config['public_warning']['enabled']==='1'&&(!extension_loaded('dom')||!extension_loaded('openssl')||($config['public_warning']['ipaws_enabled']==='1'&&!extension_loaded('curl')))){throw new \DomainException('CAP authoring requires PHP DOM and OpenSSL; IPAWS transmission also requires cURL in the runtime serving FreePBX.');}
+        }
+        $extensions=array_map('strval',$this->getConfiguredPjsipExtensionNumbers());
         foreach ($config['speakers']['devices'] as $speaker) { if (!in_array($speaker['extension'],$extensions,true)) { throw new \DomainException('Enroll speakers as existing PBX PJSIP extensions before selecting them in SLS.'); } }
         $settings=$this->getActiveSettings(); $sms=array_column($settings['announcement_sms']['recipients']??[],null,'id'); $voice=array_column($settings['outbound_voice']['recipients']??[],null,'id');
         foreach ($config['responses']['bindings'] as $row) {
@@ -93,6 +110,26 @@ trait SlsEnterpriseIntegrations
     }
     public function renderEnterpriseIntegrations(): string
     { return load_view(__DIR__.'/views/integrations.php',['state'=>$this->getEnterpriseIntegrationState(),'csrf_token'=>$this->getCsrfToken()]); }
+    public function maintainEnterpriseIntegrationJournal(array $input): array
+    {
+        $this->assertEnterpriseAdministrator();$input=IncidentConfig::object($input,['retention_days'],'Integration archival');
+        $days=$input['retention_days']??7;if(!is_int($days)||$days<1||$days>365){throw new \InvalidArgumentException('Retention must be 1–365 days.');}
+        return (new EnterpriseIntegrationsStore($this->enterpriseIntegrationsStoreDirectory()))->maintain(time(),$days*86400);
+    }
+    public function getEnterpriseContinuityReport(): array
+    {
+        $this->assertEnterpriseAdministrator();require_once __DIR__.'/EnterpriseContinuity.php';
+        return ['success'=>true,'report'=>\SLS\MassNotify\EnterpriseContinuity::report($this->getActiveSettings())];
+    }
+    public function exportEnterpriseIntegrationReport(): array
+    {
+        $this->assertEnterpriseAdministrator();$store=new EnterpriseIntegrationsStore($this->enterpriseIntegrationsStoreDirectory());$state=$store->read();
+        $report=['schema'=>1,'generated_at'=>gmdate('c'),'operations'=>array_replace($store->archiveReport('operations'),$state['operations']),
+            'responses'=>array_replace($store->archiveReport('responses'),$state['responses'])];
+        foreach($report['operations'] as &$operation){unset($operation['fingerprint']);}unset($operation);
+        foreach($report['responses'] as &$response){unset($response['fingerprint']);}unset($response);
+        return ['success'=>true,'report'=>$report];
+    }
     private function integrationEffect(string $request,string $channel,string $target,array $fingerprint): callable
     {
         $settings=$this->getActiveSettings();
@@ -105,18 +142,40 @@ trait SlsEnterpriseIntegrations
     {
         $this->assertEnterpriseAdministrator(); $config=$this->enabledEnterpriseIntegration('meetings'); $incident=$this->incidentStore()->read($id);
         if (!$incident) { throw new \DomainException('Incident does not exist.'); }
+        if(($config['oauth_refresh_enabled']??'0')==='1'&&($config['oauth_expires_at']??0)>0&&$config['oauth_expires_at']<=time()+60){$this->refreshEnterpriseMeetingToken();$config=$this->enabledEnterpriseIntegration('meetings');}
         $request=EnterpriseIntegrationsConfig::requestId($input['request_id']??'');
         return $this->enterpriseIntegrationsService()->meeting($config,$incident,$input,$this->integrationEffect($request,'incident_meeting',$id,['incident'=>$id,'input'=>$input,'provider'=>$config['provider']]));
     }
+    public function refreshEnterpriseMeetingToken(): array
+    {
+        $this->assertEnterpriseAdministrator();$config=$this->enterpriseIntegrationsConfig();$revision=hash('sha256',json_encode($config,JSON_THROW_ON_ERROR));$id=hash('sha256',json_encode($config['meetings'],JSON_THROW_ON_ERROR));
+        $state=$this->enterpriseLabsStore();$state->transaction('oauth_refresh',static function(array &$rows)use($id):void{
+            if(isset($rows[$id])){throw new \DomainException('This OAuth refresh was already attempted. Review provider authorization and save replacement credentials before trying again.');}
+            if(count($rows)>=1000){throw new \DomainException('OAuth refresh audit allocation reached. Review its private history.');}$rows[$id]=['state'=>'claimed','created_at'=>time()];
+        });
+        require_once __DIR__.'/EnterpriseIntegrationsProvider.php';$config['meetings']=(new \SLS\MassNotify\EnterpriseIntegrationsProvider())->refreshMeeting($config['meetings'],time());
+        $this->saveEnterpriseNamespace('enterprise_integrations',$config,$revision);
+        $state->transaction('oauth_refresh',static function(array &$rows)use($id):void{$rows[$id]['state']='saved';$rows[$id]['finished_at']=time();});
+        return ['success'=>true,'message'=>'Provider tokens renewed and saved to encrypted configuration.','expires_at'=>gmdate('c',$config['meetings']['oauth_expires_at'])];
+    }
+    public function revokeEnterpriseMeetingToken(): array
+    {
+        $this->assertEnterpriseAdministrator();$config=$this->enterpriseIntegrationsConfig();$revision=hash('sha256',json_encode($config,JSON_THROW_ON_ERROR));$provider=$config['meetings'];
+        $config['meetings']['enabled']='0';$config['meetings']['oauth_refresh_enabled']='0';$config['meetings']['oauth_refresh_token']='';$config['meetings']['oauth_expires_at']=0;
+        foreach(['zoom_access_token','google_access_token','webex_access_token'] as $field){$config['meetings'][$field]='';}
+        $this->saveEnterpriseNamespace('enterprise_integrations',$config,$revision);
+        require_once __DIR__.'/EnterpriseIntegrationsProvider.php';try{$result=(new \SLS\MassNotify\EnterpriseIntegrationsProvider())->revokeMeeting($provider);}catch(\Throwable $error){$result=['revoked'=>false,'provider_contacted'=>true];}
+        return ['success'=>true,'message'=>'Local meeting access disabled and tokens removed.','provider_revocation'=>$result];
+    }
     public function controlIntegrationDoor(array $input): array
     {
-        $this->assertEnterpriseAdministrator(); $config=$this->enabledEnterpriseIntegration('access_control');
+        $this->assertEnterpriseAdministrator(); $config=$this->enabledEnterpriseIntegration('access_control',($input['operation']??'')!=='read');
         if (($input['operation']??'')!=='read') { require_once __DIR__.'/LabsSafety.php'; \SLS\MassNotify\LabsSafety::requireReceipt($this->getActiveSettings(),'access_control_actuation'); }
         $request=EnterpriseIntegrationsConfig::requestId($input['request_id']??'');
         return $this->enterpriseIntegrationsService()->door($config,$input,$this->integrationEffect($request,'access_control',(string)($input['door_id']??''),$input));
     }
     public function readIntegrationSpeakerTelemetry(string $id): array
-    { $this->assertEnterpriseAdministrator(); return $this->enterpriseIntegrationsService()->speakerTelemetry($this->enabledEnterpriseIntegration('speakers'),$id); }
+    { $this->assertEnterpriseAdministrator(); return $this->enterpriseIntegrationsService()->speakerTelemetry($this->enabledEnterpriseIntegration('speakers',false),$id); }
     public function sendIntegrationSpeakerAnnouncement(array $input): array
     {
         $this->assertEnterpriseAdministrator(); $config=$this->enabledEnterpriseIntegration('speakers');
@@ -130,9 +189,30 @@ trait SlsEnterpriseIntegrations
         return $this->sendSipNotifyAnnouncement(array_values(array_unique($extensions)),$message,false,true,[],['audio_mode'=>'tts',
             'title'=>IncidentConfig::text($input['title']??'Speaker announcement',80,'Speaker title'),'trigger_source'=>'Enterprise SIP speaker','_is_test'=>$test]);
     }
+    public function sendIntegrationLabsAnnouncement(array $input): array
+    {
+        $this->assertEnterpriseAdministrator();
+        $input=IncidentConfig::object($input,['browser_recipient_ids','connector_ids','message','title','is_test'],'Labs announcement');
+        return $this->controlApiSendAnnouncement(['targets'=>[],'message'=>IncidentConfig::text($input['message']??'',1500,'Announcement message'),
+            'title'=>IncidentConfig::text($input['title']??'Labs delivery test',100,'Announcement title'),
+            'browser_recipient_ids'=>IncidentConfig::listOf($input['browser_recipient_ids']??[],50,'Browser recipients'),
+            'connector_ids'=>IncidentConfig::listOf($input['connector_ids']??[],20,'Connectors'),
+            'options'=>['audio_mode'=>'none','_is_test'=>IncidentConfig::flag($input['is_test']??true,'Test flag'),'force_queue'=>true]]);
+    }
+    public function validatePublicWarningAcceptance(array $input): array
+    {
+        $this->assertEnterpriseAdministrator();$config=$this->enabledEnterpriseIntegration('public_warning',false);
+        $input=IncidentConfig::object($input,['warning','post_envelope'],'Public warning acceptance');
+        require_once __DIR__.'/EnterprisePublicWarning.php';
+        $draft=EnterprisePublicWarning::author($input['warning']??[],time());
+        if(!in_array($input['warning']['status']??'', ['Test','Exercise'],true)){throw new \DomainException('Acceptance validation requires a Test or Exercise warning.');}
+        EnterprisePublicWarning::verifyPreparedEnvelope((string)($input['post_envelope']??''),$draft['xml'],$config,time());
+        return ['success'=>true,'message'=>'Local CAP and signed-envelope checks passed. Nothing was transmitted. FEMA CDTE and channel acceptance remain pending.',
+            'cap_sha256'=>hash('sha256',$draft['xml']),'envelope_sha256'=>hash('sha256',$input['post_envelope']),'authority_qualification'=>'pending_external_acceptance'];
+    }
     public function exportPublicWarning(array $input): array
     {
-        $this->assertEnterpriseAdministrator(); $this->enabledEnterpriseIntegration('public_warning'); require_once __DIR__.'/EnterprisePublicWarning.php';
+        $this->assertEnterpriseAdministrator(); $this->enabledEnterpriseIntegration('public_warning',false); require_once __DIR__.'/EnterprisePublicWarning.php';
         return EnterprisePublicWarning::author($input,time());
     }
     public function submitPublicWarning(array $input): array
@@ -178,7 +258,7 @@ trait SlsEnterpriseIntegrations
     private function integrationResponseCurrent(array $binding): bool
     {
         $settings=$this->getActiveSettings(); $config=$this->enterpriseIntegrationsConfig($settings);
-        if (empty($settings['enabled']) || $config['enabled']!=='1' || $config['responses']['enabled']!=='1'
+        if ($config['enabled']!=='1' || $config['responses']['enabled']!=='1'
             || !hash_equals($binding['config_fingerprint'],EnterpriseIntegrationsConfig::fingerprint($config['responses']))) { return false; }
         $incident=$this->incidentStore()->read($binding['incident_id']); if (!$incident || $incident['state']!=='open') { return false; }
         $person=array_column($incident['template']['roster'],null,'id')[$binding['person_id']]??null;
@@ -207,7 +287,7 @@ trait SlsEnterpriseIntegrations
     }
     public function receiveSensorHeartbeat(string $ruleId,array $input): array
     {
-        $config=$this->enabledEnterpriseIntegration('sensors'); $rules=AutomationConfig::normalize($this->getActiveSettings()['automations']??[])['rules'];
+        $config=$this->enabledEnterpriseIntegration('sensors',false); $rules=AutomationConfig::normalize($this->getActiveSettings()['automations']??[])['rules'];
         $rule=array_column($rules,null,'id')[$ruleId]??null; if (!$rule) { throw new \DomainException('Unknown enrolled sensor.'); }
         return $this->enterpriseIntegrationsService()->heartbeat($config,$rule,$input);
     }

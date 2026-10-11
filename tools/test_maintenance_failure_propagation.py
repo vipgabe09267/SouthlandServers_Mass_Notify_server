@@ -44,6 +44,7 @@ class UpdaterFailures(unittest.TestCase):
         executable(self.mock_bin / "python3", '''#!/usr/bin/python3
 import json, os, subprocess, sys
 failure = os.environ["MOCK_FAILURE"]
+sys.argv = [sys.argv[0], *[arg for arg in sys.argv[1:] if arg != '-I']]
 if len(sys.argv) > 1 and sys.argv[1] == os.environ["CONFIG_LOADER"]:
     if failure == "config": raise SystemExit(23)
     sys.stdout.buffer.write(b"GITHUB_UPDATES_ENABLED\\0" + b"1\\0")
@@ -51,6 +52,8 @@ if len(sys.argv) > 1 and sys.argv[1] == os.environ["CONFIG_LOADER"]:
 if len(sys.argv) > 1 and sys.argv[1].endswith("/sls_release_verify.py"):
     raise SystemExit(4 if failure == "verification" else 0)
 data = sys.stdin.read() if len(sys.argv) > 1 and sys.argv[1] == "-" else None
+if data and 'Updater admission' in data:
+    raise SystemExit(2 if failure == 'root-admission' else 0)
 if data and 'repo = os.environ.get("REPOSITORY"' in data:
     if failure == "feed" or failure.startswith('feed:'):
         print(json.dumps({"ok": False, "message": "secret-fixture-must-not-leak", "error_category": failure.partition(':')[2]}))
@@ -65,16 +68,21 @@ if data and 'repo = os.environ.get("REPOSITORY"' in data:
 raise SystemExit(subprocess.run([sys.executable, *sys.argv[1:]], input=data, text=True).returncode)
 ''')
         executable(self.mock_bin / "curl", '''#!/usr/bin/python3
-import os, pathlib, sys
+import os, pathlib, sys, urllib.parse
 failure = os.environ["MOCK_FAILURE"]
 if failure == "download": raise SystemExit(22)
-output = pathlib.Path(sys.argv[sys.argv.index("-o") + 1])
-if output.name == "install_release.sh":
+assert sys.argv[sys.argv.index("-o") + 1] == '-'
+name = pathlib.Path(urllib.parse.urlparse(sys.argv[-1]).path).name
+if failure == 'installer-flood' and name == 'install_release.sh':
+    sys.stdout.buffer.write(b'x' * (1048576 + 1024)); raise SystemExit(0)
+if failure == 'signature-flood' and name == 'release-manifest.sig':
+    sys.stdout.buffer.write(b'x' * 1024); raise SystemExit(0)
+if name == "install_release.sh":
     content = "#!/usr/bin/env bash\\nprintf 'called' >> \\\"$MOCK_SENTINEL\\\"\\nexit " + ("17" if failure == "installer" else "0") + "\\n"
     if failure == "syntax": content = "#!/usr/bin/env bash\\necho 'unclosed\\n"
-    output.write_text(content)
+    sys.stdout.write(content)
 else:
-    output.write_text("verified fixture bytes")
+    sys.stdout.write("verified fixture bytes")
 ''')
         source = (BIN / "sls_mass_notify_update.sh").read_text()
         source = source.replace('PATH="/usr/local/sbin:', 'PATH="$MOCK_BIN:/usr/local/sbin:')
@@ -93,7 +101,7 @@ else:
         return result, progress
 
     def test_failure_codes_categories_and_no_false_completion(self):
-        cases = [("config", 2, "protected_config_validation_failed"),
+        cases = [("root-admission", 2, "root_runtime_unapproved"), ("config", 2, "protected_config_validation_failed"),
                  ("feed", 1, "release_check_failed"),
                  ("download", 1, "download_failed"),
                  ("verification", 1, "release_verification_failed"),
@@ -120,6 +128,15 @@ else:
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(progress.get("state"), "failed")
         self.assertFalse((self.base / "installer-called").exists())
+
+    def test_unknown_length_artifact_floods_fail_before_installer_execution(self):
+        for failure, category in [('installer-flood', 'download_failed'), ('signature-flood', 'release_verification_failed')]:
+            with self.subTest(failure=failure):
+                result, progress = self.run_update(failure)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(progress.get('state'), 'failed')
+                self.assertEqual(progress.get('error_category'), category)
+                self.assertFalse((self.base / 'installer-called').exists())
 
     def test_failed_check_can_be_retried_without_installing(self):
         result, _ = self.run_update('feed', check_only=True)

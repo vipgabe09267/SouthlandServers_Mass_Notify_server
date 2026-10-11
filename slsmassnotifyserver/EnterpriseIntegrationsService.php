@@ -17,7 +17,12 @@ final class EnterpriseIntegrationsService
     private function perform(string $request,string $kind,array $input,callable $operation): array
     {
         self::requestId($request); $fingerprint=self::fingerprint($input); $now=$this->now();
-        $claim=$this->store->transaction(static function(array &$state) use($request,$kind,$fingerprint,$now): array {
+        $claim=$this->store->transaction(function(array &$state) use($request,$kind,$fingerprint,$now): array {
+            $archived=$this->store->archived('operations',$request);
+            if ($archived!==null) {
+                if (!hash_equals($archived['fingerprint'],$fingerprint)||$archived['kind']!==$kind) { throw new \DomainException('This request identifier belongs to different archived integration details.'); }
+                return ['claimed'=>false,'row'=>$archived];
+            }
             if (isset($state['operations'][$request])) {
                 $row=$state['operations'][$request]; if (!hash_equals($row['fingerprint'],$fingerprint) || $row['kind']!==$kind) { throw new \DomainException('This request identifier belongs to different integration details.'); }
                 if ($row['state']==='submitting') { $row['state']='uncertain'; $row['detail']='The operation was claimed but completion is unconfirmed. No automatic replay is allowed.'; }
@@ -50,7 +55,7 @@ final class EnterpriseIntegrationsService
     {
         $input=IncidentConfig::object($input,['request_id','door_id','operation'],'Door operation'); $id=EnterpriseIntegrationsConfig::id($input['door_id']??'','door');
         $door=array_column($config['doors'],null,'id')[$id]??null; $operation=$input['operation']??'';
-        if (($config['enabled']??'0')!=='1' || !$door || !in_array($operation,['read','lock','unlock'],true) || empty($door['allow_'.$operation])) { throw new \DomainException('This door operation is disabled or outside its saved permission.'); }
+        if (($config['enabled']??'0')!=='1' || !$door || !in_array($operation,['read','lock','unlock','access'],true) || empty($door['allow_'.$operation])) { throw new \DomainException('This door operation is disabled or outside its saved permission.'); }
         if ($operation==='read') { return $this->provider->door($config,$door,$operation); }
         $request=self::requestId($input['request_id']??'');
         return $this->perform($request,'door',['config'=>self::fingerprint($config),'door'=>$door,'operation'=>$operation],function(array $claim) use($config,$door,$operation,$effect): array {
@@ -119,7 +124,9 @@ final class EnterpriseIntegrationsService
     {
         if ($event==='' || strlen($event)>200 || preg_match('/[\x00-\x1f]/',$event)) { throw new \InvalidArgumentException('Human response needs a verified stable event identity.'); }
         $id=hash('sha256',$binding['provider'].'|'.$event); $fingerprint=self::fingerprint([$binding['id'],$response]); $now=$this->now();
-        $claim=$this->store->transaction(static function(array &$state) use($id,$fingerprint,$now): array {
+        $claim=$this->store->transaction(function(array &$state) use($id,$fingerprint,$now): array {
+            $archived=$this->store->archived('responses',$id);
+            if ($archived!==null) { if (!hash_equals($archived['fingerprint'],$fingerprint)) { throw new \DomainException('This provider event was already bound to different archived response details.'); } return $archived; }
             if (isset($state['responses'][$id])) { if (!hash_equals($state['responses'][$id]['fingerprint'],$fingerprint)) { throw new \DomainException('This provider event was already bound to different response details.'); } return $state['responses'][$id]; }
             return $state['responses'][$id]=['fingerprint'=>$fingerprint,'state'=>'pending','created_at'=>$now];
         });

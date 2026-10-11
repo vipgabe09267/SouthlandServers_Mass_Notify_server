@@ -231,6 +231,7 @@ final class ApiSecurity
         try { self::values(array_key_exists('sms_recipient_ids', $request) ? $request['sms_recipient_ids'] : [], '/^sms_[a-f0-9]{24}$/D', 50); }
         catch (\DomainException $error) { return false; }
         if (($principal['audience']['unrestricted'] ?? false) === true) { return true; }
+        if(!empty($request['browser_recipient_ids'])||!empty($request['connector_ids'])){return false;}
         $allowed = self::allowedAudience($principal, $settings);
         foreach ($allowed as $key => $targets) {
             if (!is_array($request[$key] ?? []) || array_diff(array_map('strval', $request[$key] ?? []), $targets)) { return false; }

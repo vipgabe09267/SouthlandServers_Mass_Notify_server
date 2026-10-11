@@ -59,7 +59,7 @@ $config=['enabled'=>true,'remote_enabled'=>true,'mode'=>'edge','role'=>'node','c
     'peers'=>[['node_id'=>'coordinator','site_id'=>'site-a','role'=>'coordinator','https_url'=>'https://localhost/peer',
         'cert_sha256'=>str_repeat('a',64),'hmac_secret'=>str_repeat('b',64)]]];
 mkdir($temporary.'/edge',0700);
-$runtime=new R(['enterprise_cluster'=>$config],$temporary.'/edge/enterprise-cluster',str_repeat('c',64));
+$runtime=new R(['enterprise_cluster'=>$config],$temporary.'/edge/enterprise-cluster',str_repeat('c',64),null,static fn()=>['enterprise_cluster'=>$config]);
 reject(static fn()=>$runtime->store()->read(),'Missing cluster journal silently reinitialized.');
 $runtime->initialize(); $edge=new E($runtime); $now=time();
 $statePath=$temporary.'/edge/enterprise-cluster/worker-state.json'; $markerPath=$temporary.'/edge/enterprise-cluster/cluster-required.json';
@@ -76,7 +76,7 @@ $broken=json_decode($stateBytes,true); $broken['control']['stopped']='0'; file_p
 reject(static fn()=>$runtime->store()->read(),'Damaged STOP/control schema permitted authority.');
 file_put_contents($statePath,$stateBytes);
 check($runtime->store()->read()['control']['stopped']===false,'Complete restored evidence did not retain original identity.');
-$differentEpoch=new R(['enterprise_cluster'=>array_replace($config,['witness_epoch'=>str_repeat('e',64)])],$temporary.'/edge/enterprise-cluster',str_repeat('c',64));
+$differentEpoch=new R(['enterprise_cluster'=>array_replace($config,['witness_epoch'=>str_repeat('e',64)])],$temporary.'/edge/enterprise-cluster',str_repeat('c',64),null,static fn()=>['enterprise_cluster'=>array_replace($config,['witness_epoch'=>str_repeat('e',64)])]);
 reject(static fn()=>$differentEpoch->initialize(),'New epoch overwrote existing authority evidence instead of requiring separate reviewed recovery.');
 echo "PASS permanent required marker, same-epoch reset prevention, partial recovery and corrupt authority schema fence\n";
 $job=['id'=>'job-a','delivery_id'=>'delivery-a','site_id'=>'site-a','created_at'=>$now,'expires_at'=>$now+60,
@@ -85,18 +85,66 @@ $request=['source'=>'coordinator','action'=>'site.enqueue','payload'=>$job];
 check($runtime->dispatch($request)['state']==='queued','Site enqueue failed.');
 check($runtime->dispatch($request)['state']==='queued','Identical job must be idempotent.');
 reject(static fn()=>$runtime->dispatch(['source'=>'coordinator','action'=>'site.enqueue','payload'=>array_replace($job,['id'=>'queue-overflow'])]),'Bounded site queue overflow accepted.');
+$policyEffect=R::intent(['delivery_id'=>'paused-direct','channel'=>'desktop','target'=>'desktop-a','site_id'=>'site-a',
+    'created_at'=>$now,'expires_at'=>$now+60,'content_sha256'=>$hash,'estimated_cost_cents'=>0,'schedule_id'=>'','incident_id'=>'']);
+$policyCallbacks=0;
+foreach([false,'0',null] as $policy){
+    $pausedRuntime=new R(['enabled'=>'0','runtime_enabled'=>$policy,'enterprise_cluster'=>$config],$temporary.'/edge/enterprise-cluster',str_repeat('c',64),null,static fn()=>['enabled'=>'0','runtime_enabled'=>$policy,'enterprise_cluster'=>$config]);
+    $pausedEdge=new E($pausedRuntime);$beforePolicy=file_get_contents($statePath);
+    foreach([static fn()=>$pausedEdge->drain(false),static fn()=>$pausedRuntime->executeEffect($policyEffect,static function() use(&$policyCallbacks):array{++$policyCallbacks;return ['state'=>'accepted'];})] as $attempt){
+        $rejected=false;
+        try{$attempt();}catch(DomainException $error){$rejected=$policy===false?str_contains($error->getMessage(),'stopped'):str_contains($error->getMessage(),'must be a boolean');}
+        check($rejected,'Paused or malformed edge runtime did not fail at the strict notification gate.');
+    }
+    check($policyCallbacks===0&&file_get_contents($statePath)===$beforePolicy,'Runtime rejection executed an effect or consumed queued/replay state.');
+    check($pausedRuntime->dispatch(['source'=>'coordinator','action'=>'status','payload'=>[]])['queued']===1,'Runtime policy blocked read-only cluster status.');
+    check($pausedRuntime->store()->read()['queue']['job-a']['job']['expires_at']===$job['expires_at'],'Pause renewed or altered queued expiry.');
+}
+$pausedRuntime=new R(['runtime_enabled'=>false,'enterprise_cluster'=>$config],$temporary.'/edge/enterprise-cluster',str_repeat('c',64),null,static fn()=>['runtime_enabled'=>false,'enterprise_cluster'=>$config]);
+$pausedEdge=new E($pausedRuntime);
 $edge->drain(false); $device=$edge->authenticate('desktop-a',$deviceToken); $events=$edge->poll($device);
 check(count($events)===1 && $events[0]['message']===$intent['message'],'Approved offline cache did not serve LAN event.');
 check($edge->drain(false)===[],'Completed local publication was automatically replayed.');
 reject(static fn()=>$edge->authenticate('desktop-a',str_repeat('X',48)),'Wrong local device credential accepted.');
-$receipt=$edge->receipt($device,['id'=>'job-a','kind'=>'application_received']);
+$receipt=$pausedEdge->receipt($device,['id'=>'job-a','kind'=>'application_received']);
 check(!$receipt['human_acknowledgment'] && $edge->poll($device)===[],'Application receipt was conflated with human acknowledgment or event replayed.');
 check($edge->receipt($device,['id'=>'job-a','kind'=>'application_received'])===$receipt,'Local application receipt should be idempotent.');
+check($edge->drain(true)===[],'Resumed runtime replayed an already completed publication or paused receipt.');
+echo "PASS Weather-independent edge dispatch, strict stopped/malformed runtime fences, unchanged queue claims/expiry, paused status and actual device receipt\n";
+$changingConfig=array_replace($config,['max_queue'=>2]);mkdir($temporary.'/changing-policy',0700);
+$currentPolicy=['runtime_enabled'=>true,'enterprise_cluster'=>$changingConfig];
+$changingRuntime=new R($currentPolicy,$temporary.'/changing-policy/enterprise-cluster',str_repeat('f',64),null,
+    static function() use(&$currentPolicy):array{return $currentPolicy;});
+$changingRuntime->initialize();
+foreach(['first','second'] as $suffix){$changingRuntime->dispatch(['source'=>'coordinator','action'=>'site.enqueue','payload'=>array_replace($job,['id'=>'changing-'.$suffix,'delivery_id'=>'changing-delivery-'.$suffix])]);}
+$dispatches=[];$stoppedDuringDrain=false;
+try{
+    $changingRuntime->drain(static function(array $queued) use(&$dispatches,&$currentPolicy):array{
+        $dispatches[]=$queued['id'];$currentPolicy['runtime_enabled']=false;return ['uncertain'=>false,'state'=>'accepted'];
+    },false);
+}catch(DomainException $error){$stoppedDuringDrain=str_contains($error->getMessage(),'stopped');}
+$afterStop=$changingRuntime->store()->read();
+check($stoppedDuringDrain&&$dispatches===['changing-first'],'Stop between jobs used a stale constructor policy or dispatched the second job.');
+check($afterStop['queue']['changing-first']['state']==='complete'&&$afterStop['queue']['changing-second']['state']==='queued'
+    &&$afterStop['queue']['changing-second']['job']['expires_at']===$job['expires_at'],'Concurrent stop consumed or renewed unadmitted work.');
+$beforeEffects=$afterStop['effects'];
+reject(static fn()=>$changingRuntime->executeEffect($policyEffect,static function() use(&$dispatches):array{$dispatches[]='forbidden-effect';return ['state'=>'accepted'];}),'Direct effect used stale running policy.');
+check($changingRuntime->store()->read()['effects']===$beforeEffects&&$dispatches===['changing-first'],'Stopped direct effect consumed a replay claim.');
+$currentPolicy['runtime_enabled']=true;
+$resumed=$changingRuntime->drain(static function(array $queued) use(&$dispatches):array{$dispatches[]=$queued['id'];return ['uncertain'=>false,'state'=>'accepted'];},false);
+check(array_keys($resumed)===['changing-second']&&$dispatches===['changing-first','changing-second'],'Resume replayed admitted work or lost the original unclaimed job.');
+check($changingRuntime->drain(static function() use(&$dispatches):array{$dispatches[]='replay';return [];},true)===[],'Completed jobs replayed on a subsequent drain.');
+$currentPolicy['runtime_enabled']='0';
+reject(static fn()=>$changingRuntime->executeEffect($policyEffect,static fn()=>['state'=>'accepted']),'Current malformed policy was hidden by an earlier valid snapshot.');
+$currentPolicy['runtime_enabled']=true;$currentPolicy['enterprise_cluster']['enabled']=false;
+reject(static fn()=>$changingRuntime->executeEffect($policyEffect,static fn()=>['state'=>'accepted']),'Revoked cluster enablement was cached as an authority grant.');
+check($changingRuntime->store()->read()['effects']===$beforeEffects,'Changed policy consumed a previously untouched effect identity.');
+echo "PASS fresh per-claim policy, stop between jobs, revoked cluster enablement, unclaimed expiry preservation and single resume delivery\n";
 $runtime->store()->transaction(static function(array &$s): void { $s['cache']['job-a']['expires_at']=time()-1; });
 reject(static fn()=>$edge->receipt($device,['id'=>'job-a','kind'=>'application_received']),'Expired edge receipt accepted.');
 echo "PASS bounded owned-site queue, approved offline LAN cache, local device authentication, immutable receipts and expired replay rejection\n";
 $unapproved=array_replace($config,['approved_cache'=>[],'max_queue'=>2]); mkdir($temporary.'/unapproved',0700);
-$r2=new R(['enterprise_cluster'=>$unapproved],$temporary.'/unapproved/enterprise-cluster',str_repeat('d',64)); $r2->initialize();
+$r2=new R(['enterprise_cluster'=>$unapproved],$temporary.'/unapproved/enterprise-cluster',str_repeat('d',64),null,static fn()=>['enterprise_cluster'=>$unapproved]); $r2->initialize();
 $r2->dispatch($request); check((new E($r2))->drain(false)===[],'Unapproved cache was played offline.');
 $r2->store()->transaction(static function(array &$s): void { $s['queue']['job-a']['state']='uncertain'; });
 check((new E($r2))->drain(true)===[],'Interrupted site action was automatically replayed after reconnect.');

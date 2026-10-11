@@ -31,9 +31,14 @@
   const pageAccess = allowed => root.querySelectorAll('[data-labs-panel], .sls-ent-tabs').forEach(panel => { panel.inert = !allowed; });
   pageAccess(acknowledged.has(pageFeature));
   let dangerRequest;
+  function waitForBetaNotice() {
+    if (window.SlsBetaNoticeReady) return window.SlsBetaNoticeReady;
+    if (!document.getElementById('sls-beta-notice-template')) return Promise.resolve();
+    return new Promise(resolve => document.addEventListener('sls-beta-notice-acknowledged', resolve, { once: true }));
+  }
   function acknowledge() {
     if (acknowledged.has(pageFeature)) return Promise.resolve(true);
-    if (!dangerRequest) dangerRequest = showWarning().finally(() => { dangerRequest = null; });
+    if (!dangerRequest) dangerRequest = waitForBetaNotice().then(showWarning).finally(() => { dangerRequest = null; });
     return dangerRequest;
   }
   async function showWarning() {
@@ -144,7 +149,7 @@
     const name = field('Name', input('text', row.name)); name.required = true; name.maxLength = 80;
     const active = input('checkbox'); active.checked = row.enabled; field('Enable this saved entry', active);
     if (section === 'dual_approval') {
-      const channels = field('Channels requiring review', select(['phones', 'desktops', 'webhooks', 'voice_recipient_ids', 'email_recipient_ids', 'sms_recipient_ids'].map(key => ({ id: key, name: { phones: 'Phone audio/display', desktops: 'Desktop', webhooks: 'Webhook', voice_recipient_ids: 'External calls', email_recipient_ids: 'Email', sms_recipient_ids: 'SMS / MMS' }[key] })), row.channels || [], true));
+      const channels = field('Channels requiring review', select(['phones', 'desktops', 'webhooks', 'voice_recipient_ids', 'email_recipient_ids', 'sms_recipient_ids', 'browser_recipient_ids', 'connector_ids'].map(key => ({ id: key, name: { phones: 'Phone audio/display', desktops: 'Desktop', webhooks: 'Webhook', voice_recipient_ids: 'External calls', email_recipient_ids: 'Email', sms_recipient_ids: 'SMS / MMS', browser_recipient_ids: 'Browser Web Push', connector_ids: 'ntfy / Gotify' }[key] })), row.channels || [], true));
       const people = field('Authorized people', select(state.people, row.approver_ids || [], true), 'Choose at least two distinct people. Both must retain send permission for every selected recipient.');
       const expiry = field('Review lifetime (seconds)', input('number', row.expires_seconds || 300)); expiry.min = 60; expiry.max = 900; expiry.step = 1;
       handler = () => saveRow(section, { ...row, name: name.value, enabled: active.checked, channels: values(channels), approver_ids: values(people), expires_seconds: Number(expiry.value) });
@@ -200,5 +205,6 @@
     const launch = node('button', 'Launch drill', 'btn btn-primary'); launch.type = 'button'; launch.addEventListener('click', () => { open(`Launch drill · ${assignment.name}`, 'Launch marked drill'); body.append(node('p', 'Every announcement in this run is marked DRILL / TEST. The applied template supplies the audience and delivery settings.')); const template = state.templates.find(row => row.id === assignment.template_id), fields = {}; (template?.fields || []).forEach(row => { const control = field(row.label, input('text')); control.required = true; control.maxLength = 120; fields[row.key] = control; }); const request = requestId(); handler = async () => { const values = Object.fromEntries(Object.entries(fields).map(([key, control]) => [key, control.value])); const result = await post('drill_start', { assignment_id: assignment.id, request_id: request, fields: values }); feedback(result.message || 'Drill run created. Review its incident delivery details.'); location.reload(); }; }); card.append(launch);
     assignment.runs.forEach(run => { const line = node('div', undefined, 'sls-ent-row'); line.append(node('span', `${run.created_at} · ${run.state}`)); const review = node('button', 'Record review', 'btn btn-default btn-sm'); review.type = 'button'; review.addEventListener('click', () => { open('Review drill objectives', 'Record review'); const flags = run.assignment.objectives.map(text => { const flag = input('checkbox'); field(text, flag); return flag; }); const note = field('Review notes', node('textarea')); note.maxLength = 1000; handler = async () => { await post('drill_review', { run_id: run.id, completed: flags.map(flag => flag.checked), note: note.value }); location.reload(); }; }); line.append(review); card.append(line); }); drills.append(card);
   });
+  root.querySelector('#sls-operations-archive').addEventListener('click', async event => { event.currentTarget.disabled = true; try { const result = await post('operations_archive', { retention_days: Number(root.querySelector('#sls-operations-retention').value) }); feedback('Completed coordination history archived.'); } catch (error) { feedback(error.message); } finally { event.currentTarget.disabled = false; } });
   root.querySelector('#sls-drill-export').addEventListener('click', async () => { try { const report = await post('drill_report'), url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' })), link = node('a'); link.href = url; link.download = 'sls-drill-report.json'; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); } catch (error) { feedback(error.message); } });
 })();

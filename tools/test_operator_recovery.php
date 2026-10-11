@@ -31,7 +31,7 @@ try{
   'sipnotify'=>['base_url'=>'https://pbx.example.test:8443/api/sipnotify'],'unrelated'=>'preserved'];
  $auth=Auth::create($oldPassword);$auth['force_password_change']=false;$auth['totp_secret_enc']=Auth::seal($secret,$id,$settings);
  $auth['recovery_hashes']=[hash('sha256','01234567-01234567-01234567-01234567')];
- $account=['id'=>$id,'username'=>'fixture','name'=>'Fixture','email'=>'fixture@example.test','source'=>'portal','enabled'=>true,'role'=>'administrator','site_ids'=>[],'group_ids'=>[],'auth'=>$auth];
+ $account=['id'=>$id,'username'=>'fixture','name'=>'Fixture','email'=>'fixture@example.test','source'=>'portal','enabled'=>true,'expires_at'=>1900003600,'role'=>'administrator','site_ids'=>[],'group_ids'=>[],'auth'=>$auth];
  $account['identity']=Auth::identity($account);$settings['operator_access']=Access::normalize(['enabled'=>false,'portal_enabled'=>true,'accounts'=>[$account]]);
  $module->seed($settings);file_put_contents(RecoveryFixture::PENDING_SETTINGS_JSON,json_encode($settings+['pending_only'=>'keep']));
  $issue=static function()use($module,$id):array{$out=$module->manageOperatorPasswordReset('generate_reset_link',['id'=>$id]);recoveryCheck($out['success'],$out['message']??'Generate failed');return $out;};
@@ -73,6 +73,7 @@ try{
  recoveryReject(fn()=>$module->completeOperatorPasswordReset($binding,$oldPassword,Auth::code($secret,intdiv($module->now,30))),'Old password reused');
  $result=$module->completeOperatorPasswordReset($binding,$newPassword,Auth::code($secret,intdiv($module->now,30)));$after=$module->account();
  recoveryCheck($result['username']==='fixture'&&Auth::verify($newPassword,$after['auth']['password_hash'])&&!Auth::verify($oldPassword,$after['auth']['password_hash']),'Verified reset did not install exact new password');
+ recoveryCheck($after['expires_at']===$before['expires_at']&&$after['expires_at']===1900003600,'Password recovery extended or cleared account expiry');
  recoveryCheck($after['auth']['totp_secret_enc']===$before['auth']['totp_secret_enc']&&$after['auth']['recovery_hashes']===$before['auth']['recovery_hashes'],'Password reset replaced enrolled authenticator or backup codes');
  recoveryCheck(!Portal::current($oldSession,$after,1800,$module->now),'Old authenticated session survived reset');
  recoveryReject(fn()=>$module->beginOperatorPasswordReset($second[1]),'Used reset link replayed');

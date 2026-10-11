@@ -111,6 +111,33 @@ $csrf_token=str_repeat('b',64);$endpoint='/operator-config.php';
 </style></head><body><div id="page_body"><?php include MODULE.'/views/operators.php';?></div></body></html>
 '''.replace('MODULE',json.dumps(str(MODULE)))
         (cls.root/'operator-config.php').write_text(operator_view)
+        incident_view=r'''<?php
+require MODULE.'/IncidentService.php';require MODULE.'/IncidentLanguages.php';
+if(!function_exists('_')){function _($v){return $v;}}
+function load_view($path,$variables=[]){extract($variables);ob_start();include $path;return ob_get_clean();}
+if($_SERVER['REQUEST_METHOD']==='POST'){
+ if(($_POST['slsmassnotifyserver_csrf']??'')!==str_repeat('b',64)){http_response_code(403);echo '{}';return;}
+ $payload=json_decode($_POST['payload']??'{}',true,24,JSON_THROW_ON_ERROR);
+ if($_POST['slsmassnotifyserver_action']==='save_languages'){\SLS\MassNotify\IncidentConfig::recipientLanguages($payload['recipient_languages']);}
+ file_put_contents(__DIR__.'/browser-incident-action.json',json_encode(['action'=>$_POST['slsmassnotifyserver_action'],'input'=>$payload]));
+ header('Content-Type: application/json');echo json_encode(['success'=>true]);return;
+}
+$template=\SLS\MassNotify\IncidentConfig::template(['id'=>'tpl_'.str_repeat('d',24),'name'=>'Browser language fixture','title'=>'Initial fixture','message'=>'Initial fixture message',
+ 'delivery'=>['desktop_clients'=>['desktop0','desktop1']], 'language_variants'=>[
+ ['locale'=>'es','label'=>'Spanish','title'=>'Mensaje de prueba','message'=>'Mensaje inicial de prueba','review_note'=>'Fixture only','reviewed'=>true],
+ ['locale'=>'fr','label'=>'French','title'=>'Message de test','message'=>'Message initial de test','review_note'=>'Fixture only','reviewed'=>true]]]);
+$preferences=[];$choices=['desktop_clients'=>[]];for($n=0;$n<160;$n++){
+ $preferences[]=['channel'=>'desktop_clients','recipient_id'=>'desktop'.$n,'locale'=>$n%2 ? 'fr' : 'es'];$choices['desktop_clients'][]=['id'=>'desktop'.$n,'name'=>'Desktop '.$n];}
+$service=new \SLS\MassNotify\IncidentService(new \SLS\MassNotify\IncidentStore(__DIR__.'/browser-incidents'),fn()=>$template,fn($d)=>$d,
+ fn($d,$m,$t,$c)=>['success'=>true,'job_id'=>'job_'.md5(json_encode($c))],fn($j)=>['success'=>true,'job_id'=>$j,'receipts'=>[['channel'=>'desktop','target'=>'Fixture desktop','state'=>'received','detail'=>'Received by desktop app']]],null,
+ fn($t,$d,$f,$l,$test)=>\SLS\MassNotify\IncidentLanguages::plan($t,$d,$preferences,$f,$l,$test,fn($targets)=>$targets));
+$incident=$service->start(['template_id'=>$template['id'],'request_id'=>str_repeat('d',32),'fields'=>[],'is_test'=>false],['identity'=>'Browser fixture','source'=>'test']);$incident=$service->get($incident['id']);
+?><!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>*{box-sizing:border-box}body{margin:0;font:14px Arial}.container-fluid{padding:0 15px}.btn{display:inline-block;padding:6px 12px}</style></head><body><?php
+echo load_view(MODULE.'/views/incidents.php',['templates'=>[$template],'active_templates'=>[$template],'choices'=>$choices,'tones'=>[],
+ 'recipient_languages'=>$preferences,'active_recipient_languages'=>$preferences,'incident'=>$incident,'listing'=>['success'=>true,'incidents'=>[]],'csrf_token'=>str_repeat('b',64)]);
+?></body></html>
+'''.replace('MODULE',json.dumps(str(MODULE)))
+        (cls.root/'incident-view.php').write_text(incident_view)
         seed = '''require MODULE.'/ConfigCrypto.php';require MODULE.'/IncidentConfig.php';require MODULE.'/EnterpriseOperationsConfig.php';
 $s=['incident_workflows'=>['schema'=>1,'templates'=>[\\SLS\\MassNotify\\IncidentConfig::template(['id'=>'tpl_'.str_repeat('a',24),'name'=>'Browser template','title'=>'Fixture','message'=>'Fixture','delivery'=>['extensions'=>['1000']]])]],'operator_access'=>['accounts'=>[]]];
 $s['enterprise_operations']=\\SLS\\MassNotify\\EnterpriseOperationsConfig::normalize(['enabled'=>true,'floorplans'=>['enabled'=>true,'plans'=>[['id'=>'plan_'.str_repeat('a',24),'name'=>'Private assigned plan','enabled'=>true,'site_id'=>'site_a','image_id'=>'img_'.str_repeat('a',64),'markers'=>[]]]]]);
@@ -119,7 +146,7 @@ file_put_contents(FIXTURE.'/active.config',\\FreePBX\\modules\\SlsConfigCrypto::
         subprocess.run(['php', '-r', seed.replace('MODULE', json.dumps(str(MODULE))).replace('FIXTURE', json.dumps(str(cls.root)))], check=True, capture_output=True)
         router = '''<?php
 $_SERVER['HTTPS']='on';$path=parse_url($_SERVER['REQUEST_URI'],PHP_URL_PATH);
-if($path==='/config.php'){require __DIR__.'/central.php';return;}
+if($path==='/config.php'){require __DIR__. (($_GET['display']??'')==='slsmassnotifyserver_incidents' ? '/incident-view.php' : '/central.php');return;}
 if($path==='/operator-config.php'&&$_SERVER['REQUEST_METHOD']==='GET'){require __DIR__.'/operator-config.php';return;}
 if(preg_match('~^/modules/slsmassnotifyserver/views/([a-z_]+\\.(?:js|css))$~D',$path,$m)){header('Content-Type: '.(str_ends_with($m[1],'.js')?'text/javascript':'text/css'));readfile(MODULE.'/views/'.$m[1]);return;}
 if($path==='/mass-notify/'){require __DIR__.'/mass-notify/index.php';return;}http_response_code(404);
@@ -200,6 +227,29 @@ if($path==='/mass-notify/'){require __DIR__.'/mass-notify/index.php';return;}htt
         errors=[line for line in (cls.root/'server.log').read_text().splitlines() if any(term in line for term in ['Fatal error','Parse error','Warning:'])]
         if errors:print('\n'.join(errors[-10:]),flush=True)
         cls.context.close();cls.browser.close();cls.playwright.stop();cls.proxy.shutdown();cls.proxy.server_close();cls.proxy_thread.join();cls.fixture.tearDownClass()
+
+    def test_beta_notice_blocks_labs_warning_until_acknowledgment(self):
+        page = self.context.new_page()
+        try:
+            # Model the pending global warning lifecycle before the real Labs
+            # script runs. No timeout or missing response may release Labs.
+            page.add_init_script('window.SlsBetaNoticeReady = new Promise(resolve => { window.finishBetaFixture = resolve; });')
+            actions = self.root / 'central-actions.jsonl'
+            before = actions.read_bytes() if actions.exists() else b''
+            page.goto(self.browser_url + '/config.php?display=slsmassnotifyserver_enterprise')
+            page.wait_for_function('Boolean(window.SlsLabsSafety)')
+            page.wait_for_timeout(300)
+            self.assertEqual(page.locator('#sls-labs-danger[open]').count(), 0)
+            self.assertTrue(page.locator('[data-labs-panel]').evaluate_all('(panels) => panels.every(panel => panel.inert)'))
+            self.assertEqual(actions.read_bytes() if actions.exists() else b'', before)
+            page.evaluate('window.finishBetaFixture()')
+            page.locator('#sls-labs-danger[open]').wait_for()
+            self.assertTrue(page.locator('#sls-labs-danger-agree').is_disabled())
+            self.assertEqual(json.loads(actions.read_text().splitlines()[-1])['action'], 'danger_begin')
+            page.locator('#sls-labs-danger-cancel').click()
+            page.wait_for_url('**/config.php?display=index')
+        finally:
+            page.close()
 
     def test_central_tabs_identity_revisions_typed_editors_and_warning_delay(self):
         page = self.page
@@ -291,6 +341,82 @@ if($path==='/mass-notify/'){require __DIR__.'/mass-notify/index.php';return;}htt
         self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), 420)
         page.set_viewport_size({'width':1440,'height':1000})
         print('Central Chromium: tabs, revisioned identity POST, typed approval/drill/shift/floorplan editors, private overlay refresh, speaker row, five-second warning and mobile width passed.',flush=True)
+
+    def test_structured_directory_review_and_browser_key_controls(self):
+        page=self.page
+        page.goto(self.browser_url+'/config.php?display=slsmassnotifyserver_enterprise')
+        page.locator('[data-labs-tab="identity"]').click()
+        directory=page.locator('details').filter(has=page.locator('[data-directory-sources]')).first
+        directory.locator('summary').first.click()
+        page.locator('[data-source-type]').select_option('csv')
+        page.locator('[data-add-source]').click()
+        source=page.locator('[data-directory-sources] .sls-identity-card').last
+        source.get_by_label('Name',exact=True).fill('Browser CSV fixture')
+        source.get_by_label('Enabled',exact=True).check()
+        page.locator('[data-directory-sources]').get_by_label('Enable directory synchronization',exact=True).check()
+        page.locator('[data-save-config="directory"]').click()
+        page.locator('[data-identity-status]').get_by_text('Directory settings saved',exact=False).wait_for()
+        config=json.loads(page.locator('[data-config="directory"]').input_value())
+        page.locator('[data-preview-source]').select_option(config['sources'][-1]['id'])
+        page.locator('[data-csv-file]').set_input_files({'name':'people.csv','mimeType':'text/csv','buffer':b'external_id,name\nfixture-person,Fixture Person\n'})
+        page.locator('[data-preview-directory]').click()
+        page.wait_for_function('!document.querySelector("[data-apply-directory]").disabled')
+        with page.expect_navigation():page.locator('[data-apply-directory]').click()
+        page.locator('[data-labs-tab="identity"]').click()
+        directory=page.locator('details').filter(has=page.locator('[data-directory-sources]')).first
+        directory.locator('summary').first.click()
+        page.locator('[data-preview-source]').select_option(config['sources'][-1]['id'])
+        page.locator('[data-preview-deprovision]').click()
+        page.locator('[data-deactivation-warning]').wait_for(state='visible')
+        self.assertTrue(page.locator('[data-apply-directory]').is_disabled())
+        page.locator('[data-confirm-deactivation]').check()
+        self.assertFalse(page.locator('[data-apply-directory]').is_disabled())
+        subscriber=page.locator('details').filter(has=page.locator('[data-subscriber-settings]')).first
+        subscriber.locator('summary').first.click()
+        page.locator('[data-browser-key]').click()
+        page.locator('[data-identity-status]').get_by_text('VAPID key generated',exact=False).wait_for()
+        self.assertTrue(page.locator('[data-browser-key]').is_disabled())
+        config=json.loads(page.locator('[data-config="subscriber"]').input_value())
+        self.assertTrue(config['push']['private_key_configured'])
+        self.assertFalse(config['push']['enabled'])
+        self.assertNotIn('private_key_pem',config['push'])
+        page.set_viewport_size({'width':390,'height':844})
+        self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'),420)
+        page.set_viewport_size({'width':1440,'height':1000})
+        self.assertEqual(self.errors,[])
+        print('Structured Labs Chromium: saved CSV source selection, real dry-run/apply, mandatory deactivation review and redacted disabled VAPID generation passed.',flush=True)
+
+    def test_recipient_language_preferences_review_and_receipt_ui(self):
+        page=self.page;page.goto(self.browser_url+'/config.php?display=slsmassnotifyserver_incidents')
+        self.assertEqual(page.get_by_text('Received by desktop app',exact=True).count(),2)
+        page.get_by_role('button',name='Recipient languages',exact=True).click()
+        dialog=page.locator('.sls-inc-dialog');self.assertEqual(dialog.locator('tbody tr').count(),40)
+        dialog.get_by_role('button',name='Next',exact=True).click()
+        self.assertEqual(dialog.locator('tbody tr').count(),40)
+        dialog.get_by_label('Find saved preferences',exact=True).fill('Desktop 149')
+        self.assertEqual(dialog.locator('tbody tr').count(),1)
+        dialog.get_by_role('button',name='Edit',exact=True).click()
+        dialog.get_by_label('Preferred reviewed language',exact=True).select_option('es')
+        dialog.get_by_role('button',name='Add preference',exact=True).click()
+        self.assertEqual(dialog.locator('tbody td').nth(1).inner_text(),'es')
+        page.set_viewport_size({'width':390,'height':844})
+        self.assertLessEqual(dialog.bounding_box()['width'],390)
+        with page.expect_navigation():dialog.get_by_role('button',name='Save preferences',exact=True).click()
+        result=json.loads((self.root/'browser-incident-action.json').read_text())
+        self.assertEqual(result['action'],'save_languages');self.assertEqual(len(result['input']['recipient_languages']),160)
+        self.assertEqual(next(row for row in result['input']['recipient_languages'] if row['recipient_id']=='desktop149')['locale'],'es')
+        page.get_by_role('button',name='Send separate update',exact=True).click()
+        dialog=page.locator('.sls-inc-dialog');dialog.get_by_label('New announcement text',exact=True).fill('Updated base wording')
+        dialog.locator('details').filter(has=page.get_by_label('Reviewed es update',exact=True)).locator('summary').click()
+        dialog.get_by_label('Reviewed es update',exact=True).fill('Nuevo mensaje revisado')
+        dialog.get_by_label('Reviewer and revision',exact=True).first.fill('Fixture reviewer')
+        dialog.get_by_label('A competent reviewer approved this update',exact=True).first.check()
+        with page.expect_navigation():dialog.get_by_role('button',name='Send update',exact=True).click()
+        result=json.loads((self.root/'browser-incident-action.json').read_text())
+        self.assertEqual(result['action'],'send_update');self.assertEqual(result['input']['language_messages'],[{'locale':'es','message':'Nuevo mensaje revisado','review_note':'Fixture reviewer','reviewed':True}])
+        self.assertEqual(result['input']['message'],'Updated base wording')
+        self.assertEqual(self.errors,[]);page.set_viewport_size({'width':1440,'height':1000})
+        print('Incident language Chromium: paginated preference edit/save, immutable cohort receipts, explicit reviewed update and mobile dialog width passed.',flush=True)
 
     def test_portal_approval_drill_review_and_private_overlay(self):
         page=self.page;helper_instance=helper.PortalHttpTests()

@@ -3,6 +3,39 @@
 
 declare(strict_types=1);
 ini_set('display_errors', '0');
+// A local installer probe verifies the PHP runtime serving this route. It
+// exposes fixed runtime facts and cannot read settings or invoke actions.
+if (($_GET['sls_installer_runtime'] ?? '') === '1'
+    && ($_SERVER['REQUEST_METHOD'] ?? '') === 'GET'
+    && in_array($_SERVER['REMOTE_ADDR'] ?? '', ['127.0.0.1', '::1'], true)
+    && !isset($_SERVER['HTTP_FORWARDED']) && !isset($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+    $missing = [];
+    $extensions = [];
+    foreach (['pdo_sqlite', 'curl', 'dom', 'mbstring', 'posix', 'openssl', 'sodium'] as $extension) {
+        $extensions[$extension] = extension_loaded($extension);
+        if (!$extensions[$extension]) { $missing[] = $extension; }
+    }
+    if (PHP_VERSION_ID < 80200) { $missing[] = 'php_8_2_or_newer'; }
+    $functions = [];
+    foreach (['exec','proc_open','posix_geteuid','posix_getpwnam','openssl_encrypt','openssl_decrypt','sodium_crypto_aead_xchacha20poly1305_ietf_encrypt','sodium_crypto_pwhash_str'] as $function) {
+        $functions[$function] = function_exists($function);
+        if (!$functions[$function]) { $missing[] = $function . '_enabled'; }
+    }
+    $runtimeAccount = function_exists('posix_getpwnam') ? posix_getpwnam('asterisk') : false;
+    $runtimeAccountOk = is_array($runtimeAccount) && is_int($runtimeAccount['uid'] ?? null) && $runtimeAccount['uid'] > 0
+        && function_exists('posix_geteuid') && posix_geteuid() === $runtimeAccount['uid'];
+    if (!$runtimeAccountOk) {
+        $missing[] = 'web_runtime_must_run_as_asterisk';
+    }
+    http_response_code($missing ? 503 : 200);
+    header('Content-Type: application/json');
+    header('Cache-Control: no-store');
+    header('X-Content-Type-Options: nosniff');
+    echo json_encode(['probe' => 'sls_served_php_v1', 'ok' => !$missing, 'missing' => $missing,
+        'php_version'=>PHP_VERSION, 'php_sapi'=>PHP_SAPI, 'runtime_account_ok'=>$runtimeAccountOk,
+        'extensions'=>$extensions, 'functions'=>$functions]);
+    exit;
+}
 // Older installations alias the complete API prefix to a PHP shim, including
 // child paths. Dispatch exact dedicated endpoints before Control API
 // authentication; each endpoint enforces its own protocol and authority.
@@ -123,14 +156,14 @@ function control_get_resource(array $query): array
     $resource = $query['resource'] ?? 'status';
     if (!is_string($resource) || strlen($resource) > 32) { return ['error' => 'invalid_resource']; }
     $resource = strtolower(trim($resource));
-    if (!in_array($resource, ['status', 'capabilities', 'audiences', 'delivery', 'events', 'readiness', 'desktop_fleet', 'config', 'incidents', 'incident', 'incident_report','enterprise_capabilities','incident_templates'], true)) {
+    if (!in_array($resource, ['status', 'capabilities', 'audiences', 'delivery', 'events', 'readiness', 'desktop_fleet', 'config', 'incidents', 'incident', 'incident_report','enterprise_capabilities','incident_templates','recordings'], true)) {
         return ['error' => 'unknown_resource'];
     }
     foreach (['job_id' => 64, 'incident_id' => 64, 'cursor' => $resource === 'events' ? 768 : 160, 'revision' => 160] as $field => $limit) {
         if (isset($query[$field]) && (!is_string($query[$field]) || strlen($query[$field]) > $limit)) { return ['error' => 'invalid_' . $field]; }
     }
     foreach (['limit', 'job_offset'] as $field) {
-        if (isset($query[$field]) && (!is_string($query[$field]) || !preg_match('/^[0-9]{1,3}$/D', $query[$field]))) {
+        if (isset($query[$field]) && (!is_string($query[$field]) || !preg_match($field === 'job_offset' ? '/^[0-9]{1,4}$/D' : '/^[0-9]{1,3}$/D', $query[$field]))) {
             return ['error' => 'invalid_pagination'];
         }
     }
@@ -602,7 +635,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
             }
         }
         foreach (['limit', 'job_offset'] as $field) {
-            if (isset($_GET[$field]) && (!is_string($_GET[$field]) || !preg_match('/^[0-9]{1,3}$/D', $_GET[$field]))) {
+            if (isset($_GET[$field]) && (!is_string($_GET[$field]) || !preg_match($field === 'job_offset' ? '/^[0-9]{1,4}$/D' : '/^[0-9]{1,3}$/D', $_GET[$field]))) {
                 respond(400, ['ok' => false, 'error' => 'invalid_pagination', 'message' => 'Incident pagination counts must be nonnegative integers.']);
             }
         }
@@ -652,6 +685,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         }
         audit_control_api($clientIp, 'get_readiness', 200, true);
         respond(200, ['ok'=>true, 'resource'=>'readiness'] + $report);
+    }
+    if ($resource === 'recordings') {
+        require_permission('config', 'get_recordings', true);
+        $search=$_GET['query']??''; $offset=$_GET['offset']??'0'; $limit=$_GET['limit']??'100';
+        if (!is_string($search)||strlen($search)>200||!is_string($offset)||!preg_match('/^[0-9]{1,4}$/D',$offset)||!is_string($limit)||!preg_match('/^[0-9]{1,3}$/D',$limit)) {
+            respond(400,['ok'=>false,'error'=>'invalid_recording_pagination']);
+        }
+        try { $page=freepbx_module()->getSystemRecordingCatalogue($search,(int)$offset,(int)$limit); }
+        catch (InvalidArgumentException $error) { respond(400,['ok'=>false,'error'=>'invalid_recording_pagination','message'=>$error->getMessage()]); }
+        catch (Throwable $error) { header('Retry-After: 2'); respond(503,['ok'=>false,'error'=>'recording_catalogue_unavailable','retryable'=>true]); }
+        audit_control_api($clientIp,'get_recordings',200,true);
+        respond(200,['ok'=>true,'resource'=>'recordings']+$page);
     }
     if ($resource === 'desktop_fleet') {
         require_permission('read', 'get_desktop_fleet', true);
@@ -746,6 +791,11 @@ if ($action === 'send_announcement' || $action === 'preview_announcement') {
         audit_control_api($clientIp, $action, 400, false);
         respond(400, ['ok' => false, 'error' => 'invalid_announcement_fields', 'message' => $error->getMessage()]);
     }
+    if ((!empty($body['browser_recipient_ids']) || !empty($body['connector_ids']) || !empty($body['options']['browser_recipient_ids']) || !empty($body['options']['connector_ids']))
+        && (($principal['id']??'')==='legacy' || ($principal['audience']['unrestricted']??false)!==true)) {
+        audit_control_api($clientIp,$action,403,false);
+        respond(403,['ok'=>false,'error'=>'labs_audience_not_permitted','message'=>'Browser and connector delivery requires an unrestricted named sender.']);
+    }
 }
 try {
     $module = freepbx_module();
@@ -790,8 +840,27 @@ try {
     }
 
     if ($action === 'send_announcement' || $action === 'preview_announcement') {
-        $result = $module->controlApiSendAnnouncement($body);
+        $idempotencyKey=request_header_value('Idempotency-Key');
+        if ($action==='send_announcement' && $idempotencyKey!=='') {
+            try {
+                require_once '/var/www/html/admin/modules/slsmassnotifyserver/ControlIdempotency.php';
+                $result=(new \SLS\MassNotify\ControlIdempotency('/var/lib/asterisk/SLS_Mass_Notifications_Plugin/control-idempotency'))
+                    ->submit($idempotencyKey,$principal,$body,static fn()=> $module->controlApiSendAnnouncement($body),time());
+            } catch (InvalidArgumentException $error) {
+                audit_control_api($clientIp,$action,400,false);
+                respond(400,['ok'=>false,'error'=>'invalid_idempotency_key','message'=>$error->getMessage()]);
+            } catch (DomainException $error) {
+                audit_control_api($clientIp,$action,409,false);
+                respond(409,['ok'=>false,'error'=>'idempotency_conflict','message'=>$error->getMessage()]);
+            } catch (Throwable $error) {
+                error_log('SLS announcement idempotency storage failure: '.$error->getMessage());
+                audit_control_api($clientIp,$action,503,false);
+                respond(503,['ok'=>false,'error'=>'idempotency_storage_unavailable','retryable'=>false,
+                    'message'=>'Submission could not be confirmed. Check delivery history before sending with a different key.']);
+            }
+        } else { $result = $module->controlApiSendAnnouncement($body); }
         if (($result['error_code'] ?? '') === 'permission_denied') { audit_control_api($clientIp, $action, 403, false); respond(403, ['ok' => false, 'error' => 'audience_not_permitted']); }
+        if (($result['error_code']??'')==='announcement_submission_uncertain') { audit_control_api($clientIp,$action,409,false); respond(409,['ok'=>false,'error'=>'announcement_submission_uncertain']+$result); }
         audit_control_api($clientIp, $action, !empty($result['success']) ? 200 : 400, !empty($result['success']));
         respond(!empty($result['success']) ? 200 : 400, ['ok' => !empty($result['success']), 'action' => $action] + $result);
     }

@@ -92,6 +92,8 @@ Per-site FreePBX jobs resolve approved explicit phone, desktop, saved email/SMS/
 
 Offline dispatch requires all of: local cache enabled, `offline_approved=true`, exact canonical content hash on the local `approved_cache` list, owned recipients, supported local channels and an unexpired prequeued job. This is a short-lived approved cache, not indefinite WAN-history replay or remote telephony. Independent site configuration and cached content remain available when the central coordinator is unreachable. Each queue action is journaled uncertain before dispatch and is not reset to queued by reboot or reconnect.
 
+The protected boolean `runtime_enabled` also gates edge publication and direct cluster effects before queue or effect claims. A stopped or malformed runtime policy blocks new publication while status, administrative recovery and receipts for existing published events remain available. Every claim checks current encrypted settings under the shared configuration lock, ordered against the exclusive console-stop write. The lock covers bounded witness admission requests where needed and is released before notification callbacks; a stop between jobs prevents the next queue claim. Resume keeps the original expiry and consumed identities; it does not replay completed or uncertain work, retract published events or interrupt an effect already admitted.
+
 The existing HTTPS location hosts `edge.php` independently of FreePBX. Each local device supplies its owned device ID and a bearer token whose SHA256 matches its local configuration. Supported operations are:
 
 | Request | Result |

@@ -11,6 +11,7 @@ import pwd
 import subprocess
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT/'tools/install_release.sh').read_text()
@@ -131,6 +132,37 @@ kill -KILL "$$"
         self.assertEqual(target.read_bytes(),b'preserve')
         self.assertEqual(target.stat().st_uid,0)
 
+    @unittest.skipUnless(os.geteuid()==0,'requires root to validate service-owned legacy locks')
+    def test_rejected_guard_pipe_returns_actionable_failure_instead_of_sigpipe(self):
+        data=self.root/'data'; data.mkdir()
+        account=pwd.getpwnam('asterisk')
+        lock=data/'enterprise-worker.lock'; lock.touch(); lock.chmod(0o644)
+        os.chown(lock,account.pw_uid,account.pw_gid)
+        for _ in range(5):
+            result=self.shell('DATA_DIR="$DATA"; ensure_data_directory() { :; }; acquire_worker_coordination',DATA=str(data))
+            self.assertEqual(result.returncode,1,result.stdout+result.stderr)
+            self.assertIn('Unable to pause active notification workers safely',result.stdout)
+            self.assertEqual(lock.stat().st_mode & 0o777,0o644)
+
+    def test_releasing_closed_guard_pipe_does_not_terminate_parent(self):
+        result=self.shell('coproc CLOSED_PIPE { exit 1; }; exec {WORKER_LOCK_KEEPALIVE_FD}>&"${CLOSED_PIPE[1]}"; wait "$CLOSED_PIPE_PID" || true; release_worker_coordination; printf survived')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(result.stdout,'survived')
+
+    @unittest.skipUnless(os.geteuid()==0,'requires root to reproduce a strict legacy lock rejection')
+    def test_guard_exit_before_coprocess_capture_is_actionable(self):
+        data=self.root/'data';data.mkdir()
+        account=pwd.getpwnam('asterisk')
+        lock=data/'enterprise-worker.lock';lock.touch();lock.chmod(0o644)
+        os.chown(lock,account.pw_uid,account.pw_gid)
+        marker='  WORKER_LOCK_PID="${SLS_INSTALL_WORKER_GUARD_PID:-}"'
+        self.assertIn(marker,SOURCE)
+        self.installer.write_text(SOURCE.replace(marker,'  sleep .2\n'+marker))
+        result=self.shell('DATA_DIR="$DATA"; ensure_data_directory() { :; }; acquire_worker_coordination',DATA=str(data))
+        self.assertEqual(result.returncode,1,result.stdout+result.stderr)
+        self.assertIn('Unable to pause active notification workers safely',result.stdout)
+        self.assertNotIn('unbound variable',result.stderr)
+
     @unittest.skipUnless(os.geteuid()==0,'requires root to validate paging slot coordination')
     def test_live_paging_cannot_start_while_installer_holds_all_slots(self):
         data=self.root/'data'; data.mkdir()
@@ -153,11 +185,15 @@ kill -KILL "$$"
         self.addCleanup(lambda: __import__('shutil').rmtree(backup,ignore_errors=True))
         self.assertEqual((backup/'slsmassnotifyserver/old').read_text(),'previous')
         self.assertEqual((modules/'slsmassnotifyserver/module.xml').stat().st_uid,pwd.getpwnam('asterisk').pw_uid)
-        self.assertFalse(source.exists())
+        self.assertTrue(source.exists())
+        self.assertEqual((source/'module.xml').read_text(),'candidate')
+        self.assertEqual((source/'module.xml').stat().st_uid,0)
 
     def test_fixed_phase_order_and_no_mutable_root_promotion(self):
         main=SOURCE.split('main() {',1)[1]
-        phases=['verify_tgz','stage_module_directory','prepare_installer_bootstrap','acquire_worker_coordination','prepare_authenticated_installer','protected_install_phase prepare --apply',
+        phases=['verify_tgz','stage_module_directory','prepare_installer_bootstrap','prepare_authenticated_installer',
+                'protect_freepbx_chown_permissions','repair_authenticated_legacy_permissions','preflight_authenticated_prerequisites',
+                'restore_previous_phone_collector','acquire_worker_coordination','protected_install_phase prepare --apply',
                 'protected_install_phase dependencies --apply','activate_staged_module',
                 'install_module_with_autoenable','protected_install_phase activate --apply','fwconsole reload',
                 'protected_install_phase verify','verify_install','INSTALL_COMMITTED=1']
@@ -181,8 +217,9 @@ kill -KILL "$$"
         self.installer.write_text(fixture)
         package=self.root/'input.tgz'; package.write_bytes(b'isolated signed package')
         manifest=self.root/'release-manifest.json'; signature=self.root/'release-manifest.sig'
-        data={'schema':1,'version':'0.1.5-beta','tag':'slsmassnotifyserver-0.1.5-beta',
-              'package':'slsmassnotifyserver-0.1.5-beta.tgz','package_sha256':hashlib.sha256(package.read_bytes()).hexdigest(),
+        version=ET.parse(ROOT/'slsmassnotifyserver/module.xml').getroot().findtext('version').strip()
+        data={'schema':1,'version':version,'tag':'slsmassnotifyserver-'+version,
+              'package':'slsmassnotifyserver-'+version+'.tgz','package_sha256':hashlib.sha256(package.read_bytes()).hexdigest(),
               'installer_sha256':hashlib.sha256(self.installer.read_bytes()).hexdigest()}
         manifest.write_text(json.dumps(data))
         subprocess.run(['openssl','pkeyutl','-sign','-rawin','-inkey',str(key),'-in',str(manifest),'-out',str(signature)],check=True,capture_output=True)
@@ -194,6 +231,10 @@ kill -KILL "$$"
         package.write_bytes(b'tampered package')
         self.assertNotEqual(verify().returncode,0)
         package.write_bytes(b'isolated signed package')
+        original=self.installer.read_bytes()
+        self.installer.write_bytes(original+b'\n# altered fixture installer\n')
+        self.assertNotEqual(verify().returncode,0)
+        self.installer.write_bytes(original)
         signature.write_bytes(b'0'*64)
         self.assertNotEqual(verify().returncode,0)
 

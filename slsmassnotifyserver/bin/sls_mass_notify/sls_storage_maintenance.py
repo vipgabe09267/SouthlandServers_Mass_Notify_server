@@ -36,6 +36,7 @@ EVENT_LOGS = (Path('/var/log/sls_mass_notify_events.jsonl'), Path('/var/log/nws_
 MAX_SCAN = 20000
 DIRECTORY_SCAN_SECONDS = 3
 MAX_DELETE = 250
+MAX_GENERATED_FILES = 18000
 MAX_REFERENCE_BYTES = 32 * 1024 * 1024
 MAX_QUEUE_FILES = 256
 AUDIT_MAX_BYTES = 8 * 1024 * 1024
@@ -43,6 +44,8 @@ SYSLOG_SOCKET = '/dev/log'
 ACTIVE_JOBS = {'queued', 'worker_starting', 'running'}
 TERMINAL_JOBS = {'complete', 'failed', 'partial_or_failed', 'expired'}
 AUDIO_NAME = re.compile(r'(?:announcement_(?:tts|sequence|tone)_[A-Za-z0-9_-]+|nws_[A-Za-z0-9_-]+|test_(?:piper_tts|sequence)_[A-Za-z0-9_-]+|xweather_(?:tts|sequence)_[A-Za-z0-9_-]+)\.wav')
+IMPORTED_AUDIO_NAME = re.compile(r'recording_[a-f0-9]{32}\.wav')
+VOICEMAIL_AUDIO_NAME = re.compile(r'[a-f0-9]{32}(?:-(?:receive|mix))?\.wav')
 IMAGE_NAME = re.compile(r'(?:mms_[0-9]{14}_[a-f0-9]{32}\.png|alert_[a-f0-9]{12}(?:_[a-f0-9]{20})?\.png|announcement_[0-9]{14}_[a-f0-9]{6,32}\.png|phone_payload_[a-f0-9]{12}(?:_[a-f0-9]{20})?\.xml)')
 
 def open_directory(path):
@@ -87,6 +90,8 @@ def reference_names(value):
         elif isinstance(item, list):
             stack.extend(item)
         elif isinstance(item, str):
+            for match in re.finditer(r'recording_[a-f0-9]{32}(?:\.wav)?', item):
+                name = match.group(); names.add(name if name.endswith('.wav') else name + '.wav')
             for match in re.finditer(r'(?:announcement_(?:tts|sequence|tone)_|nws_|test_(?:piper_tts|sequence)_|xweather_(?:tts|sequence)_)[A-Za-z0-9_-]{1,220}(?:\.wav)?', item):
                 name = match.group()
                 names.add(name if name.endswith('.wav') else name + '.wav')
@@ -206,6 +211,8 @@ def generated_inventory(directory, web_dir):
     deadline = time.monotonic() + DIRECTORY_SCAN_SECONDS
     for kind, path, pattern, age in (
             ('audio', Path(directory) / 'sounds/tts', AUDIO_NAME, 900),
+            ('audio', Path(directory) / 'sounds/tones', IMPORTED_AUDIO_NAME, 7 * 86400),
+            ('voicemail', Path(directory) / 'sounds/voicemail', VOICEMAIL_AUDIO_NAME, 1800),
             ('images', Path(web_dir), IMAGE_NAME, 3 * 86400)):
         try: descriptor = open_directory(path)
         except FileNotFoundError: continue
@@ -236,6 +243,10 @@ def prune_generated_cache(directory, web_dir, protected, now, limit):
     # A 15-minute grace always protects newly rendered/in-flight media.
     rows.sort(key=lambda row: (row[3].st_mtime >= now - row[4], row[3].st_mtime, row[2]))
     for kind, path, name, before, age in rows:
+        # The voicemail worker owns recording leases and native mailbox handoff.
+        # Count its workspace toward admission, but never unlink it here.
+        if kind == 'voicemail':
+            continue
         counter = kind + '_removed'
         if name in protected or before.st_mtime >= now - (86400 if name.startswith('mms_') else 900) or removed[counter] >= MAX_DELETE:
             continue
@@ -1031,12 +1042,21 @@ def storage_summary(directory=DATA, now=None):
         summary['audit_failure_code'] = 'audit_fault_state_unavailable'
         summary['audit_fault_active'] = True
         summary['queue_errors'] += 1
-    summary.update(media_bytes=0, media_cache_limit_bytes=0, media_over_budget=False, media_scan_incomplete=False)
+    summary.update(media_bytes=0, media_files=0, media_cache_limit_bytes=0, media_over_budget=False, media_scan_incomplete=False,
+                   media_near_budget=False, media_free_reserve_bytes=0, free_below_media_reserve=False)
     try:
         settings = _config_crypto.read_config(directory / 'mass-notifications.config')
         summary['media_cache_limit_bytes'] = generated_cache_limit(settings)
-        summary['media_bytes'] = sum(row[3].st_size for row in generated_inventory(directory, WEB))
+        media = generated_inventory(directory, WEB)
+        summary['media_bytes'] = sum(row[3].st_size for row in media)
+        summary['media_files'] = len(media)
         summary['media_over_budget'] = summary['media_bytes'] > summary['media_cache_limit_bytes']
+        summary['media_near_budget'] = summary['media_bytes'] * 10 >= summary['media_cache_limit_bytes'] * 9 or len(media) >= MAX_GENERATED_FILES * .9
+        reserve = settings.get('generated_media_min_free_mib', 128)
+        if type(reserve) is not int or not 64 <= reserve <= 4096:
+            raise ValueError('Invalid generated-media free reserve')
+        summary['media_free_reserve_bytes'] = reserve * 1048576
+        summary['free_below_media_reserve'] = free < summary['media_free_reserve_bytes']
     except (OSError, ValueError, RuntimeError, TypeError, AttributeError):
         summary['media_scan_incomplete'] = True
     summary.update(audit_forwarding_enabled=False, audit_forwarding_active=False,

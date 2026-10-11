@@ -45,7 +45,7 @@ final class OperatorPortal
     public static function current(array $binding, array $identity, int $timeout, int $now): bool
     {
         try {
-            return is_int($binding['signed_in_at'] ?? null) && is_int($binding['last_activity'] ?? null)
+            return OperatorAccess::activeAccount($identity, $now) && is_int($binding['signed_in_at'] ?? null) && is_int($binding['last_activity'] ?? null)
                 && $now >= $binding['signed_in_at'] && $now >= $binding['last_activity']
                 && $now - $binding['signed_in_at'] < 28800
                 && $now - $binding['last_activity'] < min(28800, max(60, $timeout))

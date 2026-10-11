@@ -59,7 +59,7 @@ class ResourceCapacityTests(unittest.TestCase):
 
     def test_small_tmp_moves_scratch_without_weakening_target_mount_checks(self):
         storage = RESOURCE.storage_requirements()
-        def filesystems(budgets):
+        def filesystems(budgets, inode_budgets=None):
             scratch = '/tmp' if '/tmp' in budgets else '/var/tmp'
             return [{'device': 'data', 'paths': [p for p in budgets if p != scratch],
                      'available_bytes': 2 * GIB, 'required_free_bytes': sum(v for p, v in budgets.items() if p != scratch)},
@@ -77,7 +77,7 @@ class ResourceCapacityTests(unittest.TestCase):
             selected, mounts = RESOURCE.probe_storage_filesystems(storage, '/tmp')
             self.assertEqual(selected['temporary_directory'], '/tmp')
             self.assertTrue(any(row['available_bytes'] < row['required_free_bytes'] for row in mounts))
-        def insufficient(budgets):
+        def insufficient(budgets, inode_budgets=None):
             return [{'device': '1', 'paths': list(budgets), 'available_bytes': 64 * RESOURCE.MIB,
                      'required_free_bytes': sum(budgets.values())}]
         with patch.object(RESOURCE, 'trusted_temporary_directory', return_value=True), \
@@ -170,7 +170,8 @@ class ResourceCapacityTests(unittest.TestCase):
             for path, parts in report['component_budgets_bytes'].items():
                 self.assertEqual(report['free_budgets_bytes'][path], sum(parts.values()))
             self.assertFalse(report['retention_is_byte_bounded'])
-            self.assertFalse(report['synthesis_concurrency_is_enforced'])
+            self.assertTrue(report['synthesis_concurrency_is_enforced'])
+            self.assertTrue(report['generated_media_admission_is_byte_bounded'])
             self.assertNotIn('one_audio_pipeline', str(report['component_budgets_bytes']))
 
     def test_larger_managed_runtime_and_state_expand_recovery_space(self):
@@ -224,7 +225,7 @@ class ResourceCapacityTests(unittest.TestCase):
         self.assertEqual(RESOURCE.evaluate(hardware(), 1)['eligible_limit'], 50)
 
     def test_nominal_memory_reporting_allowance_is_bounded(self):
-        minimum = 4 * GIB * 95 // 100
+        minimum = RESOURCE.minimum_reported_memory({}, 4 * GIB)
         measured = hardware()
         measured['effective_memory_bytes'] = minimum
         self.assertEqual(RESOURCE.evaluate(measured, 50)['errors'], [])
@@ -232,6 +233,74 @@ class ResourceCapacityTests(unittest.TestCase):
         report = RESOURCE.evaluate(measured, 50)
         self.assertEqual(report['errors'][0]['code'], 'memory_insufficient')
         self.assertEqual(report['eligible_limit'], 0)
+
+    def test_reported_four_gib_host_passes_but_lower_container_quota_does_not(self):
+        measured = hardware()
+        measured['effective_memory_bytes'] = 4068581376
+        self.assertEqual(RESOURCE.evaluate(measured, 25)['errors'], [])
+        measured['memory_limit_bytes'] = 4068581376
+        report = RESOURCE.evaluate(measured, 25)
+        self.assertIn('memory_insufficient', [row['code'] for row in report['errors']])
+        self.assertIn('baseline', report['errors'][0]['message'])
+        self.assertEqual(16 * GIB - RESOURCE.minimum_reported_memory({}, 16 * GIB), 256 * RESOURCE.MIB)
+
+    def test_runtime_capacity_does_not_reserve_another_installation(self):
+        runtime = RESOURCE.storage_requirements(mode='runtime')
+        prepare = RESOURCE.storage_requirements(mode='prepare')
+        install = RESOURCE.storage_requirements(mode='install')
+        self.assertEqual(runtime['temporary_free_bytes'], 0)
+        self.assertLess(runtime['additional_free_bytes'], prepare['additional_free_bytes'])
+        self.assertLess(prepare['additional_free_bytes'], install['additional_free_bytes'])
+        sparse = RESOURCE.storage_requirements({'runtime': {'allocated_bytes': 4096, 'logical_bytes': 2 * GIB}})
+        self.assertGreaterEqual(sparse['temporary_free_bytes'], GIB)
+        journal=sparse['component_budgets_bytes'][RESOURCE.INSTALLER_JOURNAL]
+        self.assertIn('prior_static_runtime_and_api_snapshot',journal)
+        self.assertGreaterEqual(journal['prior_static_runtime_and_api_snapshot'],2*GIB)
+        self.assertIn('saved_candidate_archive_and_metadata',journal)
+        self.assertNotIn('prior_static_runtime_and_api_snapshot',sparse['component_budgets_bytes']['/tmp'])
+
+    def test_inode_shortfall_and_volatile_data_are_rejected(self):
+        measured = hardware()
+        measured['filesystems'][0].update(available_inodes=20, required_inodes=21)
+        self.assertIn('storage_inodes_insufficient', [row['code'] for row in RESOURCE.evaluate(measured, 25)['errors']])
+        measured['filesystems'][0].update(available_inodes=100, persistent=False,
+            filesystem_type='tmpfs', volatile_targets=[RESOURCE.MANAGED_TREES['data']])
+        self.assertIn('storage_not_persistent', [row['code'] for row in RESOURCE.evaluate(measured, 25)['errors']])
+
+    def test_cached_tree_scan_does_not_rescan_a_measured_child(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); child = root / 'child'; child.mkdir()
+            (child / 'one').write_bytes(b'12345')
+            cache = {}
+            RESOURCE.measure_tree(root, RESOURCE.time.monotonic() + 2, cache=cache)
+            with patch.object(RESOURCE.os, 'scandir', side_effect=AssertionError('duplicate scan')):
+                report = RESOURCE.measure_tree(child, RESOURCE.time.monotonic() + 2, cache=cache)
+            self.assertEqual(report['logical_bytes'], 5)
+
+    def test_payload_budget_uses_actual_destination_sizes_and_rejects_links(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            for relative, body in [('bin/helper.py', b'x'*100), ('api/sipnotify/index.php', b'x'*200),
+                                   ('assets/icon.svg', b'x'*50), ('module.xml', b'<module/>')]:
+                file = root/relative; file.parent.mkdir(parents=True, exist_ok=True); file.write_bytes(body)
+            payloads = RESOURCE.measure_release_payloads(root)
+            self.assertEqual(payloads[RESOURCE.MANAGED_TREES['sip_api']]['bytes'], 200)
+            self.assertEqual(payloads[RESOURCE.MANAGED_TREES['runtime']]['bytes'], 100)
+            measured = RESOURCE.storage_requirements(payloads=payloads)
+            self.assertLess(measured['free_budgets_bytes'][RESOURCE.MANAGED_TREES['sip_api']], RESOURCE.MIB)
+            (root/'assets/link').symlink_to('/etc/passwd')
+            with self.assertRaises(RESOURCE.ResourceProbeError): RESOURCE.measure_release_payloads(root)
+
+    def test_missing_aes_dependency_returns_a_specific_error_without_traceback(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            (root/'sls_config_crypto.py').write_text("raise ImportError('fixture-only detail')")
+            config = root/'settings.config'
+            config.write_text(json.dumps({'format':'sls-mass-notify-config-aes256gcm-v1', 'ciphertext':'fixture'}))
+            with patch.object(RESOURCE, '__file__', str(root/'capacity.py')):
+                with self.assertRaises(RESOURCE.ResourceProbeError) as caught: RESOURCE.configured_limits(config)
+            self.assertEqual(caught.exception.code,'config_crypto_dependency_missing')
+            self.assertNotIn('fixture-only detail',str(caught.exception))
 
     def test_sls_headroom_is_enforced_without_a_total_volume_floor(self):
         # A smaller existing PBX volume is acceptable when SLS has its own headroom.
@@ -254,7 +323,7 @@ class ResourceCapacityTests(unittest.TestCase):
             self.assertEqual(report['errors'],[],(phones,report))
             self.assertEqual(report['requirements']['cpu_count'],cpu)
             self.assertEqual(report['requirements']['memory_bytes'],ram*GIB)
-        self.assertEqual(RESOURCE.evaluate(hardware(3,4.25),50)['eligible_phone_limit'],228)
+        self.assertEqual(RESOURCE.evaluate(hardware(3,4.25),50)['eligible_phone_limit'],300)
         self.assertEqual(RESOURCE.evaluate(hardware(3,4.5),50)['eligible_phone_limit'],300)
         self.assertEqual(RESOURCE.evaluate(hardware(4,5),50)['eligible_phone_limit'],500)
         self.assertEqual(RESOURCE.evaluate(hardware(7,6),50)['eligible_phone_limit'],1000)
@@ -305,7 +374,7 @@ class ResourceCapacityTests(unittest.TestCase):
         report=RESOURCE.evaluate(measured,50,100)
         self.assertTrue(all(check['ok'] is True for check in report['resource_checks'].values()))
         measured['effective_cpu_count']=1.9
-        measured['effective_memory_bytes']=4*GIB*95//100-1
+        measured['effective_memory_bytes']=RESOURCE.minimum_reported_memory({}, 4 * GIB)-1
         measured['filesystems'][0]['available_bytes']=measured['filesystems'][0]['required_free_bytes']-1
         report=RESOURCE.evaluate(measured,50,100)
         self.assertTrue(all(check['ok'] is False for check in report['resource_checks'].values()))
@@ -496,16 +565,29 @@ class ResourceCapacityTests(unittest.TestCase):
 
     def test_installer_cannot_bypass_failed_preflight(self):
         with tempfile.TemporaryDirectory(prefix='sls-capacity-main-') as name:
+            fixture = Path(name)
+            framework = fixture / 'framework-module.xml'
+            framework.write_text('<module><rawname>framework</rawname><version>17.0.1</version></module>')
+            # Exercise the real profile validator against private prerequisite
+            # evidence. CI has no installed FreePBX, and this fixture must not
+            # depend on or modify the host's Framework module.
+            source = (ROOT / 'tools/install_release.sh').read_text()
+            framework_path = '/var/www/html/admin/modules/framework/module.xml'
+            self.assertIn(framework_path, source)
+            installer = fixture / 'install_release.sh'
+            installer.write_text(source.replace(framework_path, str(framework)))
             script = r'''
 source "$1"
 LOG_FILE="$2/log"
 ensure_installer_log_prerequisites() { :; }
+acquire_update_coordination() { :; }
+acquire_maintenance_coordination() { :; }
 preflight_hardware_requirements() { return 2; }
 record_install_failure() { :; }
 require_freepbx() { printf 'unexpected\n' >"$2/forbidden"; }
 main
 '''
-            result = subprocess.run(['bash', '-c', script, '_', str(ROOT / 'tools/install_release.sh'), name],
+            result = subprocess.run(['bash', '-c', script, '_', str(installer), name],
                                     capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertFalse((Path(name) / 'forbidden').exists())
@@ -519,8 +601,8 @@ source "$1"
 CONFIG_FILE="$2/config"
 LOG_FILE="$2/log"
 bootstrap_resource_capacity() {
-  [[ "$*" == "--check --config $CONFIG_FILE" ]] || return 99
-  printf '{"schema":1,"requested_limit":1000,"errors":[{"code":"cpu_insufficient"}]}\n'
+  [[ "$*" == "--check --mode prepare --config $CONFIG_FILE" ]] || return 99
+  printf '{"schema":1,"requested_limit":1000,"errors":[{"code":"cpu_insufficient","message":"More CPU cores are required for 1000 desktops."}]}\n'
   return 2
 }
 preflight_hardware_requirements
@@ -528,7 +610,9 @@ preflight_hardware_requirements
             result = subprocess.run(['bash', '-c', script, '_', str(ROOT / 'tools/install_release.sh'), name],
                                     capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 2, result.stderr)
-            self.assertIn('"requested_limit":1000', result.stdout)
+            self.assertIn('[cpu_insufficient] More CPU cores are required for 1000 desktops.', result.stdout)
+            self.assertNotIn('"requested_limit":1000', result.stdout)
+            self.assertIn('"requested_limit":1000', (fixture / 'log').read_text())
 
     def test_installer_carries_only_verified_fresh_rounding(self):
         with tempfile.TemporaryDirectory(prefix='sls-capacity-fresh-') as name:
@@ -537,7 +621,7 @@ source "$1"
 CONFIG_FILE="$2/absent.config"
 LOG_FILE="$2/log"
 bootstrap_resource_capacity() {
-  [[ "$*" == "--check --desktop-limit 25 --auto-phone-limit" ]] || return 99
+  [[ "$*" == "--check --mode prepare --desktop-limit 25 --auto-phone-limit" ]] || return 99
   printf '%s\n' "$FIXTURE_REPORT"
 }
 preflight_hardware_requirements || exit $?

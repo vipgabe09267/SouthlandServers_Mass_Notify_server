@@ -6,6 +6,7 @@ namespace SLS\MassNotify;
 final class SystemRecordings
 {
     public const FORMATS = ['wav', 'wav49', 'ulaw', 'alaw', 'gsm', 'sln', 'sln16', 'g722'];
+    private const MAX_DECODED_BYTES = 20 * 1024 * 1024;
 
     public static function validPath(string $relative): bool
     {
@@ -16,9 +17,37 @@ final class SystemRecordings
 
     public static function catalogue(string $directory, array $labels = []): array
     {
+        return self::cataloguePage($directory, $labels, '', 0, 500)['items'];
+    }
+
+    /** Read a bounded page; truncation is explicit instead of hiding recordings. */
+    public static function cataloguePage(string $directory, array $labels = [], string $query = '', int $offset = 0, int $limit = 100, ?string $cacheFile = null): array
+    {
+        if ($offset < 0 || $offset > 5000 || $limit < 1 || $limit > 500 || strlen($query) > 200) {
+            throw new \InvalidArgumentException('Recording search or page limits are invalid.');
+        }
+        $identity = hash('sha256', $directory . "\0" . json_encode($labels, JSON_THROW_ON_ERROR));
+        $index = self::cachedCatalogue($cacheFile, $identity);
+        if ($index === null) {
+            $index = self::scanCatalogue($directory, $labels);
+            self::saveCatalogue($cacheFile, $identity, $index);
+        }
+        $rows = $index['items']; $query = trim($query);
+        if ($query !== '') {
+            $rows = array_values(array_filter($rows, static fn($row) => stripos($row['label'], $query) !== false || stripos($row['value'], $query) !== false));
+        }
+        $total = count($rows); $end = min($total, $offset + $limit);
+        return array_merge($index, ['items'=>array_slice($rows, $offset, $limit), 'total'=>$total,
+            'offset'=>$offset, 'limit'=>$limit, 'has_more'=>$end < $total,
+            'next_offset'=>$end < $total ? $end : null]);
+    }
+
+    private static function scanCatalogue(string $directory, array $labels): array
+    {
         $root = realpath($directory);
-        if ($root === false) { return []; }
-        $root .= '/'; $seen = []; $count = 0; $deadline = microtime(true) + 2;
+        $result = ['items'=>[], 'scan_complete'=>false, 'truncated'=>false, 'observed_at'=>gmdate('c'), 'warning'=>''];
+        if ($root === false) { $result['warning'] = 'The System Recordings directory is unavailable.'; return $result; }
+        $root .= '/'; $seen = []; $count = 0; $deadline = microtime(true) + 2; $complete = true;
         $roots = array_merge(glob($root.'custom', GLOB_ONLYDIR) ?: [], glob($root.'*/custom', GLOB_ONLYDIR) ?: []);
         foreach ($roots as $custom) {
             if (is_link($custom)) { continue; }
@@ -26,7 +55,7 @@ final class SystemRecordings
                 $iterator = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($custom, \FilesystemIterator::SKIP_DOTS));
                 $iterator->setMaxDepth(4);
                 foreach ($iterator as $file) {
-                    if (++$count > 5000 || microtime(true) > $deadline) { break 2; }
+                    if (++$count > 5000 || microtime(true) > $deadline) { $complete = false; break 2; }
                     $relative = substr($file->getPathname(), strlen($root));
                     if (!self::validPath($relative) || $file->isLink() || !$file->isFile() || !$file->isReadable() || $file->getSize() < 1 || $file->getSize() > 20*1024*1024) { continue; }
                     $resolved = $file->getRealPath();
@@ -36,14 +65,52 @@ final class SystemRecordings
                     if (isset($seen[$key]) && $seen[$key]['rank'] <= $rank) { continue; }
                     $seen[$key] = ['value'=>'system:'.$relative, 'label'=>$labels[$base] ?? $base, 'rank'=>$rank];
                 }
-            } catch (\UnexpectedValueException $error) { continue; }
+            } catch (\UnexpectedValueException $error) { $complete = false; continue; }
         }
         uasort($seen, static fn($a,$b) => strnatcasecmp($a['label'], $b['label']));
-        return array_map(static fn($r) => ['value'=>$r['value'], 'label'=>$r['label']], array_slice(array_values($seen), 0, 500));
+        $result['items'] = array_map(static fn($r) => ['value'=>$r['value'], 'label'=>$r['label']], array_values($seen));
+        $result['scan_complete'] = $complete; $result['truncated'] = !$complete;
+        if (!$complete) { $result['warning'] = 'The recording scan reached its time or file limit. Some recordings are not listed; refine the recordings directory or retry after checking permissions.'; }
+        return $result;
+    }
+
+    private static function cachedCatalogue(?string $path, string $identity): ?array
+    {
+        if ($path === null) { return null; }
+        $info = @lstat($path);
+        if (!$info || ($info['mode'] & 0170000) !== 0100000 || $info['nlink'] !== 1 || $info['size'] > 2*1024*1024 || ($info['mode'] & 0007) !== 0 || $info['mtime'] < time()-30 || $info['mtime'] > time()+1) { return null; }
+        try { $raw = self::readSource($path); }
+        catch (\InvalidArgumentException $error) { return null; }
+        $value = is_string($raw) ? json_decode($raw, true) : null;
+        if (!is_array($value) || ($value['identity'] ?? '') !== $identity || !is_array($value['catalogue']['items'] ?? null)
+            || count($value['catalogue']['items']) > 5000 || !is_bool($value['catalogue']['scan_complete'] ?? null)
+            || !is_bool($value['catalogue']['truncated'] ?? null) || !is_string($value['catalogue']['observed_at'] ?? null)
+            || !is_string($value['catalogue']['warning'] ?? null)) { return null; }
+        foreach ($value['catalogue']['items'] as $row) {
+            if (!is_array($row) || !is_string($row['value'] ?? null) || !is_string($row['label'] ?? null)
+                || !str_starts_with($row['value'], 'system:') || !self::validPath(substr($row['value'], 7)) || strlen($row['label']) > 1000) { return null; }
+        }
+        return $value['catalogue'];
+    }
+
+    private static function saveCatalogue(?string $path, string $identity, array $index): void
+    {
+        if ($path === null || !is_dir(dirname($path)) || is_link(dirname($path)) || is_link($path)) { return; }
+        $raw = json_encode(['identity'=>$identity, 'catalogue'=>$index], JSON_THROW_ON_ERROR);
+        if (strlen($raw) > 2*1024*1024) { return; }
+        $temporary = dirname($path).'/.recordings-index-'.bin2hex(random_bytes(12));
+        $handle = @fopen($temporary, 'x');
+        if (!$handle) { return; }
+        try {
+            @chmod($temporary, 0640);
+            if (fwrite($handle, $raw) !== strlen($raw) || !fflush($handle)) { return; }
+            if (function_exists('fsync')) { fsync($handle); }
+            if (!is_link($path)) { @rename($temporary, $path); }
+        } finally { fclose($handle); @unlink($temporary); }
     }
 
     /** Freeze source bytes: later System Recording uploads cannot alter a queued page. */
-    public static function import(string $selection, string $directory, string $tones): string
+    public static function import(string $selection, string $directory, string $tones, ?callable $admission = null): string
     {
         if (!str_starts_with($selection, 'system:') || !self::validPath($relative = substr($selection, 7))) { throw new \InvalidArgumentException('The selected System Recording path is invalid.'); }
         $root = realpath($directory); $source = realpath($directory.'/'.$relative);
@@ -57,6 +124,11 @@ final class SystemRecordings
         if ($cached && ($cached['mode'] & 0170000) === 0100000 && $cached['nlink'] === 1
             && $cached['size'] >= 44 && $cached['size'] <= 20*1024*1024 && self::validCache($target)) { return $name; }
         if (!is_dir($tones) || is_link($tones) || !is_writable($tones)) { throw new \InvalidArgumentException('The SLS tone directory is not writable. Run Repair Installation.'); }
+        // The optional callback is a trusted local dependency for disposable
+        // media tests. No request/API input supplies this argument.
+        $workspace = strlen($bytes) + self::MAX_DECODED_BYTES;
+        if ($admission !== null) { $admission($workspace); }
+        else { self::reserveGeneratedRecording($workspace); }
         $base = $tones.'/.import-'.bin2hex(random_bytes(12)); $input = $base.'.source.'.$format; $output = $base.'.wav';
         try {
             $handle = fopen($input, 'x');
@@ -65,17 +137,60 @@ final class SystemRecordings
             try { if (fwrite($handle, $bytes) !== strlen($bytes)) { throw new \RuntimeException('System Recording import ran out of storage.'); } } finally { fclose($handle); }
             if ($format === 'g722') {
                 if (!is_executable('/usr/bin/ffmpeg')) { throw new \InvalidArgumentException('G.722-only recordings need FFmpeg. Save a WAV version in System Recordings instead.'); }
-                $command = '/usr/bin/timeout --kill-after=2 30 /usr/bin/ffmpeg -nostdin -v error -f g722 -i '.escapeshellarg($input).' -ac 1 -ar 8000 -c:a pcm_s16le '.escapeshellarg($output);
+                $command = ['/usr/bin/ffmpeg', '-nostdin', '-v', 'error', '-f', 'g722', '-i', $input, '-ac', '1', '-ar', '8000', '-c:a', 'pcm_s16le', $output];
             } else {
-                $raw = ['gsm'=>'-t gsm', 'ulaw'=>'-t ul -r 8000 -c 1', 'alaw'=>'-t al -r 8000 -c 1', 'sln'=>'-t raw -r 8000 -c 1 -e signed-integer -b 16 -L', 'sln16'=>'-t raw -r 16000 -c 1 -e signed-integer -b 16 -L'];
-                $command = '/usr/bin/timeout --kill-after=2 30 /usr/bin/sox '.($raw[$format] ?? '-t wav').' '.escapeshellarg($input).' -r 8000 -c 1 -b 16 '.escapeshellarg($output);
+                $raw = ['gsm'=>['-t','gsm'], 'ulaw'=>['-t','ul','-r','8000','-c','1'], 'alaw'=>['-t','al','-r','8000','-c','1'],
+                    'sln'=>['-t','raw','-r','8000','-c','1','-e','signed-integer','-b','16','-L'],
+                    'sln16'=>['-t','raw','-r','16000','-c','1','-e','signed-integer','-b','16','-L']];
+                $command = array_merge(['/usr/bin/sox'], $raw[$format] ?? ['-t','wav'], [$input,'-r','8000','-c','1','-b','16',$output]);
             }
-            exec($command.' 2>/dev/null', $unused, $code);
+            $code = self::convertBounded($command);
+            clearstatcache(true, $output);
+            if (is_file($output) && filesize($output) >= self::MAX_DECODED_BYTES) {
+                throw new \InvalidArgumentException('Decoded System Recording exceeds the 20 MiB audio limit. Shorten the recording before importing it. No partial recording was saved.');
+            }
             if ($code !== 0 || !self::validCache($output)) { throw new \InvalidArgumentException('The System Recording could not be decoded. Upload a valid WAV recording and try again.'); }
             if (is_link($target) || !rename($output, $target)) { throw new \RuntimeException('The imported System Recording could not be saved. Check available storage and directory permissions.'); }
             chmod($target, 0644);
             return $name;
         } finally { @unlink($input); @unlink($output); }
+    }
+
+    private static function convertBounded(array $command): int
+    {
+        // The kernel limit applies while decoding, including compressed inputs.
+        // Both codecs write one output file; timeout also bounds their process group.
+        $program = <<<'PY'
+import os, resource, signal, sys
+limit = int(sys.argv[1])
+resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+signal.signal(signal.SIGXFSZ, signal.SIG_DFL)
+os.execv(sys.argv[2], sys.argv[2:])
+PY;
+        $process = @proc_open(array_merge(['/usr/bin/timeout', '--kill-after=2', '30', '/usr/bin/python3', '-I', '-c', $program, (string)self::MAX_DECODED_BYTES], $command),
+            [0=>['file','/dev/null','r'],1=>['file','/dev/null','w'],2=>['file','/dev/null','w']], $pipes, null, null, ['bypass_shell'=>true]);
+        if (!is_resource($process)) { throw new \RuntimeException('Bounded recording conversion could not start. Check Python, SoX and web PHP process permissions.'); }
+        $code = proc_close($process);
+        $output = end($command); clearstatcache(true, $output);
+        // Some codec versions report success after an EFBIG write. A reached
+        // kernel bound is always rejected, never accepted as a shorter recording.
+        return is_file($output) && filesize($output) >= self::MAX_DECODED_BYTES ? 65 : $code;
+    }
+
+    private static function reserveGeneratedRecording(int $bytes): void
+    {
+        $helper = '/usr/local/bin/sls_mass_notify/sls_speech_admission.py'; $info = @lstat($helper);
+        if (!$info || ($info['mode'] & 0170000) !== 0100000 || $info['nlink'] !== 1 || $info['uid'] !== 0 || ($info['mode'] & 0022)) {
+            throw new \RuntimeException('The protected generated-media admission helper is unavailable. Run Repair Installation before importing recordings.');
+        }
+        $process = @proc_open(['/usr/bin/timeout', '--kill-after=1', '8', '/usr/bin/python3', '-I', $helper, '--reserve-media-bytes', (string)$bytes],
+            [0=>['file','/dev/null','r'],1=>['file','/dev/null','w'],2=>['pipe','w']], $pipes, null, null, ['bypass_shell'=>true]);
+        if (!is_resource($process)) { throw new \RuntimeException('Generated-media admission could not start. Check the protected runtime installation.'); }
+        stream_get_contents($pipes[2], 4096); fclose($pipes[2]); $code = proc_close($process);
+        if ($code !== 0) {
+            throw new \RuntimeException($code === 73 ? 'The recording import needs more generated-media budget or free disk space. Review Storage settings and queued alerts.'
+                : ($code === 75 ? 'Generated-media reservation capacity is full. Wait for current renders to finish.' : 'Generated-media admission failed. Check Storage diagnostics and runtime permissions.'));
+        }
     }
 
     private static function validCache(string $path): bool

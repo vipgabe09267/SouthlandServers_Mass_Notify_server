@@ -415,6 +415,11 @@ $emailText = static function ($value) {
 			<?php } ?>
 			</div>
 			<div class="row"><div class="col-md-4"><div class="form-group"><label for="sls-lightning-tts-volume"><?php echo _('Lightning TTS Volume'); ?></label><div class="input-group"><input class="form-control" id="sls-lightning-tts-volume" type="number" min="1" max="200" name="xweather[tts_volume]" value="<?php echo (int)($xweather['tts_volume'] ?? ($settings['nws_tts_volume'] ?? 25)); ?>"><span class="input-group-addon">%</span></div><p class="help-block"><?php echo _('Default 25%; range 1–200%.'); ?></p></div></div></div>
+			<div class="form-group">
+				<input type="hidden" name="xweather[voicemail_enabled]" value="0">
+				<div class="checkbox"><label for="sls-lightning-voicemail"><input type="checkbox" id="sls-lightning-voicemail" name="xweather[voicemail_enabled]" value="1" <?php echo in_array($xweather['voicemail_enabled'] ?? '1', [true, 1, '1'], true) ? 'checked' : ''; ?> aria-describedby="sls-lightning-voicemail-help"> <i class="fa fa-envelope-o" aria-hidden="true"></i> <?php echo _('Leave voicemail for unanswered extensions'); ?></label></div>
+				<p class="help-block" id="sls-lightning-voicemail-help"><?php echo _('Enabled by default for lightning warnings and all-clear calls. Alert audio is saved to each selected extension’s enabled FreePBX mailbox if its phones do not answer. External numbers are unchanged.'); ?></p>
+			</div>
 			<p class="help-block"><?php echo _('The warning text is spoken with the configured weather Piper voice between these tones. Coordinate locations are spoken as “this area”; named locations use the configured city. One second of leading silence is included before the pre-tone and speech. System Recordings are validated and imported when saved.'); ?></p></div>
 		</div>
 

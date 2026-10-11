@@ -63,8 +63,8 @@ $meta = $typeMeta[$event['notification_type'] ?? ''] ?? ['icon' => 'fa-circle-o'
 	</div>
 
 	<?php foreach ($weather_delivery['warnings'] ?? [] as $warning) { ?><div class="alert alert-warning" role="status"><?php echo htmlspecialchars($warning, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?></div><?php } ?>
-	<?php if (!empty($weather_delivery['rows'])) { ?><div class="sls-detail-card"><div class="sls-detail-card-title"><i class="fa fa-paper-plane text-primary" aria-hidden="true"></i> <?php echo _('Email and Webhook Delivery'); ?></div><div class="sls-detail-card-body">
-	<p class="text-muted"><?php echo _('Accepted means the mail transport or webhook service accepted the submission. It does not confirm that a person saw the alert. Older records may lack transport evidence.'); ?></p>
+	<?php if (!empty($weather_delivery['rows'])) { ?><div class="sls-detail-card"><div class="sls-detail-card-title"><i class="fa fa-paper-plane text-primary" aria-hidden="true"></i> <?php echo _('Delivery Results'); ?></div><div class="sls-detail-card-body">
+	<p class="text-muted"><?php echo _('Accepted means the transport accepted the submission. Saved in FreePBX voicemail means Asterisk stored the complete message in the extension’s mailbox. Neither confirms that a person read or heard it.'); ?></p>
 	<?php foreach ($weather_delivery['rows'] as $receipt) { ?><dl class="sls-detail-list"><div class="sls-detail-row"><dt><?php echo htmlspecialchars($receipt['channel']); ?></dt><dd><strong><?php echo htmlspecialchars(str_replace('_', ' ', $receipt['status'])); ?></strong><?php if ($receipt['http_status']) { ?> · HTTP <?php echo (int)$receipt['http_status']; ?><?php } ?><br><?php echo htmlspecialchars($receipt['group']); ?> · <?php echo htmlspecialchars($receipt['queue_state']); ?><?php if ($receipt['error']) { ?><br><code><?php echo htmlspecialchars($receipt['error']); ?></code><?php } ?><?php if ($receipt['recorded_at']) { ?><br><small class="text-muted"><?php echo htmlspecialchars($receipt['recorded_at']); ?></small><?php } ?></dd></div></dl><?php } ?>
 	</div></div><?php } ?>
 

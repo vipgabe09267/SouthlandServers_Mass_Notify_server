@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
+import types
 import io
 import json
 import os
@@ -431,9 +431,9 @@ def enroll_sls(root: Path, archive: Path, manifest_path: Path, signature_path: P
     # Enrollment must use the same authority as the updater and installer;
     # otherwise a legitimate key transition would fail later during promotion.
     sys.dont_write_bytecode = True
-    spec = importlib.util.spec_from_file_location('sls_publisher_enrollment', Path(__file__).with_name('sls_release_trust.py'))
-    publisher = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(publisher)
+    path = Path(__file__).with_name('sls_release_trust.py')
+    publisher = types.ModuleType('sls_publisher_enrollment'); publisher.__file__ = str(path)
+    exec(compile(read(path, 256 * 1024), str(path), 'exec'), publisher.__dict__)
     try:
         release = publisher.authenticate_manifest(manifest, signature, anchor=PUBLIC_KEY, directory=root)
     except (ValueError, OSError, subprocess.SubprocessError) as error:

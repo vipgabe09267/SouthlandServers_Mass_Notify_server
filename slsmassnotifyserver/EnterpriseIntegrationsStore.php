@@ -1,6 +1,7 @@
 <?php
 declare(strict_types=1);
 namespace SLS\MassNotify;
+require_once __DIR__.'/EnterpriseIdentityStore.php';
 if (!class_exists('SlsAnnouncementJobStore',false)) { require_once __DIR__.'/bin/sls_mass_notify/sls_announcement_jobs.php'; }
 
 /** Private durable provider claims, reply bindings and enrolled sensor health. */
@@ -126,5 +127,45 @@ final class EnterpriseIntegrationsStore
     private function writeInitializationMarker($lock): void
     {
         if (fseek($lock,0)!==0 || fwrite($lock,self::MARKER)!==strlen(self::MARKER) || !ftruncate($lock,strlen(self::MARKER)) || !fflush($lock) || !fsync($lock)) { throw new \RuntimeException('Cannot commit the integration initialization marker. Preserve replay evidence.'); }
+    }
+    public function archived(string $kind,string $id): ?array
+    {
+        if (!in_array($kind,['operations','responses'],true)||!preg_match('/^[a-f0-9]{32,64}$/D',$id)) { throw new \InvalidArgumentException('Invalid integration archive lookup.'); }
+        if (!is_dir($this->directory.'/archive')&&!is_link($this->directory.'/archive')&&!file_exists($this->directory.'/.archive-required')) { return null; }
+        return (new EnterpriseIdentityStore($this->directory.'/archive'))->read($kind)[$id]??null;
+    }
+    public function archiveReport(string $kind): array
+    {
+        if(!in_array($kind,['operations','responses'],true)){throw new \InvalidArgumentException('Invalid integration report kind.');}
+        if(!is_dir($this->directory.'/archive')&&!is_link($this->directory.'/archive')&&!file_exists($this->directory.'/.archive-required')){return [];}
+        return (new EnterpriseIdentityStore($this->directory.'/archive'))->read($kind);
+    }
+    public function usage(): array
+    {
+        $state=$this->read();$usage=[];
+        foreach (['operations'=>500,'bindings'=>2000,'responses'=>4000,'sensors'=>100] as $kind=>$maximum) {
+            $usage[$kind]=['used'=>count($state[$kind]),'maximum'=>$maximum,'needs_attention'=>count($state[$kind])>=$maximum*.8];
+        }
+        foreach(['operations','responses'] as $kind){$rows=$this->archiveReport($kind);$bytes=strlen(json_encode((object)$rows,JSON_THROW_ON_ERROR));$usage['archive_'.$kind]=['used'=>count($rows),'maximum'=>20000,'bytes'=>$bytes,'maximum_bytes'=>4194304,'needs_attention'=>count($rows)>=16000||$bytes>=3355443];}
+        return $usage;
+    }
+    /** Archive first, then compact; failure leaves live replay evidence intact. */
+    public function maintain(int $now,int $retentionSeconds=604800): array
+    {
+        if ($now<1||$retentionSeconds<86400||$retentionSeconds>31536000) { throw new \InvalidArgumentException('Archive retention must be one day through one year.'); }
+        return $this->transaction(function(array &$state) use($now,$retentionSeconds): array {
+            $archive=new EnterpriseIdentityStore($this->directory.'/archive');$counts=['operations'=>0,'responses'=>0,'expired_bindings'=>0];
+            foreach (['operations','responses'] as $kind) {
+                $eligible=array_filter($state[$kind],static fn(array $row):bool=>($row['created_at']??$now)>0&&$row['created_at']<=$now-$retentionSeconds
+                    && ($kind==='operations'?in_array($row['state'],['accepted','provider_reported','failed'],true):$row['state']==='complete'));
+                if (!$eligible) { continue; }
+                $archive->transaction($kind,static function(array &$rows) use($eligible):void {
+                    foreach ($eligible as $id=>$row) { if (isset($rows[$id])&&$rows[$id]!==$row) { throw new \RuntimeException('Archive identity conflict. Live history was preserved.'); } $rows[$id]=$row; }
+                });
+                foreach ($eligible as $id=>$row) { unset($state[$kind][$id]); }$counts[$kind]=count($eligible);
+            }
+            foreach ($state['bindings'] as $id=>$row) { if ($row['expires_at']<=$now) { unset($state['bindings'][$id]);$counts['expired_bindings']++; } }
+            return ['success'=>true,'archived'=>$counts,'meaning'=>'Archived request identities remain replay-protected. Pending and uncertain operations were preserved.'];
+        });
     }
 }

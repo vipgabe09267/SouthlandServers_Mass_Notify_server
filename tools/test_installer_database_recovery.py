@@ -18,6 +18,8 @@ class FakeStatement {
  function __construct($sql){$this->sql=$sql;}
  function execute($args){
   $s=&$GLOBALS['fixture']; $sql=$this->sql;
+  if ($sql==='SHOW TABLES LIKE ?') {$this->rows=[[$args[0]]]; return true;}
+  if ($sql==='SELECT enabled FROM modules WHERE modulename = ?') {$this->rows=[[1]]; return true;}
   if(preg_match('/^SELECT \* FROM (modules|recordings) WHERE (modulename|filename) = \?/', $sql,$m)){
    $this->rows=array_values(array_filter($s[$m[1]],static fn($r)=>$r[$m[2]]===$args[0])); return true;
   }
@@ -30,6 +32,7 @@ class FakeStatement {
   }
   throw new RuntimeException('Unexpected query: '.$sql);
  }
+ function fetchColumn(){return $this->rows[0][0]??false;}
  function fetch($mode=null){return $this->rows[0]??false;}
  function fetchAll($mode=null){return $this->rows;}
 }

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Read and validate the SLS Mass Notify central configuration."""
 
-import importlib.util
 import json
 import ipaddress
 import os
@@ -11,9 +10,10 @@ from pathlib import Path
 
 import sys as _config_sys
 _config_sys.dont_write_bytecode = True
-_config_crypto_spec = importlib.util.spec_from_file_location("sls_config_crypto", Path(__file__).resolve().with_name("sls_config_crypto.py"))
-_config_crypto = importlib.util.module_from_spec(_config_crypto_spec)
-_config_crypto_spec.loader.exec_module(_config_crypto)
+import types
+_config_crypto_path = Path(__file__).resolve().with_name("sls_config_crypto.py")
+_config_crypto = types.ModuleType("sls_config_crypto"); _config_crypto.__file__ = str(_config_crypto_path)
+exec(compile(_config_crypto_path.read_bytes(), str(_config_crypto_path), 'exec'), _config_crypto.__dict__)
 from urllib.parse import urlparse
 
 
@@ -303,6 +303,7 @@ def main():
         "PIPER_NWS_VOICE": validated_voice(data.get("nws_piper_voice"), "en_US-amy-low.onnx"),
         "PIPER_ANNOUNCEMENT_VOICE": validated_voice(data.get("announcement_piper_voice")),
         "PIPER_NWS_VOLUME": scalar(data.get("nws_tts_volume"), 25),
+        "NWS_VOICEMAIL_ENABLED": "1" if data.get("nws_voicemail_enabled", "1") in (True, 1, "1") else "0",
         "PIPER_ANNOUNCEMENT_VOLUME": scalar(data.get("announcement_tts_volume"), 25),
         "PIPER_MAX_SECONDS": bounded_int(data.get("tts_max_seconds"), 1, 600, 30),
         "LOG_RETENTION_DAYS": bounded_int(data.get("log_retention_days"), 1, 365, 90),

@@ -4,9 +4,15 @@
 
 # SLS Mass Notifications Server
 
-Phone, desktop, weather, lightning, and scheduled notifications for FreePBX 17 / Debian 12. AGPL-3.0-or-later. Version `0.1.5-beta`.
+Phone, desktop, weather, lightning, and scheduled notifications for FreePBX 17 / Debian 12. AGPL-3.0-or-later. Version `0.1.6-beta`.
 
-The 0.1.5-beta prerelease includes the repaired older-release upgrade path, storage checks for dedicated mounts and small `/tmp` filesystems, retryable update checks, faster Enterprise Labs account lookup and dashboard redirection when its warning is cancelled. Existing 0.1.5-beta installations must rerun the current signed installer to receive this same-version repair. See [authenticated installation and recovery](INSTALL.md#authenticated-installation-and-recovery).
+> This is the corrected `0.1.6-beta` prerelease replacing the withdrawn October 10 package. SLS is beta software for noncritical testing. Install the signed replacement manually if an earlier `0.1.6-beta` is already installed; equal-version automatic updates are intentionally skipped.
+
+SLS is beta software for noncritical testing. Do not rely on it for critical or urgent information. After setup, or an upgrade to this version, the FreePBX administrator must acknowledge this warning. The confirmation remains disabled for five visible seconds; there is no close button. The acknowledgment is saved in the encrypted central configuration.
+
+After setup, every FreePBX administrator must acknowledge the beta warning separately on their first authenticated page visit. Agreement requires five visible seconds, is saved per account in the encrypted configuration, and persists across later logins while the warning revision remains current. An existing receipt counts only for the administrator who originally agreed.
+
+Version 0.1.6-beta corrects nominal 4 GiB memory admission, separates operating headroom from installation workspace, and supports activation and recovery when scratch and module files are on different filesystems. Dial-in paging uses one verified audience across PHP and Python and excludes the caller’s contact while retaining other handsets. See [installation and recovery](INSTALL.md#authenticated-installation-and-recovery).
 
 ## Enterprise Labs
 
@@ -21,16 +27,16 @@ Enterprise Labs automatically opens the requested danger notice on the first vis
 
 ## Install or update
 
-Install or upgrade to `0.1.5-beta` using the version-pinned installer below.
+Install or upgrade to `0.1.6-beta` using the version-pinned installer below.
 
 Run as `root` on the PBX:
 
 ```bash
 cd /tmp
 curl -fsSL -o sls-install.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.5-beta/tools/install_release.sh
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.6-beta/tools/install_release.sh
 chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.5-beta/slsmassnotifyserver-0.1.5-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.6-beta/slsmassnotifyserver-0.1.6-beta.tgz' \
 ./sls-install.sh
 ```
 
@@ -84,28 +90,29 @@ The current catalog includes four US English voices plus Spanish (Spain), French
 
 The installer requires **additional free workspace**, derived from those managed trees and the exact package/model catalog. Existing allocations are measured again on every check. Missing runtimes use the measured pinned reference; missing voices use the sixteen exact catalog file sizes. The ten compatible pinned wheels total **77,802,965 bytes (74.20 MiB)** according to their [PyPI release metadata](https://pypi.org/pypi/onnxruntime/1.30.0/json), including [NumPy](https://pypi.org/pypi/numpy/2.4.6/json) and [Piper](https://pypi.org/pypi/piper-tts/1.8.0/json). The updated pinned environment measured **207.69 MiB** on October 2 and passed isolated speech generation with all four US English catalog voices. NumPy 2.5 requires Python 3.12, so this Python 3.11 release retains compatible NumPy 2.4.6. Pip uses binary wheels without a persistent download cache. A platform without compatible wheels fails with an actionable error; the amd64 measurement is not a universal architecture guarantee.
 
-A read-only check on October 5, 2026 requires approximately **0.94 GiB additional persistent SLS free space** and **1.47 GiB temporary workspace** on this PBX (about **2.41 GiB** when both share a filesystem). The fresh-host reference is **1.35 GiB persistent** plus **1.25 GiB temporary** (about **2.60 GiB** combined). These include authenticated package review and rollback storage. The installer recalculates this from actual allocations and missing models; this is free space dedicated to SLS, separate from total PBX disk capacity.
+Resource reports distinguish **runtime**, **prepare**, and **install** budgets. Ordinary capacity checks reserve bounded state writes, remaining configuration backups and sequential log compaction. Initial preparation reserves signed download and extraction workspace. After verifying the candidate, installation measures its actual module, runtime, API, portal, asset and trust payloads and adds dependency and rollback workspace. Required bytes and inodes are combined only for paths on the same filesystem; total disk size is not an admission floor. Use the installer report for this host’s current requirements rather than reserving a fixed disk size.
 
 | Workspace component | Calculation |
 | --- | --- |
 | Runtime replacement | The larger of the measured runtime or the pinned environment plus a permitted package payload |
 | Voices | Total missing catalog bytes, or one largest model for atomic repair, whichever is larger |
 | State and configuration backups | Phone and Weather journal replacement space, the larger of the actual schedule journal or its 10 MiB backup limit, a 3 MiB encrypted configuration write, up to 25 concurrent 2 MiB job writes, and remaining space for 20 retained 3 MiB config backups |
-| Module, public assets, and API copies | Each actual destination filesystem receives a conservative package-payload allowance: the enforced 50 MiB extraction limit plus allocation overhead for up to 2,000 archive entries |
+| Module, public assets, and API copies | Each destination receives its measured authenticated payload plus per-entry allocation overhead; the bounded catalog is used before the candidate is available |
 | Event log compaction | Two 64 MiB copies for the original backup and retained temporary stream; event logs are compacted sequentially |
 | Permanent trust generation | A bounded authenticated package payload plus stock and release manifests on the actual trust-store filesystem |
-| Temporary installation/recovery | The enforced 52 MiB download limit and metadata, extraction and failed-release recovery, the measured old module and runtime/API/recording snapshot, protected configuration snapshot, pinned wheel downloads, unpacking and old-package recovery, and one largest voice download |
+| Persistent installation recovery | Root-private transaction metadata, authenticated previous/candidate sources, protected configuration and measured runtime/API/recording snapshots (using logical bytes when a sparse/compressed allocation is smaller), retained until recovery is verified |
+| Temporary installation workspace | The enforced 52 MiB download limit and metadata, extraction and failed-release recovery, pinned wheel downloads, unpacking and old-package recovery, and one largest voice download |
 | Authenticated package review | Bounded previous/candidate source copies, previous release download, two upstream signed packages and one active GPG verification workspace, missing signed helper repairs, and bounded cache quarantine |
 
 These totals include approximately **283 MiB for state writes, bounded backup growth and log compaction**. They are conservative workspaces, not the installed size or an arbitrary 3 GiB requirement. Actual results change with managed file sizes, missing voices, and filesystem allocation units. The helper reports every component and path. Budgets add when paths share a filesystem; separate or bind-mounted voice/data/runtime/API locations are checked by device identity. No partition size, whole-volume minimum, or storage quota is imposed.
 
 **Provision retained history and simultaneous rendering separately.** General Settings provides a combined generated-media cache target, default **512 MiB** (64–4096 MiB), stored as `generated_media_cache_mib` in the central `.config`. Periodic maintenance removes age-expired files first, then the oldest unused speech/images/phone XML if the combined payload bytes exceed that target. It preserves queued/playback/configuration/desktop references, custom recordings and the first 15 minutes after file creation. The target limits retained unused cache; it is not a hard disk quota or a reservation. Protected usage above the target raises a current storage warning, cleared by a later healthy measurement. Bounded cleanup retries automatically; incomplete inventories or unreadable references preserve files.
 
-There is no enforced global speech-synthesis concurrency limit, so passing the workspace check does not establish that an arbitrary notification workload has enough storage. Raw mono 16-bit PCM uses `seconds × voice sample rate × 2` bytes, plus its WAV header; PBX audio uses `seconds × 8,000 × 2`. For example, 600 seconds uses 18.3 MiB at 16 kHz, or 50.5 MiB at 44.1 kHz, before converted speech and sequence copies. Budget raw audio, converted speech, the final sequence, and its temporary replacement for every simultaneously rendering job. Include opening/closing sounds in sequence duration.
+Speech synthesis uses a shared bounded queue, with one active synthesis by default. Configured concurrency and media reservations limit generation; passing the workspace check does not certify an arbitrary notification workload. Raw mono 16-bit PCM uses `seconds × voice sample rate × 2` bytes, plus its WAV header; PBX audio uses `seconds × 8,000 × 2`. For example, 600 seconds uses 18.3 MiB at 16 kHz, or 50.5 MiB at 44.1 kHz, before converted speech and sequence copies. Budget raw audio, converted speech, the final sequence, and its temporary replacement for every simultaneously rendering job. Include opening/closing sounds in sequence duration.
 
 For operational sizing, measure retained-byte growth across representative busy days and peak generation between successful cleanup runs; add that growth over the configured retention window to the measured footprint and required workspace. Terminal jobs are eligible after 30 days, generated images after 3 days, and unreferenced generated audio after 15 minutes. Active jobs, pending deliveries, and desktop history can retain media longer. Event-log retention follows the configured days; oversized or unsafe records can defer cleanup. Its temporary recovery files use the private `event-log-recovery` directory under SLS data, while live event logs keep their existing paths. Unfinished recovery files block another cleanup until reviewed. Monitor free space and deferred cleanup instead of treating those ages as disk quotas. Ordinary PBX recordings, voicemail, backups, and OS package work need their own budget.
 
-- **Platform and measurement:** FreePBX 17 / Debian 12 with supported Asterisk/PJSIP capabilities. Checks honor CPU affinity and container CPU/RAM allocations. A 5% allowance applies to reported usable RAM; CPU and free-space requirements have no allowance. Sustained CPU matters: oversubscribed virtual CPUs can delay calls and speech.
+- **Platform and measurement:** FreePBX 17 / Debian 12 with supported Asterisk/PJSIP capabilities. Checks honor CPU affinity and container CPU/RAM allocations. Kernel reservations may reduce reported RAM by at most 256 MiB (and never more than one sixteenth of the tier). A cgroup quota below the nominal tier does not receive that allowance; scratch on tmpfs also consumes the RAM budget. CPU and free-space requirements have no allowance. Sustained CPU matters: oversubscribed virtual CPUs can delay calls and speech.
 - **Installation scratch:** workspaces use `/tmp`, or `/var/tmp` when `/tmp` is too small and the complete disk check passes there. Downloads, extracted files, recovery copies and speech dependency work use the selected location. Dedicated SLS mounts are checked directly; unused parent volumes have no separate minimum. Genuine target or scratch shortages still block installation.
 - **Admission:** installation checks both configured capacities and SLS headroom before dependency/module changes. Capacity changes use the same combined calculation. Errors identify the measured shortage and required amount. Existing clients are never deleted to satisfy a failed check.
 - **Desktop transport:** the global limit remains 32 simultaneous SSE connections, with two per desktop username. The reviewed desktop app supports five-second JSON fallback after a stalled or throttled stream. Authenticated polling, ACKs, and stream connections share a 120-request-per-minute budget per username; failed-login protection is separate, so clients behind one public IP do not share the normal traffic budget. Limiter storage supports the configured fleet up to 1,000 clients, and throttled responses include `Retry-After`. These limits and the hardware policy are not a 1,000-client load certification; test the fleet, burst rate, and PBX workload together.
@@ -129,6 +136,7 @@ The paging editor uses the same header and section styling as the other SLS page
 - **Weather Alerts:** monitor up to five U.S. Weather.gov zones. Each zone selects its own phones, desktops, email recipients, webhooks, and quiet hours. EAS emails include the spoken announcement, affected areas, full NWS description and protective instructions; custom templates retain these details. Notification Details shows bounded email/webhook transport evidence, including HTTP failures. Old records without evidence remain explicitly unknown. New observations continue while queued alerts are delivered chronologically; expiry, cancellation, and overlapping-zone deduplication are checked before submission.
 - **Lightning Alerts:** configure up to five areas with their own location, radius, strike type, destinations, quiet hours, and all-clear rules. Adaptive polling follows current Weather.gov alerts and the forecast period active now. Query cadence, provider token allowance, and fresh-observation checks still apply.
 - **Scheduling:** choose specific dates or repeat every 7 or 14 days at a PBX-local time. Recurrence is a finite series of up to five years; review the displayed last occurrence. It does not renew indefinitely.
+- **Dial-in Paging:** speak to registered recipients and leave the recorded page for unanswered extensions with enabled FreePBX mailboxes. Voicemail starts enabled and can be disabled independently on the paging page. An offline group can receive voicemail without a registered phone; with voicemail disabled, at least one receiving phone must be registered. The caller is excluded. See [paging](docs/PAGING.md).
 - **Locations and Audiences (Labs):** start with the default site, organize buildings/floors/rooms, combine a person’s devices or shared destinations, and review saved groups or individual devices for announcements, scheduling, Weather and Lightning. Recipient directories are managed here. Saved audience groups are immutable snapshots. See [locations](docs/LOCATIONS.md).
 - **Operator Portal (Labs):** disabled by default; enable it in **Operator Access**. The PBX link opens in a new tab. Create independent logins in the PBX **Operator Access** page. Operators use HTTPS `/mass-notify/`, a personal password and mandatory authenticator verification. Assign actions, channels, sites, locations, saved audiences or personal devices; workers recheck permission changes. The separate portal defaults to dark mode and follows local PBX branding. See [operator access](docs/OPERATORS.md).
 - **Operator recovery:** register an email per login for up to two self-service recovery emails. Administrators can generate or revoke a single-use 24-hour reset link; saving a new password requires the enrolled authenticator. Failed passwords have durable per-IP limits of 6/5 minutes, 12/10 minutes and 20/24 hours. Recovery and sign-in events are audited, and announcement history identifies the verified operator. See [recovery and sign-in limits](docs/OPERATORS.md#password-recovery).
@@ -153,6 +161,16 @@ A shared phone admission ledger is used for announcements, Weather, Lightning, a
 
 A collector fault does not prevent FreePBX reload or Apply Config from completing. The reload logs a diagnostic, and SLS Help/Deployment readiness reports current collector health. Installation and restore verification remain strict; new SLS phone audio still requires a fresh authenticated AMI heartbeat.
 
+### Internal voicemail fallback
+
+**Weather Alerts > Weather Alert Audio** and **Lightning Alerts > Alert Audio** each have **Leave voicemail for unanswered extensions**, enabled by default. **Dial-in Paging > Paging access** has the independent **Record live pages for voicemail** option, also enabled by default. Existing saved disabled values are preserved. Preferences stay in the encrypted central `.config`; save and Apply Config to activate a change.
+
+Weather and Lightning save their complete prepared alert audio, including a configured all-clear. Live paging records the caller's page and delivers it after the page ends. For each selected extension, voicemail is eligible only if none of its selected handsets answered; there is at most one deposit per extension and page, and the paging caller is excluded. All-offline live groups can receive voicemail when eligible mailboxes exist. Disabling live-page voicemail prevents that recording. Ordinary Dashboard TTS announcements and external-number calls are unchanged; carrier-greeting detection is not implemented.
+
+Asterisk writes messages through its native voicemail application, using the extension's current mailbox and normal storage, message-waiting indication and notification settings. SLS does not create mailboxes, change voicemail configuration or bypass mailbox length/capacity policies. A PBX without usable voicemail continues to support phone paging, while ineligible or failed fallback deliveries retain a specific outcome. Mailbox storage is managed by FreePBX/Asterisk, separately from SLS generated-media retention.
+
+Manual Weather/Lightning tests and saved channel checks do not leave voicemail. Validate actual mailbox delivery using an explicitly approved internal recipient; a mailbox deposit does not prove that a person heard the message.
+
 External voice is experimental and disabled by default. Saved international numbers can be selected on the Dashboard, in groups, and in schedules. The default delegates to FreePBX outbound routes; a specific PJSIP trunk and outgoing caller-ID/DID override can be selected. A DID selection supplies caller ID; it does not create an inbound route, and carrier/forced-trunk caller-ID policy still applies. Sent work keeps its original recipient and routing snapshot. Edited or revoked destinations cannot redirect an already submitted alert.
 
 **External voice supports a restricted routing profile.** SLS checks the loaded FreePBX dialplan before submission and again before dialing. Supported calls ignore SIP forwarding using a call-local Dial option; ordinary PBX calls and saved trunk settings are unchanged. Reviewed FreePBX 17 CRM, missed-call, allowlist and outbound-route email metadata callbacks are accepted only when their exact context bodies and script hashes match the shipped compatibility profiles. Changed callbacks, route PINs, recording hooks, unknown call-producing hooks and incompatible per-trunk Dial overrides are rejected with a specific reason. Vendor module updates may require a new reviewed profile.
@@ -165,13 +183,13 @@ Each external recipient has an independent call and playback start. SLS requires
 
 ### Audio reservation durability
 
-`0.1.5-beta` coordinates recorded announcements, Weather, Lightning, dial-in paging, and generated-media cleanup through a permanent audio reservation lock. Reservation updates replace complete, synchronized JSON documents instead of rewriting the active journal in place. Existing recipient, waiting-page, and media leases are preserved; cleanup holds the shared lock until deletion finishes.
+`0.1.6-beta` coordinates recorded announcements, Weather, Lightning, dial-in paging, and generated-media cleanup through a permanent audio reservation lock. Reservation updates replace complete, synchronized JSON documents instead of rewriting the active journal in place. Existing recipient, waiting-page, and media leases are preserved; cleanup holds the shared lock until deletion finishes.
 
 Install these writers and readers together with the bundled installer. It waits for existing workers and live pages to drain and bridges the old journal lock with the permanent lock during migration. Standalone older audio helpers must also finish before the upgrade can proceed. Empty or corrupt existing journals, unsafe paths, and a missing previously initialized journal block new audio or cleanup with an error; they are not automatically reset. Preserve the journal, lock, and installer log for review rather than deleting them or restoring older delivery state. Isolated durability and interoperability tests do not establish handset playback or power-loss behavior on every storage device.
 
 ### Announcement email
 
-General announcement email is included in `0.1.5-beta`. Validation uses isolated fake mail programs and browser fixtures; no real external email delivery or inbox receipt has been verified.
+General announcement email is available since `0.1.5-beta`. Validation uses isolated fake mail programs and browser fixtures; no real external email delivery or inbox receipt has been verified.
 
 Open **General Settings > Announcement Email**, explicitly enable the channel, and save up to **50 named recipients**. It is disabled by default. Configure the existing email sender name/domain/local part, then **Save and Apply Config**. The Dashboard's **Email** selector supports search and selected counts; saved recipients can also belong to announcement groups, schedules, incident templates and supervisor follow-ups. Email-only announcements can use **Audio: None**. Saving recipients does not send mail. All configuration, including recipient IDs, enabled flags, addresses and sender identity, stays in the protected central `.config`; receipts and submission history are separate operational data.
 
@@ -240,6 +258,10 @@ Configured system notification recipients also receive announcement-worker and s
 
 Discord uses the packaged `assets/webhook-builder.png` downloaded during development. Alert payloads refer to the PBX-hosted HTTPS copy with a content revision and the configured public Control API port; they do not fetch branding from the Southland Servers website. The card uses a small footer icon, with no large branding image or repeated author icon. The PBX image route must be reachable by Discord.
 
+Email delivery is disabled on fresh installations. Configure Postfix and recipients in **General Settings → Delivery → Manage Delivery**; enable announcement email explicitly. Weather and Lightning email destinations are chosen in their respective settings. Upgrades preserve existing configured email routes.
+
+SLS email requires local Postfix `sendmail` and `postqueue -j`. Before submission, a bounded queue check stops SLS email at a backlog of 200 messages or when the queue cannot be verified. Shared limits cap total submissions at 120 per minute, 1,000 per hour and 5,000 per day; system faults have stricter limits of 2, 10 and 20. All SLS producers share these limits, including password recovery. Unknown or interrupted mail handoffs are never replayed automatically. These are SLS limits; they do not change Postfix or other PBX mail producers. Cron output goes to bounded private diagnostics rather than cron email.
+
 ## SLS console
 
 The signed installer adds `slsconsole` to `/usr/local/bin`. Run control commands with `sudo`:
@@ -250,6 +272,7 @@ The signed installer adds `slsconsole` to `/usr/local/bin`. Run control commands
 | `sudo slsconsole stop` | Pause new SLS notifications. Existing PBX calls and receipt collection continue. |
 | `sudo slsconsole start` | Start the SLS collector if needed and resume notification admission. |
 | `sudo slsconsole reboot` | Restart the SLS collector while admission is paused, then restore the previous running or stopped state. |
+| `sudo slsconsole uninstall` | Remove SLS using its included, authenticated offline uninstaller. Preserve configuration, media, delivery history and logs. |
 
 Use `slsconsole help` for usage. These commands do not reboot the host or restart Asterisk, Apache or the FreePBX firewall. Pause state is a strict `runtime_enabled` boolean in the encrypted central `.config`, synchronized with an existing staged configuration. Other settings and feature switches are preserved. Existing accepted notifications are not resent; deferred work keeps its original expiry. A failed collector restart leaves admission paused. Status and receipt APIs remain available while stopped.
 
@@ -297,7 +320,7 @@ A restricted named credential grants direct email access through `audience.email
 }
 ```
 
-Omitted email selectors preserve existing non-email API behavior. Calls containing email destinations return queued work; inspect its delivery receipts rather than treating queue acceptance as mail-service acceptance. See [incident email destinations](docs/INCIDENT_API.md#email-destinations) for template and escalation fields. These email additions are available in `0.1.5-beta`.
+Omitted email selectors preserve existing non-email API behavior. Calls containing email destinations return queued work; inspect its delivery receipts rather than treating queue acceptance as mail-service acceptance. See [incident email destinations](docs/INCIDENT_API.md#email-destinations) for template and escalation fields. These email additions are available since `0.1.5-beta`.
 
 Configure **API reverse proxies** only when using a proxy you administer. List its exact IPv4/IPv6 CIDRs and configure it to overwrite `X-Forwarded-For` and `X-Forwarded-Proto`. Unlisted peers cannot supply trusted client addresses; malformed or missing forwarded information from a listed proxy is rejected. Forwarded hostnames are never trusted. Leave the list empty for direct connections. Proxy trust settings and credential management are restricted to the authenticated FreePBX administrator UI; Control API configuration mutations cannot change them.
 
@@ -310,7 +333,7 @@ Optional [audit forwarding](docs/AUDIT_FORWARDING.md) sends the same bounded rec
 
 Manual and opt-in automatic updates verify a publisher-signed manifest covering the installer and TGZ. The updater resolves the release to a commit and installs the exact verified archive. New fixes require a new version; same-version replacements do not trigger updates. Older unsigned releases require their own tagged installer. See [installation and recovery](INSTALL.md) for offline installs, prerequisites, repair, and rollback.
 
-The current 0.1.5-beta installer restores missing previous helpers from authenticated release bytes and quarantines recognized Python caches before preparing rollback. It reports unknown runtime changes by filename, retains stage/helper diagnostics in the protected log, and checks actual target filesystems for free bytes, writable mounts and available inodes. Already installed 0.1.5-beta systems need the current installer to receive this same-version repair.
+The installer restores missing previous helpers from authenticated release bytes and quarantines recognized Python caches before preparing rollback. Changed Framework/Dashboard versions require new signed upstream package verification. Unknown changes require review. A stale collector can be repaired only after independent process, spool, channel and media checks establish that SLS is idle; delivery history remains in place and final admission requires a fresh collector heartbeat. Run `bash ./sls-install.sh --inspect` with the release URL or offline signed assets to collect private evidence without changing packages, services, keys, trust pointers or active/pending settings.
 
 Locally signed custom modules may display **Unknown** in FreePBX. Verification must still return trusted status `129`. Dashboard integration is checked and repaired after FreePBX updates; review health after any upgrade or restore.
 
@@ -318,23 +341,23 @@ Update and repair failures retain their command exit status and failure category
 
 ## Uninstall
 
-Normal uninstall preserves the central configuration, backups, uploaded tones, and schedule execution history:
+The uninstaller is included in the installed software. No download, reinstallation or additional SLS software is required. Normal uninstall preserves the central configuration, backups, uploaded tones, schedule execution history, delivery history and logs:
 
 ```bash
-cd /tmp
-curl -fsSL -o sls-uninstall.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.5-beta/tools/uninstall_release.sh
-chmod +x sls-uninstall.sh
-./sls-uninstall.sh
+sudo slsconsole uninstall
+# Direct equivalent, including older installations that already bundle it:
+sudo /usr/local/bin/sls_mass_notify/sls_mass_notify_uninstall.sh
 ```
 
 A complete purge is destructive and requires explicit confirmation. Configuration recovery keys are retained even after a purge so older encrypted backups remain recoverable; see [recovery-key retention](docs/RECOVERY.md) before removing them. See [INSTALL.md](INSTALL.md) before removing a live installation.
+
+The uninstaller uses retained publisher-authenticated helpers and reviewed Framework/Dashboard inventories. Missing unrelated workers, including `sls_privileged_install.py`, do not block removal. It drains notification workers before teardown and refuses active phone delivery. Changed security evidence still requires review. A stopped PBX is not started; a reload failure is reported separately from completed software removal, with its recovery log retained.
 
 ## Documentation and development
 
 [Installation and recovery](INSTALL.md) · [Phone formats](PHONE_FORMATS.md) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md)
 
-Run `./tools/build_tgz.sh` from the repository root to run the release checks and produce `dist/slsmassnotifyserver-0.1.5-beta.tgz`. Signing requires the publisher’s private Ed25519 key outside the repository; `SLS_RELEASE_SIGNING_KEY` selects it. Publish the archive, `release-manifest.json`, and `release-manifest.sig` together. No configuration, credentials, voice models, generated media, logs, or private signing keys belong in the package.
+On a development host, run `./tools/build_tgz.sh` from the repository root. On a PBX, use `bash tools/run_isolated_tests.sh --build` to run all checks in private mount, network and process namespaces; sign its unsigned candidate with `python3 tools/sign_release.py` afterward. The build produces `dist/slsmassnotifyserver-0.1.6-beta.tgz`. Signing requires the publisher’s private Ed25519 key outside the repository; `SLS_RELEASE_SIGNING_KEY` selects it. Publish the archive, `release-manifest.json`, and `release-manifest.sig` together. No configuration, credentials, voice models, generated media, logs, or private signing keys belong in the package.
 
 On a development PBX, `bash tools/run_isolated_tests.sh` runs regression fixtures in private network, process, and mount namespaces with disposable PBX state. It requires root and Linux namespace support. It does not build, sign, install, or send alerts. Device delivery and destructive install/restore acceptance tests still require an explicitly authorized test environment.
 
@@ -345,3 +368,42 @@ Dependency hashes, SBOM generation and offline development validation are docume
 Release channel, version pins, automatic windows and rollout delays are documented in [Update policy](docs/UPDATE_POLICY.md).
 
 The Control API event log supports bounded newest-first pagination with `cursor`, `next_cursor`, `has_more` and `scan_limited`. A cursor freezes the file prefix while new events append. Invalid cursors return 400, changed/rotated snapshots return 409 (restart without the cursor), and unavailable or busy storage returns retryable 503. Each page reads at most 512 KiB and returns at most 100 records.
+
+## Readiness improvements in 0.1.6-beta
+
+The candidate adds persistent, authenticated installer recovery, a read-only
+installation doctor and a verified offline support-bundle workflow. Interrupted
+upgrades retain their recovery evidence. Unsupported Python, PHP, mount or
+service layouts fail with a specific explanation before activation. See
+[installer operations](docs/INSTALLER_OPERATIONS.md).
+
+Phone discovery on dashboard and settings pages uses a bounded, timestamped
+background snapshot. Sending checks registration again. Speech producers share
+one admission queue: one synthesis job, eight waiting jobs and a 15-second wait
+by default. Generated-media admission uses a 512 MiB budget and leaves at least
+128 MiB free; protected active files are retained. These controls limit SLS work;
+they do not certify PBX call throughput.
+
+System recordings have search, pagination and incomplete-scan warnings. Shared
+calendar programmes support A/B days, holidays, weekly rotations and whole-day
+substitutions. Saved schedules retain their reviewed dates when a shared
+calendar changes. Operator logins can expire at an exact date and time in the
+PBX timezone; expired accounts cannot sign in, continue a session or authorize
+new queued delivery.
+
+Additional Labs controls remain disabled until configured:
+
+- Encrypted browser Web Push for email-verified subscribers, plus scoped ntfy
+  and Gotify destinations using the normal immutable delivery queue.
+- Reviewed incident translations selected per recipient, with explicit fallback,
+  frozen voices and one absolute expiry across language cohorts.
+- OAuth credential renewal/revocation, directory attribute mappings and an
+  explicit confirmation for large deactivation plans.
+- Archived integration/drill reports, outage-readiness review, speaker firmware
+  and acceptance records, device-enforced timed door access and signed CAP
+  Test/Exercise validation.
+
+A push service or webhook accepting a message does not confirm screen display
+or human receipt. Provider accounts, real speakers/controllers, multi-host
+fencing and a full FreePBX VM installation require separate qualification.
+See [verification and release limits](docs/READINESS_REVIEW_0.1.6.md).

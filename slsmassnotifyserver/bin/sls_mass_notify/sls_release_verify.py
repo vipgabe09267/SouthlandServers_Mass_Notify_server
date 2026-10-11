@@ -2,7 +2,7 @@
 """Verify a publisher-signed release without executing downloaded code."""
 import argparse
 import hashlib
-import importlib.util
+import types
 import json
 import re
 import subprocess
@@ -11,9 +11,9 @@ from pathlib import Path
 
 PUBLIC_KEY = Path(__file__).with_name('release-signing.pub')
 sys.dont_write_bytecode = True
-_spec = importlib.util.spec_from_file_location('sls_release_trust', Path(__file__).with_name('sls_release_trust.py'))
-trust = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(trust)
+_path = Path(__file__).with_name('sls_release_trust.py')
+trust = types.ModuleType('sls_release_trust'); trust.__file__ = str(_path)
+exec(compile(_path.read_bytes(), str(_path), 'exec'), trust.__dict__)
 
 
 def digest(path):

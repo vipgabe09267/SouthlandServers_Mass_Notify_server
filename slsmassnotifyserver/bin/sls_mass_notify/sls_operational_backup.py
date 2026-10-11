@@ -23,6 +23,7 @@ MAX_ARCHIVES = 5
 FORMAT = 'sls-operational-recovery-v1'
 ENTERPRISE_FENCES = {
     '.enterprise-state-required': b'SLS_ENTERPRISE_STATE_V1\n',
+    '.control-idempotency-required': b'SLS_ENTERPRISE_STATE_V1\n',
     '.enterprise-operations-required': b'SLS_ENTERPRISE_OPERATIONS_V1\n',
     '.enterprise-integrations-required': b'SLS_ENTERPRISE_INTEGRATIONS_V1\n',
 }
@@ -46,6 +47,8 @@ EXACT = {
     '.incident-replay-blocked.json',
     '.incident-replay-required',
     '.enterprise-state-required',
+    '.control-idempotency-required',
+    'enterprise-integrations/.archive-required', 'enterprise-operations/.archive-required',
     '.enterprise-operations-required',
     '.enterprise-integrations-required',
     '.enterprise-cluster-required.json',
@@ -63,11 +66,13 @@ PATTERNS = [
     re.compile(r'announcement-jobs/job_[a-f0-9]{32}\.json'),
     re.compile(r'incidents/inc_[a-f0-9]{32}\.json'),
     re.compile(r'sipnotify/acknowledgements/[a-f0-9]{64}\.json'),
-    re.compile(r'enterprise-state/(?:login|replay|directory_plans|subscriber_tokens|identity_audit)\.(?:json|required)'),
+    re.compile(r'enterprise-state/(?:login|replay|directory_plans|subscriber_tokens|identity_audit|browser_subscriptions|browser_push_claims|browser_test_events|connector_claims|oauth_refresh)\.(?:json|required)'),
     re.compile(r'enterprise-floorplans/img_[a-f0-9]{64}'),
+    re.compile(r'control-idempotency/announcement_claims\.(?:json|required)'),
+    re.compile(r'enterprise-(?:operations|integrations)/archive/(?:approvals|drills|operations|responses)\.(?:json|required)'),
 ]
 DIRECTORIES = ['', 'announcement-jobs', 'incidents', 'incidents/archive', 'sipnotify', 'sipnotify/acknowledgements',
-               'enterprise-state', 'enterprise-cluster', 'enterprise-operations', 'enterprise-integrations', 'enterprise-floorplans']
+               'enterprise-state', 'control-idempotency', 'enterprise-integrations/archive', 'enterprise-operations/archive', 'enterprise-cluster', 'enterprise-operations', 'enterprise-integrations', 'enterprise-floorplans']
 
 
 class RecoveryError(RuntimeError):

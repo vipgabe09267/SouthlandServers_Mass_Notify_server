@@ -21,6 +21,10 @@ if($mode==='invalid'){echo json_encode(['ok'=>false,'state'=>'rejected','error_c
 if($mode==='badjson'){echo 'bad';exit(0);}
 if($mode==='oversized'){echo str_repeat('x',10000);sleep(20);exit(0);}
 if($mode==='nonzero'){exit(1);}
+if(str_starts_with($mode,'mail_')){
+ echo json_encode(['ok'=>false,'state'=>'rejected','retryable'=>false,'submission_started'=>false,
+ 'recipient_id'=>$e['recipient_id'],'message_id'=>$e['message_id'],'error_code'=>$mode]);exit(0);
+}
 $state=$mode==='temporary'?'rejected':($mode==='uncertain'?'uncertain':'accepted');
 echo json_encode(['ok'=>$state==='accepted','state'=>$state,'retryable'=>$mode==='temporary',
  'recipient_id'=>$e['recipient_id'],'message_id'=>$mode==='wrong_id'?'wrong':$e['message_id'],
@@ -35,6 +39,10 @@ try {
         $fixture->mode=$mode;$start=microtime(true);$result=$fixture->send($envelope);
         if($result['state']!==$expected || $result['retryable']!==in_array($mode,['temporary','not_started'],true))throw new RuntimeException('Sender protocol mismatch: '.$mode.' '.json_encode($result));
         if(microtime(true)-$start>3)throw new RuntimeException('Private sender deadline/cleanup exceeded fixture bound');
+    }
+    foreach(['mail_queue_full','mail_queue_unavailable','mail_rate_limited','mail_admission_unavailable']as$mode){
+        $fixture->mode=$mode;$result=$fixture->send($envelope);
+        if($result['state']!=='failed'||$result['retryable']!==false||$result['submission_started']!==false||!str_contains($result['detail'],'mail'))throw new RuntimeException('Mail admission refusal was not surfaced safely: '.$mode);
     }
     echo "Actual private CLI stdin/protocol/timeout/oversized-output handling passed; no real mailer invoked.\n";
 }finally{unlink($helper);rmdir($root);}

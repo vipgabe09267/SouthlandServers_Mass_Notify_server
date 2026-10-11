@@ -38,7 +38,7 @@ class EnterpriseIntegrationsProvider
     {
         if (($config['enabled']??'0')!=='1') { throw new \DomainException('Incident meeting creation is disabled.'); }
         $provider=$config['provider']; $token=$config[$provider==='google_meet'?'google_access_token':$provider.'_access_token']??'';
-        if ($token==='' || preg_match('/[\r\n]/',$token)) { throw new \DomainException('A valid provider OAuth access token is required.'); }
+        if ($token==='' || preg_match('/[\r\n]/',$token)||(($config['oauth_expires_at']??0)>0&&$config['oauth_expires_at']<=time())) { throw new \DomainException('A valid, unexpired provider OAuth access token is required.'); }
         if ($provider==='zoom') {
             $url='https://api.zoom.us/v2/users/'.rawurlencode($config['zoom_user']).'/meetings';
             $payload=['topic'=>$title,'type'=>2,'start_time'=>gmdate('Y-m-d\TH:i:s\Z',$start),'duration'=>$duration,
@@ -63,8 +63,15 @@ class EnterpriseIntegrationsProvider
     public function door(array $config,array $door,string $operation): array
     {
         if (($config['enabled']??'0')!=='1' || $config['origin']==='' || $config['username']==='' || $config['password']==='') { throw new \DomainException('Save and enable the authorized Axis controller before using its API.'); }
-        if (!in_array($operation,['read','lock','unlock'],true) || empty($door['allow_'.$operation])) { throw new \DomainException('This operation is outside the saved door permission.'); }
-        $command=['read'=>'tdc:GetDoorState','lock'=>'tdc:LockDoor','unlock'=>'tdc:UnlockDoor'][$operation];
+        if (!in_array($operation,['read','lock','unlock','access'],true) || empty($door['allow_'.$operation])) { throw new \DomainException('This operation is outside the saved door permission.'); }
+        if($operation==='access'){
+            $configuration=self::jsonResult($this->request($config['origin'].'/vapix/doorcontrol','{"tdc:GetDoorList":{"Limit":100}}',['Content-Type: application/json','Accept: application/json'],$config),[200]);
+            $matches=array_values(array_filter($configuration['Door']??[],static fn($row)=>is_array($row)&&($row['token']??'')===$door['token']));
+            if(count($matches)!==1||!preg_match('/^PT([1-9][0-9]?)S$/D',$matches[0]['AccessTime']??'',$duration)||(int)$duration[1]>($door['maximum_access_seconds']??10)){
+                throw new \DomainException('Controller access timer is unconfirmed or exceeds the saved maximum. Configure the device timer before granting timed access.');
+            }
+        }
+        $command=['read'=>'tdc:GetDoorState','lock'=>'tdc:LockDoor','unlock'=>'tdc:UnlockDoor','access'=>'tdc:AccessDoor'][$operation];
         $body=self::jsonResult($this->request($config['origin'].'/vapix/doorcontrol',json_encode([$command=>['Token'=>$door['token']]],JSON_THROW_ON_ERROR),['Content-Type: application/json','Accept: application/json'],$config),[200]);
         if (isset($body['Fault']) || isset($body['fault']) || isset($body['error'])) { throw new \DomainException('The Axis controller returned an API fault.'); }
         if ($operation==='read') {
@@ -75,8 +82,32 @@ class EnterpriseIntegrationsProvider
             }
             return ['state'=>'observed','door_id'=>$door['id'],'observed'=>$fields,'detail'=>'Controller-reported door telemetry; physical verification may still be required.'];
         }
-        if ($body!==[] && !isset($body[$operation==='lock'?'LockDoorResponse':'UnlockDoorResponse'])) { throw new \RuntimeException('Door command response is unconfirmed.'); }
-        return ['state'=>'accepted','door_id'=>$door['id'],'operation'=>$operation,'detail'=>'Controller accepted the command. Physical door state is not confirmed.'];
+        if ($body!==[] && !isset($body[['lock'=>'LockDoorResponse','unlock'=>'UnlockDoorResponse','access'=>'AccessDoorResponse'][$operation]])) { throw new \RuntimeException('Door command response is unconfirmed.'); }
+        return ['state'=>'accepted','door_id'=>$door['id'],'operation'=>$operation,'detail'=>$operation==='access'?'Controller accepted timed access with its verified relocking timer. Physical door state is not confirmed.':'Controller accepted the command. Physical door state is not confirmed.'];
+    }
+    public function refreshMeeting(array $config,int $now): array
+    {
+        if(($config['oauth_refresh_enabled']??'0')!=='1'||empty($config['oauth_refresh_token'])||empty($config['oauth_client_id'])||empty($config['oauth_client_secret'])){throw new \DomainException('Provider OAuth refresh is disabled or incomplete.');}
+        $provider=$config['provider'];$urls=['zoom'=>'https://zoom.us/oauth/token','google_meet'=>'https://oauth2.googleapis.com/token','webex'=>'https://webexapis.com/v1/access_token'];
+        if(!isset($urls[$provider])){throw new \DomainException('Unknown OAuth provider.');}
+        $form=['grant_type'=>'refresh_token','refresh_token'=>$config['oauth_refresh_token']];$headers=['Content-Type: application/x-www-form-urlencoded','Accept: application/json'];
+        if($provider==='zoom'){$headers[]='Authorization: Basic '.base64_encode($config['oauth_client_id'].':'.$config['oauth_client_secret']);}
+        else{$form+=['client_id'=>$config['oauth_client_id'],'client_secret'=>$config['oauth_client_secret']];}
+        $body=self::jsonResult($this->request($urls[$provider],http_build_query($form,'','&',PHP_QUERY_RFC3986),$headers),[200]);
+        if(!is_string($body['access_token']??null)||$body['access_token']===''||strlen($body['access_token'])>8192||preg_match('/[\r\n\x00]/',$body['access_token'])
+            ||!is_int($body['expires_in']??null)||$body['expires_in']<60||$body['expires_in']>31536000||strtolower($body['token_type']??'bearer')!=='bearer'){throw new \RuntimeException('OAuth refresh returned an invalid token or expiry. Preserve the provider result; no meeting was created.');}
+        $refresh=$body['refresh_token']??$config['oauth_refresh_token'];if(!is_string($refresh)||$refresh===''||strlen($refresh)>8192||preg_match('/[\r\n\x00]/',$refresh)){throw new \RuntimeException('Provider returned an invalid replacement refresh token.');}
+        $config[$provider==='google_meet'?'google_access_token':$provider.'_access_token']=$body['access_token'];$config['oauth_refresh_token']=$refresh;$config['oauth_expires_at']=$now+$body['expires_in'];return $config;
+    }
+    public function revokeMeeting(array $config): array
+    {
+        $provider=$config['provider'];$token=$config[$provider==='google_meet'?'google_access_token':$provider.'_access_token']??'';
+        if($token===''){return ['revoked'=>true,'provider_contacted'=>false];}
+        if($provider==='webex'){return ['revoked'=>false,'provider_contacted'=>false,'detail'=>'Revoke this integration in Webex authorizations. Local meeting access has been disabled.'];}
+        $headers=['Content-Type: application/x-www-form-urlencoded'];$url=$provider==='zoom'?'https://zoom.us/oauth/revoke':'https://oauth2.googleapis.com/revoke';
+        if($provider==='zoom'){$headers[]='Authorization: Basic '.base64_encode($config['oauth_client_id'].':'.$config['oauth_client_secret']);}
+        $result=$this->request($url,http_build_query(['token'=>$token],'','&',PHP_QUERY_RFC3986),$headers);
+        return ['revoked'=>$result['error']===0&&$result['status']===200,'provider_contacted'=>true,'detail'=>'Review provider authorization if revocation was not confirmed.'];
     }
     public function speakerTelemetry(array $speaker): array
     {

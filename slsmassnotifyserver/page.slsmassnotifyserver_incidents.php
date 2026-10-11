@@ -16,6 +16,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         $id = $payload['incident_id'] ?? ''; unset($payload['incident_id']);
         if (!is_string($id)) { throw new \InvalidArgumentException('Incident identifier must be text.'); }
         switch ($_POST['slsmassnotifyserver_action'] ?? '') {
+            case 'save_languages': $result = $slsmassnotifyserver->saveIncidentRecipientLanguages($payload); break;
             case 'save_retention': $result = $slsmassnotifyserver->saveIncidentRetention($payload); break;
             case 'save_template': $result = $slsmassnotifyserver->saveIncidentTemplate($payload); break;
             case 'delete_template':

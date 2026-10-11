@@ -16,7 +16,7 @@ import sls_emergency_observer as observer
 class EmergencyObserver(unittest.TestCase):
     def setUp(self):
         self.rule={'id':'trg_'+'a'*24,'enabled':True,'kind':'emergency_call','callers':['1000'],'numbers':['911'],'max_age_seconds':300}
-        self.settings={'enabled':'1','automations':{'rules':[self.rule]}}
+        self.settings={'enabled':'0','runtime_enabled':True,'automations':{'rules':[self.rule]}}
         self.event={'Event':'DialBegin','Channel':'PJSIP/1000-0000001a','Uniqueid':'178000.5','CallerIDNum':'5125550100','DialString':'911@fixture-trunk'}
 
     def test_strict_channel_identity_and_destinations(self):
@@ -34,6 +34,24 @@ class EmergencyObserver(unittest.TestCase):
         second=observer.observations(dict(self.event,DestUniqueid='different-leg'),self.settings,'a'*64,1001)[0]
         self.assertEqual(first['id'],second['id'])
         self.assertNotIn('CallerIDNum',first); self.assertNotIn('Channel',first)
+
+    def test_stopped_or_invalid_runtime_creates_no_observation(self):
+        self.settings['runtime_enabled']=False
+        self.assertEqual(observer.observations(self.event,self.settings,'a'*64,1000),[])
+        self.settings['runtime_enabled']='1'
+        with self.assertRaisesRegex(RuntimeError,'runtime policy'):
+            observer.observations(self.event,self.settings,'a'*64,1000)
+
+    def test_stopped_runtime_does_not_create_spool_or_start_worker(self):
+        self.settings['runtime_enabled']=False
+        with tempfile.TemporaryDirectory(prefix='sls-emergency-') as directory:
+            root=Path(directory); path=root/'mass-notifications.config'
+            path.write_text(json.dumps(self.settings)); path.chmod(0o640)
+            os.chown(path,0,pwd.getpwnam('asterisk').pw_gid)
+            with patch.object(observer.subprocess,'Popen') as start:
+                observer.EmergencyObserver(root,clock=lambda:1000).record(self.event)
+                start.assert_not_called()
+            self.assertFalse((root/'emergency-observations').exists())
 
     def test_durable_spool_and_no_replacement(self):
         with tempfile.TemporaryDirectory(prefix='sls-emergency-') as directory:

@@ -144,6 +144,7 @@ class IdleCheck:
         self.data = Path(data); self.module = Path(module); self.proc = Path(proc)
         self.spools = tuple(map(Path, spools)); self.channels = channels
         self.boot_id = boot_id; self.monotonic = monotonic; self.clock = clock
+        self.repair_pending = []; self.repair_missing = False
         self.subsystem_paths = tuple(map(Path, subsystem_paths)) if subsystem_paths is not None else (
             self.module.with_name('PhoneEventService.php'),
             Path('/etc/systemd/system/sls-mass-notify-phone-events.service'),
@@ -243,22 +244,83 @@ class IdleCheck:
             raise IdleError('Audio reservation inspection failed: ' + str(error)) from error
         lines = [line for line in self.channels().splitlines() if line.strip()]
         if any(line.count('!') < 10 for line in lines): raise IdleError('Asterisk returned an unrecognized channel inventory')
-        if any(re.search(r'sls[-_]|nws[-_]|xweather|SLS_Mass_Notifications_Plugin', line, re.I) for line in lines):
+        if any(re.search(r'sls[-_]|SLSPhone[:/]|nws[-_]|xweather|SLS_Mass_Notifications_Plugin', line, re.I) for line in lines):
             raise IdleError('A notification channel is active; allow it to finish before installation')
 
-    def phone_history(self, installed):
-        state = read_json(self.data / 'phone-admission.json', optional=not installed)
-        if state is None: return {}
+    def pending_voicemail(self, batch):
+        # Older collectors did not take the outer worker lease. Refuse a
+        # fallback they can still submit before replacing their runtime.
+        fallback = batch.get('vm_fallback')
+        if fallback is None:
+            return False
+        if not isinstance(fallback, dict):
+            raise IdleError('Phone voicemail history is malformed; preserve it for review')
+        sound = fallback.get('sound')
+        if sound is None:
+            return False
+        if not isinstance(sound, str) or not sound:
+            raise IdleError('Phone voicemail audio identity is invalid')
+        for name in ('expires_at', 'expires_tick'):
+            value = fallback.get(name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise IdleError('Phone voicemail expiry cannot be inspected safely')
+        if fallback['expires_at'] <= self.clock() or fallback['expires_tick'] <= self.monotonic():
+            return False
+        targets = fallback.get('targets')
+        channels = batch.get('channels')
+        failures = batch.get('voicemail_failures', {})
+        if not isinstance(targets, dict) or not isinstance(channels, dict) or not isinstance(failures, dict):
+            raise IdleError('Phone voicemail targets cannot be inspected safely')
+        for recipient, row in targets.items():
+            if not isinstance(row, dict) or not isinstance(row.get('dials'), list):
+                raise IdleError('Phone voicemail target is malformed')
+            claimed = row.get('claimed_token')
+            if claimed is not None and (not isinstance(claimed, str) or not TOKEN.fullmatch(claimed)):
+                raise IdleError('Phone voicemail claim is invalid')
+            if claimed is not None or recipient in failures:
+                continue
+            eligible = True
+            for dial in row['dials']:
+                if not isinstance(dial, str) or not dial:
+                    raise IdleError('Phone voicemail contact is malformed')
+                contacts = [entry for entry in channels.values()
+                            if isinstance(entry, dict) and entry.get('kind') == 'contact' and entry.get('dial') == dial]
+                if (len(contacts) != 1 or contacts[0].get('ended_at') is None
+                        or contacts[0].get('answered_at') is not None or contacts[0].get('joined_at') is not None
+                        or contacts[0].get('outcome_uncertain')
+                        or contacts[0].get('dial_status') not in {'BUSY', 'NOANSWER', 'CANCEL', 'CONGESTION', 'CHANUNAVAIL', 'DONTCALL'}):
+                    eligible = False
+                    break
+            if eligible:
+                return True
+        return False
+
+    def phone_history(self, installed, repair_collector=False, *, allow_pending_voicemail=False):
+        self.repair_pending = []; self.repair_missing = False
+        state = read_json(self.data / 'phone-admission.json', optional=not installed or repair_collector)
+        if state is None:
+            self.repair_missing = installed
+            return {}
         batches = state.get('batches')
         if state.get('schema') != 1 or not isinstance(batches, dict) or len(batches) > MAX_HISTORY:
             raise IdleError('Phone admission history cannot be inspected safely')
         history = {}
         for token, batch in batches.items():
-            if not isinstance(token, str) or not TOKEN.fullmatch(token) or not isinstance(batch, dict) or batch.get('status') != 'closed':
+            if not isinstance(token, str) or not TOKEN.fullmatch(token) or not isinstance(batch, dict):
                 raise IdleError('Phone admission has an unclosed or invalid batch; allow it to drain')
+            if batch.get('status') != 'closed':
+                if not repair_collector or batch.get('status') not in ('active', 'reserved'):
+                    raise IdleError('Phone admission has an unclosed or invalid batch; allow it to drain')
+                # Independent process, spool, lease and complete channel checks
+                # ran first under worker guards. Preserve the journal; require
+                # authenticated collector reconciliation before completion.
+                self.repair_pending.append(hashlib.sha256(token.encode()).hexdigest())
+                continue
+            if not allow_pending_voicemail and self.pending_voicemail(batch):
+                raise IdleError('A voicemail fallback is pending; allow it to finish or expire and retry installation')
             history[hashlib.sha256(token.encode()).hexdigest()] = hashlib.sha256(
                 json.dumps(batch, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
-        if installed:
+        if installed and not repair_collector:
             health = state.get('collector')
             if self.boot_id is None:
                 self.boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
@@ -269,11 +331,11 @@ class IdleCheck:
                 raise IdleError('Phone collector heartbeat is stale or invalid; restore collector health before installation')
         return history
 
-    def inspect(self, baseline=None):
+    def inspect(self, baseline=None, repair_collector=False):
         self.no_processes(); self.no_pending(); self.no_playback()
         installed = self.installed()
         collector_required = installed and self.phone_subsystem_present()
-        history = self.phone_history(collector_required)
+        history = self.phone_history(collector_required, repair_collector)
         if baseline is not None:
             before = read_json(Path(baseline), 2 * 1024 * 1024, protected=True)
             known = before.get('phone_history')
@@ -283,8 +345,14 @@ class IdleCheck:
                 raise IdleError('Installation phone-history baseline is invalid')
             if any(history.get(key) != value for key, value in known.items()):
                 raise IdleError('Retained closed phone history changed or disappeared; preserve recovery evidence and never restore an old live ledger')
+            pending = before.get('pending_phone_reconciliation', [])
+            if not isinstance(pending, list) or len(pending) > MAX_HISTORY or any(not isinstance(key, str) or not HASH.fullmatch(key) for key in pending):
+                raise IdleError('Collector repair baseline is invalid')
+            if not repair_collector and any(key not in history for key in pending):
+                raise IdleError('Collector repair has not closed its independently idle batches; preserve the journal and inspect collector health')
         return {'schema': 1, 'ok': True, 'checked_at': datetime.now(timezone.utc).isoformat(), 'installed': installed,
                 'phone_collector_required': collector_required, 'closed_phone_batches': len(history), 'phone_history': history,
+                'pending_phone_reconciliation': self.repair_pending, 'missing_phone_ledger': self.repair_missing,
                 'manual_test_active': False, 'notification_playback_active': False, 'pending_announcements': False}
 
 
@@ -293,9 +361,10 @@ def main():
     parser.add_argument('--data', type=Path, default=DATA)
     parser.add_argument('action', choices=('inspect',))
     parser.add_argument('--baseline', type=Path)
+    parser.add_argument('--repair-collector', action='store_true', help='Inspect independent idleness for collector recovery without changing its journal')
     args = parser.parse_args()
     if os.geteuid() != 0: raise IdleError('Complete installation idle inspection requires root visibility')
-    print(json.dumps(IdleCheck(args.data).inspect(args.baseline), sort_keys=True))
+    print(json.dumps(IdleCheck(args.data).inspect(args.baseline, args.repair_collector), sort_keys=True))
 
 if __name__ == '__main__':
     try: main()

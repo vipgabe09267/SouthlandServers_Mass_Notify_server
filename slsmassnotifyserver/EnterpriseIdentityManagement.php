@@ -35,8 +35,24 @@ trait SlsEnterpriseLabs
     {
         $lock=null;$activity=null;
         try{
-            $this->enterpriseLabsAdmin();$allowed=['identity_save','directory_save','directory_preview','directory_apply','subscriber_save','subscriber_invite','subscriber_revoke'];
+            $this->enterpriseLabsAdmin();$allowed=['identity_save','directory_save','directory_preview','directory_apply','subscriber_save','subscriber_invite','subscriber_revoke','subscriber_push_key','subscriber_push_test'];
             if(!in_array($action,$allowed,true)){throw new \DomainException('Unsupported enterprise Labs action.');}
+            if($action==='subscriber_push_test'){
+                $activity=$this->acquireAnnouncementActivityLock(false,5);
+                if($activity===null){throw new \DomainException('Browser test settings are busy. Retry after the current settings operation completes.');}
+                $settings=$this->getActiveSettings();require_once __DIR__.'/EnterpriseClusterConfig.php';
+                if(\SLS\MassNotify\EnterpriseClusterConfig::enabled($settings)){throw new \DomainException('Use the queued Enterprise Labs test when cluster coordination is enabled; direct browser tests cannot prove witness authority. No push was submitted.');}
+                require_once __DIR__.'/bin/sls_mass_notify/sls_runtime_state.php';\SLS\MassNotify\RuntimeState::requireRunning($settings);
+                if(array_diff(array_keys($input),['subscriber_id','request_id','title','message'])||!preg_match('/^[a-f0-9]{32}$/D',$input['request_id']??'')){throw new \DomainException('Select one subscriber and a valid test request.');}
+                $event=['event_id'=>'push_'.$input['request_id'],'title'=>EnterpriseIdentityConfig::text($input['title']??'Browser test',100,'Title'),
+                    'message'=>EnterpriseIdentityConfig::text($input['message']??'Browser notification test',1500,'Message'),'is_test'=>true,'expires_at'=>time()+300];
+                $event['subscriber_id']=($input['subscriber_id']??'');$id=$input['request_id'];$event=$this->enterpriseLabsStore()->transaction('browser_test_events',static function(array &$rows)use($id,$event):array{
+                    foreach($rows as $key=>$saved){if($saved['expires_at']<time()){unset($rows[$key]);}}
+                    if(isset($rows[$id])){foreach(['title','message','subscriber_id'] as $field){if($rows[$id][$field]!==$event[$field]){throw new \DomainException('Test request identity was reused with different content.');}}return $rows[$id];}
+                    if(count($rows)>=100){throw new \DomainException('Too many browser tests in progress.');}return $rows[$id]=$event;
+                });
+                return ['success'=>true,'message'=>'Browser test submission recorded. Review push-service receipts.','result'=>$this->subscriberService()->push($settings,$input['subscriber_id']??'',$event,time())];
+            }
             if($action==='directory_preview'){
                 if(array_diff(array_keys($input),['source_id','csv','deprovision_all'])){throw new \DomainException('Directory dry-run request contains unsupported fields.');}$settings=$this->getActiveSettings();$c=DirectoryConfig::normalize($settings['directory_sync']??[]);$deprovision=$input['deprovision_all']??false;if(!is_bool($deprovision)){throw new \DomainException('Deprovision preview flag must be boolean.');}
                 if(!$c['enabled']){throw new \DomainException('Directory sync is disabled.');}$source=null;foreach($c['sources'] as $s){if($s['id']===($input['source_id']??'')&&($s['enabled']||$deprovision)){$source=$s;}}
@@ -78,12 +94,15 @@ trait SlsEnterpriseLabs
                     foreach(['ldap_password','scim_token'] as $key){unset($s[$key.'_configured']);if(isset($prior[$key])&&($s[$key]??'')===''){$s[$key]=$prior[$key];}}
                     if($prior&&$prior['records']&&($s['template_ids']??[])!==$prior['template_ids']){throw new \DomainException('First preview and apply deprovisioning for this source before changing its template assignments.');}$s['records']=$prior['records']??[];
                 }unset($s);foreach($byId as $id=>$s){if($s['records']&&!in_array($id,$kept,true)){throw new \DomainException('Deprovision all records before deleting their directory source.');}}
-                $active['directory_sync']=DirectoryConfig::normalize($config);$this->enterpriseLabsWrite($active,['directory_sync']);return ['success'=>true,'message'=>'Directory settings saved; no connector was contacted or roster changed.','config'=>DirectoryConfig::publicConfig($active['directory_sync']),'revision'=>$this->enterpriseLabsConfigRevision('directory_sync',$active)];
+                $active['directory_sync']=DirectoryConfig::normalize($config);
+                foreach($active['directory_sync']['sources'] as $source){if($active['directory_sync']['enabled']&&$source['enabled']&&$source['type']==='ldap'&&!extension_loaded('ldap')){throw new \DomainException('The PHP runtime serving FreePBX lacks LDAP. Install its matching php-ldap package and reload the web PHP handler before enabling this source.');}}
+                $this->enterpriseLabsWrite($active,['directory_sync']);return ['success'=>true,'message'=>'Directory settings saved; no connector was contacted or roster changed.','config'=>DirectoryConfig::publicConfig($active['directory_sync']),'revision'=>$this->enterpriseLabsConfigRevision('directory_sync',$active)];
             }
             if($action==='directory_apply'){
-                if(array_keys($input)!==['plan_id']||!preg_match('/^[a-f0-9]{64}$/D',$input['plan_id']??'')){throw new \DomainException('Select one valid directory preview.');}
+                if(array_diff(array_keys($input),['plan_id','confirm_deactivation'])||!preg_match('/^[a-f0-9]{64}$/D',$input['plan_id']??'')||!is_bool($input['confirm_deactivation']??false)){throw new \DomainException('Select one valid directory preview.');}
                 $id=$input['plan_id'];$plan=$this->enterpriseLabsStore()->transaction('directory_plans',static function(array &$rows)use($id):?array{$p=$rows[$id]??null;unset($rows[$id]);return $p;});
                 if(!$plan||$plan['expires_at']<=time()||!hash_equals($plan['revision'],DirectorySync::revision($active))){throw new \DomainException('Directory preview expired or settings changed. Run another dry run.');}
+                if(!empty($plan['requires_deactivation_confirmation'])&&empty($input['confirm_deactivation'])){throw new \DomainException('This snapshot deactivates '.$plan['deactivation_count'].' people ('.$plan['deactivation_percent'].'%). Review another preview and explicitly confirm this change.');}
                 $config=DirectoryConfig::normalize($active['directory_sync']??[]);$source=null;foreach($config['sources'] as $s){if($s['id']===$plan['source_id']){$source=$s;}}
                 if(!$config['enabled']||!$source||(!$source['enabled']&&!($plan['deprovision_all']??false))){throw new \DomainException('Directory source was disabled.');}
                 $active=DirectorySync::apply($active,$source,$plan['records']);$this->enterpriseLabsWrite($active,['directory_sync','incident_workflows','subscriber_browser'],$source,$plan['records']);
@@ -91,14 +110,22 @@ trait SlsEnterpriseLabs
             }
             if($action==='subscriber_save'){
                 $config=$input['config'];$old=SubscriberConfig::normalize($active['subscriber_browser']??[]);$people=array_column($old['people'],null,'id');
+                if(!array_key_exists('push',$config)){$config['push']=$old['push'];}
+                if(is_array($config['push']??null)){unset($config['push']['private_key_configured'],$config['push']['public_key']);if(($config['push']['private_key_pem']??'')===''){$config['push']['private_key_pem']=$old['push']['private_key_pem'];}}
                 if(!is_array($config)){throw new \DomainException('Configuration must be an object.');}$config['people']??=[];foreach($config['people'] as &$p){if(empty($p['id'])){$p['id']='sub_'.bin2hex(random_bytes(12));}$prior=$people[$p['id']]??null;$same=$prior&&($p['person_id']??'')===$prior['person_id']&&($p['name']??'')===$prior['name']&&strtolower($p['email']??'')===strtolower($prior['email']);
                     $p['version']=$same?$prior['version']:bin2hex(random_bytes(32));$p['registered_at']=$same?$prior['registered_at']:time();}unset($p);
-                $active['subscriber_browser']=SubscriberConfig::normalize($config);$this->enterpriseLabsWrite($active,['subscriber_browser']);return ['success'=>true,'message'=>'Subscriber people saved. No verification invitation was sent.','config'=>$active['subscriber_browser'],'revision'=>$this->enterpriseLabsConfigRevision('subscriber_browser',$active)];
+                $active['subscriber_browser']=SubscriberConfig::normalize($config);$this->enterpriseLabsWrite($active,['subscriber_browser']);return ['success'=>true,'message'=>'Subscriber people saved. No verification invitation was sent.','config'=>SubscriberConfig::publicConfig($active['subscriber_browser']),'revision'=>$this->enterpriseLabsConfigRevision('subscriber_browser',$active)];
+            }
+            if($action==='subscriber_push_key'){
+                if($input){throw new \DomainException('Key generation accepts no fields.');}$config=SubscriberConfig::normalize($active['subscriber_browser']??[]);
+                if($config['push']['private_key_pem']!==''){throw new \DomainException('A VAPID key already exists. Existing browser enrollments depend on it.');}
+                require_once __DIR__.'/BrowserPush.php';$config['push']['private_key_pem']=\SLS\MassNotify\BrowserPush::generateKey()['private_key_pem'];
+                $active['subscriber_browser']=$config;$this->enterpriseLabsWrite($active,['subscriber_browser']);return ['success'=>true,'message'=>'VAPID key generated in encrypted configuration. Browser push remains disabled.','config'=>SubscriberConfig::publicConfig($config),'revision'=>$this->enterpriseLabsConfigRevision('subscriber_browser',$active)];
             }
             if($action==='subscriber_revoke'){
                 if(array_keys($input)!==['subscriber_id']){throw new \DomainException('Select one subscriber.');}$config=SubscriberConfig::normalize($active['subscriber_browser']??[]);$found=false;
                 foreach($config['people'] as &$p){if($p['id']===$input['subscriber_id']){$p['version']=bin2hex(random_bytes(32));$found=true;}}unset($p);if(!$found){throw new \DomainException('Subscriber unavailable.');}
-                $active['subscriber_browser']=$config;$this->enterpriseLabsWrite($active,['subscriber_browser']);$this->subscriberService()->revoke($input['subscriber_id']);return ['success'=>true,'message'=>'Subscriber links and browser sessions revoked.','config'=>$config,'revision'=>$this->enterpriseLabsConfigRevision('subscriber_browser',$active)];
+                $active['subscriber_browser']=$config;$this->enterpriseLabsWrite($active,['subscriber_browser']);$this->subscriberService()->revoke($input['subscriber_id']);return ['success'=>true,'message'=>'Subscriber links and browser sessions revoked.','config'=>SubscriberConfig::publicConfig($config),'revision'=>$this->enterpriseLabsConfigRevision('subscriber_browser',$active)];
             }
             throw new \LogicException('Unhandled enterprise Labs action.');
         }catch(\DomainException|\InvalidArgumentException|\JsonException $e){return ['success'=>false,'message'=>$e->getMessage()];}
@@ -107,10 +134,12 @@ trait SlsEnterpriseLabs
     public function renderEnterpriseLabsPage(string $endpoint,string $csrf): string
     {
         $this->enterpriseLabsAdmin();$settings=$this->getActiveSettings();$identity=EnterpriseIdentityConfig::publicConfig(EnterpriseIdentityConfig::normalize($settings['enterprise_identity']??[]));
-        $directory=DirectoryConfig::publicConfig(DirectoryConfig::normalize($settings['directory_sync']??[]));$subscriber=SubscriberConfig::normalize($settings['subscriber_browser']??[]);
+        $directory=DirectoryConfig::publicConfig(DirectoryConfig::normalize($settings['directory_sync']??[]));$subscriber=SubscriberConfig::publicConfig($settings['subscriber_browser']??[]);
         $revisions=['identity'=>$this->enterpriseLabsConfigRevision('enterprise_identity',$settings),'directory'=>$this->enterpriseLabsConfigRevision('directory_sync',$settings),'subscriber'=>$this->enterpriseLabsConfigRevision('subscriber_browser',$settings)];
         $accounts=array_map(static fn($a)=>['id'=>$a['id'],'username'=>$a['username'],'role'=>$a['role']],array_values(array_filter($settings['operator_access']['accounts']??[],static fn($a)=>$a['source']==='portal')));
         $templates=array_map(static fn($t)=>['id'=>$t['id'],'name'=>$t['name']],$settings['incident_workflows']['templates']??[]);
+        $rosterChoices=[];foreach($settings['incident_workflows']['templates']??[] as $template){foreach($template['roster']??[] as $person){$rosterChoices[$person['id']]=['id'=>$person['id'],'name'=>$person['name']];}}$rosterChoices=array_values($rosterChoices);
+        $incidentChoices=method_exists($this,'listIncidents')?array_values(array_map(static fn($incident)=>['id'=>$incident['id'],'name'=>$incident['title']],array_filter($this->listIncidents(50)['incidents']??[],static fn($incident)=>($incident['state']??'')==='open'))):[];
         ob_start();include __DIR__.'/views/identity_labs.php';return ob_get_clean();
     }
 }

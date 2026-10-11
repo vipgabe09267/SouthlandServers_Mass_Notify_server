@@ -20,6 +20,7 @@ class EnterpriseOperatorApiFixture
     const PLUGIN_DATA_DIR=ENTERPRISE_OPERATOR_API_FIXTURE;
     public array $settings=[],$submissions=[];
     public bool $reviewSubmissions=false;
+    public int $inventoryReads=0;
     public ?array $human=null;
     public function getActiveSettings(){return $this->settings;}
     public function currentOperator():array{return $this->human??throw new DomainException('A human login is required.');}
@@ -31,6 +32,9 @@ class EnterpriseOperatorApiFixture
     public function normalizeWebhookDestinations($settings,$kind){return [];}
     public function getAvailableTones(){return [];}
     public function getAvailableSystemSounds(){return [];}
+    public function getSystemRecordingCatalogue(string $query='',int $offset=0,int $limit=500):array{return ['success'=>true,'items'=>[],'total'=>0,'offset'=>$offset,'limit'=>$limit,'next_offset'=>null];}
+    protected function phoneDisplayInventory():array{$this->inventoryReads++;return ['available'=>false,'observed_at'=>null,'endpoints'=>[]];}
+    protected function announcementDesktopPresence():array{return [];}
     public function getPbxDateTimeZone(){return new DateTimeZone('UTC');}
     public function locationCatalog($settings){return ['extensions'=>[],'desktop_client_ids'=>[],'voice_recipient_ids'=>[],'email_recipient_ids'=>[],'sms_recipient_ids'=>[],'webhook_ids'=>[]];}
     private function acquireAnnouncementActivityLock(...$args){return null;}
@@ -117,8 +121,10 @@ try{
     $update=['incident_id'=>$pending['id'],'request_id'=>str_repeat('6',32),'kind'=>'update','message'=>'Isolated follow-up'];
     checkEnterpriseOperator(!$fixture->operatorAction('update_incident',$update)['success'],'Pending review permitted another incident update.');
     checkEnterpriseOperator($fixture->operatorAction('approval_reject',['review_id'=>$pendingOperation['review_id']])['success'],'Assigned human could not reject an unsubmitted API-origin review.');
+    $inventoryReads=$fixture->inventoryReads;
     $updated=$fixture->operatorAction('update_incident',$update);
-    checkEnterpriseOperator($updated['success'],'Rejected review permanently blocked subsequent incident updates.');
+    checkEnterpriseOperator($updated['success'],'Rejected review permanently blocked subsequent incident updates: '.($updated['message']??'No failure detail.'));
+    checkEnterpriseOperator($fixture->inventoryReads===$inventoryReads,'Incident updates performed unrelated fleet discovery.');
     $record=(new \SLS\MassNotify\IncidentStore($base.'/incidents'))->read($pending['id']);
     checkEnterpriseOperator($record['operations'][str_repeat('5',32)]['state']==='not_submitted','Reject did not clear only its pending incident operation.');
     $fixture->reviewSubmissions=false;

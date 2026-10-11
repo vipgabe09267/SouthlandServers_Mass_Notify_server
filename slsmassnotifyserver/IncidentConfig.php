@@ -55,7 +55,7 @@ final class IncidentConfig
 
     public static function context($value): array
     {
-        $value = self::object($value, ['schema', 'incident_id', 'sequence', 'kind', 'severity', 'is_test'], 'Incident context');
+        $value = self::object($value, ['schema', 'incident_id', 'sequence', 'kind', 'severity', 'is_test', 'operation_request_id', 'language_variant', 'language_batch', 'language_batches', 'expires_at'], 'Incident context');
         if (($value['schema'] ?? null) !== 1 || !is_int($value['sequence'] ?? null) || $value['sequence'] < 1 || $value['sequence'] > 250
             || !in_array($value['kind'] ?? null, ['initial', 'update', 'all_clear', 'escalation'], true)
             || !in_array($value['severity'] ?? null, ['information', 'warning', 'critical'], true)) {
@@ -63,6 +63,21 @@ final class IncidentConfig
         }
         self::identifier($value['incident_id'] ?? '', '/^inc_[a-f0-9]{32}$/D', 'Incident identifier');
         self::flag($value['is_test'] ?? null, 'Incident test flag');
+        if (array_key_exists('operation_request_id', $value)) {
+            self::identifier($value['operation_request_id'], '/^[a-f0-9]{32}$/D', 'Incident operation request');
+            self::identifier($value['language_variant'] ?? '', '/^(?:[a-z]{2,3}(?:-[a-z0-9]{2,8}){0,3})?$/D', 'Incident language');
+            if (!is_int($value['language_batch'] ?? null) || !is_int($value['language_batches'] ?? null)
+                || $value['language_batch'] < 1 || $value['language_batch'] > $value['language_batches'] || $value['language_batches'] > 7) {
+                throw new \InvalidArgumentException('Incident language batch metadata is invalid.');
+            }
+            if (!is_string($value['expires_at'] ?? null) || !preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00$/D', $value['expires_at'])) {
+                throw new \InvalidArgumentException('Incident language delivery expiry is invalid.');
+            }
+            $date=\DateTimeImmutable::createFromFormat('!Y-m-d\TH:i:sP',$value['expires_at']);
+            if (!$date || $date->format('c')!==$value['expires_at']) { throw new \InvalidArgumentException('Incident language delivery expiry is invalid.'); }
+        } elseif (array_intersect(array_keys($value), ['language_variant','language_batch','language_batches','expires_at'])) {
+            throw new \InvalidArgumentException('Incident language metadata requires its operation identity.');
+        }
         return $value;
     }
     public static function defaults(): array { return ['schema' => 1, 'templates' => []]; }
@@ -255,18 +270,37 @@ final class IncidentConfig
     }
     public static function normalize($value): array
     {
-        $value = self::object($value, ['schema', 'templates', 'retention'], 'Incident workflow settings');
+        $value = self::object($value, ['schema', 'templates', 'retention', 'recipient_languages'], 'Incident workflow settings');
         if (($value['schema'] ?? 1) !== 1) { throw new \InvalidArgumentException('Unsupported incident configuration schema.'); }
         $out = self::defaults(); $seen = [];
         // Leave legacy portable settings unchanged when this opt-in feature
         // has never been configured.
         if (array_key_exists('retention', $value)) { $out['retention'] = self::retention($value['retention']); }
+        if (array_key_exists('recipient_languages', $value)) { $out['recipient_languages'] = self::recipientLanguages($value['recipient_languages']); }
         foreach (self::listOf($value['templates'] ?? [], 50, 'Incident templates') as $row) {
             $template = self::template($row);
             if (isset($seen[$template['id']])) { throw new \InvalidArgumentException('Incident template identifiers must be unique.'); }
             $seen[$template['id']] = true; $out['templates'][] = $template;
         }
         if (strlen(json_encode($out, JSON_THROW_ON_ERROR)) > 2097152) { throw new \InvalidArgumentException('Incident templates exceed the 2 MiB protected configuration allocation.'); }
+        return $out;
+    }
+
+    public static function recipientLanguages($value): array
+    {
+        $patterns = ['extensions'=>'/^[0-9]{1,20}$/D', 'desktop_clients'=>'/^[A-Za-z0-9_.@-]{1,80}$/D',
+            'voice_recipient_ids'=>'/^voice_[a-f0-9]{24}$/D', 'email_recipient_ids'=>'/^email_[a-f0-9]{24}$/D',
+            'sms_recipient_ids'=>'/^sms_[a-f0-9]{24}$/D', 'webhook_ids'=>'/^[A-Za-z0-9_-]{1,64}$/D'];
+        $out = []; $seen = [];
+        foreach (self::listOf($value, 2000, 'Recipient language preferences') as $row) {
+            $row = self::object($row, ['channel','recipient_id','locale'], 'Recipient language preference');
+            if (!is_string($row['channel'] ?? null) || !isset($patterns[$row['channel']])) { throw new \InvalidArgumentException('Select an existing recipient channel for each language preference.'); }
+            $id = self::identifier($row['recipient_id'] ?? '', $patterns[$row['channel']], 'Language recipient');
+            $locale = strtolower(self::identifier($row['locale'] ?? '', '/^[a-zA-Z]{2,3}(?:-[a-zA-Z0-9]{2,8}){0,3}$/D', 'Preferred language'));
+            $key = $row['channel']."\0".$id;
+            if (isset($seen[$key])) { throw new \InvalidArgumentException('Each notification device can have only one preferred language.'); }
+            $seen[$key] = true; $out[] = ['channel'=>$row['channel'],'recipient_id'=>$id,'locale'=>$locale];
+        }
         return $out;
     }
     public static function render(array $template, $values, $language = ''): array

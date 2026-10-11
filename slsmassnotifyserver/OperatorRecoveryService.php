@@ -99,15 +99,71 @@ trait SlsOperatorRecovery
         try{$sender=OperatorRecovery::email(array_key_exists('mail_from_domain',$settings)
             ?(string)($settings['mail_from_local_part']??'no-reply').'@'.(string)$settings['mail_from_domain']:(string)($settings['mail_from_addr']??''));}
         catch(\DomainException $error){return 'failed';}
-        if($sender===''||!is_executable('/usr/sbin/sendmail')){return 'failed';}
+        if($sender===''||!$this->operatorRecoveryEmailTransportAvailable()||!$this->admitOperatorRecoveryEmail()){return 'failed';}
         $message='From: <'.$sender.">\r\nTo: <".$recipient.">\r\nSubject: ".$subject
             ."\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n".$body."\r\n";
-        $pipes=[];$process=@proc_open(['/usr/bin/timeout','--signal=TERM','--kill-after=1','1','/usr/sbin/sendmail','-oi','-t'],
-            [0=>['pipe','r'],1=>['file','/dev/null','w'],2=>['file','/dev/null','w']],$pipes,null,null,['bypass_shell'=>true]);
+        $pipes=[];$process=$this->startOperatorRecoveryEmailProcess($pipes);
         if(!is_resource($process)){return 'failed';}
         try{$written=fwrite($pipes[0],$message);fclose($pipes[0]);unset($pipes[0]);$exit=proc_close($process);$process=null;
             return $written===strlen($message)&&$exit===0?'accepted':(in_array($exit,[124,137],true)?'unconfirmed':'failed');
         }finally{foreach($pipes as $pipe){if(is_resource($pipe)){fclose($pipe);}}if(is_resource($process)){proc_close($process);}}
+    }
+
+    protected function startOperatorRecoveryEmailProcess(&$pipes)
+    {
+        return @proc_open(['/usr/bin/timeout','--signal=TERM','--kill-after=1','1','/usr/sbin/sendmail','-oi','-t'],
+            [0=>['pipe','r'],1=>['file','/dev/null','w'],2=>['file','/dev/null','w']],$pipes,null,null,['bypass_shell'=>true]);
+    }
+
+    protected function operatorRecoveryEmailTransportAvailable(): bool
+    {
+        return is_executable('/usr/sbin/sendmail');
+    }
+
+    protected function startOperatorMailAdmission(&$pipes)
+    {
+        return @proc_open(['/usr/bin/timeout','--signal=TERM','--kill-after=1','3','/usr/bin/python3','-I',
+            '/usr/local/bin/sls_mass_notify/sls_mail_admission.py','reserve'],
+            [0=>['pipe','r'],1=>['pipe','w'],2=>['file','/dev/null','w']],$pipes,null,null,['bypass_shell'=>true]);
+    }
+
+    /** Reserve local capacity before exposing a reset link to sendmail. */
+    protected function admitOperatorRecoveryEmail(): bool
+    {
+        $pipes=[];
+        $process=$this->startOperatorMailAdmission($pipes);
+        if(!is_resource($process)){return false;}
+        $output='';
+        $exit=-1;
+        $deadline=microtime(true)+3.0;
+        try{
+            $request="{\"category\":\"account\",\"recipients\":1}\n";
+            $written=fwrite($pipes[0],$request);
+            fclose($pipes[0]);
+            unset($pipes[0]);
+            if($written!==strlen($request)){return false;}
+            stream_set_blocking($pipes[1],false);
+            while(microtime(true)<$deadline){
+                $chunk=stream_get_contents($pipes[1],2049-strlen($output));
+                if($chunk===false){return false;}
+                $output.=$chunk;
+                if(strlen($output)>2048){return false;}
+                $status=proc_get_status($process);
+                if(!$status['running']){
+                    $output.=(string)stream_get_contents($pipes[1],2049-strlen($output));
+                    $exit=(int)$status['exitcode'];
+                    break;
+                }
+                usleep(10000);
+            }
+            $result=strlen($output)<=2048?json_decode(trim($output),true,4):null;
+            return $exit===0&&is_array($result)&&($result['ok']??null)===true;
+        }finally{
+            $status=proc_get_status($process);
+            if($status['running']){@proc_terminate($process,9);}
+            foreach($pipes as $pipe){if(is_resource($pipe)){fclose($pipe);}}
+            proc_close($process);
+        }
     }
 
     public function requestOperatorPasswordRecovery(string $username, string $email): void

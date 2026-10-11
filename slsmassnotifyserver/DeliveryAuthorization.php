@@ -5,6 +5,7 @@ require_once __DIR__ . '/AutomationConfig.php';
 require_once __DIR__ . '/AutomationStore.php';
 require_once __DIR__ . '/api/sls-mass-notify/security.php';
 require_once __DIR__ . '/ConfigCrypto.php';
+require_once __DIR__ . '/bin/sls_mass_notify/sls_runtime_state.php';
 
 /** Read-only authorization at an external transmission boundary. */
 final class DeliveryAuthorization
@@ -38,7 +39,7 @@ final class DeliveryAuthorization
     public static function permits(array $settings, array $input, string $journal = AutomationStore::DIRECTORY, ?int $now = null): bool
     {
         $now ??= time();
-        if (array_diff(array_keys($input), ['automation_context', 'api_credential_id', 'webhook_ids']) || empty($settings['enabled'])) { return false; }
+        if (array_diff(array_keys($input), ['automation_context', 'api_credential_id', 'webhook_ids']) || !RuntimeState::running($settings)) { return false; }
         $ids = $input['webhook_ids'] ?? null;
         if (!is_array($ids) || !array_is_list($ids) || !$ids || count($ids) > 10) { return false; }
         foreach ($ids as $id) { if (!is_string($id) || !preg_match('/^[A-Za-z0-9_-]{1,64}$/D', $id)) { return false; } }

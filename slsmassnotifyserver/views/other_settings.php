@@ -10,7 +10,6 @@ $importResult = $import_result ?? null;
 $hasPendingChanges = !empty($has_pending_changes);
 $voices = is_array($available_voices ?? null) ? $available_voices : [];
 $tones = is_array($available_tones ?? null) ? $available_tones : [];
-$systemSounds = is_array($available_system_sounds ?? null) ? $available_system_sounds : [];
 $control = is_array($settings['control_api'] ?? null) ? $settings['control_api'] : [];
 $updates = is_array($settings['updates'] ?? null) ? $settings['updates'] : [];
 $desktopClients = is_array($desktop_clients ?? null) ? $desktop_clients : [];
@@ -386,6 +385,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						<div class="tab-content">
 							<section class="tab-pane active sls-destination-pane" id="sls-destination-email" role="tabpanel">
 								<h4><?php echo _('Postfix Email Configuration'); ?></h4>
+								<p class="help-block"><?php echo _('Email is off on a new installation. Configure local Postfix, then add recipients here. Announcement email also requires its Enable checkbox; Weather and Lightning recipients are selected in their own delivery settings.'); ?></p>
 								<?php include __DIR__.'/postfix_help.php'; ?>
 								<p class="text-muted"><?php echo _('The module hands branded HTML email with a plain-text fallback to the PBX local mail service. Final delivery depends on Postfix, DNS, and any relay configured outside this module.'); ?></p>
 							<div class="row"><div class="col-sm-5"><div class="form-group"><label for="sls-mail-from-local-part"><?php echo _('Sender Local Part'); ?></label><input class="form-control" id="sls-mail-from-local-part" name="mail_from_local_part" type="text" value="<?php echo htmlspecialchars($mailFromLocalPart); ?>" maxlength="64" pattern="[A-Za-z0-9](?:[A-Za-z0-9._+\-]{0,62}[A-Za-z0-9])?" autocomplete="off" spellcheck="false" placeholder="no-reply"><p class="help-block"><?php echo _('The part before the @ sign.'); ?></p></div></div><div class="col-sm-7"><div class="form-group"><label for="sls-mail-from-domain"><?php echo _('Sender Domain'); ?></label><div class="input-group"><span class="input-group-addon">@</span><input class="form-control" id="sls-mail-from-domain" name="mail_from_domain" type="text" value="<?php echo htmlspecialchars($mailFromDomain); ?>" maxlength="253" autocomplete="off" spellcheck="false" placeholder="pbx.example.com"></div></div></div></div>
@@ -453,9 +453,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 									<option value="<?php echo htmlspecialchars($tone); ?>" <?php echo ($settings['opening_tone'] ?? 'opening_Paging_Tone_Opening') === $tone ? 'selected' : ''; ?>><?php echo htmlspecialchars($tone === 'opening_Paging_Tone_Opening' ? _('Paging Tone Opening (bundled default)') : str_replace('_', ' ', $tone)); ?></option>
 								<?php } ?>
 								</optgroup>
-								<?php if ($systemSounds) { ?><optgroup label="<?php echo htmlspecialchars(_('FreePBX System Recordings')); ?>">
-								<?php foreach ($systemSounds as $sound) { ?><option value="<?php echo htmlspecialchars($sound['value']); ?>"><?php echo htmlspecialchars($sound['label']); ?></option><?php } ?>
-								</optgroup><?php } ?>
+								<?php include __DIR__.'/system_recording_options.php'; ?>
 							</select>
 							<p class="help-block"><?php echo _('Upload additional choices in Admin > System Recordings.'); ?></p>
 						</div>
@@ -470,9 +468,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 									<option value="<?php echo htmlspecialchars($tone); ?>" <?php echo ($settings['closing_tone'] ?? 'closing_Paging_Tone_Closing') === $tone ? 'selected' : ''; ?>><?php echo htmlspecialchars($tone === 'closing_Paging_Tone_Closing' ? _('Paging Tone Closing (bundled default)') : str_replace('_', ' ', $tone)); ?></option>
 								<?php } ?>
 								</optgroup>
-								<?php if ($systemSounds) { ?><optgroup label="<?php echo htmlspecialchars(_('FreePBX System Recordings')); ?>">
-								<?php foreach ($systemSounds as $sound) { ?><option value="<?php echo htmlspecialchars($sound['value']); ?>"><?php echo htmlspecialchars($sound['label']); ?></option><?php } ?>
-								</optgroup><?php } ?>
+								<?php include __DIR__.'/system_recording_options.php'; ?>
 							</select>
 							<p class="help-block"><?php echo _('System recordings are converted into a managed Asterisk tone when saved.'); ?></p>
 						</div>
@@ -726,8 +722,17 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						<div class="col-sm-4"><label for="sls-media-cache"><?php echo _('Cache target'); ?></label>
 							<div class="input-group"><input id="sls-media-cache" class="form-control" name="generated_media_cache_mib" type="number" min="64" max="4096" step="1" required aria-describedby="sls-media-cache-help" value="<?php echo (int)($settings['generated_media_cache_mib'] ?? 512); ?>"><span class="input-group-addon">MiB</span></div>
 						</div>
-						<div class="col-sm-8"><p id="sls-media-cache-help" class="help-block"><?php echo _('Default: 512 MiB for generated speech, images and phone XML combined. Maintenance removes the oldest unused files when the target is exceeded. Active alerts, saved references and files created within 15 minutes remain protected. This target is not a disk reservation or a limit on active announcements; excess protected usage produces a storage warning.'); ?></p></div>
+						<div class="col-sm-8"><p id="sls-media-cache-help" class="help-block"><?php echo _('Default: 512 MiB for generated speech, images, phone XML and imported recording copies. New rendering stops when its reserved workspace exceeds this budget. Maintenance removes old unused files; active alerts and saved references remain protected.'); ?></p></div>
+						<div class="col-sm-4"><label for="sls-media-min-free"><?php echo _('Minimum remaining free space'); ?></label><div class="input-group"><input id="sls-media-min-free" class="form-control" name="generated_media_min_free_mib" type="number" min="64" max="4096" required value="<?php echo (int)($settings['generated_media_min_free_mib'] ?? 128); ?>"><span class="input-group-addon">MiB</span></div></div>
 					</div></div>
+				</div>
+				<div class="panel panel-default">
+					<div class="panel-heading"><strong><i class="fa fa-microphone" aria-hidden="true"></i> <?php echo _('Speech workload'); ?></strong></div>
+					<div class="panel-body"><div class="row">
+						<?php foreach (['speech_synthesis_limit'=>[_('Concurrent synthesis jobs'),1,4,1], 'speech_queue_limit'=>[_('Waiting jobs'),1,32,8], 'speech_queue_wait_seconds'=>[_('Maximum queue wait (seconds)'),0,60,15]] as $field=>$spec) { ?>
+						<div class="col-sm-4"><label for="sls-<?php echo $field; ?>"><?php echo $spec[0]; ?></label><input class="form-control" id="sls-<?php echo $field; ?>" name="<?php echo $field; ?>" type="number" min="<?php echo $spec[1]; ?>" max="<?php echo $spec[2]; ?>" required value="<?php echo (int)($settings[$field] ?? $spec[3]); ?>"></div>
+						<?php } ?>
+					</div><p class="help-block"><?php echo _('The default runs one speech job at reduced priority. All announcement and weather producers share this queue. A full queue returns an error before speech starts; increasing phone capacity does not increase synthesis concurrency.'); ?></p></div>
 				</div>
 				<?php if (($packageStatus['state'] ?? '') === 'update') { ?>
 					<div class="alert alert-warning"><i class="fa fa-exclamation-triangle" aria-hidden="true"></i> <strong><?php echo htmlspecialchars($packageStatus['label'] ?? _('Update available')); ?></strong><?php if (!empty($packageStatus['message'])) { ?> <?php echo htmlspecialchars($packageStatus['message']); ?><?php } ?></div>
@@ -772,7 +777,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						<div class="row">
 							<div class="col-sm-6 col-md-3 form-group">
 								<label for="sls-update-pin"><?php echo _('Pinned version'); ?></label>
-								<input id="sls-update-pin" class="form-control" name="updates[pinned_version]" maxlength="19" placeholder="0.1.5-beta" value="<?php echo htmlspecialchars($updates['pinned_version'] ?? '', ENT_QUOTES, 'UTF-8'); ?>" aria-describedby="sls-update-pin-help">
+								<input id="sls-update-pin" class="form-control" name="updates[pinned_version]" maxlength="19" placeholder="0.1.6-beta" value="<?php echo htmlspecialchars($updates['pinned_version'] ?? '', ENT_QUOTES, 'UTF-8'); ?>" aria-describedby="sls-update-pin-help">
 								<p id="sls-update-pin-help" class="help-block"><?php echo _('Optional exact version. Leave blank for the newest eligible release. An older pin holds the current installation; it does not downgrade it.'); ?></p>
 							</div>
 							<div class="col-sm-6 col-md-3 form-group">
@@ -832,6 +837,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 
 			<div data-settings-related="maintenance" aria-labelledby="sls-settings-tab-maintenance">
 			<h3 class="sls-config-backup"><i class="fa fa-download text-primary" aria-hidden="true"></i> <?php echo _('Config Backup'); ?></h3>
+			<p class="help-block"><i class="fa fa-lock" aria-hidden="true"></i> <?php echo _('FreePBX backups include the encrypted SLS configuration and its recovery key. Protect the entire backup archive with encryption and restricted access. For a configuration-only export protected by a separate passphrase, use the form below.'); ?></p>
 			<?php if (!empty($configuration_backup_reminder['due'])): ?>
 			<div class="alert alert-info" role="note">
 				<i class="fa fa-shield" aria-hidden="true"></i>

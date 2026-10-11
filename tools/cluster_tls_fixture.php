@@ -5,7 +5,7 @@ require_once __DIR__.'/../slsmassnotifyserver/EnterpriseClusterRuntime.php';
 require_once __DIR__.'/../slsmassnotifyserver/EnterpriseClusterEdge.php';
 require_once __DIR__.'/../slsmassnotifyserver/EnterpriseCluster.php';
 $fixture=json_decode(file_get_contents($argv[1]),true,32,JSON_THROW_ON_ERROR);
-$r=new \SLS\MassNotify\EnterpriseClusterRuntime($fixture['settings'],$fixture['directory'],$fixture['boot_id'],$fixture['pbx_files']);
+$r=new \SLS\MassNotify\EnterpriseClusterRuntime($fixture['settings'],$fixture['directory'],$fixture['boot_id'],$fixture['pbx_files'],static fn()=>json_decode(file_get_contents($argv[1]),true,32,JSON_THROW_ON_ERROR)['settings']);
 if (($argv[2]??'')==='authority') {
     try { echo json_encode(\SLS\MassNotify\EnterpriseClusterIntegration::authority($fixture['settings'],$r)); }
     catch (Throwable $error) { echo json_encode(['ok'=>false,'error'=>'cluster_effect_fenced_or_uncertain']); }
@@ -17,7 +17,7 @@ if (($argv[2]??'')==='recover') {
         public function __construct(private array $fixture) {}
         private function getActiveSettings(): array { return $this->fixture['settings']; }
         protected function enterpriseClusterRuntime(array $settings): \SLS\MassNotify\EnterpriseClusterRuntime {
-            return new \SLS\MassNotify\EnterpriseClusterRuntime($settings,$this->fixture['directory'],$this->fixture['boot_id'],$this->fixture['pbx_files']);
+            return new \SLS\MassNotify\EnterpriseClusterRuntime($settings,$this->fixture['directory'],$this->fixture['boot_id'],$this->fixture['pbx_files'],fn()=>$this->fixture['settings']);
         }
         private function announcementJobDirectory(): string { return $this->fixture['jobs']; }
         private function scheduledAnnouncementDeadline(array $request): ?int { return $request['schedule_deadline_at']??null; }

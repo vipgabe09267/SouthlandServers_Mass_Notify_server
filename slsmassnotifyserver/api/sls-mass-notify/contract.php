@@ -8,7 +8,7 @@ final class ControlContract
 {
     public static function capabilities(array $principal): array
     {
-        $resources = ['status', 'capabilities', 'audiences', 'delivery', 'events', 'readiness', 'desktop_fleet', 'config', 'incidents', 'incident', 'incident_report', 'enterprise_capabilities', 'incident_templates'];
+        $resources = ['status', 'capabilities', 'audiences', 'delivery', 'events', 'readiness', 'desktop_fleet', 'config', 'incidents', 'incident', 'incident_report', 'enterprise_capabilities', 'incident_templates', 'recordings'];
         $actions = ['send_announcement' => 'send', 'preview_announcement' => 'send', 'retry_announcement' => 'send', 'test_nws' => 'test',
             'trigger_nws_test' => 'test', 'get_config' => 'config', 'update_config' => 'config',
             'start_incident' => 'send', 'update_incident' => 'send', 'incident_roll_call' => 'config', 'incident_checklist' => 'config', 'enterprise_template_start' => 'send'];
@@ -21,7 +21,7 @@ final class ControlContract
             if (ApiSecurity::permits($principal, $scope) && ($scope !== 'config' || $unrestricted)
                 && (!$incident || ($unrestricted && ($principal['id'] ?? '') !== 'legacy'))) {
                 $available[] = ['action' => $action, 'scope' => $scope,
-                    'idempotency' => $incident || $action === 'enterprise_template_start' ? 'request_id' : 'none', 'maximum_body_bytes' => $action === 'update_config' ? 2097152 : 65536];
+                    'idempotency' => $incident || $action === 'enterprise_template_start' ? 'request_id' : ($action==='send_announcement'?'Idempotency-Key':'none'), 'maximum_body_bytes' => $action === 'update_config' ? 2097152 : 65536];
             }
         }
         $availableResources = [];
@@ -36,7 +36,7 @@ final class ControlContract
         return ['api_version' => 1, 'notification_payload_schema' => 1, 'desktop_sse_protocol' => 2,
             'resources' => $availableResources, 'actions' => $available,
             'credential' => ['id' => (string)($principal['id'] ?? ''), 'scopes' => array_values($principal['scopes'] ?? []), 'unrestricted_audience' => $unrestricted],
-            'limits' => ['event_page_records' => 100, 'event_page_scan_bytes' => 524288, 'incident_page_records' => 200,
+            'limits' => ['announcement_idempotency_retention_seconds'=>2592000,'event_page_records' => 100, 'event_page_scan_bytes' => 524288, 'incident_page_records' => 200,
                 'sms_recipients' => 50, 'email_recipients' => 50],
             'paths' => ['control' => '/api/sls-mass-notify/', 'desktop' => '/api/sipnotify/desktop',
                 'desktop_acknowledgement' => '/api/sipnotify/desktop/ack', 'desktop_stream' => '/api/sipnotify/desktop/stream',
@@ -73,7 +73,7 @@ final class ControlContract
         $options = $body['options'] ?? [];
         $allowedOptions = ['style', 'image', 'title', 'background_color', 'audio_mode', 'opening_tone', 'closing_tone',
             'priority', 'desktop_all', 'phones_all', 'desktop_clients', 'voice_recipient_ids', 'email_recipient_ids',
-            'sms_recipient_ids', 'webhook_ids', 'piper_voice', 'tts_volume', 'preview', 'is_test'];
+            'sms_recipient_ids', 'webhook_ids', 'browser_recipient_ids','connector_ids','piper_voice', 'tts_volume', 'preview', 'is_test'];
         $allowedBody = array_merge(['action', 'options', 'message', 'body', 'text', 'targets', 'extensions', 'groups',
             'announcement_groups', 'desktop_targets', 'all_desktops', 'all_phones', 'desktop', 'tts'], $allowedOptions);
         if (array_diff(array_keys($body), $allowedBody) || !is_array($options) || ($options && array_is_list($options))
@@ -91,6 +91,13 @@ final class ControlContract
             }
             if (array_key_exists('tts_volume', $fields) && (!is_int($fields['tts_volume']) || $fields['tts_volume'] < 1 || $fields['tts_volume'] > 200)) {
                 throw new \InvalidArgumentException('tts_volume must be an integer from 1 through 200.');
+            }
+            foreach (['browser_recipient_ids'=>['/^sub_[a-f0-9]{24}$/D',50],'connector_ids'=>['/^conn_[a-f0-9]{24}$/D',20]] as $field=>[$pattern,$maximum]) {
+                if (!array_key_exists($field,$fields)) { continue; }
+                $ids=$fields[$field];
+                if (!is_array($ids)||!array_is_list($ids)||count($ids)>$maximum) { throw new \InvalidArgumentException($field.' must contain a bounded list of saved IDs.'); }
+                foreach ($ids as $id) { if (!is_string($id)||!preg_match($pattern,$id)) { throw new \InvalidArgumentException($field.' contains an invalid saved ID.'); } }
+                if (count(array_unique($ids))!==count($ids)) { throw new \InvalidArgumentException($field.' contains duplicate IDs.'); }
             }
             if (array_key_exists('webhook_ids', $fields) && (!is_array($fields['webhook_ids']) || !array_is_list($fields['webhook_ids'])
                 || count($fields['webhook_ids']) > 10)) {
@@ -123,7 +130,7 @@ final class ControlContract
         $unrestricted = ($principal['audience']['unrestricted'] ?? false) === true;
         $allowed = ApiSecurity::allowedAudience($principal, $settings);
         $result = ['phone_targets' => [], 'desktop_clients' => [], 'announcement_groups' => [], 'nws_zones' => [],
-            'voice_recipients' => [], 'email_recipients' => [], 'sms_recipients' => [], 'webhooks' => []];
+            'voice_recipients' => [], 'email_recipients' => [], 'sms_recipients' => [], 'webhooks' => [], 'browser_recipients' => [], 'connectors' => []];
         $phones = $unrestricted ? (array)($settings['alert_recipients'] ?? []) : $allowed['phones'];
         foreach (['announcement_groups', 'nws_zones'] as $collection) {
             foreach ((array)($settings[$collection] ?? []) as $row) {
@@ -164,6 +171,14 @@ final class ControlContract
             if (!is_array($row) || !self::enabled($row) || !is_string($row['id'] ?? null)
                 || (!$unrestricted && !in_array($row['id'], $allowed['webhooks'], true))) { continue; }
             $result['webhooks'][] = self::metadata($row, $row['id']);
+        }
+        if ($unrestricted && ($principal['id']??'')!=='legacy') {
+            if (!empty($settings['subscriber_browser']['enabled']) && !empty($settings['subscriber_browser']['push']['enabled'])) {
+                foreach ((array)($settings['subscriber_browser']['people'] ?? []) as $row) { if (is_array($row) && self::enabled($row)) { $result['browser_recipients'][] = self::metadata($row, $row['id']); } }
+            }
+            if (self::enabled($settings['enterprise_integrations'] ?? []) && self::enabled($settings['enterprise_integrations']['connectors'] ?? [])) {
+                foreach ((array)($settings['enterprise_integrations']['connectors']['destinations'] ?? []) as $row) { if (is_array($row) && self::enabled($row)) { $result['connectors'][] = self::metadata($row, $row['id']); } }
+            }
         }
         return $result;
     }

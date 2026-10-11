@@ -171,32 +171,28 @@ foreach (['getSipNotifyTargets', 'getAllPjsipExtensions', 'getRegisteredPjsipExt
 	}
 }
 
-// Exercise inventory fallback and its request-local cache using inert host
-// adapters. A failed primary probe must retain the fixed fallback deadline.
+// Display reads use one bounded snapshot, even when Asterisk is slow or unavailable.
 eval('namespace FreePBX\\modules; function exec($command, &$output=null, &$status=null) {
     $GLOBALS["sls_ui_probe_calls"][]=$command;
-    if (str_contains($command,"--list-endpoints-json")) {$output=[];$status=124;return false;}
-    if ($command!=="/usr/bin/timeout --kill-after=1 5 /usr/sbin/asterisk -rx \'pjsip show contacts\' 2>/dev/null") {
-        throw new \\RuntimeException("Unexpected or unbounded inventory fallback command.");
-    }
-    $output=empty($GLOBALS["sls_ui_probe_failure"]) ? ["Contact: 1000/sip:fixture Avail 5"] : [];
+    if (!str_contains($command,"--kill-after=2 15 /usr/bin/python3 -I") || !str_contains($command,"--list-endpoints-json")) { throw new \\RuntimeException("Unexpected discovery command."); }
+    $output=empty($GLOBALS["sls_ui_probe_failure"]) ? [json_encode(["1001"=>[]])] : [];
     $status=empty($GLOBALS["sls_ui_probe_failure"]) ? 0 : 124;
     return false;
 }');
 $GLOBALS['sls_ui_probe_calls']=[];$GLOBALS['sls_ui_probe_failure']=false;
-$registered=$invoke('getRegisteredPjsipExtensions');$probeCalls=count($GLOBALS['sls_ui_probe_calls']);
-if ($registered!==['1000'] || $probeCalls<1 || $invoke('getRegisteredPjsipExtensions')!==['1000']
-    || count($GLOBALS['sls_ui_probe_calls'])!==$probeCalls) {
-    ui_performance_fail('Failed primary discovery did not recover through the bounded cached Asterisk fallback.');
+$cache=$parent->getProperty('phoneInventoryCache');$cache->setValue($fixture,['available'=>true,'endpoints'=>['1000'=>[]]]);
+if($invoke('getRegisteredPjsipExtensions')!==['1000']||$invoke('getRegisteredPjsipExtensions')!==['1000']||$GLOBALS['sls_ui_probe_calls']){
+    ui_performance_fail('Display reads executed live discovery or lost cached registration.');
 }
-$unavailable=(new ReflectionClass(UiPerformanceFixture::class))->newInstanceWithoutConstructor();
-$getRegistered=$parent->getMethod('getRegisteredPjsipExtensions');$GLOBALS['sls_ui_probe_failure']=true;
-if ($getRegistered->invoke($unavailable)!==[]) {
-    ui_performance_fail('Failed Asterisk fallback inferred a registered extension.');
+$unavailable=(new ReflectionClass(UiPerformanceFixture::class))->newInstanceWithoutConstructor();$cache->setValue($unavailable,['available'=>false,'endpoints'=>[]]);
+$getRegistered=$parent->getMethod('getRegisteredPjsipExtensions');
+if($getRegistered->invoke($unavailable)!==[]||$getRegistered->invoke($unavailable)!==[]||$GLOBALS['sls_ui_probe_calls']){
+    ui_performance_fail('Unavailable display inventory started a live probe or invented registration.');
 }
-$probeCalls=count($GLOBALS['sls_ui_probe_calls']);$getRegistered->invoke($unavailable);
-if (count($GLOBALS['sls_ui_probe_calls'])!==$probeCalls) {
-    ui_performance_fail('Repeated UI reads restarted unavailable inventory probes.');
-}
+$live=$parent->getProperty('phoneInventoryForSending');$live->setValue($fixture,true);
+if($invoke('getRegisteredPjsipExtensions')!==['1001']||count($GLOBALS['sls_ui_probe_calls'])!==1){ui_performance_fail('Sending trusted display cache instead of current registration.');}
+$GLOBALS['sls_ui_probe_failure']=true;
+try{$invoke('getRegisteredPjsipExtensions');ui_performance_fail('Failed current registration did not stop sending.');}catch(DomainException $expected){}
+if(str_contains($methodSource('getDetectedEndpointFormats'),'exec(')){ui_performance_fail('Phone diagnostics started a live inventory subprocess.');}
 
 echo "UI performance contract tests passed.\n";

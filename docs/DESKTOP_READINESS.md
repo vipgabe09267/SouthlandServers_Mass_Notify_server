@@ -45,4 +45,6 @@ Neither connection nor compatibility confirms receipt or human reading; the
 existing exact-event acknowledgement ledger remains authoritative for app receipt.
 
 The current desktop app must add these headers to populate version reporting.
-No minimum version is imposed by an upgrade and existing clients continue working.
+Fresh installations default to a minimum version of `1.0.10-beta`. Upgrades
+preserve an existing explicit policy. This is an advisory upgrade check;
+existing authenticated clients continue working.

@@ -118,6 +118,21 @@ Its private TLS-server tests exercise actual certificate verification, bearer
 authentication, warnings, stale/invalid reports and redirect rejection. No
 separate monitoring host was deployed during PBX validation.
 
+## Desktop stream disconnects
+
+Streams flush heartbeats approximately every 15 seconds and release their capacity
+slots when PHP detects a disconnect or the 300-second stream lifetime ends.
+TCP and FastCGI proxies can delay detection beyond the next heartbeat. A local
+verified-HTTPS qualification check through an Apache/FPM route closed the actual socket
+after authentication and observed its exact claimed lock release 44.559 seconds
+later, before the requested 300-second deadline. An earlier 18-second check did
+not observe release. The check does not identify which layer caused the delay
+or establish a maximum for other networks or proxy configurations. The isolated
+HTTPS regression now requests 300 seconds and
+requires early-disconnect cleanup within 50 seconds, so natural stream expiry
+cannot satisfy it; that fixture uses Apache/mod_php rather than the deployed
+FastCGI route.
+
 Local success does not certify 1,000-client throughput, handset display, full
 audio playback, provider acceptance or human receipt. Perform those acceptance
 tests with the intended devices, routes and providers before operational use.

@@ -582,6 +582,20 @@ def alert_chain_key(alert):
     return f"{event}|{reference_id or alert_id}"
 
 
+def reserve_generated_asset(web_dir, amount):
+    # Private previews/test captures are not retained in the managed cache.
+    if Path(web_dir) != Path('/var/www/html/sls_mass_notify'):
+        return
+    helper = Path('/usr/local/bin/sls_mass_notify/sls_speech_admission.py')
+    info = helper.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != 0 or info.st_mode & 0o022:
+        raise RuntimeError('The protected generated-media admission helper is unavailable. Run Repair Installation.')
+    result = subprocess.run(['/usr/bin/python3', '-I', str(helper), '--reserve-media-bytes', str(amount)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+    if result.returncode:
+        raise RuntimeError('Generated media could not reserve cache budget or free space. Review Storage diagnostics before retrying.')
+
+
 def render_alert_image(config, alert):
     props = alert.get("properties", {})
     priority = alert_priority(props)
@@ -591,6 +605,7 @@ def render_alert_image(config, alert):
     web_dir = Path(config.get("visual", "web_dir", fallback="/var/www/html/sls_mass_notify"))
     public_base_url = config.get("visual", "public_base_url", fallback="https://PBX_HOST/sls_mass_notify").rstrip("/")
     web_dir.mkdir(parents=True, exist_ok=True)
+    reserve_generated_asset(web_dir, 5 * 1024 * 1024)
     output = web_dir / safe_alert_filename(alert)
     lines = [imagemagick_text(line) for line in image_text_lines(alert)]
 
@@ -615,7 +630,7 @@ def render_alert_image(config, alert):
         "-define", "png:color-type=2",
         "PNG24:" + str(output),
     ]
-    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=30)
     if result.returncode != 0:
         raise RuntimeError((result.stderr or "ImageMagick convert failed").strip())
     validate_rendered_png(output, width, height)
@@ -640,6 +655,7 @@ def validate_rendered_png(path, expected_width, expected_height):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        timeout=5,
     )
     details = (result.stdout or "").strip()
     expected = f"PNG {expected_width} {expected_height} 8 sRGB"
@@ -765,6 +781,7 @@ def hosted_phone_payload(config, xml_payload):
     web_dir = Path(config.get("visual", "web_dir", fallback="/var/www/html/sls_mass_notify"))
     public_base_url = config.get("visual", "public_base_url", fallback="https://PBX_HOST/sls_mass_notify").rstrip("/")
     web_dir.mkdir(parents=True, exist_ok=True)
+    reserve_generated_asset(web_dir, len(xml_payload.encode('utf-8')) + 4096)
     payload_hash = hashlib.sha256(xml_payload.encode("utf-8")).hexdigest()[:12]
     output = web_dir / f"phone_payload_{payload_hash}_{secrets.token_hex(10)}.xml"
     tmp = output.with_name(output.name + f".tmp.{os.getpid()}")
@@ -897,6 +914,7 @@ def render_announcement_image(config, title, message, background_color="#1f2937"
     url_setting = "desktop_public_base_url" if desktop else "public_base_url"
     public_base_url = config.get("visual", url_setting, fallback="https://PBX_HOST/sls_mass_notify").rstrip("/")
     web_dir.mkdir(parents=True, exist_ok=True)
+    reserve_generated_asset(web_dir, 5 * 1024 * 1024)
 
     title = imagemagick_text((title or "Announcement").strip(), 48) or "Announcement"
     cleaned = " ".join((message or "").split()).strip() or "Announcement"
@@ -938,7 +956,7 @@ def render_announcement_image(config, title, message, background_color="#1f2937"
         "-define", "png:color-type=2",
         "PNG24:" + str(output),
     ])
-    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=30)
     if result.returncode != 0:
         raise RuntimeError((result.stderr or "ImageMagick convert failed").strip())
     validate_rendered_png(output, width, height)
@@ -1042,6 +1060,17 @@ def endpoint_format_overrides(config):
     return overrides
 
 
+def saved_phone_format_overrides(settings):
+    """Use the same normalization for background display and live delivery."""
+    sipnotify = settings.get('sipnotify') if isinstance(settings.get('sipnotify'), dict) else {}
+    config = configparser.ConfigParser(interpolation=None)
+    config.read_dict({
+        'endpoint_format_overrides': {str(key): str(value) for key, value in (sipnotify.get('format_overrides') or {}).items() if str(key).isdigit()},
+        'device_format_overrides': {str(key): str(value.get('format', '')) for key, value in (sipnotify.get('device_format_overrides') or {}).items() if re.fullmatch('[a-f0-9]{32}', str(key)) and isinstance(value, dict)},
+    })
+    return endpoint_format_overrides(config)
+
+
 def device_registration_key(endpoint, uri):
     # Bind the override to this registration, never to an extension's other
     # contacts. Address/port changes intentionally fall back to autodetection.
@@ -1085,18 +1114,22 @@ def detect_phone_format(user_agent, endpoint=""):
     return "unknown"
 
 
-def asterisk_contact_uri_inventory(endpoints):
+def asterisk_contact_uri_inventory(endpoints, max_seconds=5):
     inventory = {}
+    deadline = time.monotonic() + max_seconds
     for endpoint in sorted(set(endpoints or [])):
         if not re.fullmatch(r"[0-9]+", endpoint):
             continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
             result = subprocess.run(
                 ["/usr/sbin/asterisk", "-rx", f"pjsip show aor {endpoint}"],
                 cwd="/",
                 capture_output=True,
                 text=True,
-                timeout=8,
+                timeout=min(5, remaining),
                 check=False,
             )
         except Exception as exc:
@@ -1142,7 +1175,7 @@ def get_registered_endpoint_info(ami, allowed_targets=None, format_overrides=Non
         if ami_field(event, "Event") != "ContactList":
             continue
         endpoint = str(ami_field(event, "Endpoint", "AOR", "ObjectName")).split("/", 1)[0].strip()
-        if endpoint and (not allowed_targets or endpoint in allowed_targets):
+        if endpoint and (not allowed_targets or endpoint in allowed_targets) and not registered_contact_uri(ami_field(event, 'Contact', 'Uri')):
             candidate_endpoints.add(endpoint)
     contact_uri_inventory = asterisk_contact_uri_inventory(candidate_endpoints) if resolve_contact_uris else {}
     contact_uri_offsets = {}
@@ -1787,7 +1820,8 @@ def normalize_incident_context(value):
     if value is None:
         return None
     keys = {'schema', 'incident_id', 'sequence', 'kind', 'severity', 'is_test'}
-    if (not isinstance(value, dict) or set(value) != keys
+    extra = {'operation_request_id','language_variant','language_batch','language_batches','expires_at'}
+    if (not isinstance(value, dict) or not keys.issubset(value) or set(value)-keys-extra
             or type(value['schema']) is not int or value['schema'] != 1
             or not isinstance(value['incident_id'], str)
             or re.fullmatch(r'inc_[0-9a-f]{32}', value['incident_id']) is None
@@ -1796,6 +1830,15 @@ def normalize_incident_context(value):
             or value['severity'] not in ('information', 'warning', 'critical')
             or type(value['is_test']) is not bool):
         raise ValueError('Invalid incident publication metadata')
+    if set(value) & extra:
+        if (not extra.issubset(value) or not isinstance(value['operation_request_id'],str)
+                or re.fullmatch('[a-f0-9]{32}',value['operation_request_id']) is None
+                or not isinstance(value['language_variant'],str) or re.fullmatch('(?:[a-z]{2,3}(?:-[a-z0-9]{2,8}){0,3})?',value['language_variant']) is None
+                or type(value['language_batch']) is not int or type(value['language_batches']) is not int
+                or not 1 <= value['language_batch'] <= value['language_batches'] <= 7
+                or not isinstance(value['expires_at'],str) or re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00',value['expires_at']) is None):
+            raise ValueError('Invalid incident language publication metadata')
+        datetime.fromisoformat(value['expires_at'])
     return dict(value)
 
 
@@ -1811,6 +1854,12 @@ def announcement_api_record(alert_id, message, xml_payload, extensions, desktop_
         display_expires_at = (
             datetime.now(timezone.utc) + timedelta(seconds=timeout_seconds)
         ).isoformat().replace("+00:00", "Z")
+    if incident is not None and 'expires_at' in incident:
+        absolute = datetime.fromisoformat(incident['expires_at'])
+        if absolute <= datetime.now(timezone.utc):
+            raise ValueError('Incident language publication expired before delivery')
+        if display_expires_at is None or absolute < datetime.fromisoformat(display_expires_at.replace('Z','+00:00')):
+            display_expires_at = absolute.isoformat().replace('+00:00','Z')
     style = "colored" if image else "standard"
     text_color = contrasting_text_color(normalized_background)
     record = {

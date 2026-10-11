@@ -10,6 +10,8 @@ import pwd
 import subprocess
 import tempfile
 import unittest
+import sys
+import types
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +26,7 @@ def load(name):
 
 
 CONSOLE, CRYPTO, GUARD = (load(name) for name in ('sls_console','sls_config_crypto','sls_cluster_guard'))
+TRUST = load('sls_module_trust')
 
 
 class ConsoleTests(unittest.TestCase):
@@ -77,6 +80,15 @@ class ConsoleTests(unittest.TestCase):
             self.assertEqual(path.stat().st_uid,self.uid)
             self.assertNotIn(b'fixture-key-only',path.read_bytes())
         self.assertEqual([c[1] for c in self.calls if c[1]!='show'],['start','restart','start','restart'])
+
+    def test_doctor_does_not_enter_mutating_runtime_control_or_read_secrets(self):
+        import types,sys
+        doctor=types.SimpleNamespace(main=lambda:0)
+        with patch.object(sys,'argv',['slsconsole','doctor','--json']),patch.object(CONSOLE,'protected_file'),patch.object(CONSOLE,'load',return_value=doctor) as loader:
+            self.assertEqual(CONSOLE.main(),0)
+        loader.assert_called_once_with('sls_install_doctor')
+        self.assertEqual(self.calls,[])
+        self.assertEqual(self.read(),self.original)
 
     def test_failed_reboot_remains_stopped_and_never_restarts_pbx(self):
         self.failure='restart'
@@ -154,6 +166,92 @@ class ConsoleTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):CONSOLE.protected_file(alias)
         with patch.object(CONSOLE.os,'geteuid',return_value=self.uid),patch('sys.argv',['slsconsole','stop']):
             with self.assertRaisesRegex(RuntimeError,'requires root'):CONSOLE.main()
+
+    def test_uninstall_dispatch_uses_only_authenticated_teardown(self):
+        trusted = types.SimpleNamespace()
+        for explicit, inherited, expected in [(False, '1', '0'), (True, '0', '1')]:
+            argv = ['slsconsole', 'uninstall'] + (['--purge'] if explicit else [])
+            with patch.object(sys, 'argv', argv), patch.object(CONSOLE, 'protected_file'), \
+                    patch.object(CONSOLE, 'load_uninstall_trust', return_value=trusted), \
+                    patch.object(CONSOLE, 'authenticate_uninstaller', return_value=CONSOLE.UNINSTALLER) as authenticate, \
+                    patch.object(CONSOLE, 'load', side_effect=FileNotFoundError(
+                        2, 'No such file or directory',
+                        '/usr/local/bin/sls_mass_notify/sls_privileged_install.py')) as operational_loader, \
+                    patch.dict(os.environ, {'SLS_MASS_NOTIFY_PURGE_CONFIG': inherited}), \
+                    patch.object(CONSOLE.os, 'execve') as execute:
+                self.assertEqual(CONSOLE.main(), 0)
+            authenticate.assert_called_once_with(trusted)
+            operational_loader.assert_not_called()
+            program, arguments, environment = execute.call_args.args
+            self.assertEqual(program, '/usr/bin/bash')
+            self.assertEqual(arguments, ['/usr/bin/bash', str(CONSOLE.UNINSTALLER)])
+            self.assertEqual(environment['SLS_MASS_NOTIFY_PURGE_CONFIG'], expected)
+
+    def test_uninstall_flags_and_nonroot_execution_are_rejected(self):
+        for argv in [['slsconsole', 'start', '--purge'], ['slsconsole', 'uninstall', '--json']]:
+            with patch.object(sys, 'argv', argv), self.assertRaises(SystemExit) as failure:
+                CONSOLE.main()
+            self.assertEqual(failure.exception.code, 2)
+        with patch.object(sys, 'argv', ['slsconsole', 'uninstall']), \
+                patch.object(CONSOLE.os, 'geteuid', return_value=self.uid), \
+                patch.object(CONSOLE, 'load_uninstall_trust') as loader:
+            with self.assertRaisesRegex(RuntimeError, 'requires root'):
+                CONSOLE.main()
+            loader.assert_not_called()
+
+
+class UninstallPublisherTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix='sls-console-publisher-', dir='/run')
+        self.addCleanup(self.directory.cleanup)
+        self.base = Path(self.directory.name)
+        self.store = self.base / 'trust'
+        self.script = self.base / 'uninstall.sh'
+        files = {
+            'bin/sls_mass_notify/sls_module_trust.py': (RUNTIME / 'sls_module_trust.py').read_bytes(),
+            'bin/sls_mass_notify_uninstall.sh': (ROOT / 'tools/uninstall_release.sh').read_bytes(),
+        }
+        self.data = {'schema': 1, 'module': 'slsmassnotifyserver', 'version': '0.1.6-beta',
+                     'source': {'kind': 'publisher-ed25519', 'archive_sha256': 'a' * 64},
+                     'files': {name: {'sha256': TRUST.digest(body), 'target': 'admin/modules/slsmassnotifyserver/' + name}
+                               for name, body in files.items()}}
+        raw = json.dumps(self.data).encode()
+        name = TRUST.store_manifest(self.store, self.data, raw)
+        self.generation = self.store / name
+        for name, body in files.items():
+            path = self.generation / 'module' / name
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path.write_bytes(body); path.chmod(0o600)
+        self.script.write_bytes(files['bin/sls_mass_notify_uninstall.sh']); self.script.chmod(0o700)
+
+    def test_offline_retained_generation_authenticates_without_operational_runtime(self):
+        trust = CONSOLE.load_uninstall_trust(self.store)
+        self.assertEqual(CONSOLE.authenticate_uninstaller(trust, path=self.script, root=self.store), self.script)
+        self.assertFalse((self.generation / 'module/bin/sls_mass_notify/sls_phone_events.py').exists())
+
+    def test_changed_or_linked_uninstaller_is_rejected(self):
+        trust = CONSOLE.load_uninstall_trust(self.store)
+        original = self.script.read_bytes()
+        self.script.write_bytes(original + b'\n# changed\n')
+        with self.assertRaisesRegex(RuntimeError, 'differs'):
+            CONSOLE.authenticate_uninstaller(trust, path=self.script, root=self.store)
+        self.script.unlink(); self.script.symlink_to(self.generation / 'module/bin/sls_mass_notify_uninstall.sh')
+        with self.assertRaises(RuntimeError):
+            CONSOLE.authenticate_uninstaller(trust, path=self.script, root=self.store)
+
+    def test_changed_trust_source_is_rejected_before_execution(self):
+        path = self.generation / 'module/bin/sls_mass_notify/sls_module_trust.py'
+        path.write_text('raise AssertionError("must not execute changed source")\n')
+        with self.assertRaisesRegex(RuntimeError, 'trust helper changed'):
+            CONSOLE.load_uninstall_trust(self.store)
+
+    def test_missing_or_malformed_publisher_reference_is_rejected(self):
+        path = self.store / 'slsmassnotifyserver.active.json'
+        for value in [[], {'sha256': 123}, {'sha256': 'a' * 64, 'generation': '../escape'}]:
+            path.write_text(json.dumps(value))
+            with self.assertRaises(RuntimeError): CONSOLE.load_uninstall_trust(self.store)
+        path.unlink()
+        with self.assertRaises(FileNotFoundError): CONSOLE.load_uninstall_trust(self.store)
 
 
 if __name__=='__main__':unittest.main()

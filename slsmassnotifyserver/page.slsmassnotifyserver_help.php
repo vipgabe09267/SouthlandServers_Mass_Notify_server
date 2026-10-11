@@ -4,7 +4,7 @@
 $slsmassnotifyserver = \FreePBX::create()->Slsmassnotifyserver;
 $slsmassnotifyserver->enforceOperatorPageAccess('slsmassnotifyserver_help');
 $deviceTestAction = $_REQUEST['slsmassnotifyserver_action'] ?? '';
-if (in_array($deviceTestAction, ['device_acceptance_state', 'record_device_acceptance'], true)) {
+if (in_array($deviceTestAction, ['device_acceptance_state', 'record_device_acceptance', 'installation_profile'], true)) {
 	$respond = static function (array $body, int $status): void {
 		while (ob_get_level() > 0) { @ob_end_clean(); }
 		http_response_code($status);
@@ -19,6 +19,7 @@ if (in_array($deviceTestAction, ['device_acceptance_state', 'record_device_accep
 		$respond(['success' => false, 'message' => 'The security token expired. Reload the page before recording this observation.'], 403);
 	}
 	if (session_status() === PHP_SESSION_ACTIVE) { session_write_close(); }
+	if ($deviceTestAction === 'installation_profile') { $result=$slsmassnotifyserver->getInstallationProfile(); $respond($result, !empty($result['success']) ? 200 : 403); }
 	if ($deviceTestAction === 'record_device_acceptance') {
 		$raw = $_POST['payload'] ?? null;
 		if (!is_string($raw) || strlen($raw) > 8192) { $respond(['success' => false, 'message' => 'The device-test form is invalid or exceeds its request limit.'], 400); }
