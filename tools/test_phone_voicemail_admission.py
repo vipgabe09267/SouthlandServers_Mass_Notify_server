@@ -74,6 +74,70 @@ class VoicemailAdmissionTests(unittest.TestCase):
         return self.store.admit_voicemail(token, '1000', options.get('limit', 25),
             options.get('inventory', self.inventory()), options.get('mailbox', '1000@default'), sound)
 
+    def hangup_only(self, token, changes=None):
+        self.store.bind_origin(token, '1000', '1.1', 'Local/1000@sls-alert-audio-1;2')
+        for index, dial in enumerate(self.dials, 2):
+            uid, channel = '1.' + str(index), 'PJSIP/1000-' + str(index)
+            self.store.bind_contact(token, '1000', uid, channel, dial)
+            event = {'Event': 'Hangup', 'Uniqueid': uid, 'Channel': channel,
+                     'AccountCode': phone.accountcode(token), 'Cause': '19',
+                     'ChannelState': '5', 'ChannelStateDesc': 'Ringing'}
+            event.update((changes or {}).get(index, {}))
+            self.store.record_event(event)
+        self.store.ended(token, '1.1', 16)
+        self.now += 1
+
+    def test_page_timeout_without_dialend_authorizes_one_exact_mailbox(self):
+        token, sound = self.source(service='lightning')
+        self.hangup_only(token)
+        contacts = [row for row in self.state()['batches'][token]['channels'].values() if row['kind'] == 'contact']
+        self.assertTrue(all(row['dial_status'] == 'NOANSWER' and row['dial_status_source'] == 'hangup' for row in contacts))
+        child = self.claim(token, sound)
+        self.assertEqual(self.state()['batches'][child]['voicemail']['source_token'], token)
+        with self.assertRaisesRegex(phone.PhoneAdmissionError, 'already_attempted'):
+            self.claim(token, sound)
+
+    def test_busy_and_unavailable_terminal_handsets_allow_one_fallback(self):
+        token, sound = self.source(service='lightning')
+        self.hangup_only(token, {2: {'Cause': '17', 'ChannelState': '7', 'ChannelStateDesc': 'Busy'},
+                                 3: {'Cause': '20', 'ChannelState': '0', 'ChannelStateDesc': 'Down'}})
+        child = self.claim(token, sound)
+        self.assertEqual(self.state()['batches'][child]['purpose'], 'voicemail')
+
+    def test_up_terminal_handset_blocks_voicemail_even_with_negative_cause(self):
+        token, sound = self.source(service='lightning')
+        self.hangup_only(token, {2: {'ChannelState': '6', 'ChannelStateDesc': 'Up'}})
+        self.assertIsNotNone(self.state()['batches'][token]['channels']['1.2']['answered_at'])
+        with self.assertRaisesRegex(phone.PhoneAdmissionError, 'noanswer_unconfirmed'):
+            self.claim(token, sound)
+
+    def test_ambiguous_terminal_state_cause_or_identity_never_grants_voicemail(self):
+        cases = [
+            {'ChannelState': '', 'ChannelStateDesc': ''},
+            {'ChannelState': '6', 'ChannelStateDesc': 'Ringing'},
+            {'ChannelState': '5', 'ChannelStateDesc': 'Unknown'},
+            {'Cause': '16'}, {'Cause': '0'}, {'Cause': '19oops'},
+            {'Channel': ''}, {'Channel': 'PJSIP/unrelated-2'},
+            {'Uniqueid': '99.2'},
+        ]
+        for event in cases:
+            with self.subTest(event=event):
+                token, sound = self.source(service='lightning')
+                self.hangup_only(token, {2: event})
+                with self.assertRaises(phone.PhoneAdmissionError):
+                    self.claim(token, sound)
+                self.assertIsNone(self.state()['batches'][token]['vm_fallback']['targets']['1000']['claimed_token'])
+
+    def test_recorded_answer_is_not_overwritten_by_negative_hangup(self):
+        token, sound = self.source(service='lightning')
+        self.end_unanswered(token, {2: 'ANSWER'})
+        self.store.record_event({'Event': 'Hangup', 'Uniqueid': '1.2', 'Channel': 'PJSIP/1000-2',
+            'AccountCode': phone.accountcode(token), 'Cause': '19', 'ChannelState': '5', 'ChannelStateDesc': 'Ringing'})
+        self.assertEqual(self.state()['batches'][token]['channels']['1.2']['dial_status'], 'ANSWER')
+        self.now += 1
+        with self.assertRaisesRegex(phone.PhoneAdmissionError, 'noanswer_unconfirmed'):
+            self.claim(token, sound)
+
     def test_plain_phone_requests_cannot_introduce_mailbox_targets(self):
         for service in ('manual', 'live', 'nws', 'lightning'):
             with self.subTest(service=service), self.assertRaises(phone.PhoneAdmissionError):

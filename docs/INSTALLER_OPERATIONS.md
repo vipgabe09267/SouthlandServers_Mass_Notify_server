@@ -85,7 +85,7 @@ and use the exact location printed in its log:
 
 ```bash
 bash /path/to/publisher-authenticated/install_release.sh --recover \
-  /var/lib/sls-mass-notify-installer/transaction-<id>
+  '/var/lib/sls-mass-notify-installer/transaction-<id>'
 ```
 
 Recovery authenticates the saved installer, package and executable helpers

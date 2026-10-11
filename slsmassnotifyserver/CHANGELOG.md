@@ -2,6 +2,8 @@
 
 ## 0.1.6-beta — 2026-10-10
 
+- Put install/update, offline uninstall, service commands and recovery at the top of the README. Remove repeated release notes and move capacity tables and detailed delivery behavior into linked guides.
+- Fix native voicemail fallback after a Lightning or Weather page times out without a per-handset `DialEnd`. Accept an exact tracked handset's terminal AMI state with an explicit busy/no-answer/unavailable cause; retain answered-call, uncertain-outcome and duplicate-deposit protections.
 - Synchronize every installer stage with the protected transaction allowlist, fixing exit code 2 before ownership protection. Keep the last recorded stage after a rejected transition so rollback can finish durably. Retain settings snapshots until commit or verified rollback; support authenticated recovery of the earlier prepared transaction before retrying installation.
 - Recover a missing central-configuration mutex and recognized root-owned active/pending settings during authenticated installation. Validate settings before repair; preserve ciphertext, keys, existing mutex inodes and delivery history. Keep configuration coordination in the authenticated worker keeper and reject linked, nonempty or unexpected files without blocking on special files.
 - Separate publisher approval, legacy permission recovery, previous collector recovery and worker/configuration coordination in installer diagnostics. Failed preparation names the actual stage; successful final verification clears the installation warning.

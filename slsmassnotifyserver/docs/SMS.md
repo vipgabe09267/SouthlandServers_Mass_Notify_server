@@ -1,9 +1,9 @@
 # SMS announcements
 
-This feature belongs to the unpublished 0.1.5-beta candidate. The adapters and
-failure paths have isolated tests; a real provider account, callback route and
-carrier still need acceptance testing. SMS is disabled by default. Saving settings
-or previewing text does not contact a provider.
+SMS/MMS adapters are disabled by default. Sending, callback handling and failure
+paths have isolated tests; each provider account, callback route and carrier still
+needs deployment acceptance testing. Saving settings or previewing text does not
+contact a provider.
 
 ## Configure
 
@@ -97,8 +97,11 @@ display expiry are separate.
 
 SMS is available for general announcements and incident workflows. Weather and
 lightning routes can explicitly select saved SMS recipients and retain the same
-consent, immutable audience, quiet-hours, expiry and provider checks. Mobile push,
-IP speakers, visitor enrollment and failover remain excluded/deferred.
+consent, immutable audience, quiet-hours, expiry and provider checks. Native mobile
+push and visitor enrollment are unavailable. Browser push, SIP speakers and
+notification failover are separate, disabled-by-default Enterprise Labs features;
+see [integration limits](ENTERPRISE_INTEGRATIONS.md) and
+[notification continuity](ENTERPRISE_CLUSTER.md).
 
 ## Receipts, limits and recovery
 

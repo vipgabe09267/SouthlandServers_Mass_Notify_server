@@ -921,6 +921,25 @@ class PhoneAdmissionStore:
                 cause = str(event.get('Cause', ''))
                 if cause.isdigit() and 0 <= int(cause) <= 127:
                     channel['hangup_cause'] = int(cause)
+                # Page's asynchronous dial can omit per-contact DialEnd on
+                # timeout. Use only the exact bound handset's terminal AMI
+                # state and explicit negative cause, never a Local answer or
+                # an AGI end hook alone, as alternate no-answer evidence.
+                if (channel['kind'] == 'contact' and not VOICE_ID.fullmatch(channel['recipient'])
+                        and source_name == channel['channel']):
+                    terminal_state = str(event.get('ChannelState', ''))
+                    description = str(event.get('ChannelStateDesc', ''))
+                    if terminal_state == '6' and description == 'Up':
+                        if channel.get('answered_at') is None:
+                            channel['answered_at'] = now
+                    elif (channel.get('dial_status') == '' and channel.get('answered_at') is None
+                            and channel.get('joined_at') is None
+                            and {'0': 'Down', '3': 'Dialing', '4': 'Ring', '5': 'Ringing',
+                                 '7': 'Busy'}.get(terminal_state) == description
+                            and cause in {'17', '18', '19', '20'}):
+                        channel['dial_status'] = {'17': 'BUSY', '18': 'NOANSWER',
+                                                  '19': 'NOANSWER', '20': 'CHANUNAVAIL'}[cause]
+                        channel['dial_status_source'] = 'hangup'
             batch.update(updated_at=now, updated_tick=self.monotonic())
         return True
 

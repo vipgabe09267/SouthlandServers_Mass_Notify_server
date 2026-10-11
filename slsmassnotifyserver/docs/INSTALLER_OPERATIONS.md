@@ -85,7 +85,7 @@ and use the exact location printed in its log:
 
 ```bash
 bash /path/to/publisher-authenticated/install_release.sh --recover \
-  /var/lib/sls-mass-notify-installer/transaction-<id>
+  '/var/lib/sls-mass-notify-installer/transaction-<id>'
 ```
 
 Recovery authenticates the saved installer, package and executable helpers
@@ -93,6 +93,20 @@ against publisher evidence before using the original restoration sequence.
 The journal does not approve live file hashes. It does not restore operational
 delivery history over newer records. Failed restoration or newer activity that
 prevents safe verification requires administrator review.
+
+The corrected `0.1.6-beta` installer accepts all ownership, permission, collector
+and coordination stage names. Earlier copies can exit with code 2 while their
+journal remains in `prepared` phase. Recover that retained transaction with
+the command above, then rerun the normal corrected installer. A prepared
+transaction is not disposable: its signed evidence and any native-permission
+snapshot are checked before completion. The supported recovery stage is also
+recognized by the earlier helper. Do not edit its allowlist, replace its saved
+installer or delete the transaction directory to bypass recovery.
+
+New stage transitions are recorded before replacing the last successful stage.
+If recording fails, restoration can still record completion against that
+previous stage. Active and pending settings snapshots remain available through
+all postconditions and are removed only after durable completion.
 
 An interruption before complete signed evidence was saved, an expired/revoked
 release, lost recovery media or unknown modifications can require manual
