@@ -77,6 +77,55 @@ class InstallerPrivilegeTests(unittest.TestCase):
         for name in ('schedule-runner.lock','announcement-activity.lock','weather-dispatch-worker.lock'):
             self.assertEqual((data/name).stat().st_uid,pwd.getpwnam('asterisk').pw_uid)
 
+    @unittest.skipUnless(os.geteuid()==0,'requires root for real configuration leases')
+    def test_shell_handoff_keeps_worker_and_settings_mutexes_until_release(self):
+        account=pwd.getpwnam('asterisk')
+        probe=self.root/'probe.py'
+        probe.write_text("import fcntl,sys\nf=open(sys.argv[1], 'r+')\ntry: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError: sys.exit(17)\n")
+        for existing in (False,True):
+            with self.subTest(existing=existing):
+                data=self.root/('existing' if existing else 'missing');data.mkdir()
+                config=data/'mass-notifications.config';config.write_bytes(b'{"preserve":"exactly"}')
+                mutex=data/'mass-notifications.config.lock'
+                if existing: mutex.touch();mutex.chmod(0o600)
+                inode=mutex.stat().st_ino if existing else None
+                result=self.shell('''DATA_DIR="$DATA"; CONFIG_FILE="$DATA/mass-notifications.config"; SETTINGS_LOCK="$CONFIG_FILE.lock"
+ensure_data_directory() { :; }
+acquire_worker_coordination
+trap release_worker_coordination EXIT
+acquire_settings_coordination
+acquire_settings_coordination
+for mutex in "$SETTINGS_LOCK" "$DATA/schedule-runner.lock"; do
+  if /usr/bin/python3 "$PROBE" "$mutex"; then exit 90; else [ "$?" = 17 ]; fi
+done
+release_worker_coordination
+/usr/bin/python3 "$PROBE" "$SETTINGS_LOCK"
+/usr/bin/python3 "$PROBE" "$DATA/schedule-runner.lock"
+''',DATA=str(data),PROBE=str(probe))
+                self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+                info=mutex.stat()
+                self.assertEqual((info.st_uid,info.st_gid,info.st_mode & 0o777,info.st_size,info.st_nlink),
+                                 (account.pw_uid,account.pw_gid,0o640,0,1))
+                if existing: self.assertEqual(info.st_ino,inode)
+                self.assertEqual(config.read_bytes(),b'{"preserve":"exactly"}')
+
+    @unittest.skipUnless(os.geteuid()==0,'requires root for real mutex preparation')
+    def test_failed_settings_preparation_does_not_send_guard_command(self):
+        data=self.root/'data';data.mkdir()
+        config=data/'mass-notifications.config';config.write_bytes(b'{}')
+        mutex=data/'mass-notifications.config.lock';os.mkfifo(mutex)
+        result=self.shell('''DATA_DIR="$DATA"; CONFIG_FILE="$DATA/mass-notifications.config"; SETTINGS_LOCK="$CONFIG_FILE.lock"
+ensure_data_directory() { :; }
+acquire_worker_coordination
+trap release_worker_coordination EXIT
+if acquire_settings_coordination; then exit 90; fi
+kill -0 "$WORKER_LOCK_PID"
+printf safely-refused
+''',DATA=str(data))
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertIn('safely-refused',result.stdout)
+        self.assertEqual(config.read_bytes(),b'{}')
+
     @unittest.skipUnless(os.geteuid()==0,'requires root for actual worker and service-account descendants')
     def test_parent_death_releases_guard_while_descendant_remains_alive(self):
         # Exercise both the explicit child wrapper and ordinary PHP/fwconsole's

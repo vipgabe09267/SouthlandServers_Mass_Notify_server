@@ -80,6 +80,83 @@ class GuardTests(unittest.TestCase):
         for name in ('audio-reservations.lock','audio-reservations.json'):
             fd=self.lock(self.data/name);os.close(fd)
 
+    def request_settings(self, child):
+        child.stdin.write(b'settings\n'); child.stdin.flush()
+
+    def settings_ready(self, child):
+        self.assertTrue(select.select([child.stdout],[],[],5)[0])
+        self.assertEqual(child.stdout.readline(),b'settings-ready\n')
+
+    def test_settings_can_join_existing_worker_lease_without_replacing_inode(self):
+        child=self.start(timeout='1',settings=False);self.ready(child)
+        path=self.data/'mass-notifications.config.lock';self.assertFalse(path.exists())
+        fd=self.lock(path);inode=path.stat().st_ino
+        self.request_settings(child)
+        self.assertFalse(select.select([child.stdout],[],[],.05)[0])
+        with open(self.data/'enterprise-worker.lock','r+') as held:
+            with self.assertRaises(BlockingIOError):fcntl.flock(held,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        os.close(fd);self.settings_ready(child)
+        self.assertEqual(path.stat().st_ino,inode)
+        with path.open('r+') as held:
+            with self.assertRaises(BlockingIOError):fcntl.flock(held,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        count=len(os.listdir('/proc/'+str(child.pid)+'/fd'))
+        self.request_settings(child);self.settings_ready(child)
+        self.assertEqual(len(os.listdir('/proc/'+str(child.pid)+'/fd')),count)
+        child.communicate(b'release\n',timeout=5);self.assertEqual(child.returncode,0)
+        fd=self.lock(path);os.close(fd)
+
+    def test_fresh_configuration_lease_creates_only_empty_private_mutex(self):
+        child=self.start(settings=False);self.ready(child)
+        path=self.data/'mass-notifications.config.lock';self.assertFalse(path.exists())
+        self.request_settings(child);self.settings_ready(child)
+        info=path.stat();account=pwd.getpwnam('asterisk')
+        self.assertEqual((info.st_uid,info.st_gid,info.st_size,info.st_nlink,info.st_mode & 0o777),(account.pw_uid,account.pw_gid,0,1,0o640))
+        self.assertFalse((self.data/'mass-notifications.config').exists())
+        child.communicate(b'release\n',timeout=5);self.assertEqual(child.returncode,0)
+
+    def test_configuration_editor_timeout_releases_workers_without_acceptance(self):
+        child=self.start(timeout='.1',settings=False);self.ready(child)
+        path=self.data/'mass-notifications.config.lock';fd=self.lock(path);inode=path.stat().st_ino
+        try:
+            self.request_settings(child)
+            out,err=child.communicate(timeout=5)
+            self.assertNotEqual(child.returncode,0);self.assertNotIn(b'settings-ready',out)
+            self.assertIn(b'configuration editor did not become idle',err)
+            self.assertEqual(path.stat().st_ino,inode)
+            probe=self.lock(self.data/'enterprise-worker.lock');os.close(probe)
+        finally:os.close(fd)
+
+    def test_late_settings_request_rejects_unsafe_files_without_blocking(self):
+        for kind in ('symlink','hardlink','fifo','owner','mode','nonempty'):
+            with self.subTest(kind=kind):
+                path=self.data/'mass-notifications.config.lock'
+                if path.exists() or path.is_symlink():path.unlink()
+                child=self.start(settings=False);self.ready(child)
+                victim=self.data/('victim-'+kind);victim.write_bytes(b'');victim.chmod(0o640)
+                if kind=='symlink':path.symlink_to(victim)
+                elif kind=='hardlink':os.link(victim,path)
+                elif kind=='fifo':os.mkfifo(path,0o640)
+                else:
+                    path.write_bytes(b'');path.chmod(0o640)
+                    if kind=='owner':os.chown(path,12345,12345)
+                    elif kind=='mode':path.chmod(0o644)
+                    else:path.write_bytes(b'not a mutex')
+                before=(victim.stat().st_ino,victim.read_bytes(),victim.stat().st_mode)
+                self.request_settings(child);out,err=child.communicate(timeout=5)
+                self.assertNotEqual(child.returncode,0);self.assertNotIn(b'settings-ready',out)
+                self.assertEqual((victim.stat().st_ino,victim.read_bytes(),victim.stat().st_mode),before)
+
+    def test_configuration_request_rejects_replaced_data_directory(self):
+        child=self.start(settings=False);self.ready(child)
+        original=self.data.with_name(self.data.name+'-moved')
+        self.addCleanup(lambda:__import__('shutil').rmtree(original,ignore_errors=True))
+        self.data.rename(original);self.data.mkdir(mode=0o700)
+        self.request_settings(child);out,err=child.communicate(timeout=5)
+        self.assertNotEqual(child.returncode,0);self.assertNotIn(b'settings-ready',out)
+        self.assertIn(b'data directory changed',err)
+        self.assertFalse((original/'mass-notifications.config.lock').exists())
+        self.assertFalse((self.data/'mass-notifications.config.lock').exists())
+
     def test_audio_both_generations_excluded_and_idle_shared_reader_coexists(self):
         path=self.data/'audio-reservations.json'
         original=b'{"recipients":{},"media":{}}'

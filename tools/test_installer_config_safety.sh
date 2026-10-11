@@ -62,6 +62,48 @@ prepare_settings_lock
 [ ! -L "$SETTINGS_LOCK" ]
 [ "$(stat -c '%a %U:%G' "$SETTINGS_LOCK")" = '640 asterisk:asterisk' ]
 
+# Recognized root-created mutexes are repaired in place, never replaced.
+lock_inode="$(stat -c '%d:%i' "$SETTINGS_LOCK")"
+for legacy_mode in 0600 0640 0644; do
+  chown root:root "$SETTINGS_LOCK"
+  chmod "$legacy_mode" "$SETTINGS_LOCK"
+  prepare_settings_lock
+  [ "$(stat -c '%d:%i' "$SETTINGS_LOCK")" = "$lock_inode" ]
+  [ "$(stat -c '%a %U:%G %s %h' "$SETTINGS_LOCK")" = '640 asterisk:asterisk 0 1' ]
+done
+
+for unsafe_lock in hardlink fifo owner group mode contents directory; do
+  rm -f "$SETTINGS_LOCK"
+  case "$unsafe_lock" in
+    hardlink) ln "$sentinel" "$SETTINGS_LOCK" ;;
+    fifo) mkfifo "$SETTINGS_LOCK" ;;
+    directory) mkdir "$SETTINGS_LOCK" ;;
+    *)
+      install -m 0640 /dev/null "$SETTINGS_LOCK"
+      case "$unsafe_lock" in
+        owner) chown 12345:0 "$SETTINGS_LOCK" ;;
+        group) chown 0:12345 "$SETTINGS_LOCK" ;;
+        mode) chmod 0660 "$SETTINGS_LOCK" ;;
+        contents) printf 'not-a-mutex' >"$SETTINGS_LOCK" ;;
+      esac
+      ;;
+  esac
+  unsafe_metadata="$(stat -c '%d:%i:%a:%u:%g:%s:%h' "$SETTINGS_LOCK")"
+  set +e
+  /usr/bin/timeout 2 bash -c 'source "$1"; CONFIG_FILE="$2"; SETTINGS_LOCK="$3"; prepare_settings_lock' _ \
+    "${ROOT_DIR}/tools/install_release.sh" "$CONFIG_FILE" "$SETTINGS_LOCK" >/dev/null 2>&1
+  unsafe_status=$?
+  set -e
+  if [ "$unsafe_status" -eq 0 ] || [ "$unsafe_status" -eq 124 ]; then
+    printf 'Installer accepted or blocked on unsafe configuration mutex: %s.\n' "$unsafe_lock" >&2
+    exit 1
+  fi
+  [ "$(stat -c '%d:%i:%a:%u:%g:%s:%h' "$SETTINGS_LOCK")" = "$unsafe_metadata" ]
+  [ "$(cat "$sentinel")" = 'ROOT-SENTINEL-MUST-NOT-CHANGE' ]
+  if [ -d "$SETTINGS_LOCK" ]; then rmdir "$SETTINGS_LOCK"; else rm -f "$SETTINGS_LOCK"; fi
+done
+prepare_settings_lock
+
 DATA_DIR="$fixture/data"
 INSTALL_FAILURE_FILE="$DATA_DIR/install-failure.json"
 FREEPBX_CONFIRMED=1

@@ -1,7 +1,8 @@
 #!/usr/bin/python3
 """Tighten recognized legacy SLS files after authenticated upgrade approval.
 
-No ownership adoption, journal replacement, service operation or delivery occurs.
+Only central configuration and its empty mutex can recover known root/service
+ownership. Journals, executable files and encryption keys are never replaced.
 The runtime's authoritative readers remain strict after this bounded migration.
 """
 from __future__ import annotations
@@ -24,6 +25,7 @@ import time
 sys.dont_write_bytecode = True
 MAX_STATE = 16 * 1024 * 1024
 CONFIG_NAMES = ('mass-notifications.config', 'mass-notifications.pending.config')
+CONFIG_LOCK = 'mass-notifications.config.lock'
 NAMES = ('enterprise-worker.lock', 'announcement-activity.lock', 'mass-notifications.config.lock',
          'phone-admission.lock', 'phone-admission.json', *CONFIG_NAMES)
 CONFIG_KEYRING = Path('/etc/sls-mass-notify/config-keys.json')
@@ -178,6 +180,63 @@ def checked_configuration(raw):
         raise PermissionRecoveryError('Central configuration could not be authenticated; preserve its original file and encryption keys for review') from None
 
 
+def checked_file(fd, name, account):
+    info = os.fstat(fd)
+    configuration = name in (*CONFIG_NAMES, CONFIG_LOCK)
+    owner_ok = (info.st_uid in (0, account.pw_uid) and info.st_gid in (0, account.pw_gid)) if configuration else (
+        info.st_uid == account.pw_uid and info.st_gid == account.pw_gid)
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not owner_ok
+            or stat.S_IMODE(info.st_mode) not in (0o600, 0o640, 0o644)):
+        raise PermissionRecoveryError(
+            f'Unsafe SLS file {name}: uid={info.st_uid}, gid={info.st_gid}, '
+            f'mode={stat.S_IMODE(info.st_mode):04o}, links={info.st_nlink}. '
+            'Only single-link regular files with recognized root/service configuration ownership '
+            'or matching Asterisk runtime ownership can be recovered.')
+    if name.endswith('.lock') and info.st_size != 0:
+        raise PermissionRecoveryError('Legacy worker/admission lock is not the recognized empty layout: ' + name)
+    return info
+
+
+def recover_missing_config_lock(parent, account):
+    # Old installations/restores can contain valid settings without this mutex.
+    # Validate both configurations before making the absent mutex visible. An
+    # existing mutex is never removed, truncated or replaced, including on retry.
+    found = False
+    for name in CONFIG_NAMES:
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
+        except FileNotFoundError:
+            continue
+        try:
+            checked_file(fd, name, account)
+            checked_configuration(read(fd, 3 * 1024 * 1024))
+            found = True
+        finally:
+            os.close(fd)
+    if not found:
+        return None, False
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        fd = os.open(CONFIG_LOCK, flags | os.O_CREAT | os.O_EXCL, 0o640, dir_fd=parent)
+    except FileExistsError:
+        return os.open(CONFIG_LOCK, flags, dir_fd=parent), False
+    try:
+        opened = os.fstat(fd)
+        named = os.stat(CONFIG_LOCK, dir_fd=parent, follow_symlinks=False)
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != 0 or opened.st_nlink != 1
+                or opened.st_size != 0 or identity(named) != identity(opened)):
+            raise PermissionRecoveryError('The new configuration mutex changed during creation')
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.fchown(fd, account.pw_uid, account.pw_gid)
+        os.fchmod(fd, 0o640)
+        os.fsync(fd)
+        os.fsync(parent)
+        return fd, True
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def repair(data, approval, *, timeout=120):
     if os.geteuid() != 0:
         raise PermissionRecoveryError('Legacy permission recovery requires root')
@@ -199,27 +258,29 @@ def repair(data, approval, *, timeout=120):
             raise PermissionRecoveryError('SLS data directory appeared during fresh-install inspection')
         finally: os.close(missing_parent)
     files = []
+    created = []
     try:
         info = os.fstat(parent)
         if (info.st_uid != account.pw_uid or info.st_gid != account.pw_gid
                 or stat.S_IMODE(info.st_mode) not in (0o700, 0o750, 0o755)):
             raise PermissionRecoveryError('Legacy SLS data directory has unsafe ownership or permissions')
         parent_identity = info.st_dev, info.st_ino
-        if stat.S_IMODE(info.st_mode) == 0o755 and not previous:
-            raise PermissionRecoveryError('Legacy directory migration requires authenticated previous-release approval')
         deadline = time.monotonic() + timeout
         for name in NAMES:
             try:
                 fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
-            except FileNotFoundError: continue
+            except FileNotFoundError:
+                if name != CONFIG_LOCK:
+                    continue
+                fd, was_created = recover_missing_config_lock(parent, account)
+                if fd is None:
+                    continue
+                if was_created:
+                    created.append(name)
             info = os.fstat(fd)
             files.append((name, fd, identity(info)))
-            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != account.pw_uid
-                    or info.st_gid != account.pw_gid or stat.S_IMODE(info.st_mode) not in (0o600, 0o640, 0o644)):
-                raise PermissionRecoveryError('Legacy SLS file ownership, links or mode are unsafe: ' + name)
+            checked_file(fd, name, account)
             if name.endswith('.lock'):
-                if info.st_size != 0:
-                    raise PermissionRecoveryError('Legacy worker/admission lock is not the recognized empty layout: ' + name)
                 while True:
                     try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB); break
                     except BlockingIOError:
@@ -231,10 +292,10 @@ def repair(data, approval, *, timeout=120):
                     raise PermissionRecoveryError('Existing phone admission journal is missing its permanent lock; preserve it for reviewed recovery')
                 checked_phone_state(read(fd, MAX_STATE))
             else:
-                if not any(entry[0] == 'mass-notifications.config.lock' for entry in files):
+                if not any(entry[0] == CONFIG_LOCK for entry in files):
                     raise PermissionRecoveryError('Existing central configuration is missing its permanent lock; preserve it for reviewed recovery')
                 checked_configuration(read(fd, 3 * 1024 * 1024))
-            if stat.S_IMODE(info.st_mode) == 0o644 and not previous:
+            if stat.S_IMODE(info.st_mode) == 0o644 and not previous and name not in (*CONFIG_NAMES, CONFIG_LOCK):
                 raise PermissionRecoveryError('Legacy file migration requires authenticated previous-release approval: ' + name)
         # Inspect every recognized file before any permission change. Never
         # replace a locked inode or rewrite a journal merely to repair its mode.
@@ -250,10 +311,18 @@ def repair(data, approval, *, timeout=120):
                 raise PermissionRecoveryError('Legacy SLS file changed before repair: ' + name)
         changed = []
         for name, fd, original in files:
-            if identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) != identity(os.fstat(fd)):
+            current = os.fstat(fd)
+            if identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) != original or identity(current) != original:
                 raise PermissionRecoveryError('Legacy SLS file name changed during repair: ' + name)
-            if stat.S_IMODE(os.fstat(fd).st_mode) == 0o644:
-                os.fchmod(fd, 0o640); os.fsync(fd); changed.append(name)
+            needs_owner = name in (*CONFIG_NAMES, CONFIG_LOCK) and (current.st_uid, current.st_gid) != (account.pw_uid, account.pw_gid)
+            needs_mode = stat.S_IMODE(current.st_mode) == 0o644 or needs_owner and stat.S_IMODE(current.st_mode) != 0o640
+            if needs_owner:
+                os.fchown(fd, account.pw_uid, account.pw_gid)
+            if needs_mode:
+                os.fchmod(fd, 0o640)
+            if needs_owner or needs_mode:
+                os.fsync(fd)
+                changed.append(name)
         if stat.S_IMODE(os.fstat(parent).st_mode) == 0o755:
             os.fchmod(parent, 0o750); changed.append('.')
         os.fsync(parent)
@@ -263,7 +332,7 @@ def repair(data, approval, *, timeout=120):
             if (current_parent.st_dev, current_parent.st_ino) != parent_identity:
                 raise PermissionRecoveryError('Legacy SLS data directory changed during repair; review the preserved files')
         finally: os.close(live)
-        return {'ok': True, 'repaired_files': changed, 'preserved_files': len(files)}
+        return {'ok': True, 'repaired_files': changed, 'created_files': created, 'preserved_files': len(files)}
     finally:
         for _, fd, _ in files: os.close(fd)
         os.close(parent)

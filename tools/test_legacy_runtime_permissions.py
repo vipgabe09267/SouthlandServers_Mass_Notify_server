@@ -154,21 +154,119 @@ class PermissionRecoveryTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), body); self.assertEqual(target.stat().st_ino, inode)
         self.assertFalse(self.keyring.exists())
 
-    def test_unsafe_or_unlocked_central_config_is_not_adopted(self):
+    def test_unsafe_central_config_is_not_adopted(self):
         self.add_configs(); source = (self.data / recovery.CONFIG_NAMES[0]).read_bytes()
-        for kind in ('owner', 'symlink', 'missinglock', 'duplicate', 'invalidenvelope'):
+        for kind in ('owner', 'group', 'symlink', 'duplicate', 'invalidenvelope'):
             with self.subTest(kind=kind):
                 path = self.data / recovery.CONFIG_NAMES[0]; path.unlink()
                 self.file('mass-notifications.config.lock')
                 path = self.file(recovery.CONFIG_NAMES[0], source)
-                if kind == 'owner': os.chown(path, 0, self.account.pw_gid)
+                if kind == 'owner': os.chown(path, self.account.pw_uid + 1, self.account.pw_gid)
+                elif kind == 'group': os.chown(path, self.account.pw_uid, self.account.pw_gid + 1)
                 elif kind == 'symlink': path.unlink(); path.symlink_to(self.keyring)
-                elif kind == 'missinglock': (self.data / 'mass-notifications.config.lock').unlink()
                 elif kind == 'duplicate': path.write_bytes(b'{"configured":true,"configured":false}')
                 else: path.write_bytes(b'{"format":"unsupported","configured":true}')
                 modes = {name: stat.S_IMODE((self.data / name).lstat().st_mode) for name in recovery.NAMES if (self.data / name).exists()}
                 with self.assertRaises((OSError, recovery.PermissionRecoveryError)): recovery.repair(self.data, self.approval)
                 self.assertEqual({name: stat.S_IMODE((self.data / name).lstat().st_mode) for name in modes}, modes)
+
+    def test_root_restored_active_pending_and_settings_lock_recover_in_place(self):
+        self.add_configs()
+        names = (*recovery.CONFIG_NAMES, recovery.CONFIG_LOCK)
+        ring = self.keyring.read_bytes()
+        for uid, gid in ((0, 0), (0, self.account.pw_gid), (self.account.pw_uid, 0)):
+            for mode in (0o600, 0o640, 0o644):
+                with self.subTest(uid=uid, gid=gid, mode=mode):
+                    for name in names:
+                        path = self.data / name; os.chown(path, uid, gid); path.chmod(mode)
+                    before = self.metadata()
+                    result = recovery.repair(self.data, self.approval)
+                    self.assertTrue(set(names).issubset(result['repaired_files']))
+                    for name in names:
+                        current = self.metadata()[name]
+                        self.assertEqual(current[:2], before[name][:2])
+                        self.assertEqual(current[2:5], (self.account.pw_uid, self.account.pw_gid, 0o640))
+                        self.assertEqual(current[5], before[name][5])
+                    self.assertEqual(self.keyring.read_bytes(), ring)
+                    self.assertEqual(recovery.repair(self.data, self.approval)['repaired_files'], [])
+
+    def test_missing_configuration_mutex_is_created_once_without_rewriting_settings(self):
+        self.add_configs(); (self.data / recovery.CONFIG_LOCK).unlink()
+        before = self.metadata(); ring = self.keyring.read_bytes()
+        result = recovery.repair(self.data, self.approval)
+        self.assertEqual(result['created_files'], [recovery.CONFIG_LOCK])
+        mutex = self.data / recovery.CONFIG_LOCK; info = mutex.stat()
+        self.assertEqual((info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode), info.st_size, info.st_nlink),
+                         (self.account.pw_uid, self.account.pw_gid, 0o640, 0, 1))
+        for name in recovery.CONFIG_NAMES:
+            current = self.metadata()[name]
+            self.assertEqual(current[:4], before[name][:4]); self.assertEqual(current[5], before[name][5])
+        self.assertEqual(self.keyring.read_bytes(), ring)
+        again = recovery.repair(self.data, self.approval)
+        self.assertEqual(again['created_files'], []); self.assertEqual(mutex.stat().st_ino, info.st_ino)
+
+    def test_fresh_retry_accepts_root_configuration_and_missing_mutex(self):
+        self.write_approval(fresh=True)
+        for name in ('enterprise-worker.lock', 'phone-admission.lock', 'phone-admission.json'):
+            (self.data / name).unlink()
+        for name in recovery.CONFIG_NAMES:
+            path = self.file(name, crypto.encode_with_keyring({'configured': True, 'phone_device_limit': 25}, self.ring))
+            os.chown(path, 0, 0)
+        before = self.metadata()
+        result = recovery.repair(self.data, self.approval)
+        self.assertEqual(result['created_files'], [recovery.CONFIG_LOCK])
+        self.assertEqual(stat.S_IMODE(self.data.stat().st_mode), 0o750)
+        for name in recovery.CONFIG_NAMES:
+            current = self.metadata()[name]
+            self.assertEqual(current[:2], before[name][:2]); self.assertEqual(current[5], before[name][5])
+            self.assertEqual(current[2:5], (self.account.pw_uid, self.account.pw_gid, 0o640))
+
+    def test_empty_fresh_directory_can_be_secured_without_creating_settings(self):
+        self.write_approval(fresh=True)
+        for child in self.data.iterdir(): child.unlink()
+        result = recovery.repair(self.data, self.approval)
+        self.assertEqual(result['repaired_files'], ['.'])
+        self.assertEqual(result['created_files'], [])
+        self.assertEqual(list(self.data.iterdir()), [])
+
+    def test_missing_mutex_does_not_adopt_corrupt_unsafe_or_oversized_config(self):
+        self.add_configs(); (self.data / recovery.CONFIG_LOCK).unlink()
+        source = (self.data / recovery.CONFIG_NAMES[1]).read_bytes()
+        for kind in ('malformed', 'ciphertext', 'owner', 'symlink', 'hardlink', 'fifo', 'oversize'):
+            with self.subTest(kind=kind):
+                path = self.data / recovery.CONFIG_NAMES[1]
+                path.unlink(); extra = self.root / 'extra-config-link'
+                if extra.exists(): extra.unlink()
+                self.file(recovery.CONFIG_NAMES[1], source)
+                if kind == 'malformed': path.write_bytes(b'{"configured":true,"configured":false}')
+                elif kind == 'ciphertext':
+                    envelope = json.loads(source); raw = bytearray(base64.b64decode(envelope['ciphertext'])); raw[-1] ^= 1
+                    envelope['ciphertext'] = base64.b64encode(raw).decode(); path.write_text(json.dumps(envelope))
+                elif kind == 'owner': os.chown(path, self.account.pw_uid + 1, self.account.pw_gid)
+                elif kind == 'symlink': path.unlink(); path.symlink_to(self.keyring)
+                elif kind == 'hardlink': os.link(path, extra)
+                elif kind == 'fifo': path.unlink(); os.mkfifo(path, 0o640)
+                else:
+                    with path.open('wb') as handle: handle.truncate(3 * 1024 * 1024 + 1)
+                modes = {p.name: stat.S_IMODE(p.lstat().st_mode) for p in self.data.iterdir()}
+                descriptors = len(os.listdir('/proc/self/fd'))
+                with self.assertRaises((OSError, recovery.PermissionRecoveryError)): recovery.repair(self.data, self.approval)
+                self.assertFalse((self.data / recovery.CONFIG_LOCK).exists())
+                self.assertEqual({p.name: stat.S_IMODE(p.lstat().st_mode) for p in self.data.iterdir()}, modes)
+                self.assertEqual(len(os.listdir('/proc/self/fd')), descriptors)
+
+    def test_new_mutex_is_retained_safely_when_a_later_journal_check_fails(self):
+        self.add_configs(); (self.data / recovery.CONFIG_LOCK).unlink()
+        self.file('phone-admission.json', b'{')
+        before = {name: (self.data / name).read_bytes() for name in recovery.CONFIG_NAMES}
+        with self.assertRaisesRegex(recovery.PermissionRecoveryError, 'malformed'): recovery.repair(self.data, self.approval)
+        mutex = self.data / recovery.CONFIG_LOCK; inode = mutex.stat().st_ino
+        self.assertEqual(mutex.read_bytes(), b'')
+        self.assertEqual(stat.S_IMODE(mutex.stat().st_mode), 0o640)
+        for name, raw in before.items(): self.assertEqual((self.data / name).read_bytes(), raw)
+        self.file('phone-admission.json', json.dumps(self.state).encode())
+        recovery.repair(self.data, self.approval)
+        self.assertEqual(mutex.stat().st_ino, inode)
 
     def test_malformed_journal_never_partially_tightens_locks(self):
         for body in (b'{', b'{"schema":1,"schema":1,"batches":{}}',

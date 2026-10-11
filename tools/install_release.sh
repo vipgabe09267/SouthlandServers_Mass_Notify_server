@@ -31,7 +31,7 @@ URL="${SLS_MASS_NOTIFY_TGZ_URL:-${1:-}}"
 SHA256="${SLS_MASS_NOTIFY_SHA256:-}"
 TOKEN="${SLS_MASS_NOTIFY_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
 LOG_FILE="${SLS_MASS_NOTIFY_INSTALL_LOG:-/tmp/slsmassnotifyserver-install.log}"
-EXPECTED_TGZ_SHA256="60d2ec9abaeabce370ed1aca543aa484b10b0ed7660c5055020bdeece78a719c"
+EXPECTED_TGZ_SHA256="28dc3aaa85faa9dde55bdeca5ac11c941aae90f765a07f106452d7a92a5bc604"
 DATA_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin"
 CONFIG_FILE="$DATA_DIR/mass-notifications.config"
 CONFIG_SNAPSHOT=""
@@ -43,6 +43,7 @@ PENDING_CONFIG_PATH=""
 PENDING_CONFIG_SNAPSHOT=""
 PENDING_CONFIG_HASH=""
 CONFIG_LOCK_FD=""
+WORKER_LOCK_RESPONSE_FD=""
 SETTINGS_LOCK="$DATA_DIR/mass-notifications.config.lock"
 STAGING_DIR=""
 INSTALL_TEMP_ROOT="/tmp"
@@ -1599,12 +1600,13 @@ acquire_worker_coordination() {
   # Bash removes a coprocess's array/PID when an immediately rejected child
   # exits. Treat that race as the same controlled readiness failure.
   if [ -z "$WORKER_LOCK_PID" ] || [ -z "$guard_input" ] || [ -z "$guard_output" ] \
-    || ! exec {WORKER_LOCK_KEEPALIVE_FD}>&"$guard_input"; then
+    || ! exec {WORKER_LOCK_KEEPALIVE_FD}>&"$guard_input" \
+    || ! exec {WORKER_LOCK_RESPONSE_FD}<&"$guard_output"; then
     log 'Unable to pause active notification workers safely. No release files were activated.'
     release_worker_coordination
     return 1
   fi
-  if ! IFS= read -r status <&"$guard_output" || [ "$status" != ready ]; then
+  if ! IFS= read -r status <&"$WORKER_LOCK_RESPONSE_FD" || [ "$status" != ready ]; then
     log 'Unable to pause active notification workers safely. No release files were activated.'
     release_worker_coordination
     return 1
@@ -1621,6 +1623,10 @@ release_worker_coordination() {
   fi
   [ -z "${WORKER_LOCK_PID:-}" ] || wait "$WORKER_LOCK_PID" 2>/dev/null || true
   WORKER_LOCK_PID=""
+  if [ -n "${WORKER_LOCK_RESPONSE_FD:-}" ]; then
+    exec {WORKER_LOCK_RESPONSE_FD}<&-
+    WORKER_LOCK_RESPONSE_FD=""
+  fi
 }
 
 close_inherited_maintenance_lock_fds() {
@@ -1643,6 +1649,9 @@ run_without_install_maintenance_lock() (
   # A detached descendant must not keep the worker guard alive after our exit.
   if [ -n "${WORKER_LOCK_KEEPALIVE_FD:-}" ]; then
     exec {WORKER_LOCK_KEEPALIVE_FD}>&-
+  fi
+  if [ -n "${WORKER_LOCK_RESPONSE_FD:-}" ]; then
+    exec {WORKER_LOCK_RESPONSE_FD}<&-
   fi
   "$@"
 )
@@ -4037,24 +4046,48 @@ import stat
 
 path = os.environ["SETTINGS_LOCK_PATH"]
 parts = [part for part in path.split("/") if part]
-if not path.startswith("/") or not parts or "\x00" in path:
+if not path.startswith("/") or not parts or "\x00" in path or any(part in (".", "..") for part in parts):
     raise SystemExit("invalid settings-lock path")
+if os.geteuid() != 0:
+    raise SystemExit("settings-lock preparation requires root")
+account = pwd.getpwnam("asterisk")
+if account.pw_uid == 0:
+    raise SystemExit("Asterisk UID must be nonzero")
 directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
-file_flags = os.O_RDWR | os.O_CLOEXEC | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+file_flags = os.O_RDWR | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
 parent_fd = os.open("/", directory_flags)
 try:
-    for component in parts[:-1]:
+    for index, component in enumerate(parts[:-1]):
         next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
         os.close(parent_fd)
         parent_fd = next_fd
-    file_fd = os.open(parts[-1], file_flags, 0o640, dir_fd=parent_fd)
+        info = os.fstat(parent_fd)
+        sticky = info.st_uid == 0 and info.st_mode & stat.S_ISVTX and index < len(parts) - 2
+        if (info.st_uid not in (0, account.pw_uid) or info.st_mode & 0o002 and not sticky
+                or info.st_mode & 0o020 and not sticky and info.st_gid not in (0, account.pw_gid)):
+            raise SystemExit("settings-lock parent ownership or permissions are unsafe")
+    try:
+        file_fd = os.open(parts[-1], file_flags | os.O_CREAT | os.O_EXCL, 0o640, dir_fd=parent_fd)
+    except FileExistsError:
+        file_fd = os.open(parts[-1], file_flags, dir_fd=parent_fd)
     try:
         metadata = os.fstat(file_fd)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise SystemExit("settings lock is not a regular file")
-        account = pwd.getpwnam("asterisk")
-        os.fchmod(file_fd, 0o640)
+        named = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size != 0
+                or metadata.st_uid not in (0, account.pw_uid) or metadata.st_gid not in (0, account.pw_gid)
+                or stat.S_IMODE(metadata.st_mode) not in (0o600, 0o640, 0o644)
+                or (metadata.st_dev, metadata.st_ino) != (named.st_dev, named.st_ino)):
+            raise SystemExit("settings lock is not an empty, single-link regular file with recognized private ownership and mode")
         os.fchown(file_fd, account.pw_uid, account.pw_gid)
+        os.fchmod(file_fd, 0o640)
+        os.fsync(file_fd)
+        verified = os.fstat(file_fd)
+        named = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+        if (verified.st_uid != account.pw_uid or verified.st_gid != account.pw_gid
+                or stat.S_IMODE(verified.st_mode) != 0o640 or verified.st_nlink != 1 or verified.st_size != 0
+                or (verified.st_dev, verified.st_ino) != (named.st_dev, named.st_ino)):
+            raise SystemExit("settings lock changed during preparation; preserve it for review")
+        os.fsync(parent_fd)
     finally:
         os.close(file_fd)
 finally:
@@ -4068,18 +4101,24 @@ acquire_settings_coordination() {
     exit 1
   }
   [ -e "$CONFIG_FILE" ] || return 0
-  prepare_settings_lock
+  prepare_settings_lock || return 1
   [ ! -L "$SETTINGS_LOCK" ] && [ -f "$SETTINGS_LOCK" ] || {
     log "Refusing to use an unsafe central-configuration lock file."
     exit 1
   }
-  exec {CONFIG_LOCK_FD}<>"$SETTINGS_LOCK"
-  flock -w 120 -x "$CONFIG_LOCK_FD" || { log "The configuration editor did not become idle within 120 seconds; no settings were replaced."; return 1; }
-  lock_fd_identity="$(stat -Lc '%d:%i' "/proc/$$/fd/$CONFIG_LOCK_FD" 2>/dev/null || true)"
-  lock_path_identity="$(stat -Lc '%d:%i' "$SETTINGS_LOCK" 2>/dev/null || true)"
-  if [ -z "$lock_fd_identity" ] || [ "$lock_fd_identity" != "$lock_path_identity" ] || [ -L "$SETTINGS_LOCK" ]; then
-    log "The central-configuration lock path changed while the installer acquired it."
-    exit 1
+  # The authenticated keeper opens with no-follow/nonblocking semantics and
+  # retains this mutex beside the worker leases. No shell pathname reopen or
+  # lock descriptor reaches an unprivileged FreePBX subprocess.
+  local status
+  if [ -z "${WORKER_LOCK_KEEPALIVE_FD:-}" ] || [ -z "${WORKER_LOCK_RESPONSE_FD:-}" ] \
+    || [ -z "${WORKER_LOCK_PID:-}" ] || ! kill -0 "$WORKER_LOCK_PID" 2>/dev/null; then
+    log 'The authenticated worker keeper is unavailable; no configuration was replaced.'
+    return 1
+  fi
+  if ! (printf 'settings\n' >&"$WORKER_LOCK_KEEPALIVE_FD") 2>/dev/null \
+    || ! IFS= read -r status <&"$WORKER_LOCK_RESPONSE_FD" || [ "$status" != settings-ready ]; then
+    log 'The configuration mutex could not be acquired safely. Review its ownership, mode, identity or active editor in the log; no settings were replaced.'
+    return 1
   fi
 }
 
@@ -6039,14 +6078,23 @@ main() {
   # Persist authenticated recovery evidence before even the bounded native
   # chown exclusion or legacy metadata repair can change protected state.
   begin_install_transaction
-  set_install_stage "publisher and stock approval" "Review the specific legacy permission or previous collector error in the log. Only recognized private file modes and authenticated previous helpers are repaired; unknown local changes require review."
+  set_install_stage "FreePBX ownership protection" "Review the FreePBX chown configuration conflict named in the log. Existing unrelated ownership rules are preserved."
   protect_freepbx_chown_permissions
+  INSTALL_ERROR_CATEGORY="legacy_permission_recovery_failed"
+  set_install_stage "legacy configuration and runtime permissions" "Review the exact filename, ownership, mode or validation error in the log. Valid central configuration and a missing settings mutex are recovered without replacing settings or existing lock inodes. Unknown owners, links and damaged data require review."
   repair_authenticated_legacy_permissions
+  INSTALL_ERROR_CATEGORY="install_command_failed"
+  set_install_stage "authenticated prerequisite validation" "Review the specific prerequisite in the log. Previous executable files and approved PBX integration must still match their authenticated inventories."
   preflight_authenticated_prerequisites
+  INSTALL_ERROR_CATEGORY="previous_collector_recovery_failed"
+  set_install_stage "previous phone collector recovery" "Review the collector journal and approved service state. The installer verifies a fresh authenticated heartbeat before pausing notification workers; it does not reset phone history."
   restore_previous_phone_collector
+  INSTALL_ERROR_CATEGORY="worker_coordination_failed"
+  set_install_stage "notification worker coordination" "Let active SLS work finish, then retry. Review the named worker mutex if ownership, mode, contents or identity were rejected."
   acquire_worker_coordination
-  acquire_settings_coordination
   INSTALL_ERROR_CATEGORY="protected_config_validation_failed"
+  set_install_stage "configuration coordination" "Close active configuration editors and retry. The settings mutex must remain an empty, private regular file with a stable inode; review the specific failure in the log."
+  acquire_settings_coordination
   snapshot_config
   snapshot_pending_config
   validate_preserved_config_prerequisites

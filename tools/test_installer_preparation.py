@@ -52,6 +52,36 @@ main
         bootstrap = re.search(r'^prepare_installer_bootstrap\(\) \{.*?(?=^[a-z_]+\(\) \{)', SOURCE, re.M | re.S).group(0)
         self.assertNotIn('initialize_configuration_keyring',bootstrap)
 
+    def test_preparation_failures_report_the_actual_stage(self):
+        cases=[('prepare_authenticated_installer','publisher and stock approval','install_command_failed'),
+               ('repair_authenticated_legacy_permissions','legacy configuration and runtime permissions','legacy_permission_recovery_failed'),
+               ('restore_previous_phone_collector','previous phone collector recovery','previous_collector_recovery_failed'),
+               ('acquire_worker_coordination','notification worker coordination','worker_coordination_failed'),
+               ('acquire_settings_coordination','configuration coordination','protected_config_validation_failed')]
+        for operation,stage,category in cases:
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as name:
+                root=Path(name)
+                harness=r'''
+source "$1"
+fixture="$2"; failure="$3"
+while read -r unused unused function; do
+  case "$function" in main|set_install_stage) continue;; esac
+  eval "$function() { :; }"
+done < <(declare -F)
+LOG_FILE="$fixture/log"
+open_root_owned_file() { exec {INSTALL_LOG_FD}>>"$LOG_FILE"; }
+guard_config_on_exit() {
+  printf '%s\n%s\n%s\n' "$INSTALL_STAGE" "$INSTALL_ERROR_CATEGORY" "$INSTALL_EXIT_CODE" >"$fixture/failure"
+}
+eval "$failure() { return 17; }"
+main
+'''
+                result=subprocess.run(['bash','-c',harness,'fixture',str(ROOT/'tools/install_release.sh'),str(root),operation],
+                                      capture_output=True,text=True,timeout=5)
+                self.assertEqual(result.returncode,17,result.stdout+result.stderr)
+                lines=(root/'failure').read_text().splitlines()
+                self.assertEqual(lines[:2],[stage,category])
+
     def php_profile(self, root, handler, user='asterisk', extra_pool='', custom_include=False,
                     listen='/run/php/php8.2-fpm.sock', extra_pools=None, binary_version='8.2', warning='', pool_mode=0o644,
                     apache_owner='root',pool_owner='root'):

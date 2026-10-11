@@ -13,6 +13,61 @@ import sys
 import time
 
 
+def settings_metadata(fd, parent, account):
+    name = 'mass-notifications.config.lock'
+    info = os.fstat(fd)
+    named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+            or info.st_uid not in (0, account.pw_uid) or info.st_gid not in (0, account.pw_gid)
+            or stat.S_IMODE(info.st_mode) not in (0o600, 0o640) or info.st_size != 0
+            or (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino)):
+        raise RuntimeError('configuration lock has unsafe ownership, mode, contents or identity')
+
+
+def check_current_directory(data, parent):
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    current = os.open('/', flags)
+    try:
+        for part in data.split('/'):
+            if not part: continue
+            child = os.open(part, flags, dir_fd=current)
+            os.close(current); current = child
+        opened = os.fstat(parent); named = os.fstat(current)
+        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+            raise RuntimeError('worker data directory changed before configuration coordination')
+    finally:
+        os.close(current)
+
+
+def acquire_settings(parent, account, locks, timeout):
+    name = 'mass-notifications.config.lock'
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        fd = os.open(name, flags | os.O_CREAT | os.O_EXCL, 0o640, dir_fd=parent)
+    except FileExistsError:
+        fd = os.open(name, flags, dir_fd=parent)
+        created = False
+    else:
+        created = True
+    locks.append(fd)
+    if created:
+        settings_metadata(fd, parent, account)
+        os.fchown(fd, account.pw_uid, account.pw_gid)
+        os.fchmod(fd, 0o640)
+        os.fsync(fd); os.fsync(parent)
+    settings_metadata(fd, parent, account)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise RuntimeError('active configuration editor did not become idle') from None
+            time.sleep(.05)
+    settings_metadata(fd, parent, account)
+
+
 def hold(data, timeout=120, settings=False):
     account = pwd.getpwnam('asterisk')
     if account.pw_uid == 0: raise SystemExit('Asterisk UID must be nonzero')
@@ -80,6 +135,8 @@ def hold(data, timeout=120, settings=False):
                 raise RuntimeError('unsafe worker lock: ' + name)
             if name == 'enterprise-worker.lock' and (info.st_mode & 0o7027 or info.st_size > 4096):
                 raise RuntimeError('enterprise worker lock permissions or size are unsafe')
+            if name == 'mass-notifications.config.lock':
+                settings_metadata(fd, lock_parent, account)
             if name in ('audio-reservations.lock', 'audio-reservations.json'):
                 if info.st_uid != os.fstat(parent).st_uid:
                     raise RuntimeError('audio state owner must match the runtime data directory: ' + name)
@@ -95,8 +152,21 @@ def hold(data, timeout=120, settings=False):
                     time.sleep(0.1)
             entry = os.stat(name, dir_fd=lock_parent, follow_symlinks=False)
             if (info.st_dev, info.st_ino) != (entry.st_dev, entry.st_ino): raise RuntimeError('worker lock identity changed')
+            if name == 'mass-notifications.config.lock':
+                settings_metadata(fd, lock_parent, account)
         print('ready', flush=True)
-        os.read(0, 32)
+        settings_held = settings
+        while True:
+            command = sys.stdin.buffer.readline(33)
+            if command in (b'', b'release\n'):
+                break
+            if command != b'settings\n':
+                raise RuntimeError('unknown installer guard command')
+            check_current_directory(data, parent)
+            if not settings_held:
+                acquire_settings(parent, account, locks, timeout)
+                settings_held = True
+            print('settings-ready', flush=True)
     finally:
         for fd in locks: os.close(fd)
         if paging >= 0: os.close(paging)

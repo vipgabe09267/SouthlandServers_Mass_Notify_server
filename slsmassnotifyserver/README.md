@@ -14,6 +14,8 @@ After setup, every FreePBX administrator must acknowledge the beta warning separ
 
 Version 0.1.6-beta corrects nominal 4 GiB memory admission, separates operating headroom from installation workspace, and supports activation and recovery when scratch and module files are on different filesystems. Dial-in paging uses one verified audience across PHP and Python and excludes the caller’s contact while retaining other handsets. See [installation and recovery](INSTALL.md#authenticated-installation-and-recovery).
 
+Authenticated installation also repairs recognized root-owned configuration files and creates a missing configuration mutex after validating active and pending settings. Existing settings, encryption keys, lock inodes and delivery records are preserved. Unknown owners, links, damaged data and unapproved executable changes still require review. See [permission recovery](docs/INSTALLER_OPERATIONS.md#recognized-legacy-permission-recovery).
+
 ## Enterprise Labs
 
 Optional enterprise tools are disabled by default and configured in **Enterprise Labs** inside the FreePBX administrator panel. The operator portal receives only assigned operational actions. Existing phone, desktop, SMS, email and webhook delivery continues through the existing SLS queues.
