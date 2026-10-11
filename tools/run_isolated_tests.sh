@@ -48,6 +48,10 @@ if [[ -f /var/lib/asterisk/documentation/core-en_US.xml && ! -L /var/lib/asteris
 fi
 mount -t tmpfs -o mode=755,size=64M tmpfs /var/lib/asterisk
 mount -t tmpfs -o mode=755,size=32M tmpfs /var/spool/asterisk
+if [[ -e /var/spool/postfix || -L /var/spool/postfix ]]; then
+  [[ -d /var/spool/postfix && ! -L /var/spool/postfix ]] || { printf 'Postfix test isolation requires a real spool directory.\n' >&2; exit 2; }
+  mount -t tmpfs -o mode=755,size=16M tmpfs /var/spool/postfix
+fi
 mount -t tmpfs -o mode=755,size=16M tmpfs /etc/asterisk
 mount -t tmpfs -o mode=750,size=4M,gid="$(id -g asterisk)" tmpfs /etc/sls-mass-notify
 mount -t tmpfs -o mode=755,size=32M tmpfs /var/log

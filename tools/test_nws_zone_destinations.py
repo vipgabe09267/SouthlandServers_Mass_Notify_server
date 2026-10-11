@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -599,43 +600,12 @@ def test_email_deduplication():
         captured["message"] = input
         return subprocess.CompletedProcess(command, 0)
 
-    email_module.subprocess.run = fake_run
-    result = email_module.send_branded_email(
-        {
-            "mail_from_name": "SLS Test",
-            "mail_from_local_part": "no-reply",
-            "mail_from_domain": "pbx.example.com",
-        },
-        "Weather test",
-        "Body",
-        recipients_override="GLOBAL@example.com global@example.com zone@example.net ZONE@example.net",
-    )
-    if result is not True or not isinstance(captured.get("message"), bytes):
-        fail("Branded email test did not reach the bounded sendmail submission")
-    message = BytesParser(policy=policy.default).parsebytes(captured["message"])
-    bcc = [address.strip() for address in str(message.get("Bcc") or "").split(",") if address.strip()]
-    if bcc != ["GLOBAL@example.com", "zone@example.net"]:
-        fail(f"Global and zone email recipients were not deduplicated case-insensitively: {bcc!r}")
-
-    captured.clear()
-    empty_result = email_module.send_branded_email(
-        {
-            "mail_from_name": "SLS Test",
-            "mail_from_local_part": "no-reply",
-            "mail_from_domain": "pbx.example.com",
-            "system_notification_emails": "system@example.com",
-            "mail_to": "legacy@example.com",
-        },
-        "Weather test",
-        "Body",
-        recipients_override="",
-    )
-    if empty_result is not False or captured:
-        fail("An explicitly empty service email route fell back to system or legacy recipients")
-
-    too_many = " ".join(f"recipient{index}@example.com" for index in range(51))
-    try:
-        email_module.send_branded_email(
+    # Admission/backpressure is exercised in test_mail_admission.py. Routing
+    # must not read the host queue, consume its quota or launch a mail process.
+    with (mock.patch.object(email_module._mail_admission, "reserve", return_value={"ok": True}) as admission,
+          mock.patch.object(email_module.subprocess, "run", side_effect=fake_run) as submission,
+          mock.patch.object(email_module.subprocess, "Popen", side_effect=AssertionError("Routing fixture accessed Postfix"))):
+        result = email_module.send_branded_email(
             {
                 "mail_from_name": "SLS Test",
                 "mail_from_local_part": "no-reply",
@@ -643,13 +613,52 @@ def test_email_deduplication():
             },
             "Weather test",
             "Body",
-            recipients_override=too_many,
+            recipients_override="GLOBAL@example.com global@example.com zone@example.net ZONE@example.net",
         )
-    except RuntimeError as exc:
-        if "50-recipient" not in str(exc):
-            raise
-    else:
-        fail("An oversized global plus zone email list was silently truncated")
+        if result is not True or not isinstance(captured.get("message"), bytes):
+            fail("Branded email test did not reach the bounded sendmail submission")
+        message = BytesParser(policy=policy.default).parsebytes(captured["message"])
+        bcc = [address.strip() for address in str(message.get("Bcc") or "").split(",") if address.strip()]
+        if bcc != ["GLOBAL@example.com", "zone@example.net"]:
+            fail(f"Global and zone email recipients were not deduplicated case-insensitively: {bcc!r}")
+        admission.assert_called_once_with("alert", 2)
+        submission.assert_called_once()
+
+        captured.clear()
+        empty_result = email_module.send_branded_email(
+            {
+                "mail_from_name": "SLS Test",
+                "mail_from_local_part": "no-reply",
+                "mail_from_domain": "pbx.example.com",
+                "system_notification_emails": "system@example.com",
+                "mail_to": "legacy@example.com",
+            },
+            "Weather test",
+            "Body",
+            recipients_override="",
+        )
+        if empty_result is not False or captured:
+            fail("An explicitly empty service email route fell back to system or legacy recipients")
+
+        too_many = " ".join(f"recipient{index}@example.com" for index in range(51))
+        try:
+            email_module.send_branded_email(
+                {
+                    "mail_from_name": "SLS Test",
+                    "mail_from_local_part": "no-reply",
+                    "mail_from_domain": "pbx.example.com",
+                },
+                "Weather test",
+                "Body",
+                recipients_override=too_many,
+            )
+        except RuntimeError as exc:
+            if "50-recipient" not in str(exc):
+                raise
+        else:
+            fail("An oversized global plus zone email list was silently truncated")
+        admission.assert_called_once_with("alert", 2)
+        submission.assert_called_once()
 
 
 def main():
