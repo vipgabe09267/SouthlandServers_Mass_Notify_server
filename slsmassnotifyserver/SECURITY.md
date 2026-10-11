@@ -288,6 +288,14 @@ successful cleanup. A completed journal marker is preserved even when its bulky
 recovery data is retired. Stock Dashboard bootstrap verifies official signatures;
 unknown local differences still require review.
 
+Installer stage names are allowlisted and checked against every emitted stage
+by regressions that exercise the real journal. A rejected transition retains
+the last valid stage for rollback recording. Settings snapshots survive the
+remaining verification checks until commit or verified restoration is recorded.
+Prepared transactions from earlier installers require recovery authenticated
+against their original publisher evidence; their saved programs are not patched
+in place and their journal never approves new executable bytes.
+
 Served PHP prerequisites are checked independently of CLI PHP. The protected
 job/collector profile requires PHP to run as the Asterisk service account with
 `exec`, `proc_open` and the documented extensions available. The installer does

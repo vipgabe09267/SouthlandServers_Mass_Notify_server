@@ -26,7 +26,10 @@ FIELDS = ('RECOVERY_DIR', 'INSTALL_BOOTSTRAP_DIR', 'UPGRADE_TRUST_DIR',
 TERMINAL = {'committed', 'rolled_back', 'abandoned'}
 PHASES = {'prepared', 'mutating', 'recovering', 'recovery_failed'} | TERMINAL
 STAGES = {'initialization', 'hardware admission', 'platform validation', 'release download and validation',
-          'publisher and stock approval', 'dependency installation', 'timezone validation',
+          'publisher and stock approval', 'FreePBX ownership protection',
+          'legacy configuration and runtime permissions', 'authenticated prerequisite validation',
+          'previous phone collector recovery', 'notification worker coordination',
+          'configuration coordination', 'dependency installation', 'timezone validation',
           'protected runtime preparation', 'module activation', 'runtime integration',
           'post-install verification', 'interrupted installation recovery'}
 NAME = re.compile(r'transaction-[0-9a-f]{24}\Z')

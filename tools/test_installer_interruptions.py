@@ -5,6 +5,8 @@ import io
 import json
 import os
 from pathlib import Path
+import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -81,6 +83,34 @@ class Journal(unittest.TestCase):
     def setUpClass(cls):
         spec=importlib.util.spec_from_file_location('transaction_fixture',BIN/'sls_install_transaction.py')
         cls.module=importlib.util.module_from_spec(spec);spec.loader.exec_module(cls.module)
+    def test_every_emitted_stage_matches_the_transaction_allowlist(self):
+        stages={'initialization'}
+        for line in SOURCE.read_text().splitlines():
+            if re.match(r'^\s*set_install_stage\s',line):
+                arguments=shlex.split(line)
+                self.assertEqual(len(arguments),3,'Stage calls must use literal names and recovery instructions')
+                self.assertNotRegex(arguments[1],r'[$`]')
+                stages.add(arguments[1])
+        self.assertEqual(stages,self.module.STAGES)
+
+    @unittest.skipUnless(os.geteuid()==0,'requires root for private installer journals')
+    def test_cli_records_every_stage_and_installation_rollback_phase(self):
+        tool=BIN/'sls_install_transaction.py'
+        with tempfile.TemporaryDirectory() as name:
+            root=Path(name)/'journal'
+            for stage in sorted(self.module.STAGES):
+                with self.subTest(stage=stage):
+                    transaction=self.module.begin(root)
+                    command=['python3','-I',str(tool),'--root',str(root),'--transaction',str(transaction),'--stage',stage]
+                    result=subprocess.run([*command,'stage'],capture_output=True,text=True,timeout=5)
+                    self.assertEqual(result.returncode,0,result.stderr)
+                    for phase in ('prepared','mutating','recovering','recovery_failed','recovering','rolled_back'):
+                        result=subprocess.run([*command,'--phase',phase,'update'],input='{"STATIC_MUTATION_STARTED":"1"}',capture_output=True,text=True,timeout=5)
+                        self.assertEqual(result.returncode,0,result.stderr)
+                        value=self.module.state(transaction)
+                        self.assertEqual((value['stage'],value['phase']),(stage,phase))
+                        self.assertEqual(value['settings'],{'STATIC_MUTATION_STARTED':'1'})
+            self.assertEqual(self.module.pending(root),[])
     def test_killed_transaction_survives_and_blocks_new_mutation(self):
         with tempfile.TemporaryDirectory() as name:
             root=Path(name)/'journal'; transaction=self.module.begin(root)
@@ -188,6 +218,13 @@ class Journal(unittest.TestCase):
 
     @unittest.skipUnless(os.geteuid()==0,'requires root for authenticated durable permission snapshots')
     def test_sigkill_after_native_permission_protection_has_durable_recovery(self):
+        self.preparation_recovery(False)
+
+    @unittest.skipUnless(os.geteuid()==0,'requires root for publisher-authenticated previous installer recovery')
+    def test_previous_signed_prepared_stage_failure_recovers_before_retry(self):
+        self.preparation_recovery(True)
+
+    def preparation_recovery(self,legacy_stage_failure):
         with tempfile.TemporaryDirectory(dir='/run') as name:
             root=Path(name);bootstrap=root/'bootstrap';bootstrap.mkdir(mode=0o700)
             approval=root/'approval';approval.mkdir(mode=0o700)
@@ -207,13 +244,49 @@ class Journal(unittest.TestCase):
             verifier=verifier[:begin]+prefix+repr(public)+verifier[end:]
             verifier=verifier.replace("DIRECTORY = Path('/var/lib/sls-mass-notify-trust')","DIRECTORY = Path("+repr(str(root/'unused-policy'))+")")
             contents['sls_release_trust.py']=verifier.encode()
+            if legacy_stage_failure:
+                missing={'FreePBX ownership protection','legacy configuration and runtime permissions',
+                         'authenticated prerequisite validation','previous phone collector recovery',
+                         'notification worker coordination','configuration coordination'}
+                text=contents['sls_install_transaction.py'].decode()
+                text=re.sub(r'^STAGES = .*?(?=^NAME =)',
+                    lambda unused:'STAGES = '+repr(self.module.STAGES-missing)+'\n',text,flags=re.M|re.S)
+                contents['sls_install_transaction.py']=text.encode()
             for filename,body in contents.items():
                 (bootstrap/filename).write_bytes(body);(bootstrap/filename).chmod(0o700)
             # Recovery authenticates the exact saved programs against this
             # fixture's signed package, including the permission helper.
             installer=root/'installer.sh'
-            installer.write_text(SOURCE.read_text().replace('/usr/local/bin/sls_mass_notify/sls_release_trust.py',
-                str(root/'recovery-verifier.py')))
+            installer_text=SOURCE.read_text().replace('/usr/local/bin/sls_mass_notify/sls_release_trust.py',
+                str(root/'recovery-verifier.py'))
+            if legacy_stage_failure:
+                legacy_setter='''set_install_stage() {
+  INSTALL_STAGE="$1"
+  INSTALL_SOLUTION="$2"
+  if [ -n "$INSTALL_TRANSACTION_DIR" ] && [ -n "$TRANSACTION_TOOL" ]; then
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" --root "$INSTALL_TRANSACTION_ROOT" --transaction "$INSTALL_TRANSACTION_DIR" --stage "$INSTALL_STAGE" stage || return $?
+  fi
+}
+'''
+                installer_text=re.sub(r'^set_install_stage\(\) \{.*?^\}\n',lambda unused:legacy_setter,
+                    installer_text,count=1,flags=re.M|re.S)
+                # The saved installer really executes after the patched caller
+                # authenticates it. Replace only external PBX coordination with
+                # inert fixture commands inside this signed, private artifact.
+                overrides='''
+INSTALL_TRANSACTION_ROOT="FIXTURE/journal"
+DATA_DIR="FIXTURE/absent-data"; FREEPBX_CHOWN_CONFIG="FIXTURE/freepbx_chown.conf"
+LOG_FILE="FIXTURE/recovery.log"; INSTALL_NOTIFICATION_SIDE_EFFECTS=0
+acquire_update_coordination() { :; }
+acquire_maintenance_coordination() { :; }
+acquire_worker_coordination() { printf worker >>"FIXTURE/trace"; }
+acquire_settings_coordination() { :; }
+clear_install_failure() { :; }
+record_install_failure() { :; }
+'''.replace('FIXTURE',str(root))
+                installer_text=installer_text.replace('if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then',
+                    overrides+'\nif [[ "${BASH_SOURCE[0]}" == "$0" ]]; then')
+            installer.write_text(installer_text)
             (root/'recovery-verifier.py').write_bytes(contents['sls_release_trust.py'])
             installer.chmod(0o600)
             package=root/'package.tgz'
@@ -240,16 +313,33 @@ protect_freepbx_chown_permissions
 printf 'READY:%s\n' "$INSTALL_TRANSACTION_DIR"
 kill -KILL "$$"
 '''
+            if legacy_stage_failure:
+                harness=harness.replace('protect_freepbx_chown_permissions',
+                    '''INSTALL_STAGE="publisher and stock approval"
+persist_install_transaction prepared
+trap guard_config_on_exit EXIT
+set_install_stage "FreePBX ownership protection" "fixture recovery instruction"''').replace('kill -KILL "$$"','exit 99')
             killed=subprocess.run(['bash','-c',harness,'fixture',str(installer),str(root)],capture_output=True,text=True,timeout=10)
-            self.assertEqual(killed.returncode,-signal.SIGKILL,killed.stdout+killed.stderr)
+            self.assertEqual(killed.returncode,2 if legacy_stage_failure else -signal.SIGKILL,killed.stdout+killed.stderr)
             pending=self.module.pending(root/'journal');self.assertEqual(len(pending),1)
             transaction=Path(pending[0]['directory'])
             state=self.module.state(transaction)
             self.assertEqual(state['phase'],'prepared')
             self.assertEqual(state['settings']['CONFIG_SNAPSHOT'],'')
             self.assertEqual(state['settings']['PENDING_CONFIG_STATE'],'')
-            self.assertTrue((transaction/'approval/freepbx-chown.snapshot').is_file())
-            self.assertNotEqual(config.read_bytes(),original)
+            if legacy_stage_failure:
+                self.assertEqual(state['stage'],'publisher and stock approval')
+                self.assertEqual(config.read_bytes(),original)
+                self.assertFalse((transaction/'approval/freepbx-chown.snapshot').exists())
+                evidence={str(p.relative_to(transaction)):p.read_bytes() for p in transaction.rglob('*') if p.is_file()}
+                discover='source "$1"; INSTALL_TRANSACTION_ROOT="$2"; check_interrupted_installation'
+                blocked=subprocess.run(['bash','-c',discover,'fixture',str(SOURCE),str(root/'journal')],capture_output=True,text=True,timeout=5)
+                self.assertEqual(blocked.returncode,3,blocked.stderr)
+                self.assertEqual(evidence,{str(p.relative_to(transaction)):p.read_bytes() for p in transaction.rglob('*') if p.is_file()})
+                self.assertIn('--recover '+str(transaction),blocked.stderr)
+            else:
+                self.assertTrue((transaction/'approval/freepbx-chown.snapshot').is_file())
+                self.assertNotEqual(config.read_bytes(),original)
             recovery=r'''
 source "$1"
 fixture="$2"; INSTALL_TRANSACTION_ROOT="$fixture/journal"
@@ -264,7 +354,13 @@ clear_install_failure() { :; }
 record_install_failure() { :; }
 recover_interrupted_installation "$3"
 '''
-            restored=subprocess.run(['bash','-c',recovery,'fixture',str(transaction/'installer.sh'),str(root),str(transaction)],
+            if legacy_stage_failure:
+                recovery=recovery.replace('INSTALLER_SOURCE_PATH="$3/installer.sh"','INSTALLER_SOURCE_PATH="$1"')
+                patched=root/'patched-installer.sh'
+                patched.write_text(SOURCE.read_text().replace('/usr/local/bin/sls_mass_notify/sls_release_trust.py',
+                    str(root/'recovery-verifier.py')))
+                patched.chmod(0o600)
+            restored=subprocess.run(['bash','-c',recovery,'fixture',str(patched) if legacy_stage_failure else str(transaction/'installer.sh'),str(root),str(transaction)],
                 capture_output=True,text=True,timeout=10)
             self.assertEqual(restored.returncode,0,restored.stdout+restored.stderr)
             self.assertEqual(config.read_bytes(),original)
@@ -272,6 +368,11 @@ recover_interrupted_installation "$3"
             self.assertFalse((root/'absent-data').exists())
             self.assertEqual(self.module.pending(root/'journal'),[])
             self.assertEqual(self.module.state(transaction)['phase'],'rolled_back')
+            if legacy_stage_failure:
+                self.assertEqual(self.module.state(transaction)['stage'],'interrupted installation recovery')
+                retry=self.module.begin(root/'journal')
+                self.assertNotEqual(retry,transaction)
+                self.assertEqual(self.module.state(retry)['phase'],'prepared')
 
 
 if __name__=='__main__': unittest.main()

@@ -2,6 +2,7 @@
 
 ## 0.1.6-beta — 2026-10-10
 
+- Synchronize every installer stage with the protected transaction allowlist, fixing exit code 2 before ownership protection. Keep the last recorded stage after a rejected transition so rollback can finish durably. Retain settings snapshots until commit or verified rollback; support authenticated recovery of the earlier prepared transaction before retrying installation.
 - Recover a missing central-configuration mutex and recognized root-owned active/pending settings during authenticated installation. Validate settings before repair; preserve ciphertext, keys, existing mutex inodes and delivery history. Keep configuration coordination in the authenticated worker keeper and reject linked, nonempty or unexpected files without blocking on special files.
 - Separate publisher approval, legacy permission recovery, previous collector recovery and worker/configuration coordination in installer diagnostics. Failed preparation names the actual stage; successful final verification clears the installation warning.
 - Include authenticated offline removal through `slsconsole uninstall`, including when the operational installer helper is missing. Drain notification workers before teardown and refuse active phone delivery. Preserve configuration, media, schedules, delivery history and logs by default; recover interrupted teardown using approved stock states. Refuse unexpected cron read/write failures and preserve unrelated jobs.

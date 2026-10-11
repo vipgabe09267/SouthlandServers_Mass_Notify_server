@@ -93,6 +93,7 @@ The module install hook prepares the local PBX integration by applying managed c
 - serializes install, update, repair, and uninstall work with the root maintenance lock. A child installer launched by the maintenance worker reuses the inherited lock instead of deadlocking, while direct CLI operations wait for an active maintenance transaction to finish
 - performs one final signing pass after reload. A candidate `module.sig` is published only after FreePBX verifies it; a failed verification restores the previous signature
 - records a failed install or repair in protected state and FreePBX notifications. Dashboard health shows a red fault with the failed stage and a possible next step until comprehensive integration, signature, runtime, and health verification completes successfully
+- validates installer stage names against the protected transaction helper. Rejected transitions retain the last recorded stage so restoration can finish durably; settings snapshots survive all final checks until commit or verified rollback is recorded. An unfinished earlier attempt requires authenticated recovery before retrying
 - installs the native FreePBX backup/restore adapters, checks module-based backup-job enrollment, and stages protected post-restore repair. A replacement PBX must already have this custom module installed before FreePBX can restore its module data
 
 ## First-Run Setup

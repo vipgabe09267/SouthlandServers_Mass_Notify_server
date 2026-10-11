@@ -31,7 +31,7 @@ URL="${SLS_MASS_NOTIFY_TGZ_URL:-${1:-}}"
 SHA256="${SLS_MASS_NOTIFY_SHA256:-}"
 TOKEN="${SLS_MASS_NOTIFY_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
 LOG_FILE="${SLS_MASS_NOTIFY_INSTALL_LOG:-/tmp/slsmassnotifyserver-install.log}"
-EXPECTED_TGZ_SHA256="28dc3aaa85faa9dde55bdeca5ac11c941aae90f765a07f106452d7a92a5bc604"
+EXPECTED_TGZ_SHA256="fbfffdf3e41bac40a5fa140e75c19ebafd69529cbfeb770c86d4400304694af7"
 DATA_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin"
 CONFIG_FILE="$DATA_DIR/mass-notifications.config"
 CONFIG_SNAPSHOT=""
@@ -701,11 +701,21 @@ run_logged() {
 }
 
 set_install_stage() {
-  INSTALL_STAGE="$1"
-  INSTALL_SOLUTION="$2"
+  local next_stage="$1" next_solution="$2" status
   if [ -n "$INSTALL_TRANSACTION_DIR" ] && [ -n "$TRANSACTION_TOOL" ]; then
-    /usr/bin/python3 -I "$TRANSACTION_TOOL" --root "$INSTALL_TRANSACTION_ROOT" --transaction "$INSTALL_TRANSACTION_DIR" --stage "$INSTALL_STAGE" stage || return $?
+    if /usr/bin/python3 -I "$TRANSACTION_TOOL" --root "$INSTALL_TRANSACTION_ROOT" --transaction "$INSTALL_TRANSACTION_DIR" --stage "$next_stage" stage; then
+      :
+    else
+      status=$?
+      INSTALL_ERROR_CATEGORY="installer_stage_recording_failed"
+      INSTALL_SOLUTION="The authenticated installer could not record stage '$next_stage'. Preserve the transaction directory and installer log, and use a corrected signed installer before retrying."
+      log "$INSTALL_SOLUTION"
+      return "$status"
+    fi
   fi
+  # A rejected transition must not poison rollback's last valid journal stage.
+  INSTALL_STAGE="$next_stage"
+  INSTALL_SOLUTION="$next_solution"
 }
 
 ensure_data_directory() {
@@ -4478,8 +4488,8 @@ verify_config_unchanged() {
   [ -n "$CONFIG_HASH_BEFORE" ] || return 0
   current_hash="$(safe_config_hash "$CONFIG_FILE" 2>/dev/null || true)"
   if [ "$current_hash" = "$CONFIG_HASH_BEFORE" ]; then
-    rm -f "$CONFIG_SNAPSHOT"
-    CONFIG_SNAPSHOT=""
+    # Later postconditions can still fail. Retire this snapshot only after the
+    # transaction's commit or verified rollback has been recorded durably.
     return 0
   fi
   current_snapshot="$(mktemp "$INSTALL_TEMP_ROOT/slsmassnotifyserver-config-current.XXXXXX")"
