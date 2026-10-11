@@ -199,7 +199,7 @@ class UpgradeTrustTests(unittest.TestCase):
         self.assertEqual(self.upgrade.runtime_inventory(runtime), {Path(name).name for name in self.upgrade.runtime_files(self.old)})
         self.assert_preserved()
 
-    def test_cache_quarantine_keeps_bytecode_out_of_execution_approval_and_rollback(self):
+    def prepare_runtime_caches(self, count=1):
         # Extend the signed fixture with an imported helper, as in the real014 runtime.
         self.old['bin/sls_mass_notify/sls_config.py'] = b'VALUE = 1\n'
         self.previous = self.release('previous-python', '0.1.4-beta', self.old)
@@ -209,9 +209,16 @@ class UpgradeTrustTests(unittest.TestCase):
         runtime = self.fs / 'usr/local/bin/sls_mass_notify'
         (runtime / 'sls_config.py').write_bytes(self.old['bin/sls_mass_notify/sls_config.py'])
         self.environment['SLS_MASS_NOTIFY_PREVIOUS_TGZ'], self.environment['SLS_MASS_NOTIFY_PREVIOUS_MANIFEST'], self.environment['SLS_MASS_NOTIFY_PREVIOUS_MANIFEST_SIGNATURE'] = map(str, self.previous)
-        cache = runtime / '__pycache__/sls_config.cpython-311.pyc'
-        cache.parent.mkdir(); cache.write_bytes(b'untrusted bytecode must not execute or be restored')
-        self.prepare(); self.assertTrue(cache.exists()); self.assert_preserved()
+        directory = runtime / '__pycache__'
+        directory.mkdir()
+        caches = [directory / ('sls_config.cpython-311' + ('.opt-1' if index else '') + '.pyc') for index in range(count)]
+        for cache in caches:
+            cache.write_bytes(b'untrusted bytecode must not execute or be restored')
+        self.prepare(); self.assert_preserved()
+        return caches
+
+    def test_cache_quarantine_keeps_bytecode_out_of_execution_approval_and_rollback(self):
+        cache, = self.prepare_runtime_caches()
         approved = json.loads((self.workspace / 'previous-root-approval.json').read_bytes())
         self.assertNotIn('/usr/local/bin/sls_mass_notify/__pycache__/sls_config.cpython-311.pyc', approved['files'])
         self.assertEqual(len(approved['quarantine_caches']), 1)
@@ -220,7 +227,148 @@ class UpgradeTrustTests(unittest.TestCase):
         evidence = json.loads((self.workspace / 'runtime-cache-recovery/inventory.json').read_bytes())
         self.assertFalse(evidence['execution_approved'])
         digest = self.trust.digest(('/usr/local/bin/sls_mass_notify/__pycache__/' + cache.name).encode())
-        self.assertEqual((self.workspace / 'runtime-cache-recovery' / digest).read_bytes(), b'untrusted bytecode must not execute or be restored')
+        saved = self.workspace / 'runtime-cache-recovery' / digest
+        self.assertEqual(saved.read_bytes(), b'untrusted bytecode must not execute or be restored')
+        evidence_before = {path.name: (path.read_bytes(), path.stat().st_ino) for path in saved.parent.iterdir()}
+        with patch.object(self.upgrade, 'WEB', self.web):
+            self.upgrade.verify_previous(self.workspace)
+        self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        self.assertFalse(cache.exists())
+        self.assertEqual(evidence_before, {path.name: (path.read_bytes(), path.stat().st_ino) for path in saved.parent.iterdir()})
+        self.assert_preserved()
+
+    def test_partial_cache_quarantine_resumes_without_replacing_signed_helpers(self):
+        first, second = self.prepare_runtime_caches(count=2)
+        helper = first.parent.parent / 'sls_mass_notify_update.sh'
+        helper_before = (helper.read_bytes(), helper.stat().st_ino)
+        unlink = self.upgrade.os.unlink
+        removed = []
+
+        def interrupt_second(path, *args, **kwargs):
+            if path in {first.name, second.name} and 'dir_fd' in kwargs:
+                if removed:
+                    raise OSError('fixture: interrupted after first quarantine')
+                result = unlink(path, *args, **kwargs)
+                removed.append(path)
+                return result
+            return unlink(path, *args, **kwargs)
+
+        with patch.object(self.upgrade.os, 'unlink', side_effect=interrupt_second):
+            with self.assertRaisesRegex(OSError, 'interrupted after first'):
+                self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        self.assertEqual(sum(cache.exists() for cache in (first, second)), 1)
+        self.assert_preserved()
+        self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        self.assertFalse(first.exists()); self.assertFalse(second.exists())
+        self.assertEqual(helper_before, (helper.read_bytes(), helper.stat().st_ino))
+        self.assert_preserved()
+
+    def test_cache_disappearance_without_quarantine_cannot_authorize_helper_repair(self):
+        helper = self.fs / 'usr/local/bin/sls_mass_notify/sls_mass_notify_update.sh'
+        helper.unlink()
+        cache, = self.prepare_runtime_caches()
+        cache.unlink()
+        with self.assertRaisesRegex(self.upgrade.UpgradeError, 'absent without valid private quarantine evidence'):
+            self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        self.assertFalse((self.workspace / 'runtime-cache-recovery').exists())
+        self.assertFalse(helper.exists())
+        self.assert_preserved()
+
+    def test_repeated_cache_check_rejects_missing_or_changed_quarantine_inventory(self):
+        self.prepare_runtime_caches()
+        self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        inventory = self.workspace / 'runtime-cache-recovery/inventory.json'
+        original = inventory.read_bytes()
+        approved = json.loads(original)
+        invalid = [None, b'{', b'[]', json.dumps({**approved, 'schema': True}).encode(),
+                   json.dumps({**approved, 'execution_approved': True}).encode(),
+                   json.dumps({**approved, 'execution_approved': 0}).encode(),
+                   json.dumps({**approved, 'files': {}}).encode()]
+        for body in invalid:
+            with self.subTest(body=body):
+                if body is None:
+                    inventory.unlink()
+                else:
+                    inventory.write_bytes(body)
+                with self.assertRaises(self.upgrade.UpgradeError):
+                    self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+                if body is not None:
+                    self.assertEqual(inventory.read_bytes(), body)
+                self.assert_preserved()
+                inventory.write_bytes(original)
+        self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+
+    def test_repeated_cache_check_rejects_unsafe_or_missing_quarantine_bytes(self):
+        cache, = self.prepare_runtime_caches()
+        self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        absolute = self.upgrade.RUNTIME + '/__pycache__/' + cache.name
+        saved = self.workspace / 'runtime-cache-recovery' / self.trust.digest(absolute.encode())
+        original = saved.read_bytes()
+        for alteration in ('changed', 'missing', 'symlink', 'hardlink', 'writable', 'oversized'):
+            with self.subTest(alteration=alteration):
+                saved.unlink()
+                extra = self.root / 'quarantine-fixture'
+                if alteration == 'changed':
+                    saved.write_bytes(b'changed cache evidence')
+                elif alteration == 'symlink':
+                    extra.write_bytes(original); saved.symlink_to(extra)
+                elif alteration == 'hardlink':
+                    extra.write_bytes(original); os.link(extra, saved)
+                elif alteration == 'writable':
+                    saved.write_bytes(original); saved.chmod(0o666)
+                elif alteration == 'oversized':
+                    saved.write_bytes(b'x' * (1024 * 1024 + 1))
+                with self.assertRaises(self.upgrade.UpgradeError):
+                    self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+                self.assertFalse(cache.exists()); self.assert_preserved()
+                if saved.exists() or saved.is_symlink():
+                    saved.unlink()
+                if extra.exists():
+                    self.assertEqual(extra.read_bytes(), original); extra.unlink()
+                saved.write_bytes(original); saved.chmod(0o600)
+        self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+
+    def test_repeated_cache_check_requires_private_recovery_directory(self):
+        self.prepare_runtime_caches()
+        self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        evidence = self.workspace / 'runtime-cache-recovery'
+        evidence.chmod(0o755)
+        with self.assertRaisesRegex(self.upgrade.UpgradeError, 'private quarantine evidence'):
+            self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        evidence.chmod(0o700)
+        self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        self.assert_preserved()
+
+    def test_runtime_changes_after_cache_quarantine_still_require_review(self):
+        cache, = self.prepare_runtime_caches()
+        self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        source = cache.parent.parent / 'sls_config.py'
+        original = source.read_bytes()
+        source.write_bytes(b'changed executable source')
+        with self.assertRaisesRegex(self.upgrade.UpgradeError, 'Previous runtime changed after preflight'):
+            self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        self.assertEqual(source.read_bytes(), b'changed executable source')
+        source.write_bytes(original)
+        unknown = source.parent / 'unknown.py'; unknown.write_bytes(b'new unknown executable')
+        with self.assertRaisesRegex(self.upgrade.UpgradeError, 'no additional files were approved'):
+            self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        self.assertEqual(unknown.read_bytes(), b'new unknown executable'); unknown.unlink()
+        cache.write_bytes(b'changed recreated bytecode')
+        with self.assertRaisesRegex(self.upgrade.UpgradeError, 'Python cache changed after preflight'):
+            self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        self.assertEqual(cache.read_bytes(), b'changed recreated bytecode')
+        self.assert_preserved()
+
+    def test_new_approval_after_completed_quarantine_supports_upgrade_retry(self):
+        self.prepare_runtime_caches()
+        self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        self.args.workspace = self.workspace = self.root / 'retry-review'
+        self.prepare()
+        approval = json.loads((self.workspace / 'previous-root-approval.json').read_bytes())
+        self.assertEqual(approval['quarantine_caches'], {})
+        self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
+        self.upgrade.normalize_previous_runtime(self.workspace, prefix=self.fs)
         self.assert_preserved()
 
     def test_unknown_cache_content_links_and_writable_entries_remain_blocked(self):

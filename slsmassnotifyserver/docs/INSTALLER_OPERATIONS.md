@@ -217,6 +217,14 @@ After recovery, the installer verifies the approved collector service and a fres
 
 An older collector may have a voicemail fallback pending in a closed phone batch. Upgrade preflight refuses that still-eligible, unexpired fallback before activation; let it finish or expire, then retry. It does not claim or erase the fallback. Current collectors coordinate voicemail submission and recording cleanup with the same worker guards.
 
+## Legacy Python-cache quarantine
+
+Earlier installers can stop with `Previous runtime changed after preflight; no additional files were approved` immediately after reporting `quarantined_caches: 1` or more. They remove recognized legacy Python caches during permission preparation, then incorrectly require those same caches during the next runtime verification.
+
+The corrected `0.1.6-beta` recognizes completed or partially completed quarantine only when the protected `runtime-cache-recovery/inventory.json` matches the original approval and the saved cache bytes match their recorded hashes. Each check still verifies authenticated source files and rejects unknown runtime files, unsafe recovery entries and changed caches. Quarantined bytecode never receives execution or rollback approval. Completed quarantine evidence is left intact.
+
+Download the current matching installer and package, then rerun the normal installation command. If it reports an unfinished transaction, use the authenticated recovery command in [Interrupted installations](#interrupted-installations) before retrying. Preserve the transaction and installer log; missing or changed quarantine evidence requires review rather than manual cache deletion or new live-file approvals.
+
 ## Included offline removal
 
 Run `sudo slsconsole uninstall` or the included `/usr/local/bin/sls_mass_notify/sls_mass_notify_uninstall.sh`. Removal does not download packages or require the installed `sls_privileged_install.py`, speech engine or collector to be healthy. It authenticates fixed teardown helpers against the retained publisher generation and checks independently approved Framework/Dashboard inventories. It drains notification workers under private leases before changing services or removing files, and refuses active phone delivery. It preserves configuration, media, history, logs and recovery keys by default. Purging data is a separate destructive option.

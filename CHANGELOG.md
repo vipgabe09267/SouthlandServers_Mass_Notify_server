@@ -2,6 +2,7 @@
 
 ## 0.1.6-beta — 2026-10-10
 
+- Make legacy Python-cache quarantine repeatable across upgrade verification and interrupted cleanup. Recognize removed caches only through the original private quarantine inventory and matching saved bytes; preserve signed-source checks, recovery evidence and rejection of unknown files.
 - Put install/update, offline uninstall, service commands and recovery at the top of the README. Remove repeated release notes and move capacity tables and detailed delivery behavior into linked guides.
 - Fix native voicemail fallback after a Lightning or Weather page times out without a per-handset `DialEnd`. Accept an exact tracked handset's terminal AMI state with an explicit busy/no-answer/unavailable cause; retain answered-call, uncertain-outcome and duplicate-deposit protections.
 - Synchronize every installer stage with the protected transaction allowlist, fixing exit code 2 before ownership protection. Keep the last recorded stage after a rejected transition so rollback can finish durably. Retain settings snapshots until commit or verified rollback; support authenticated recovery of the earlier prepared transaction before retrying installation.

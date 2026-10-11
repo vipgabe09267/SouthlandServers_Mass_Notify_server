@@ -471,7 +471,8 @@ def normalize_previous_runtime(workspace, *, prefix=Path('/')):
     runtime = prefix / RUNTIME[1:]
     own = {name[len(RUNTIME) + 1:] for name in expected if name.startswith(RUNTIME + '/')}
     actual = runtime_inventory(runtime)
-    if actual - own != {name[len(RUNTIME) + 1:] for name in caches}:
+    cache_paths = {name[len(RUNTIME) + 1:] for name in caches}
+    if (actual - own) - cache_paths:
         raise UpgradeError('Previous runtime changed after preflight; no additional files were approved')
     # Verify every input and existing destination before modifying any live file.
     payloads = {}
@@ -486,16 +487,34 @@ def normalize_previous_runtime(workspace, *, prefix=Path('/')):
             payloads[name] = body
         if TRUST.digest(body) != digest:
             raise UpgradeError('Previous runtime changed after preflight: ' + name)
+    evidence = workspace / 'runtime-cache-recovery'
+    absent_caches = cache_paths - actual
+    if absent_caches:
+        try:
+            TRUST.private_generation(evidence)
+            recovered = json.loads(TRUST.read(evidence / 'inventory.json', TRUST.MAX_MANIFEST, protected=True))
+        except (OSError, ValueError, TRUST.TrustError) as error:
+            raise UpgradeError('Previous Python cache is absent without valid private quarantine evidence; preserve the review directory') from error
+        if (not isinstance(recovered, dict) or type(recovered.get('schema')) is not int
+                or recovered != {'schema': 1, 'execution_approved': False, 'files': caches}
+                or recovered.get('execution_approved') is not False):
+            raise UpgradeError('Previous Python cache quarantine inventory differs from its original approval; preserve the review directory')
     cache_bodies = {}
     for name, digest in caches.items():
-        if runtime_cache_source(name[len(RUNTIME) + 1:]) not in own:
+        relative = name[len(RUNTIME) + 1:]
+        if runtime_cache_source(relative) not in own:
             raise UpgradeError('Invalid runtime cache recovery path')
-        body = TRUST.read(prefix / name[1:], 1024 * 1024, protected=True)
+        if relative in absent_caches:
+            try:
+                body = TRUST.read(evidence / TRUST.digest(name.encode()), 1024 * 1024, protected=True)
+            except (OSError, TRUST.TrustError) as error:
+                raise UpgradeError('Previous Python cache quarantine bytes are missing or unsafe; preserve the review directory: ' + name) from error
+        else:
+            body = TRUST.read(prefix / name[1:], 1024 * 1024, protected=True)
+            cache_bodies[name] = body
         if TRUST.digest(body) != digest:
             raise UpgradeError('Previous Python cache changed after preflight: ' + name)
-        cache_bodies[name] = body
-    evidence = workspace / 'runtime-cache-recovery'
-    if caches:
+    if cache_bodies:
         TRUST.prepare_root(evidence)
         for name, body in cache_bodies.items():
             TRUST.atomic(evidence / TRUST.digest(name.encode()), body)
@@ -559,7 +578,8 @@ def normalize_previous_runtime(workspace, *, prefix=Path('/')):
             os.close(parent)
     if runtime_inventory(runtime) != own:
         raise UpgradeError('Previous runtime normalization is incomplete; preserve the review evidence')
-    print(json.dumps({'ok': True, 'restored_signed_helpers': len(payloads), 'quarantined_caches': len(caches), 'review_directory': str(workspace)}))
+    print(json.dumps({'ok': True, 'restored_signed_helpers': len(payloads), 'quarantined_caches': len(cache_bodies),
+                      'already_quarantined_caches': len(absent_caches), 'review_directory': str(workspace)}))
 
 
 def restored_web_inventory(data, old, web):

@@ -73,7 +73,7 @@ If an attempt reports an unfinished transaction, preserve its directory and subs
 bash ./sls-install.sh --recover '/var/lib/sls-mass-notify-installer/transaction-<id>'
 ```
 
-Then rerun the normal installer. Do not delete recovery evidence or change live hashes to force approval. Keep `/tmp/slsmassnotifyserver-install.log`; see [troubleshooting](INSTALL.md#installer-log-and-runtime-errors), [legacy permission recovery](docs/INSTALLER_OPERATIONS.md#recognized-legacy-permission-recovery) and [interrupted installation recovery](docs/INSTALLER_OPERATIONS.md#interrupted-installations).
+Then rerun the normal installer. The corrected `0.1.6-beta` also fixes repeat verification after legacy Python-cache cleanup. Do not delete recovery evidence or change live hashes to force approval. Keep `/tmp/slsmassnotifyserver-install.log`; see [troubleshooting](INSTALL.md#installer-log-and-runtime-errors), [legacy permission recovery](docs/INSTALLER_OPERATIONS.md#recognized-legacy-permission-recovery) and [interrupted installation recovery](docs/INSTALLER_OPERATIONS.md#interrupted-installations).
 
 ## Requirements
 
