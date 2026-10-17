@@ -29,7 +29,7 @@ class Secure
         try {
             return random_bytes(\PHP_INT_SIZE);
         } catch (\Exception $e) {
-            throw new RandomException($e->getMessage(), $e->getCode(), $e->getPrevious());
+            throw new RandomException($e->getMessage(), $e->getCode(), $e);
         }
     }
 

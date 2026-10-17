@@ -1,4 +1,5 @@
 <?php
+if (!class_exists('SlsAtomicJson', false)) { require_once __DIR__ . '/sls_atomic_json.php'; }
 /** Bootstrap-independent announcement state. Never loads config or sends alerts. */
 final class SlsAnnouncementJobStore
 {
@@ -16,6 +17,7 @@ final class SlsAnnouncementJobStore
         'sip_notify_submission_failed' => 'One or more SIP NOTIFY submissions failed. Review the phone visual channel receipts.',
         'channel_submission_failed' => 'The last announcement had a delivery failure. Open its Delivery details for the affected destination and reason.',
         'job_expired' => 'The announcement expired before processing began.',
+        'weather_source_cancelled' => 'The weather source cancelled, superseded or no longer authorized this queued announcement before any destination was submitted.',
     ];
     private $directory;
 
@@ -219,10 +221,47 @@ final class SlsAnnouncementJobStore
     {
         return $this->serviceLock('announcement-send.lock');
     }
+    public function clusterReplayLock() { return $this->serviceLock('cluster-replay.lock'); }
+    public function clusterReplayState() { return $this->readNamed($this->directory.'/cluster-replay.json'); }
 
     public function previewLock()
     {
         return $this->serviceLock('announcement-preview.lock');
+    }
+
+    /** Bound worker startup before FreePBX bootstrap; keep every lock inode. */
+    public function workerLease(string $identity, int $maximum = 4)
+    {
+        if (!preg_match('/^(?:[a-f0-9]{64}|--sources|--observe)$/D', $identity) || $maximum < 1 || $maximum > 4) {
+            throw new InvalidArgumentException('Invalid worker startup admission.');
+        }
+        $gate = $this->admissionLock();
+        if (!$gate) { return null; }
+        $available = null;
+        try {
+            for ($slot = 0; $slot < $maximum; $slot++) {
+                $name = 'worker-slot-' . $slot . '.json';
+                $handle = $this->lock('job_' . substr(hash('sha256', 'worker-slot|' . $slot), 0, 32));
+                if (!$handle) {
+                    $current = $this->readNamed($this->directory . '/' . $name);
+                    if (!is_array($current) || ($current['schema'] ?? null) !== 1 || !is_string($current['identity'] ?? null)) {
+                        throw new RuntimeException('Active worker admission metadata is unavailable. Preserve its locks and repair storage.');
+                    }
+                    if (hash_equals($identity, $current['identity'])) { return null; }
+                } elseif ($available === null) {
+                    $available = [$handle, $name];
+                } else {
+                    self::unlock($handle);
+                }
+            }
+            if ($available === null) { return null; }
+            $this->atomic($available[1], ['schema' => 1, 'identity' => $identity, 'started_at' => time()]);
+            $lease = $available[0]; $available = null;
+            return $lease;
+        } finally {
+            if ($available !== null) { self::unlock($available[0]); }
+            self::unlock($gate);
+        }
     }
 
     private function serviceLock(string $name)
@@ -275,8 +314,7 @@ final class SlsAnnouncementJobStore
             if (fstat($handle)['size'] > self::LIMIT) { throw new RuntimeException('Announcement state is oversized.'); }
             $raw = stream_get_contents($handle, self::LIMIT + 1);
             if (strlen($raw) > self::LIMIT) { throw new RuntimeException('Announcement state is oversized.'); }
-            $job = json_decode($raw, true, 64, JSON_THROW_ON_ERROR);
-            if (!is_array($job)) { throw new RuntimeException('Announcement state is malformed.'); }
+            $job = \SlsAtomicJson::decodeObject($raw);
             return $job;
         } finally { fclose($handle); }
     }
@@ -375,7 +413,8 @@ final class SlsAnnouncementJobStore
     public function failure(array $job, $category, $uncertain = false)
     {
         if (!isset(self::REASONS[$category])) { $category = 'worker_runtime_failed'; }
-        $job['state'] = $category === 'job_expired' ? 'expired' : 'failed';
+        $job['state'] = $category === 'job_expired' ? 'expired'
+            : ($category === 'weather_source_cancelled' ? 'cancelled' : 'failed');
         $job['failure_category'] = $category; $job['message'] = self::reason($category);
         foreach ($job['receipts'] ?? [] as $index => $row) {
             if (($row['channel'] ?? '') === 'email' && ($row['state'] ?? '') === 'submitting') {
@@ -388,7 +427,7 @@ final class SlsAnnouncementJobStore
         $job['submission_uncertain'] = $uncertain; $job['finished_at'] = gmdate('c');
         unset($job['result']);
         $this->write($job);
-        error_log('SLS announcement ' . $job['id'] . ': ' . $category);
+        if ($category !== 'weather_source_cancelled') { error_log('SLS announcement ' . $job['id'] . ': ' . $category); }
         return $job;
     }
 

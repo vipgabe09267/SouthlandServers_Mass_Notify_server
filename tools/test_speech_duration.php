@@ -8,7 +8,7 @@ mkdir($directory, 0700);
 $reflection = new ReflectionClass(\FreePBX\modules\Slsmassnotifyserver::class);
 $source = file($reflection->getFileName());
 $methods = '';
-foreach (['generateAnnouncementTtsFile', 'buildAnnouncementTtsText', 'normalizeTtsMaxSeconds', 'normalizeTtsVolume', 'volumePercentToScalar', 'readNativeBackupFile', 'announcementAudioFileMetadata', 'isValidAnnouncementAudioCache', 'reserveGeneratedMedia', 'combineAudioParts', 'createQuietAnnouncementTone', 'normalizeToneName', 'getAnnouncementSequenceDuration'] as $name) {
+foreach (['generateAnnouncementTtsFile', 'buildAnnouncementTtsText', 'normalizeTtsMaxSeconds', 'normalizeTtsVolume', 'volumePercentToScalar', 'readNativeBackupFile', 'unlinkNamedFileIfIdentity', 'announcementAudioFileMetadata', 'isValidAnnouncementAudioCache', 'reserveGeneratedMedia', 'combineAudioParts', 'createQuietAnnouncementTone', 'normalizeToneName', 'getAnnouncementSequenceDuration'] as $name) {
     $method = $reflection->getMethod($name);
     $methods .= implode('', array_slice($source, $method->getStartLine() - 1, $method->getEndLine() - $method->getStartLine() + 1));
 }
@@ -99,6 +99,9 @@ try {
     foreach (['message'=>['bad'], 'kind'=>'send', 'color'=>'file:///etc/passwd', 'title'=>str_repeat('x',81)] as $key=>$value) {
         if ($fixture->previewAnnouncement(array_replace($input, [$key=>$value]))['success']) { throw new RuntimeException('Invalid preview field accepted: '.$key); }
     }
+    foreach (["\x01", "\u{200b}"] as $controlTitle) {
+        if ($fixture->previewAnnouncement(array_replace($input, ['title'=>$controlTitle]))['success']) { throw new RuntimeException('Control-only preview title accepted.'); }
+    }
     $fixture->settings['announcement_piper_voice'] = '30.25';
     $rejected = $fixture->previewAnnouncement($input);
     if ($rejected['success'] || strpos($rejected['message'], '30.25 seconds') === false || glob($directory . '/*.wav')) { throw new RuntimeException('Preview concealed a duration error.'); }
@@ -112,6 +115,22 @@ try {
     $measure=new ReflectionMethod($fixture,'getAnnouncementSequenceDuration');
     $duration=$measure->invoke($fixture,'fixture_audio/'.$combined);
     if ($combined==='' || abs($duration-5.0)>.01) { throw new RuntimeException('Bounded concatenation lost a complete tone or its one-second opening silence.'); }
+	mkdir($directory.'/tts',0700);
+	if ($measure->invoke($fixture,'fixture_audio/tts/../fixture-tone')!==0.0) {
+		throw new RuntimeException('Sequence duration accepted a parent-directory path segment.');
+	}
+	rmdir($directory.'/tts');
+	$link=$directory.'/duration-link.wav';
+	symlink($directory.'/fixture-tone.wav',$link);
+	if ($measure->invoke($fixture,'fixture_audio/duration-link')!==0.0) {
+		throw new RuntimeException('Sequence duration followed a symbolic-link audio path.');
+	}
+	unlink($link);
+	link($directory.'/fixture-tone.wav',$link);
+	if ($measure->invoke($fixture,'fixture_audio/duration-link')!==0.0) {
+		throw new RuntimeException('Sequence duration accepted shared-inode audio.');
+	}
+	unlink($link);
     $inode=fileinode($directory.'/'.$combined.'.wav');
     if ($combine->invoke($fixture,'roundtrip',$parts,'fixture')!==$combined || fileinode($directory.'/'.$combined.'.wav')!==$inode) {
         throw new RuntimeException('Audio concatenation unnecessarily regenerated its current cache.');

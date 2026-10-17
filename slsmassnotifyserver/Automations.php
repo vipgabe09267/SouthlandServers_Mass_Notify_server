@@ -3,6 +3,7 @@ declare(strict_types=1);
 namespace FreePBX\modules;
 require_once __DIR__ . '/AutomationService.php';
 require_once __DIR__ . '/AutomationInputs.php';
+if (!class_exists('SlsAtomicJson',false)) { require_once __DIR__.'/bin/sls_mass_notify/sls_atomic_json.php'; }
 use SLS\MassNotify\{AutomationConfig,AutomationStore,AutomationService,AutomationInputs,IncidentConfig};
 
 trait SlsAutomations
@@ -28,18 +29,25 @@ trait SlsAutomations
     }
     private function automationRunner(array $arguments, ?array $input=null): array
     {
+        $helper=$this->automationRuntimeFile('sls_trigger_actions.py');
         $pipes=[];
-        $process=proc_open(array_merge(['/usr/bin/timeout','--kill-after=2','15','/usr/bin/python3',self::RUNTIME_DIR.'/sls_trigger_actions.py'],$arguments),
+        $process=proc_open(array_merge(['/usr/bin/timeout','--kill-after=2','15','/usr/bin/python3','-I',$helper],$arguments),
             [0=>['pipe','r'],1=>['pipe','w'],2=>['file','/dev/null','w']],$pipes,'/',['PATH'=>'/usr/bin:/bin','LANG'=>'C.UTF-8','PYTHONDONTWRITEBYTECODE'=>'1'],['bypass_shell'=>true]);
         if (!is_resource($process)) { throw new \RuntimeException('Trigger action worker could not start. Check the installed Python runtime and action helper.'); }
         try {
             $encoded=$input===null ? '' : json_encode($input,JSON_THROW_ON_ERROR);
             if (strlen($encoded)>16384) { throw new \InvalidArgumentException('Action input exceeds its bounded handoff size.'); }
-            if ($encoded!=='' && fwrite($pipes[0],$encoded)!==strlen($encoded)) { throw new \RuntimeException('Action input could not be delivered completely.'); }
+            $written=0;
+            while ($written<strlen($encoded)) {
+                $count=fwrite($pipes[0],substr($encoded,$written));
+                if (!is_int($count) || $count<1) { throw new \RuntimeException('Action input could not be delivered completely.'); }
+                $written+=$count;
+            }
             fclose($pipes[0]); $pipes[0]=null;
             $output=stream_get_contents($pipes[1],8193); fclose($pipes[1]); $pipes[1]=null;
             $exit=proc_close($process); $process=null;
-            $result=is_string($output) && strlen($output)<=8192 ? json_decode($output,true) : null;
+            try{$result=is_string($output)&&strlen($output)<=8192?\SlsAtomicJson::decodeObject($output,24):null;}
+            catch(\Throwable $error){$result=null;}
             if (!is_array($result)) { return ['state'=>'uncertain','detail'=>'Action worker did not return a bounded result. Review the script/device before any manual resend.']; }
             if ($exit!==0 && !isset($result['state'])) { $result=['state'=>'failed','detail'=>'Action inspection failed.']; }
             return $result;
@@ -47,6 +55,19 @@ trait SlsAutomations
             foreach ($pipes as $pipe) { if (is_resource($pipe)) { fclose($pipe); } }
             if (is_resource($process)) { proc_terminate($process,9); proc_close($process); }
         }
+    }
+    private function automationRuntimeFile(string $name): string
+    {
+        if(!in_array($name,['sls_trigger_actions.py','sls_mass_notify_automation_worker.php'],true)){throw new \InvalidArgumentException('Unsupported automation runtime helper.');}
+        $directory=rtrim(self::RUNTIME_DIR,'/');$path=$directory.'/'.$name;clearstatcache(true,$directory);clearstatcache(true,$path);
+        $parent=@lstat($directory);$meta=@lstat($path);$production=$directory==='/usr/local/bin/sls_mass_notify';
+        $owner=$production?0:(function_exists('posix_geteuid')?posix_geteuid():-1);
+        if(!is_array($parent)||!is_array($meta)||($parent['mode']&0170000)!==0040000||$parent['uid']!==$owner||($parent['mode']&0022)
+            ||($meta['mode']&0170000)!==0100000||$meta['uid']!==$owner||$meta['nlink']!==1||($meta['mode']&0022)||$meta['size']<1||$meta['size']>2097152
+            ||realpath($directory)!==$directory||realpath($path)!==$path||!is_readable($path)){
+            throw new \RuntimeException('The protected automation runtime helper is missing or unsafe. Run Repair Installation before executing actions.');
+        }
+        return $path;
     }
     private function runAutomationAction(array $action,array $event): array
     {
@@ -233,13 +254,14 @@ trait SlsAutomations
         if (!preg_match('/^[a-f0-9]{64}$/D',$id)) { throw new \InvalidArgumentException('Invalid trigger event identifier.'); }
         // A durable queued record precedes this best-effort start; the minute
         // worker recovers missed starts using the same claim, never a new event.
-        exec('/usr/bin/timeout --kill-after=5 180 /usr/bin/php '.escapeshellarg(self::RUNTIME_DIR.'/sls_mass_notify_automation_worker.php').' '.escapeshellarg($id).' >/dev/null 2>&1 &');
+        $worker=$this->automationRuntimeFile('sls_mass_notify_automation_worker.php');
+        exec('/usr/bin/timeout --kill-after=5 180 /usr/bin/php '.escapeshellarg($worker).' '.escapeshellarg($id).' >/dev/null 2>&1 &');
     }
     private function automationObservationPaths(string $directory): array
     {
         $handle=@opendir($directory);
         if (!$handle) { throw new \RuntimeException('Emergency observation storage could not be scanned.'); }
-        $paths=[]; $inspected=0; $limited=false; $deadline=hrtime(true)+1000000000;
+        $paths=[];$identities=[]; $inspected=0; $limited=false; $deadline=hrtime(true)+1000000000;
         try {
             while (($name=readdir($handle))!==false) {
                 if ($name==='.' || $name==='..') { continue; }
@@ -251,9 +273,10 @@ trait SlsAutomations
                     throw new \RuntimeException('Emergency observation storage contains an unsafe record.');
                 }
                 $paths[]=$path;
+                $identities[$path]=array_intersect_key($meta,array_flip(['dev','ino','mode','uid','gid','nlink','size','mtime','ctime']));
             }
         } finally { closedir($handle); }
-        return ['paths'=>$paths,'inspected'=>$inspected,'limited'=>$limited];
+        return ['paths'=>$paths,'identities'=>$identities,'inspected'=>$inspected,'limited'=>$limited];
     }
     public function processAutomationSources(bool $feeds=true): array
     {
@@ -264,6 +287,13 @@ trait SlsAutomations
         try {
             $lease=$this->acquireAnnouncementActivityLock(false,5); $settings=$this->getActiveSettings();
             $config=AutomationConfig::normalize($settings['automations'] ?? []); $service=$this->automationService(); $health=[];
+            $launched=[]; $deferred=[];
+            $launchQueued=function(array $event) use (&$launched,&$deferred): void {
+                if ($event['state']!=='queued' || isset($launched[$event['id']])) { return; }
+                if (count($launched)>=4) { $deferred[$event['id']]=true; return; }
+                $launched[$event['id']]=true;
+                $this->startAutomationWorker($event['id']);
+            };
             $directory=self::PLUGIN_DATA_DIR.'/emergency-observations';
             if (!$feeds && is_dir($directory)) {
                 $observations=new \SlsAnnouncementJobStore($directory); $processed=0;
@@ -277,28 +307,33 @@ trait SlsAutomations
                         if (is_int($record['sent_at'] ?? null) && $record['sent_at']<time()-86400) {
                             // read() checked regular-file identity and private parent;
                             // the collector never replaces an existing record.
-                            if (is_file($path) && !is_link($path)) { unlink($path); }
+                            clearstatcache(true,$path);$current=@lstat($path);$expected=$scan['identities'][$path]??null;
+                            if(!is_array($current)||!is_array($expected)){throw new \RuntimeException('Emergency observation changed before retention cleanup.');}
+                            foreach($expected as $field=>$value){if(($current[$field]??null)!==$value){throw new \RuntimeException('Emergency observation changed before retention cleanup.');}}
+                            if(!unlink($path)){throw new \RuntimeException('Expired emergency observation could not be removed.');}
                         }
                         continue;
                     }
                     if ($processed>=32) { break; }
                     $processed++;
                     try {
-                        if (!is_string($record['settings_sha256'] ?? null) || !hash_equals(hash_file('sha256',self::SETTINGS_JSON),$record['settings_sha256'])) {
+                        $settingsHash=is_file(self::SETTINGS_JSON)&&!is_link(self::SETTINGS_JSON)?hash_file('sha256',self::SETTINGS_JSON):false;
+                        if (!is_string($settingsHash)||!is_string($record['settings_sha256'] ?? null) || !hash_equals($settingsHash,$record['settings_sha256'])) {
                             throw new \DomainException('Configuration changed after the dial attempt. No new recipient selection was inferred.');
                         }
                         $input=array_intersect_key($record,array_flip(['request_id','sent_at','expires_at','event','caller','message','is_test']));
                         $event=$service->activate((string)$record['rule_id'],$input,'emergency_call');
-                        $record['event_id']=$event['id']; $record['state']='accepted'; $this->startAutomationWorker($event['id']);
+                        $record['event_id']=$event['id']; $record['state']='accepted'; $launchQueued($event);
                     } catch (\InvalidArgumentException | \DomainException $error) { $record['state']='rejected'; $record['reason']=$error->getMessage(); }
                     $observations->atomic($id.'.json',$record);
                 }
-                $health['emergency_call']=['checked_at'=>time(),'ok'=>!$scan['limited'],'processed'=>$processed,'inspected'=>$scan['inspected']];
+                $health['emergency_call']=['checked_at'=>time(),'ok'=>!$scan['limited'],'processed'=>$processed,'inspected'=>$scan['inspected'],
+                    'queued_for_reconciliation'=>count($deferred)];
                 if ($scan['limited']) { $health['emergency_call']['detail']='Emergency observation scanning reached its bounded work limit. Review the protected journal for excess retained files before retrying.'; }
             }
             foreach ($config['rules'] as $rule) {
                 if (!$feeds || !$rule['enabled'] || $rule['kind']!=='cap') { continue; }
-                $accepted=0; $ignored=0;
+                $accepted=0; $ignored=0; $previousDeferred=count($deferred);
                 try {
                     $inputs=AutomationInputs::cap(AutomationInputs::fetch($rule['feed_url']),$rule);
                     // Old/expired feed entries never replay after enabling a feed
@@ -307,20 +342,23 @@ trait SlsAutomations
                     foreach ($inputs as $input) {
                         if ($input['sent_at']<time()-$rule['max_age_seconds'] || $input['expires_at']<=time() || ($input['is_test'] && !$rule['allow_tests'])) { $ignored++; continue; }
                         try {
-                            $event=$service->activate($rule['id'],$input,'cap'); if ($event['state']==='queued') { $this->startAutomationWorker($event['id']); } $accepted++;
+                            $event=$service->activate($rule['id'],$input,'cap'); $launchQueued($event); $accepted++;
                         } catch (\DomainException $error) { $ignored++; }
                     }
-                    $health[$rule['id']]=['checked_at'=>time(),'ok'=>true,'accepted'=>$accepted,'ignored'=>$ignored];
+                    $health[$rule['id']]=['checked_at'=>time(),'ok'=>true,'accepted'=>$accepted,'ignored'=>$ignored,
+                        'queued_for_reconciliation'=>count($deferred)-$previousDeferred];
                 } catch (\Throwable $error) { $health[$rule['id']]=['checked_at'=>time(),'ok'=>false,'detail'=>in_array(get_class($error),[\InvalidArgumentException::class,\DomainException::class,\RuntimeException::class],true) ? substr($error->getMessage(),0,400) : 'CAP source could not be processed. Check the installed PHP XML/cURL extensions and protected trigger journal.']; }
             }
             $files->atomic('worker-state.json',['schema'=>1,'checked_at'=>time(),'sources'=>$health]);
-            return ['success'=>!array_filter($health,static fn($row)=>!$row['ok'])];
+            return ['success'=>!array_filter($health,static fn($row)=>!$row['ok']),
+                'queued_for_reconciliation'=>count($deferred)];
         } finally { if ($lease!==null) { $this->releaseNativeBackupFileLock($lease); } \SlsAnnouncementJobStore::unlock($lock); }
     }
     public function processAutomationEvents(string $id=''): array
     {
         if (PHP_SAPI!=='cli') { throw new \DomainException('Trigger processing requires the local CLI worker.'); }
         $settings=$this->getActiveSettings(); $config=AutomationConfig::normalize($settings['automations'] ?? []);
+        if (!\SLS\MassNotify\RuntimeState::running($settings)) { return ['success'=>true,'processed'=>0,'deferred'=>true]; }
         if (!$config['rules'] && !is_dir($this->automationStoreDirectory())) { return ['success'=>true,'processed'=>0]; }
         $lease=$this->acquireAnnouncementActivityLock(false,5);
         try {
@@ -328,13 +366,22 @@ trait SlsAutomations
             if ($id!=='') { $row=$service->process($id); return ['success'=>in_array($row['state'],['complete','cancelled','expired'],true),'event'=>$row]; }
             foreach (['cap'=>'--sources','emergency_call'=>'--observe'] as $kind=>$argument) {
                 if (array_filter($config['rules'],static fn($row)=>$row['enabled'] && $row['kind']===$kind)) {
-                    exec('/usr/bin/timeout --kill-after=5 120 /usr/bin/php '.escapeshellarg(self::RUNTIME_DIR.'/sls_mass_notify_automation_worker.php').' '.$argument.' >/dev/null 2>&1 &');
+                    $worker=$this->automationRuntimeFile('sls_mass_notify_automation_worker.php');
+                    exec('/usr/bin/timeout --kill-after=5 120 /usr/bin/php '.escapeshellarg($worker).' '.$argument.' >/dev/null 2>&1 &');
                 }
             }
             // Reconciliation stays bounded; each event is executed by its own
             // supervised worker, so a slow script cannot stall schedules.
-            foreach ($store->read()['events'] as $event) {
-                if ($event['state']==='queued' || ($event['state']==='running' && ($event['claimed_at'] ?? 0)<time()-240)) { $this->startAutomationWorker($event['id']); }
+            $service->reconcile();
+            $events=$store->read()['events'];
+            uasort($events,static fn($left,$right)=>($left['created_at']??0)<=>($right['created_at']??0));
+            $enabledRules=array_column(array_filter($config['rules'],static fn($rule)=>$rule['enabled']),null,'id');
+            $launches=0;
+            foreach ($events as $event) {
+                if ($event['state']!=='queued' || !isset($enabledRules[$event['rule_id']??''])
+                    || ($event['context']['expires_at']??0)<=time() || !empty($event['blocked'])) { continue; }
+                $this->startAutomationWorker($event['id']);
+                if (++$launches>=4) { break; }
             }
             return ['success'=>!$failures,'processed'=>0];
         } finally { $this->releaseNativeBackupFileLock($lease); }

@@ -18,6 +18,7 @@ foreach(['sendSipNotifyAnnouncement','resolveAnnouncementRequest','saveAnnouncem
     'getScheduledAnnouncementHealthWarnings','processScheduledAnnouncements','findLiveScheduledOccurrence','scheduleExecutionRecord',
     'validateScheduledAnnouncementRecurrences','sanitizeScheduleText','normalizeScheduleRecurrenceMode','scheduleRecurrenceIntervalDays',
     'buildScheduledOccurrences','scheduleRecurrenceMatchesOccurrences','resolveScheduleLocalDateTime','parseScheduleUtcTimestamp',
+    'aggregateSavedAudienceTargets','validateAggregateSavedAudienceTargets',
     'normalizeAnnouncementAudioMode','normalizeToneName']as $name){
     $method=$reflection->getMethod($name);$lines=file($method->getFileName());
     $methods.=implode('',array_slice($lines,$method->getStartLine()-1,$method->getEndLine()-$method->getStartLine()+1));
@@ -64,7 +65,7 @@ class EmailMainFacadeFixture {
     public function warnings(){return $this->getScheduledAnnouncementHealthWarnings($this->settings);}
     public function validate($rows){return $this->validateScheduledAnnouncementRecurrences($rows,$this->settings['announcement_groups']??[]);}
 FIXTURE;
-foreach(['MAX_SCHEDULES','MAX_SCHEDULE_OCCURRENCES','MAX_SCHEDULE_YEARS','SCHEDULE_GRACE_SECONDS','MAX_WEBHOOK_DESTINATIONS']as $name){$fixture.='const '.$name.'='.var_export($reflection->getConstant($name),true).';';}
+foreach(['MAX_SCHEDULES','MAX_SCHEDULE_OCCURRENCES','MAX_SCHEDULE_YEARS','SCHEDULE_GRACE_SECONDS','MAX_WEBHOOK_DESTINATIONS','MAX_SAVED_CHANNEL_RECIPIENTS','MAX_EXTERNAL_VOICE_RECIPIENTS']as $name){$fixture.='const '.$name.'='.var_export($reflection->getConstant($name),true).';';}
 foreach(['ANNOUNCEMENT_LOCK_FILE'=>'announcement.lock','SCHEDULE_LOCK_FILE'=>'schedule.lock','SETTINGS_JSON'=>'active.config','TONES_DIR'=>'tones']as $name=>$file){$fixture.='const '.$name.'='.var_export($directory.'/'.$file,true).';';}
 $fixture.='const PLUGIN_DATA_DIR='.var_export($directory,true).';';
 $fixture.='const VISUAL_PUSH_SCRIPT="/bin/true";';

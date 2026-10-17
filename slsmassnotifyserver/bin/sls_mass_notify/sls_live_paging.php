@@ -5,6 +5,7 @@ namespace SLS\MassNotify;
 
 require_once __DIR__ . '/sls_config_crypto.php';
 require_once __DIR__ . '/sls_runtime_state.php';
+if (!class_exists('SlsAtomicJson', false)) { require_once __DIR__ . '/sls_atomic_json.php'; }
 
 /** Bootstrap-independent live paging configuration and call controller. */
 final class LivePagingConfig
@@ -310,9 +311,9 @@ class LivePagingAgi
 
     private function line(int $timeout): string
     {
-        $deadline = microtime(true) + $timeout;
+        $deadline = hrtime(true) + $timeout * 1000000000;
         while (strpos($this->buffer, "\n") === false) {
-            $remaining = $deadline - microtime(true);
+            $remaining = ($deadline - hrtime(true)) / 1000000000;
             if ($remaining <= 0 || strlen($this->buffer) > 65536) { throw new \RuntimeException('agi_timeout'); }
             $read = [$this->input]; $write = null; $except = null;
             $ready = @stream_select($read, $write, $except, (int)$remaining, (int)(($remaining - floor($remaining)) * 1000000));
@@ -753,44 +754,7 @@ class LivePagingState
 
     private function locked(string $name, array $defaults, callable $operation, int $maxBytes = 1048576)
     {
-        if (is_link($this->directory) || !is_dir($this->directory)) { throw new \RuntimeException('paging_state_unavailable'); }
-        $path = $this->directory . '/' . $name;
-        $before = @lstat($path);
-        if (is_link($path) || (is_array($before) && (($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1))) {
-            throw new \RuntimeException('paging_state_unsafe');
-        }
-        $handle = @fopen($path, 'c+');
-        if ($handle === false) { throw new \RuntimeException('paging_state_unavailable'); }
-        try {
-            $deadline = hrtime(true) + 2000000000;
-            while (!flock($handle, LOCK_EX | LOCK_NB)) {
-                if (hrtime(true) >= $deadline) { throw new \RuntimeException('paging_lock_timeout'); }
-                usleep(20000);
-            }
-            $stat = fstat($handle); $named = @lstat($path);
-            if (!is_array($stat) || !is_array($named) || ($stat['mode'] & 0170000) !== 0100000
-                || $stat['nlink'] !== 1 || $stat['ino'] !== $named['ino'] || $stat['dev'] !== $named['dev']
-                || $stat['size'] > $maxBytes) { throw new \RuntimeException('paging_state_unsafe'); }
-            @chmod($path, 0640);
-            $raw = stream_get_contents($handle, $maxBytes + 1);
-            $state = $raw === '' ? $defaults : json_decode((string)$raw, true);
-            if (!is_array($state)) { throw new \RuntimeException('paging_state_corrupt'); }
-            [$next, $result, $changed] = $operation($state);
-            if ($changed) {
-                $encoded = json_encode($next, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n";
-                if (strlen($encoded) > $maxBytes) { throw new \RuntimeException('paging_state_capacity'); }
-                rewind($handle);
-                $offset = 0;
-                while ($offset < strlen($encoded)) {
-                    $written = fwrite($handle, substr($encoded, $offset));
-                    if (!is_int($written) || $written < 1) { throw new \RuntimeException('paging_state_write_failed'); }
-                    $offset += $written;
-                }
-                if (!ftruncate($handle, strlen($encoded)) || !fflush($handle)
-                    || (function_exists('fsync') && !fsync($handle))) { throw new \RuntimeException('paging_state_write_failed'); }
-            }
-            return $result;
-        } finally { flock($handle, LOCK_UN); fclose($handle); }
+        return \SlsAtomicJson::transaction($this->directory . '/' . $name, $defaults, $operation, $maxBytes);
     }
 
     public function authenticationAllowed(string $caller, bool $recordFailure = false, ?int $now = null): bool
@@ -896,21 +860,14 @@ final class LivePagingSession
 
     public static function loadSettings(string $path): array
     {
+        clearstatcache(true, $path);
         $before = @lstat($path);
         if (is_link($path) || (is_array($before) && (($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1))) {
             throw new \RuntimeException('paging_config_unsafe');
         }
-        $handle = @fopen($path, 'rb');
-        if ($handle === false) { throw new \RuntimeException('paging_config_unavailable'); }
-        try {
-            $stat = fstat($handle); $named = @lstat($path);
-            if (!is_array($stat) || !is_array($named) || ($stat['mode'] & 0170000) !== 0100000 || $stat['nlink'] !== 1
-                || ($stat['mode'] & 0027) !== 0 || $stat['size'] > \FreePBX\modules\SlsConfigCrypto::MAX_FILE_BYTES
-                || $stat['ino'] !== $named['ino'] || $stat['dev'] !== $named['dev']) { throw new \RuntimeException('paging_config_unsafe'); }
-            $decoded = \FreePBX\modules\SlsConfigCrypto::decode((string)stream_get_contents($handle, \FreePBX\modules\SlsConfigCrypto::MAX_FILE_BYTES + 1));
-            if (!is_array($decoded)) { throw new \RuntimeException('paging_config_invalid'); }
-            return $decoded;
-        } finally { fclose($handle); }
+        if (!is_array($before)) { throw new \RuntimeException('paging_config_unavailable'); }
+        if (($before['mode'] & 0027) !== 0) { throw new \RuntimeException('paging_config_unsafe'); }
+        return \FreePBX\modules\SlsConfigCrypto::readFile($path);
     }
 
     private function caller(array $config): array

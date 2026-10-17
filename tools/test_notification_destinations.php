@@ -151,6 +151,37 @@ if (count($validation) !== 1 || stripos(implode(' ', $validation), 'destination 
 	destination_fail('Duplicate destination IDs were not rejected visibly.');
 }
 
+foreach ([
+	['name' => ['nested'], 'url' => $generic],
+	['name' => "Control\x01Name", 'url' => $generic],
+	['name' => 'Receiver', 'url' => ['nested']],
+	['name' => 'Receiver', 'url' => $generic, 'bearer_token' => ['nested']],
+	['name' => 'Receiver', 'url' => $generic, 'signing_secret' => "contains whitespace"],
+] as $malformedDestination) {
+	$destinationErrors = $call('validateWebhookDestinations', [$malformedDestination], 'generic');
+	if (!$destinationErrors) {
+		destination_fail('Malformed nested webhook input was accepted.');
+	}
+	$normalizerRejected = false;
+	try { $call('normalizeWebhookDestinations', [$malformedDestination], 'generic'); }
+	catch (InvalidArgumentException $expected) { $normalizerRejected = true; }
+	if (!$normalizerRejected) {
+		destination_fail('Malformed nested webhook input reached normalization without rejection.');
+	}
+}
+
+foreach ([[['nested']], ['address' => 'ops@example.com'], 7] as $malformedRecipients) {
+	if (!$call('validateEmailRecipientsInput', $malformedRecipients)) {
+		destination_fail('Malformed notification email input was accepted.');
+	}
+	$normalizerRejected = false;
+	try { $call('normalizeEmailRecipientList', $malformedRecipients); }
+	catch (DomainException $expected) { $normalizerRejected = true; }
+	if (!$normalizerRejected) {
+		destination_fail('Malformed notification email input was silently normalized.');
+	}
+}
+
 $merged = $call('mergeWebhookDestinationSecrets', [
 	['id' => 'saved', 'name' => 'Renamed', 'url' => '[redacted]', 'enabled' => '1'],
 ], [

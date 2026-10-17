@@ -6,6 +6,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import multiprocessing
+import os
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -203,6 +205,24 @@ def main() -> None:
         assert state["nws_groups"]["zone_concurrent"]["last_poll_fail_count"] == expected
         assert state["last_poll_fail_count"] == expected
         assert state["last_fault_group_id"] == "zone_concurrent"
+
+    with tempfile.TemporaryDirectory(prefix='sls-nws-status-protocol-') as directory:
+        status_file = Path(directory) / 'status.json'
+        helper.mutate_status(status_file, 'zone_a', 'Fixture', 'TXC453', {
+            'fault': {'stage': 'api', 'message': 'Keep this fault', 'at': '2026-10-14T00:00:00Z'}}, ['zone_a'])
+        for command, changes in [
+                ('reconcile', {'NWS_CONFIGURED_GROUP_IDS_JSON': '{broken'}),
+                ('reconcile', {'NWS_CONFIGURED_GROUP_IDS_JSON': 'null'}),
+                ('reconcile', {'NWS_CONFIGURED_GROUP_IDS_JSON': '[true]'}),
+                ('mutate', {'NWS_STATUS_MUTATION_JSON': '{"clear_faults":false,"clear_faults":true}'}),
+                ('mutate', {'NWS_STATUS_MUTATION_JSON': '{"patch":{"last_poll_fail_count":1e999}}'})]:
+            before = status_file.read_bytes()
+            result = subprocess.run(['/usr/bin/python3', str(HELPER), command],
+                env={**os.environ, 'STATUS_FILE_PATH': str(status_file), 'NWS_STATUS_GROUP_ID': 'zone_a',
+                     'NWS_CONFIGURED_GROUP_IDS_JSON': '["zone_a"]', 'NWS_STATUS_MUTATION_JSON': '{}', **changes},
+                capture_output=True, text=True, timeout=5)
+            assert result.returncode == 2, 'Invalid status protocol was accepted: ' + str(changes)
+            assert status_file.read_bytes() == before, 'Invalid status protocol changed retained evidence'
 
     print("Atomic multi-zone Weather.gov status regressions passed.")
 

@@ -25,13 +25,15 @@ trait SlsEnterpriseIntegrations
     }
     public function getEnterpriseIntegrationState(): array
     {
-        $this->assertEnterpriseAdministrator(); $config=$this->enterpriseIntegrationsConfig(); $history=[]; $health=[]; $error='';$usage=[];
-        if (is_dir($this->enterpriseIntegrationsStoreDirectory())) {
+        $this->assertEnterpriseAdministrator();$settings=$this->getActiveSettings();$config=$this->enterpriseIntegrationsConfig($settings); $history=[]; $health=[]; $error='';$usage=[];
+        $journalDirectory=$this->enterpriseIntegrationsStoreDirectory();
+        $journalFence=dirname($journalDirectory).'/.'.basename($journalDirectory).'-required';
+        if (is_dir($journalDirectory)||is_link($journalDirectory)||file_exists($journalFence)||is_link($journalFence)) {
             try {
-                require_once __DIR__.'/EnterpriseIntegrationsStore.php'; $state=(new EnterpriseIntegrationsStore($this->enterpriseIntegrationsStoreDirectory()))->read();
-                $usage=(new EnterpriseIntegrationsStore($this->enterpriseIntegrationsStoreDirectory()))->usage();
+                require_once __DIR__.'/EnterpriseIntegrationsStore.php';$store=new EnterpriseIntegrationsStore($journalDirectory);$state=$store->read();
+                $usage=$store->usage();
                 foreach (array_slice(array_reverse($state['operations']),0,50) as $row) { $history[]=array_diff_key($row,['fingerprint'=>true]); }
-                $rules=array_column(AutomationConfig::normalize($this->getActiveSettings()['automations']??[])['rules'],null,'id');
+                $rules=array_column(AutomationConfig::normalize($settings['automations']??[])['rules'],null,'id');
                 foreach ($state['sensors'] as $id=>$row) {
                     if (!isset($rules[$id]) || $rules[$id]['kind']!=='sensor') { continue; }
                     $health[]=['rule_id'=>$id,'name'=>$rules[$id]['name'],'last_seen'=>$row['last_seen'],'is_test'=>$row['is_test'],
@@ -43,18 +45,18 @@ trait SlsEnterpriseIntegrations
         return ['config'=>EnterpriseIntegrationsConfig::redacted($config),'revision'=>hash('sha256',json_encode($config,JSON_THROW_ON_ERROR)),
             'catalog'=>EnterpriseIntegrationsConfig::catalog(),'history'=>$history,'sensor_health'=>$health,'storage_error'=>$error,'journal_usage'=>$usage,
             'extensions'=>array_map('strval',$this->getConfiguredPjsipExtensionNumbers()),
-            'sms_recipients'=>array_map(static fn($r)=>['id'=>$r['id'],'name'=>$r['name']??$r['id']],$this->getActiveSettings()['announcement_sms']['recipients']??[]),
-            'voice_recipients'=>array_map(static fn($r)=>['id'=>$r['id'],'name'=>$r['name']??$r['id']],$this->getActiveSettings()['outbound_voice']['recipients']??[]),
-            'people'=>$this->integrationRosterChoices(),
-            'browser_people'=>array_map(static fn($person)=>['id'=>$person['id'],'name'=>$person['name']],array_values(array_filter(($this->getActiveSettings()['subscriber_browser']['people']??[]),static fn($person)=>!empty($person['enabled'])))),
+            'sms_recipients'=>array_map(static fn($r)=>['id'=>$r['id'],'name'=>$r['name']??$r['id']],$settings['announcement_sms']['recipients']??[]),
+            'voice_recipients'=>array_map(static fn($r)=>['id'=>$r['id'],'name'=>$r['name']??$r['id']],$settings['outbound_voice']['recipients']??[]),
+            'people'=>$this->integrationRosterChoices($settings),
+            'browser_people'=>array_map(static fn($person)=>['id'=>$person['id'],'name'=>$person['name']],array_values(array_filter(($settings['subscriber_browser']['people']??[]),static fn($person)=>!empty($person['enabled'])))),
             'runtime_dependencies'=>['curl'=>extension_loaded('curl'),'openssl'=>extension_loaded('openssl'),'dom'=>extension_loaded('dom')],
             'incidents'=>array_values(array_map(static fn($row)=>['id'=>$row['id'],'name'=>$row['title']],array_filter(($this->listIncidents(50)['incidents']??[]),static fn($row)=>($row['state']??'')==='open'))),
             'qualification'=>'Labs · isolated protocol fixtures only; hardware, OAuth accounts and FEMA authority acceptance are pending.',
             'ipaws_qualification'=>'Requires an authorized COG, current certificate/key, issued WSDL-generated signed envelope and CDTE acceptance. No FEMA certification is claimed.'];
     }
-    private function integrationRosterChoices(): array
+    private function integrationRosterChoices(?array $settings=null): array
     {
-        $people=[]; foreach ($this->getActiveSettings()['incident_workflows']['templates']??[] as $template) {
+        $settings??=$this->getActiveSettings();$people=[]; foreach ($settings['incident_workflows']['templates']??[] as $template) {
             foreach ($template['roster']??[] as $person) { $people[$person['id']]=['id'=>$person['id'],'name'=>$person['name']]; }
         }
         return array_values($people);
@@ -78,22 +80,30 @@ trait SlsEnterpriseIntegrations
             }
         }
         if (isset($value['speakers']['devices'])) {
+            if (!is_array($value['speakers'])||!is_array($value['speakers']['devices'])||!array_is_list($value['speakers']['devices'])) { throw new \InvalidArgumentException('Speaker profiles must be a list of objects.'); }
             $old=array_column($current['speakers']['devices'],null,'id');
             foreach ($merged['speakers']['devices'] as &$row) {
                 if (!is_array($row)) { throw new \InvalidArgumentException('Speaker entries must be objects.'); }
-                if (($row['id']??'')==='') { $row['id']='spk_'.bin2hex(random_bytes(12)); }
+                $rowId=$row['id']??'';
+                if (!is_string($rowId)) { throw new \InvalidArgumentException('Speaker identifiers must be text.'); }
+                if ($rowId==='') { $rowId='spk_'.bin2hex(random_bytes(12));$row['id']=$rowId; }
                 unset($row['telemetry_password_configured']); $path='speakers.'.$row['id'].'.telemetry_password';
                 if (in_array($path,$clear,true)) { $row['telemetry_password']=''; }
-                elseif (($row['telemetry_password']??'')==='') { $row['telemetry_password']=$old[$row['id']]['telemetry_password']??''; }
+                elseif (($row['telemetry_password']??'')==='') { $row['telemetry_password']=$old[$rowId]['telemetry_password']??''; }
             } unset($row);
         }
         if(isset($value['connectors']['destinations'])){
+            if(!is_array($value['connectors'])||!is_array($value['connectors']['destinations'])||!array_is_list($value['connectors']['destinations'])){throw new \InvalidArgumentException('Connector destinations must be a list of objects.');}
             $old=array_column($current['connectors']['destinations'],null,'id');foreach($merged['connectors']['destinations'] as &$row){
-                if(!is_array($row)){throw new \InvalidArgumentException('Connector entries must be objects.');}if(($row['id']??'')===''){$row['id']='conn_'.bin2hex(random_bytes(12));}
-                unset($row['token_configured']);if(in_array('connectors.'.$row['id'].'.token',$clear,true)){$row['token']='';}elseif(($row['token']??'')===''){$row['token']=$old[$row['id']]['token']??'';}
+                if(!is_array($row)){throw new \InvalidArgumentException('Connector entries must be objects.');}$rowId=$row['id']??'';
+                if(!is_string($rowId)){throw new \InvalidArgumentException('Connector identifiers must be text.');}if($rowId===''){$rowId='conn_'.bin2hex(random_bytes(12));$row['id']=$rowId;}
+                unset($row['token_configured']);if(in_array('connectors.'.$rowId.'.token',$clear,true)){$row['token']='';}elseif(($row['token']??'')===''){$row['token']=$old[$rowId]['token']??'';}
             }unset($row);
         }
-        if (isset($value['access_control']['doors'])) { foreach ($merged['access_control']['doors'] as &$row) { if (is_array($row) && ($row['id']??'')==='') { $row['id']='door_'.bin2hex(random_bytes(12)); } } unset($row); }
+        if (isset($value['access_control']['doors'])) {
+            if(!is_array($value['access_control'])||!is_array($value['access_control']['doors'])||!array_is_list($value['access_control']['doors'])){throw new \InvalidArgumentException('Permitted doors must be a list of objects.');}
+            foreach ($merged['access_control']['doors'] as &$row) { if (!is_array($row)) { throw new \InvalidArgumentException('Permitted door entries must be objects.'); } if (($row['id']??'')==='') { $row['id']='door_'.bin2hex(random_bytes(12)); } } unset($row);
+        }
         $config=EnterpriseIntegrationsConfig::normalize($merged);
         if($config['enabled']==='1'){
             foreach(['meetings','access_control','connectors'] as $section){if($config[$section]['enabled']==='1'&&(!extension_loaded('curl')||!extension_loaded('openssl'))){throw new \DomainException('Enable PHP cURL and OpenSSL in the runtime serving FreePBX before enabling '.$section.'.');}}
@@ -112,20 +122,31 @@ trait SlsEnterpriseIntegrations
     { return load_view(__DIR__.'/views/integrations.php',['state'=>$this->getEnterpriseIntegrationState(),'csrf_token'=>$this->getCsrfToken()]); }
     public function maintainEnterpriseIntegrationJournal(array $input): array
     {
-        $this->assertEnterpriseAdministrator();$input=IncidentConfig::object($input,['retention_days'],'Integration archival');
+        $this->assertEnterpriseAdministrator();$input=IncidentConfig::object($input,['retention_days','evidence_retention_days'],'Integration archival');
         $days=$input['retention_days']??7;if(!is_int($days)||$days<1||$days>365){throw new \InvalidArgumentException('Retention must be 1–365 days.');}
-        return (new EnterpriseIntegrationsStore($this->enterpriseIntegrationsStoreDirectory()))->maintain(time(),$days*86400);
+        $evidenceDays=$input['evidence_retention_days']??30;if(!is_int($evidenceDays)||$evidenceDays<1||$evidenceDays>365){throw new \InvalidArgumentException('Full-evidence retention must be 1–365 days.');}
+        return (new EnterpriseIntegrationsStore($this->enterpriseIntegrationsStoreDirectory()))->maintain(time(),$days*86400,$evidenceDays*86400);
+    }
+    public function resolveEnterpriseIntegrationUncertainty(array $input): array
+    {
+        $principal=$this->assertEnterpriseAdministrator();$input=IncidentConfig::object($input,['request_id','resolution','evidence_reference'],'Integration uncertainty resolution');
+        $request=EnterpriseIntegrationsConfig::requestId($input['request_id']??'');$resolution=$input['resolution']??'';$evidence=IncidentConfig::text($input['evidence_reference']??'',256,'Evidence reference');
+        if(!is_string($resolution)){throw new \InvalidArgumentException('Choose the reviewed provider outcome.');}
+        $resolver=hash('sha256',json_encode([$principal['id']??'',$principal['username']??''],JSON_THROW_ON_ERROR));
+        $row=(new EnterpriseIntegrationsStore($this->enterpriseIntegrationsStoreDirectory()))->resolveUncertain($request,$resolution,$evidence,$resolver,time());
+        return ['success'=>true,'message'=>'The reviewed uncertainty was closed without replaying the provider operation.','operation'=>array_diff_key($row,['fingerprint'=>true,'resolved_by'=>true]),'state'=>$this->getEnterpriseIntegrationState()];
     }
     public function getEnterpriseContinuityReport(): array
     {
         $this->assertEnterpriseAdministrator();require_once __DIR__.'/EnterpriseContinuity.php';
-        return ['success'=>true,'report'=>\SLS\MassNotify\EnterpriseContinuity::report($this->getActiveSettings())];
+        return ['success'=>true,'report'=>\SLS\MassNotify\EnterpriseContinuity::report($this->getActiveSettings(), self::MODULE_VERSION)];
     }
     public function exportEnterpriseIntegrationReport(): array
     {
         $this->assertEnterpriseAdministrator();$store=new EnterpriseIntegrationsStore($this->enterpriseIntegrationsStoreDirectory());$state=$store->read();
-        $report=['schema'=>1,'generated_at'=>gmdate('c'),'operations'=>array_replace($store->archiveReport('operations'),$state['operations']),
-            'responses'=>array_replace($store->archiveReport('responses'),$state['responses'])];
+        $report=['schema'=>2,'generated_at'=>gmdate('c'),'operations'=>array_replace($store->archiveReport('operations'),$state['operations']),
+            'responses'=>array_replace($store->archiveReport('responses'),$state['responses']),
+            'operation_replay_tombstones'=>$store->tombstoneReport('operations'),'response_replay_tombstones'=>$store->tombstoneReport('responses')];
         foreach($report['operations'] as &$operation){unset($operation['fingerprint']);}unset($operation);
         foreach($report['responses'] as &$response){unset($response['fingerprint']);}unset($response);
         return ['success'=>true,'report'=>$report];
@@ -144,7 +165,7 @@ trait SlsEnterpriseIntegrations
         if (!$incident) { throw new \DomainException('Incident does not exist.'); }
         if(($config['oauth_refresh_enabled']??'0')==='1'&&($config['oauth_expires_at']??0)>0&&$config['oauth_expires_at']<=time()+60){$this->refreshEnterpriseMeetingToken();$config=$this->enabledEnterpriseIntegration('meetings');}
         $request=EnterpriseIntegrationsConfig::requestId($input['request_id']??'');
-        return $this->enterpriseIntegrationsService()->meeting($config,$incident,$input,$this->integrationEffect($request,'incident_meeting',$id,['incident'=>$id,'input'=>$input,'provider'=>$config['provider']]));
+        return ['success'=>true]+$this->enterpriseIntegrationsService()->meeting($config,$incident,$input,$this->integrationEffect($request,'incident_meeting',$id,['incident'=>$id,'input'=>$input,'provider'=>$config['provider']]));
     }
     public function refreshEnterpriseMeetingToken(): array
     {
@@ -169,13 +190,15 @@ trait SlsEnterpriseIntegrations
     }
     public function controlIntegrationDoor(array $input): array
     {
-        $this->assertEnterpriseAdministrator(); $config=$this->enabledEnterpriseIntegration('access_control',($input['operation']??'')!=='read');
+        $this->assertEnterpriseAdministrator();$input=IncidentConfig::object($input,['request_id','door_id','operation'],'Door operation');
+        if(!is_string($input['door_id']??null)||!is_string($input['operation']??null)){throw new \InvalidArgumentException('Door identifier and operation must be text.');}
+        $config=$this->enabledEnterpriseIntegration('access_control',$input['operation']!=='read');
         if (($input['operation']??'')!=='read') { require_once __DIR__.'/LabsSafety.php'; \SLS\MassNotify\LabsSafety::requireReceipt($this->getActiveSettings(),'access_control_actuation'); }
         $request=EnterpriseIntegrationsConfig::requestId($input['request_id']??'');
-        return $this->enterpriseIntegrationsService()->door($config,$input,$this->integrationEffect($request,'access_control',(string)($input['door_id']??''),$input));
+        return ['success'=>true]+$this->enterpriseIntegrationsService()->door($config,$input,$this->integrationEffect($request,'access_control',(string)($input['door_id']??''),$input));
     }
     public function readIntegrationSpeakerTelemetry(string $id): array
-    { $this->assertEnterpriseAdministrator(); return $this->enterpriseIntegrationsService()->speakerTelemetry($this->enabledEnterpriseIntegration('speakers',false),$id); }
+    { $this->assertEnterpriseAdministrator(); return ['success'=>true]+$this->enterpriseIntegrationsService()->speakerTelemetry($this->enabledEnterpriseIntegration('speakers',false),$id); }
     public function sendIntegrationSpeakerAnnouncement(array $input): array
     {
         $this->assertEnterpriseAdministrator(); $config=$this->enabledEnterpriseIntegration('speakers');
@@ -204,11 +227,13 @@ trait SlsEnterpriseIntegrations
         $this->assertEnterpriseAdministrator();$config=$this->enabledEnterpriseIntegration('public_warning',false);
         $input=IncidentConfig::object($input,['warning','post_envelope'],'Public warning acceptance');
         require_once __DIR__.'/EnterprisePublicWarning.php';
-        $draft=EnterprisePublicWarning::author($input['warning']??[],time());
-        if(!in_array($input['warning']['status']??'', ['Test','Exercise'],true)){throw new \DomainException('Acceptance validation requires a Test or Exercise warning.');}
-        EnterprisePublicWarning::verifyPreparedEnvelope((string)($input['post_envelope']??''),$draft['xml'],$config,time());
+        $warning=$input['warning']??null;$envelope=$input['post_envelope']??null;
+        if(!is_array($warning)||array_is_list($warning)||!is_string($envelope)){throw new \InvalidArgumentException('Public warning acceptance requires a warning object and signed envelope text.');}
+        $draft=EnterprisePublicWarning::author($warning,time());
+        if(!in_array($warning['status']??'', ['Test','Exercise'],true)){throw new \DomainException('Acceptance validation requires a Test or Exercise warning.');}
+        EnterprisePublicWarning::verifyPreparedEnvelope($envelope,$draft['xml'],$config,time());
         return ['success'=>true,'message'=>'Local CAP and signed-envelope checks passed. Nothing was transmitted. FEMA CDTE and channel acceptance remain pending.',
-            'cap_sha256'=>hash('sha256',$draft['xml']),'envelope_sha256'=>hash('sha256',$input['post_envelope']),'authority_qualification'=>'pending_external_acceptance'];
+            'cap_sha256'=>hash('sha256',$draft['xml']),'envelope_sha256'=>hash('sha256',$envelope),'authority_qualification'=>'pending_external_acceptance'];
     }
     public function exportPublicWarning(array $input): array
     {
@@ -219,8 +244,11 @@ trait SlsEnterpriseIntegrations
     {
         $this->assertEnterpriseAdministrator(); $config=$this->enabledEnterpriseIntegration('public_warning'); require_once __DIR__.'/LabsSafety.php';
         \SLS\MassNotify\LabsSafety::requireReceipt($this->getActiveSettings(),'public_warning_origination');
+        $input=IncidentConfig::object($input,['request_id','warning','post_envelope'],'IPAWS submission');$warning=$input['warning']??null;$envelope=$input['post_envelope']??null;
+        if(!is_array($warning)||array_is_list($warning)||!is_string($envelope)){throw new \InvalidArgumentException('IPAWS submission requires a warning object and signed envelope text.');}
+        $identifier=$warning['identifier']??null;if(!is_string($identifier)){throw new \InvalidArgumentException('IPAWS warning identifier must be text.');}
         $request=EnterpriseIntegrationsConfig::requestId($input['request_id']??'');
-        return $this->enterpriseIntegrationsService()->publicWarning($config,$input,$this->integrationEffect($request,'public_warning',(string)($input['warning']['identifier']??''),['warning'=>$input['warning']??[],'envelope_sha256'=>hash('sha256',(string)($input['post_envelope']??''))]));
+        return ['success'=>true]+$this->enterpriseIntegrationsService()->publicWarning($config,$input,$this->integrationEffect($request,'public_warning',$identifier,['warning'=>$warning,'envelope_sha256'=>hash('sha256',$envelope)]));
     }
     /** Additive frozen metadata. Normal announcement bodies/phone audio remain unchanged when off. */
     protected function snapshotEnterpriseIntegrationResponses(array $request,array $settings): array
@@ -247,6 +275,8 @@ trait SlsEnterpriseIntegrations
                 $type=$target['message_type']??'SMS'; if ($type==='SMS' && \SLS\MassNotify\Sms\Config::units($target['body'],$sms['from'],$type)['segments']>$sms['max_segments']) { throw new \DomainException('Incident response instructions exceed the SMS segment limit. Shorten the message before sending.'); }
                 $target['body_hash']=\SLS\MassNotify\Sms\Config::messageHash($target['body'],$type,$target['media']??[]); $target['incident_response_binding']=$row['id']; unset($target);
             }
+            if(!isset($request['outbound_targets'])){$request['outbound_targets']=[];}
+            if(!is_array($request['outbound_targets'])){throw new \RuntimeException('Frozen outbound voice targets are invalid.');}
             foreach ($request['outbound_targets'] as &$target) {
                 if ($binding['voice_recipient_id']!==$target['id']) { continue; }
                 $row=$service->bindResponse($config['responses'],$incident,$person,'voice',$target,$this->outboundVoiceFingerprint($target));

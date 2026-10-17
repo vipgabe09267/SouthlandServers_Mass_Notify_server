@@ -12,13 +12,15 @@ class OperatorMailFixture {
     }
     protected function startOperatorRecoveryEmailProcess(&$pipes) {
         $this->submissions++;
-        return proc_open(['/usr/bin/php', $this->helper, 'mailer'], [0 => ['pipe', 'r'], 1 => ['file', '/dev/null', 'w'], 2 => ['file', '/dev/null', 'w']], $pipes, null, [], ['bypass_shell' => true]);
+        return proc_open(['/usr/bin/timeout', '--signal=TERM', '--kill-after=1s', '5s', '/usr/bin/php', $this->helper, 'mailer'],
+            [0 => ['pipe', 'r'], 1 => ['file', '/dev/null', 'w'], 2 => ['file', '/dev/null', 'w']], $pipes, null, [], ['bypass_shell' => true]);
     }
     public function send(): string { return $this->sendOperatorRecoveryEmail(['mail_from_addr' => 'notify@example.test'], 'owner@example.test', 'Reset', 'Private reset credential'); }
 }
-$root = sys_get_temp_dir() . '/sls-operator-mail-' . bin2hex(random_bytes(8)); mkdir($root, 0700);
+$root = sys_get_temp_dir() . '/sls-operator-mail-' . bin2hex(random_bytes(8));
+if (!mkdir($root, 0700)) { throw new RuntimeException('Unable to create the private operator-mail fixture.'); }
 $helper = $root . '/helper.php';
-file_put_contents($helper, <<<'PHP'
+$helperSource=<<<'PHP'
 <?php
 $request = stream_get_contents(STDIN); $mode = $argv[1];
 if ($mode === 'mailer') { file_put_contents(__DIR__ . '/email.txt', $request); exit(0); }
@@ -31,8 +33,9 @@ if ($mode === 'nonzero') { echo '{"ok":true}'; exit(1); }
 if ($mode !== 'accepted') { echo json_encode(['ok' => false, 'error_code' => $mode]); exit(1); }
 echo '{"ok":true}';
 PHP
-);
+;
 try {
+    if (file_put_contents($helper,$helperSource,LOCK_EX)!==strlen($helperSource)) { throw new RuntimeException('Unable to create the operator-mail helper.'); }
     $fixture = new OperatorMailFixture(); $fixture->helper = $helper; $checks = 0;
     foreach (['mail_queue_full', 'mail_queue_unavailable', 'mail_rate_limited', 'mail_admission_unavailable', 'missing', 'timeout', 'oversized', 'malformed', 'nonboolean', 'nonzero'] as $mode) {
         $fixture->mode = $mode; $start = microtime(true);
@@ -41,7 +44,10 @@ try {
     }
     $fixture->mode = 'accepted';
     if ($fixture->send() !== 'accepted' || $fixture->submissions !== 1) { throw new RuntimeException('Reserved recovery email was not submitted exactly once'); }
-    if (json_decode(file_get_contents($root . '/admission.txt'), true) !== ['category' => 'account', 'recipients' => 1]
-        || !str_contains(file_get_contents($root . '/email.txt'), 'Private reset credential')) { throw new RuntimeException('Admission leaked the reset credential or altered its mail'); }
+    $admission=file_get_contents($root . '/admission.txt');$email=file_get_contents($root . '/email.txt');
+    if (!is_string($admission)||!is_string($email)||json_decode($admission,true,4,JSON_THROW_ON_ERROR)!==['category'=>'account','recipients'=>1]
+        || !str_contains($email, 'Private reset credential')) { throw new RuntimeException('Admission leaked the reset credential or altered its mail'); }
     echo ($checks + 2) . " operator mail refusal, timeout, output bounds and private reservation checks passed; no real MTA invoked.\n";
-} finally { foreach (glob($root . '/*') as $file) { unlink($file); } rmdir($root); }
+} finally {
+    $files=glob($root.'/*');if($files!==false){foreach($files as $file){if(is_file($file)||is_link($file)){unlink($file);}}}rmdir($root);
+}

@@ -52,6 +52,28 @@ class Providers(unittest.TestCase):
             with self.assertRaises(ValueError):provider.fetch(self.settings('tempest'),opener=Transport(json.dumps(payload).encode()))
         with self.assertRaises(ValueError):provider.normalized('tempest',(30,-97),25,[(1790942400,30,-97,'cg')]*provider.MAX_STRIKES)
 
+    def test_ambiguous_json_and_nonfinite_metadata_never_imply_clear(self):
+        for body in (b'{"strikes":[{"time":1790942400}],"strikes":[]}',
+                     b'{"strikes":[],"metadata":{"count":1,"count":0}}',
+                     b'{"strikes":[],"metadata":1e9999}',
+                     b'{"strikes":[],"metadata":NaN}',
+                     b'{"strikes":[],"metadata":Infinity}'):
+            with self.assertRaises(ValueError):
+                provider.fetch(self.settings('tempest'),opener=Transport(body))
+
+    def test_strike_coordinates_are_numbers_not_booleans_or_strings(self):
+        for coordinate in (True, False, '30', None, [], {}):
+            for index in (1, 2):
+                row=[1790942400,30,-97,'cg'];row[index]=coordinate
+                with self.assertRaises(ValueError):
+                    provider.normalized('tempest',(30,-97),25,[row])
+
+    def test_duplicate_meteomatics_properties_do_not_override_observations(self):
+        for original, replacement in ((b'<type>2</type>',b'<type>1</type><type>2</type>'),
+                                      (b'<time>2026-10-02T12:00:00Z</time>',b'<time>2026-10-02T11:00:00Z</time><time>2026-10-02T12:00:00Z</time>')):
+            with self.assertRaisesRegex(ValueError,'duplicate_strike_field'):
+                provider.fetch(self.settings('meteomatics'),opener=Transport(SCHEMA,GML.replace(original,replacement)))
+
     def test_xml_entities_oversized_and_redirect_rejected(self):
         with self.assertRaises(ValueError):provider.xml(b'<!DOCTYPE a [<!ENTITY test SYSTEM "file:///etc/passwd">]><a>&test;</a>')
         with self.assertRaises(ValueError):provider.request('https://api.meteomatics.com/wfs',opener=Transport(b'x'*(provider.MAX_BYTES+1)))

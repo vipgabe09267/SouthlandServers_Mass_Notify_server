@@ -397,6 +397,20 @@ class PrivilegedInstall(unittest.TestCase):
             self.fs.write(INSTALL.CONFIG,json.dumps({'log_retention_days':value}).encode(),0o640,user=True)
             with self.assertRaises(INSTALL.InstallError): self.action.prepare()
             self.assertFalse(self.fs.path(INSTALL.RUNTIME).exists())
+    def test_ambiguous_legacy_config_is_rejected_without_changes(self):
+        for raw in (b'{"log_retention_days":30,"log_retention_days":31}',
+                    b'{"log_retention_days":30,"other":{"scope":1,"scope":2}}',
+                    b'{"log_retention_days":30,"other":1e309}'):
+            with self.subTest(raw=raw):
+                self.fs.write(INSTALL.CONFIG,raw,0o640,user=True)
+                before=self.fs.path(INSTALL.CONFIG).stat()
+                with self.assertRaises((ValueError,RuntimeError)): self.action.preflight()
+                after=self.fs.path(INSTALL.CONFIG).stat()
+                self.assertEqual((before.st_ino,before.st_mode,before.st_uid),
+                                 (after.st_ino,after.st_mode,after.st_uid))
+                self.assertEqual(self.fs.read(INSTALL.CONFIG),raw)
+                self.assertFalse(self.fs.path(INSTALL.RUNTIME).exists())
+                self.assertEqual(self.services.calls,[])
     def test_compatibility_venv_is_never_chowned_or_traversed(self):
         self.fs.mkdir(INSTALL.DATA + '/piper/venv',0o755)
         directory = self.fs.path(INSTALL.DATA + '/piper/venv')

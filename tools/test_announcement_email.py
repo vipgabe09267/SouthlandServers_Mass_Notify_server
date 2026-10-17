@@ -141,6 +141,6 @@ class AnnouncementEmail(unittest.TestCase):
     def test_weather_profile_and_signature_remain_compatible(self):
         import sls_branded_email as branded
         self.assertIn('EXTREME WEATHER',branded.build_html('Tornado warning','Stay indoors'))
-        self.assertIn('SYSTEM TEST',branded.build_html('System test','Test only'))
+        self.assertIn('SYSTEM TEST',branded.build_html('System test','Test only',is_test=True))
 
 if __name__=='__main__':unittest.main()

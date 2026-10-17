@@ -1,5 +1,8 @@
 <?php
 declare(strict_types=1);
+// Intercept only the incident namespace so this regression can prove that
+// durable records and summaries never require write access merely to read.
+eval('namespace SLS\\MassNotify; function fopen($path,$mode,$include=false,$context=null){if(($GLOBALS["sls_incident_fopen_target"]??null)===$path){$GLOBALS["sls_incident_fopen_modes"][]=$mode;}return $context===null?\\fopen($path,$mode,$include):\\fopen($path,$mode,$include,$context);}');
 require_once dirname(__DIR__) . '/slsmassnotifyserver/IncidentService.php';
 use SLS\MassNotify\IncidentStore;
 use SLS\MassNotify\IncidentService;
@@ -20,6 +23,28 @@ $service=new IncidentService($store,static fn()=>$template,static fn(array $d):a
     static function (...$args) use (&$sent):array { $sent[]=$args;return ['success'=>true,'job_id'=>'job_'.str_pad(dechex(count($sent)),32,'0',STR_PAD_LEFT)]; },static fn():array=>[],static fn():int=>$now);
 $seed=$service->start(['template_id'=>$template['id'],'request_id'=>str_repeat('f',32),'is_test'=>true],['identity'=>'Fixture','source'=>'test']);
 $seed=$store->read($seed['id']);
+$seedPath=$directory.'/'.$seed['id'].'.json';$seedBytes=file_get_contents($seedPath);
+$GLOBALS['sls_incident_fopen_target']=$seedPath;$GLOBALS['sls_incident_fopen_modes']=[];
+$store->read($seed['id']);$store->metadata($seed['id']);
+unset($GLOBALS['sls_incident_fopen_target']);
+bounds_check($GLOBALS['sls_incident_fopen_modes']!==[]&&!array_diff($GLOBALS['sls_incident_fopen_modes'],['rb']),'Incident read paths requested write access.');
+chmod($seedPath,0644);$rejected=false;try{$store->read($seed['id']);}catch(RuntimeException $expected){$rejected=true;}chmod($seedPath,0600);
+bounds_check($rejected,'World-readable incident history was accepted.');
+$damaged=json_decode($seedBytes,true,64,JSON_THROW_ON_ERROR);$requestKey=array_key_first($damaged['operations']);$damaged['operations'][$requestKey]['actor']['identity']=[];
+file_put_contents($seedPath,json_encode($damaged,JSON_THROW_ON_ERROR));chmod($seedPath,0600);$rejected=false;
+try{$store->read($seed['id']);}catch(RuntimeException $expected){$rejected=true;}file_put_contents($seedPath,$seedBytes);chmod($seedPath,0600);
+bounds_check($rejected,'Malformed nested incident history escaped durable-record validation.');
+$damaged=json_decode($seedBytes,true,64,JSON_THROW_ON_ERROR);$damaged['unexpected_root']='not part of schema 1';
+file_put_contents($seedPath,json_encode($damaged,JSON_THROW_ON_ERROR));chmod($seedPath,0600);$rejected=false;
+try{$store->read($seed['id']);}catch(RuntimeException $expected){$rejected=true;}file_put_contents($seedPath,$seedBytes);chmod($seedPath,0600);
+bounds_check($rejected,'Unknown incident root data escaped durable-record validation.');
+$damaged=json_decode($seedBytes,true,64,JSON_THROW_ON_ERROR);$damaged['template']['name']=' Fixture ';
+file_put_contents($seedPath,json_encode($damaged,JSON_THROW_ON_ERROR));chmod($seedPath,0600);$rejected=false;
+try{$store->read($seed['id']);}catch(RuntimeException $expected){$rejected=true;}file_put_contents($seedPath,$seedBytes);chmod($seedPath,0600);
+bounds_check($rejected,'A noncanonical frozen incident template escaped durable-record validation.');
+$lockPath=$directory.'/'.$seed['id'].'.lock';file_put_contents($lockPath,'x');chmod($lockPath,0600);$rejected=false;
+try{$store->transaction($seed['id'],static fn(array $record):array=>$record);}catch(RuntimeException $expected){$rejected=true;}file_put_contents($lockPath,'');
+bounds_check($rejected,'A nonempty incident lock file was accepted.');
 // The upper record-count boundary plus eight near-limit records (32 MiB). Full
 // reads are instrumented, proving warm list/worker cost does not scale to 8 GiB.
 foreach (glob($directory.'/*') as $path) { unlink($path); }
@@ -28,7 +53,8 @@ $ids=[];
 for ($i=0;$i<2000;$i++) {
     $id='inc_'.str_pad(dechex($i+1),32,'0',STR_PAD_LEFT);$ids[]=$id;
     $record=$seed;$record['id']=$id;$record['state']='closed';$record['operations']=[];$record['timeline']=[];
-    if ($i<8) { $record['_fixture_padding']=str_repeat('p',3900000); }
+    if ($i<8) { $record['timeline']=[['at'=>$record['updated_at'],'kind'=>'fixture_padding',
+        'actor'=>['identity'=>'Fixture','source'=>'test'],'details'=>['padding'=>str_repeat('p',3900000)]]]; }
     if ($i===1999) { $record['state']='planned';$record['planned_at']=gmdate('c',$now-30);$record['opened_at']=''; }
     $raw=json_encode(['_storage_revision'=>bin2hex(random_bytes(16))]+$record,JSON_THROW_ON_ERROR);
     file_put_contents($directory.'/'.$id.'.json',$raw);chmod($directory.'/'.$id.'.json',0600);

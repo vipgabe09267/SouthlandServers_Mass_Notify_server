@@ -11,6 +11,11 @@ final class EnterpriseIntegrationsService
     public function __construct(EnterpriseIntegrationsStore $store,?EnterpriseIntegrationsProvider $provider=null,?callable $clock=null)
     { $this->store=$store; $this->provider=$provider??new EnterpriseIntegrationsProvider(); $this->clock=$clock??static fn(): int=>time(); }
     private function now(): int { return (int)($this->clock)(); }
+    private static function detail($value,string $fallback): string
+    {
+        return is_string($value)&&$value!==''&&strlen($value)<=1000&&preg_match('//u',$value)===1
+            &&!preg_match('/[\x00-\x1f\x7f]/',$value)?$value:$fallback;
+    }
     public static function fingerprint(array $value): string { return EnterpriseIntegrationsConfig::fingerprint($value); }
     public static function requestId($value): string { return IncidentConfig::identifier($value,'/^[a-f0-9]{32}$/D','Integration request identifier'); }
     /** Claim before side effects; interrupted requests remain uncertain and are never retried. */
@@ -25,18 +30,30 @@ final class EnterpriseIntegrationsService
             }
             if (isset($state['operations'][$request])) {
                 $row=$state['operations'][$request]; if (!hash_equals($row['fingerprint'],$fingerprint) || $row['kind']!==$kind) { throw new \DomainException('This request identifier belongs to different integration details.'); }
-                if ($row['state']==='submitting') { $row['state']='uncertain'; $row['detail']='The operation was claimed but completion is unconfirmed. No automatic replay is allowed.'; }
+                if ($row['state']==='submitting') {
+                    $row['state']='uncertain';$row['detail']='The operation was claimed but completion is unconfirmed. No automatic replay is allowed.';$row['finished_at']=$now;
+                    $state['operations'][$request]=$row;
+                }
                 return ['claimed'=>false,'row'=>$row];
             }
             $row=['request_id'=>$request,'kind'=>$kind,'fingerprint'=>$fingerprint,'state'=>'submitting','created_at'=>$now];
+            EnterpriseIntegrationsStore::requireAllocation($state,'operations',$request,$row);
             $state['operations'][$request]=$row; return ['claimed'=>true,'row'=>$row];
         });
         if (!$claim['claimed']) { return $claim['row']; }
-        try { $outcome=$operation($claim['row']); }
-        catch (\DomainException $error) { $outcome=['state'=>'failed','detail'=>$error->getMessage()]; }
+        try {
+            $outcome=$operation($claim['row']);
+            if(!is_array($outcome)||array_is_list($outcome)){throw new \UnexpectedValueException('Provider returned an unsupported receipt.');}
+            EnterpriseIntegrationsStore::assertOutcome($kind,$outcome);
+        }
+        catch (\DomainException $error) { $outcome=['state'=>'failed','detail'=>self::detail($error->getMessage(),'Provider rejected the operation.')]; }
         catch (\Throwable $error) { $outcome=['state'=>'uncertain','detail'=>'Provider completion is unconfirmed. Review the provider before another request. No automatic replay is allowed.']; }
-        return $this->store->transaction(static function(array &$state) use($request,$outcome,$now): array {
-            $state['operations'][$request]=array_replace($state['operations'][$request],$outcome,['finished_at'=>$now]); return $state['operations'][$request];
+        $finishedAt=max($now,$this->now());
+        return $this->store->transaction(static function(array &$state) use($request,$outcome,$finishedAt): array {
+            $current=$state['operations'][$request]??null;if(!is_array($current)){throw new \RuntimeException('Integration claim disappeared before its provider receipt could be stored.');}
+            if(($current['state']??'')==='resolved'){$current['late_outcome_hash']=self::fingerprint($outcome);$current['late_outcome_at']=$finishedAt;$current['detail']='A late provider result arrived after administrator resolution. Review the provider evidence again; the original request remains blocked from replay.';$state['operations'][$request]=$current;return $current;}
+            if(!in_array($current['state']??'',['submitting','uncertain'],true)){return $current;}
+            $state['operations'][$request]=array_replace($current,$outcome,['finished_at'=>$finishedAt]); return $state['operations'][$request];
         });
     }
     public function meeting(array $config,array $incident,array $input,?callable $effect=null): array
@@ -75,8 +92,12 @@ final class EnterpriseIntegrationsService
         $request=self::requestId($input['request_id']??''); $warning=EnterprisePublicWarning::author($input['warning']??[],$this->now());
         $envelope=$input['post_envelope']??''; if (!is_string($envelope)) { throw new \InvalidArgumentException('A WSDL-generated signed postCAP envelope is required.'); }
         EnterprisePublicWarning::verifyPreparedEnvelope($envelope,$warning['xml'],$config,$this->now());
-        return $this->perform($request,'ipaws',['config'=>self::fingerprint($config),'warning_hash'=>$warning['sha256'],'envelope_hash'=>hash('sha256',$envelope)],function(array $claim) use($config,$envelope,$effect): array {
-            $send=fn()=> $this->provider->ipaws($config,$envelope); return $effect?$effect($send,$claim['created_at']):$send();
+        return $this->perform($request,'ipaws',['config'=>self::fingerprint($config),'warning_hash'=>$warning['sha256'],'envelope_hash'=>hash('sha256',$envelope)],function(array $claim) use($config,$envelope,$effect,$warning): array {
+            $send=function() use($config,$envelope,$warning): array {
+                if($this->now()>=$warning['expires_at']) { throw new \DomainException('The public warning expired before transmission. No provider request was submitted.'); }
+                return $this->provider->ipaws($config,$envelope);
+            };
+            return $effect?$effect($send,$claim['created_at']):$send();
         });
     }
     public function bindResponse(array $config,array $incident,array $person,string $channel,array $target,string $route): array
@@ -94,31 +115,47 @@ final class EnterpriseIntegrationsService
                 $existing=$state['bindings'][$id]; if (!hash_equals($existing['identity_fingerprint'],self::fingerprint($identity))) { throw new \DomainException('This incident reply binding changed. Retire it and review a new incident before enrolling another identity.'); } return $existing;
             }
             do { $token=strtoupper(bin2hex(random_bytes(6))); } while (in_array($token,array_column($state['bindings'],'token'),true));
-            return $state['bindings'][$id]=['id'=>$id,'token'=>$token,'identity_fingerprint'=>self::fingerprint($identity),'created_at'=>$now,'expires_at'=>$now+$config['ttl_seconds']]+$identity;
+            $row=['id'=>$id,'token'=>$token,'identity_fingerprint'=>self::fingerprint($identity),'created_at'=>$now,'expires_at'=>$now+$config['ttl_seconds']]+$identity;
+            EnterpriseIntegrationsStore::requireAllocation($state,'bindings',$id,$row);return $state['bindings'][$id]=$row;
         });
     }
     public static function smsPrompt(array $binding): string
     { return $binding?' Reply SLS '.$binding['token'].' SAFE, HELP, or RECEIVED.':''; }
     public function smsResponse(array $config,array $event,callable $current,callable $respond): array
     {
-        if (($config['enabled']??'0')!=='1' || empty($event['inbound']) || !empty($event['opt_out'])) { return ['state'=>'ignored']; }
+        if (($config['enabled']??'0')!=='1') { return ['state'=>'ignored']; }
+        if (!is_bool($event['inbound']??null) || !is_bool($event['opt_out']??null)) {
+            throw new \InvalidArgumentException('Authenticated SMS response flags are invalid.');
+        }
+        if (!$event['inbound'] || $event['opt_out']) { return ['state'=>'ignored']; }
         $body=$event['body']??'';
         if (!is_string($body) || !preg_match('/^SLS ([A-F0-9]{12}) (SAFE|HELP|RECEIVED)$/Di',trim($body),$match)) { return ['state'=>'ignored']; }
+        $provider=$event['provider']??null;$from=$event['from']??null;$eventId=$event['event_id']??null;
+        if (!is_string($provider)||!in_array($provider,['twilio','telnyx'],true)||!is_string($from)||!preg_match('/^\+[1-9][0-9]{1,14}$/D',$from)
+            ||!is_string($eventId)||$eventId===''||strlen($eventId)>200||preg_match('/[\x00-\x1f\x7f]/',$eventId)) {
+            throw new \InvalidArgumentException('Authenticated SMS response identity is invalid.');
+        }
         $rows=array_values(array_filter($this->store->read()['bindings'],fn($row)=>$row['channel']==='sms' && $row['token']===strtoupper($match[1])
-            && $row['provider']===($event['provider']??'') && $row['number_hash']===hash('sha256',$event['from']??'') && $row['expires_at']>$this->now()));
+            && $row['provider']===$provider && $row['number_hash']===hash('sha256',$from) && $row['expires_at']>$this->now()));
         if (count($rows)!==1 || !$current($rows[0])) { throw new \DomainException('SMS reply has no unique current provider, participant and incident binding.'); }
-        return $this->humanResponse($rows[0],(string)($event['event_id']??''),['SAFE'=>'safe','HELP'=>'needs_assistance','RECEIVED'=>'received'][strtoupper($match[2])],$respond);
+        return $this->humanResponse($rows[0],$eventId,['SAFE'=>'safe','HELP'=>'needs_assistance','RECEIVED'=>'received'][strtoupper($match[2])],$respond);
     }
     public function voiceResponse(array $config,array $input,callable $current,callable $respond): array
     {
         if (($config['enabled']??'0')!=='1') { return ['state'=>'ignored']; }
         $input=IncidentConfig::object($input,['binding_id','token','recipient_id','event_id','digit'],'Incident keypad response');
-        $id=IncidentConfig::identifier($input['binding_id']??'','/^[a-f0-9]{64}$/D','Response binding'); $row=$this->store->read()['bindings'][$id]??null;
-        if (!$row || $row['channel']!=='voice' || $row['expires_at']<=$this->now() || !is_string($input['token']??null)
-            || !hash_equals($row['token'],$input['token']) || $row['recipient_id']!==($input['recipient_id']??'') || !$current($row)) { throw new \DomainException('Keypad response lacks a current call, participant and incident binding.'); }
-        $response=['1'=>'received','2'=>'safe','3'=>'needs_assistance'][$input['digit']??'']??null;
+        $id=IncidentConfig::identifier($input['binding_id']??'','/^[a-f0-9]{64}$/D','Response binding');
+        foreach (['token','recipient_id','event_id','digit'] as $field) {
+            if (!is_string($input[$field]??null)) { throw new \InvalidArgumentException('Incident keypad response fields must be text.'); }
+        }
+        if (!preg_match('/^[0-9*#]?$/D',$input['digit']) || $input['event_id']==='' || strlen($input['event_id'])>200
+            || preg_match('/[\x00-\x1f\x7f]/',$input['event_id'])) { throw new \InvalidArgumentException('Incident keypad evidence is invalid.'); }
+        $row=$this->store->read()['bindings'][$id]??null;
+        if (!$row || $row['channel']!=='voice' || $row['expires_at']<=$this->now()
+            || !hash_equals($row['token'],$input['token']) || $row['recipient_id']!==$input['recipient_id'] || !$current($row)) { throw new \DomainException('Keypad response lacks a current call, participant and incident binding.'); }
+        $response=['1'=>'received','2'=>'safe','3'=>'needs_assistance'][$input['digit']]??null;
         if ($response===null) { return ['state'=>'ignored']; }
-        return $this->humanResponse($row,(string)($input['event_id']??''),$response,$respond);
+        return $this->humanResponse($row,$input['event_id'],$response,$respond);
     }
     private function humanResponse(array $binding,string $event,string $response,callable $respond): array
     {
@@ -128,13 +165,13 @@ final class EnterpriseIntegrationsService
             $archived=$this->store->archived('responses',$id);
             if ($archived!==null) { if (!hash_equals($archived['fingerprint'],$fingerprint)) { throw new \DomainException('This provider event was already bound to different archived response details.'); } return $archived; }
             if (isset($state['responses'][$id])) { if (!hash_equals($state['responses'][$id]['fingerprint'],$fingerprint)) { throw new \DomainException('This provider event was already bound to different response details.'); } return $state['responses'][$id]; }
-            return $state['responses'][$id]=['fingerprint'=>$fingerprint,'state'=>'pending','created_at'=>$now];
+            $row=['fingerprint'=>$fingerprint,'state'=>'pending','created_at'=>$now];EnterpriseIntegrationsStore::requireAllocation($state,'responses',$id,$row);return $state['responses'][$id]=$row;
         });
         if ($claim['state']==='complete') { return ['state'=>'duplicate']; }
         // IncidentService provides its own durable idempotency; pending commits may retry safely.
         $respond($binding['incident_id'],['request_id'=>substr($id,0,32),'person_id'=>$binding['person_id'],'response'=>$response,'note'=>'Explicit participant reply'],
             ['identity'=>'Participant '.$binding['person_id'],'source'=>$binding['channel']==='sms'?'verified_sms_human':'bound_call_dtmf_human']);
-        $this->store->transaction(static function(array &$state) use($id): void { $state['responses'][$id]['state']='complete'; });
+        $completedAt=$this->now();$this->store->transaction(static function(array &$state) use($id,$completedAt): void { $state['responses'][$id]['state']='complete';$state['responses'][$id]['completed_at']=$completedAt; });
         return ['state'=>'recorded','incident_id'=>$binding['incident_id'],'person_id'=>$binding['person_id'],'response'=>$response];
     }
     /** Caller must have checked the existing exact-body HMAC and verified HTTPS. */

@@ -1,4 +1,4 @@
-> These instructions install the corrected `0.1.6-beta` prerelease replacing the withdrawn October 10 package. SLS remains beta software for noncritical testing.
+> Instructions for the unpublished `0.1.7-beta` candidate. Do not use its release URLs until publication. SLS remains beta software for noncritical testing.
 
 # Installation Notes
 
@@ -21,23 +21,25 @@ The installer detects these capabilities and installs only missing Debian packag
 
 ## Recommended Install
 
-Run as `root` on the FreePBX server:
+For a first installation, verify the installer using [the existing host tools and independently retained publisher key](docs/FIRST_INSTALL_VERIFICATION.md) before running it. An installed protected updater already verifies downloaded code. For a manually downloaded installer, obtain its independently verified SHA-256 first; run as `root` on the FreePBX server:
 
 ```bash
-cd /tmp
+SLS_INSTALL_DIR="$(mktemp -d /tmp/sls-verified-install.XXXXXXXX)"
+cd "$SLS_INSTALL_DIR"
 curl -fsSL -o sls-install.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.6-beta/tools/install_release.sh
-chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.6-beta/slsmassnotifyserver-0.1.6-beta.tgz' \
-./sls-install.sh
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.7-beta/tools/install_release.sh
+SLS_INSTALLER_SHA256='REPLACE_WITH_THE_INDEPENDENTLY_VERIFIED_INSTALLER_SHA256'
+printf '%s  sls-install.sh\n' "$SLS_INSTALLER_SHA256" | sha256sum --check || exit 1
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.7-beta/slsmassnotifyserver-0.1.7-beta.tgz' \
+bash ./sls-install.sh
 ```
 
 The installer prints the PBX operating-system timezone before module activation. It keeps the existing system timezone by default. Review or change it in the first-run UI wizard; the CLI does not ask for a timezone. Scheduled announcements, quiet hours, logs, and alert timing all use this system timezone. Unattended and UI-triggered installs never prompt and keep the existing value. For a scripted timezone change, pass an exact IANA name explicitly:
 
 ```bash
 SLS_MASS_NOTIFY_TIMEZONE='America/Chicago' \
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.6-beta/slsmassnotifyserver-0.1.6-beta.tgz' \
-./sls-install.sh
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.7-beta/slsmassnotifyserver-0.1.7-beta.tgz' \
+bash ./sls-install.sh
 ```
 
 The requested name must exist in both the systemd timezone catalogue and `/usr/share/zoneinfo`. If a later installation stage fails after changing it, the installer restores the original system timezone as part of rollback.
@@ -49,9 +51,9 @@ The updater resolves a release tag to its commit, verifies the publisher’s Ed2
 For an offline/local package, obtain its SHA-256 through a trusted channel and use the matching version’s installer:
 
 ```bash
-SLS_MASS_NOTIFY_TGZ='/tmp/slsmassnotifyserver-0.1.6-beta.tgz' \
+SLS_MASS_NOTIFY_TGZ='/tmp/slsmassnotifyserver-0.1.7-beta.tgz' \
 SLS_MASS_NOTIFY_SHA256='<trusted 64-character SHA-256>' \
-./sls-install.sh
+bash ./sls-install.sh
 ```
 
 Unsupported nonstandard FreePBX runtime layouts fail early with the required path/capability instead of being rewritten speculatively. A custom-built Asterisk that already provides a required capability is accepted; a missing unmanaged provider requires administrator repair. The installer does not replace custom Asterisk binaries, alter SIP peers, disable device security, or upgrade unrelated installed FreePBX modules.
@@ -114,7 +116,7 @@ After installing the module:
 12. Review the announcement, Weather Alert, and Lightning Alert volume controls; fresh installs default all three to 25%.
 13. Set notification log retention.
 14. Optionally configure Xweather under **Lightning Alerts**. Up to five named trigger areas can each select a Weather Alert group, strike type, location, radius, phones, desktops, email recipients, quiet hours, and all-clear behavior; enabled shared webhooks remain managed in General Settings. Adaptive protection is enabled by default and can open from a qualifying current Weather.gov alert or from thunder in the forecast period active at that time, then remains open for the configured grace period. A later forecast period does not start paid polling before its boundary. Multiple active areas can consume the shared account allowance faster. Lightning volume defaults to 25%, and coordinate locations are spoken as “this area.”
-15. After setup, review **General Settings > Outbound Delivery**. Fresh installs send through local Postfix as `no-reply` at the detected Postfix/PBX domain; the sender local part and domain can be edited. Add system/error email recipients only if those operational notices are wanted. Weather and Lightning email recipients are selected inside their individual zones and trigger areas. Discord and generic HTTPS webhooks remain available from the same General Settings manager.
+15. After setup, review **General Settings > Delivery**. Email starts disabled on fresh installs. Configure Postfix and recipients before enabling it. The default sender is `no-reply` at the detected Postfix/PBX domain; both parts can be edited. Add system/error recipients only if those notices are wanted. Weather and Lightning recipients are selected in their individual groups. Discord and generic HTTPS webhooks use the same delivery manager.
 16. Complete setup, then use FreePBX’s standard top-right **Apply Config** control when it appears.
 
 Notification Logs supports combined event-type and PBX-local calendar-date filtering. General Settings keeps repair, complete uninstall, and configuration replacement in separate Danger Zone cards so the scope of each confirmed maintenance action remains clear.
@@ -157,7 +159,7 @@ Portable `.config` exports include schedule definitions but not the PBX-local ex
 
 The native FreePBX 17 backup adapter includes the protected config, schedule execution journal, custom module tones, SMS continuity when present, and a bounded operational evidence archive in module-based backup jobs. Historical queues, desktop inbox entries, storm state and incidents are archived for review, never reactivated. Weather/lightning automation and external voice remain disabled after restore until reviewed. See [recovery policy and acceptance checks](docs/RECOVERY.md). The installer enables FreePBX Backup, verifies adapter discovery, and enrolls Mass Notify in existing module-based jobs. A system with no administrator-defined jobs is healthy; create one in **Backup & Restore** when its schedule, storage, and retention policy have been chosen. Restores validate manifest records, SHA-256 hashes, size limits, config structure, credentials, and WAV data before an atomic replacement, then run post-restore integration repair. Due or completed occurrences are not replayed. FreePBX cannot download an unknown custom module from this project automatically, so install `slsmassnotifyserver` on a replacement PBX before restoring its archive and keep an independent `.config` backup.
 
-Executable runtime, including Piper and the automatic updater, is root-owned. Mutable config, voice models, tones, journals, and generated audio remain in the Asterisk data folder. Generated TTS and combined announcement audio is removed automatically fifteen minutes after its reserved playback ends; queued media is leased until then. This prevents the Asterisk service account from replacing code later executed by a privileged maintenance/update job.
+Executable runtime, including Piper and the automatic updater, is root-owned. Mutable configuration, voices, recordings, journals and generated media remain in the Asterisk data folder. Periodic cleanup can remove unreferenced generated audio after fifteen minutes; active jobs, queue/voicemail leases and desktop references can retain it longer. Mailbox recordings follow FreePBX's retention policy. This separation prevents the service account from replacing privileged maintenance/update code; see [media retention](docs/RESOURCES.md#generated-media-and-history).
 
 ## FAQ
 
@@ -272,7 +274,7 @@ For disconnected preparation, set `SLS_MASS_NOTIFY_UPSTREAM_PACKAGES` to a root-
 
 The supported legacy Piper compatibility layout contains only `venv/bin/piper -> /usr/local/bin/piper`. The installer validates its exact contents and safe ownership/modes, retains recovery metadata, then recreates root-owned compatibility directories. A known authenticated wrapper missing its execute bit is repaired by dependency preparation. Unknown executables, additional files, unsafe links and writable environments require investigation; do not recursively change ownership to bypass validation.
 
-0.1.6-beta uses a new tag and signed artifacts. The updater can select it from 0.1.5-beta; equal versions remain ignored, and installed settings and delivery history are preserved.
+0.1.7-beta uses a new tag and signed artifacts. The updater can select it from 0.1.6-beta or earlier; equal versions remain ignored, and installed settings and delivery history are preserved.
 
 Keep all recovery paths printed by a failed installer. Static recovery preserves the original snapshot and does not rewind notification or schedule execution history. Rollback restores the previous maintenance schedule only after its release, recovered web files and root runtime match the approval made before installation. If any recovery check fails, SLS root jobs remain disabled and the installer reports the failed postcondition and recovery paths. A restored file tree alone is not sufficient proof of a complete repair.
 
@@ -282,6 +284,8 @@ The installer verifies that generated image/XML requests pass through the config
 ### Candidate prerequisites and release trust
 
 Dependency repair checks the selected CLI PHP version, installs its matching SQLite, cURL, XML/DOM and other required packages, then verifies loaded CLI extensions. Post-install verification separately probes the PHP handler serving the local API route, so a mismatched Apache/FPM PHP version cannot silently pass on CLI checks alone. Missing interpreter/package metadata, failed package operations and extensions that remain unloaded produce specific errors. JavaScript actions require `/usr/bin/node`; enabled CAP feeds require DOM and cURL. Resource shortages do not trigger destructive reconfiguration.
+
+When the served handler is PHP-FPM, activation and rollback reload its qualified versioned service to replace cached code. FPM may close active web requests during reload; desktop streams reconnect. The installer verifies the release version through the served API afterward. This does not restart Asterisk or change PHP settings.
 
 The current self-signing key is preserved. Release manifests now include signed expiry metadata. Optional reviewed publisher rotation/revocation and root offline recovery are documented in [Release Trust](docs/RELEASE_TRUST.md). Do not initialize a stricter publisher policy merely to troubleshoot an install: initialization intentionally disables legacy manifests without expiry metadata.
 
@@ -305,4 +309,4 @@ The supported adapter remains Debian 12, FreePBX 17 and the documented runtime p
 
 ### Previously installed withdrawn candidate
 
-A PBX already running the withdrawn `0.1.6-beta` will not receive an equal-version replacement automatically: the updater intentionally ignores equal versions. Use the signed replacement's authenticated manual installer to replace that candidate. Do not bypass package signatures, delete trust inventories or downgrade protected configuration to make the update appear newer.
+0.1.7-beta upgrades earlier 0.1.6-beta builds using a distinct version and signed package. Releases are immutable: fixes after publication require a newer version. The updater intentionally ignores equal versions. Do not bypass package signatures, delete trust inventories or downgrade protected configuration to make the update appear newer.

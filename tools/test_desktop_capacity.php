@@ -92,10 +92,22 @@ try {
     $report = ['schema' => 1, 'eligible_limit' => 0, 'errors' => [['code' => 'storage_directory_unreadable', 'message' => 'The PBX account cannot read the runtime cache. Run Repair Installation.']]];
     file_put_contents($helper, 'import sys' . "\nprint(" . var_export(json_encode($report), true) . ")\nsys.exit(3)\n");
     if ($probe->probe() !== $report) { throw new RuntimeException('Structured exit-3 resource diagnostic was hidden.'); }
+    $report = ['schema' => 1, 'eligible_limit' => 1000, 'eligible_phone_limit' => 1000, 'errors' => 'malformed'];
+    file_put_contents($helper, "print(" . var_export(json_encode($report), true) . ")\n");
+    if (strpos($probe->probe()['errors'][0]['message'], 'valid report') === false) { throw new RuntimeException('Malformed schema-1 capacity output was accepted.'); }
     file_put_contents($helper, "print('not-json')\n");
     if (strpos($probe->probe()['errors'][0]['message'], 'code 0') === false) { throw new RuntimeException('Invalid resource output omitted the exit code.'); }
+    file_put_contents($helper, "print('x' * 1100000)\n");
+    if (strpos($probe->probe()['errors'][0]['message'], 'bounded response limit') === false) { throw new RuntimeException('Oversized resource output was buffered or reported generically.'); }
+    file_put_contents($helper, "import os\nwhile True: os.write(1,b'x'*8192)\n");
+    $started=microtime(true);$unbounded=$probe->probe();$elapsed=microtime(true)-$started;
+    if (strpos($unbounded['errors'][0]['message'], 'bounded response limit') === false || $elapsed>3) { throw new RuntimeException('Unbounded resource output was not stopped at the response limit.'); }
+    file_put_contents($helper, "import sys\nsys.stderr.write('x' * 70000)\n");
+    if (strpos($probe->probe()['errors'][0]['message'], 'bounded response limit') === false) { throw new RuntimeException('Oversized resource diagnostics were allowed to fill the request.'); }
     file_put_contents($helper, "import time\ntime.sleep(9)\n");
     if (strpos($probe->probe()['errors'][0]['message'], 'five-second deadline') === false) { throw new RuntimeException('Resource timeout omitted its deadline.'); }
+    chmod($helper,0666);
+    if (strpos($probe->probe()['errors'][0]['message'], 'checker is unavailable') === false) { throw new RuntimeException('Writable capacity helper was executed.'); }
 } finally { unlink($helper); rmdir($capacityDirectory); }
 echo "Actual capacity subprocess bridge preserves actionable probe errors and reports malformed output/timeouts.\n";
 
@@ -119,4 +131,15 @@ if ($fixture->calls!==$before) { throw new RuntimeException('Invalid preview inp
 $fixture->result=['schema'=>1,'requirements'=>[],'errors'=>[['message'=>'The storage probe could not finish.']]];
 $preview=$fixture->previewDeviceCapacity(['desktop_client_limit'=>'25','phone_device_limit'=>'25']);
 if ($preview['success']||$preview['message']!=='The storage probe could not finish.') { throw new RuntimeException('Failed resource probe produced a positive UI report.'); }
+$fixture->result=['schema'=>1,'eligible_limit'=>25,'eligible_phone_limit'=>25,
+    'requirements'=>['cpu_count'=>2,'memory_bytes'=>1],'hardware'=>['effective_cpu_count'=>2.0,'effective_memory_bytes'=>1],
+    'resource_checks'=>[],'errors'=>['malformed']];
+$preview=$fixture->previewDeviceCapacity(['desktop_client_limit'=>'25','phone_device_limit'=>'25']);
+if ($preview['success']||!str_contains($preview['message'],'invalid report')) { throw new RuntimeException('Malformed resource diagnostics reached the capacity UI.'); }
+$fixture->result=['schema'=>1,'requirements'=>[],'errors'=>[['message'=>['private'=>'value']]]];
+$preview=$fixture->previewDeviceCapacity(['desktop_client_limit'=>'25','phone_device_limit'=>'25']);
+if($preview['success']||!is_string($preview['message'])||str_contains($preview['message'],'Array')){throw new RuntimeException('Nested capacity diagnostic reached the UI or triggered unsafe coercion.');}
+$fixture->result=['eligible_limit'=>0,'eligible_phone_limit'=>0,'errors'=>[['message'=>['private'=>'value']]]];
+try{$fixture->save(100,50);throw new RuntimeException('Malformed resource shortage was accepted.');}
+catch(DomainException $error){if(!str_contains($error->getMessage(),'invalid shortage details')){throw new RuntimeException('Malformed shortage did not produce the fixed recovery instruction.');}}
 echo "Capacity counter uses the server admission report, preserves shortage details and rejects invalid input before probing.\n";

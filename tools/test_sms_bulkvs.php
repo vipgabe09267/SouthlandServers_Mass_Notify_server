@@ -43,6 +43,8 @@ $provider->response=['status'=>200,'error'=>0,'body'=>json_encode([['TN'=>'13109
 $diagnostic=$provider->diagnoseBulkvs($config);
 $check(!$diagnostic['sms_enabled']&&!$diagnostic['campaign_configured']&&count($diagnostic['issues'])===2,'Disabled sender/campaign check failed.');
 $check(end($provider->requests)['lookup']==='https://portal.bulkvs.com/api/v1.0/tnRecord?Number=13109060901','Sender check used a sending/provisioning route.');
+$provider->response=['status'=>200,'error'=>0,'body'=>json_encode([['TN'=>'13109060901','Messaging'=>'malformed']])];
+try{$provider->diagnoseBulkvs($config);throw new RuntimeException('Malformed messaging record was accepted.');}catch(DomainException $error){$check(str_contains($error->getMessage(),'unexpected messaging record'),'Malformed messaging record did not receive a bounded diagnostic.');}
 $provider->response=['status'=>409,'error'=>0,'body'=>json_encode(['Description'=>'SMS disabled for 13109060901; fixture-api-token https://private.example/token <b>review</b>', 'Code'=>'7401'])];
 $failure=$send();
 $check(str_contains($failure['error_detail'],'SMS disabled')&&str_contains($failure['error_detail'],'7401')
@@ -53,7 +55,7 @@ foreach ([400,401,403,404,409,429] as $http) {
     $result=$send();$check($result['state']==='failed'&&$result['error_code']==='bulkvs_http_'.$http,'HTTP rejection lost its safe error code.');
 }
 foreach ([['status'=>503,'error'=>0,'body'=>''],['status'=>200,'error'=>28,'body'=>''],['status'=>302,'error'=>0,'body'=>''],
-    ['status'=>200,'error'=>0,'body'=>'{invalid']] as $response) {
+    ['status'=>200,'error'=>0,'body'=>'{invalid'],['status'=>200,'error'=>0,'body'=>'{"RefId":"'.$id.'","RefId":"'.$id.'"}']] as $response) {
     $provider->response=$response;$check($send()['state']==='uncertain','Ambiguous provider submission became retryable or successful.');
 }
 foreach ([array_replace($accepted,['From'=>'13109060902']),array_replace($accepted,['RefId'=>'invalid']),

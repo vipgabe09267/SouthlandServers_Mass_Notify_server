@@ -4,7 +4,7 @@ These opt-in adapters start disabled: `enterprise_integrations.enabled`, every s
 
 The Weather Alerts switch controls NWS delivery and manual Weather tests. Ordinary notifications, enrolled triggers and Labs adapters use their own saved enablement and the SLS runtime switch. Stopping SLS blocks new notifications and physical actuation. Authorized delivery receipts, participant responses, sensor heartbeats, status queries, read-only device telemetry and local CAP validation/export remain available; their current identity and feature permissions still apply. Lightning has its own enablement.
 
-Qualification is limited to isolated API, HMAC, TLS, signature, replay and DTMF fixtures. No real speaker, sensor board, controller, OAuth account, carrier incident reply or FEMA account was available. The Arduino sketches have not been compiled or exercised on hardware. Device firmware, physical results, provider permissions and authorized FEMA CDTE acceptance remain pending. This does not claim managed mustering, visitor/badge/camera management, geofencing or device certification.
+Qualification covers isolated API, HMAC, TLS, signature, replay and DTMF fixtures, plus source-level checks of the Arduino and ESP32 examples. A full embedded-SDK compilation is not claimed by this audit. No real speaker, sensor board, controller, OAuth account, carrier incident reply or FEMA account was available. Hardware operation, physical results, provider permissions and authorized FEMA CDTE acceptance remain pending. This does not claim managed mustering, visitor/badge/camera management, geofencing or device certification.
 
 ## Speakers and physical evidence
 
@@ -66,6 +66,18 @@ Opt-in voice metadata passes through existing immutable outbound snapshots and P
 
 ## Enrolled sensor examples
 
+ESP32 and MKR examples retain the latest expired activation for review, stop
+retrying it and continue independent heartbeats. They verify persistent writes
+before sending or clearing pending work. MKR uses a checksum and new journal
+format: review an old journal before explicitly initializing a new enrollment.
+Do not reset sequences to replay work. `HTTPS_PORT` defaults to 443 and supports
+a configured forwarded port. The documented qualification toolchain targets are
+Arduino CLI 1.5.1, Arduino SAMD 1.8.14, ESP32 core 3.3.12, WiFiNINA 1.9.1,
+ArduinoBearSSL 1.7.5 and FlashStorage 1.0.0. `tools/qualify_sensor_examples.py`
+can compile against explicitly supplied local SDKs; it downloads nothing and
+uploads no firmware. Source checks do not verify compilation, flash durability,
+TLS clocks or physical inputs.
+
 Examples under `slsmassnotifyserver/examples/sensors/` cover Raspberry Pi GPIO, ESP32 and Arduino MKR WiFi 1010/Nano 33 IoT. They are disabled by default and use only an approved isolated dry-contact input. They do not connect to, alter or supervise a fire panel. Enroll an existing sensor trigger and use its saved literal 64-character secret; do not hex-decode that key.
 
 The exact signature input is UTF-8 `rule_id + "." + timestamp + "." + raw_body`, HMAC-SHA256, sent as hex `X-SLS-Signature` and decimal `X-SLS-Timestamp`. HTTPS trust and hostname verification are required, and redirects are refused. The JSON body's stable `request_id` is 32 lower-case hex digits; pending activation bytes and expiry are preserved across retries. Local contact debounce is 50 ms, a held startup input establishes a baseline, and local activation cooldown is 10 seconds. Server enrolled-trigger replay protection/cooldown still apply.
@@ -82,9 +94,9 @@ The bounded CAP 1.2 editor defaults to Test and Public scope, requires a current
 
 The local acceptance action accepts only a Test or Exercise draft and its matching signed `post_envelope`. It validates structure, configured authority and signatures, returning `cap_sha256`, `envelope_sha256` and `authority_qualification: "pending_external_acceptance"`. Nothing is transmitted. Passing this check does not replace authorized FEMA CDTE or channel acceptance.
 
-IPAWS origination separately requires saved `ipaws_enabled`, authorized COG confirmation, the exact issued FEMA HTTPS service endpoint and WSDL SOAPAction, current matching RSA certificate/key, and `public_warning_origination` Labs acknowledgement. There is no supplied authority, certificate, account, WSDL or channel permission. The authorized integration provides a matching WSDL-generated signed postCAP SOAP envelope; SLS verifies the configured COG identity, exact reviewed CAP payload, exclusive canonicalization/SHA256/RSA256 signatures and unique message IDs before submission. This Labs bridge currently accepts an inline CAP alert with one alert signature and one SOAP-body signature. Other WSDL representations are not guessed and remain unsupported until authorized qualification.
+IPAWS origination separately requires saved `ipaws_enabled`, authorized COG confirmation, the exact issued FEMA HTTPS service endpoint and WSDL SOAPAction, current matching RSA certificate/key, and `public_warning_origination` Labs acknowledgement. There is no supplied authority, certificate, account, WSDL or channel permission. The authorized integration provides a matching WSDL-generated signed postCAP SOAP envelope; SLS verifies the configured COG identity, exact reviewed CAP payload, exclusive canonicalization, SHA-256 digests, RSA-SHA256 signatures and unique message IDs before submission. This Labs bridge currently accepts an inline CAP alert with one alert signature and one SOAP-body signature. Other WSDL representations are not guessed and remain unsupported until authorized qualification.
 
-A documented signed getAck envelope builder is available for authorized integration qualification. Provider responses retain bounded channel status codes, which do not prove public dissemination or receipt. FEMA authority must validate its issued WSDL, channel requirements, CAP signature representation and CDTE workflow before use. [FEMA IPAWS-OPEN interface guide v4.02](https://content.govdelivery.com/attachments/USDHSFEMA/2023/11/17/file_attachments/2687711/IPAWS-OPEN-v4-02-InterfaceDesignGuide_Draft_11172023.pdf)
+A documented signed getAck envelope builder is available for authorized integration qualification. Provider responses retain bounded channel status codes, which do not prove public dissemination or receipt. FEMA authority must validate its current issued interface guide, WSDL, channel requirements, CAP signature representation and CDTE workflow before use. The linked [2023 FEMA IPAWS-OPEN v4.02 draft](https://content.govdelivery.com/attachments/USDHSFEMA/2023/11/17/file_attachments/2687711/IPAWS-OPEN-v4-02-InterfaceDesignGuide_Draft_11172023.pdf) is historical reference material, not the current production contract.
 
 ## Durable claims and maintenance
 
@@ -92,9 +104,11 @@ External meeting, door-actuation and IPAWS operations claim a stable 32-hex requ
 
 Direct browser and manual Weather tests cannot establish notification-HA witness authority. Browser tests reject cluster-enabled deployments; manual Weather tests reject HA, edge or witness roles before any channel begins. Use queued, witness-authorized announcement tests for those deployments. Standalone configuration mirroring does not prevent the manual Weather test.
 
-Preserve `/var/lib/asterisk/SLS_Mass_Notifications_Plugin/enterprise-integrations/worker-state.json`, its `announcement-send.lock` initialization marker and the parent `.enterprise-integrations-required` marker in private operational backups. Missing established state or malformed records reject. Active capacities are 500 provider operations, 2000 participant bindings, 4000 reply events and 100 enrolled sensor-health rows; the UI reports capacity warnings at 80 percent.
+Preserve `/var/lib/asterisk/SLS_Mass_Notifications_Plugin/enterprise-integrations/worker-state.json`, its `announcement-send.lock` initialization marker, the parent `.enterprise-integrations-required` marker and the complete `archive/` directory in private operational backups. A missing established journal, marker, archive shard or malformed record fails closed. Active capacities are 500 provider operations, 2000 participant bindings, 4000 reply events and 100 enrolled sensor-health rows. New provider work is rejected before contact when its projected active record cannot fit. The UI reports active and per-shard capacity warnings at 80 percent.
 
-Administrator-initiated archival accepts `retention_days` from 1–365, default 7. It archives old terminal provider operations and completed responses before compacting the active journal; pending and uncertain operations remain active. Expired response bindings are removed, while response and request replay evidence remains retained. Archives use private `archive/operations.json` and `archive/responses.json`, each bounded to 4 MiB and 20,000 records, with per-ledger `.required` and parent `.archive-required` markers. Reports merge active and archived evidence. A missing archive, conflicting identity or exhausted allocation requires reviewed recovery; exporting a report does not authorize deleting replay evidence.
+Administrator-initiated maintenance accepts `retention_days` and `evidence_retention_days` from 1–365. Defaults are 7 days in the active journal and 30 days of full archived detail. Terminal provider operations and completed responses move first to prefix-sharded private ledgers such as `archive/operations_ab.json` and `archive/responses_cd.json`; each shard is limited to 10,000 rows and 4 MiB. Older full records become prefix-sharded immutable replay tombstones containing their identity, terminal metadata and SHA-256 evidence hash. Pending and uncertain operations stay active, expired response bindings are removed, and request/event identifiers remain permanently blocked from replay. Each ledger has a `.required` marker and the archive has a parent `.archive-required` marker.
+
+An administrator may close an `uncertain` operation only after five minutes and after reviewing evidence outside SLS. The administrator records one of `confirmed_completed`, `confirmed_not_completed` or `abandoned_unconfirmed` plus a bounded receipt, ticket, device-log or review reference. The journal preserves the original uncertainty time separately from the review time. Resolution never resends the original request. A provider result that arrives after resolution receives its own arrival time and evidence hash and marks the record for renewed review. Active and full-detail retention are measured from the latest terminal evidence rather than the initial claim. The browser report is limited to 20,000 rows or 16 MiB; the protected FreePBX backup is the complete retained export. A missing archive, cross-shard record, identity conflict or exhausted allocation requires reviewed recovery.
 
 ## Administrator actions
 
@@ -107,8 +121,9 @@ These are the authenticated FreePBX administrator dispatcher actions, using the 
 | `integrations_oauth_revoke` | `{}` | Disables local access, clears tokens and attempts supported provider revocation. |
 | `integrations_door` | `{request_id,door_id,operation}` | Saved permitted `read`, `lock`, `unlock` or timed `access`; actuation requires danger acknowledgment. |
 | `integrations_continuity` | `{}` | Configuration-only channel dependencies and local recovery readiness; no network or outage test. |
-| `integrations_report` | `{}` | Active and archived operation/response evidence, without authentication fingerprints. |
-| `integrations_archive` | `{retention_days?}` | Safe bounded archival; preserves uncertain work and permanent replay evidence. |
+| `integrations_report` | `{}` | Bounded active/full-detail evidence plus replay tombstones, without authentication fingerprints. Use protected backup for the complete retained set. |
+| `integrations_archive` | `{retention_days?,evidence_retention_days?}` | Moves terminal work into full-detail shards, compacts older detail to replay tombstones, and preserves pending/uncertain work. |
+| `integrations_resolve` | `{request_id,resolution,evidence_reference}` | Closes an uncertainty after the five-minute guard without replaying the provider request. |
 | `integrations_cap_validate` | `{warning,post_envelope}` | Local Test/Exercise validation; sends nothing. |
 
 Run deployment-specific checks in [Enterprise acceptance](ENTERPRISE_ACCEPTANCE.md). These controls do not establish hardware, carrier, provider or authority qualification.

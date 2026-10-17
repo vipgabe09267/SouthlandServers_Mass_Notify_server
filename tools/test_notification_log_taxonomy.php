@@ -22,6 +22,9 @@ $sanitize = $reflection->getMethod('sanitizeType');
 $sanitize->setAccessible(true);
 
 $cases = [
+	[['type'=>'nws','trigger_source'=>'NWS API','event'=>'Alert for a test area','is_test'=>false], 'weather', 'Weather Alert'],
+	[['type'=>'xweather','trigger_source'=>'Manual route name','is_test'=>false], 'lightning', 'Lightning Alert'],
+	[['type'=>'xweather','trigger_source'=>'Xweather API','is_test'=>true], 'manual_test', 'Manual Test'],
 	[['type' => 'nws', 'trigger_source' => 'NWS API'], 'weather', 'Weather Alert'],
 	[['type' => 'xweather', 'trigger_source' => 'Xweather API'], 'lightning', 'Lightning Alert'],
 	[['type' => 'xweather', 'trigger_source' => 'Manual Lightning Test'], 'manual_test', 'Manual Test'],
@@ -37,6 +40,7 @@ foreach ($cases as [$input, $expectedType, $expectedLabel]) {
 	if (($event['notification_type'] ?? '') !== $expectedType || ($event['notification_type_label'] ?? '') !== $expectedLabel) {
 		log_taxonomy_fail('Notification log taxonomy did not classify ' . json_encode($input));
 	}
+	if (isset($input['is_test']) && ($event['is_test'] ?? null)!==$input['is_test']) { log_taxonomy_fail('Explicit test metadata was lost.'); }
 }
 
 foreach ([

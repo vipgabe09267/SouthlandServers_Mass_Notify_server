@@ -47,6 +47,7 @@ with tempfile.TemporaryDirectory() as directory:
 
 with tempfile.TemporaryDirectory() as directory:
     source = (runtime/'sls_announcement_jobs.php').read_text().removeprefix('<?php')
+    source = source.replace("require_once __DIR__ . '/sls_atomic_json.php';", 'require_once ' + json.dumps(str(runtime/'sls_atomic_json.php')) + ';')
     script = '''<?php
 namespace Race;
 use \\RuntimeException; use \\Throwable;

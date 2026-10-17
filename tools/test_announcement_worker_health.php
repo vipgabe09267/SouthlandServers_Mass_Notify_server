@@ -45,6 +45,15 @@ try {
     $check(!$health['ok'] && $health['health_failure_code'] === 'worker_helper_missing', 'Missing execute permission blocks readiness.');
     chmod($helper, 0750); clearstatcache();
     $check($fixture->getAnnouncementWorkerHealth()['ok'], 'A fresh successful probe clears the warning without erasing history.');
+    foreach (['{"ok":false,"ok":true}', '{"metric":1e999}', '[]', '{"child":{"state":"complete","state":"queued"}}'] as $raw) {
+        file_put_contents($directory . '/jobs/worker-probe.json', $raw);
+        $refused = false;
+        try { $store->health(); } catch (Throwable $error) { $refused = true; }
+        $check($refused, 'Ambiguous or non-object worker evidence was accepted.');
+        $check(file_get_contents($directory . '/jobs/worker-probe.json') === $raw, 'Rejected worker evidence was modified.');
+        $health = $fixture->getAnnouncementWorkerHealth();
+        $check(!$health['ok'] && $health['health_failure_code'] === 'worker_storage_unavailable', 'Invalid worker evidence became readiness.');
+    }
     unlink($directory . '/jobs/worker-probe.json');
     symlink('/dev/null', $directory . '/jobs/worker-probe.json');
     $health = $fixture->getAnnouncementWorkerHealth();

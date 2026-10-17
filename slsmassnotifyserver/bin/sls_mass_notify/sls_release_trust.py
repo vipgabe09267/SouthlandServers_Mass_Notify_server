@@ -9,6 +9,7 @@ import base64
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -25,6 +26,48 @@ MAX_BYTES = 16384
 
 def canonical(value):
     return (json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True) + '\n').encode('ascii')
+
+
+def strict_json(body):
+    def object_value(pairs):
+        value = {}
+        for key, child in pairs:
+            if key in value:
+                raise ValueError('Publisher metadata contains a duplicate JSON member')
+            value[key] = child
+        return value
+
+    def reject_constant(value):
+        raise ValueError('Publisher metadata contains a non-finite JSON number: ' + value)
+
+    if isinstance(body, bytes) and body.startswith((b'\xef\xbb\xbf', b'\xff\xfe', b'\xfe\xff')):
+        raise ValueError('Publisher metadata is not strict JSON')
+    try:
+        result = json.loads(body, object_pairs_hook=object_value, parse_constant=reject_constant)
+    except (TypeError, UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ValueError('Publisher metadata is not strict JSON') from error
+
+    nodes = 0
+    def validate(value, depth=0):
+        nonlocal nodes
+        nodes += 1
+        if depth > 64 or nodes > 32768:
+            raise ValueError('Publisher metadata exceeds its JSON structural limit')
+        if isinstance(value, str):
+            try:
+                value.encode('utf-8')
+            except UnicodeEncodeError as error:
+                raise ValueError('Publisher metadata contains invalid Unicode') from error
+        elif isinstance(value, list):
+            for child in value:
+                validate(child, depth + 1)
+        elif isinstance(value, dict):
+            for key, child in value.items():
+                validate(key, depth + 1); validate(child, depth + 1)
+        elif isinstance(value, float) and not math.isfinite(value):
+            raise ValueError('Publisher metadata contains a non-finite JSON number')
+    validate(result)
+    return result
 
 
 def public_der(pem):
@@ -87,18 +130,24 @@ def verify_bytes(body, signature, entry):
     return result.returncode == 0
 
 
-def bounded_read(path, *, protected=False):
+def bounded_read(path, *, protected=False, private_owner=None):
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     descriptor = os.open(path, flags)
     try:
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > MAX_BYTES \
-                or (protected and (info.st_uid != 0 or info.st_mode & 0o077)):
+                or (protected and (info.st_uid != 0 or info.st_mode & 0o077)) \
+                or (private_owner is not None and (info.st_uid != private_owner or info.st_mode & 0o077)):
             raise ValueError('Publisher metadata must be a bounded regular file; trust state must be root-private')
         with os.fdopen(os.dup(descriptor), 'rb') as handle:
             body = handle.read(MAX_BYTES + 1)
         if len(body) > MAX_BYTES:
             raise ValueError('Publisher metadata exceeds 16 KiB')
+        current = os.fstat(descriptor)
+        named = os.stat(path, follow_symlinks=False)
+        fields = ('st_dev', 'st_ino', 'st_mode', 'st_uid', 'st_gid', 'st_nlink', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
+        if any(getattr(info, field) != getattr(current, field) or getattr(info, field) != getattr(named, field) for field in fields):
+            raise ValueError('Publisher metadata changed while reading')
         return body
     finally:
         os.close(descriptor)
@@ -135,7 +184,7 @@ class TrustStore:
             raise ValueError('Established publisher trust state is incomplete; restore it before updating')
         if bounded_read(self.marker, protected=True) != (self.anchor['id'] + '\n').encode('ascii'):
             raise ValueError('Publisher trust bootstrap identity changed')
-        state = json.loads(bounded_read(self.state, protected=True))
+        state = strict_json(bounded_read(self.state, protected=True))
         if not isinstance(state, dict) or set(state) not in ({'policy', 'retired_ids'}, {'policy', 'retired_ids', 'last_recovery'}) \
                 or not isinstance(state['retired_ids'], list) or len(state['retired_ids']) > 64 \
                 or len(set(state['retired_ids'])) != len(state['retired_ids']) \
@@ -280,7 +329,7 @@ def authenticate_manifest(body, signature, anchor=ANCHOR_PEM, directory=DIRECTOR
                 and active(entry, now) and verify_bytes(body, signature, entry)), None)
     if key is None:
         raise ValueError('Release publisher signature is invalid, expired or revoked')
-    data = json.loads(body)
+    data = strict_json(body)
     if not isinstance(data, dict):
         raise ValueError('Invalid authenticated release manifest')
     metadata = data.get('signing')
@@ -290,6 +339,8 @@ def authenticate_manifest(body, signature, anchor=ANCHOR_PEM, directory=DIRECTOR
             or metadata['key_id'] != key['id'] or type(metadata['issued_at']) is not int \
             or type(metadata['expires_at']) is not int \
             or metadata['issued_at'] < key['not_before'] or metadata['issued_at'] > now + 300 \
+            or key['expires_at'] and metadata['issued_at'] >= key['expires_at'] \
+            or key['revoked_at'] and metadata['issued_at'] >= key['revoked_at'] \
             or not metadata['issued_at'] < metadata['expires_at'] <= metadata['issued_at'] + 2 * 366 * 86400 \
             or now >= metadata['expires_at']:
         raise ValueError('Signed release metadata is missing, expired or has an invalid validity window')
@@ -312,7 +363,7 @@ def main():
         elif args.action == 'import-transition':
             if args.transition is None:
                 parser.error('--transition is required')
-            state = store.import_transition(json.loads(bounded_read(args.transition))); initialized = True
+            state = store.import_transition(strict_json(bounded_read(args.transition))); initialized = True
         elif args.action == 'recover-offline':
             if args.public_key is None:
                 parser.error('--public-key is required for offline recovery')

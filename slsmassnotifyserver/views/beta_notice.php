@@ -11,6 +11,7 @@ $styleRevision = substr(hash_file('sha256', __DIR__ . '/beta_notice.css'), 0, 16
         <div class="sls-beta-notice-brand">SLS Mass Notifications · Beta</div>
         <h2 id="sls-beta-notice-title"><?= $escape(BetaNotice::TITLE) ?></h2>
         <p id="sls-beta-notice-body"><strong><?= $escape(BetaNotice::BODY) ?></strong></p>
+        <p><em>This is a one time nag!</em></p>
         <p class="sls-beta-notice-status" role="status" aria-live="polite">Preparing the five-second confirmation…</p>
         <button type="button" disabled>Agree and continue (5s)</button>
     </dialog>

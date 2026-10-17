@@ -40,7 +40,7 @@ The checkbox remains disabled for five seconds and displays the remaining time. 
 
 ## Completion evidence
 
-Current candidate: **0.1.6-beta**, under review. The following describes available software checks, not provider/hardware qualification or a production SLA. Every new master and subordinate feature remains disabled until explicitly configured and enabled.
+Current candidate: **0.1.7-beta**, under review. The following describes available software checks, not provider/hardware qualification or a production SLA. Every new master and subordinate feature remains disabled until explicitly configured and enabled.
 
 | Area | Implemented behavior and isolated checks | Remaining qualification |
 | --- | --- | --- |

@@ -233,7 +233,8 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 .sls-operation-status[data-state="failed"] { border-color:#efc2c2; border-left-color:#c53030; background:#fff8f8; }
 .sls-operation-status[data-state="failed"] .sls-operation-status__icon { background:#fbe7e7; color:#b42318; }
 .sls-operation-status[data-state="complete"] .sls-operation-status__track,
-.sls-operation-status[data-state="failed"] .sls-operation-status__track { display:none; }
+.sls-operation-status[data-state="failed"] .sls-operation-status__track,
+.sls-operation-status[data-state="unconfirmed"] .sls-operation-status__track { display:none; }
 @keyframes sls-operation-progress {
 	0% { transform:translateX(-115%); }
 	50% { transform:translateX(80%); }
@@ -641,7 +642,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 								<div class="form-group">
 									<label><?php echo _('Allowed IPs/CIDRs'); ?></label>
 									<textarea class="form-control" name="control_api[ip_allowlist]" rows="3" placeholder="198.51.100.10&#10;203.0.113.0/24"><?php echo htmlspecialchars($control['ip_allowlist'] ?? ''); ?></textarea>
-									<p class="help-block"><?php echo _('Optional. One IPv4/IPv6 address or IPv4 CIDR per line. Leave disabled to allow any source with the API key.'); ?></p>
+									<p class="help-block"><?php echo _('Optional. One IPv4 or IPv6 address or CIDR per line. Leave disabled to allow any source with the API key.'); ?></p>
 								</div>
 							</div>
 						</div>
@@ -777,7 +778,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						<div class="row">
 							<div class="col-sm-6 col-md-3 form-group">
 								<label for="sls-update-pin"><?php echo _('Pinned version'); ?></label>
-								<input id="sls-update-pin" class="form-control" name="updates[pinned_version]" maxlength="19" placeholder="0.1.6-beta" value="<?php echo htmlspecialchars($updates['pinned_version'] ?? '', ENT_QUOTES, 'UTF-8'); ?>" aria-describedby="sls-update-pin-help">
+								<input id="sls-update-pin" class="form-control" name="updates[pinned_version]" maxlength="19" placeholder="0.1.7-beta" value="<?php echo htmlspecialchars($updates['pinned_version'] ?? '', ENT_QUOTES, 'UTF-8'); ?>" aria-describedby="sls-update-pin-help">
 								<p id="sls-update-pin-help" class="help-block"><?php echo _('Optional exact version. Leave blank for the newest eligible release. An older pin holds the current installation; it does not downgrade it.'); ?></p>
 							</div>
 							<div class="col-sm-6 col-md-3 form-group">
@@ -909,7 +910,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						</section>
 						<section class="sls-danger-action sls-danger-action--critical">
 							<h4><i class="fa fa-upload text-danger" aria-hidden="true"></i> <?php echo _('Replace Configuration'); ?></h4>
-							<p><?php echo _('Replacing the config file wipes the current module data and overwrites API keys, desktop clients, voices, announcement groups, NWS settings, schedules, and retention settings.'); ?></p>
+							<p><?php echo _('Replaces saved settings, including API keys, desktop clients, voices, announcement groups, weather settings, schedules, and retention. Delivery history and existing recordings are retained. Imported operators, automations, schedules, and enterprise features require review and re-enabling.'); ?></p>
 							<form method="post" enctype="multipart/form-data" class="sls-maintenance-form" data-maintenance-action="config" data-confirm="<?php echo htmlspecialchars(_('Replace the Mass Notifications config? This requires Apply Config to become live.'), ENT_QUOTES, 'UTF-8'); ?>">
 								<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
 								<input type="hidden" name="slsmassnotifyserver_action" value="import_config">
@@ -991,6 +992,20 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 }());
 (function() {
 	var updateProgress = document.getElementById('sls-update-progress');
+	var progressStopped = false, progressRequests = new Set();
+	var observationStarted = performance.now(), observationBudget = 60 * 60 * 1000;
+	window.addEventListener('pagehide', function() {
+		progressStopped = true;
+		progressRequests.forEach(function(controller) { controller.abort(); });
+	});
+	function operationStatus(url) {
+		var controller = new AbortController();
+		progressRequests.add(controller);
+		var timeout = window.setTimeout(function() { controller.abort(); }, 15000);
+		return fetch(url, { credentials: 'same-origin', cache: 'no-store', headers: { 'Accept': 'application/json' }, signal: controller.signal })
+			.then(function(response) { if (!response.ok) throw new Error('status request failed'); return response.json(); })
+			.finally(function() { window.clearTimeout(timeout); progressRequests.delete(controller); });
+	}
 	if (updateProgress && updateProgress.getAttribute('data-active') === '1') {
 		var updatePolls = 0;
 		var updateStatusUrl = updateProgress.getAttribute('data-status-url');
@@ -998,12 +1013,12 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 		var updateTitle = updateProgress.querySelector('.sls-operation-status__title');
 		var updateText = updateProgress.querySelector('.sls-operation-status__message');
 		function renderUpdateDisplay(state, message) {
-			var terminal = state === 'complete' || state === 'failed';
+			var terminal = state === 'complete' || state === 'failed' || state === 'unconfirmed';
 			updateProgress.hidden = false;
 			updateProgress.setAttribute('data-state', state);
 			updateProgress.setAttribute('aria-busy', terminal ? 'false' : 'true');
-			updateIcon.className = state === 'complete' ? 'fa fa-check' : (state === 'failed' ? 'fa fa-exclamation' : 'fa fa-cloud-download');
-			updateTitle.textContent = state === 'complete' ? 'Update complete' : (state === 'failed' ? 'Update needs attention' : 'Module update');
+			updateIcon.className = state === 'complete' ? 'fa fa-check' : (state === 'failed' ? 'fa fa-exclamation' : (state === 'unconfirmed' ? 'fa fa-question-circle' : 'fa fa-cloud-download'));
+			updateTitle.textContent = state === 'complete' ? 'Update complete' : (state === 'failed' ? 'Update needs attention' : (state === 'unconfirmed' ? 'Update status unavailable' : 'Module update'));
 			updateText.textContent = message || (state === 'complete' ? 'Update completed.' : (state === 'failed' ? 'Update failed.' : 'Checking update status...'));
 		}
 		function finishUpdateDisplay(state, message) {
@@ -1028,10 +1043,15 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 			}
 		}
 		function pollUpdateStatus() {
+			if (progressStopped) return;
+			if (performance.now() - observationStarted >= observationBudget) {
+				finishUpdateDisplay('unconfirmed', 'Update status could not be confirmed within one hour. The installer may still be running. Review the installer log or reload this page before retrying.');
+				return;
+			}
 			updatePolls += 1;
-			fetch(updateStatusUrl, { credentials: 'same-origin', cache: 'no-store', headers: { 'Accept': 'application/json' } })
-				.then(function(response) { if (!response.ok) throw new Error('status request failed'); return response.json(); })
+			operationStatus(updateStatusUrl)
 				.then(function(data) {
+					if (progressStopped) return;
 					var state = String(data.state || 'checking');
 					var message = String(data.message || 'Checking for update status...');
 					if (state === 'complete' || state === 'failed') {
@@ -1042,8 +1062,9 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 					window.setTimeout(pollUpdateStatus, 2000);
 				})
 				.catch(function() {
+					if (progressStopped) return;
 					if (updatePolls >= 300) {
-						finishUpdateDisplay('failed', 'Update status could not be confirmed. Check Notification Logs and try again.');
+						finishUpdateDisplay('unconfirmed', 'Update status could not be confirmed. The installer may still be running. Review its log and reload the page before retrying.');
 						return;
 					}
 					renderUpdateDisplay('checking', 'Update is running; waiting for the PBX interface to respond...');
@@ -1115,8 +1136,8 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 			maintenanceProgress.hidden = false;
 			maintenanceProgress.setAttribute('data-state', state);
 			maintenanceProgress.setAttribute('aria-busy', 'false');
-			maintenanceIcon.className = state === 'complete' ? 'fa fa-check' : 'fa fa-exclamation';
-			maintenanceTitle.textContent = state === 'complete' ? 'Maintenance complete' : 'Maintenance needs attention';
+			maintenanceIcon.className = state === 'complete' ? 'fa fa-check' : (state === 'failed' ? 'fa fa-exclamation' : 'fa fa-question-circle');
+			maintenanceTitle.textContent = state === 'complete' ? 'Maintenance complete' : (state === 'failed' ? 'Maintenance needs attention' : 'Maintenance status unavailable');
 			maintenanceText.textContent = message || (state === 'complete' ? 'Maintenance completed.' : 'Maintenance failed.');
 			cleanMaintenanceUrl();
 			if (state === 'complete' && expectedAction === 'repair') {
@@ -1124,10 +1145,15 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 			}
 		}
 		function pollMaintenanceStatus() {
+			if (progressStopped) return;
+			if (performance.now() - observationStarted >= observationBudget) {
+				finishMaintenanceDisplay('unconfirmed', 'Maintenance status could not be confirmed within one hour. The operation may still be running. Review its log or Module Admin before retrying.');
+				return;
+			}
 			maintenancePolls += 1;
-			fetch(maintenanceStatusUrl, { credentials: 'same-origin', cache: 'no-store', headers: { 'Accept': 'application/json' } })
-				.then(function(response) { if (!response.ok) throw new Error('status request failed'); return response.json(); })
+			operationStatus(maintenanceStatusUrl)
 				.then(function(data) {
+					if (progressStopped) return;
 					maintenanceFailures = 0;
 					var action = String(data.action || expectedAction || '');
 					var state = String(data.state || 'running');
@@ -1149,13 +1175,14 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 					window.setTimeout(pollMaintenanceStatus, 1500);
 				})
 				.catch(function() {
+					if (progressStopped) return;
 					maintenanceFailures += 1;
 					if (expectedAction === 'uninstall' && maintenanceFailures >= 3) {
-						finishMaintenanceDisplay('complete', 'The module interface is no longer available. Complete uninstall has likely finished; verify in Module Admin.');
+						finishMaintenanceDisplay('unconfirmed', 'The module interface is unavailable. Uninstall is not confirmed; check Module Admin or the installer log. An expired session or network failure can also prevent status checks.');
 						return;
 					}
 					if (maintenancePolls >= 400) {
-						finishMaintenanceDisplay('failed', 'Maintenance status could not be confirmed. Review Notification Logs before retrying.');
+						finishMaintenanceDisplay('unconfirmed', 'Maintenance status could not be confirmed. Review its log before retrying; the operation may still be running.');
 						return;
 					}
 					maintenanceProgress.setAttribute('data-state', 'running');
@@ -1226,7 +1253,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 	var refreshDevices = document.getElementById('sls-device-refresh');
 	if (refreshDevices) refreshDevices.addEventListener('click',function() {
 		refreshDevices.disabled = true; deviceStatus.textContent = 'Reading current registrations…';
-		fetch('config.php?display=slsmassnotifyserver&slsmassnotifyserver_action=device_inventory',{credentials:'same-origin',cache:'no-store'})
+        fetch('config.php?display=slsmassnotifyserver&slsmassnotifyserver_action=device_inventory',{credentials:'same-origin',cache:'no-store',signal:AbortSignal.timeout(15000)})
 		.then(function(response) { if (!response.ok) throw new Error(); return response.json(); }).then(function(data) {
 			devicePicker.innerHTML = ''; deviceInventory = {};
 			if (!data.success) { deviceStatus.textContent = data.message || 'Device discovery is unavailable.'; return; }
@@ -1460,7 +1487,20 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
  var phones = <?php echo json_encode($testProfilePhones, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
  var desktops = <?php echo json_encode($testProfileDesktops, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
  var profiles = <?php echo json_encode(array_values($settings['test_profiles'] ?? []), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
- var index = 0, busy = false, pollTimer = null;
+ var index = 0, busy = false, pollTimer = null, activeRequest = null, departed = false;
+ window.addEventListener('pagehide',function() { departed = true; if(pollTimer)window.clearTimeout(pollTimer); if(activeRequest)activeRequest.abort(); });
+ function checkRequest(url, options) {
+  var controller = new AbortController(); activeRequest = controller;
+  var timeout = window.setTimeout(function() { controller.abort(); },15000);
+  options = Object.assign({},options || {},{credentials:'same-origin',cache:'no-store',signal:controller.signal});
+  return fetch(url,options).then(function(response) {
+   if (!response.ok) throw new Error('check status unavailable');
+   return response.json();
+  }).finally(function() {
+   window.clearTimeout(timeout);
+   if (activeRequest === controller) activeRequest = null;
+  });
+ }
  function field(parent, title, name, values, selected, multiple) {
   var label = document.createElement('label'); label.textContent = title; parent.appendChild(label);
   var select = document.createElement('select'); select.className = 'form-control'; select.name = name;
@@ -1476,14 +1516,14 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
   busy = false; list.querySelectorAll('[data-profile-run]').forEach(function(button) { button.disabled = false; });
  }
  function poll(id, started) {
-  if (!document.body.contains(list)) return;
-  if (Date.now() - started > 900000) { finish({message:'Check is taking longer than expected. Review Dashboard delivery status before retrying.'}); return; }
-  fetch('config.php?display=slsmassnotifyserver&slsmassnotifyserver_action=announcement_job&job_id=' + encodeURIComponent(id), {credentials:'same-origin', cache:'no-store'})
-   .then(function(r) { if (!r.ok) throw new Error(); return r.json(); }).then(function(data) {
+  if (departed || !document.body.contains(list)) return;
+  if (performance.now() - started > 900000) { finish({message:'Check is taking longer than expected. Review Dashboard delivery status before retrying.'}); return; }
+  checkRequest('config.php?display=slsmassnotifyserver&slsmassnotifyserver_action=announcement_job&job_id=' + encodeURIComponent(id)).then(function(data) {
+    if (departed) return;
     status.textContent = data.message || 'Checking delivery…';
     if (data.state === 'queued' || data.state === 'running') pollTimer = window.setTimeout(function() { poll(id, started); },2000);
     else finish(data);
-   }).catch(function() { status.textContent = 'Waiting for delivery status. Do not resend yet.'; pollTimer = window.setTimeout(function() { poll(id, started); },3000); });
+   }).catch(function() { if (departed) return; status.textContent = 'Waiting for delivery status. Do not resend yet.'; pollTimer = window.setTimeout(function() { poll(id, started); },3000); });
  }
  function addProfile(profile) {
   if (list.children.length >= 10) return;
@@ -1505,14 +1545,13 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
    list.querySelectorAll('[data-profile-run]').forEach(function(button) { button.disabled=true; }); status.textContent='Queuing channel check…';
    var body=new FormData(); body.set('slsmassnotifyserver_action','run_test_profile'); body.set('profile_id',id.value);
    body.set('slsmassnotifyserver_csrf',document.querySelector('#sls-other-settings-form [name="slsmassnotifyserver_csrf"]').value);
-   fetch('config.php?display=slsmassnotifyserver',{method:'POST',credentials:'same-origin',body:body}).then(function(r) { if(!r.ok)throw new Error();return r.json(); })
-    .then(function(data) { if(data.queued && data.job_id) poll(data.job_id,Date.now()); else finish(data); })
-    .catch(function() { finish({message:'Request could not be confirmed. Check Dashboard status before trying again.'}); });
+   checkRequest('config.php?display=slsmassnotifyserver',{method:'POST',body:body})
+    .then(function(data) { if (departed) return; if(data.queued && data.job_id) poll(data.job_id,performance.now()); else finish(data); })
+    .catch(function() { if (!departed) finish({message:'Request could not be confirmed. Check Dashboard status before trying again.'}); });
   });
   var remove=document.createElement('button'); remove.type='button'; remove.className='btn btn-default btn-sm'; remove.style.marginLeft='8px'; remove.textContent='Remove';
   remove.addEventListener('click',function() { if(!busy) { row.remove();add.disabled=false; } }); row.appendChild(remove); list.appendChild(row); add.disabled=list.children.length>=10;
  }
  profiles.forEach(addProfile); add.addEventListener('click',function() { addProfile({}); });
- window.addEventListener('pagehide',function() { if(pollTimer)window.clearTimeout(pollTimer); });
 }());
 </script>

@@ -90,13 +90,15 @@ foreach (['getAvailableTones', 'getAvailablePiperVoices'] as $method) {
 $voiceDirectory = sys_get_temp_dir() . '/sls-ui-voices-' . bin2hex(random_bytes(8));
 mkdir($voiceDirectory, 0700);
 eval('class UiVoiceCatalogueFixture { const PIPER_VOICE_DIR = ' . var_export($voiceDirectory, true) . ';
+	const PIPER_VOICE_MAX_BYTES = 100000000; const PIPER_VOICE_METADATA_MAX_BYTES = 1048576;
     private function getPiperVoiceDownloads() { return ["en_US-lessac-low.onnx"=>"unused", "en_US-lessac-low.onnx.json"=>"unused", "es_ES-davefx-medium.onnx"=>"unused"]; }
     private function isValidPiperVoiceFile($path) {
         if (str_ends_with($path, ".onnx")) { throw new RuntimeException("The UI catalogue hashed a speech model."); }
         return $this->isPresentPiperVoiceFile($path) && hash_file("sha256", $path) === hash("sha256", "verified-config");
     }
 ' . $methodSource('getAvailablePiperVoices') . $methodSource('isPresentPiperVoiceFile') . '}');
-eval('class UiVoiceChecksumFixture {' . $methodSource('isPresentPiperVoiceFile') . $methodSource('isValidPiperVoiceFile') . '}');
+eval('class UiVoiceChecksumFixture { const PIPER_VOICE_MAX_BYTES = 100000000; const PIPER_VOICE_METADATA_MAX_BYTES = 1048576;'
+	. $methodSource('isPresentPiperVoiceFile') . $methodSource('isValidPiperVoiceFile') . '}');
 $catalogue = new UiVoiceCatalogueFixture();
 $model = $voiceDirectory . '/en_US-lessac-low.onnx';
 $configuration = $model . '.json';
@@ -144,6 +146,31 @@ try {
     rmdir($voiceDirectory);
 }
 
+eval('class UiVoiceSelectionFixture {
+    public function getAvailablePiperVoices() { return [
+        ["path"=>"/voices/ready.onnx","available"=>true],
+        ["path"=>"/voices/damaged.onnx","available"=>false],
+    ]; }
+' . $methodSource('piperVoiceCatalogueLookups') . $methodSource('resolvePiperVoiceInput') . '
+    public function choose(array $input, $current, array &$errors) {
+        [$known,$ready]=$this->piperVoiceCatalogueLookups();
+        return $this->resolvePiperVoiceInput($input,"voice",$current,"/voices/ready.onnx",$known,$ready,$errors,"fixture");
+    }
+}');
+$selection = new UiVoiceSelectionFixture();
+$errors = [];
+if ($selection->choose([], '/voices/damaged.onnx', $errors) !== '/voices/damaged.onnx' || $errors) {
+    ui_performance_fail('A temporarily unavailable saved voice was silently replaced during an unrelated save.');
+}
+$errors = [];
+if ($selection->choose(['voice'=>'/voices/damaged.onnx'], '/voices/ready.onnx', $errors) !== '/voices/ready.onnx' || count($errors) !== 1) {
+    ui_performance_fail('An explicitly selected unavailable voice was accepted or silently substituted.');
+}
+$errors = [];
+if ($selection->choose(['voice'=>'/voices/ready.onnx'], '/voices/damaged.onnx', $errors) !== '/voices/ready.onnx' || $errors) {
+    ui_performance_fail('An installed catalogue voice could not be selected.');
+}
+
 foreach (['getActiveSettings', 'getPendingSettings'] as $method) {
 	$body = $methodSource($method);
 	if (strpos($body, 'settingsCacheFingerprint') === false || strpos($body, 'normalizedSettingsCache') === false) {
@@ -161,8 +188,18 @@ if (strpos($writeBody, 'unset($this->normalizedSettingsCache[$path])') === false
 	ui_performance_fail('Successful settings writes do not invalidate the request cache and refresh the write fingerprint.');
 }
 $fingerprintBody = $methodSource('settingsCacheFingerprint');
-if (strpos($fingerprintBody, 'settingsFileFingerprint') === false) {
-	ui_performance_fail('Settings cache entries are not guarded by current on-disk fingerprints.');
+if (strpos($fingerprintBody, 'configurationPathMetadata') === false
+	|| strpos($fingerprintBody, 'settingsFileFingerprint') !== false
+	|| strpos($fingerprintBody, "['dev','ino','mode','uid','gid','nlink','size','mtime','ctime']") === false) {
+	ui_performance_fail('Settings cache entries must use current path metadata without rereading and hashing the encrypted config.');
+}
+foreach (['getActiveSettings', 'getPendingSettings'] as $method) {
+	$body = $methodSource($method);
+	$cacheReturn = $method === 'getActiveSettings' ? strpos($body, 'return $cached') : strpos($body, 'return is_array($cached');
+	$remember = strpos($body, 'rememberSettingsFingerprint');
+	if ($cacheReturn === false || ($remember !== false && $remember < $cacheReturn)) {
+		ui_performance_fail($method . ' rereads the protected file on a request-local cache hit.');
+	}
 }
 
 foreach (['getSipNotifyTargets', 'getAllPjsipExtensions', 'getRegisteredPjsipExtensions', 'getExtensionNameMap'] as $method) {
@@ -180,9 +217,21 @@ eval('namespace FreePBX\\modules; function exec($command, &$output=null, &$statu
     return false;
 }');
 $GLOBALS['sls_ui_probe_calls']=[];$GLOBALS['sls_ui_probe_failure']=false;
-$cache=$parent->getProperty('phoneInventoryCache');$cache->setValue($fixture,['available'=>true,'endpoints'=>['1000'=>[]]]);
+$cache=$parent->getProperty('phoneInventoryCache');$cache->setValue($fixture,['available'=>true,'observed_at'=>'2030-01-01T00:00:00+00:00','endpoints'=>['1000'=>[
+    'format'=>'yealink','formats'=>['yealink','cisco'],'user_agent'=>'Mixed phones','override'=>false,
+    'contacts'=>[
+        ['device_key'=>str_repeat('a',32),'format'=>'yealink','detected_format'=>'yealink','user_agent'=>'Yealink T48G','status'=>'Avail','override'=>false,'capability'=>'vendor_template','transport'=>'tls'],
+        ['device_key'=>str_repeat('b',32),'format'=>'cisco','detected_format'=>'cisco','user_agent'=>'Cisco 8841','status'=>'Avail','override'=>false,'capability'=>'vendor_template','transport'=>'tcp'],
+    ],
+]]]);
 if($invoke('getRegisteredPjsipExtensions')!==['1000']||$invoke('getRegisteredPjsipExtensions')!==['1000']||$GLOBALS['sls_ui_probe_calls']){
     ui_performance_fail('Display reads executed live discovery or lost cached registration.');
+}
+$detected=$invoke('getDetectedEndpointFormats');
+if(count($detected)!==1||count($detected[0]['devices']??[])!==2||($detected[0]['unknown']??-1)!==0
+    ||($detected[0]['devices'][0]['format']??'')!=='yealink'||($detected[0]['devices'][1]['format']??'')!=='cisco'
+    ||($detected[0]['devices'][0]['transport']??'')!=='tls'||($detected[0]['devices'][1]['transport']??'')!=='tcp'){
+    ui_performance_fail('Mixed phone contacts on one extension were collapsed, mislabeled, or lost transport metadata.');
 }
 $unavailable=(new ReflectionClass(UiPerformanceFixture::class))->newInstanceWithoutConstructor();$cache->setValue($unavailable,['available'=>false,'endpoints'=>[]]);
 $getRegistered=$parent->getMethod('getRegisteredPjsipExtensions');
@@ -194,5 +243,14 @@ if($invoke('getRegisteredPjsipExtensions')!==['1001']||count($GLOBALS['sls_ui_pr
 $GLOBALS['sls_ui_probe_failure']=true;
 try{$invoke('getRegisteredPjsipExtensions');ui_performance_fail('Failed current registration did not stop sending.');}catch(DomainException $expected){}
 if(str_contains($methodSource('getDetectedEndpointFormats'),'exec(')){ui_performance_fail('Phone diagnostics started a live inventory subprocess.');}
+
+$integrationStateMethod=$parent->getMethod('getEnterpriseIntegrationState');
+$integrationSource=file($integrationStateMethod->getFileName());
+if(!is_array($integrationSource)){ui_performance_fail('Unable to inspect the Enterprise Integrations controller.');}
+$integrationBody=implode('',array_slice($integrationSource,$integrationStateMethod->getStartLine()-1,
+    $integrationStateMethod->getEndLine()-$integrationStateMethod->getStartLine()+1));
+if(substr_count($integrationBody,'$this->getActiveSettings()')!==1){
+    ui_performance_fail('Enterprise Integrations state rendering repeats protected configuration reads.');
+}
 
 echo "UI performance contract tests passed.\n";

@@ -6,9 +6,17 @@ import pwd
 import re
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
+
+if os.environ.get('SLS_TEST_NAMESPACE') != 'entered' or any(
+    os.environ.get('SLS_TEST_PARENT_' + label + '_NS') in
+    (None, '', os.readlink('/proc/self/ns/' + kind))
+    for label, kind in [('MOUNT', 'mnt'), ('NET', 'net'), ('PID', 'pid')]
+):
+    raise SystemExit('Use the private fixture runner; no spool or permission changes were made.')
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT/'tools/install_release.sh').read_text()
@@ -28,11 +36,11 @@ source "$1"
 fixture="$2"; CONFIG_FILE="$fixture/config"; SLS_MASS_NOTIFY_INVENTORY_ONLY=1
 bootstrap_resource_capacity() { printf '{"requirements":{}}'; }
 select_install_temp_root() { INSTALL_TEMP_ROOT="$fixture"; }
-download_tgz() { printf 'download\n' >>"$fixture/trace"; }
+download_tgz() { DOWNLOAD_DIR="$fixture/download"; mkdir "$DOWNLOAD_DIR"; printf 'download\n' >>"$fixture/trace"; }
 verify_tgz() { printf 'verified\n' >>"$fixture/trace"; }
-stage_module_directory() { printf 'staged\n' >>"$fixture/trace"; }
-prepare_installer_bootstrap() { printf 'bootstrap\n' >>"$fixture/trace"; }
-prepare_authenticated_installer() { printf 'approved\n' >>"$fixture/trace"; UPGRADE_TRUST_DIR="$fixture/evidence"; }
+stage_module_directory() { STAGING_DIR="$fixture/stage"; mkdir "$STAGING_DIR"; printf 'staged\n' >>"$fixture/trace"; }
+prepare_installer_bootstrap() { INSTALL_BOOTSTRAP_DIR="$fixture/bootstrap"; mkdir "$INSTALL_BOOTSTRAP_DIR"; printf 'bootstrap\n' >>"$fixture/trace"; }
+prepare_authenticated_installer() { printf 'approved\n' >>"$fixture/trace"; UPGRADE_TRUST_DIR="$fixture/evidence"; mkdir "$UPGRADE_TRUST_DIR"; }
 for forbidden in ensure_installer_log_prerequisites acquire_update_coordination acquire_maintenance_coordination require_freepbx fwconsole install_dependencies initialize_configuration_keyring acquire_worker_coordination acquire_settings_coordination record_install_failure commit_authenticated_installer protect_freepbx_chown_permissions repair_authenticated_legacy_permissions restore_previous_phone_collector; do
  eval "$forbidden() { printf 'forbidden' >\"\$fixture/forbidden\"; return 99; }"
 done
@@ -43,6 +51,37 @@ main
             self.assertFalse((root/'forbidden').exists())
             self.assertEqual((root/'trace').read_text().splitlines(), ['download','verified','staged','bootstrap','approved'])
             self.assertEqual((root/'freepbx.conf').read_text(), 'inspection sentinel')
+            self.assertTrue((root/'evidence').is_dir())
+            self.assertFalse((root/'download').exists())
+            self.assertFalse((root/'stage').exists())
+            self.assertFalse((root/'bootstrap').exists())
+
+    def test_failed_inspection_removes_transient_release_workspaces(self):
+        with tempfile.TemporaryDirectory(dir='/run') as name:
+            root = Path(name)
+            (root/'freepbx.conf').write_text('inspection sentinel')
+            (root/'framework').mkdir(); (root/'framework/module.xml').write_text('<module/>')
+            installer = root/'installer.sh'
+            installer.write_text(SOURCE.replace('/etc/freepbx.conf', str(root/'freepbx.conf'))
+                .replace('/var/www/html/admin/modules/framework', str(root/'framework')))
+            harness = r'''
+source "$1"
+fixture="$2"; CONFIG_FILE="$fixture/config"; SLS_MASS_NOTIFY_INVENTORY_ONLY=1
+bootstrap_resource_capacity() { printf '{"requirements":{}}'; }
+select_install_temp_root() { INSTALL_TEMP_ROOT="$fixture"; }
+download_tgz() { DOWNLOAD_DIR="$fixture/download"; mkdir "$DOWNLOAD_DIR"; }
+verify_tgz() { :; }
+stage_module_directory() { STAGING_DIR="$fixture/stage"; mkdir "$STAGING_DIR"; }
+prepare_installer_bootstrap() { INSTALL_BOOTSTRAP_DIR="$fixture/bootstrap"; mkdir "$INSTALL_BOOTSTRAP_DIR"; }
+prepare_authenticated_installer() { UPGRADE_TRUST_DIR="$fixture/evidence"; mkdir "$UPGRADE_TRUST_DIR"; return 23; }
+main
+'''
+            result = subprocess.run(['bash','-c',harness,'fixture',str(installer),str(root)], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
+            self.assertTrue((root/'evidence').is_dir())
+            self.assertFalse((root/'download').exists())
+            self.assertFalse((root/'stage').exists())
+            self.assertFalse((root/'bootstrap').exists())
 
     def test_optional_repairs_follow_approval_and_recovery(self):
         main = SOURCE.split('main() {',1)[1].split('\nif [[',1)[0]
@@ -208,6 +247,46 @@ main
             self.assertEqual((sentinel.stat().st_uid,sentinel.stat().st_mode),(before.st_uid,before.st_mode))
             self.assertEqual((spool/'tmp').stat().st_uid,0)
             (spool/'outgoing').unlink()
+
+    def test_spool_unknown_metadata_is_preserved_without_partial_repair(self):
+        self.assertEqual(os.environ.get('SLS_TEST_NAMESPACE'), 'entered')
+        spool = Path('/var/spool/asterisk')
+        for unsafe in ('foreign_group', 'world_writable'):
+            with self.subTest(unsafe=unsafe):
+                for child in ('tmp', 'outgoing', 'outgoing_done'):
+                    path = spool/child
+                    if path.is_symlink(): path.unlink()
+                    elif path.exists(): shutil.rmtree(path)
+                    path.mkdir(mode=0o700)
+                suspect = spool/'outgoing_done'
+                if unsafe == 'foreign_group': os.chown(suspect, 0, 65000)
+                else: suspect.chmod(0o777)
+                before = {child: (spool/child).stat() for child in ('tmp', 'outgoing', 'outgoing_done')}
+                result = subprocess.run(['bash', '-c', 'source "$1"; secure_asterisk_spool', 'fixture', str(ROOT/'tools/install_release.sh')], capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                for child, old in before.items():
+                    current = (spool/child).stat()
+                    self.assertEqual((current.st_ino, current.st_uid, current.st_gid, current.st_mode), (old.st_ino, old.st_uid, old.st_gid, old.st_mode))
+        shutil.rmtree(spool/'tmp')
+        (spool/'outgoing_done').chmod(0o777)
+        result = subprocess.run(['bash', '-c', 'source "$1"; secure_asterisk_spool', 'fixture', str(ROOT/'tools/install_release.sh')], capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((spool/'tmp').exists(), 'Unsafe existing spool metadata caused another directory to be created')
+
+    def test_spool_recognized_layout_preserves_directory_inodes(self):
+        self.assertEqual(os.environ.get('SLS_TEST_NAMESPACE'), 'entered')
+        spool = Path('/var/spool/asterisk'); account = pwd.getpwnam('asterisk')
+        for child in ('tmp', 'outgoing', 'outgoing_done'):
+            path = spool/child
+            if path.is_symlink(): path.unlink()
+            elif path.exists(): shutil.rmtree(path)
+            path.mkdir(mode=0o755); os.chown(path, 0, 0)
+        before = {child: (spool/child).stat().st_ino for child in ('tmp', 'outgoing', 'outgoing_done')}
+        result = subprocess.run(['bash', '-c', 'source "$1"; secure_asterisk_spool', 'fixture', str(ROOT/'tools/install_release.sh')], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for child, mode in (('tmp', 0o775), ('outgoing', 0o775), ('outgoing_done', 0o750)):
+            current = (spool/child).stat()
+            self.assertEqual((current.st_ino, current.st_uid, current.st_gid, stat.S_IMODE(current.st_mode)), (before[child], account.pw_uid, account.pw_gid, mode))
 
 
 if __name__ == '__main__': unittest.main()

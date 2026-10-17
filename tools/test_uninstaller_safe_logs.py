@@ -63,7 +63,7 @@ class UninstallerProtectedFiles(unittest.TestCase):
         result = self.run_shell('prepare_uninstall_logs\nprintf "module output\\n" >>"$MODULE_UNINSTALL_LOG"\nprintf "stock output\\n" >>"$STOCK_RESTORE_LOG"\n')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.module_log.read_text(), "module output\n")
-        self.assertEqual(self.stock_log.read_text(), "previous log\nstock output\n")
+        self.assertEqual(self.stock_log.read_text(), "stock output\n")
         self.assert_protected(self.module_log)
         self.assert_protected(self.stock_log)
 

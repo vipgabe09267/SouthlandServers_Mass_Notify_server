@@ -59,8 +59,14 @@ try {
     $action=$post?($_POST['portal_action']??''):'';
     $finish=static function(array $account) use($now,$module): void {
         if (!\SLS\MassNotify\OperatorAuth::ready($account)) { throw new DomainException('Finish your password and authenticator setup before signing in.'); }
+        $federation=$_SESSION['portal_pending']['enterprise_identity']??null;
+        if ($federation!==null && (!is_array($federation) || empty($_SESSION['portal_pending']['mfa_passed'])
+            || !\SLS\MassNotify\EnterpriseIdentity::current($module->getActiveSettings(),$federation,$account['id'],$now))) {
+            throw new DomainException('Enterprise sign-in expired or changed. Start again and verify your authenticator.');
+        }
         if (!session_regenerate_id(true)) { throw new RuntimeException('portal_session_rotation_failed'); }
         $_SESSION=[]; $_SESSION['portal_identity']=OperatorPortal::binding($account,$now); OperatorPortal::csrf($_SESSION);
+        if ($federation!==null) { $_SESSION['portal_identity']['enterprise_identity']=$federation; }
         $module->operatorSecurityEvent('operator_sign_in_completed',$account);
         header('Location: '.OperatorPortal::BASE,true,303); exit;
     };
@@ -139,7 +145,9 @@ try {
         $account=$module->portalAccount($pending['username']??'');
         if (!$account || $account['id']!==($pending['id']??'') || !is_int($pending['started_at']??null)
             || $now<$pending['started_at'] || $now-$pending['started_at']>=300
-            || !hash_equals(\SLS\MassNotify\OperatorAuth::identity($account),$pending['identity']??'')) {
+            || !hash_equals(\SLS\MassNotify\OperatorAuth::identity($account),$pending['identity']??'')
+            || (isset($pending['enterprise_identity']) && (!is_array($pending['enterprise_identity'])
+                || !\SLS\MassNotify\EnterpriseIdentity::current($settings,$pending['enterprise_identity'],$account['id'],$now)))) {
             unset($_SESSION['portal_pending']); $pending=null; $account=null;
             $error='Sign-in setup expired or this login changed. Start again.'; http_response_code(401);
         } else {
@@ -237,8 +245,7 @@ try {
         if ($json) {
             $action=$_POST['slsmassnotifyserver_action']; $raw=$_POST['payload'] ?? null;
             if (!is_string($action) || !is_string($raw) || strlen($raw)>65536) { throw new DomainException('The request is missing or exceeds 64 KiB.'); }
-            if (!(json_decode($raw,false,16,JSON_THROW_ON_ERROR) instanceof \stdClass)) { throw new DomainException('The portal requires an object request.'); }
-            $input=json_decode($raw,true,16,JSON_THROW_ON_ERROR);
+            $input=ApiSecurity::jsonObject($raw,false,16);
             if ($view==='access') {
                 if(!in_array($action,['save_access','generate_reset_link','revoke_reset_link'],true)){throw new DomainException('Unsupported operator-access action.');}
                 $result=$action==='save_access'?$module->saveOperatorAccess($input):$module->manageOperatorPasswordReset($action,$input);

@@ -2,12 +2,12 @@
 """Scope, revocation and proxy regressions against actual PHP API entry points."""
 import json
 import hashlib
+import fcntl
 import os
 from pathlib import Path
 import re
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -16,6 +16,13 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / 'slsmassnotifyserver/api/sls-mass-notify/security.php'
+
+
+def require_private_network():
+    if os.environ.get('SLS_TEST_NAMESPACE') != 'entered' or os.environ.get(
+        'SLS_TEST_PARENT_NET_NS'
+    ) in (None, '', os.readlink('/proc/self/ns/net')):
+        raise RuntimeError('API security fixtures require a verified private network namespace.')
 
 
 class ApiSecurityTests(unittest.TestCase):
@@ -45,6 +52,74 @@ class ApiSecurityTests(unittest.TestCase):
             'name': 'Fixture credential', 'scopes': list(scopes),
             'audience': dict(unrestricted=unrestricted, **audience)}) + '));')
 
+    def test_strict_json_preserves_long_text_and_rejects_ambiguous_members(self):
+        result = self.php(r'''
+            $valid = ['text'=>str_repeat('"',50000) . ' { [ : } ]','nested'=>['same'=>'one'],'other'=>['same'=>'two']];
+            $decoded = Security::jsonObject(json_encode($valid));
+            $rejected = 0;
+            foreach (['{"x":1,"x":2}', '{"x":1,"\\u0078":2}', '{"x":{"a":1,"a":2}}',
+                '{"rows":[{"a":1,"\\u0061":2}]}', '{"x":1e9999}', '[]'] as $raw) {
+                try { Security::jsonObject($raw); } catch (Throwable $error) { $rejected++; }
+            }
+            echo json_encode(['preserved'=>$decoded===$valid,'empty'=>Security::jsonObject('{}')===[],
+                'legacy'=>Security::jsonObject('[]',true)===[],'rejected'=>$rejected]);
+        ''')
+        self.assertEqual(result, {'preserved': True, 'empty': True, 'legacy': True, 'rejected': 6})
+
+    def test_module_and_deployed_api_helpers_share_classes_in_either_load_order(self):
+        deployed = self.directory / 'deployed-api'
+        deployed.mkdir()
+        names = ['security.php', 'event-log.php', 'contract.php', 'config-crypto.php', 'media-policy.php']
+        for name in names:
+            (deployed / name).write_bytes((HELPER.parent / name).read_bytes())
+        program = r'''
+            interface BMO {}
+            $module=$argv[1];$deployed=$argv[2];$order=$argv[3];
+            $helpers=['security.php','event-log.php','contract.php','config-crypto.php','media-policy.php'];
+            $load=static function($root)use($helpers){foreach($helpers as $name){require_once $root.'/'.$name;}};
+            if($order==='api-first'){$load($deployed);}
+            require_once $module.'/Slsmassnotifyserver.class.php';
+            $first=(new ReflectionClass(\SLS\MassNotify\ApiSecurity::class))->getFileName();
+            $load($deployed);$load($module.'/api/sls-mass-notify');
+            $rejected=0;
+            try{\SLS\MassNotify\ApiSecurity::jsonObject('{"same":1,"same":2}');}catch(InvalidArgumentException $error){$rejected++;}
+            try{\SLS\MassNotify\MediaAccess::normalize(['network_restricted'=>true,'allowed_cidrs'=>['0.0.0.0/0']]);}catch(DomainException $error){$rejected++;}
+            echo json_encode(['same_definition'=>$first===(new ReflectionClass(\SLS\MassNotify\ApiSecurity::class))->getFileName(),
+                'api_first'=>$first===$deployed.'/security.php','rejected'=>$rejected,
+                'classes'=>class_exists(\SLS\MassNotify\EventLog::class,false)&&class_exists(\SLS\MassNotify\ControlContract::class,false),
+                'scopes'=>\SLS\MassNotify\ApiSecurity::SCOPES]);
+        '''
+        for order in ['module-first', 'api-first']:
+            with self.subTest(order=order):
+                result = subprocess.run(['php', '-r', program, str(ROOT / 'slsmassnotifyserver'),
+                                         str(deployed), order], capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stderr, '')
+                self.assertEqual(json.loads(result.stdout), {'same_definition': True, 'api_first': order == 'api-first',
+                    'rejected': 2, 'classes': True, 'scopes': ['read', 'send', 'test', 'config']})
+
+    def test_weather_cli_guard_rejects_http_before_loading_runtime_dependencies(self):
+        self.start_api()
+        runtime = ROOT / 'slsmassnotifyserver/bin/sls_mass_notify'
+        marker = self.directory / 'unexpected-runtime-load'
+        dependency = self.directory / 'private-permission-fixture.php'
+        dependency.write_text('<?php file_put_contents(' + json.dumps(str(marker)) + ', "loaded");')
+        source = (runtime / 'sls_api_test_guard.php').read_text()
+        original = "require_once '/var/www/html/admin/modules/slsmassnotifyserver/ApiPermissionGuards.php';"
+        self.assertEqual(source.count(original), 1)
+        source = source.replace(original, 'require_once ' + json.dumps(str(dependency)) + ';')
+        (self.directory / 'sls_config_crypto.php').write_bytes((runtime / 'sls_config_crypto.php').read_bytes())
+        (self.directory / 'index.php').write_text(source)
+        try:
+            with urllib.request.urlopen(self.url, timeout=5) as response:
+                status = response.status
+                response.read()
+        except urllib.error.HTTPError as error:
+            status = error.code
+            error.read()
+        self.assertEqual(status, 404)
+        self.assertFalse(marker.exists(), 'HTTP entered the private runtime bootstrap')
+
     @staticmethod
     def php_value(value):
         return 'json_decode(' + json.dumps(json.dumps(value)) + ',true)'
@@ -57,6 +132,7 @@ class ApiSecurityTests(unittest.TestCase):
         (self.directory / 'settings.json').chmod(0o640)
 
     def start_api(self, desktop=False):
+        require_private_network()
         api = ROOT / ('slsmassnotifyserver/api/sipnotify/index.php' if desktop else 'slsmassnotifyserver/api/sls-mass-notify/index.php')
         source = api.read_text().replace("dirname(__DIR__) . '/sls-mass-notify/security.php'", json.dumps(str(HELPER)))
         source = source.replace("__DIR__ . '/event-log.php'", json.dumps(str(ROOT / 'slsmassnotifyserver/api/sls-mass-notify/event-log.php')))
@@ -81,6 +157,17 @@ class ApiSecurityTests(unittest.TestCase):
                 return new class {
                     public function __call($name, $arguments) {
                         file_put_contents(__DIR__ . '/module-calls.jsonl', json_encode([$name,$arguments])."\\n",FILE_APPEND);
+                        if ($name==='getDeploymentReadiness') {
+                            $available=0;
+                            for ($slot=0;$slot<4;$slot++) {
+                                $path=dirname(CONTROL_API_RATE_FILE).'/control-api-preauth-'.$slot.'.lock';
+                                if (!is_file($path)) { $available++; continue; }
+                                $handle=fopen($path,'r+b');
+                                if (flock($handle,LOCK_EX|LOCK_NB)) { $available++; }
+                                fclose($handle);
+                            }
+                            return ['success'=>true,'method'=>$name,'arguments'=>$arguments,'available_request_slots'=>$available];
+                        }
                         return ['success'=>true,'method'=>$name,'arguments'=>$arguments];
                     }
                 };
@@ -129,10 +216,15 @@ class ApiSecurityTests(unittest.TestCase):
             $control['credentials']=Security::revoke($control['credentials'],$a['credential']['id']);
             $once=$control['credentials'];$control['credentials']=Security::revoke($once,$a['credential']['id']);
             $bad=$a['credential'];$bad['scopes'][]='administrator';
+            $duplicate=$a['credential'];$duplicate['id']='api_'.str_repeat('f',24);$duplicateRejected=false;
+            try{Security::credentials([$a['credential'],$duplicate]);}catch(DomainException $error){$duplicateRejected=true;}
+            $badDate=$a['credential'];$badDate['created_at']='2026-02-30T12:00:00+00:00';$badDateRejected=false;
+            try{Security::credentials([$badDate]);}catch(DomainException $error){$badDateRejected=true;}
             echo json_encode(['unique'=>$a['secret']!==$b['secret'],'stored'=>strpos(json_encode($a['credential']),$a['secret'])===false,
               'digest'=>$a['credential']['secret_hash']===hash('sha256',$a['secret']), 'id'=>$before['id'],
               'revoked'=>Security::authenticate($control,$a['secret'])===null,'idempotent'=>$once===$control['credentials'],
-              'unknown_scope'=>Security::authenticate(['credentials'=>[$bad]],$a['secret'])===null]);
+              'unknown_scope'=>Security::authenticate(['credentials'=>[$bad]],$a['secret'])===null,
+              'duplicate_secret'=>$duplicateRejected,'calendar_date'=>$badDateRejected]);
         ''')
         self.assertTrue(all(value for key, value in result.items() if key != 'id'))
         self.assertRegex(result['id'], r'^api_[a-f0-9]{24}$')
@@ -145,9 +237,9 @@ class ApiSecurityTests(unittest.TestCase):
                   ['scopes'=>['send'],'audience'=>['unrestricted'=>false,'extensions'=>['1000x']]],
                   ['scopes'=>[],'audience'=>['unrestricted'=>true]]];$count=0;
             foreach($bad as $input){try{Security::issue(['name'=>'Fixture']+$input);}catch(DomainException $e){$count++;}}
-            echo json_encode($count);
+            echo json_encode(['count'=>$count,'malformed_operator'=>Security::currentCredential(['operator_access'=>'broken'],'operator_fixture')===null]);
         ''')
-        self.assertEqual(result, 5)
+        self.assertEqual(result, {'count': 5, 'malformed_operator': True})
 
     def test_actual_control_entry_enforces_scope_and_revocation_before_actions(self):
         issued = self.issue()
@@ -278,6 +370,13 @@ class ApiSecurityTests(unittest.TestCase):
         self.assertTrue(body['ok'])
         self.assertEqual(body['resource'], 'readiness')
         self.assertEqual(body['method'], 'getDeploymentReadiness')
+        self.assertEqual(body['available_request_slots'], 3, 'Authenticated module work released its concurrency lease too early.')
+        for slot in range(4):
+            path = self.directory / f'control-api-preauth-{slot}.lock'
+            if not path.exists():
+                continue
+            with path.open('r+b') as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         calls = [json.loads(row) for row in (self.directory/'module-calls.jsonl').read_text().splitlines()]
         self.assertEqual(calls, [['getDeploymentReadiness', []]])
 
@@ -314,10 +413,13 @@ class ApiSecurityTests(unittest.TestCase):
             $spoof=$base;$spoof['REMOTE_ADDR']='203.0.113.1';
             $bad=$base;$bad['HTTP_X_FORWARDED_FOR']='127.0.0.1';$bad['HTTP_X_FORWARDED_PROTO']='http';
             $malformed=$base;$malformed['HTTP_X_FORWARDED_PROTO']='http,https';
+            $typed=Security::requestNetwork(['REMOTE_ADDR'=>['127.0.0.1'],'HTTPS'=>[]],$settings);
+            $forwardedType=$base;$forwardedType['HTTP_X_FORWARDED_FOR']=[];
             echo json_encode([$valid,Security::requestNetwork($spoof,$settings),Security::requestNetwork($bad,$settings),
                 Security::requestNetwork($malformed,$settings),Security::requestNetwork(['REMOTE_ADDR'=>'127.0.0.1'],[]),
                 Security::requestNetwork(['REMOTE_ADDR'=>'127.0.0.1'],$settings),
-                Security::inCidr('2001:db8:1234::1','2001:db8::/32'),Security::inCidr('2001:db9::1','2001:db8::/32')]);
+                Security::inCidr('2001:db8:1234::1','2001:db8::/32'),Security::inCidr('2001:db9::1','2001:db8::/32'),
+                $typed,Security::requestNetwork($forwardedType,$settings)]);
         ''')
         self.assertEqual(result[0]['ip'], '198.51.100.3')
         self.assertTrue(result[0]['https'])
@@ -328,7 +430,9 @@ class ApiSecurityTests(unittest.TestCase):
         self.assertEqual(result[3]['error'], 'invalid_forwarded_headers')
         self.assertTrue(result[4]['loopback'])
         self.assertFalse(result[5]['loopback'])
-        self.assertEqual(result[6:], [True, False])
+        self.assertEqual(result[6:8], [True, False])
+        self.assertEqual(result[8]['error'], 'invalid_remote_address')
+        self.assertEqual(result[9]['error'], 'invalid_forwarded_headers')
 
     def test_actual_control_proxy_https_and_ip_allowlist_use_client(self):
         self.write_config(control_api={'enabled': True, 'api_key': 'legacy-example-key-1234567890',
@@ -397,12 +501,6 @@ class ApiSecurityTests(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    # The real HTTP fixtures need loopback, but must never alter the host's
-    # interface state or have a route to any real notification destination.
-    if 'SLS_API_SECURITY_PARENT_NET' not in os.environ:
-        os.environ['SLS_API_SECURITY_PARENT_NET'] = os.readlink('/proc/self/ns/net')
-        os.execvp('unshare', ['unshare', '--net', sys.executable, __file__])
-    if os.environ['SLS_API_SECURITY_PARENT_NET'] == os.readlink('/proc/self/ns/net'):
-        raise SystemExit('API security fixtures require a private network namespace.')
+    require_private_network()
     subprocess.run(['ip', 'link', 'set', 'dev', 'lo', 'up'], check=True)
     unittest.main()

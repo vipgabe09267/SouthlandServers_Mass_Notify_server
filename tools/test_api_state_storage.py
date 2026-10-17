@@ -2,6 +2,8 @@
 """Exercise API filesystem failures in private files, without production access."""
 import json
 import fcntl
+import os
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 import subprocess
@@ -18,7 +20,25 @@ function fopen($path, $mode, ...$args) {
     if (($GLOBALS['swap_fifo'] ?? '') === $path && $mode === 'r+b') {
         unset($GLOBALS['swap_fifo']); unlink($path); posix_mkfifo($path, 0600);
     }
+    if (($GLOBALS['swap_journal_fifo'] ?? '') === $path && $mode === 'c+b') {
+        unset($GLOBALS['swap_journal_fifo']); unlink($path); posix_mkfifo($path, 0600);
+    }
     return \fopen($path, $mode, ...$args);
+}
+function file_get_contents($path, ...$args) {
+    if (($GLOBALS['grow_ack'] ?? '') === $path) {
+        unset($GLOBALS['grow_ack']);
+        \file_put_contents($path, str_repeat(' ', 2097153), FILE_APPEND);
+    }
+    return \file_get_contents($path, ...$args);
+}
+function stream_get_contents($handle, ...$args) {
+    $path=stream_get_meta_data($handle)['uri'] ?? '';
+    if (($GLOBALS['grow_ack_stream'] ?? '') === $path) {
+        unset($GLOBALS['grow_ack_stream']);
+        \file_put_contents($path, str_repeat(' ', 2097153), FILE_APPEND);
+    }
+    return \stream_get_contents($handle, ...$args);
 }
 function fwrite($handle, $data, ...$args) {
     $uri = stream_get_meta_data($handle)['uri'] ?? '';
@@ -84,6 +104,64 @@ class ApiStateStorageTests(unittest.TestCase):
         return ("desktop_auth_attempt_allowed('192.0.2.1','alice',true,1800000000)" if kind == 'desktop'
                 else "control_rate_allowed(['rate_limit_enabled'=>1,'rate_limit_per_minute'=>2],'192.0.2.1')")
 
+    def test_ack_reader_does_not_reopen_checked_path_with_unbounded_read(self):
+        result, error = self.fixture('desktop', r'''
+            mkdir(DESKTOP_ACK_DIRECTORY, 0750);
+            $path=DESKTOP_ACK_DIRECTORY.'/'.hash('sha256','id:device-a').'.json';
+            file_put_contents($path,'{"schema":1,"acknowledgements":{}}'); chmod($path,0640);
+            $GLOBALS['grow_ack']=$path;
+            $ok=record_desktop_acknowledgement([],['client_id'=>'device-a','username'=>'alice'],['id'=>'new']);
+            echo json_encode(['ok'=>$ok,'path_reopened'=>!isset($GLOBALS['grow_ack'])]);
+        ''')
+        self.assertEqual(error, '')
+        self.assertEqual(result, {'ok': True, 'path_reopened': False})
+
+    def test_ack_rejects_duplicate_history_and_preserves_it(self):
+        result, error = self.fixture('desktop', r'''
+            mkdir(DESKTOP_ACK_DIRECTORY, 0750);
+            $path=DESKTOP_ACK_DIRECTORY.'/'.hash('sha256','id:device-a').'.json';
+            $raw='{"schema":1,"acknowledgements":{"prior":{"event_id":"prior","ack_at":"2027-01-15T08:00:00Z"}},"acknowledgements":{}}';
+            file_put_contents($path,$raw); chmod($path,0640);
+            $ok=record_desktop_acknowledgement([],['client_id'=>'device-a','username'=>'alice'],['id'=>'new']);
+            echo json_encode(['ok'=>$ok,'preserved'=>file_get_contents($path)===$raw]);
+        ''')
+        self.assertEqual(error, '')
+        self.assertEqual(result, {'ok': False, 'preserved': True})
+
+    def test_ack_bounds_growth_and_rejects_raced_fifo(self):
+        for attack in ('growth', 'fifo', 'writable', 'public'):
+            with self.subTest(attack=attack):
+                self.reset()
+                setup = {
+                    'growth': "$GLOBALS['grow_ack_stream']=$path;",
+                    'fifo': "$GLOBALS['swap_journal_fifo']=$path;",
+                    'writable': "chmod($path,0660);",
+                    'public': "chmod($path,0644);",
+                }[attack]
+                result, error = self.fixture('desktop', r'''
+                    if (!is_dir(DESKTOP_ACK_DIRECTORY)) { mkdir(DESKTOP_ACK_DIRECTORY,0750); }
+                    $path=DESKTOP_ACK_DIRECTORY.'/'.hash('sha256','id:device-a').'.json';
+                    @unlink($path);
+                    file_put_contents($path,'{"schema":1,"acknowledgements":{}}'); chmod($path,0640);
+                ''' + setup + r'''
+                    $ok=record_desktop_acknowledgement([],['client_id'=>'device-a','username'=>'alice'],['id'=>'new']);
+                    clearstatcache(true,$path);
+                    echo json_encode(['ok'=>$ok,'kind'=>filetype($path),'size'=>filesize($path)]);
+                ''')
+                self.assertEqual(error, '')
+                self.assertFalse(result['ok'])
+                self.assertEqual(result['kind'], 'fifo' if attack == 'fifo' else 'file')
+                if attack == 'growth': self.assertGreater(result['size'], 2097152)
+
+    def test_duplicate_routing_member_in_event_journal_is_preserved(self):
+        result, error = self.fixture('desktop', r'''
+            file_put_contents(EVENTS_FILE,'{"id":"same","desktop_recipients":["alice"],"desktop_recipients":["bob"]}' . "\n");
+            retained_events([]);
+        ''')
+        self.assertEqual(error, '')
+        self.assertEqual(result['error'], 'journal_corrupt')
+        self.assertIn('"desktop_recipients":["alice"]', (self.directory/'events.jsonl').read_text())
+
     def reset(self):
         for path in self.directory.iterdir():
             if path.is_file() or path.is_symlink() or path.name.endswith('.json'):
@@ -95,6 +173,19 @@ class ApiStateStorageTests(unittest.TestCase):
         second = self.control[self.control.index(start):self.control.index('function control_rate_allowed(')]
         self.assertEqual(first, second)
 
+    def test_bounded_large_journal_parser_does_not_retain_two_decoded_trees(self):
+        path=self.directory/'large-journal.json'
+        rows={f'occ_{i}':{'occurrence_id':f'occ_{i}','state':'success','schedule_id':'scheduled',
+            'run_at_utc':'2026-10-13T12:00:00Z','message':'x'*160} for i in range(30000)}
+        path.write_text(json.dumps({'version':1,'occurrences':rows},separators=(',',':')))
+        result, error=self.fixture('desktop', "ini_set('memory_limit','64M'); $raw=file_get_contents("
+            +json.dumps(str(path))+r'''); $data=\SLS\MassNotify\ApiSecurity::jsonObject($raw);
+            echo json_encode(['count'=>count($data['occurrences']),
+                'last'=>$data['occurrences']['occ_29999']['state'],'peak'=>memory_get_peak_usage(true)]);
+        ''')
+        self.assertEqual(error,''); self.assertEqual(result['count'],30000); self.assertEqual(result['last'],'success')
+        self.assertLess(result['peak'],64*1024*1024)
+
     def test_fresh_state_and_real_linux_file_directory_fsync(self):
         for kind in ('desktop', 'control'):
             self.reset()
@@ -104,6 +195,22 @@ class ApiStateStorageTests(unittest.TestCase):
             self.assertEqual(error, '')
             self.assertEqual(list(self.directory.glob('.sls-api-state-*')), [])
 
+    def test_state_rejects_group_or_publicly_writable_leaf_directory(self):
+        original_mode = self.directory.stat().st_mode & 0o7777
+        try:
+            for mode in (0o770, 0o707):
+                with self.subTest(mode=oct(mode)):
+                    self.reset()
+                    self.directory.chmod(mode)
+                    for kind in ('desktop', 'control'):
+                        result, error = self.fixture(kind, 'echo json_encode(["allowed"=>' + self.rate(kind)
+                            + ',"error"=>$GLOBALS["sls_api_state_error"]]);')
+                        self.assertEqual(error, '')
+                        self.assertEqual(result, {'allowed': False, 'error': 'state_directory_unsafe'})
+                        self.assertFalse((self.directory / 'rate.json').exists())
+        finally:
+            self.directory.chmod(original_mode)
+
     def test_corrupt_empty_and_oversized_existing_state_fail_closed_unchanged(self):
         for kind in ('desktop', 'control'):
             for content in ('', '{broken', '{"bad":{"bucket":false,"count":0}}', 'x' * 524289):
@@ -112,6 +219,38 @@ class ApiStateStorageTests(unittest.TestCase):
                 self.assertFalse(result['allowed'])
                 self.assertIn(result['error'], ('state_invalid', 'state_oversized'))
                 self.assertEqual(rate.read_text(), content)
+
+    def test_duplicate_state_members_fail_closed_without_resetting_evidence(self):
+        for kind in ('desktop', 'control'):
+            self.reset(); rate = self.directory / 'rate.json'
+            key = 'a' * 64
+            bucket = (datetime.fromtimestamp(1800000000, timezone.utc) if kind == 'desktop'
+                      else datetime.now(timezone.utc)).strftime('%Y%m%d%H%M')
+            content = '{"' + key + '":{"bucket":"' + bucket + '","count":600,"count":0}}'
+            rate.write_text(content)
+            result, _ = self.fixture(kind, 'echo json_encode(["allowed"=>' + self.rate(kind) + ',"error"=>$GLOBALS["sls_api_state_error"]]);')
+            self.assertFalse(result['allowed'], 'Duplicate counters were accepted by the actual API journal reader.')
+            self.assertEqual(result['error'], 'state_invalid')
+            self.assertEqual(rate.read_text(), content)
+
+    def test_valid_legacy_empty_list_migrates_to_a_typed_object(self):
+        for kind in ('desktop', 'control'):
+            self.reset(); rate = self.directory / 'rate.json'; rate.write_text('[]')
+            result, _ = self.fixture(kind, 'echo json_encode(["allowed"=>' + self.rate(kind) + ',"error"=>$GLOBALS["sls_api_state_error"]]);')
+            self.assertTrue(result['allowed']); self.assertEqual(result['error'], '')
+            self.assertTrue(rate.read_text().startswith('{'))
+
+    def test_writable_or_unexpected_owner_state_is_rejected_unchanged(self):
+        for kind in ('desktop', 'control'):
+            for mode, owner in ((0o666, 0), (0o660, 0), (0o644, 0), (0o640, 12345)):
+                self.reset(); rate = self.directory / 'rate.json'; rate.write_text('{}')
+                rate.chmod(mode); os.chown(rate, owner, os.getegid())
+                before = rate.stat()
+                result, _ = self.fixture(kind, 'echo json_encode(["allowed"=>' + self.rate(kind) + ',"error"=>$GLOBALS["sls_api_state_error"]]);')
+                self.assertFalse(result['allowed']); self.assertEqual(result['error'], 'state_unsafe')
+                self.assertEqual(rate.read_text(), '{}')
+                after = rate.stat()
+                self.assertEqual((after.st_ino, after.st_uid, after.st_mode), (before.st_ino, before.st_uid, before.st_mode))
 
     def test_failed_write_sync_and_rename_preserve_prior_budget(self):
         for kind in ('desktop', 'control'):
@@ -260,7 +399,7 @@ class ApiStateStorageTests(unittest.TestCase):
             file_put_contents(DESKTOP_LAST_SEEN_FILE,'{}');
             $held=\fopen(DESKTOP_LAST_SEEN_FILE,'r+b');flock($held,LOCK_EX);
             $_SERVER=['REQUEST_URI'=>'/api/sipnotify/desktop/stream','REQUEST_METHOD'=>'GET','REMOTE_ADDR'=>'127.0.0.1','PHP_AUTH_USER'=>'alice','PHP_AUTH_PW'=>'test-password'];
-            $_GET=['stream_seconds'=>1];
+            $_GET=['stream_seconds'=>'1'];
         ''', endpoint=True, raw=True)
         self.assertIn('event: authenticated', output); self.assertIn(': keepalive ', output)
         self.assertIn('event: reconnect', output); self.assertNotIn('Fatal', error)

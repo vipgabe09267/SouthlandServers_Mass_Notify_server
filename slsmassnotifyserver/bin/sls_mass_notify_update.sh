@@ -12,7 +12,7 @@ STATUS_FILE="${STATUS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/upda
 UPDATE_PROGRESS_FILE="${UPDATE_PROGRESS_FILE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/update-progress.json}"
 LOG_FILE="${LOG_FILE:-/var/log/sls_mass_notify.log}"
 LOCK_FILE="${LOCK_FILE:-/run/lock/sls-mass-notify-update.lock}"
-CURRENT_VERSION="${SLS_MASS_NOTIFY_CURRENT_VERSION:-0.1.6-beta}"
+CURRENT_VERSION="${SLS_MASS_NOTIFY_CURRENT_VERSION:-0.1.7-beta}"
 
 GITHUB_UPDATES_ENABLED="0"
 GITHUB_UPDATES_CHANNEL="beta"
@@ -24,7 +24,9 @@ MANUAL_UPDATE="${SLS_MASS_NOTIFY_MANUAL_UPDATE:-0}"
 CHECK_ONLY="${SLS_MASS_NOTIFY_CHECK_ONLY:-0}"
 readonly GITHUB_UPDATES_REPOSITORY="vipgabe09267/SouthlandServers_Mass_Notify_server"
 FAILURE_RECORDED=0
+REPORTING_ADMITTED=0
 release_work=""
+LOG_FD=""
 
 # Open only a root-owned regular file through trusted directories. Creation is
 # exclusive; an existing file is never truncated or written before fd identity
@@ -32,7 +34,7 @@ release_work=""
 open_root_owned_file() {
   local output_variable="$1" protected_path="$2"
   local protected_identity opened_identity protected_fd
-  protected_identity="$(/usr/bin/python3 - "$protected_path" <<'PY'
+  protected_identity="$(/usr/bin/python3 -I - "$protected_path" <<'PY'
 import os
 import stat
 import sys
@@ -80,78 +82,93 @@ PY
   printf -v "$output_variable" '%s' "$protected_fd"
 }
 
+open_append_log() {
+  local output_variable="$1" protected_path="$2"
+  local protected_identity opened_identity protected_fd
+  protected_identity="$(/usr/bin/python3 -I - "$protected_path" <<'PYLOG'
+import os
+import pwd
+import stat
+import sys
+
+path = sys.argv[1]
+parts = path.split('/')[1:]
+if not path.startswith('/') or not parts or any(part in ('', '.', '..') for part in parts):
+    raise SystemExit(1)
+account = pwd.getpwnam('asterisk')
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+parent = os.open('/', flags)
+descriptor = -1
+try:
+    for component in parts[:-1]:
+        child = os.open(component, flags, dir_fd=parent)
+        os.close(parent); parent = child
+        info = os.fstat(parent)
+        if info.st_uid != 0 or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX):
+            raise RuntimeError('unsafe log parent')
+    open_flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        descriptor = os.open(parts[-1], open_flags | os.O_CREAT | os.O_EXCL,
+                             0o640, dir_fd=parent)
+        os.fchown(descriptor, account.pw_uid, account.pw_gid)
+        os.fchmod(descriptor, 0o640)
+        os.fsync(parent)
+    except FileExistsError:
+        descriptor = os.open(parts[-1], open_flags, dir_fd=parent)
+    opened = os.fstat(descriptor)
+    named = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+    if ((opened.st_uid, opened.st_gid) not in
+            ((account.pw_uid, account.pw_gid), (0, account.pw_gid), (0, 0))
+            or not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+            or opened.st_mode & 0o022
+            or (opened.st_dev, opened.st_ino, opened.st_uid, opened.st_gid,
+                opened.st_mode, opened.st_nlink)
+            != (named.st_dev, named.st_ino, named.st_uid, named.st_gid,
+                named.st_mode, named.st_nlink)):
+        raise RuntimeError('unsafe update log')
+    print(f'{opened.st_dev}:{opened.st_ino}')
+finally:
+    if descriptor >= 0: os.close(descriptor)
+    os.close(parent)
+PYLOG
+)" || return 1
+  exec {protected_fd}>>"$protected_path" || return 1
+  opened_identity="$(stat -Lc '%d:%i' "/proc/${BASHPID}/fd/$protected_fd" 2>/dev/null)" || opened_identity=""
+  if [ "$opened_identity" != "$protected_identity" ]; then
+    exec {protected_fd}>&-
+    return 1
+  fi
+  printf -v "$output_variable" '%s' "$protected_fd"
+}
+
 log() {
-  printf '%s: %s\n' "$(date)" "$*" >> "$LOG_FILE" 2>/dev/null || true
+  [ -n "${LOG_FD:-}" ] || return 0
+  printf '%s: %s\n' "$(date)" "$*" >&"$LOG_FD" || true
+}
+
+write_runtime_status() {
+  local path="$1" payload="$2"
+  [ "$REPORTING_ADMITTED" = "1" ] || { printf '%s\n' 'Updater status is unavailable before authenticated runtime admission.' >&2; return 1; }
+  printf '%s' "$payload" | /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN \
+    /usr/sbin/runuser -u asterisk -- /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_update_status.py "$path"
 }
 
 write_manual_progress() {
   [ "$MANUAL_UPDATE" = "1" ] || return 0
-  local state="$1"
-  local message="$2"
-  UPDATE_PROGRESS_FILE="$UPDATE_PROGRESS_FILE" UPDATE_STATE="$state" UPDATE_MESSAGE="$message" UPDATE_ERROR_CATEGORY="${3:-}" UPDATE_EXIT_CODE="${4:-0}" /usr/bin/python3 - <<'PY'
-import json
-import os
-import pwd
-import tempfile
+  local state="$1" message="$2" payload
+  payload="$(UPDATE_STATE="$state" UPDATE_MESSAGE="$message" UPDATE_ERROR_CATEGORY="${3:-}" UPDATE_EXIT_CODE="${4:-0}" /usr/bin/python3 -I - <<'PY'
+import json, os
 from datetime import datetime, timezone
-
-path = os.environ["UPDATE_PROGRESS_FILE"]
-directory = os.path.dirname(path)
-os.makedirs(directory, mode=0o750, exist_ok=True)
-payload = {
-    "state": os.environ["UPDATE_STATE"],
-    "message": os.environ["UPDATE_MESSAGE"][:300],
-    "updated_at": datetime.now(timezone.utc).isoformat(),
-    "error_category": os.environ["UPDATE_ERROR_CATEGORY"],
-    "exit_code": int(os.environ["UPDATE_EXIT_CODE"]),
-}
-fd, temporary = tempfile.mkstemp(prefix=".update-progress.", dir=directory)
-with os.fdopen(fd, "w", encoding="utf-8") as handle:
-    json.dump(payload, handle, separators=(",", ":"))
-    handle.write("\n")
-os.chmod(temporary, 0o640)
-account = pwd.getpwnam("asterisk")
-os.chown(temporary, account.pw_uid, account.pw_gid)
-os.replace(temporary, path)
+print(json.dumps({"state":os.environ["UPDATE_STATE"], "message":os.environ["UPDATE_MESSAGE"][:300],
+ "updated_at":datetime.now(timezone.utc).isoformat(), "error_category":os.environ["UPDATE_ERROR_CATEGORY"],
+ "exit_code":int(os.environ["UPDATE_EXIT_CODE"])},separators=(",",":")))
 PY
+)" || return 1
+  write_runtime_status "$UPDATE_PROGRESS_FILE" "$payload"
 }
 
 write_status() {
-  local json="$1"
-  STATUS_FILE_PATH="$STATUS_FILE" STATUS_JSON="$json" /usr/bin/python3 - <<'PY'
-import fcntl
-import json
-import os
-import tempfile
-
-path = os.environ["STATUS_FILE_PATH"]
-payload = json.loads(os.environ["STATUS_JSON"])
-directory = os.path.dirname(path)
-os.makedirs(directory, mode=0o750, exist_ok=True)
-lock_path = "/run/lock/sls-mass-notify-update-status.lock"
-with open(lock_path, "a+", encoding="utf-8") as lock_handle:
-    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-    fd, temporary = tempfile.mkstemp(prefix=".update-status.", dir=directory)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, separators=(",", ":"))
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.chmod(temporary, 0o640)
-    try:
-        import pwd
-        account = pwd.getpwnam("asterisk")
-        os.chown(temporary, account.pw_uid, account.pw_gid)
-    except (KeyError, PermissionError):
-        pass
-    os.replace(temporary, path)
-    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-PY
+  write_runtime_status "$STATUS_FILE" "$1"
 }
 
 admit_update_runtime() {
@@ -189,7 +206,7 @@ load_update_config() {
   local key
   local value
   dump_file="$(mktemp /tmp/sls_mass_notify_update_config.XXXXXX)" || return 1
-  if [ ! -x "$CONFIG_LOADER" ] || ! /usr/bin/python3 "$CONFIG_LOADER" "$CONFIG_JSON_FILE" > "$dump_file" 2>>"$LOG_FILE"; then
+  if [ ! -x "$CONFIG_LOADER" ] || ! /usr/bin/python3 -I "$CONFIG_LOADER" "$CONFIG_JSON_FILE" > "$dump_file" 2>&"$LOG_FD"; then
     rm -f "$dump_file"
     return 1
   fi
@@ -205,7 +222,7 @@ load_update_config() {
 
 fetch_update_asset() {
   local url="$1" output="$2" limit="$3" seconds="$4"
-  curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 15 \
+  /usr/bin/curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 15 \
     --max-time "$seconds" --max-filesize "$limit" -o - "$url" \
     | /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_bounded_stream.py "$output" "$limit"
 }
@@ -217,7 +234,7 @@ fail_update() {
   [[ "$status" =~ ^[0-9]+$ ]] && [ "$status" -gt 0 ] && [ "$status" -lt 256 ] || status=1
   FAILURE_RECORDED=1
   log "Update failed [$category] (exit $status): $message"
-  write_status "$(CURRENT_VERSION="$CURRENT_VERSION" FAILURE_CATEGORY="$category" FAILURE_MESSAGE="$message" FAILURE_EXIT_CODE="$status" python3 - <<'PY'
+  write_status "$(CURRENT_VERSION="$CURRENT_VERSION" FAILURE_CATEGORY="$category" FAILURE_MESSAGE="$message" FAILURE_EXIT_CODE="$status" /usr/bin/python3 -I - <<'PY'
 import json
 import os
 from datetime import datetime, timezone
@@ -240,16 +257,19 @@ finish_update() {
   fi
   exit "$status"
 }
+
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+  printf '%s\n' 'Automatic update refused because it was not started as root.' >&2
+  exit 1
+fi
+open_append_log LOG_FD "$LOG_FILE" || {
+  printf '%s\n' 'Automatic update refused an unsafe log file.' >&2
+  exit 1
+}
 trap finish_update EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
 
-if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-  log "Automatic update refused because it was not started as root"
-  exit 1
-fi
-
-mkdir -p "$(dirname "$LOCK_FILE")"
 UPDATE_LOCK_FD=""
 open_root_owned_file UPDATE_LOCK_FD "$LOCK_FILE" || fail_update "process_failed" "The protected update lock could not be opened safely."
 exec 9>&"$UPDATE_LOCK_FD"
@@ -265,13 +285,14 @@ fi
 if ! admit_update_runtime; then
   fail_update "root_runtime_unapproved" "Installed root helpers do not match the authenticated release. Run the signed installer to repair them before updating." 2
 fi
+REPORTING_ADMITTED=1
 
 if ! load_update_config; then
   fail_update "protected_config_validation_failed" "The protected central configuration is invalid or unavailable." 2
 fi
 
 export GITHUB_UPDATES_CHANNEL GITHUB_UPDATES_PIN GITHUB_UPDATES_WINDOW_START GITHUB_UPDATES_WINDOW_END GITHUB_UPDATES_DELAY_HOURS
-release_json="$(CURRENT_VERSION="$CURRENT_VERSION" REPOSITORY="$GITHUB_UPDATES_REPOSITORY" python3 - <<'PY'
+release_json="$(CURRENT_VERSION="$CURRENT_VERSION" REPOSITORY="$GITHUB_UPDATES_REPOSITORY" /usr/bin/python3 -I - <<'PY'
 import json
 import os
 import re
@@ -287,7 +308,7 @@ from datetime import datetime, timezone
 sys.dont_write_bytecode = True
 
 repo = os.environ.get("REPOSITORY", "")
-current = os.environ.get("CURRENT_VERSION", "0.1.6-beta")
+current = os.environ.get("CURRENT_VERSION", "0.1.7-beta")
 now = datetime.now(timezone.utc).astimezone().isoformat()
 if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
     print(json.dumps({"ok": False, "checked_at": now, "update_available": False, "latest_version": current, "message": "Configured GitHub repository is invalid."}, separators=(",", ":")))
@@ -328,7 +349,7 @@ def version_key(value):
 try:
     request = urllib.request.Request(
         f"https://api.github.com/repos/{repo}/releases?per_page=100",
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "SouthlandServers-Mass-Notifications-Updater/0.1.6-beta"},
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "SouthlandServers-Mass-Notifications-Updater/0.1.7-beta"},
     )
     with urllib.request.urlopen(request, timeout=20) as response:
         body = response.read(2097153)
@@ -415,10 +436,10 @@ PY
 )"
 
 write_status "$release_json"
-update_available="$(printf '%s' "$release_json" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("update_available") else "0")' 2>/dev/null || printf '0')"
-release_ok="$(printf '%s' "$release_json" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("ok") else "0")' 2>/dev/null || printf '0')"
+update_available="$(printf '%s' "$release_json" | /usr/bin/python3 -I -c 'import json,sys; print("1" if json.load(sys.stdin).get("update_available") else "0")' 2>/dev/null || printf '0')"
+release_ok="$(printf '%s' "$release_json" | /usr/bin/python3 -I -c 'import json,sys; print("1" if json.load(sys.stdin).get("ok") else "0")' 2>/dev/null || printf '0')"
 if [ "$release_ok" != "1" ]; then
-  release_category="$(printf '%s' "$release_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("error_category", ""))')"
+  release_category="$(printf '%s' "$release_json" | /usr/bin/python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("error_category", ""))')"
   case "$release_category" in
     release_rate_limited) fail_update "$release_category" "GitHub rate-limited this PBX public IP. Wait for its API limit to reset (normally within an hour), then click Check for updates. No installer ran." ;;
     release_tls_failed) fail_update "$release_category" "HTTPS certificate verification failed for GitHub. Check the PBX clock, CA certificates and any HTTPS inspection proxy, then retry. Certificate verification remains required." ;;
@@ -439,13 +460,13 @@ if [ "$update_available" != "1" ]; then
   exit 0
 fi
 [ "$GITHUB_UPDATES_ENABLED" = "1" ] || [ "$MANUAL_UPDATE" = "1" ] || exit 0
-automatic_eligible="$(printf '%s' "$release_json" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("automatic_eligible") is True else "0")')"
+automatic_eligible="$(printf '%s' "$release_json" | /usr/bin/python3 -I -c 'import json,sys; print("1" if json.load(sys.stdin).get("automatic_eligible") is True else "0")')"
 if [ "$MANUAL_UPDATE" != "1" ] && [ "$automatic_eligible" != "1" ]; then
   log "Automatic update deferred by the configured maintenance window or rollout delay."
   exit 0
 fi
 
-readarray -t release_values < <(printf '%s' "$release_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("tgz_url", "")); print(d.get("sha256", "")); print(d.get("installer_url", "")); print(d.get("latest_version", ""))')
+readarray -t release_values < <(printf '%s' "$release_json" | /usr/bin/python3 -I -c 'import json,sys; d=json.load(sys.stdin); print(d.get("tgz_url", "")); print(d.get("sha256", "")); print(d.get("installer_url", "")); print(d.get("latest_version", ""))')
 tgz_url="${release_values[0]:-}"
 sha256="${release_values[1]:-}"
 installer_url="${release_values[2]:-}"
@@ -482,20 +503,20 @@ release_manifest="$release_work/release-manifest.json"
 release_signature="$release_work/release-manifest.sig"
 release_package="$release_work/package.tgz"
 write_manual_progress "installing" "Downloading and installing Mass Notify ${latest}."
-if ! fetch_update_asset "$installer_url" "$tmp_script" 1048576 120 >> "$LOG_FILE" 2>&1; then
+if ! fetch_update_asset "$installer_url" "$tmp_script" 1048576 120 >&"$LOG_FD" 2>&1; then
   log "Automatic update could not download the tagged installer for $latest"
   fail_update "download_failed" "The verified installer could not be downloaded."
 fi
 release_base="${tgz_url%/*}"
-if ! fetch_update_asset "$release_base/release-manifest.json" "$release_manifest" 16384 120 >> "$LOG_FILE" 2>&1 \
-  || ! fetch_update_asset "$release_base/release-manifest.sig" "$release_signature" 64 120 >> "$LOG_FILE" 2>&1 \
-  || ! fetch_update_asset "$tgz_url" "$release_package" 52428800 900 >> "$LOG_FILE" 2>&1 \
-  || ! /usr/bin/python3 /usr/local/bin/sls_mass_notify/sls_release_verify.py \
-      --manifest "$release_manifest" --signature "$release_signature" --installer "$tmp_script" --package "$release_package" --version "$latest" >> "$LOG_FILE" 2>&1; then
+if ! fetch_update_asset "$release_base/release-manifest.json" "$release_manifest" 16384 120 >&"$LOG_FD" 2>&1 \
+  || ! fetch_update_asset "$release_base/release-manifest.sig" "$release_signature" 64 120 >&"$LOG_FD" 2>&1 \
+  || ! fetch_update_asset "$tgz_url" "$release_package" 52428800 900 >&"$LOG_FD" 2>&1 \
+  || ! /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_release_verify.py \
+      --manifest "$release_manifest" --signature "$release_signature" --installer "$tmp_script" --package "$release_package" --version "$latest" >&"$LOG_FD" 2>&1; then
   log "Update rejected: publisher signature or artifact verification failed for $latest"
   fail_update "release_verification_failed" "Release authenticity could not be verified. No downloaded installer was executed."
 fi
-if ! /bin/bash -n "$tmp_script" >> "$LOG_FILE" 2>&1; then
+if ! /bin/bash -n "$tmp_script" >&"$LOG_FD" 2>&1; then
   fail_update "update_script_syntax_error" "The verified installer contains a shell syntax error. No installer was executed." 2
 fi
 chmod 0700 "$tmp_script"
@@ -503,7 +524,7 @@ log "Automatic update installing $latest"
 # Install the exact authenticated bytes. Do not fetch the mutable release asset
 # a second time or substitute the GitHub API's unauthenticated digest.
 verified_sha256="$(sha256sum "$release_package" | awk '{print $1}')"
-if SLS_MASS_NOTIFY_TGZ="$release_package" SLS_MASS_NOTIFY_TGZ_URL='' SLS_MASS_NOTIFY_SHA256="$verified_sha256" "$tmp_script" >> "$LOG_FILE" 2>&1; then
+if SLS_MASS_NOTIFY_TGZ="$release_package" SLS_MASS_NOTIFY_TGZ_URL='' SLS_MASS_NOTIFY_SHA256="$verified_sha256" "$tmp_script" >&"$LOG_FD" 2>&1; then
   :
 else
   installer_status=$?

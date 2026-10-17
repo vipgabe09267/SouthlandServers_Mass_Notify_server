@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## Unreleased
+
+### Fixed
+
+- Escaped control and invalid bytes in `RejectionException` messages, bounded
+  rendered reasons, and contained throwing reason formatters
+
+
 ## 3.0.2 - 2026-08-24
 
 ### Added

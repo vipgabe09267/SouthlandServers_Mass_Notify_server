@@ -56,7 +56,7 @@ final class OperatorAccess
             $defaults=match($row['role']) {'sender'=>['view','send'],'scheduler'=>['view','schedule'],'warden'=>['view','roll_call'],'administrator'=>OperatorAuth::ACTIONS,default=>['view']};
             $actions=self::ids($row['actions']??$defaults,'/^(?:view|send|schedule|roll_call)$/D',4);
             if (!in_array('view',$actions,true)) { throw new \DomainException('An operator must be allowed to view their assigned work.'); }
-            $channels=self::ids($row['channels']??array_keys(LocationDirectory::MEMBERS),'/^(?:extensions|desktop_client_ids|voice_recipient_ids|email_recipient_ids|sms_recipient_ids|webhook_ids)$/D',6);
+            $channels=self::ids($row['channels']??['extensions','desktop_client_ids','voice_recipient_ids','email_recipient_ids','sms_recipient_ids','webhook_ids'],'/^(?:extensions|desktop_client_ids|voice_recipient_ids|email_recipient_ids|sms_recipient_ids|webhook_ids|browser_recipient_ids|connector_ids)$/D',8);
             if (!$channels) { throw new \DomainException('Select at least one permitted delivery channel.'); }
             if ($row['role'] === 'administrator' && ($sites || $groups || $locations || array_filter($members))) { throw new \DomainException('SLS administrators have module-wide access. Use another role to restrict recipients.'); }
             if ($row['enabled'] && $row['role'] !== 'administrator' && !$sites && !$groups && !$locations && !array_filter($members)) { throw new \DomainException('An enabled operator needs a site, location, saved audience or personal device assignment.'); }
@@ -165,7 +165,7 @@ final class OperatorAccess
         if (($principal['audience']['unrestricted'] ?? false) === true) { return true; }
         $allowed = ApiSecurity::allowedAudience($principal, $settings);
         $mapping = ['extensions'=>'phones', 'desktop_clients'=>'desktops', 'voice_recipient_ids'=>'voice_recipient_ids',
-            'email_recipient_ids'=>'email_recipient_ids', 'sms_recipient_ids'=>'sms_recipient_ids', 'webhook_ids'=>'webhooks'];
+            'email_recipient_ids'=>'email_recipient_ids', 'sms_recipient_ids'=>'sms_recipient_ids', 'webhook_ids'=>'webhooks', 'browser_recipient_ids'=>'browser_recipient_ids', 'connector_ids'=>'connector_ids'];
         foreach ($mapping as $key=>$target) {
             if (!is_array($delivery[$key] ?? []) || array_diff($delivery[$key] ?? [], $allowed[$target])) { return false; }
         }

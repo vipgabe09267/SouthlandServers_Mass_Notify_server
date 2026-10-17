@@ -1,5 +1,95 @@
 # Changelog
 
+## 0.1.7-beta — Unreleased
+
+### Installation, upgrades and removal
+
+- Authenticate previous and candidate releases before changing services or files. Preserve independently verified Framework/Dashboard inventories and reject unknown executable changes instead of approving live hashes.
+- Preserve recovery across interrupted preparation, activation and rollback. Finish artifact capture before recording a prepared transaction; synchronize stage names and retain the last valid stage after a rejected transition. Coordinate transaction discovery and reject repeat recovery of completed installs.
+- Recover recognized legacy configuration and runtime permissions without replacing settings, history or lock inodes. Preserve unknown owners, links, unsafe spool layouts and unreviewed signing keys for administrator review.
+- Preserve standard FreePBX `0775/0664` permissions on static web and Asterisk integration files owned by root/Asterisk with the Asterisk group. Keep root runtime private and reject world-writable or unrelated-group files; retain original metadata through rollback.
+- Read the collector’s current heartbeat file during final installation checks, bound to its ledger generation, boot and anchor. Preserve legacy heartbeat support, private permissions and closed delivery history.
+- Validate the full static recovery inventory during read-only inspection and authenticated preflight, before pausing notification workers. Report the exact path, owner, group and mode for rejected layouts.
+- Prevent duplicate-class failures when the module and deployed API load shared security, discovery, event-log and media-policy helpers in one process. Cover both include orders while retaining strict authorization and media checks.
+- Validate configuration and resource inputs through bounded, stable file reads. Reject ambiguous JSON, dangling storage roots, unsupported Python/runtime profiles and unavailable module inventories before activation.
+- Validate offline SHA-256 values as exactly 64 hexadecimal characters. Retain publisher verification and reject ambiguous archive paths, duplicate entries, unsafe modes/types, oversized payloads and invalid module metadata before extraction.
+- Bound captured output for both supported FreePBX module-install argument forms. Verify final enablement from the captured module inventory, preserving unattended installation.
+- Follow bounded Asterisk configuration includes, distinguish supported load directives and tolerate absent optional stock tables during rollback. Keep ordinary FreePBX reloads nonfatal when the phone collector is unavailable.
+- Refresh qualified PHP-FPM workers after activation and rollback, including installations with timestamp checks disabled. Verify the compiled release version through the served route.
+- Verify authenticated cursor polling when the desktop API advertises a stream-capacity fallback, including shared PHP-FPM pools. Require the enrolled client identity and an uncached live baseline; reject failed authentication, stalled streams and unadvertised fallback routes.
+- Preserve native configuration locks and active/pending settings throughout upgrades. Keep immediate security changes authoritative after partial writes and reconcile staged section revisions before Apply Config.
+- Preserve unrelated AMI accounts, cron jobs, ancestor permissions and shared signing locks. Require credential/loopback ownership before managing an AMI account; bound failed or partial cron reads before cleanup.
+- Retain authenticated local uninstaller recovery and unrecorded temporary artifacts after failures. Keep download credentials out of service-account commands and use the runtime account for updater status.
+- Bind installation-doctor deadlines to their own loopback sockets. Report incomplete resource/audit health as unknown and retain trust-generation storage needed for recovery.
+
+### Security and operator identity
+
+- Render the Labs warning without exposing private configuration methods. Avoid reacquiring the activity lock during SSO saves, compare operator revisions against normalized legacy settings, bound web settings waits and retain confirmation after immediate Operator Access saves.
+- Keep the non-production warning acknowledgment once per administrator across upgrades. Recognize existing 0.1.6/0.1.7 receipts without rewriting configuration or suppressing the warning for another administrator; retain the five-second first-use delay.
+- Move SAML/OIDC configuration to **Operator Access**. SSO continues to sign in only to the separate operator portal and requires saved local grants, current account/provider revisions and the local authenticator.
+- Require an unexpired, enrolled local recovery administrator before enabling SSO. Apply IP/global handshake budgets without treating all users behind a gateway as one identity.
+- Validate IdP URLs while preserving encoded paths and explicit HTTPS ports. Require exact SAML request/callback bindings and an audience match in every signed restriction; reject transforms that can exclude identity fields from the signature.
+- Reject ambiguous provider, token and portal JSON. Recheck identity-ledger leases around callbacks and commits, use monotonic lock deadlines and retain nonce, TLS and replay checks.
+- Validate existing password-work slots and their leases before deriving a password. Preserve failed-login history when established storage disappears instead of resetting its limits.
+- Count distinct verified identities for dual approval so aliases of one PBX/operator account cannot approve twice.
+- Bind desktop polling, SSE, receipts and queued delivery to the original enrollment. Reused usernames cannot inherit prior events; queued Weather/Lightning delivery freezes enrollment IDs.
+- Accept valid fractional-second publication timestamps from the Python publisher and older journals. Preserve their original values and history while retaining strict calendar, timezone, JSON and file-integrity checks.
+- Extend explicit operator/API audiences to browser subscribers and connectors. Recheck current channel permissions and saved enrollment bindings at delivery; existing accounts gain no implicit grants.
+- Reject duplicate JSON members, nonfinite/overflowed numbers, invalid UTF-8 and unsafe file metadata at configuration, API, journal and private-handoff boundaries. Preserve valid multilingual text, finite scientific notation and existing encryption compatibility.
+- Preserve durable initialization/replay evidence for phone admission, external delivery, Weather, incidents, triggers, SMS and mail. Missing or damaged established state blocks new irreversible work; interrupted first initialization resumes without replacing permanent mutexes.
+- Recheck lock, file and directory identities before commits. Bound receipt/status reads, reject FIFO substitution without blocking and preserve damaged evidence for review.
+- Validate release-key ownership, links, size and read stability; sign using the validated bytes. Keep pinned vendor provenance and root-owned signing inputs separate from runtime configuration.
+
+### Notification delivery and runtime
+
+- Label the last recorded Weather fault as history, preserving its timestamp and delivery evidence.
+- Group detected phone models and transports into one Help row per extension. Preserve individual registered-contact formats, including unknown softphones, and cover mixed Yealink/Acrobits/Grandstream dispatch.
+- Keep desktop, email and webhook-only announcements independent of phone inventory. Resolve stable audience IDs before legacy names and reject unavailable or ambiguous selections before delivery.
+- Preserve immutable recipients, absolute deadlines and current authorization across schedules, incidents and queued connectors. Include browser/connector selections in cooldowns, overlap previews and bounded form envelopes.
+- Preserve complete bounded Weather instructions across speech, email, visual, external voice and SMS handoffs without process-argument overflow. Keep ordinary announcement limits and provider/speech rejection rules.
+- Preserve official Weather instructions and withhold noncritical delivery for invalid enabled quiet hours. Retain legacy alert history and bounded cross-zone claims rather than replaying alerts or erasing deduplication evidence.
+- Harden Lightning observation parsing, state reads, quota locks and refunds. Retain checkpoints across clock rollback, backfill supported observation windows and require observed coverage before all-clear. Correct polar/date-line bounds and Tempest key-only credentials.
+- Preserve configured Lightning polling periods, apply provider-supported ranges in the editor and setup wizard, and limit standard Xweather polling to four minutes.
+- Keep Weather/Lightning audio private and Asterisk-readable for voicemail. Reject ambiguous audio leases and preserve recordings if phone history is missing; caller exclusion and duplicate-deposit protections remain enforced.
+- Bound phone AGI/AMI work by cumulative monotonic deadlines, including partial lines and repeated headers. Bound buffers, close failed connections and retain admission/origin failure codes.
+- Preserve all-contact paging authority and original recipients. Validate complete PCM/WAV prompts before reuse, regenerate truncated caches and protect newer popup ownership from stale page cleanup.
+- Bound audio/speech reservation waits without extending them after clock changes. Release timed-out tickets, recheck speech mutexes and preserve active playback/history.
+- Reverify pinned voice bytes during promotion and validate bounded voice-repair ancestors. Preserve the current model if staging fails and retain shared speech coordination for voicemail callers.
+- Release redundant decoded schedule trees before strict validation, reducing peak memory for large retained histories. Validate recurrence snapshots during imports and native backup.
+- Preserve full webhook payloads and queued instructions. Validate Discord bounds per destination and keep independent routes deliverable when another route fails.
+- Reject malformed external authorization, retry counters and receipt identities before changing history. Preserve uncertain/nonretryable outcomes and independent channel results.
+- Use a shared private bounded Weather/Lightning audit appender. Preserve log inodes, coordinate retention and report incomplete persistence without replaying successful deliveries.
+- Retain fault-email suppression, admission and initialization history through interrupted writes and operational exports. Invalid suppression state refuses mail transport; unchanged status reads avoid journal rewrites.
+- Use cursor polling under PHP-FPM to protect shared PBX workers. Bound SSE lifetime and credential rechecks with monotonic time, preserving immediate revocation behavior across clock corrections.
+- Keep alert-test metadata explicit in logs; use legacy wording only when metadata is absent. Count configured external routes in health without claiming physical delivery.
+
+### Labs, APIs and interface
+
+- Retain cluster authority before dispatch/reconciliation, including missing-helper failures. Preserve pending work, peer identity evidence and immutable recovery snapshots; bound socket work without relaxing certificate/signature checks.
+- Honor local edge channel permissions and retain audio across receipt stages. Keep playback replay protection, original expiry and separate displayed/received/played evidence.
+- Limit CAP/phone-observation launches to four per pass, reconcile deferred/expired triggers and preserve selected-language CAP instructions. Stop expired sensor retries after checking persistent pending state.
+- Recheck public-warning expiry immediately before transmission and record actual completion time. Bound provider replies, preserve uncertain operation IDs and retain reviewed integration settings during requests.
+- Keep subscriber invitation history for the full hourly budget independently of link expiry. Preserve proof history on refused requests and accept equivalent fields in either order.
+- Preserve existing local grants and require the operator authenticator after federation. Normalize CSP nonces, allow subscriber worker registration and retry display before recording notification deduplication.
+- Bound Dashboard, operator, warning, directory, calendar, automation, registration and test requests through response decoding. Preserve drafts and disabled controls after timeouts; avoid automatic retries of unconfirmed changes.
+- Stop polling on navigation/widget replacement. Prevent concurrent saves/tests, freeze submitted selections and retain acknowledgment requirements when a response is unavailable.
+- Return clean Weather, Lightning and calendar JSON under FreePBX output buffering. Refuse blocked response handlers before sending work and report uncertain removal instead of claiming success after a lost connection.
+- Show site, SMS and external-call options on new Weather groups; preserve imported recordings when reopening audio settings. Keep complete selected test areas and reset webhook choices for new schedules.
+- Warn before discarding unsaved site coverage. Recognize additional phone brands and separate registration counts from voicemail eligibility.
+- Build location, recipient-language and subscriber/connector catalogs once per response. Preserve pending editor labels, current enrollment checks and active configuration while reducing repeated searches and hashing.
+- Add the italic one-time notice below beta/Labs warnings without changing per-account scope or the five-second delay. Place the SSO warning in Operator Access and refresh changed stylesheet revisions.
+- Read email branding through one bounded PNG helper, skipping unsafe assets without losing the message. Correct delivery labels, language selectors, token-renewal guidance, import scope and IPv6 help.
+
+### Validation and dependencies
+
+- Run every registered fixture in the package gate, including private Asterisk fan-out at 25/50/100 contacts. Fail the registry check if a runnable test is omitted.
+- Require fresh mount/network/PID namespaces before fixture services or sockets start. Make inherited filesystems read-only, retain disposable writable overlays and suppress bytecode without weakening runtime checks.
+- Require browser checks in source CI and extend private workflow coverage for warning gates, CSP, separate-origin IdP navigation and large recipient editors.
+- Match the browser SSO fixture's registered callback to its private HTTPS origin, release its mounts before later suites, and open calendar editors before testing hostile names. Require browser dependencies for voicemail controls when CI qualification is mandatory. Keep production origin validation and text escaping intact.
+- Extend the disposable VM controller to 0.1.6 upgrades, repair, removal and interrupted early preparation. Controller fixtures are separate from completed full-PBX VM qualification.
+- Refresh the dependency inventory and exact upstream/patch hashes. Harden vendored key, ASN.1, X.509, XML signature, SSH/SFTP, terminal, stream, random-source and diagnostic boundaries; retain meaningful parser/crypto regressions.
+- Use HTTPS in the AGPL license reference, remove obsolete internal handoffs/release-announcement files and keep root/packaged documentation synchronized.
+
 ## 0.1.6-beta — 2026-10-10
 
 - Make legacy Python-cache quarantine repeatable across upgrade verification and interrupted cleanup. Recognize removed caches only through the original private quarantine inventory and matching saved bytes; preserve signed-source checks, recovery evidence and rejection of unknown files.

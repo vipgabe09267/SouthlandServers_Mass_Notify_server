@@ -3,6 +3,7 @@ declare(strict_types=1);
 
 namespace SlsConfigDurabilityFixture {
     final class SlsConfigCrypto {
+        public const MAX_FILE_BYTES = \FreePBX\modules\SlsConfigCrypto::MAX_FILE_BYTES;
         public static function encode(array $settings): string {
             return \FreePBX\modules\SlsConfigCrypto::encodeWithKeyring($settings, $GLOBALS['durability_keyring']);
         }
@@ -46,6 +47,17 @@ namespace {
     $presenceMethod = $reflection->getMethod('configurationPathMetadata');
     $presenceBody = implode('', array_slice($source, $presenceMethod->getStartLine() - 1,
         $presenceMethod->getEndLine() - $presenceMethod->getStartLine() + 1));
+    $removePendingMethod = $reflection->getMethod('removePendingSettingsFileUnlocked');
+    $removePendingBody = implode('', array_slice($source, $removePendingMethod->getStartLine() - 1,
+        $removePendingMethod->getEndLine() - $removePendingMethod->getStartLine() + 1));
+    $removePendingBody = str_replace('private function removePendingSettingsFileUnlocked',
+        'public function removePendingSettingsFileUnlocked', $removePendingBody);
+    $unlinkMethod = $reflection->getMethod('unlinkNamedFileIfIdentity');
+    $unlinkBody = implode('', array_slice($source, $unlinkMethod->getStartLine() - 1,
+        $unlinkMethod->getEndLine() - $unlinkMethod->getStartLine() + 1));
+    $syncMethod = $reflection->getMethod('syncNativeDirectory');
+    $syncBody = implode('', array_slice($source, $syncMethod->getStartLine() - 1,
+        $syncMethod->getEndLine() - $syncMethod->getStartLine() + 1));
     $activationMethod = $reflection->getMethod('assertEnterpriseActivationSafe');
     $activationSource = file($activationMethod->getFileName());
     $activationBody = implode('', array_slice($activationSource, $activationMethod->getStartLine() - 1,
@@ -53,6 +65,7 @@ namespace {
     $activationBody = str_replace('LabsSafety::', '\\SLS\\MassNotify\\LabsSafety::', $activationBody);
     eval('namespace SlsConfigDurabilityFixture; class Writer {
         const SETTINGS_JSON = ' . var_export($directory . '/active.config', true) . ';
+        const PENDING_SETTINGS_JSON = ' . var_export($directory . '/pending.config', true) . ';
         const NATIVE_BACKUP_MAX_CONFIG_BYTES = 1024;
         public $normalizedSettingsCache = [];
         public $fingerprints = [];
@@ -63,7 +76,7 @@ namespace {
         private function backupAppliedSettings() { $this->backups++; }
         private function setPrivateOwnership($path) { chmod($path, 0640); }
         private function rememberSettingsFingerprint($path) { $this->fingerprints[$path] = hash_file("sha256", $path); }
-        ' . $activationBody . $presenceBody . $body . '}');
+        ' . $activationBody . $presenceBody . $unlinkBody . $syncBody . $removePendingBody . $body . '}');
     $writer = new \SlsConfigDurabilityFixture\Writer();
     $apiMethod = $reflection->getMethod('controlApiUpdateConfig');
     $apiBody = implode('', array_slice($source, $apiMethod->getStartLine() - 1, $apiMethod->getEndLine() - $apiMethod->getStartLine() + 1));
@@ -147,6 +160,31 @@ namespace {
         link($target, $path);
         try { $writer->writeSettingsFileUnlocked($path, ['new' => true], false); throw new LogicException('Configuration hardlink accepted.'); }
         catch (RuntimeException $error) { $assert(strpos($error->getMessage(), 'safe regular file') !== false, 'Hardlink rejection was unclear.'); }
+
+        $pending = $writer::PENDING_SETTINGS_JSON;
+        file_put_contents($pending, 'staged configuration'); chmod($pending, 0640);
+        $GLOBALS['config_fixture_calls'] = [];
+        $writer->removePendingSettingsFileUnlocked('Unsafe staged settings.');
+        $assert(!file_exists($pending) && in_array('sync_directory', $GLOBALS['config_fixture_calls'], true),
+            'Validated staged settings were not durably removed.');
+        $pendingTarget = $directory . '/pending-target';
+        file_put_contents($pendingTarget, 'must remain'); chmod($pendingTarget, 0640);
+        foreach (['hardlink', 'symlink', 'fifo', 'empty', 'oversized'] as $kind) {
+            if ($kind === 'hardlink') { link($pendingTarget, $pending); }
+            elseif ($kind === 'symlink') { symlink($pendingTarget, $pending); }
+            elseif ($kind === 'fifo') { posix_mkfifo($pending, 0600); }
+            else {
+                $pendingHandle = fopen($pending, 'x+b');
+                if (!is_resource($pendingHandle)) { throw new RuntimeException('Pending-settings fixture could not be created.'); }
+                if ($kind === 'oversized') { ftruncate($pendingHandle, \SlsConfigDurabilityFixture\SlsConfigCrypto::MAX_FILE_BYTES + 1); }
+                fclose($pendingHandle);
+            }
+            try { $writer->removePendingSettingsFileUnlocked('Unsafe staged settings.'); throw new LogicException('Unsafe pending settings accepted: ' . $kind); }
+            catch (RuntimeException $error) { $assert($error->getMessage() === 'Unsafe staged settings.', 'Pending-settings rejection changed its caller-safe error.'); }
+            $assert(file_get_contents($pendingTarget) === 'must remain' && (file_exists($pending) || is_link($pending)),
+                'Rejected pending settings changed another file or removed the unsafe entry.');
+            unlink($pending);
+        }
         echo "Protected configuration: complete short writes, durable replacement ordering, failure preservation, private staging, size bounds and link rejection passed.\n";
     } finally {
         foreach (glob($directory . '/*') ?: [] as $file) { unlink($file); }

@@ -17,19 +17,22 @@ from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE = ROOT / 'slsmassnotifyserver'
-if os.environ.get('SLS_TEST_NAMESPACE') != 'entered' or os.environ.get('SLS_TEST_PARENT_NET_NS') == os.readlink('/proc/self/ns/net'):
+MOBILE_WIDTH = int(os.environ.get('SLS_UI_MOBILE_WIDTH', '390'))
+if MOBILE_WIDTH not in (320, 360, 390, 768):
+    raise SystemExit('Choose a supported private UI fixture width: 320, 360, 390 or 768.')
+if os.environ.get('SLS_TEST_NAMESPACE') != 'entered' or os.environ.get('SLS_TEST_PARENT_NET_NS') in (None, '', os.readlink('/proc/self/ns/net')):
     raise SystemExit('Use the isolated fixture runner; no browser was started.')
 driver = os.environ.get('SLS_UI_PYTHON_PATH')
 browser_path = os.environ.get('SLS_UI_CHROMIUM')
 if not driver or not browser_path or not Path(browser_path).is_file():
     print('SKIPPED optional browser audit: set SLS_UI_PYTHON_PATH and SLS_UI_CHROMIUM to preinstalled local dependencies. No browser checks ran; this fixture downloads nothing.')
-    raise SystemExit(0)
+    raise SystemExit(1 if os.environ.get('SLS_UI_REQUIRED') == '1' else 0)
 sys.path.insert(0, driver)
 try:
     from playwright.sync_api import sync_playwright
 except ImportError:
     print('SKIPPED optional browser audit: the configured local Python driver is unavailable. No browser checks ran.')
-    raise SystemExit(0)
+    raise SystemExit(1 if os.environ.get('SLS_UI_REQUIRED') == '1' else 0)
 spec = importlib.util.spec_from_file_location('enterprise_portal_browser_helper', ROOT / 'tools/test_operator_portal_http.py')
 helper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(helper)
@@ -46,7 +49,7 @@ class EnterpriseBrowserTests(unittest.TestCase):
         php = '''<?php
 declare(strict_types=1);
 require MODULE.'/EnterpriseIdentityManagement.php';require MODULE.'/EnterpriseAdministration.php';
-require MODULE.'/EnterpriseClusterConfig.php';require MODULE.'/EnterpriseOperationsConfig.php';require MODULE.'/EnterpriseIntegrations.php';require MODULE.'/ConfigCrypto.php';
+require MODULE.'/Operators.php';require MODULE.'/EnterpriseClusterConfig.php';require MODULE.'/EnterpriseOperationsConfig.php';require MODULE.'/EnterpriseIntegrations.php';require MODULE.'/ConfigCrypto.php';
 use SLS\\MassNotify\\{EnterpriseIdentityConfig,DirectoryConfig,SubscriberConfig,IncidentConfig,IncidentStore,EnterpriseOperationsConfig,EnterpriseClusterConfig,EnterpriseIntegrationsConfig,LabsSafety};
 use FreePBX\\modules\\SlsConfigCrypto;
 define('SLS_IDENTITY_FIXTURE',FIXTURE);define('FREEPBX_IS_AUTH',true);
@@ -59,7 +62,8 @@ if(!function_exists('_')){function _($v){return $v;}}
         model = management[start:end].replace('class EnterpriseIdentityFixture', 'class EnterpriseBrowserCentral')
         model = model.replace('use \\FreePBX\\modules\\SlsEnterpriseLabs;', '''use \\FreePBX\\modules\\SlsEnterpriseLabs;
  use \\FreePBX\\modules\\SlsEnterpriseAdministration {enterpriseAdministratorAction as private actualAdministratorAction;}
- use \\FreePBX\\modules\\SlsEnterpriseIntegrations;''')
+ use \\FreePBX\\modules\\SlsEnterpriseIntegrations;
+ use \\FreePBX\\modules\\SlsOperators;''')
         model = re.sub(r' protected function assertEnterpriseAdministrator\(\):void\{[^\n]+\}\n', '', model)
         model = model[:model.rfind('}')] + '''
  public function currentOperator():array{return ['id'=>'recovery_admin','username'=>'fixture-admin','operator_role'=>'administrator'];}
@@ -67,19 +71,21 @@ if(!function_exists('_')){function _($v){return $v;}}
  public function validateCsrfToken($value):bool{return is_string($value)&&hash_equals($this->getCsrfToken(),$value);}
  private function configurationPathMetadata($path){return file_exists($path)?lstat($path):null;}
  private function getDefaultSettings():array{return ['enterprise_operations'=>EnterpriseOperationsConfig::defaults()];}
- public function enterpriseAdministratorAction(string $action,array $input):array{file_put_contents(FIXTURE.'/central-actions.jsonl',json_encode(['action'=>$action,'input'=>$input])."\\n",FILE_APPEND|LOCK_EX);return $this->actualAdministratorAction($action,$input);}
+ public function enterpriseAdministratorAction(string $action,array $input):array{file_put_contents(FIXTURE.'/central-actions.jsonl',json_encode(['action'=>$action,'input'=>$input])."\\n",FILE_APPEND|LOCK_EX);if($action==='integrations_labs_send'){return ['success'=>true,'message'=>'Inert browser fixture: no delivery.'];}return $this->actualAdministratorAction($action,$input);}
+ public function enforceOperatorPageAccess(string $page):void{}
+ public function operatorAccessState():array{return ['access'=>['enabled'=>false,'portal_enabled'=>false,'accounts'=>[]],'directory'=>['accounts'=>[],'warnings'=>[]],'sites'=>[],'locations'=>[],'devices'=>[],'audiences'=>[],'revision'=>str_repeat('a',64),'security_activity'=>['events'=>[],'notices'=>[]]];}
  public function getConfiguredPjsipExtensionNumbers():array{return ['1000'];}
  public function getEnterpriseClusterConfiguration():array{return EnterpriseClusterConfig::defaults();}
  public function renderClusterPage(string $endpoint,string $csrf):string{return load_view(MODULE.'/views/cluster.php',['config'=>$this->getEnterpriseClusterConfiguration(),'endpoint'=>$endpoint,'csrf'=>$csrf,'revision'=>str_repeat('a',64)]);}
  public function configureEnterpriseCluster(array $input):array{$settings=$this->getActiveSettings();$settings['enterprise_cluster']=$input;$this->assertEnterpriseActivationSafe($settings);return ['success'=>true,'revision'=>str_repeat('b',64),'message'=>'Inert browser fixture: no cluster activation.'];}
- public function getEnterpriseIntegrationState():array{$cfg=EnterpriseIntegrationsConfig::normalize($this->getActiveSettings()['enterprise_integrations']??[]);return ['config'=>EnterpriseIntegrationsConfig::redacted($cfg),'revision'=>hash('sha256',json_encode($cfg,JSON_THROW_ON_ERROR)),'catalog'=>EnterpriseIntegrationsConfig::catalog(),'history'=>[],'sensor_health'=>[],'storage_error'=>'','extensions'=>['1000'],'sms_recipients'=>[],'voice_recipients'=>[],'people'=>[],'incidents'=>[]];}
+ public function getEnterpriseIntegrationState():array{$cfg=EnterpriseIntegrationsConfig::normalize($this->getActiveSettings()['enterprise_integrations']??[]);return ['config'=>EnterpriseIntegrationsConfig::redacted($cfg),'revision'=>hash('sha256',json_encode($cfg,JSON_THROW_ON_ERROR)),'catalog'=>EnterpriseIntegrationsConfig::catalog(),'history'=>[['request_id'=>str_repeat('a',32),'kind'=>'meeting','state'=>'uncertain','created_at'=>time()-600,'finished_at'=>time()-590,'detail'=>'Fixture uncertainty']],'sensor_health'=>[],'storage_error'=>'','journal_usage'=>[],'browser_people'=>[],'runtime_dependencies'=>['curl'=>true,'openssl'=>true,'dom'=>true],'extensions'=>['1000'],'sms_recipients'=>[],'voice_recipients'=>[],'people'=>[],'incidents'=>[]];}
  public function enterpriseOperationsState():array{$cfg=EnterpriseOperationsConfig::normalize($this->getActiveSettings()['enterprise_operations']??[]);return ['config'=>$cfg,'revision'=>hash('sha256',json_encode($cfg,JSON_THROW_ON_ERROR)),'sites'=>[['id'=>'site_a','name'=>'Fixture Site']],'people'=>[['id'=>'pbx:fixture-admin','name'=>'Fixture administrator'],['id'=>'pbx:reviewer','name'=>'Fixture reviewer']],'templates'=>[['id'=>'tpl_'.str_repeat('a',24),'name'=>'Browser template','fields'=>[]]],'audiences'=>[['id'=>'grp_'.str_repeat('a',24),'name'=>'Saved fixture audience']],'marker_choices'=>[['kind'=>'location','id'=>'room_a','name'=>'Fixture room']],'tones'=>[],'timezone'=>'UTC','timezones'=>['UTC','America/Chicago'],'reviews'=>[],'drill_report'=>[],'incident_choices'=>[['id'=>'inc_'.str_repeat('a',32),'name'=>'Assigned browser incident']]];}
  public function getEnterpriseFloorplanImage(string $id):array{if($id!=='img_'.str_repeat('a',64)){throw new DomainException('Unknown private fixture image.');}return ['type'=>'image/png','bytes'=>base64_decode(substr(file_get_contents(FIXTURE.'/browser-image.txt'),22),true)];}
  public function enterpriseOperationsAction(string $action,array $input):array{if($action==='floorplan_overlay'){if($input!==['plan_id'=>'plan_'.str_repeat('a',24),'incident_id'=>'inc_'.str_repeat('a',32)]){throw new DomainException('Unexpected private overlay selection.');}return ['success'=>true,'plan'=>['image_id'=>'img_'.str_repeat('a',64),'markers'=>[['label'=>'Fixture room','x'=>50,'y'=>50,'status'=>'unconfirmed']]],'observed_at'=>gmdate('c'),'meaning'=>'Human responses remain separate from transport receipts.'];}if($action==='drill_report'){return ['success'=>true,'assignments'=>[]];}if($action!=='operations_save'){throw new DomainException('Only editor saves are inert in this fixture.');}$cfg=EnterpriseOperationsConfig::normalize($input['config']);$this->saveEnterpriseNamespace('enterprise_operations',$cfg,$input['revision']);return ['success'=>true,'message'=>'Fixture coordination settings saved.'];}
 }
 class FreePBX{public static function create(){return (object)['Slsmassnotifyserver'=>new EnterpriseBrowserCentral()];}}
 session_name('SLSCENTRALFIXTURE');session_start();
-require MODULE.'/page.slsmassnotifyserver_enterprise.php';
+require MODULE.((($_GET['display']??'')==='slsmassnotifyserver_operators')?'/page.slsmassnotifyserver_operators.php':'/page.slsmassnotifyserver_enterprise.php');
 '''
         # The canonical writer remains under test; fixture configuration and
         # operational storage are private temporary files, never host PBX data.
@@ -105,7 +111,7 @@ $rows=json_decode(file_get_contents(__DIR__.'/browser-security.json'),true,16,JS
 $state=['access'=>['enabled'=>false,'portal_enabled'=>false,'accounts'=>[]],
  'directory'=>['accounts'=>[],'warnings'=>[]],'sites'=>[],'locations'=>[],'devices'=>[],'audiences'=>[],
  'revision'=>str_repeat('a',64),'security_activity'=>['events'=>array_map([\\SLS\\MassNotify\\SecurityAudit::class,'project'],$rows),'notices'=>[]]];
-$csrf_token=str_repeat('b',64);$endpoint='/operator-config.php';
+$csrf_token=str_repeat('b',64);$endpoint='/operator-config.php';$identity_settings='';
 ?><!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>
 *{box-sizing:border-box}body{margin:0;font:14px Arial,sans-serif}#page_body{display:table;width:100%}.container-fluid{padding:0 15px}.btn{display:inline-block;padding:6px 12px}.table{margin-bottom:20px}th{font-weight:700}
 </style></head><body><div id="page_body"><?php include MODULE.'/views/operators.php';?></div></body></html>
@@ -128,6 +134,8 @@ $template=\SLS\MassNotify\IncidentConfig::template(['id'=>'tpl_'.str_repeat('d',
  ['locale'=>'fr','label'=>'French','title'=>'Message de test','message'=>'Message initial de test','review_note'=>'Fixture only','reviewed'=>true]]]);
 $preferences=[];$choices=['desktop_clients'=>[]];for($n=0;$n<160;$n++){
  $preferences[]=['channel'=>'desktop_clients','recipient_id'=>'desktop'.$n,'locale'=>$n%2 ? 'fr' : 'es'];$choices['desktop_clients'][]=['id'=>'desktop'.$n,'name'=>'Desktop '.$n];}
+$choices['browser_recipient_ids']=[['id'=>'sub_'.str_repeat('a',24),'name'=>'Private browser fixture']];
+$choices['connector_ids']=[['id'=>'conn_'.str_repeat('b',24),'name'=>'Private connector fixture']];
 $service=new \SLS\MassNotify\IncidentService(new \SLS\MassNotify\IncidentStore(__DIR__.'/browser-incidents'),fn()=>$template,fn($d)=>$d,
  fn($d,$m,$t,$c)=>['success'=>true,'job_id'=>'job_'.md5(json_encode($c))],fn($j)=>['success'=>true,'job_id'=>$j,'receipts'=>[['channel'=>'desktop','target'=>'Fixture desktop','state'=>'received','detail'=>'Received by desktop app']]],null,
  fn($t,$d,$f,$l,$test)=>\SLS\MassNotify\IncidentLanguages::plan($t,$d,$preferences,$f,$l,$test,fn($targets)=>$targets));
@@ -139,7 +147,7 @@ echo load_view(MODULE.'/views/incidents.php',['templates'=>[$template],'active_t
 '''.replace('MODULE',json.dumps(str(MODULE)))
         (cls.root/'incident-view.php').write_text(incident_view)
         seed = '''require MODULE.'/ConfigCrypto.php';require MODULE.'/IncidentConfig.php';require MODULE.'/EnterpriseOperationsConfig.php';
-$s=['incident_workflows'=>['schema'=>1,'templates'=>[\\SLS\\MassNotify\\IncidentConfig::template(['id'=>'tpl_'.str_repeat('a',24),'name'=>'Browser template','title'=>'Fixture','message'=>'Fixture','delivery'=>['extensions'=>['1000']]])]],'operator_access'=>['accounts'=>[]]];
+$s=['control_api'=>['base_url'=>'https://pbx.example.test/api/sls-mass-notify'],'incident_workflows'=>['schema'=>1,'templates'=>[\\SLS\\MassNotify\\IncidentConfig::template(['id'=>'tpl_'.str_repeat('a',24),'name'=>'Browser template','title'=>'Fixture','message'=>'Fixture','delivery'=>['extensions'=>['1000']]])]],'operator_access'=>['accounts'=>[]]];
 $s['enterprise_operations']=\\SLS\\MassNotify\\EnterpriseOperationsConfig::normalize(['enabled'=>true,'floorplans'=>['enabled'=>true,'plans'=>[['id'=>'plan_'.str_repeat('a',24),'name'=>'Private assigned plan','enabled'=>true,'site_id'=>'site_a','image_id'=>'img_'.str_repeat('a',64),'markers'=>[]]]]]);
 file_put_contents(FIXTURE.'/active.config',\\FreePBX\\modules\\SlsConfigCrypto::encode($s));chmod(FIXTURE.'/active.config',0640);'''
         import subprocess
@@ -284,12 +292,15 @@ if($path==='/mass-notify/'){require __DIR__.'/mass-notify/index.php';return;}htt
         self.assertFalse(page.locator('#sls-cluster-config input[name=enabled]').is_checked())
         self.assertFalse(page.locator('#sls-cluster-config input[name=mirroring_enabled]').is_checked())
         page.locator('[data-labs-tab="identity"]').click()
+        self.assertEqual(page.locator('[data-save-config="identity"]').count(), 0)
+        page.goto(self.browser_url + '/config.php?display=slsmassnotifyserver_operators')
         page.locator('[data-save-config="identity"]').click()
         page.locator('[data-identity-status]').get_by_text('Enterprise identity saved.', exact=False).wait_for()
         self.assertEqual(page.locator('#sls-labs-danger[open]').count(), 0)
         page.locator('[data-add-provider]').click()
         provider = json.loads(page.locator('[data-config="identity"]').input_value())['providers'][0]
         self.assertEqual(provider['vendor'], 'entra');self.assertFalse(provider['enabled'])
+        page.goto(url)
         page.locator('[data-labs-tab="operations"]').click()
         for section, fields in [('dual_approval', {'Name':'Fixture approval','Review lifetime (seconds)':'300'}),
                                 ('drills', {'Name':'Fixture drill','Completion deadline':'2027-01-01T12:00'}),
@@ -326,6 +337,14 @@ if($path==='/mass-notify/'){require __DIR__.'/mass-notify/index.php';return;}htt
         page.locator('[data-labs-tab="integrations"]').click()
         page.locator('[data-add="speaker"]').click()
         self.assertEqual(page.locator('#sls-integration-speakers .sls-integration-row').count(),1)
+        page.get_by_text('Record reviewed provider evidence',exact=True).click()
+        self.assertEqual(page.get_by_label('Reviewed outcome',exact=True).count(),1)
+        self.assertEqual(page.get_by_label('Evidence reference',exact=True).count(),1)
+        labs_submit=page.locator('#sls-integration-labs-send [type="submit"]')
+        page.locator('#sls-integration-labs-message').fill('Isolated browser fixture')
+        labs_submit.click()
+        page.locator('#sls-integration-status').get_by_text('Inert browser fixture',exact=False).wait_for()
+        self.assertTrue(labs_submit.is_enabled(),'Successful integration request left its submit control disabled')
         page.locator('[data-labs-tab="continuity"]').click()
         page.locator('#sls-cluster-config input[name=enabled]').check()
         page.locator('#sls-cluster-config input[name=mirroring_enabled]').check()
@@ -336,11 +355,78 @@ if($path==='/mass-notify/'){require __DIR__.'/mass-notify/index.php';return;}htt
         self.assertEqual(page.locator('#sls-labs-danger[open]').count(),0)
         self.assertEqual(self.errors,[])
         # Inspect responsiveness using actual rendered central widgets.
-        page.set_viewport_size({'width':390,'height':844})
+        page.set_viewport_size({'width':MOBILE_WIDTH,'height':844})
         page.locator('[data-labs-tab="identity"]').click()
-        self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), 420)
+        self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), MOBILE_WIDTH)
         page.set_viewport_size({'width':1440,'height':1000})
         print('Central Chromium: tabs, revisioned identity POST, typed approval/drill/shift/floorplan editors, private overlay refresh, speaker row, five-second warning and mobile width passed.',flush=True)
+
+    def test_operator_sso_administration_and_nag_copy(self):
+        page=self.page
+        operator_url=self.browser_url+'/config.php?display=slsmassnotifyserver_operators'
+        page.goto(operator_url)
+        self.assertEqual(page.locator('#sls-operator-access').count(),1,page.content()[:1000])
+        self.assertIn('does not change FreePBX or UCP sign-in',page.locator('#enterprise-identity-labs').inner_text())
+        page.locator('[data-save-config="identity"]').click()
+        page.locator('[data-identity-status]').get_by_text('Enterprise identity saved.',exact=False).wait_for()
+        self.assertEqual(page.locator('#sls-labs-danger[open]').count(),0)
+        self.assertFalse(json.loads(page.locator('[data-config="identity"]').input_value())['enabled'])
+        page.locator('[data-provider-vendor]').select_option('keycloak')
+        page.locator('[data-add-provider]').click()
+        section=page.locator('[data-identity-providers] .sls-identity-card').last
+        for label,value in [('Display name','Fixture SSO'),('Exact issuer','https://identity.example.test/realm'),
+                            ('Discovery URL','https://identity.example.test/realm/.well-known/openid-configuration'),
+                            ('Client ID','fixture-client'),('Client secret','fixture-secret'),
+                            ('Allowed endpoint hostnames (one per line)','identity.example.test')]:
+            section.get_by_label(label,exact=True).fill(value)
+        callback=section.get_by_label('Registered HTTPS callback',exact=True)
+        self.assertFalse(callback.is_editable())
+        self.assertEqual(callback.input_value(),'https://pbx.example.test/mass-notify/sso.php')
+        page.locator('[data-save-config="identity"]').click()
+        page.locator('[data-identity-status]').get_by_text('Enterprise identity saved.',exact=False).wait_for()
+        page.reload()
+        self.assertEqual(page.locator('[data-identity-providers] .sls-identity-card').count(),1)
+        self.assertEqual(page.get_by_label('Client secret',exact=True).input_value(),'')
+        saved=json.loads(page.locator('[data-config="identity"]').input_value())
+        self.assertFalse(saved['enabled']);self.assertFalse(saved['providers'][0]['enabled'])
+        for width in [MOBILE_WIDTH,1440]:
+            page.set_viewport_size({'width':width,'height':1000})
+            self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'),width)
+        self.assertEqual(page.locator('#sls-labs-danger em').inner_text(),'This is a one time nag!')
+        self.assertEqual(self.errors,[])
+        print('Operator SSO: actual administrator page, revisioned save, disabled provider persistence, blank saved secret, warning copy and responsive layout passed.',flush=True)
+
+    def test_operator_sso_warning_normal_flow(self):
+        before=(self.root/'active.config').read_bytes()
+        try:
+            # A different test may have already accepted the Labs page notice,
+            # which legitimately covers SSO. Reset only this private fixture's
+            # acknowledgment so this case exercises a first-time SSO review.
+            import subprocess
+            script="require "+json.dumps(str(MODULE/'ConfigCrypto.php'))+"; $path="+json.dumps(str(self.root/'active.config'))+";"
+            script+="$settings=\\FreePBX\\modules\\SlsConfigCrypto::readFile($path);unset($settings['labs_safety']['receipts']['enterprise_labs'],$settings['labs_safety']['receipts']['enterprise_identity']);file_put_contents($path,\\FreePBX\\modules\\SlsConfigCrypto::encode($settings));"
+            subprocess.run(['php','-r',script],check=True,capture_output=True,timeout=5)
+            page=self.page
+            page.goto(self.browser_url+'/config.php?display=slsmassnotifyserver_operators')
+            page.wait_for_function('Boolean(window.SlsLabsSafety)')
+            page.evaluate('void window.SlsLabsSafety.acknowledge().then(result => { window.normalWarningResult=result; });')
+            page.locator('#sls-labs-danger[open]').wait_for()
+            self.assertTrue(page.locator('#sls-labs-danger-agree').is_disabled())
+            self.assertEqual(page.locator('#sls-labs-danger em').inner_text(),'This is a one time nag!')
+            page.wait_for_function('!document.getElementById("sls-labs-danger-agree").disabled')
+            page.locator('#sls-labs-danger-agree').check()
+            page.locator('#sls-labs-danger-accept').click()
+            page.wait_for_function('window.normalWarningResult===true')
+            self.assertEqual(page.locator('#sls-labs-danger[open]').count(),0)
+            page.reload()
+            page.wait_for_function('Boolean(window.SlsLabsSafety)')
+            self.assertTrue(page.evaluate('window.SlsLabsSafety.acknowledge()'))
+            self.assertEqual(page.locator('#sls-labs-danger[open]').count(),0)
+            self.assertFalse(json.loads(page.locator('[data-config="identity"]').input_value())['enabled'])
+            self.assertEqual(self.errors,[])
+            print('Operator SSO warning: five-second review, explicit acceptance, persisted one-time receipt and disabled feature passed.',flush=True)
+        finally:
+            (self.root/'active.config').write_bytes(before)
 
     def test_structured_directory_review_and_browser_key_controls(self):
         page=self.page
@@ -380,8 +466,8 @@ if($path==='/mass-notify/'){require __DIR__.'/mass-notify/index.php';return;}htt
         self.assertTrue(config['push']['private_key_configured'])
         self.assertFalse(config['push']['enabled'])
         self.assertNotIn('private_key_pem',config['push'])
-        page.set_viewport_size({'width':390,'height':844})
-        self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'),420)
+        page.set_viewport_size({'width':MOBILE_WIDTH,'height':844})
+        self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'),MOBILE_WIDTH)
         page.set_viewport_size({'width':1440,'height':1000})
         self.assertEqual(self.errors,[])
         print('Structured Labs Chromium: saved CSV source selection, real dry-run/apply, mandatory deactivation review and redacted disabled VAPID generation passed.',flush=True)
@@ -399,12 +485,21 @@ if($path==='/mass-notify/'){require __DIR__.'/mass-notify/index.php';return;}htt
         dialog.get_by_label('Preferred reviewed language',exact=True).select_option('es')
         dialog.get_by_role('button',name='Add preference',exact=True).click()
         self.assertEqual(dialog.locator('tbody td').nth(1).inner_text(),'es')
-        page.set_viewport_size({'width':390,'height':844})
-        self.assertLessEqual(dialog.bounding_box()['width'],390)
+        for channel,recipient,locale in (
+                ('browser_recipient_ids','sub_'+'a'*24,'fr'),
+                ('connector_ids','conn_'+'b'*24,'es')):
+            dialog.get_by_label('Destination type',exact=True).select_option(channel)
+            dialog.get_by_label('Destination',exact=True).select_option(recipient)
+            dialog.get_by_label('Preferred reviewed language',exact=True).select_option(locale)
+            dialog.get_by_role('button',name='Add preference',exact=True).click()
+        page.set_viewport_size({'width':MOBILE_WIDTH,'height':844})
+        self.assertLessEqual(dialog.bounding_box()['width'],MOBILE_WIDTH)
         with page.expect_navigation():dialog.get_by_role('button',name='Save preferences',exact=True).click()
         result=json.loads((self.root/'browser-incident-action.json').read_text())
-        self.assertEqual(result['action'],'save_languages');self.assertEqual(len(result['input']['recipient_languages']),160)
+        self.assertEqual(result['action'],'save_languages');self.assertEqual(len(result['input']['recipient_languages']),162)
         self.assertEqual(next(row for row in result['input']['recipient_languages'] if row['recipient_id']=='desktop149')['locale'],'es')
+        self.assertEqual(next(row for row in result['input']['recipient_languages'] if row['channel']=='browser_recipient_ids')['locale'],'fr')
+        self.assertEqual(next(row for row in result['input']['recipient_languages'] if row['channel']=='connector_ids')['locale'],'es')
         page.get_by_role('button',name='Send separate update',exact=True).click()
         dialog=page.locator('.sls-inc-dialog');dialog.get_by_label('New announcement text',exact=True).fill('Updated base wording')
         dialog.locator('details').filter(has=page.get_by_label('Reviewed es update',exact=True)).locator('summary').click()
@@ -459,13 +554,13 @@ if($path==='/mass-notify/'){require __DIR__.'/mass-notify/index.php';return;}htt
         self.assertEqual(page.locator('.ops-floorplan img').evaluate('(n)=>n.naturalWidth'),2)
         self.assertEqual(self.errors,[])
         page.locator('#ops-modal [data-close]').first.click()
-        page.set_viewport_size({'width':390,'height':844})
-        self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'),420)
+        page.set_viewport_size({'width':MOBILE_WIDTH,'height':844})
+        self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'),MOBILE_WIDTH)
         print('Portal Chromium: actual local password/MFA session, expired approval controls, frozen review POST, drill launch/review POST, private response overlay and mobile width passed.',flush=True)
 
     def test_populated_operator_security_activity_is_safe_and_bounded(self):
         page=self.page
-        for width,height in [(390,844),(1440,1000)]:
+        for width,height in [(MOBILE_WIDTH,844),(1440,1000)]:
             page.set_viewport_size({'width':width,'height':height})
             page.goto(self.browser_url+'/operator-config.php')
             table=page.locator('.ops-audit-scroll table')
@@ -482,8 +577,13 @@ if($path==='/mass-notify/'){require __DIR__.'/mass-notify/index.php';return;}htt
             self.assertTrue(page.locator('#ops-modal').is_visible())
             page.locator('#ops-modal [data-close]').first.click()
         self.assertEqual(self.errors,[])
-        print('Operator Access Chromium: four attributable security rows, long/escaped actors, seven readable headers, account editor, and exact 390/1440 page bounds passed.',flush=True)
+        print(f'Operator Access Chromium: four attributable security rows, long/escaped actors, seven readable headers, account editor, and exact {MOBILE_WIDTH}/1440 page bounds passed.',flush=True)
 
 
 if __name__ == '__main__':
+    selected=os.environ.get('SLS_ORDINARY_UI_ONLY')=='1'
+    if selected:
+        suite=unittest.TestSuite([EnterpriseBrowserTests(name) for name in ['test_operator_sso_administration_and_nag_copy','test_operator_sso_warning_normal_flow']])
+        result=unittest.TextTestRunner(verbosity=2).run(suite)
+        raise SystemExit(0 if result.wasSuccessful() else 1)
     unittest.main()

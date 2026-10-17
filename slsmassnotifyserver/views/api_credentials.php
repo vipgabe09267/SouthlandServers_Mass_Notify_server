@@ -4,7 +4,7 @@
 $credentialEscape = static function ($value) { return htmlspecialchars((string)$value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); };
 $credentialRows = is_array($api_credentials ?? null) ? $api_credentials : [];
 foreach ($credentialRows as &$row) { unset($row['secret_hash']); } unset($row);
-$credentialOptions = ['extensions' => [], 'desktop_client_ids' => [], 'announcement_group_ids' => [], 'voice_recipient_ids' => [], 'webhook_ids' => [], 'nws_zone_ids' => [], 'email_recipient_ids' => [], 'sms_recipient_ids' => []];
+$credentialOptions = ['extensions' => [], 'desktop_client_ids' => [], 'announcement_group_ids' => [], 'voice_recipient_ids' => [], 'webhook_ids' => [], 'nws_zone_ids' => [], 'email_recipient_ids' => [], 'sms_recipient_ids' => [], 'browser_recipient_ids'=>[], 'connector_ids'=>[]];
 foreach ((array)($available_extensions ?? []) as $row) {
     if (is_array($row) && isset($row['extension'])) { $credentialOptions['extensions'][] = [(string)$row['extension'], (string)$row['extension'] . ' · ' . ($row['name'] ?? '')]; }
 }
@@ -29,8 +29,11 @@ foreach ((array)($settings['announcement_sms']['recipients'] ?? []) as $row) {
         $credentialOptions['sms_recipient_ids'][] = [(string)$row['id'], (string)($row['name'] ?? $row['id'])];
     }
 }
+foreach (\SLS\MassNotify\ApiSecurity::labsDirectory($settings ?? []) as $field=>$rows) {
+    foreach ($rows as $id=>$row) { if ($row['available']) { $credentialOptions[$field][]=[$id,$row['label']]; } }
+}
 $credentialLabels = ['extensions' => 'Phones', 'desktop_client_ids' => 'Desktop clients', 'announcement_group_ids' => 'Saved announcement groups',
-    'voice_recipient_ids' => 'External voice recipients', 'webhook_ids' => 'Announcement integrations', 'nws_zone_ids' => 'Weather zones', 'email_recipient_ids' => 'Announcement email recipients', 'sms_recipient_ids' => 'SMS recipients'];
+    'voice_recipient_ids' => 'External voice recipients', 'webhook_ids' => 'Announcement integrations', 'nws_zone_ids' => 'Weather zones', 'email_recipient_ids' => 'Announcement email recipients', 'sms_recipient_ids' => 'SMS recipients', 'browser_recipient_ids'=>'Browser subscribers', 'connector_ids'=>'Notification connectors'];
 ?>
 <section class="sls-manager-card sls-credential-card" aria-labelledby="sls-credential-heading">
   <h3 id="sls-credential-heading"><i class="fa fa-key" aria-hidden="true"></i> Named API credentials <?php include __DIR__ . '/labs.php'; ?></h3>
@@ -55,7 +58,7 @@ $credentialLabels = ['extensions' => 'Phones', 'desktop_client_ids' => 'Desktop 
       <div class="sls-credential-audiences">
       <?php foreach ($credentialLabels as $field => $label): ?>
         <details class="sls-credential-picker" data-credential-audience="<?php echo $field; ?>"<?php echo $field === 'extensions' && $credentialOptions[$field] ? ' open' : ''; ?>>
-          <summary><?php echo $credentialEscape($label); ?> <span class="badge" data-credential-count>0 selected</span></summary>
+          <summary><?php if (in_array($field,['browser_recipient_ids','connector_ids'],true)) { ?><i class="fa fa-flask" aria-hidden="true"></i> <?php echo _('Labs ·'); ?> <?php } ?><?php echo $credentialEscape($label); ?> <span class="badge" data-credential-count>0 selected</span></summary>
           <?php if (!$credentialOptions[$field]): ?>
             <p class="help-block">No saved entries are available. Configure these recipients before assigning permission.</p>
           <?php else: ?>

@@ -1,6 +1,7 @@
 <?php
 declare(strict_types=1);
 require_once dirname(__DIR__) . '/slsmassnotifyserver/api/sls-mass-notify/event-log.php';
+require_once dirname(__DIR__) . '/slsmassnotifyserver/api/sls-mass-notify/security.php';
 $directory = sys_get_temp_dir() . '/sls-control-bounds-' . bin2hex(random_bytes(8));
 mkdir($directory, 0700);
 define('CONTROL_API_RATE_FILE', $directory . '/rate.json');
@@ -10,13 +11,24 @@ define('CONTROL_API_MAX_ACTION_BODY_BYTES', 65536);
 $source = file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/api/sls-mass-notify/index.php');
 $helperStart = strpos($source, 'function api_state_metadata_matches(');
 eval(substr($source, $helperStart, strpos($source, 'function control_rate_allowed(', $helperStart) - $helperStart));
-foreach (['control_rate_allowed' => 'audit_control_api', 'recent_events' => 'freepbx_module', 'decode_control_request' => 'cidr_match'] as $start => $end) {
+foreach (['control_rate_allowed' => 'audit_control_api', 'recent_events' => 'freepbx_module', 'decode_control_request' => 'cidr_match', 'cidr_match'=>'api_state_metadata_matches'] as $start => $end) {
     $offset = strpos($source, 'function ' . $start . '(');
     $length = strpos($source, 'function ' . $end . '(', $offset) - $offset;
     eval(substr($source, $offset, $length));
 }
 $control = ['rate_limit_enabled' => '1', 'rate_limit_per_minute' => 2];
 try {
+    foreach (['','abc','+24','-1','32x','33','999999999999999999999',"24\n"] as $bits) {
+        foreach(['198.51.100.9','192.0.2.0'] as $ip){if(cidr_match($ip,'192.0.2.0/'.$bits)){throw new RuntimeException('Malformed CIDR prefix widened the source allowlist.');}}
+    }
+    foreach ([['192.0.2.5','192.0.2.0/24',true],['198.51.100.5','192.0.2.0/24',false],['192.0.2.5','192.0.2.5/32',true],
+        ['198.51.100.5','192.0.2.0/0',true],['2001:db8:1::5','2001:db8:1::/48',true],['2001:db8:2::5','2001:db8:1::/48',false],
+        ['2001:db8::5','2001:db8::5/128',true],['2001:db8::5','::/0',true],['2001:db8::5','192.0.2.0/24',false],
+        ['2001:db8::5','2001:db8::/129',false]] as [$ip,$range,$expected]) {
+        if(cidr_match($ip,$range)!==$expected){throw new RuntimeException('Valid CIDR behavior or address-family isolation changed.');}
+    }
+    $literalPolicy=['ip_allowlist_enabled'=>'1','ip_allowlist'=>'2001:DB8:0000:0000:0000:0000:0000:0005'];
+    if(!ip_allowed($literalPolicy,'2001:db8::5')||ip_allowed($literalPolicy,'2001:db8::6')||ip_allowed($literalPolicy,'192.0.2.5')){throw new RuntimeException('Literal IPv6 representation changed its allowlist identity.');}
     $clients = [];
     for ($index = 0; $index < 1000; $index++) {
         $clients[] = ['id' => 'fixture-' . $index, 'username' => 'client-' . $index,
@@ -33,7 +45,7 @@ try {
     if ((decode_control_request(str_repeat(' ', CONTROL_API_MAX_CONFIG_BODY_BYTES + 1))['status'] ?? 0) !== 413) {
         throw new RuntimeException('An oversized configuration request was accepted.');
     }
-    foreach (['[]', '{', '{"action":false}', '{"action":{"nested":true}}', '{"action":"update_config","value":' . str_repeat('[', 65) . '0' . str_repeat(']', 65) . '}'] as $invalid) {
+    foreach (['[]', '{', '{"action":false}', '{"action":{"nested":true}}', '{"action":"send_announcement","action":"update_config"}', '{"action":"send_announcement","x":{"a":1,"\\u0061":2}}', '{"action":"send_announcement","x":1e9999}', '{"action":"update_config","value":' . str_repeat('[', 65) . '0' . str_repeat(']', 65) . '}'] as $invalid) {
         if ((decode_control_request($invalid)['status'] ?? 0) !== 400) { throw new RuntimeException('Invalid or over-nested Control API JSON was accepted.'); }
     }
     if (!control_rate_allowed($control, '192.0.2.1') || !control_rate_allowed($control, '192.0.2.1') || control_rate_allowed($control, '192.0.2.1')) {

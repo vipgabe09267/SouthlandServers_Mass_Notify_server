@@ -5,9 +5,15 @@ if (PHP_SAPI!=='cli') { http_response_code(404);exit(1); }
 ini_set('display_errors','0');
 try {
     if ($argc!==1) { throw new RuntimeException('Unexpected Weather channel arguments.'); }
+    $account=function_exists('posix_getpwnam')?posix_getpwnam('asterisk'):false;
+    if(!is_array($account)||!function_exists('posix_geteuid')||posix_geteuid()!==$account['uid']||$account['uid']===0){throw new DomainException('Weather channel handoff must run as the unprivileged Asterisk service account.');}
     $raw=stream_get_contents(STDIN,262145);
     if (strlen($raw)>262144) { throw new RuntimeException('Weather channel request is too large.'); }
-    $input=json_decode($raw,true,16,JSON_THROW_ON_ERROR);
+    if (!class_exists('SlsAtomicJson', false)) {
+        $library=__DIR__.'/sls_atomic_json.php';
+        require_once is_file($library)?$library:__DIR__.'/sls_mass_notify/sls_atomic_json.php';
+    }
+    $input=\SlsAtomicJson::decodeObject($raw,16);
     require '/etc/freepbx.conf';
     echo json_encode(\FreePBX::Slsmassnotifyserver()->queueWeatherChannels($input),JSON_THROW_ON_ERROR),"\n";
 } catch (InvalidArgumentException|DomainException $error) {

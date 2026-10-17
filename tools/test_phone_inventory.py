@@ -83,6 +83,25 @@ class InventoryTests(unittest.TestCase):
             logged=''.join(str(args.args[0]) for args in output.write.call_args_list)
             self.assertIn('snapshot will expire',logged);self.assertNotIn('secret',logged)
 
+    def test_help_groups_mixed_models_and_escapes_agents_once_per_extension(self):
+        import subprocess
+        source = Path(__file__).resolve().parents[1] / 'slsmassnotifyserver/views/detected_phones.php'
+        script = """if(!function_exists('_')){function _($v){return $v;}}
+$endpointDiagnostics=[['extension'=>'6767','devices'=>[
+['format'=>'yealink','transport'=>'tls','user_agent'=>'Yealink T48G'],
+['format'=>'grandstream','transport'=>'udp','user_agent'=>'Grandstream GXP'],
+['format'=>'unknown','transport'=>'tcp','user_agent'=>'Acrobits <script>alert(1)</script>'],
+['format'=>'yealink','transport'=>'tls','user_agent'=>'Yealink T48G']]]];
+include $argv[1];"""
+        result = subprocess.run(['php', '-r', script, str(source)], capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout.count('<tr>'), 2)
+        self.assertEqual(result.stdout.count('6767'), 1)
+        self.assertEqual(result.stdout.count('>Yealink<'), 1)
+        self.assertIn('>Grandstream<', result.stdout)
+        self.assertIn('Acrobits (unknown)', result.stdout)
+        self.assertNotIn('<script>', result.stdout)
+        self.assertIn('&lt;script&gt;', result.stdout)
+
     def test_multiple_contacts_stable_empty_and_stale(self):
         with tempfile.TemporaryDirectory(prefix='sls-phone-inventory-') as temporary:
             root = Path(temporary)
@@ -101,5 +120,22 @@ class InventoryTests(unittest.TestCase):
             with self.assertRaises(OSError): inventory.read(root)
             with self.assertRaises(ValueError): inventory.publish({'not-an-extension': {}}, root)
             self.assertEqual(outside.read_text(), '{}')
+
+    def test_private_mode_and_replaced_staging_cleanup(self):
+        with tempfile.TemporaryDirectory(prefix='sls-phone-inventory-') as temporary:
+            root = Path(temporary); inventory.publish({}, root, now=1000)
+            path = root / inventory.NAME; path.chmod(0o660)
+            with self.assertRaisesRegex(ValueError, 'Unsafe'): inventory.read(root, now=1001)
+            replacement = b'preserve substituted staging inode'
+            def swap(source, destination, *, src_dir_fd, dst_dir_fd):
+                os.unlink(source, dir_fd=src_dir_fd)
+                fd = os.open(source, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=src_dir_fd)
+                with os.fdopen(fd, 'wb') as handle: handle.write(replacement)
+                raise OSError('injected replacement')
+            with mock.patch.object(inventory.os, 'replace', side_effect=swap), self.assertRaisesRegex(OSError, 'injected'):
+                inventory.publish({}, root, now=1002)
+            leftovers = list(root.glob('.phone-inventory-*'))
+            self.assertEqual(len(leftovers), 1)
+            self.assertEqual(leftovers[0].read_bytes(), replacement)
 
 if __name__ == '__main__': unittest.main()

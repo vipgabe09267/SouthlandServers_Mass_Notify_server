@@ -13,6 +13,12 @@ import tempfile
 import threading
 import unittest
 
+if os.environ.get('SLS_TEST_NAMESPACE') != 'entered' or any(
+    os.environ.get('SLS_TEST_PARENT_' + label + '_NS') in (None, '', os.readlink('/proc/self/ns/' + kind))
+    for label, kind in [('MOUNT', 'mnt'), ('NET', 'net'), ('PID', 'pid')]
+):
+    raise SystemExit('Use the private fixture runner; trigger isolation verification failed.')
+
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / 'slsmassnotifyserver/bin/sls_mass_notify/sls_trigger_actions.py'
 spec = importlib.util.spec_from_file_location('sls_trigger_actions', WORKER)
@@ -23,8 +29,6 @@ spec.loader.exec_module(actions)
 class TriggerActions(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if not os.environ.get('SLS_TEST_NAMESPACE') == 'entered':
-            raise RuntimeError('Run only with tools/run_isolated_tests.sh')
         subprocess.run(['ip', 'link', 'set', 'lo', 'up'], check=True)
         subprocess.run(['ip', 'address', 'add', '192.168.240.10/32', 'dev', 'lo'], check=True)
         cls.directory = Path('/var/lib/asterisk/approved-script-fixtures')

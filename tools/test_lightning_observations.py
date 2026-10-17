@@ -1,13 +1,21 @@
 import importlib.util
-import os
 import pathlib
 import tempfile
 import time
 
-path = pathlib.Path(os.environ.get('SLS_LIGHTNING_SOURCE', str(pathlib.Path(__file__).resolve().parents[1] / 'slsmassnotifyserver/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py')))
+path = pathlib.Path(__file__).resolve().parents[1] / 'slsmassnotifyserver/bin/sls_mass_notify/sls_mass_notify_xweather_poll.py'
 spec = importlib.util.spec_from_file_location('lightning_audit', path)
+if spec is None or spec.loader is None:
+    raise RuntimeError('Unable to load the lightning worker fixture.')
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
 for response in (None, 'broken', {'unexpected': 'shape'}, [None], [{'id': 'missing-fields'}]):
     try:
         m.normalize_records({'success': True, 'response': response})
@@ -15,9 +23,9 @@ for response in (None, 'broken', {'unexpected': 'shape'}, [None], [{'id': 'missi
         pass
     else:
         raise AssertionError(f'Invalid response accepted: {response!r}')
-assert m.normalize_records({'success': True, 'response': []}) == []
+require(m.normalize_records({'success': True, 'response': []}) == [], 'An empty observation response changed meaning.')
 record = {'id': 'valid', 'ob': {'timestamp': int(time.time()), 'pulse': {'type': 'cg'}}, 'relativeTo': {'distanceMI': 3.1}}
-assert len(m.normalize_records({'success': True, 'response': [record]})) == 1
+require(len(m.normalize_records({'success': True, 'response': [record]})) == 1, 'A valid lightning observation was rejected.')
 try:
     m._forecast_indicates_thunder({'properties': {}}, 1000, 3600)
 except RuntimeError:
@@ -38,7 +46,8 @@ with tempfile.TemporaryDirectory() as directory:
         return {'properties': {'weather': {'values': [{'validTime': '1970-01-01T00:00:00Z/PT12H', 'value': []}]}}}
     m._nws_json = fake_nws
     result = m.forecast_storm_gate({}, new, 1000, 60)
-    assert not result[0]
-    assert requested[0].endswith('/40.0000,-100.0000'), requested
-assert 'outside' not in m.build_spoken_message('clear', False, 10, 'this area').lower()
+    require(not result[0], 'Clear forecast unexpectedly opened the storm gate.')
+    require(requested[0].endswith('/40.0000,-100.0000'), requested)
+require('outside' not in m.build_spoken_message('clear', False, 10, 'this area').lower(),
+        'All-clear wording retained the misleading outside-radius phrase.')
 print('Lightning schema, area-cache identity, forecast validation and all-clear wording checks passed.')

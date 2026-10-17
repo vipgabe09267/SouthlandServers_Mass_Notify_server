@@ -49,7 +49,7 @@ final class AutomationConfig
     }
     public static function rule($value): array
     {
-        $row = IncidentConfig::object($value, ['id','name','enabled','kind','location_id','template_id','fields','action_ids','secret','event','callers','numbers','feed_url','sender','allow_tests','max_age_seconds','cooldown_seconds','dial_extension','confirmation_prompt'], 'Trigger rule');
+        $row = IncidentConfig::object($value, ['id','name','enabled','kind','location_id','template_id','fields','action_ids','secret','event','callers','numbers','feed_url','sender','language','allow_tests','max_age_seconds','cooldown_seconds','dial_extension','confirmation_prompt'], 'Trigger rule');
         $out = ['id'=>self::id($row['id'] ?? '', 'trg'), 'name'=>IncidentConfig::text($row['name'] ?? '', 80, 'Trigger name'),
             'enabled'=>IncidentConfig::flag($row['enabled'] ?? false, 'Trigger enabled'), 'kind'=>$row['kind'] ?? '',
             'location_id'=>IncidentConfig::identifier($row['location_id'] ?? '', '/^(?:loc_[a-f0-9]{24})?$/D', 'Assigned location'),
@@ -100,6 +100,7 @@ final class AutomationConfig
             }
             $out['sender']=IncidentConfig::text($row['sender'] ?? '', 200, 'Exact trusted CAP sender');
             $out['event']=IncidentConfig::text($row['event'] ?? '', 80, 'Exact CAP event name');
+            $out['language']=strtolower(IncidentConfig::identifier($row['language'] ?? 'en', '/^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,3}$/D', 'CAP language tag'));
         } else { throw new \InvalidArgumentException('Choose panic, signed sensor, CAP feed or emergency-call observation.'); }
         if (array_diff(array_keys($row), array_keys($out))) { throw new \InvalidArgumentException('This trigger contains fields for a different source type.'); }
         return $out;
@@ -140,16 +141,22 @@ final class AutomationConfig
             $actions[]=$action;
         } }
         // Bind group membership and recipient identities as well as the selected template.
-        $routing=array_intersect_key($settings,array_flip(['announcement_groups','desktop_clients','outbound_voice','announcement_email','announcement_sms','announcement_webhooks']));
+        $routing=array_intersect_key($settings,array_flip(['announcement_groups','desktop_clients','outbound_voice','announcement_email','announcement_sms','announcement_webhooks','subscriber_browser','enterprise_integrations']));
         $revision=hash('sha256',json_encode([$rule,$template,$location,$actions,$routing],JSON_THROW_ON_ERROR));
         return compact('rule','template','location','actions','revision');
     }
-    public static function permits(array $settings, array $context, ?int $now=null): bool
+    public static function resolvePermitted(array $settings, array $context, ?int $now=null): ?array
     {
         if (count($context) !== 4 || !is_string($context['rule_id'] ?? null) || !is_string($context['revision'] ?? null)
             || !is_string($context['event_id'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D',$context['event_id'])
-            || !is_int($context['expires_at'] ?? null) || ($now ?? time()) >= $context['expires_at']) { return false; }
-        try { $current=self::resolve($settings,$context['rule_id']); return hash_equals($current['revision'],$context['revision']); }
-        catch (\Throwable $error) { return false; }
+            || !is_int($context['expires_at'] ?? null) || ($now ?? time()) >= $context['expires_at']) { return null; }
+        try {
+            $current=self::resolve($settings,$context['rule_id']);
+            return hash_equals($current['revision'],$context['revision']) ? $current : null;
+        } catch (\Throwable $error) { return null; }
+    }
+    public static function permits(array $settings, array $context, ?int $now=null): bool
+    {
+        return self::resolvePermitted($settings,$context,$now) !== null;
     }
 }

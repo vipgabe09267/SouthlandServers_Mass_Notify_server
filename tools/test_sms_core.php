@@ -2,6 +2,7 @@
 declare(strict_types=1);
 set_error_handler(static function ($code,$message,$file,$line) { if (error_reporting() & $code) { throw new ErrorException($message,0,$code,$file,$line); } return false; });
 require dirname(__DIR__).'/slsmassnotifyserver/api/sls-mass-notify/sms/Service.php';
+eval('namespace SLS\\MassNotify\\Sms; function fopen($path,$mode,...$arguments){if(($GLOBALS["sls_sms_backup_probe"]??"")===$path){$GLOBALS["sls_sms_backup_mode"]=$mode;}return \\fopen($path,$mode,...$arguments);}');
 use SLS\MassNotify\Sms\{Config,Store,Provider,Service};
 function check($ok,string $message): void { if (!$ok) { throw new RuntimeException($message); } }
 function rejects(callable $call,string $code): void {
@@ -42,8 +43,27 @@ try {
     rejects(fn()=>Config::amount('1e3'),'SMS amounts');
     rejects(fn()=>Config::normalize(['enabled'=>true]),'Before enabling');
     rejects(fn()=>Config::normalize(array_replace($config,['recipients'=>[$config['recipients'][0],$config['recipients'][0]]])),'duplicated');
+    $invalidConsent=$config;$invalidConsent['recipients'][0]['consent_at']='2026-02-30T12:00:00Z';
+    rejects(fn()=>Config::normalize($invalidConsent),'consent timestamp');
+    $markerDirectory=$directory.'/marker-fixture'; $markerStore=new Store($markerDirectory);
+    $markerPath=$markerDirectory.'/initialized'; $markerBytes=file_get_contents($markerPath);
+    file_put_contents($markerPath,str_repeat('X',strlen($markerBytes)));
+    rejects(fn()=>$markerStore->stats($now),'sms_storage_initialization_incomplete');
+    check(file_get_contents($markerPath)===str_repeat('X',strlen($markerBytes)),'Invalid SMS marker was silently repaired');
+    file_put_contents($markerPath,str_repeat('X',2048));
+    rejects(fn()=>new Store($markerDirectory),'Initialization evidence is unsafe');
+    file_put_contents($markerPath,$markerBytes);
+    check($markerStore->stats($now)===['periods'=>[],'opt_outs'=>[]],'Valid marker recovery lost SMS state');
+    unset($markerStore);
     $store=new Store($directory.'/ledger'); $provider=new FixtureProvider(); $service=new Service($store,$provider);
     $frozen=Service::snapshot($settings,[$recipient],'Notice','Go to the meeting point.',false)[$recipient];
+    $malformedFrozen=$frozen;$malformedFrozen['fingerprint']=[];
+    rejects(fn()=>$service->send($settings,$malformedFrozen,'announcement-'.str_repeat('0',32),'job_'.str_repeat('0',32),$now+900,$now),'sms_snapshot_invalid');
+    $malformedFrozen=$frozen;$malformedFrozen['id']=[];
+    rejects(fn()=>$service->send($settings,$malformedFrozen,'announcement-'.str_repeat('0',32),'job_'.str_repeat('0',32),$now+900,$now),'sms_snapshot_invalid');
+    check(!$provider->requests,'Malformed frozen SMS snapshot reached the provider.');
+    $badAddress=$settings;$badAddress['control_api']['base_url']='https://pbx..example.com/api/sls-mass-notify';
+    rejects(fn()=>Service::callbackUrl($badAddress),'callback_address_invalid');
     $delivery='announcement-'.str_repeat('1',32); $job='job_'.str_repeat('2',32);
     $redirected=$frozen; $redirected['callback']='https://other.example.com/api/sls-mass-notify/sms-callback.php';
     rejects(fn()=>$service->send($settings,$redirected,$delivery,$job,$now+900,$now),'changed');
@@ -63,6 +83,7 @@ try {
     check($posted['StatusCallback']===$callback && (int)$posted['ValidityPeriod']===900 && $posted['To']==='+15555550102','Twilio envelope lost callback, expiry or recipient');
     rejects(fn()=>$service->callback($settings,$local,$raw.'&Injected=yes',$headers,$now),'unauthorized');
     rejects(fn()=>$service->callback($settings,$local,$raw,['content-type'=>'application/x-www-form-urlencoded','x-twilio-signature'=>'bad'],$now),'unauthorized');
+    rejects(fn()=>Provider::callback($config,$callback,$raw,['content-type'=>['malformed'],'x-twilio-signature'=>$headers['x-twilio-signature']],$now),'unauthorized');
     [$badRaw,$badHeaders]=twilioBody(['AccountSid'=>$config['twilio_account_sid'],'MessageSid'=>$message,'MessageStatus'=>'delivered','From'=>$config['from'],'To'=>'+15555550103'],$config,$callback);
     rejects(fn()=>$service->callback($settings,$local,$badRaw,$badHeaders,$now),'identity_mismatch');
     rejects(fn()=>$service->send($settings,$frozen,'announcement-'.str_repeat('9',32),$job,$now-1,$now),'sms_expired');
@@ -76,6 +97,8 @@ try {
     check(count($provider->requests)===2,'Budget rejection contacted provider');
     [$stop,$stopHeaders]=twilioBody(['AccountSid'=>$config['twilio_account_sid'],'MessageSid'=>'SM'.str_repeat('d',32),'SmsStatus'=>'received','From'=>'+15555550102','To'=>$config['from'],'Body'=>'STOP'],$config,$frozen['callback']);
     $service->callback($settings,'',$stop,$stopHeaders,$now);
+    [$foreignInbound,$foreignHeaders]=twilioBody(['AccountSid'=>$config['twilio_account_sid'],'MessageSid'=>'SM'.str_repeat('e',32),'SmsStatus'=>'received','From'=>'+15555550102','To'=>'+15555550199','Body'=>'STOP'],$config,$frozen['callback']);
+    rejects(fn()=>Provider::callback($config,$frozen['callback'],$foreignInbound,$foreignHeaders,$now),'identity_mismatch');
     $settings['announcement_sms']['daily_segments']=10;
     rejects(fn()=>$service->send($settings,$frozen,'announcement-'.str_repeat('5',32),$job,$now+900,$now),'opted_out');
     $settings['announcement_sms']['recipients'][0]['number']='+15555550104';
@@ -90,6 +113,11 @@ try {
     check(Provider::callback($telnyx,$callback,$raw,$h,$now)['state']==='delivered','Telnyx receipt signature or status');
     rejects(fn()=>Provider::callback($telnyx,$callback,$raw.' ',$h,$now),'unauthorized');
     rejects(fn()=>Provider::callback($telnyx,$callback,$raw,$h,$now+301),'unauthorized');
+    rejects(fn()=>Provider::callback($telnyx,$callback,$raw,array_replace($h,['telnyx-timestamp'=>['malformed']]),$now),'unauthorized');
+    rejects(fn()=>Provider::callback($telnyx,$callback,$raw,array_replace($h,['telnyx-signature-ed25519'=>['malformed']]),$now),'unauthorized');
+    $dataJson=json_encode($payload['data'],JSON_THROW_ON_ERROR);$duplicateRaw='{"data":'.$dataJson.',"data":'.$dataJson.'}';
+    $duplicateHeaders=['telnyx-timestamp'=>(string)$now,'telnyx-signature-ed25519'=>base64_encode(sodium_crypto_sign_detached($now.'|'.$duplicateRaw,$secret))];
+    rejects(fn()=>Provider::callback($telnyx,$callback,$duplicateRaw,$duplicateHeaders,$now),'invalid_json');
     $telnyxProvider=new FixtureProvider();
     $telnyxProvider->response=['status'=>202,'error'=>0,'body'=>json_encode(['data'=>['id'=>'33333333-3333-4333-8333-333333333333',
         'messaging_profile_id'=>$telnyx['telnyx_profile_id'],'from'=>['phone_number'=>$config['from']],'to'=>[['phone_number'=>'+15555550102']]]])];
@@ -97,13 +125,24 @@ try {
     check($sent['state']==='accepted','Telnyx accepted response not recognized');
     $posted=json_decode($telnyxProvider->requests[0][2],true);
     check($posted['encoding']==='gsm7' && $posted['text']==='Full fixture text' && $posted['webhook_url']===$callback,'Telnyx envelope changed text/encoding/receipt identity');
+    $responseData=json_encode(['id'=>'33333333-3333-4333-8333-333333333333','messaging_profile_id'=>$telnyx['telnyx_profile_id'],'from'=>['phone_number'=>$config['from']],'to'=>[['phone_number'=>'+15555550102']]],JSON_THROW_ON_ERROR);
+    $telnyxProvider->response=['status'=>202,'error'=>0,'body'=>'{"data":'.$responseData.',"data":'.$responseData.'}'];
+    check($telnyxProvider->send($telnyx,'+15555550102','Full fixture text',$callback,$now+900,$now)['state']==='uncertain','Duplicate provider JSON members confirmed a submission');
     $telnyxProvider->response=['status'=>503,'error'=>0,'body'=>''];
     check($telnyxProvider->send($telnyx,'+15555550102','Full fixture text',$callback,$now+900,$now)['state']==='uncertain','Provider 5xx treated as safe to retry');
     $telnyxProvider->response=['status'=>400,'error'=>0,'body'=>json_encode(['errors'=>[['code'=>'40002']]])];
     check($telnyxProvider->send($telnyx,'+15555550102','Full fixture text',$callback,$now+900,$now)['error_code']==='provider_40002','Provider rejection lost bounded error code');
+    $telnyxProvider->response=['status'=>400,'error'=>0,'body'=>json_encode(['errors'=>'invalid'])];
+    check($telnyxProvider->send($telnyx,'+15555550102','Full fixture text',$callback,$now+900,$now)['error_code']==='provider_http_400','Malformed provider errors emitted a warning or invented a code');
+    $telnyxProvider->response=['status'=>202,'error'=>0,'body'=>json_encode(['data'=>'invalid'])];
+    check($telnyxProvider->send($telnyx,'+15555550102','Full fixture text',$callback,$now+900,$now)['state']==='uncertain','Malformed provider success was confirmed');
+    rejects(fn()=>$telnyxProvider->send($telnyx,'+15555550102','Full fixture text','https://pbx..example.com/api/sls-mass-notify/sms-callback.php?delivery=smsd_'.str_repeat('a',64),$now+900,$now),'settings_invalid');
     // Native continuity merges evidence and limits, never queues a replay.
     $backup=$directory.'/sms-ledger.jsonl'; $store->exportSnapshot($backup);
+    $GLOBALS['sls_sms_backup_probe']=$backup;
     $restored=new Store($directory.'/restored'); $restored->mergeSnapshot($backup);
+    check(($GLOBALS['sls_sms_backup_mode']??'')==='rb','SMS continuity restore requested write access to a read-only backup');
+    unset($GLOBALS['sls_sms_backup_probe'],$GLOBALS['sls_sms_backup_mode']);
     check($restored->get($local)['state']==='delivered','Delivered receipt lost on restore');
     $secondLocal='smsd_'.hash('sha256',$second."\0".$recipient);
     check($restored->get($secondLocal)['state']==='uncertain','Unfinished restored message treated as ready to resend');
@@ -112,15 +151,22 @@ try {
     $restored->mergeSnapshot($backup);
     check($restored->stats($now)['periods']===$store->stats($now)['periods'],'Repeated restore doubled charges');
     $badBackup=$directory.'/invalid-backup.jsonl'; $lines=file($backup);
-    file_put_contents($badBackup,implode('',$lines).$lines[1]);
+    file_put_contents($badBackup,implode('',$lines).$lines[1]);chmod($badBackup,0600);
     $before=$restored->stats($now);
     rejects(fn()=>$restored->mergeSnapshot($badBackup),'duplicate_record');
     check($restored->stats($now)===$before,'Invalid backup partially committed');
     $changedBackup=$directory.'/conflict-backup.jsonl';
     $records=array_map(static fn($line)=>json_decode($line,true),$lines);
     foreach ($records as &$record) { if (($record['table']??'')==='deliveries') { $record['row']['body_hash']=str_repeat('f',64); break; } } unset($record);
-    file_put_contents($changedBackup,implode("\n",array_map(static fn($row)=>json_encode($row),$records))."\n");
+    file_put_contents($changedBackup,implode("\n",array_map(static fn($row)=>json_encode($row),$records))."\n");chmod($changedBackup,0600);
     rejects(fn()=>$restored->mergeSnapshot($changedBackup),'delivery_conflict');
+    $publicBackup=$directory.'/public-backup.jsonl';copy($backup,$publicBackup);chmod($publicBackup,0644);
+    rejects(fn()=>$restored->mergeSnapshot($publicBackup),'file_invalid');
+    $duplicateJson=$directory.'/duplicate-json-backup.jsonl';
+    file_put_contents($duplicateJson,"{\"schema\":\"sls-sms-continuity-v1\",\"schema\":\"sls-sms-continuity-v1\"}\n");chmod($duplicateJson,0600);
+    rejects(fn()=>$restored->mergeSnapshot($duplicateJson),'Duplicate JSON members');
+    $held=fopen($backup,'r+b');check(is_resource($held)&&flock($held,LOCK_EX),'Unable to lock SMS backup fixture');
+    rejects(fn()=>$restored->mergeSnapshot($backup),'sms_backup_busy');check(fclose($held),'Unable to release SMS backup fixture');
     // A detached database cannot silently serve a stale receipt or reset costs.
     rename($directory.'/restored/deliveries.sqlite',$directory.'/restored/detached.sqlite');
     rejects(fn()=>$restored->stats($now),'sms_storage_file_unsafe');

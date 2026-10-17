@@ -13,6 +13,7 @@ import tempfile
 import tarfile
 import time
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,6 +71,55 @@ class PublisherTrustTests(unittest.TestCase):
         self.store.import_transition(self.transition(policy), self.now)
         return policy
 
+    def test_private_signing_inputs_reject_links_permissions_owner_and_size(self):
+        key=self.keys[0][0];key.chmod(0o600)
+        material=t.bounded_read(key,private_owner=os.geteuid())
+        public=subprocess.run(['/usr/bin/openssl','pkey','-in','/dev/stdin','-pubout'],input=material,check=True,capture_output=True).stdout
+        self.assertEqual(public,self.keys[0][1])
+        key.chmod(0o644)
+        with self.assertRaises(ValueError):t.bounded_read(key,private_owner=os.geteuid())
+        key.chmod(0o600)
+        link=self.root/'key-link';link.symlink_to(key)
+        with self.assertRaises(OSError):t.bounded_read(link,private_owner=os.geteuid())
+        shared=self.root/'shared-key';os.link(key,shared)
+        with self.assertRaises(ValueError):t.bounded_read(key,private_owner=os.geteuid())
+        shared.unlink()
+        with self.assertRaises(ValueError):t.bounded_read(key,private_owner=os.geteuid()+1)
+        large=self.root/'oversize-key';large.write_bytes(b'x'*(t.MAX_BYTES+1));large.chmod(0o600)
+        with self.assertRaises(ValueError):t.bounded_read(large,private_owner=os.geteuid())
+        fifo=self.root/'key-fifo';os.mkfifo(fifo,0o600)
+        with self.assertRaises(ValueError):t.bounded_read(fifo,private_owner=os.geteuid())
+        original=t.os.stat
+        def replace_named(path,**kwargs):
+            if isinstance(path,(str,os.PathLike)) and Path(path)==key:
+                replacement=self.root/'replacement';replacement.write_bytes(material);replacement.chmod(0o600);os.replace(replacement,key)
+            return original(path,**kwargs)
+        with mock.patch.object(t.os,'stat',side_effect=replace_named),self.assertRaisesRegex(ValueError,'changed while reading'):
+            t.bounded_read(key,private_owner=os.geteuid())
+
+    def test_actual_release_signer_uses_disposable_validated_key_material(self):
+        spec=importlib.util.spec_from_file_location('private_release_signer',ROOT/'tools/sign_release.py')
+        signer=importlib.util.module_from_spec(spec);spec.loader.exec_module(signer)
+        signer.ROOT=self.root/'source';(signer.ROOT/'slsmassnotifyserver').mkdir(parents=True);(signer.ROOT/'tools').mkdir();(signer.ROOT/'dist').mkdir()
+        (signer.ROOT/'slsmassnotifyserver/module.xml').write_text('<module><version>0.1.7-beta</version></module>')
+        (signer.ROOT/'tools/install_release.sh').write_text('inert fixture installer')
+        (signer.ROOT/'dist/slsmassnotifyserver-0.1.7-beta.tgz').write_bytes(b'inert fixture package')
+        public=self.root/'signer-public.pem';public.write_bytes(self.keys[0][1])
+        verify=signer.verifier.verify
+        def private_verify(*args):return verify(*args,public_key=public,trust_directory=self.root/'signer-trust')
+        with mock.patch.object(signer.verifier,'verify',side_effect=private_verify),mock.patch('sys.argv',['sign_release.py','--key',str(self.keys[0][0])]):signer.main()
+        self.assertEqual((signer.ROOT/'dist/release-manifest.sig').stat().st_size,64)
+
+    def test_actual_policy_signer_uses_disposable_validated_key_material(self):
+        spec=importlib.util.spec_from_file_location('private_policy_signer',ROOT/'tools/sign_trust_policy.py')
+        signer=importlib.util.module_from_spec(spec);spec.loader.exec_module(signer)
+        policy={'schema':1,'sequence':1,'keys':[self.keys[0][2],self.keys[1][2]]}
+        plain=self.root/'policy.json';plain.write_bytes(t.canonical(policy));output=self.root/'transition.json'
+        argv=['sign_trust_policy.py','--policy',str(plain),'--key',str(self.keys[0][0]),'--key',str(self.keys[1][0]),'--output',str(output)]
+        with mock.patch('sys.argv',argv):signer.main()
+        self.store.initialize();self.store.import_transition(json.loads(output.read_bytes()),self.now)
+        self.assertEqual(self.store.load()[0]['policy'],policy)
+
     def test_bootstrap_preserves_existing_releases_and_rejects_wrong_key(self):
         self.assertEqual(self.authenticate(self.release(signing=False))['version'], '0.1.5-beta')
         with self.assertRaisesRegex(ValueError, 'signature'):
@@ -93,6 +143,27 @@ class PublisherTrustTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'metadata'):
             self.authenticate(self.release(signing=False))
         self.authenticate(self.release())
+
+    def test_trust_state_and_signed_manifests_require_strict_json(self):
+        initialized = self.store.initialize(); saved = self.store.state.read_bytes()
+        self.store.state.write_bytes(b'{"policy":{},"policy":{},"retired_ids":[]}')
+        self.store.state.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, 'duplicate JSON member'):
+            self.store.load()
+        self.store.state.write_bytes(saved); self.store.state.chmod(0o600)
+
+        key_id = self.keys[0][2]['id']
+        duplicate = ('{"schema":1,"version":"0.1.7-beta","version":"other",'
+                     '"signing":{"key_id":"'+key_id+'","issued_at":1799999999,"expires_at":1800086400}}').encode()
+        with self.assertRaisesRegex(ValueError, 'duplicate JSON member'):
+            self.authenticate((duplicate, self.signed(duplicate, 0)))
+        nonfinite = ('{"schema":1,"version":"0.1.7-beta","extra":NaN,'
+                     '"signing":{"key_id":"'+key_id+'","issued_at":1799999999,"expires_at":1800086400}}').encode()
+        with self.assertRaisesRegex(ValueError, 'non-finite JSON number'):
+            self.authenticate((nonfinite, self.signed(nonfinite, 0)))
+        for malformed in (b'\xef\xbb\xbf{}', b'{"value":1e400}', b'{"value":"\\ud800"}', b'[' * 2000 + b']' * 2000):
+            with self.subTest(malformed=malformed[:20]), self.assertRaises(ValueError):
+                t.strict_json(malformed)
 
     def test_overlapping_keys_then_irreversible_revocation(self):
         policy = self.overlap()
@@ -135,6 +206,16 @@ class PublisherTrustTests(unittest.TestCase):
         self.authenticate(release, self.now + 10)
         with self.assertRaisesRegex(ValueError, 'signature'):
             self.authenticate(release, self.now + 100)
+
+    def test_manifest_issue_time_must_precede_key_cutoffs(self):
+        self.store.initialize()
+        entry = self.keys[1][2] | {'expires_at': self.now + 100, 'revoked_at': self.now + 80}
+        policy = {'schema': 1, 'sequence': 1, 'keys': [self.keys[0][2], entry]}
+        self.store.import_transition(self.transition(policy), self.now)
+        self.authenticate(self.release(1, issued_at=self.now + 79, expires_at=self.now + 120))
+        for issued in (self.now + 80, self.now + 100):
+            with self.subTest(issued_at=issued), self.assertRaisesRegex(ValueError, 'metadata'):
+                self.authenticate(self.release(1, issued_at=issued, expires_at=issued + 60))
 
     def test_missing_initialized_state_links_fifo_and_unprotected_directory(self):
         self.store.initialize(); body = self.store.state.read_bytes(); self.store.state.unlink()

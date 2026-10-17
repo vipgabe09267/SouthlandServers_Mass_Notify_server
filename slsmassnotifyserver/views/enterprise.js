@@ -7,12 +7,25 @@
   const endpoint = 'config.php?display=slsmassnotifyserver_enterprise';
   const feedback = message => { const box = root.querySelector('#sls-enterprise-status'); box.textContent = message; box.hidden = false; box.focus(); };
   const node = (tag, text, className) => { const n = document.createElement(tag); if (text !== undefined) n.textContent = text; if (className) n.className = className; return n; };
+  let requestBusy = false;
   const post = async (action, input = {}) => {
-    const body = new FormData(); body.set('slsmassnotifyserver_csrf', data.csrf); body.set('payload', JSON.stringify({ action, input }));
-    const response = await fetch(endpoint, { method: 'POST', body, credentials: 'same-origin', headers: { Accept: 'application/json' } });
-    let result; try { result = await response.json(); } catch { throw Error('The server did not return a valid result. Reload saved state before retrying.'); }
-    if (!response.ok || result.success === false) throw Error(result.message || `The request failed (HTTP ${response.status}).`);
-    return result;
+    if (requestBusy) throw Error('Another Enterprise Labs request is already in progress. Wait for its result before trying again.');
+    requestBusy = true;
+    const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),25000);
+    try {
+      const body = new FormData(); body.set('slsmassnotifyserver_csrf', data.csrf); body.set('payload', JSON.stringify({ action, input }));
+      const response = await fetch(endpoint, { method: 'POST', body, credentials: 'same-origin', headers: { Accept: 'application/json' },signal:controller.signal });
+      let result; try { result = await response.json(); } catch { throw Error('The server did not return a valid result. Reload saved state before retrying.'); }
+      if (!result || typeof result !== 'object' || Array.isArray(result)) throw Error('The server did not return a valid structured result. Reload saved state before retrying.');
+      if (!response.ok || result.success !== true) {
+        const serverMessage = typeof result.message === 'string' && result.message.trim() !== '' ? result.message : '';
+        throw Error(serverMessage || (response.ok ? 'The server did not confirm this request. Reload saved state before retrying.' : `The request failed (HTTP ${response.status}).`));
+      }
+      return result;
+    } catch(error) {
+      if(controller.signal.aborted)throw Error('The PBX did not confirm this request within 25 seconds. Reload saved state before retrying; the request was not retried.');
+      throw error;
+    } finally { clearTimeout(timer); requestBusy = false; }
   };
   function tab(key, update = false) {
     const keys = ['continuity', 'identity', 'integrations', 'operations']; if (!keys.includes(key)) key = keys[0];
@@ -23,58 +36,7 @@
   root.querySelectorAll('[data-labs-tab]').forEach(n => n.addEventListener('click', event => { event.preventDefault(); tab(n.dataset.labsTab, true); }));
   tab(location.hash.replace(/^#labs-/, '')); window.addEventListener('hashchange', () => tab(location.hash.replace(/^#labs-/, '')));
 
-  const danger = root.querySelector('#sls-labs-danger'), agree = root.querySelector('#sls-labs-danger-agree');
-  const accept = root.querySelector('#sls-labs-danger-accept'), cancel = root.querySelector('#sls-labs-danger-cancel');
-  const acknowledged = new Set(Object.keys(data.safety.receipts).filter(key => data.safety.receipts[key].revision === data.safety_revision));
-  const pageFeature = 'enterprise_labs';
-  const dashboard = 'config.php?display=index';
-  const pageAccess = allowed => root.querySelectorAll('[data-labs-panel], .sls-ent-tabs').forEach(panel => { panel.inert = !allowed; });
-  pageAccess(acknowledged.has(pageFeature));
-  let dangerRequest;
-  function waitForBetaNotice() {
-    if (window.SlsBetaNoticeReady) return window.SlsBetaNoticeReady;
-    if (!document.getElementById('sls-beta-notice-template')) return Promise.resolve();
-    return new Promise(resolve => document.addEventListener('sls-beta-notice-acknowledged', resolve, { once: true }));
-  }
-  function acknowledge() {
-    if (acknowledged.has(pageFeature)) return Promise.resolve(true);
-    if (!dangerRequest) dangerRequest = waitForBetaNotice().then(showWarning).finally(() => { dangerRequest = null; });
-    return dangerRequest;
-  }
-  async function showWarning() {
-      const feature = pageFeature;
-      const challenge = await post('danger_begin', { feature });
-      if (challenge.acknowledged) { acknowledged.add(feature); pageAccess(true); return true; }
-      root.querySelector('#sls-labs-danger-title').textContent = challenge.title;
-      root.querySelector('#sls-labs-danger-body').textContent = challenge.body;
-      root.querySelector('#sls-labs-danger-agreement').textContent = challenge.agreement;
-      const error = root.querySelector('#sls-labs-danger-error'), countdown = root.querySelector('#sls-labs-danger-countdown');
-      error.hidden = true; agree.checked = false; agree.disabled = true; accept.disabled = true; countdown.textContent = '(5s)';
-      danger.showModal(); const deadline = performance.now() + challenge.delay_seconds * 1000;
-      const timer = setInterval(() => {
-        const left = Math.max(0, Math.ceil((deadline - performance.now()) / 1000)); countdown.textContent = left ? `(${left}s)` : '';
-        if (performance.now() >= deadline) { agree.disabled = false; clearInterval(timer); }
-      }, 100);
-      return await new Promise(resolve => {
-        const cleanup = result => {
-          clearInterval(timer); agree.onchange = null; accept.onclick = null; cancel.onclick = null; danger.oncancel = null; danger.onclose = null;
-          pageAccess(result); danger.close(); resolve(result);
-          if (!result) window.location.replace(dashboard);
-        };
-        agree.onchange = () => accept.disabled = !agree.checked || performance.now() < deadline;
-        cancel.onclick = () => cleanup(false); danger.oncancel = event => { event.preventDefault(); cleanup(false); };
-        danger.onclose = () => cleanup(false);
-        accept.onclick = async () => {
-          if (!agree.checked || agree.disabled || performance.now() < deadline) return;
-          accept.disabled = true; cancel.disabled = true;
-          try { await post('danger_accept', { feature, challenge: challenge.challenge, agree: true }); acknowledged.add(feature); cleanup(true); }
-          catch (failure) { error.textContent = failure.message; error.hidden = false; accept.disabled = false; }
-          finally { cancel.disabled = false; }
-        };
-      });
-  }
-  window.SlsLabsSafety = { acknowledge };
-  acknowledge().catch(error => { feedback(error.message); window.location.replace(dashboard); });
+  const acknowledge = () => window.SlsLabsSafety.acknowledge();
   const clusterForm = root.querySelector('#sls-cluster-config');
   const clusterValues = clusterForm ? Object.fromEntries(['enabled', 'mirroring_enabled', 'mode', 'role'].map(name => {
     const control = clusterForm.elements[name]; return [name, control.type === 'checkbox' ? control.checked : control.value];
@@ -179,13 +141,59 @@
       const target = field('Marker location or device', select(state.marker_choices.map(item => ({ id: `${item.kind}:${item.id}`, name: `${item.kind} · ${item.name}` })), ''));
       const markerList = node('div'); body.append(markerList);
       const renderMarkers = () => { map.querySelectorAll('button').forEach(n => n.remove()); markerList.replaceChildren(); markers.forEach((m, i) => { const point = node('button', String(i + 1), 'sls-ent-marker'); point.type = 'button'; point.style.left = `${m.x}%`; point.style.top = `${m.y}%`; point.title = m.label; map.append(point); const line = node('div', undefined, 'sls-ent-row'), remove = node('button', 'Remove', 'btn btn-link btn-sm'); remove.type = 'button'; remove.addEventListener('click', () => { markers.splice(i, 1); renderMarkers(); }); line.append(node('span', `${i + 1}. ${m.label}`), remove); markerList.append(line); }); };
-      upload.addEventListener('change', async () => { const file = upload.files[0]; if (!file) return; const form = new FormData(); form.set('action', 'floorplan_upload'); form.set('slsmassnotifyserver_csrf', data.csrf); form.set('floorplan', file); upload.disabled = true; try { const response = await fetch(endpoint, { method: 'POST', body: form, credentials: 'same-origin' }), result = await response.json(); if (!response.ok || !result.success) throw Error(result.message || 'Floor plan upload failed.'); imageId = result.image_id; image.src = `${endpoint}&image_id=${encodeURIComponent(imageId)}`; map.hidden = false; } catch (error) { feedback(error.message); } finally { upload.disabled = false; } });
+      upload.addEventListener('change', async () => {
+        const file = upload.files[0];
+        if (!file) return;
+        if (requestBusy) { feedback('Another Enterprise Labs request is already in progress. Wait for its result before uploading a floor plan.'); return; }
+        requestBusy = true;
+        const form = new FormData(); form.set('action', 'floorplan_upload'); form.set('slsmassnotifyserver_csrf', data.csrf); form.set('floorplan', file);
+        upload.disabled = true;
+        const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 60000);
+        try {
+          const response = await fetch(endpoint, { method: 'POST', body: form, credentials: 'same-origin', signal: controller.signal });
+          let result; try { result = await response.json(); } catch { throw Error('The PBX returned an unreadable floor-plan upload response. Reload saved images before retrying.'); }
+          const serverMessage = result && typeof result.message === 'string' && result.message.trim() !== '' ? result.message : '';
+          if (!result || typeof result !== 'object' || Array.isArray(result) || !response.ok || result.success !== true || typeof result.image_id !== 'string' || result.image_id === '') throw Error(serverMessage || 'The floor-plan upload was not confirmed. Reload saved images before retrying.');
+          imageId = result.image_id; image.src = `${endpoint}&image_id=${encodeURIComponent(imageId)}`; map.hidden = false;
+        } catch (error) {
+          feedback(controller.signal.aborted ? 'The floor plan upload exceeded 60 seconds. Check saved images before retrying.' : error.message);
+        } finally {
+          clearTimeout(timer); upload.disabled = false; requestBusy = false;
+        }
+      });
       map.addEventListener('click', event => { if (event.target !== image || !target.value || markers.length >= 250) return; const chosen = state.marker_choices.find(item => `${item.kind}:${item.id}` === target.value), rect = image.getBoundingClientRect(); markers.push({ id: id('mark'), label: chosen.name.slice(0, 80), kind: chosen.kind, target_id: chosen.id, x: Math.max(0, Math.min(100, (event.clientX - rect.left) / rect.width * 100)), y: Math.max(0, Math.min(100, (event.clientY - rect.top) / rect.height * 100)) }); renderMarkers(); });
       renderMarkers(); handler = () => { if (!imageId) throw Error('Upload a floor plan before saving this entry.'); saveRow(section, { ...row, name: name.value, enabled: active.checked, site_id: site.value, image_id: imageId, markers }); };
     }
   }
   root.querySelectorAll('[data-add-operation]').forEach(n => n.addEventListener('click', () => editRow(n.dataset.addOperation)));
   rows();
+  const storage = root.querySelector('#sls-floorplan-storage');
+  const storedImages = state.floorplan_storage?.images || [];
+  if (!storedImages.length) storage.append(node('div', 'No floor-plan images are stored.', 'sls-ent-empty'));
+  storedImages.forEach(image => {
+    const report = image.reference_report || { references: [], blocking_count: 0 };
+    const row = node('div', undefined, 'sls-ent-row'), description = node('div');
+    description.append(node('strong', image.image_id.slice(4, 20)), node('div', `${(Number(image.bytes) / 1048576).toFixed(2)} MiB`));
+    if (report.blocking_count) description.append(node('small', report.references.map(reference => `${reference.source.replaceAll('_', ' ')} · ${reference.name}`).join('; ')));
+    else description.append(node('small', 'No active or staged reference. Retained configuration backups are checked again before retirement.'));
+    const actions = node('div', undefined, 'sls-ent-actions');
+    const download = node('a', 'Download', 'btn btn-default btn-sm'); download.href = `${endpoint}&image_id=${encodeURIComponent(image.image_id)}&download=1`;
+    const retire = node('button', 'Review retirement', 'btn btn-danger btn-sm'); retire.type = 'button'; retire.disabled = report.blocking_count > 0;
+    retire.addEventListener('click', () => {
+      open('Retire stored floor plan', 'Retire image');
+      body.append(node('p', `Image ${image.image_id.slice(4, 20)} uses ${(Number(image.bytes) / 1048576).toFixed(2)} MiB.`),
+        node('p', 'Download the image first if it must be retained outside SLS. The server will recheck active, staged and retained configuration references while settings are locked.'));
+      const exportLink = node('a', 'Download image before retirement', 'btn btn-default'); exportLink.href = download.href; body.append(exportLink);
+      const confirmation = field('Enter RETIRE to confirm permanent removal', input('text')); confirmation.required = true; confirmation.pattern = 'RETIRE'; confirmation.autocomplete = 'off';
+      handler = async () => { const result = await post('floorplan_retire', { image_id: image.image_id, confirmation: confirmation.value }); feedback(result.message); location.reload(); };
+    });
+    actions.append(download, retire); row.append(description, actions); storage.append(row);
+  });
+  const retirementEvents = state.floorplan_retirements || [];
+  if (retirementEvents.length) {
+    const latest = retirementEvents[0];
+    storage.append(node('p', `Latest retirement audit: ${latest.kind.replaceAll('_', ' ')} · ${latest.at}`, 'help-block'));
+  }
   root.querySelector('#sls-operations-save').addEventListener('click', async event => {
     const button = event.currentTarget; button.disabled = true;
     try { config.enabled = enabled.checked; root.querySelectorAll('[data-enable-operation]').forEach(n => config[n.dataset.enableOperation].enabled = n.checked); await post('operations_save', { config, revision: state.revision }); location.reload(); } catch (error) { feedback(error.message); } finally { button.disabled = false; }

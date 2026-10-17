@@ -7,8 +7,8 @@ require_once '/var/www/html/admin/modules/slsmassnotifyserver/DeliveryAuthorizat
 try {
     if ($argc !== 1) { throw new RuntimeException('Unexpected arguments.'); }
     $raw = stream_get_contents(STDIN, 16385);
-    if (!is_string($raw) || strlen($raw) > 16384) { throw new RuntimeException('Invalid authorization input.'); }
-    $input = json_decode($raw, true, 12, JSON_THROW_ON_ERROR);
+    if (!is_string($raw)) { throw new RuntimeException('Invalid authorization input.'); }
+    $input = \SLS\MassNotify\DeliveryAuthorization::parseInput($raw);
     $settings = \SLS\MassNotify\DeliveryAuthorization::settings();
     if (is_array($input) && in_array($input['api_credential_id'] ?? '', array_column($settings['operator_access']['accounts'] ?? [], 'id'), true)) {
         // Local operator jobs recheck the actual PBX account, not just a name
@@ -16,8 +16,7 @@ try {
         require_once '/etc/freepbx.conf';
         require_once '/var/www/html/admin/libraries/ampuser.class.php';
     }
-    $allowed = is_array($input) && !array_is_list($input) && \SLS\MassNotify\DeliveryAuthorization::permits(
-        $settings, $input);
+    $allowed = \SLS\MassNotify\DeliveryAuthorization::permits($settings, $input);
 } catch (Throwable $error) { $allowed = false; }
 echo json_encode(['allowed' => $allowed]), "\n";
 exit($allowed ? 0 : 1);

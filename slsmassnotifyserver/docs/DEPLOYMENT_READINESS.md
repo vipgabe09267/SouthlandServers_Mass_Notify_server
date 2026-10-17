@@ -32,7 +32,7 @@ not refresh either heartbeat.
 ## Monitor from a separate host
 
 An unrestricted, named Control API credential with only the **read** permission
-can request `GET /api/sls-mass-notify?resource=readiness` over the configured
+can request `GET /api/sls-mass-notify/?resource=readiness` over the configured
 HTTPS address, using the existing bearer authentication. Keep that credential in
 the monitor's secret store. Enabling the Control API or creating credentials
 remains an explicit administrator action.
@@ -41,8 +41,11 @@ The response contains `ok: true`, `resource: readiness`,
 `schema: sls-deployment-readiness-v1`, timezone-aware `generated_at`, module
 `version`, `operational_ready`, `attention_count`, `unknown_count`, `checks` and
 `verification_scope`. Each check has an `id`, `label`, `state` (`ok`, `warning`
-or `unknown`) and a readable `detail`. Runtime check IDs are positional; use the
-aggregate readiness fields rather than assuming an index across releases.
+or `unknown`) and a readable `detail`. Checks such as `clock`, `certificate` and
+`capacity` have semantic IDs. The `runtime_N` IDs reflect the current diagnostic
+list position and can change when checks are reordered or added; do not treat
+their number as a stable identity. Use the aggregate readiness fields for the
+overall result.
 Runtime checks exclude passwords, API keys and announcement bodies. Internal
 paths, capacity measurements and administrator-entered device-test observations
 are included, so treat downloaded reports as confidential operational information.

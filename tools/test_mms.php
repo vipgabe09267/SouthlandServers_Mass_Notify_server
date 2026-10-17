@@ -1,6 +1,7 @@
 <?php
 declare(strict_types=1);
 require_once dirname(__DIR__).'/slsmassnotifyserver/api/sls-mass-notify/sms/Service.php';
+eval('namespace SLS\\MassNotify\\Sms; function fwrite($handle,$data,$length=null){$uri=\\stream_get_meta_data($handle)["uri"]??"";if(!empty($GLOBALS["sls_mms_short_write"])&&\\str_contains($uri,"/.sls-mms-")){if(!empty($GLOBALS["sls_mms_wrote_partial"])){return false;}$GLOBALS["sls_mms_wrote_partial"]=true;$data=\\substr($data,0,5);}return $length===null?\\fwrite($handle,$data):\\fwrite($handle,$data,$length);}');
 use SLS\MassNotify\Sms\{Config,Provider,Service,Store};
 class MmsFixtureProvider extends Provider {
     public array $calls=[]; public array $reply=[];
@@ -49,6 +50,12 @@ try {
         $broken=$frozen;$broken['media']['url']=str_replace($filename,'mms_20261002000000_'.str_repeat('b',32).'.png',$media['url']);$broken['body_hash']=Config::messageHash($broken['body'],'MMS',$broken['media']);
         $receipt=$service->send($settings,$broken,'announcement-'.str_repeat('8',32),$job,$now+600,$now,'bad-data');
         mmsCheck($receipt['state']==='failed'&&!$receipt['submission_started']&&count($fake->calls)===1,'Image-storage failure transmitted or retried.');
+        $short=$frozen;$shortName='mms_20261002000000_'.str_repeat('a',32).'.png';$short['media']['url']=str_replace($filename,$shortName,$media['url']);
+        $short['body_hash']=Config::messageHash($short['body'],'MMS',$short['media']);
+        $GLOBALS['sls_mms_short_write']=true;$GLOBALS['sls_mms_wrote_partial']=false;
+        $receipt=$service->send($settings,$short,'announcement-'.str_repeat('7',32),$job,$now+600,$now,base64_encode($data));
+        unset($GLOBALS['sls_mms_short_write'],$GLOBALS['sls_mms_wrote_partial']);
+        mmsCheck($receipt['state']==='failed'&&!file_exists($dir.'/media/'.$shortName)&&glob($dir.'/media/.sls-mms-*')===[],'Interrupted MMS publication left a visible or temporary image.');
         mmsCheck((new Store($dir.'/'.$provider))->get($receipt['sms_delivery_id'])['message_type']==='MMS','MMS subtype was not durable.');
     }
     $snapshot=$dir.'/mms.snapshot';$store->exportSnapshot($snapshot);

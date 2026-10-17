@@ -46,7 +46,9 @@ final class SchedulePresentation
             if (is_array($group) && is_string($group['id'] ?? null)) { $groups[$group['id']] = $group; }
         }
         $audiences = []; $events = []; $names = []; $incomplete = false;
-        $channels = ['extensions' => 'phone', 'desktop_clients' => 'desktop', 'voice_recipient_ids' => 'voice', 'email_recipient_ids' => 'email', 'sms_recipient_ids'=>'sms', 'webhook_ids'=>'webhook'];
+        $channels = ['extensions' => 'phone', 'desktop_clients' => 'desktop', 'voice_recipient_ids' => 'voice',
+            'email_recipient_ids' => 'email', 'sms_recipient_ids' => 'sms', 'webhook_ids' => 'webhook',
+            'browser_recipient_ids' => 'browser', 'connector_ids' => 'connector'];
         $schedules = (array)($settings['scheduled_announcements'] ?? []);
         if (count($schedules) > 100) { $incomplete = true; }
         foreach (array_slice($schedules, 0, 100) as $schedule) {

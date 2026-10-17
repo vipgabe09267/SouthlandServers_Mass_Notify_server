@@ -20,6 +20,16 @@ const context = {
     setSubmitBusy: pending => { context.requestInFlight = pending; }
 };
 vm.createContext(context);
+function installWidgetTransport(target) {
+    const fetch = target.fetch;
+    target.fetch = (url, options) => fetch(url, options).then(data => ({ok:true,status:200,text:() => Promise.resolve(JSON.stringify(data))}));
+    target.parseJsonResponse = response => response.text().then(JSON.parse);
+    target.AbortController = AbortController;
+    target.lifecycle = target.lifecycle || {}; target.lifecycle.requests = new Set();
+    target.window = target.window || {}; target.window.setTimeout = setTimeout; target.window.clearTimeout = clearTimeout;
+    vm.runInContext(source.slice(source.indexOf('\tasync function widgetRequest('),source.indexOf("\troot.setAttribute('data-ready'")),target);
+}
+installWidgetTransport(context);
 vm.runInContext(source.slice(start, end), context);
 const drain = () => new Promise(resolve => setImmediate(resolve));
 // Use the actual receipt renderer to check failure visibility and text-only output.
@@ -54,6 +64,7 @@ const complete = {state: 'complete', success: true, created_at: new Date().toISO
         parseJsonResponse:value=>value,renderCooldown(){},pollJob(){}
     };
     vm.createContext(cooldownContext);
+    installWidgetTransport(cooldownContext);
     vm.runInContext(source.slice(source.indexOf('\tvar cooldownPollBusy ='),source.indexOf("\tform.addEventListener('submit'")),cooldownContext);
     assert.strictEqual(interval.delay,60000,'Idle dashboard refresh became unnecessarily frequent');
     cooldownContext.document.hidden=true;interval.fn();listeners.focusin();listeners.visibilitychange();
@@ -107,6 +118,10 @@ const complete = {state: 'complete', success: true, created_at: new Date().toISO
     await operatorContext.trackJob(first);
     assert.strictEqual(operationRequests,beforeHidden,'Hidden operator portal continued receipt requests.');
     operatorContext.document.hidden=false;operationTime=0;
+    operatorContext.call=async()=>{operationRequests++;return {state:'cancelled',success:false,receipts:[],message:'Source cancelled.'};};
+    const beforeCancelled=operationRequests;await operatorContext.trackJob(first);
+    assert.strictEqual(operationRequests-beforeCancelled,1,'Operator polling did not stop at a cancelled terminal job.');
+    operationTime=0;
     operatorContext.call=async()=>{operationRequests++;return complete;};const beforeBounded=operationRequests;
     await operatorContext.trackJob(first);
     assert.strictEqual(operationRequests-beforeBounded,300,'Operator receipt polling was not bounded to ten minutes.');

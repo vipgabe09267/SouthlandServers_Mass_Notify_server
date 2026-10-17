@@ -1,0 +1,63 @@
+name: Compile Labs sensor examples
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'slsmassnotifyserver/examples/sensors/**'
+      - 'tools/qualify_sensor_examples.py'
+      - '.github/workflows/sensor-qualification.yml'
+  pull_request:
+    paths:
+      - 'slsmassnotifyserver/examples/sensors/**'
+      - 'tools/qualify_sensor_examples.py'
+      - '.github/workflows/sensor-qualification.yml'
+permissions:
+  contents: read
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Prepare verified CLI and private SDK directories
+        run: |
+          python3 - <<'PY'
+          import hashlib, io, os, pathlib, tarfile, urllib.request
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'sls-sensor-sdk';root.mkdir(mode=0o700)
+          url='https://github.com/arduino/arduino-cli/releases/download/v1.5.1/arduino-cli_1.5.1_Linux_64bit.tar.gz'
+          with urllib.request.urlopen(url,timeout=60) as source:body=source.read(67108865)
+          if len(body)>67108864 or hashlib.sha256(body).hexdigest()!='28a8e119c498a25607821c36cb2dc49e8463941b261a0d99091baa7bc692dd2b':raise SystemExit('Arduino CLI size or checksum verification failed.')
+          with tarfile.open(fileobj=io.BytesIO(body)) as archive:
+              member=archive.getmember('arduino-cli')
+              if not member.isfile() or member.size>=134217728:raise SystemExit('Invalid Arduino CLI archive member.')
+              binary=root/'arduino-cli';binary.write_bytes(archive.extractfile(member).read());binary.chmod(0o700)
+          (root/'arduino.yaml').write_text('board_manager:\n  additional_urls:\n    - https://espressif.github.io/arduino-esp32/package_esp32_index.json\ndirectories:\n  data: '+str(root/'data')+'\n  downloads: '+str(root/'downloads')+'\n  user: '+str(root/'user')+'\n')
+          with pathlib.Path(os.environ['GITHUB_ENV']).open('a') as output:output.write('SLS_SENSOR_SDK='+str(root)+'\n')
+          PY
+      - name: Install pinned board cores and libraries
+        run: |
+          "$SLS_SENSOR_SDK/arduino-cli" --config-file "$SLS_SENSOR_SDK/arduino.yaml" core update-index
+          "$SLS_SENSOR_SDK/arduino-cli" --config-file "$SLS_SENSOR_SDK/arduino.yaml" lib update-index
+          python3 -I tools/verify_sensor_sdk_lock.py --lock tools/sensor-sdk-lock.json \
+            --package-index "$SLS_SENSOR_SDK/data/package_index.json" \
+            --package-index "$SLS_SENSOR_SDK/data/package_esp32_index.json" \
+            --library-index "$SLS_SENSOR_SDK/data/library_index.json"
+          "$SLS_SENSOR_SDK/arduino-cli" --config-file "$SLS_SENSOR_SDK/arduino.yaml" core install arduino:samd@1.8.14 esp32:esp32@3.3.12
+          "$SLS_SENSOR_SDK/arduino-cli" --config-file "$SLS_SENSOR_SDK/arduino.yaml" lib install WiFiNINA@1.9.1 ArduinoBearSSL@1.7.5 FlashStorage@1.0.0
+          python3 -I tools/verify_sensor_sdk_lock.py --lock tools/sensor-sdk-lock.json \
+            --package-index "$SLS_SENSOR_SDK/data/package_index.json" \
+            --package-index "$SLS_SENSOR_SDK/data/package_esp32_index.json" \
+            --library-index "$SLS_SENSOR_SDK/data/library_index.json"
+      - name: Compile disabled examples without uploading firmware
+        run: |
+          python3 tools/qualify_sensor_examples.py --cli "$SLS_SENSOR_SDK/arduino-cli" \
+            --config "$SLS_SENSOR_SDK/arduino.yaml" --workspace "$RUNNER_TEMP/sls-sensor-builds"
+      - name: Retain build reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: labs-sensor-sdk-builds
+          path: ${{ runner.temp }}/sls-sensor-builds/**/report.json
+          if-no-files-found: warn

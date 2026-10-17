@@ -81,6 +81,19 @@ class Idle(unittest.TestCase):
         for status in ('active','reserved',None):
             self.state['batches'][self.token]['status']=status;self.save('phone-admission.json',self.state)
             with self.assertRaisesRegex(m.IdleError,'unclosed'):self.check.inspect()
+
+    def test_ambiguous_phone_history_is_refused_without_rewriting_it(self):
+        path=self.data/'phone-admission.json';valid=json.dumps(self.state)
+        for addition in (',"batches":{}',',"unused":1e309',',"unused":NaN'):
+            with self.subTest(addition=addition):
+                raw=valid[:-1]+addition+'}';path.write_text(raw);before=path.stat()
+                with self.assertRaises(m.IdleError):self.check.phone_history(True)
+                self.assertEqual(path.read_text(),raw)
+                self.assertEqual((path.stat().st_ino,path.stat().st_mtime_ns),(before.st_ino,before.st_mtime_ns))
+        path.write_text(valid.replace('"heartbeat_tick": 99','"heartbeat_tick": 9.9e1'))
+        self.assertEqual(len(self.check.phone_history(True)),1)
+        self.state['schema']=True;self.save('phone-admission.json',self.state)
+        with self.assertRaisesRegex(m.IdleError,'cannot be inspected'):self.check.phone_history(True)
     def voicemail_batch(self):
         return {'status':'closed','created_at':900,'closed_at':999,
                 'channels':{'contact':{'kind':'contact','dial':'PJSIP/1000','ended_at':999,
@@ -122,10 +135,23 @@ class Idle(unittest.TestCase):
         for key,value in (('targets',[]),('targets',{'1000':{'dials':'bad'}})):
             item=deepcopy(base);item['vm_fallback'][key]=value;variants.append(item)
         claim=deepcopy(base);claim['vm_fallback']['targets']['1000']['claimed_token']='bad';variants.append(claim)
+        invalid_unicode=deepcopy(base);invalid_unicode['channels']['contact']['dial']='PJSIP/\ud800';variants.append(invalid_unicode)
         for batch in variants:
             self.state['batches'][self.token]=batch;path=self.save('phone-admission.json',self.state);before=path.read_bytes()
             with self.assertRaises(m.IdleError):self.check.inspect()
             self.assertEqual(path.read_bytes(),before)
+    def test_voicemail_history_cardinality_is_bounded_before_matching(self):
+        batch=self.voicemail_batch()
+        batch['vm_fallback']['targets']={str(index):{'dials':[],'claimed_token':None}
+                                         for index in range(m.MAX_PHONE_TARGETS+1)}
+        self.state['batches'][self.token]=batch;self.save('phone-admission.json',self.state)
+        with self.assertRaisesRegex(m.IdleError,'inspection bounds'):self.check.inspect()
+        batch=self.voicemail_batch()
+        batch['channels']={str(index):{'kind':'contact','dial':'PJSIP/'+str(index),'ended_at':999,
+                                      'answered_at':None,'joined_at':None,'dial_status':'NOANSWER'}
+                           for index in range(m.MAX_PHONE_CHANNELS+1)}
+        self.state['batches'][self.token]=batch;self.save('phone-admission.json',self.state)
+        with self.assertRaisesRegex(m.IdleError,'inspection bounds'):self.check.inspect()
     def test_enabled_idle_paging_is_supported_without_reading_configuration(self):
         self.save('mass-notifications.config',{'live_paging':{'enabled':'1'},'secret':'do not read'})
         self.assertTrue(self.check.inspect()['ok'])
@@ -149,6 +175,74 @@ class Idle(unittest.TestCase):
             with self.assertRaises(m.IdleError):self.check.inspect()
         self.state['collector']['heartbeat_tick']=99;self.state['collector']['boot_id']='old-boot';self.save('phone-admission.json',self.state)
         with self.assertRaisesRegex(m.IdleError,'identity'):self.check.inspect()
+    def heartbeat(self, **changes):
+        anchor = self.state['collector']
+        pulse = {'schema': 1, 'generation': anchor['generation'], 'boot_id': anchor['boot_id'],
+                 'anchor_tick': anchor['heartbeat_tick'], 'heartbeat_tick': 99}
+        pulse.update(changes)
+        path = self.save('phone-collector-heartbeat.json', pulse)
+        os.chown(path, -1, m.pwd.getpwnam('asterisk').pw_gid)
+        return path
+
+    def test_fresh_bound_sidecar_accepts_old_anchor_without_changing_history(self):
+        self.state['collector']['heartbeat_tick'] = 1
+        ledger = self.save('phone-admission.json', self.state)
+        pulse = self.heartbeat()
+        before = [(p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns) for p in (ledger, pulse)]
+        baseline = self.baseline()
+        self.assertTrue(self.check.inspect(baseline)['ok'])
+        self.assertEqual(before, [(p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns) for p in (ledger, pulse)])
+        self.state['batches'][self.token]['closed_at'] = 4
+        self.save('phone-admission.json', self.state)
+        with self.assertRaisesRegex(m.IdleError, 'changed or disappeared'):
+            self.check.inspect(baseline)
+
+    def test_sidecar_requires_current_generation_boot_and_exact_numeric_anchor(self):
+        self.state['collector']['heartbeat_tick'] = 1
+        self.save('phone-admission.json', self.state)
+        for changes in ({'generation': 'c'*32}, {'boot_id': 'previous-boot'},
+                        {'anchor_tick': 2}, {'anchor_tick': True}, {'anchor_tick': '1'}):
+            with self.subTest(changes=changes):
+                self.heartbeat(**changes)
+                with self.assertRaises(m.IdleError): self.check.inspect()
+
+    def test_invalid_or_expired_sidecar_never_refreshes_collector(self):
+        for tick in (80, 101, True, '99', None):
+            with self.subTest(tick=tick):
+                self.heartbeat(heartbeat_tick=tick)
+                with self.assertRaises(m.IdleError): self.check.inspect()
+        for changes in ({'schema': True}, {'schema': 2}, {'unexpected': 1}):
+            self.heartbeat(**changes)
+            with self.assertRaises(m.IdleError): self.check.inspect()
+        path = self.heartbeat()
+        for raw in ('{bad', '{"schema":1,"schema":1}', '{"heartbeat_tick":NaN}'):
+            path.write_text(raw)
+            with self.assertRaises(m.IdleError): self.check.inspect()
+
+    def test_sidecar_from_previous_generation_can_use_fresh_legacy_anchor(self):
+        self.heartbeat(generation='c'*32)
+        self.assertTrue(self.check.inspect()['ok'])
+        (self.data/'phone-collector-heartbeat.json').unlink()
+        self.assertTrue(self.check.inspect()['ok'])
+
+    def test_sidecar_rejects_unsafe_metadata_and_preserves_target(self):
+        path = self.heartbeat(); body = path.read_bytes()
+        for mode in (0o644, 0o660, 0o740):
+            path.chmod(mode)
+            with self.assertRaisesRegex(m.IdleError, 'permissions'): self.check.inspect()
+        path.chmod(0o640)
+        victim = self.base/'pulse-victim'; victim.write_bytes(body)
+        for kind in ('symlink', 'hardlink', 'fifo'):
+            path.unlink()
+            if kind == 'symlink': path.symlink_to(victim)
+            elif kind == 'hardlink': os.link(victim, path)
+            else: os.mkfifo(path)
+            with self.assertRaises((m.IdleError, OSError)): self.check.inspect()
+            self.assertEqual(victim.read_bytes(), body)
+        path.unlink(); path = self.heartbeat()
+        with path.open('wb') as handle: handle.truncate(1025)
+        with self.assertRaisesRegex(m.IdleError, 'oversized'): self.check.inspect()
+
     def test_manual_test_live_paging_phone_agi_and_supervisor_stop_installation(self):
         for args in (['bash','/usr/local/bin/sls_mass_notify/sls_mass_notify_test.sh'],['php','sls_mass_notify_live_paging.php'],['python3','sls_mass_notify_phone_agi.py'],['php','sls_mass_notify_announcement_worker.php','--supervise'],['php','sls_mass_notify_announcement_worker.php','job_'+'e'*32]):
             with self.subTest(args=args):

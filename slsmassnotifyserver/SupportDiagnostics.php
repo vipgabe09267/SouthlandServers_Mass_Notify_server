@@ -70,6 +70,10 @@ trait SlsSupportDiagnostics
             'queue_counts' => [],
             'excluded' => ['configuration', 'credentials', 'addresses', 'hostnames', 'device_identifiers', 'message_contents', 'raw_logs'],
         ];
+        $build=\SLS\MassNotify\DeviceAcceptance::buildIdentity();
+        if ($build!==null) {
+            $report['build']=['version'=>$build['module_version'],'inventory_sha256'=>$build['inventory_sha256']];
+        }
         try {
             $query = $this->FreePBX->Database()->prepare('SELECT version FROM modules WHERE modulename = ? LIMIT 1');
             foreach (['framework', 'dashboard', 'backup', 'recordings'] as $module) {
@@ -99,10 +103,11 @@ trait SlsSupportDiagnostics
                 foreach (['ok', 'worker_exists', 'php_cli_exists', 'storage_writable', 'bootstrap_ok', 'probe_fresh'] as $key) {
                     $safe[$key] = ($worker[$key] ?? null) === true;
                 }
-                $safe['latest_state'] = in_array($worker['latest_state'] ?? '', ['idle', 'queued', 'worker_starting', 'running', 'complete', 'failed', 'expired'], true) ? $worker['latest_state'] : 'unavailable';
+                $safe['latest_state'] = in_array($worker['latest_state'] ?? '', ['idle', 'queued', 'worker_starting', 'running', 'complete', 'failed', 'cancelled', 'expired'], true) ? $worker['latest_state'] : 'unavailable';
                 $safe['failure_category'] = in_array($worker['failure_category'] ?? '', ['worker_start_failed', 'worker_bootstrap_failed',
                     'worker_module_load_failed', 'worker_runtime_failed', 'worker_timeout', 'audio_submission_failed',
-                    'sip_notify_submission_failed', 'channel_submission_failed', 'announcement_activity_timeout', 'job_expired'], true) ? $worker['failure_category'] : '';
+                    'sip_notify_submission_failed', 'channel_submission_failed', 'announcement_activity_timeout', 'job_expired',
+                    'weather_source_cancelled'], true) ? $worker['failure_category'] : '';
                 $report['announcement_worker'] = $safe;
             }
             foreach ($labels as $label) {
@@ -132,7 +137,7 @@ trait SlsSupportDiagnostics
                 if (!is_array($device)) { continue; }
                 $report['devices']['count']++;
                 $format = $device['format'] ?? 'unknown';
-                if (!in_array($format, ['yealink', 'yealink_text', 'cisco', 'poly', 'polycom', 'grandstream', 'fanvil', 'snom', 'aastra', 'mitel', 'sangoma', 'avaya', 'vtech', 'ale', 'alcatel', 'panasonic'], true)) { $format = 'unknown'; }
+                if (!in_array($format, ['yealink', 'yealink_text', 'yealink_image', 'cisco', 'poly', 'polycom', 'grandstream', 'fanvil', 'snom', 'aastra', 'mitel', 'sangoma', 'avaya', 'vtech', 'ale', 'alcatel', 'panasonic'], true)) { $format = 'unknown'; }
                 $transport = strtolower(is_string($device['transport'] ?? null) ? $device['transport'] : 'unknown');
                 if (!in_array($transport, ['udp', 'tcp', 'tls'], true)) { $transport = 'unknown'; }
                 foreach (['formats' => $format, 'transports' => $transport] as $field => $key) {
@@ -147,6 +152,14 @@ trait SlsSupportDiagnostics
                 $report['queue_counts'][$key] = is_int($value) && $value >= 0 && $value <= 1000000 ? $value : null;
             }
             $report['queue_scan_incomplete'] = ($summary['queue_scan_incomplete'] ?? false) === true;
+            $report['retained_components'] = [];
+            foreach (['configuration','configuration_backups','announcement_jobs','desktop_journal','phone_evidence','weather_evidence','incident_evidence','sms_evidence','enterprise_evidence','floorplan_images','other_state'] as $name) {
+                $row=$summary['retained_components'][$name] ?? [];
+                $report['retained_components'][$name]=[
+                    'bytes'=>is_int($row['bytes']??null)&&$row['bytes']>=0 ? $row['bytes'] : null,
+                    'files'=>is_int($row['files']??null)&&$row['files']>=0 ? $row['files'] : null,
+                    'complete'=>($row['complete']??false)===true];
+            }
         } catch (\Throwable $error) { $report['queue_counts_available'] = false; }
         return $report;
     }

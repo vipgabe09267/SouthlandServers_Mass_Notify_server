@@ -1,5 +1,6 @@
 <?php
 namespace FreePBX\modules;
+require_once __DIR__.'/api/sls-mass-notify/security.php';
 
 /** Portable authenticated encryption; the passphrase is never retained. */
 final class SlsEncryptedConfig
@@ -12,7 +13,8 @@ final class SlsEncryptedConfig
 
     private static function available(): void
     {
-        if (!function_exists('sodium_crypto_pwhash') || !function_exists('sodium_crypto_aead_xchacha20poly1305_ietf_encrypt')) {
+        if (!function_exists('sodium_crypto_pwhash') || !function_exists('sodium_crypto_aead_xchacha20poly1305_ietf_encrypt')
+            || !function_exists('sodium_crypto_aead_xchacha20poly1305_ietf_decrypt') || !function_exists('sodium_memzero')) {
             throw new \RuntimeException(_('Encrypted configuration requires the PHP Sodium extension. Enable it for the PBX web PHP version and retry.'));
         }
     }
@@ -43,9 +45,14 @@ final class SlsEncryptedConfig
         }
         $salt = random_bytes(SODIUM_CRYPTO_PWHASH_SALTBYTES);
         $nonce = random_bytes(SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_NPUBBYTES);
-        $key = self::key($passphrase, $salt);
-        try { $ciphertext = sodium_crypto_aead_xchacha20poly1305_ietf_encrypt($plaintext, self::context(), $nonce, $key); }
-        finally { sodium_memzero($key); sodium_memzero($passphrase); }
+        $key = '';
+        try {
+            $key = self::key($passphrase, $salt);
+            $ciphertext = sodium_crypto_aead_xchacha20poly1305_ietf_encrypt($plaintext, self::context(), $nonce, $key);
+        } finally {
+            if ($key !== '') { sodium_memzero($key); }
+            sodium_memzero($passphrase);
+        }
         return json_encode(['format' => self::FORMAT,
             'kdf' => ['algorithm' => 'argon2id13', 'opslimit' => self::OPS, 'memlimit' => self::MEMORY, 'salt' => base64_encode($salt)],
             'cipher' => 'xchacha20poly1305-ietf', 'nonce' => base64_encode($nonce), 'ciphertext' => base64_encode($ciphertext)],
@@ -57,8 +64,8 @@ final class SlsEncryptedConfig
         if ($file === '' || strlen($file) > self::MAX_FILE_BYTES) {
             throw new \DomainException(_('The configuration upload must be between 1 byte and 6 MiB.'));
         }
-        try { $payload = json_decode($file, true, 64, JSON_THROW_ON_ERROR); }
-        catch (\JsonException $error) { throw new \DomainException(_('The configuration file is not valid JSON. Select an SLS configuration export.')); }
+        try { $payload = \SLS\MassNotify\ApiSecurity::jsonObject($file); }
+        catch (\Throwable $error) { throw new \DomainException(_('The configuration file must contain unambiguous JSON with finite numbers. Select an SLS configuration export.')); }
         if (!is_array($payload) || array_is_list($payload)) { throw new \DomainException(_('The configuration must contain a JSON object.')); }
         if (($payload['format'] ?? '') !== self::FORMAT) {
             if (array_key_exists('format', $payload) && $payload['format'] !== 'sls-mass-notify-config-v1') {
@@ -87,12 +94,17 @@ final class SlsEncryptedConfig
             || strlen($ciphertext) > self::MAX_PLAIN_BYTES + SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_ABYTES) {
             throw new \DomainException(_('The encrypted backup is truncated or exceeds its size limit.'));
         }
-        $key = self::key($passphrase, $salt);
-        try { $plaintext = sodium_crypto_aead_xchacha20poly1305_ietf_decrypt($ciphertext, self::context(), $nonce, $key); }
-        finally { sodium_memzero($key); sodium_memzero($passphrase); }
+        $key = '';
+        try {
+            $key = self::key($passphrase, $salt);
+            $plaintext = sodium_crypto_aead_xchacha20poly1305_ietf_decrypt($ciphertext, self::context(), $nonce, $key);
+        } finally {
+            if ($key !== '') { sodium_memzero($key); }
+            sodium_memzero($passphrase);
+        }
         if ($plaintext === false) { throw new \DomainException(_('The backup passphrase is incorrect or the encrypted file was changed. No configuration was imported.')); }
-        try { $decoded = json_decode($plaintext, true, 64, JSON_THROW_ON_ERROR); }
-        catch (\JsonException $error) { throw new \DomainException(_('The decrypted backup does not contain a valid SLS configuration.')); }
+        try { $decoded = \SLS\MassNotify\ApiSecurity::jsonObject($plaintext); }
+        catch (\Throwable $error) { throw new \DomainException(_('The decrypted backup does not contain an unambiguous SLS configuration with finite numbers.')); }
         finally { sodium_memzero($plaintext); }
         if (!is_array($decoded) || ($decoded['format'] ?? '') !== 'sls-mass-notify-config-v1' || !is_array($decoded['settings'] ?? null)) {
             throw new \DomainException(_('The decrypted backup is not an SLS configuration export.'));

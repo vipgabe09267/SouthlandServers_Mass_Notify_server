@@ -1,4 +1,5 @@
 <?php
+require_once __DIR__.'/AdminResponse.php';
 
 // Southland Servers Mass Notifications Server by the Southland Servers Group
 
@@ -10,6 +11,7 @@ unset($_SESSION['slsmassnotifyserver_scheduling_result']);
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 	$action = (string)($_POST['slsmassnotifyserver_action'] ?? '');
 	$calendarRequest = in_array($action, ['preview_schedule_calendar', 'import_schedule_calendar'], true);
+	if ($calendarRequest) { \SLS\MassNotify\AdminResponse::requireClearBuffers(); }
 	$respond = static function (array $body, int $status = 200): void {
 		http_response_code($status); header('Content-Type: application/json; charset=UTF-8');
 		header('Cache-Control: private, no-store'); header('X-Content-Type-Options: nosniff');

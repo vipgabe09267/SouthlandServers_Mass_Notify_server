@@ -14,9 +14,13 @@ final class Service
     public function __construct(Store $store, ?Provider $provider=null, string $mediaRoot='/var/www/html/sls_mass_notify', ?callable $inboundHumanResponse=null) { $this->store=$store; $this->provider=$provider??new Provider(); $this->mediaRoot=$mediaRoot; $this->inboundHumanResponse=$inboundHumanResponse; }
     public static function callbackUrl(array $settings): string
     {
-        $base=$settings['control_api']['base_url']??''; $host=$settings['public_pbx_host']??'';
-        if (!is_string($base) || !is_string($host) || !preg_match('#^https://([a-z0-9.-]+)(?::([0-9]{1,5}))?/api/sls-mass-notify/?$#Di',$base,$match)
-            || strtolower($match[1])!==strtolower($host) || (isset($match[2]) && $match[2]!=='' && ((int)$match[2]<1 || (int)$match[2]>65535))) {
+        $control=is_array($settings['control_api']??null)?$settings['control_api']:[];
+        $base=$control['base_url']??''; $host=$settings['public_pbx_host']??'';
+        $parsed=is_string($base)?parse_url($base):false;
+        if (!is_array($parsed) || array_diff(array_keys($parsed),['scheme','host','port','path']) || strtolower($parsed['scheme']??'')!=='https'
+            || !Config::host($parsed['host']??null) || !Config::host($host) || strtolower($parsed['host'])!==strtolower($host)
+            || (($parsed['port']??443)<1 || ($parsed['port']??443)>65535)
+            || !in_array($parsed['path']??'',['/api/sls-mass-notify','/api/sls-mass-notify/'],true)) {
             throw new \DomainException('sms_callback_address_invalid');
         }
         return rtrim($base,'/').'/sms-callback.php';
@@ -72,25 +76,80 @@ final class Service
         $size=@getimagesizefromstring($bytes);
         if (!$size || $size[2]!==IMAGETYPE_PNG || $size[0]>1440 || $size[1]>816) { throw new \DomainException('mms_image_snapshot_invalid'); }
         $parent=@lstat($this->mediaRoot);
-        if (!$parent || ($parent['mode']&0170000)!==0040000 || ($parent['mode']&0022) || realpath($this->mediaRoot)!==$this->mediaRoot) { throw new \RuntimeException('mms_image_workspace_unsafe'); }
+        if (!$parent || ($parent['mode']&0170000)!==0040000 || ($parent['mode']&0022)
+            || !in_array($parent['uid'],[0,posix_geteuid()],true) || realpath($this->mediaRoot)!==$this->mediaRoot) {
+            throw new \RuntimeException('mms_image_workspace_unsafe');
+        }
+        $directory=@fopen($this->mediaRoot,'r');
+        if (!$directory) { throw new \RuntimeException('mms_image_workspace_unavailable'); }
+        $directoryMatches=function () use ($directory): bool {
+            clearstatcache(true,$this->mediaRoot);$named=@lstat($this->mediaRoot);$opened=fstat($directory);
+            return is_array($named)&&is_array($opened)&&($named['mode']&0170000)===0040000
+                && ($named['mode']&0022)===0&&in_array($named['uid'],[0,posix_geteuid()],true)
+                && $named['dev']===$opened['dev']&&$named['ino']===$opened['ino']&&$named['uid']===$opened['uid']
+                && $named['gid']===$opened['gid']&&$named['mode']===$opened['mode'];
+        };
+        if (!$directoryMatches()) { fclose($directory); throw new \RuntimeException('mms_image_workspace_changed'); }
         $path=$this->mediaRoot.'/'.basename(parse_url($media['url'],PHP_URL_PATH));
-        clearstatcache(true,$path); $before=@lstat($path); $created=$before===false;
-        $handle=@fopen($path,$created?'x+b':'r+b');
-        if (!$handle) { throw new \RuntimeException('mms_image_workspace_unavailable'); }
+        $identity=static function($handle,string $name,int $links=1): bool {
+            clearstatcache(true,$name);$open=fstat($handle);$named=@lstat($name);
+            return is_array($open)&&is_array($named)&&($open['mode']&0170000)===0100000
+                && ($named['mode']&0170000)===0100000&&$open['nlink']===$links&&$named['nlink']===$links
+                && ($open['mode']&0022)===0&&($named['mode']&0022)===0
+                && in_array($open['uid'],[0,posix_geteuid()],true)&&$open['uid']===$named['uid']
+                && $open['gid']===$named['gid']&&$open['mode']===$named['mode']
+                && $open['dev']===$named['dev']&&$open['ino']===$named['ino'];
+        };
+        $verify=static function($handle) use ($media,$bytes): bool {
+            $open=fstat($handle);if(!is_array($open)||$open['size']!==strlen($bytes)||fseek($handle,0)!==0){return false;}
+            $contents=stream_get_contents($handle,300001);
+            return is_string($contents)&&strlen($contents)===strlen($bytes)&&hash_equals($media['sha256'],hash('sha256',$contents));
+        };
+        clearstatcache(true,$path);$before=@lstat($path);
+        if (is_array($before)) {
+            $handle=@fopen($path,'rb');
+            try {
+                if (!$handle||!$identity($handle,$path)||!$directoryMatches()||!$verify($handle)) {
+                    throw new \RuntimeException('mms_image_identity_changed');
+                }
+                return;
+            } finally { if (is_resource($handle)) { fclose($handle); } fclose($directory); }
+        }
+        $temporary=$this->mediaRoot.'/.sls-mms-'.bin2hex(random_bytes(16));$temporaryIdentity=null;$handle=null;
         try {
-            $open=fstat($handle); clearstatcache(true,$path); $named=@lstat($path);
-            if (!$open || !$named || ($open['mode']&0170000)!==0100000 || $open['nlink']!==1 || ($open['mode']&0022)
-                || $open['dev']!==$named['dev'] || $open['ino']!==$named['ino'] || is_link($path)
-                || ($before && ($before['ino']!==$open['ino'] || $before['dev']!==$open['dev'])) || !flock($handle,LOCK_EX|LOCK_NB)) { throw new \RuntimeException('mms_image_workspace_changed'); }
-            if ($created) {
-                if (!chmod($path,0644) || fwrite($handle,$bytes)!==strlen($bytes) || !fflush($handle) || !fsync($handle)) { throw new \RuntimeException('mms_image_write_failed'); }
-                $directory=@fopen($this->mediaRoot,'r');
-                try { if (!$directory || !fsync($directory)) { throw new \RuntimeException('mms_image_write_failed'); } }
-                finally { if ($directory) { fclose($directory); } }
-            } else {
-                if ($open['size']!==strlen($bytes) || !hash_equals($media['sha256'],hash('sha256',stream_get_contents($handle,300001)))) { throw new \RuntimeException('mms_image_identity_changed'); }
+            $mask=umask(0027);try{$handle=@fopen($temporary,'x+b');}finally{umask($mask);}
+            if (!$handle||!$identity($handle,$temporary)||!$directoryMatches()) { throw new \RuntimeException('mms_image_workspace_changed'); }
+            $temporaryIdentity=fstat($handle);
+            for($offset=0,$length=strlen($bytes);$offset<$length;){
+                $written=fwrite($handle,substr($bytes,$offset,min(65536,$length-$offset)));
+                if(!is_int($written)||$written<1){throw new \RuntimeException('mms_image_write_failed');}$offset+=$written;
             }
-        } finally { fclose($handle); }
+            if(!fflush($handle)||!fsync($handle)||!$verify($handle)||!chmod($temporary,0644)||!fsync($handle)
+                ||!$identity($handle,$temporary)||!$directoryMatches()){throw new \RuntimeException('mms_image_write_failed');}
+            clearstatcache(true,$path);
+            if (@lstat($path)!==false || !@link($temporary,$path)) {
+                $existing=@fopen($path,'rb');
+                try {
+                    if(!$existing||!$identity($existing,$path)||!$verify($existing)){throw new \RuntimeException('mms_image_identity_changed');}
+                } finally {if(is_resource($existing)){fclose($existing);}}
+            } else {
+                clearstatcache(true,$path);$published=@lstat($path);$open=fstat($handle);
+                if(!is_array($published)||!is_array($open)||$published['dev']!==$open['dev']||$published['ino']!==$open['ino']
+                    ||$published['nlink']!==2||$published['mode']!==$open['mode']){throw new \RuntimeException('mms_image_workspace_changed');}
+            }
+            clearstatcache(true,$temporary);$named=@lstat($temporary);$open=fstat($handle);
+            if(!is_array($named)||!is_array($open)||$named['dev']!==$open['dev']||$named['ino']!==$open['ino']||!@unlink($temporary)){
+                throw new \RuntimeException('mms_image_write_failed');
+            }
+            $temporary='';
+            if(!$directoryMatches()||!fsync($directory)){throw new \RuntimeException('mms_image_write_failed');}
+        } finally {
+            if($temporary!==''&&is_array($temporaryIdentity)&&$directoryMatches()){
+                clearstatcache(true,$temporary);$named=@lstat($temporary);
+                if(is_array($named)&&$named['dev']===$temporaryIdentity['dev']&&$named['ino']===$temporaryIdentity['ino']){@unlink($temporary);}
+            }
+            if(is_resource($handle)){fclose($handle);}fclose($directory);
+        }
     }
     public static function receipt(array $row): array
     {
@@ -127,15 +186,24 @@ final class Service
     public function send(array $settings, array $frozen, string $delivery, string $job, int $expires, int $now, string $mediaData=''): array
     {
         $config=Config::normalize($settings['announcement_sms']??[]); $id=$frozen['id']??'';
-        $current=self::targets($settings)[$id]??null; $type=$frozen['message_type']??'SMS'; $media=$frozen['media']??[];
+        $type=$frozen['message_type']??'SMS'; $media=$frozen['media']??[];
         if (!is_array($media) || !in_array($type,['SMS','MMS'],true) || ($type==='MMS' && $config['message_format']!=='mms')) { throw new \DomainException('sms_format_changed'); }
+        foreach (['id','number','consent_at','fingerprint','route','callback','body','body_hash'] as $field) {
+            if (!is_string($frozen[$field]??null)) { throw new \DomainException('sms_snapshot_invalid'); }
+        }
+        if (!Config::id($id)||!Config::number($frozen['number'])||strlen($frozen['consent_at'])>40
+            ||!preg_match('/^[a-f0-9]{64}$/D',$frozen['fingerprint'])||!preg_match('/^[a-f0-9]{64}$/D',$frozen['route'])
+            ||!preg_match('/^[a-f0-9]{64}$/D',$frozen['body_hash'])||strlen($frozen['callback'])>2048) {
+            throw new \DomainException('sms_snapshot_invalid');
+        }
+        $current=self::targets($settings)[$id]??null;
         self::validateMedia($type,$media,self::callbackUrl($settings));
+        $segments=Config::units($frozen['body'],$config['from'],$type);
         if (!$current || !hash_equals($frozen['fingerprint']??'',self::targetFingerprint($current))
             || ($frozen['number']??null)!==$current['number'] || ($frozen['callback']??null)!==self::callbackUrl($settings)
             || !hash_equals($frozen['route']??'',Config::route($config,self::callbackUrl($settings)))
             || !hash_equals($frozen['body_hash']??'',Config::messageHash($frozen['body']??'',$type,$media))) { throw new \DomainException('sms_recipient_or_route_changed'); }
         if (!preg_match('/^announcement-[a-f0-9]{32}$/D',$delivery) || !preg_match('/^job_[a-f0-9]{32}$/D',$job)) { throw new \DomainException('sms_delivery_identity_missing'); }
-        $segments=Config::units($frozen['body'],$config['from'],$type);
         if ($type==='SMS' && $segments['segments']>$config['max_segments']) { throw new \DomainException('sms_segment_limit_exceeded'); }
         if ($type==='MMS' && $expires<=$now+5) { throw new \DomainException('sms_expired'); }
         $local='smsd_'.hash('sha256',$delivery."\0".$id); $numberHash=hash('sha256',$current['number']);

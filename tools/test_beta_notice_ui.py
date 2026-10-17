@@ -12,13 +12,13 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 if (os.environ.get('SLS_TEST_NAMESPACE') != 'entered'
-        or os.environ.get('SLS_TEST_PARENT_NET_NS') == os.readlink('/proc/self/ns/net')):
+        or os.environ.get('SLS_TEST_PARENT_NET_NS') in (None, '', os.readlink('/proc/self/ns/net'))):
     raise SystemExit('Use the isolated fixture runner; no browser was started.')
 driver = os.environ.get('SLS_UI_PYTHON_PATH')
 browser = os.environ.get('SLS_UI_CHROMIUM')
 if not driver or not browser or not Path(browser).is_file():
     print('SKIPPED optional beta notice browser checks: supply preinstalled SLS_UI_PYTHON_PATH and SLS_UI_CHROMIUM. No downloads ran.')
-    raise SystemExit(0)
+    raise SystemExit(1 if os.environ.get('SLS_UI_REQUIRED') == '1' else 0)
 sys.path.insert(0, driver)
 from playwright.sync_api import sync_playwright
 
@@ -59,11 +59,12 @@ if($_SERVER['REQUEST_METHOD']==='POST'){
    elseif($action==='beta_notice_accept'){$settings['beta_notice']=BetaNotice::merge($settings['beta_notice']??[],BetaNotice::accept($_SESSION,['challenge'=>$_POST['challenge']??'','agree'=>($_POST['agree']??'')==='1'],$actor,session_id()));$result=['success'=>true,'acknowledged'=>true];}
    else{throw new DomainException('Unexpected beta fixture action');}
   }
-  file_put_contents(__DIR__.'/settings.json',json_encode($settings));echo json_encode($result);
+  if(in_array($action,['beta_notice_accept','danger_accept'],true)){file_put_contents(__DIR__.'/settings.json',json_encode($settings));}echo json_encode($result);
  }catch(Throwable $e){http_response_code(403);echo json_encode(['success'=>false,'message'=>$e->getMessage()]);}
  return;
 }
 class InertEnterpriseView {
+ private function getActiveSettings():array{return $GLOBALS['settings'];}
  public function renderClusterPage(...$args):string{return '';}
  public function renderEnterpriseLabsPage(...$args):string{return '';}
  public function renderEnterpriseIntegrations():string{return '';}
@@ -96,7 +97,7 @@ $safety=LabsSafety::normalize($settings['labs_safety']??[]);
         cls.server.terminate(); cls.server.wait(timeout=5); cls.log.close(); cls.temp.cleanup()
 
     def setUp(self):
-        (self.root / 'settings.json').unlink(missing_ok=True)
+        (self.root / 'settings.json').write_text('{}')
 
     def test_responsive_modal_cannot_close_and_acceptance_persists(self):
         for width in (1280, 390):
@@ -148,6 +149,31 @@ $safety=LabsSafety::normalize($settings['labs_safety']??[]);
                     self.assertEqual(page.locator('dialog.sls-beta-notice').count(), 0)
         finally:
             for context in contexts: context.close()
+
+    def test_upgrade_keeps_old_agreement_without_acknowledging_another_administrator(self):
+        for revision in ('ff40a241032168da33d496200653eced9f5d91b1481ccc0b0127d1854bf0c4da', 'eaa61c4dc612b50633cc9c64972a47edb8db2a5f00a1f2653b670e7f6336ba9d'):
+            with self.subTest(revision=revision):
+                saved = {'beta_notice': {'schema': 1, 'receipt': {
+                    'revision': revision, 'accepted_at': int(time.time()) - 60, 'actor': 'owner'}}}
+                settings = self.root / 'settings.json'
+                settings.write_text(json.dumps(saved))
+                before = settings.read_bytes()
+                for actor in ('owner', 'admin2'):
+                    context = self.browser.new_context()
+                    try:
+                        page = context.new_page()
+                        page.goto(self.origin + '/index.php?fixture_actor=' + actor)
+                        if actor == 'owner':
+                            self.assertEqual(page.locator('#sls-beta-notice-template').count(), 0)
+                            page.reload()
+                            self.assertEqual(page.locator('dialog.sls-beta-notice').count(), 0)
+                        else:
+                            dialog = page.locator('dialog.sls-beta-notice')
+                            dialog.wait_for(state='visible')
+                            self.assertTrue(dialog.locator('button').is_disabled())
+                        self.assertEqual(settings.read_bytes(), before)
+                    finally:
+                        context.close()
 
     def test_labs_waits_until_beta_is_saved_then_starts_its_own_timer(self):
         context = self.browser.new_context(); page = context.new_page(); errors = []

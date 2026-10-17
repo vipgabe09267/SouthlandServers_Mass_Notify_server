@@ -22,6 +22,7 @@ import wave
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sls_phone_admission import read_private_json
+from sls_atomic_json import _object
 from sls_storage_maintenance import DATA, WEB, MAX_GENERATED_FILES, open_directory, generated_inventory, generated_cache_limit
 
 PIPER = '/usr/local/bin/sls_mass_notify/piper/venv/bin/piper'
@@ -53,11 +54,12 @@ class Admission:
         self.wait = setting(config, 'speech_queue_wait_seconds', 15, 0, 60)
         self.reserve = setting(config, 'generated_media_min_free_mib', 128, 64, 4096) * MIB
         self.budget = generated_cache_limit(config)
-        # Maximum catalog voice rate is below48kHz; reserve raw and two PBX
-        # copies plus temporary composition. Conversion holds this for60s.
+        # Maximum catalog voice rate is below 48 kHz; reserve raw and two PBX
+        # copies plus temporary composition. Conversion holds this for 60 seconds.
         self.bytes = seconds * (48000 * 2 + 8000 * 2 * 4) + MIB
         self.clock = clock
         self.fd = open_directory(self.directory)
+        self.parent_metadata = os.fstat(self.fd)
         self.handles = []
         self.names = {}
         self.active = None
@@ -69,22 +71,50 @@ class Admission:
     def file(self, name):
         fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o640, dir_fd=self.fd)
         meta = os.fstat(fd)
-        if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1 or meta.st_uid not in (0, os.geteuid()) or meta.st_mode & 0o027 or meta.st_size > 16384:
+        if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1 or meta.st_uid not in (0, os.geteuid()) or meta.st_mode & 0o7027 or meta.st_size != 0:
             os.close(fd)
             raise SpeechAdmissionError('Speech admission storage is unsafe; repair data permissions.', 73)
         self.handles.append(fd)
         self.names[fd] = name
+        if name == 'speech-admission.lock':
+            self.control = fd
         return fd
 
-    @staticmethod
-    def available(fd):
+    def verify_directory(self):
+        named = os.stat(self.directory, follow_symlinks=False)
+        opened = os.fstat(self.fd)
+        if ((named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+                or (opened.st_dev, opened.st_ino, opened.st_uid, opened.st_mode)
+                != (self.parent_metadata.st_dev, self.parent_metadata.st_ino, self.parent_metadata.st_uid, self.parent_metadata.st_mode)
+                or self.directory.resolve() != self.directory.absolute()):
+            raise SpeechAdmissionError('Speech admission directory changed. Inspect protected storage before retrying.', 73)
+
+    def verify_lock(self, fd):
+        self.verify_directory()
+        opened = os.fstat(fd)
+        named = os.stat(self.names[fd], dir_fd=self.fd, follow_symlinks=False)
+        if ((opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+                or not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or opened.st_size != 0
+                or opened.st_uid not in (0, os.geteuid()) or opened.st_mode & 0o7027):
+            raise SpeechAdmissionError('Speech admission lock changed. Inspect protected storage before retrying.', 73)
+
+    def available(self, fd):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
         except BlockingIOError:
             return False
+        self.verify_lock(fd)
+        return True
+
+    def lock_control(self, fd):
+        deadline = time.monotonic() + 2
+        while not self.available(fd):
+            if time.monotonic() >= deadline:
+                raise SpeechAdmissionError('Speech admission storage is busy. Wait for current storage operations to finish.', 75)
+            time.sleep(.02)
 
     def record(self, fd):
+        self.verify_lock(fd)
         name = self.names[fd].removesuffix('.lock') + '.json'
         try:
             source = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.fd)
@@ -92,37 +122,65 @@ class Admission:
             return []
         try:
             meta = os.fstat(source)
-            if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1 or meta.st_size > 16384 or meta.st_uid not in (0, os.geteuid()) or meta.st_mode & 0o027:
+            if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1 or meta.st_size > 16384 or meta.st_uid not in (0, os.geteuid()) or meta.st_mode & 0o7027:
                 raise SpeechAdmissionError('Speech space reservation metadata is unsafe.', 73)
             raw = os.read(source, 16385)
+            after = os.fstat(source)
+            named = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+            fields = ('st_dev', 'st_ino', 'st_nlink', 'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_mode', 'st_uid', 'st_gid')
+            if (len(raw) != meta.st_size
+                    or any(getattr(meta, field) != getattr(after, field)
+                           or getattr(after, field) != getattr(named, field) for field in fields)):
+                raise SpeechAdmissionError('Speech reservation changed while being read.', 73)
         finally:
             os.close(source)
         if not raw:
             return []
         try:
-            value = json.loads(raw)
+            value = json.loads(raw, object_pairs_hook=_object,
+                               parse_constant=lambda _: (_ for _ in ()).throw(ValueError('nonfinite_json')))
+            json.dumps(value, allow_nan=False)
             if not isinstance(value, list) or len(value) > 64:
                 raise ValueError()
             for row in value:
-                if not isinstance(row, dict) or type(row.get('bytes')) is not int or not 0 <= row['bytes'] <= 512 * MIB or type(row.get('expires')) not in (int, float) or not math.isfinite(row['expires']) or not isinstance(row.get('token'), str) or re.fullmatch('[a-f0-9]{32}',row['token']) is None:
+                if not isinstance(row, dict) or set(row) != {'bytes', 'expires', 'token'} or type(row.get('bytes')) is not int or not 0 <= row['bytes'] <= 512 * MIB or type(row.get('expires')) not in (int, float) or not math.isfinite(row['expires']) or not isinstance(row.get('token'), str) or re.fullmatch('[a-f0-9]{32}',row['token']) is None:
                     raise ValueError()
             return [row for row in value if row['expires'] > time.time()]
-        except (ValueError, UnicodeError):
+        except (ValueError, UnicodeError, RuntimeError):
             raise SpeechAdmissionError('Speech space reservation is invalid; inspect admission storage.', 73)
 
     def write(self, fd, value):
-        raw = json.dumps(value, separators=(',', ':')).encode()
+        self.verify_lock(self.control)
+        self.verify_lock(fd)
+        raw = json.dumps(value, separators=(',', ':'), allow_nan=False).encode()
+        if len(raw)>16384:
+            raise SpeechAdmissionError('Speech reservation exceeds its storage bound.',73)
         name = self.names[fd].removesuffix('.lock') + '.json'
         temporary = '.speech-budget-' + secrets.token_hex(12)
+        output = None
         try:
             output = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o640, dir_fd=self.fd)
-            with os.fdopen(output, 'wb') as handle:
+            with os.fdopen(os.dup(output), 'wb') as handle:
                 if handle.write(raw) != len(raw):
                     raise SpeechAdmissionError('Speech space reservation could not be fully saved.', 73)
                 handle.flush(); os.fsync(handle.fileno())
+            opened = os.fstat(output)
+            staged = os.stat(temporary, dir_fd=self.fd, follow_symlinks=False)
+            fields = ('st_dev', 'st_ino', 'st_nlink', 'st_size', 'st_mode', 'st_uid', 'st_gid')
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or opened.st_uid != os.geteuid()
+                    or stat.S_IMODE(opened.st_mode) not in (0o600, 0o640) or opened.st_size != len(raw)
+                    or any(getattr(opened, field) != getattr(staged, field) for field in fields)):
+                raise SpeechAdmissionError('Speech reservation staging changed unexpectedly.', 73)
+            self.verify_lock(self.control)
+            self.verify_lock(fd)
             os.replace(temporary, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+            committed = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+            if any(getattr(opened, field) != getattr(committed, field) for field in fields):
+                raise SpeechAdmissionError('Speech reservation commit changed unexpectedly.', 73)
             os.fsync(self.fd)
         finally:
+            if output is not None:
+                os.close(output)
             try: os.unlink(temporary, dir_fd=self.fd)
             except FileNotFoundError: pass
 
@@ -130,8 +188,9 @@ class Admission:
         """Budget a non-speech render without occupying a synthesis slot."""
         self.bytes = amount
         control = self.file('speech-admission.lock')
+        self.control = control
         slots = [self.file('speech-slot-%02d.lock' % index) for index in range(MAX_SLOTS)]
-        fcntl.flock(control, fcntl.LOCK_EX)
+        self.lock_control(control)
         try:
             media = generated_inventory(self.directory, self.web)
             if len(media) >= MAX_GENERATED_FILES:
@@ -156,7 +215,7 @@ class Admission:
         control = self.file('speech-admission.lock')
         self.control = control
         deadline = self.clock() + self.wait
-        fcntl.flock(control, fcntl.LOCK_EX)
+        self.lock_control(control)
         try:
             for index in range(self.queue):
                 waiter = self.file('speech-wait-%02d.lock' % index)
@@ -169,7 +228,7 @@ class Admission:
             fcntl.flock(control, fcntl.LOCK_UN)
         slots = [self.file('speech-slot-%02d.lock' % index) for index in range(MAX_SLOTS)]
         while True:
-            fcntl.flock(control, fcntl.LOCK_EX)
+            self.lock_control(control)
             unlocked = []
             try:
                 for slot in slots:
@@ -210,7 +269,11 @@ class Admission:
             if self.active is not None:
                 # Hold space across duration checks/conversion, including a
                 # short grace after failed jobs without inferring success.
-                fcntl.flock(self.control, fcntl.LOCK_EX)
+                try:
+                    self.lock_control(self.control)
+                except (OSError, SpeechAdmissionError) as error:
+                    print('Speech cleanup could not update its reservation: '+str(error),file=sys.stderr)
+                    return
                 try:
                     rows = self.record(self.active)
                     for row in rows:
@@ -243,9 +306,14 @@ def speech_output(command, seconds):
             raise SpeechAdmissionError('The selected voice metadata is unsafe. Repair the selected voice installation.', 78)
         raw = os.read(descriptor, 131073)
         try:
-            value = json.loads(raw)
+            after=os.fstat(descriptor)
+            if (len(raw)!=meta.st_size or (meta.st_mtime_ns,meta.st_ctime_ns)!=(after.st_mtime_ns,after.st_ctime_ns)):
+                raise ValueError('voice_metadata_changed')
+            value = json.loads(raw,object_pairs_hook=_object,
+                               parse_constant=lambda _: (_ for _ in ()).throw(ValueError('nonfinite_json')))
+            json.dumps(value,allow_nan=False)
             rate = value['audio']['sample_rate']
-        except (ValueError, TypeError, KeyError):
+        except (ValueError, TypeError, KeyError, RuntimeError):
             raise SpeechAdmissionError('The selected voice metadata is invalid. Repair the selected voice installation.', 78) from None
         if type(rate) is not int or not 8000 <= rate <= 48000:
             raise SpeechAdmissionError('The selected voice has an unsupported sample rate. Repair the selected voice installation.', 78)
@@ -259,7 +327,8 @@ def speech_output(command, seconds):
     finally:
         os.close(parent)
     meta = os.fstat(descriptor)
-    if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1 or meta.st_uid != os.geteuid() or meta.st_size != 0 or meta.st_mode & 0o022:
+    if (not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1 or meta.st_uid != os.geteuid()
+            or meta.st_size != 0 or stat.S_IMODE(meta.st_mode) != 0o600):
         os.close(descriptor)
         raise SpeechAdmissionError('Speech output must be an empty private regular file. Discard the failed workspace before retrying.', 73)
     # Piper reopens this descriptor alias instead of a replaceable pathname.
@@ -283,7 +352,12 @@ def launch(command, timeout, slot=0, output_fd=None, max_bytes=None):
         if hasattr(os, 'sched_getaffinity'):
             cpus = sorted(os.sched_getaffinity(0))
             os.sched_setaffinity(0, {cpus[slot % len(cpus)]})
-    environment = dict(os.environ, OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1', NUMEXPR_NUM_THREADS='1')
+    environment = {
+        'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+        'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
+        'OMP_NUM_THREADS': '1', 'OPENBLAS_NUM_THREADS': '1',
+        'MKL_NUM_THREADS': '1', 'NUMEXPR_NUM_THREADS': '1',
+    }
     # Pipe diagnostics through the unrestricted supervisor: the raw-audio file
     # limit must never cap an existing worker log or admission state write.
     child = subprocess.Popen(command, env=environment, preexec_fn=prepare, start_new_session=True,
@@ -323,7 +397,8 @@ def launch(command, timeout, slot=0, output_fd=None, max_bytes=None):
         except ProcessLookupError: pass
         try: child.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            os.killpg(child.pid, signal.SIGKILL)
+            try: os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError: pass
             child.wait(timeout=2)
         return 124
     finally:
@@ -348,13 +423,27 @@ def synthesize(command, seconds, timeout, slot=0):
                             code = 65
             except (OSError, EOFError, wave.Error):
                 code = 74
+        if code == 0:
+            try:
+                named = os.stat(output, follow_symlinks=False)
+                captured = os.fstat(descriptor)
+                if (not stat.S_ISREG(named.st_mode) or named.st_nlink != 1
+                        or stat.S_IMODE(named.st_mode) != 0o600
+                        or (named.st_dev, named.st_ino, named.st_size)
+                        != (captured.st_dev, captured.st_ino, captured.st_size)):
+                    code = 74
+            except OSError:
+                code = 74
         if code == 65:
             print('Generated speech exceeds the configured maximum of %d seconds or its reserved output bound. Audio was rejected; shorten the message or increase Maximum Speech Duration.' % seconds, file=sys.stderr)
         if code != 0:
-            named = os.stat(output, follow_symlinks=False)
-            captured = os.fstat(descriptor)
-            if (named.st_dev, named.st_ino) == (captured.st_dev, captured.st_ino):
-                os.unlink(output)
+            try:
+                named = os.stat(output, follow_symlinks=False)
+                captured = os.fstat(descriptor)
+                if (named.st_dev, named.st_ino) == (captured.st_dev, captured.st_ino):
+                    os.unlink(output)
+            except FileNotFoundError:
+                pass
         return code
     finally:
         os.close(descriptor)
@@ -376,9 +465,15 @@ def main():
     try:
         if os.geteuid() == 0:
             account = pwd.getpwnam('asterisk')
-            os.setgroups([])
-            os.setgid(account.pw_gid)
-            os.setuid(account.pw_uid)
+            if account.pw_uid <= 0:
+                raise RuntimeError('The speech runtime account must not be root')
+            environment = {
+                'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+                'LANG': 'C.UTF-8',
+                'LC_ALL': 'C.UTF-8',
+            }
+            os.execve('/usr/sbin/runuser', ['runuser', '-u', 'asterisk', '--', '/usr/bin/python3', '-I',
+                str(Path(__file__).resolve()), *sys.argv[1:]], environment)
         admission = Admission(read_private_json('mass-notifications.config'), args.max_seconds or 1)
         if args.reserve_media_bytes is not None:
             admission.reserve_media(args.reserve_media_bytes)

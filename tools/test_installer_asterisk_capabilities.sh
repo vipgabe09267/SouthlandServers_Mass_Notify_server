@@ -135,6 +135,13 @@ log() {
     printf 'An Asterisk-style noload => provider was accepted as restart-persistent.\n' >&2
     exit 1
   fi
+  printf '%s\n' '[modules]' 'autoload=yes' '[modules]' 'autoload=no' >"$mock_modules"
+  if asterisk_module_starts_persistently res_pjsip_header_funcs.so "$mock_modules"; then
+    printf 'An earlier autoload assignment overrode the effective final assignment.\n' >&2
+    exit 1
+  fi
+  printf '%s\n' '[modules]' 'autoload=no' '[modules]' 'autoload=yes' >"$mock_modules"
+  asterisk_module_starts_persistently res_pjsip_header_funcs.so "$mock_modules"
 )
 
 # The compatibility Piper path is managed only when absent or already SLS-owned.
@@ -147,7 +154,27 @@ log() {
     printf 'An unrelated Piper wrapper was accepted for overwrite.\n' >&2
     exit 1
   fi
-  printf '%s\n' '#!/bin/sh' 'exec /usr/local/bin/sls_mass_notify/piper/venv/bin/piper "$@"' >"$mock_wrapper"
+  printf '%s\n' '#!/bin/sh' '# /usr/local/bin/sls_mass_notify/piper/venv/bin/piper' 'exec /opt/other-piper "$@"' >"$mock_wrapper"
+  if validate_piper_wrapper_ownership "$mock_wrapper"; then
+    printf 'A foreign wrapper containing an SLS path in a comment was accepted for overwrite.\n' >&2
+    exit 1
+  fi
+  python3 -I - "$ROOT_DIR" "$mock_wrapper" <<'PY'
+import pathlib
+import re
+import sys
+
+source = pathlib.Path(sys.argv[1], 'slsmassnotifyserver/bin/sls_mass_notify_install_piper_voices.sh').read_bytes()
+match = re.search(rb"expected=\"\$\(cat <<'EOF'\n(.*?)\nEOF\n\)\"", source, re.S)
+assert match is not None
+pathlib.Path(sys.argv[2]).write_bytes(match.group(1) + b'\n')
+PY
+  chmod 0777 "$mock_wrapper"
+  if validate_piper_wrapper_ownership "$mock_wrapper"; then
+    printf 'An authentic Piper wrapper with unsafe permissions was accepted.\n' >&2
+    exit 1
+  fi
+  chmod 0755 "$mock_wrapper"
   validate_piper_wrapper_ownership "$mock_wrapper"
 )
 
@@ -760,6 +787,8 @@ fi
   [ "$(endpoint_inventory_records "$inventory_dir/unknown.json")" = $'1000\tunknown\t2\t1\t0\tunknown\tCommunity Phone' ]
   printf '%s\n' '{"1000":{"contacts":2,"format":"yealink","formats":["yealink","poly"],"user_agent":"Yealink | Poly"}}' >"$inventory_dir/mixed.json"
   [ "$(endpoint_inventory_records "$inventory_dir/mixed.json")" = $'1000\tyealink\t2\t0\t1\tpoly,yealink\tYealink | Poly' ]
+  printf '%s\n' '{"1000":{"contacts":1,"format":"unknown","formats":["unknown"],"user_agent":"Phone\u001b[2J\u202eTXT"}}' >"$inventory_dir/control.json"
+  [ "$(endpoint_inventory_records "$inventory_dir/control.json")" = $'1000\tunknown\t1\t1\t0\tunknown\tPhone?[2J?TXT' ]
   # Exercise every actual runtime format, including an explicit T48G image
   # override. Adding a working renderer must not make installation roll back.
   python3 -I - "$ROOT_DIR" "$inventory_dir" <<'PY'

@@ -52,6 +52,26 @@ namespace {
 	};
 
 	$defaults = $invoke('getDefaultSettings');
+	$assert($invoke('getDefaultSettings') === $defaults, 'Default credentials changed within one request.');
+	$invalidKeyRejected = false;
+	try { $invoke('normalizeDesktopAuthKey', 'not-a-valid-key'); }
+	catch (\DomainException $expected) { $invalidKeyRejected = true; }
+	$assert($invalidKeyRejected, 'An invalid persisted desktop master key was silently replaced.');
+	$invalidPasswordRejected = false;
+	try {
+		$invoke('normalizeDesktopClients', [[
+			'id'=>'desk_fixture', 'client_id'=>'cli_fixture', 'name'=>'Fixture', 'username'=>'fixture',
+			'enabled'=>'1', 'password_enc'=>'v1:not-valid',
+		]], ['desktop_auth_key'=>base64_encode(str_repeat('D', 32))]);
+	} catch (\DomainException $expected) { $invalidPasswordRejected = true; }
+	$assert($invalidPasswordRejected, 'An undecryptable persisted desktop password was silently replaced.');
+	$unicodeDesktop = $invoke('normalizeDesktopClients', [[
+		'id'=>'desk_unicode', 'client_id'=>'cli_unicode', 'name'=>str_repeat('é', 39).'🙂', 'username'=>'unicode',
+		'enabled'=>'false', 'password'=>'fixture-only-password',
+	]], ['desktop_auth_key'=>base64_encode(str_repeat('D', 32))]);
+	$assert(mb_check_encoding($unicodeDesktop[0]['name'], 'UTF-8') && strlen($unicodeDesktop[0]['name']) <= 80
+		&& $unicodeDesktop[0]['name'] === str_repeat('é', 39) && $unicodeDesktop[0]['enabled'] === '0',
+		'Desktop normalization split UTF-8 or treated a false string as enabled.');
 	$defaults['desktop_clients'] = [];
 	$defaults['desktop_auth_key'] = base64_encode(str_repeat('T', 32));
 	$defaults['control_api']['api_key'] = str_repeat('a', 32);
@@ -60,6 +80,25 @@ namespace {
 	$accept($defaults, 'Defaults');
 	$normalizedDefaults = $invoke('normalizeSettings', $defaults);
 	$accept($normalizedDefaults, 'Normalized defaults');
+	$nativeSelectors = $defaults;
+	$nativeSelectors['nws_zones'] = $invoke('normalizeNwsZoneGroups', [[
+		'id'=>'nws_fixture','name'=>'Fixture','zone'=>'TXZ163','extensions'=>['1000'],
+		'desktop_clients'=>[],'email_recipients'=>[],
+	]], '', []);
+	foreach ([str_repeat('1', 21), 1000] as $invalidExtension) {
+		$invalid = $nativeSelectors;
+		$invalid['nws_zones'][0]['extensions'] = [$invalidExtension];
+		$failed = false;
+		try { $invoke('validateNativeBackupConfig', json_encode($invalid, JSON_THROW_ON_ERROR)); }
+		catch (\RuntimeException $expected) { $failed = true; }
+		$assert($failed, 'Native restore accepted a noncanonical Weather extension selector.');
+	}
+	$invalid = $nativeSelectors;
+	$invalid['nws_zones'][0]['desktop_clients'] = ['Desk User'];
+	$failed = false;
+	try { $invoke('validateNativeBackupConfig', json_encode($invalid, JSON_THROW_ON_ERROR)); }
+	catch (\RuntimeException $expected) { $failed = true; }
+	$assert($failed, 'Native restore accepted a desktop selector that live configuration would rewrite.');
 	$media = $defaults;
 	$media['media_access'] = ['network_restricted'=>true, 'allowed_cidrs'=>['192.0.2.0/24','2001:db8::/32'], 'max_age_minutes'=>60];
 	$assert($accept($media, 'Media policy')['media_access'] === $media['media_access'], 'Protected backup changed media policy.');
@@ -176,6 +215,7 @@ namespace {
 	$scheduled = $legacy;
 	$scheduled['scheduled_announcements'] = [[
 		'id' => 'synthetic_schedule', 'name' => 'Synthetic replay safety', 'enabled' => '1',
+		'targets' => ['extensions' => ['1000']],
 		'occurrences' => [['id' => 'synthetic_occurrence', 'run_at_utc' => '2030-01-01T12:00:00Z']],
 	]];
 	$raw = json_encode($scheduled, JSON_THROW_ON_ERROR);

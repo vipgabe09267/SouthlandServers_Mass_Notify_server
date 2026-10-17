@@ -9,8 +9,8 @@ The packaged `docs/piper-sbom.cdx.json` is a reproducible CycloneDX 1.6 inventor
 From a repository checkout, inspect the actual installed environment without importing or executing its package code:
 
 ```bash
-python3 tools/build_sbom.py \
-  --site-packages /usr/local/bin/sls_mass_notify/piper/venv/lib/python3.11/site-packages \
+/usr/bin/python3 tools/build_sbom.py \
+  --site-packages "$(/usr/local/bin/sls_mass_notify/piper/venv/bin/python3 -I -c 'import sysconfig; print(sysconfig.get_path("purelib"))')" \
   --output /tmp/sls-installed-piper.cdx.json
 ```
 

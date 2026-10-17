@@ -47,7 +47,8 @@
         status.textContent=<?php echo json_encode(_('Checking the PBX…')); ?>;
         var data=new FormData();data.set('slsmassnotifyserver_action','deployment_readiness');
         data.set('slsmassnotifyserver_csrf',<?php echo json_encode((string)($csrfToken ?? $csrf_token ?? '')); ?>);
-        fetch('config.php?display=slsmassnotifyserver',{method:'POST',credentials:'same-origin',body:data,cache:'no-store'})
+        var controller=new AbortController(),timer=setTimeout(function(){controller.abort();},20000);
+        fetch('config.php?display=slsmassnotifyserver',{method:'POST',credentials:'same-origin',body:data,cache:'no-store',signal:controller.signal})
         .then(function(response){return response.json().catch(function(){throw new Error(<?php echo json_encode(_('The PBX returned an unreadable readiness response. Reload the page and check the PHP error log. HTTP status:')); ?>+' '+response.status);}).then(function(body){
             if(!response.ok||!body.success)throw new Error(body.message||<?php echo json_encode(_('The PBX rejected the readiness check. Reload the page and retry.')); ?>);
             return body.report;
@@ -67,8 +68,8 @@
             document.getElementById('sls-readiness-scope').textContent=String(value.verification_scope||'');
             results.hidden=false;download.disabled=false;
             root.dispatchEvent(new CustomEvent('sls:readiness-checked',{detail:value}));
-        }).catch(function(error){report=null;results.hidden=true;status.textContent=error.message||<?php echo json_encode(_('The readiness check could not complete. Check the PBX connection and PHP error log, then retry.')); ?>;})
-        .finally(function(){button.disabled=false;root.setAttribute('aria-busy','false');});
+        }).catch(function(error){report=null;results.hidden=true;status.textContent=controller.signal.aborted?'The readiness check exceeded 20 seconds. Check the PBX connection and try again.':error.message||<?php echo json_encode(_('The readiness check could not complete. Check the PBX connection and PHP error log, then retry.')); ?>;})
+        .finally(function(){clearTimeout(timer);button.disabled=false;root.setAttribute('aria-busy','false');});
     });
     download.addEventListener('click',function(){
         if(!report)return;

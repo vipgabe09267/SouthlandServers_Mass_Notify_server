@@ -1,5 +1,15 @@
 # Automated validation
 
+Browser dependencies are mandatory in the source CI workflow. New 0.1.7 cases
+exercise subscriber worker registration under the production CSP and actual
+POST navigation to a separate synthetic IdP origin. Missing browser tools fail
+required qualification; these fixtures make no production login requests.
+
+The VM controller retains a private report on prerequisite failure and bounded
+logs on scenario failure. It supports 0.1.6 upgrades, early preparation power
+loss, repair, removal and purge. Controller tests are not successful full PBX
+VM runs. See the [qualification matrix](QUALIFICATION_MATRIX.md).
+
 `.github/workflows/validation.yml` runs on pushes, pull requests and manual dispatch. It uses a disposable Debian 12 container on a GitHub-hosted runner, read-only repository permissions and a pinned checkout action with persisted credentials disabled. It receives no PBX credentials, release-signing keys or deployment access and does not publish artifacts or install to a PBX.
 
 `tools/lint_source.sh` checks PHP, shell and Python syntax and the mirrored documentation. `tools/run_isolated_tests.sh` discovers the behavior/failure suites registered in the release build, then masks PBX state and sockets with disposable mount, network and PID namespaces. Privileged container access is required for those namespaces and is confined to the disposable runner. Do not run CI on this production PBX as a self-hosted runner.
@@ -8,7 +18,7 @@ Run focused suites while developing; run the complete registered set before a ca
 
 Media-policy qualification starts a separate Apache/mod_php instance inside the private network namespace with dummy configuration and files. It exercises both normal URLs and legacy API prefix aliases, exact image/XML bytes, HEAD requests, network/proxy enforcement, expiry, and failures. Apache and PHP packages are installed only in the disposable CI container; the test does not reload or reconfigure a production web service.
 
-Location/geography suites exercise inherited and overridden coordinates, age exclusions, date-line and boundary selection, explicit coordinate/exclusion review, revision conflicts, frozen audiences and reused desktop identities. The actual page controller is checked for CSRF, bounds and action dispatch. Private browser qualification additionally uses 1,000 fixture desktops, real PHP handlers and intercepted local assets at 1440/390 widths to exercise map dragging, keyboard navigation, numeric selection, audience creation and stale edits. Those browser runs send no notifications and are separate from the registered headless PHP/Node syntax gates.
+Location/geography suites exercise inherited and overridden coordinates, age exclusions, date-line and boundary selection, explicit coordinate/exclusion review, revision conflicts, frozen audiences and reused desktop identities. The actual page controller is checked for CSRF, bounds and action dispatch, and deterministic editor fixtures cover large desktop catalogs. Responsive map interaction remains an explicit release acceptance check in a supported browser; the deterministic PHP/Node gates do not qualify it. That check sends no notifications.
 
 CI does not prove handset behavior, public-edge HTTPS operation, provider delivery, full-fleet capacity or fresh FreePBX installation/restore compatibility. Those checks remain separate acceptance gates on approved targets and disposable PBX systems. The workflow is prepared locally and requires publication of the repository changes before GitHub can execute it; no remote CI success is claimed by adding the file.
 

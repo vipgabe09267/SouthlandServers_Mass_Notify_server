@@ -16,6 +16,8 @@ final class LocationDirectory
         'email_recipient_ids' => '/^email_[a-f0-9]{24}$/D',
         'sms_recipient_ids' => '/^sms_[a-f0-9]{24}$/D',
         'webhook_ids' => '/^[A-Za-z0-9_-]{1,64}$/D',
+        'browser_recipient_ids' => '/^sub_[a-f0-9]{24}$/D',
+        'connector_ids' => '/^conn_[a-f0-9]{24}$/D',
     ];
     public const PARENTS = ['site' => '', 'building' => 'site', 'floor' => 'building', 'room' => 'floor'];
 

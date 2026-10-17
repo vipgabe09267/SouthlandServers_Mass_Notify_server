@@ -62,6 +62,24 @@ class PagingPromptOwnershipFixture
     {
         $this->realOwnershipHelper('setPrivateOwnership', [$file]);
     }
+    private function readNativeBackupFile($path, $maxBytes, $failureMessage)
+    {
+        $method = new ReflectionMethod($this->module, 'readNativeBackupFile');
+        return $method->invoke($this->module, $path, $maxBytes, $failureMessage);
+    }
+    private function writeNativeSnapshotFile($path, $contents, $mode): void
+    {
+        $this->realOwnershipHelper('writeNativeSnapshotFile', [$path, $contents, $mode]);
+    }
+    private function unlinkNamedFileIfIdentity($path, $identity): void
+    {
+        $this->realOwnershipHelper('unlinkNamedFileIfIdentity', [$path, $identity]);
+    }
+    private function isValidAnnouncementAudioCache($path): bool
+    {
+        $method=new ReflectionMethod($this->module,'isValidAnnouncementAudioCache');
+        return $method->invoke($this->module,$path);
+    }
     private function generateAnnouncementTtsFile($text, $settings): string
     {
         paging_ownership_check(($settings['_tts_prompt_only'] ?? false) === true, 'Paging prompt retained the announcement prefix');
@@ -88,6 +106,8 @@ $disabled = $settings; $disabled['live_paging']['enabled'] = '0';
 $fixture->assertReady($disabled);
 $fixture->prepare($settings);
 $fixture->assertReady($settings);
+paging_ownership_check(glob(PagingPromptOwnershipFixture::TTS_DIR . '/fixture_*.wav') === [], 'Generated source prompts were not removed after activation');
+paging_ownership_check(glob(PagingPromptOwnershipFixture::SOUNDS_DIR . '/paging/.prompt-*') === [], 'Paging prompt staging files were not removed');
 $changedVoice = $settings; $changedVoice['announcement_piper_voice'] = 'changed-voice';
 paging_readiness_rejects(static function () use ($fixture, $changedVoice): void { $fixture->assertReady($changedVoice); }, 'Changed speech voice bypassed paging preparation');
 $files = glob(PagingPromptOwnershipFixture::SOUNDS_DIR . '/paging/*.wav');
@@ -124,6 +144,12 @@ file_put_contents($files[0], str_repeat('invalid header ', 8));
 paging_readiness_rejects(static function () use ($fixture, $settings): void { $fixture->assertReady($settings); }, 'Invalid cached WAV passed the activation guard');
 $fixture->prepare($settings);
 paging_ownership_check($fixture->generated === 11, 'Applying configuration did not regenerate a corrupt cached prompt');
+$fixture->assertReady($settings);
+$validPrompt=file_get_contents($files[0]);
+file_put_contents($files[0],substr($validPrompt,0,48));
+paging_readiness_rejects(static function()use($fixture,$settings):void{$fixture->assertReady($settings);},'Truncated cached WAV with a valid signature passed readiness');
+$fixture->prepare($settings);
+paging_ownership_check($fixture->generated===12,'A truncated cached prompt was reused instead of regenerated');
 $fixture->assertReady($settings);
 $extraLink = PAGING_OWNERSHIP_FIXTURE_ROOT . '/linked-prompt'; link($files[0], $extraLink);
 paging_readiness_rejects(static function () use ($fixture, $settings): void { $fixture->assertReady($settings); }, 'Hardlinked cached WAV passed the activation guard');

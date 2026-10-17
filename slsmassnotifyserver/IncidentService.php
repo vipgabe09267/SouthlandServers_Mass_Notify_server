@@ -105,7 +105,9 @@ final class IncidentService
     }
     private function claim(array &$record, string $request, string $kind, string $message, array $actor, string $fingerprint): void
     {
-        if (count($record['operations']) >= 250 || count($record['timeline']) > 3995
+        // A seven-cohort reviewed delivery needs one claim event, one aggregate
+        // event and seven later approval-linkage events.
+        if (count($record['operations']) >= 250 || count($record['timeline']) > 3991
             || strlen(json_encode($record, JSON_THROW_ON_ERROR)) > IncidentStore::MAX_BYTES - 16384) {
             throw new \RuntimeException('Incident delivery history is full. Export it and start a new incident.');
         }
@@ -269,7 +271,9 @@ final class IncidentService
             if (!hash_equals($record['actions'][$request], $fingerprint)) { throw new \InvalidArgumentException('Request identifier belongs to a different response.'); }
             return false;
         }
-        if (count($record['actions']) >= 3500) { throw new \RuntimeException('Incident response history is full. Export this incident before starting another.'); }
+        if (count($record['actions']) >= 3500 || count($record['timeline']) + IncidentStore::pendingApprovalCount($record) >= 4000) {
+            throw new \RuntimeException('Incident response history is full. Export this incident before starting another.');
+        }
         $record['actions'][$request] = $fingerprint; return true;
     }
     public function respond(string $id, array $input, array $actor, ?string $desktop = null, ?callable $authorize = null): array

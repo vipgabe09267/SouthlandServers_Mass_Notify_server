@@ -1,7 +1,9 @@
 <?php
+declare(strict_types=1);
 // Southland Servers Mass Notifications Server by the Southland Servers Group
-$setupModal = (string)($setup_modal ?? '');
-$page = trim((string)($requested_page ?? ''));
+$setupModal = is_string($setup_modal ?? null) ? $setup_modal : '';
+$page = is_string($requested_page ?? null) ? trim($requested_page) : '';
+$heroImage = is_string($hero_image ?? null) ? $hero_image : '';
 $titleMap = [
 	'main' => _('Notification Logs'),
 	'settings' => _('Weather Alerts'),
@@ -13,10 +15,10 @@ $titleMap = [
 $title = $titleMap[$page] ?? _('Mass Notifications');
 ?>
 <div class="container-fluid">
-	<?php echo load_view(__DIR__ . '/hero.php', ['hero_image' => $hero_image ?? '']); ?>
+	<?php echo load_view(__DIR__ . '/hero.php', ['hero_image' => $heroImage]); ?>
 	<div class="panel panel-warning">
 		<div class="panel-heading">
-			<strong><?php echo htmlspecialchars($title); ?></strong>
+			<strong><?php echo htmlspecialchars($title, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?></strong>
 		</div>
 		<div class="panel-body">
 			<div class="alert alert-warning" style="margin-bottom: 0;">

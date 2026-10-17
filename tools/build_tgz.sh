@@ -6,6 +6,10 @@ export PYTHONDONTWRITEBYTECODE=1
 
 UNSIGNED=0
 if [[ "${1:-}" == --unsigned ]]; then UNSIGNED=1; shift; fi
+if [[ "$#" -ne 0 ]]; then
+  printf 'Usage: %s [--unsigned]\n' "$0" >&2
+  exit 2
+fi
 if [[ -r /etc/freepbx.conf ]]; then
   [[ "${SLS_TEST_NAMESPACE:-}" == entered ]] || {
     printf 'Building on a PBX requires tools/run_isolated_tests.sh --build; direct builds cannot use production state as a fixture.\n' >&2
@@ -24,6 +28,10 @@ fi
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODULE="slsmassnotifyserver"
 VERSION="$(php -r '$x=simplexml_load_file($argv[1]); if (!$x) exit(1); echo (string)$x->version;' "${ROOT_DIR}/${MODULE}/module.xml")"
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-beta)?$ ]] || {
+  printf 'module.xml contains an invalid release version.\n' >&2
+  exit 2
+}
 DIST_DIR="${ROOT_DIR}/dist"
 PACKAGE="${DIST_DIR}/${MODULE}-${VERSION}.tgz"
 
@@ -45,6 +53,10 @@ while IFS= read -r -d '' file; do
   bash -n "$file"
 done < <(find "${ROOT_DIR}/${MODULE}" "${ROOT_DIR}/tools" -type f -name '*.sh' -print0)
 
+while IFS= read -r -d '' file; do
+  node --check "$file" >/dev/null
+done < <(find "${ROOT_DIR}/${MODULE}" "${ROOT_DIR}/tools" -type f -name '*.js' -print0)
+
 python3 - "${ROOT_DIR}/${MODULE}" <<'PY'
 import ast
 import pathlib
@@ -54,12 +66,72 @@ for path in pathlib.Path(sys.argv[1]).rglob("*.py"):
     ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 PY
 
+python3 - "${ROOT_DIR}/${MODULE}" <<'PY'
+import json
+import pathlib
+import sys
+
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('duplicate member: ' + key)
+        result[key] = value
+    return result
+
+def constant(value):
+    raise ValueError('non-standard number: ' + value)
+
+for path in pathlib.Path(sys.argv[1]).rglob('*.json'):
+    if path.is_symlink() or not path.is_file():
+        raise ValueError('JSON source path is unsafe: ' + str(path))
+    if path.stat().st_size > 8 * 1024 * 1024:
+        raise ValueError('JSON source exceeds 8 MiB: ' + str(path))
+    try:
+        json.loads(path.read_text(encoding='utf-8'), object_pairs_hook=unique, parse_constant=constant)
+    except (ValueError, UnicodeError) as error:
+        raise ValueError('Invalid JSON source ' + str(path) + ': ' + str(error)) from error
+PY
+
+python3 - "${ROOT_DIR}" "${BASH_SOURCE[0]}" <<'PY'
+import pathlib
+import re
+import sys
+
+root = pathlib.Path(sys.argv[1])
+source = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+expected = {
+    path.relative_to(root).as_posix()
+    for path in (root / "tools").glob("test_*")
+    if path.is_file() and path.suffix in {".js", ".php", ".py", ".sh"}
+}
+referenced = set(re.findall(r'\$\{ROOT_DIR\}/(tools/test_[^" ]+)', source))
+missing = sorted(expected - referenced)
+stale = sorted(referenced - expected)
+if missing or stale:
+    raise SystemExit(
+        "release regression inventory mismatch; missing="
+        + repr(missing)
+        + "; stale="
+        + repr(stale)
+    )
+PY
+
 cmp -s "${ROOT_DIR}/slsmassnotifyserver/api/sls-mass-notify/config-crypto.php" "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify/sls_config_crypto.php" || { printf 'Shared PHP configuration encryption copies differ.\n' >&2; exit 1; }
 python3 "${ROOT_DIR}/tools/test_config_crypto.py"
 python3 "${ROOT_DIR}/tools/test_config_fail_closed.py"
+python3 "${ROOT_DIR}/tools/test_live_paging_readers.py"
+node "${ROOT_DIR}/tools/test_operation_progress.js"
+node "${ROOT_DIR}/tools/test_operations_transport.js"
+node "${ROOT_DIR}/tools/test_administrative_transport.js"
+python3 "${ROOT_DIR}/tools/test_isolation_readonly.py"
+python3 "${ROOT_DIR}/tools/test_webhook_content.py"
+python3 "${ROOT_DIR}/tools/test_external_journal_safety.py"
 python3 "${ROOT_DIR}/tools/test_installer_crypto_helper.py"
 python3 "${ROOT_DIR}/tools/test_release_portability.py"
 php "${ROOT_DIR}/tools/test_ami_loopback.php"
+php "${ROOT_DIR}/tools/test_ami_ownership.php"
+php "${ROOT_DIR}/tools/test_api_audience_projection.php"
 php "${ROOT_DIR}/tools/test_operator_directory.php"
 python3 "${ROOT_DIR}/tools/test_upgrade_trust.py"
 bash "${ROOT_DIR}/tools/test_installer_asterisk_capabilities.sh"
@@ -71,8 +143,10 @@ php "${ROOT_DIR}/tools/test_scheduling_contract.php"
 php "${ROOT_DIR}/tools/test_schedule_calendar.php"
 php "${ROOT_DIR}/tools/test_schedule_programmes.php"
 php "${ROOT_DIR}/tools/test_directory_mapping.php"
+php "${ROOT_DIR}/tools/test_directory_ldap_records.php"
 php "${ROOT_DIR}/tools/test_enterprise_continuity.php"
 php "${ROOT_DIR}/tools/test_incident_languages.php"
+php "${ROOT_DIR}/tools/test_incident_editor_directory.php"
 php "${ROOT_DIR}/tools/test_operator_expiry.php"
 node "${ROOT_DIR}/tools/test_subscriber_worker.js"
 php "${ROOT_DIR}/tools/test_enterprise_provider_lifecycle.php"
@@ -80,6 +154,32 @@ php "${ROOT_DIR}/tools/test_enterprise_journal_maintenance.php"
 php "${ROOT_DIR}/tools/test_enterprise_announcement_channels.php"
 php "${ROOT_DIR}/tools/test_browser_push.php"
 python3 "${ROOT_DIR}/tools/test_installation_doctor.py"
+python3 "${ROOT_DIR}/tools/test_017_regressions.py"
+python3 "${ROOT_DIR}/tools/test_017_lightning_windows.py"
+python3 "${ROOT_DIR}/tools/test_017_storage_and_startup.py"
+python3 "${ROOT_DIR}/tools/test_017_state_boundaries.py"
+python3 "${ROOT_DIR}/tools/test_017_portal_csp.py"
+python3 "${ROOT_DIR}/tools/test_first_install_documentation.py"
+php "${ROOT_DIR}/tools/test_017_identity_revisions.php"
+php "${ROOT_DIR}/tools/test_vendor_stream_bounds.php"
+php "${ROOT_DIR}/tools/test_vendor_promise_diagnostics.php"
+php "${ROOT_DIR}/tools/test_vendor_random_engine.php"
+php "${ROOT_DIR}/tools/test_vendor_random_failure.php"
+php "${ROOT_DIR}/tools/test_vendor_phpseclib_key_formats.php"
+php "${ROOT_DIR}/tools/test_vendor_phpseclib_arithmetic.php"
+php "${ROOT_DIR}/tools/test_vendor_asn1_bounds.php"
+php "${ROOT_DIR}/tools/test_vendor_x509_bounds.php"
+php "${ROOT_DIR}/tools/test_vendor_xmlsec_bounds.php"
+php "${ROOT_DIR}/tools/test_vendor_ssh_bounds.php"
+php "${ROOT_DIR}/tools/test_vendor_ansi_bounds.php"
+php "${ROOT_DIR}/tools/test_module_private_atomic_write.php"
+php "${ROOT_DIR}/tools/test_017_labs_audiences.php"
+php "${ROOT_DIR}/tools/test_017_approval_alias.php"
+php "${ROOT_DIR}/tools/test_017_environment_boundary.php"
+python3 "${ROOT_DIR}/tools/test_runtime_account_environment.py"
+python3 "${ROOT_DIR}/tools/test_installer_module_enabled.py"
+python3 "${ROOT_DIR}/tools/test_installer_config_readers.py"
+php "${ROOT_DIR}/tools/test_017_runtime_history.php"
 php "${ROOT_DIR}/tools/test_phone_inventory.php"
 php "${ROOT_DIR}/tools/test_paging_readiness.php"
 php "${ROOT_DIR}/tools/test_control_idempotency.php"
@@ -101,6 +201,7 @@ php "${ROOT_DIR}/tools/test_announcement_delivery_contract.php"
 php "${ROOT_DIR}/tools/test_announcement_snapshot.php"
 php "${ROOT_DIR}/tools/test_speech_duration.php"
 python3 "${ROOT_DIR}/tools/test_announcement_previews.py"
+php "${ROOT_DIR}/tools/test_announcement_preview_protocol.php"
 php "${ROOT_DIR}/tools/test_desktop_capacity.php"
 php "${ROOT_DIR}/tools/test_sms_bulkvs.php"
 php "${ROOT_DIR}/tools/test_general_settings_save.php"
@@ -119,6 +220,7 @@ php "${ROOT_DIR}/tools/test_announcement_email_transport.php"
 php "${ROOT_DIR}/tools/test_announcement_email_facade.php"
 php "${ROOT_DIR}/tools/test_api_email_permissions.php"
 php "${ROOT_DIR}/tools/test_recipient_selection_email.php"
+python3 "${ROOT_DIR}/tools/test_scheduled_recipient_envelope_ui.py"
 php "${ROOT_DIR}/tools/test_incident_email.php"
 php "${ROOT_DIR}/tools/test_phone_collector_service.php"
 python3 "${ROOT_DIR}/tools/test_installer_phone_service.py"
@@ -130,10 +232,15 @@ python3 "${ROOT_DIR}/tools/test_phone_outcomes.py"
 python3 "${ROOT_DIR}/tools/test_outbound_routes.py"
 php "${ROOT_DIR}/tools/test_phone_producers.php"
 python3 "${ROOT_DIR}/tools/test_resource_capacity.py"
+python3 "${ROOT_DIR}/tools/test_phone_capacity_asterisk.py"
 python3 "${ROOT_DIR}/tools/test_installer_preparation.py"
 python3 "${ROOT_DIR}/tools/test_served_php_probe.py"
+python3 "${ROOT_DIR}/tools/test_served_php_fpm_cache.py"
 php "${ROOT_DIR}/tools/test_system_recordings.php"
 python3 "${ROOT_DIR}/tools/test_weather_channels.py"
+php "${ROOT_DIR}/tools/test_weather_channel_authorization.php"
+python3 "${ROOT_DIR}/tools/test_private_channel_handoffs.py"
+php "${ROOT_DIR}/tools/test_weather_health_destinations.php"
 python3 "${ROOT_DIR}/tools/test_lightning_providers.py"
 python3 "${ROOT_DIR}/tools/test_piper_dependencies.py"
 python3 "${ROOT_DIR}/tools/test_piper_environment.py"
@@ -146,6 +253,7 @@ php "${ROOT_DIR}/tools/test_setup_preferences.php"
 php "${ROOT_DIR}/tools/test_control_api_bounds.php"
 php "${ROOT_DIR}/tools/test_control_api_contract.php"
 php "${ROOT_DIR}/tools/test_event_log_pages.php"
+python3 "${ROOT_DIR}/tools/test_admin_output_buffers.py"
 php "${ROOT_DIR}/tools/test_speech_rules.php"
 php "${ROOT_DIR}/tools/test_sms_core.php"
 php "${ROOT_DIR}/tools/test_mms.php"
@@ -161,11 +269,13 @@ php "${ROOT_DIR}/tools/test_protected_config_compatibility.php"
 php "${ROOT_DIR}/tools/test_announcement_activity_lock.php"
 python3 "${ROOT_DIR}/tools/test_announcement_worker_lifecycle.py"
 python3 "${ROOT_DIR}/tools/test_sip_notify_submission_status.py"
+python3 "${ROOT_DIR}/tools/test_ami_transport_bounds.py"
 php "${ROOT_DIR}/tools/test_phone_media_url.php"
 python3 "${ROOT_DIR}/tools/test_phone_media_url.py"
 python3 "${ROOT_DIR}/tools/test_announcement_display_timeout.py"
 python3 "${ROOT_DIR}/tools/test_desktop_payload.py"
 python3 "${ROOT_DIR}/tools/test_desktop_streaming.py"
+python3 "${ROOT_DIR}/tools/test_desktop_fpm_capacity.py"
 php "${ROOT_DIR}/tools/test_desktop_announcement_expiry.php"
 php "${ROOT_DIR}/tools/test_email_sender_domain.php"
 python3 "${ROOT_DIR}/tools/test_email_sender_domain.py"
@@ -180,6 +290,11 @@ php "${ROOT_DIR}/tools/test_config_durability.php"
 php "${ROOT_DIR}/tools/test_protected_file_helpers.php"
 php "${ROOT_DIR}/tools/test_ui_performance_contract.php"
 php "${ROOT_DIR}/tools/test_ui_log_bounds.php"
+php "${ROOT_DIR}/tools/test_hero_view.php"
+php "${ROOT_DIR}/tools/test_dashboard_section.php"
+python3 "${ROOT_DIR}/tools/test_runtime_tree_safety.py"
+php "${ROOT_DIR}/tools/test_native_cron_read.php"
+python3 "${ROOT_DIR}/tools/test_schedule_journal_memory.py"
 php "${ROOT_DIR}/tools/test_update_contract.php"
 python3 "${ROOT_DIR}/tools/test_maintenance_failure_propagation.py"
 python3 "${ROOT_DIR}/tools/test_installer_log_compatibility.py"
@@ -190,6 +305,7 @@ php "${ROOT_DIR}/tools/test_advertised_address.php"
 php "${ROOT_DIR}/tools/test_encrypted_config.php"
 php "${ROOT_DIR}/tools/test_sensitive_exports.php"
 python3 "${ROOT_DIR}/tools/test_api_security.py"
+php "${ROOT_DIR}/tools/test_admin_request_boundaries.php"
 php "${ROOT_DIR}/tools/test_api_credential_management.php"
 php "${ROOT_DIR}/tools/test_api_announcement_permissions.php"
 python3 "${ROOT_DIR}/tools/test_api_delayed_permissions.py"
@@ -208,6 +324,7 @@ php "${ROOT_DIR}/tools/test_operator_recovery.php"
 python3 "${ROOT_DIR}/tools/test_operator_portal_http.py"
 python3 "${ROOT_DIR}/tools/test_phone_visual_owner.py"
 php "${ROOT_DIR}/tools/test_weather_delivery_receipts.php"
+python3 "${ROOT_DIR}/tools/test_weather_receipt_readers.py"
 php "${ROOT_DIR}/tools/test_weather_voicemail_receipts.php"
 python3 "${ROOT_DIR}/tools/test_weather_email_details.py"
 bash "${ROOT_DIR}/tools/test_installer_dependencies.sh"
@@ -217,6 +334,7 @@ php "${ROOT_DIR}/tools/test_panic_phone.php"
 python3 "${ROOT_DIR}/tools/test_trigger_actions.py"
 python3 "${ROOT_DIR}/tools/test_emergency_observer.py"
 php "${ROOT_DIR}/tools/test_incidents.php"
+php "${ROOT_DIR}/tools/test_incident_replay_restore.php"
 php "${ROOT_DIR}/tools/test_incident_escalation.php"
 node --check "${ROOT_DIR}/slsmassnotifyserver/views/incident_escalation_editor.js"
 node --check "${ROOT_DIR}/slsmassnotifyserver/views/schedule_programmes.js"
@@ -254,6 +372,7 @@ python3 "${ROOT_DIR}/tools/test_uninstaller_safe_logs.py"
 python3 "${ROOT_DIR}/tools/test_uninstaller_transaction.py"
 python3 "${ROOT_DIR}/tools/test_external_delivery_retry.py"
 python3 "${ROOT_DIR}/tools/test_system_notifications.py"
+python3 "${ROOT_DIR}/tools/test_system_notification_storage.py"
 python3 "${ROOT_DIR}/tools/test_system_health_notifications.py"
 python3 "${ROOT_DIR}/tools/test_status_health.py"
 python3 "${ROOT_DIR}/tools/test_maintenance_permission_safety.py"
@@ -261,6 +380,8 @@ python3 "${ROOT_DIR}/tools/test_sls_notify_journal.py"
 python3 "${ROOT_DIR}/tools/test_xweather_runtime_safety.py"
 python3 "${ROOT_DIR}/tools/test_xweather_manual_test_status.py"
 python3 "${ROOT_DIR}/tools/test_xweather_usage_period.py"
+python3 "${ROOT_DIR}/tools/test_lightning_audit_boundaries.py"
+python3 "${ROOT_DIR}/tools/test_nws_worker_boundaries.py"
 php "${ROOT_DIR}/tools/test_xweather_usage_period.php"
 python3 "${ROOT_DIR}/tools/test_xweather_groups.py"
 php "${ROOT_DIR}/tools/test_xweather_groups.php"
@@ -269,6 +390,8 @@ python3 "${ROOT_DIR}/tools/test_nws_status_concurrency.py"
 python3 "${ROOT_DIR}/tools/test_alert_worker_cli_safety.py"
 python3 "${ROOT_DIR}/tools/test_weather_manual_test_contract.py"
 python3 "${ROOT_DIR}/tools/test_manual_weather_reservations.py"
+python3 "${ROOT_DIR}/tools/test_weather_audit_regular.py"
+python3 "${ROOT_DIR}/tools/test_weather_audit_bounds.py"
 php "${ROOT_DIR}/tools/test_freepbx_backup_restore.php"
 php "${ROOT_DIR}/tools/test_native_restore_recovery.php"
 python3 "${ROOT_DIR}/tools/test_operational_backup.py"
@@ -276,6 +399,7 @@ php "${ROOT_DIR}/tools/test_operational_backup.php"
 php "${ROOT_DIR}/tools/test_help_ui_contract.php"
 php "${ROOT_DIR}/tools/test_desktop_reliability.php"
 php "${ROOT_DIR}/tools/test_desktop_receipts.php"
+python3 "${ROOT_DIR}/tools/test_desktop_status_readers.py"
 python3 "${ROOT_DIR}/tools/test_desktop_receipt_contract.py"
 node "${ROOT_DIR}/tools/test_desktop_receipt_ui.js"
 node "${ROOT_DIR}/tools/test_phone_contact_editor.js"
@@ -307,6 +431,7 @@ php "${ROOT_DIR}/tools/test_lightning_gate_view.php"
 php "${ROOT_DIR}/tools/test_lightning_outage_config.php"
 python3 "${ROOT_DIR}/tools/test_weather_channel_isolation.py"
 python3 "${ROOT_DIR}/tools/test_release_manifest.py"
+python3 "${ROOT_DIR}/tools/test_release_signer_transaction.py"
 python3 "${ROOT_DIR}/tools/test_release_trust.py"
 python3 "${ROOT_DIR}/tools/test_device_overrides.py"
 python3 "${ROOT_DIR}/tools/test_weather_queue.py"
@@ -321,15 +446,22 @@ python3 "${ROOT_DIR}/tools/test_announcement_footer.py"
 php "${ROOT_DIR}/tools/test_support_diagnostics.php"
 php "${ROOT_DIR}/tools/test_deployment_readiness.php"
 php "${ROOT_DIR}/tools/test_device_acceptance.php"
+php "${ROOT_DIR}/tools/test_immediate_settings.php"
 php "${ROOT_DIR}/tools/test_enterprise_operations.php"
 php "${ROOT_DIR}/tools/test_enterprise_security_review.php"
 python3 "${ROOT_DIR}/tools/test_enterprise_controller_http.py"
 php "${ROOT_DIR}/tools/test_enterprise_identity.php"
+php "${ROOT_DIR}/tools/test_http_client_safeguards.php"
+python3 "${ROOT_DIR}/tools/test_sensor_sdk_lock.py"
+php "${ROOT_DIR}/tools/test_enterprise_identity_leases.php"
+php "${ROOT_DIR}/tools/test_enterprise_provider_json.php"
 php "${ROOT_DIR}/tools/test_enterprise_identity_management.php"
 php "${ROOT_DIR}/tools/test_enterprise_operator_api.php"
 python3 "${ROOT_DIR}/tools/test_enterprise_control_http.py"
 python3 "${ROOT_DIR}/tools/test_enterprise_identity_http.py"
 php "${ROOT_DIR}/tools/test_enterprise_cluster.php"
+php "${ROOT_DIR}/tools/test_cluster_protocol_deadline.php"
+php "${ROOT_DIR}/tools/test_enterprise_edge_receipts.php"
 python3 "${ROOT_DIR}/tools/test_enterprise_cluster_tls.py"
 python3 "${ROOT_DIR}/tools/test_enterprise_cluster_deployment.py"
 node "${ROOT_DIR}/tools/test_enterprise_edge_view.js"
@@ -403,15 +535,15 @@ for required in \
   EnterpriseContinuity.php \
   docs/INSTALLER_OPERATIONS.md docs/ENTERPRISE_ACCEPTANCE.md docs/READINESS_REVIEW_0.1.6.md PhoneInventory.php ScheduleProgrammes.php ControlIdempotency.php BrowserPush.php EnterpriseAnnouncementChannels.php EnterpriseDeliveryConnector.php IncidentLanguages.php \
   views/identity_labs.css views/schedule_programmes.php views/schedule_programmes.js views/schedule_programmes.css views/installation_profile.php views/system_recording_browser.js portal/subscriber-worker.js \
-  bin/sls_mass_notify/sls_speech_admission.py bin/sls_mass_notify/sls_phone_inventory.py bin/sls_mass_notify/sls_install_transaction.py bin/sls_mass_notify/sls_install_doctor.py \
+  bin/sls_mass_notify/sls_speech_admission.py bin/sls_mass_notify/sls_phone_inventory.py bin/sls_mass_notify/sls_install_transaction.py bin/sls_mass_notify/sls_install_doctor.py bin/sls_mass_notify/sls_update_status.py bin/sls_mass_notify/sls_atomic_json.php bin/sls_mass_notify/sls_atomic_json.py \
   docs/OPERATORS.md docs/TRIGGERS.md docs/RELEASE_TRUST.md docs/PAGING.md \
   docs/ENTERPRISE_OPERATIONS.md docs/ENTERPRISE_LABS_PLAN.md docs/ENTERPRISE_CLUSTER.md docs/ENTERPRISE_IDENTITY.md docs/ENTERPRISE_INTEGRATIONS.md \
-  LabsSafety.php BetaNotice.php BetaNoticeService.php views/beta_notice.php views/beta_notice.css views/beta_notice.js EnterpriseAdministration.php EnterpriseOperations.php EnterpriseOperationsConfig.php EnterpriseOperationsStore.php EnterpriseApprovalService.php EnterpriseFloorplanStore.php page.slsmassnotifyserver_enterprise.php views/enterprise.php views/enterprise.css views/enterprise.js \
+  LabsSafety.php BetaNotice.php BetaNoticeService.php views/beta_notice.php views/beta_notice.css views/beta_notice.js EnterpriseAdministration.php EnterpriseOperations.php EnterpriseOperationsConfig.php EnterpriseOperationsStore.php EnterpriseApprovalService.php EnterpriseFloorplanStore.php EnterpriseFloorplanAudit.php EnterpriseFloorplanReferences.php page.slsmassnotifyserver_enterprise.php views/enterprise.php views/enterprise.css views/enterprise.js \
   EnterpriseCluster.php EnterpriseClusterConfig.php EnterpriseClusterIntegration.php EnterpriseClusterRuntime.php EnterpriseClusterProtocol.php EnterpriseClusterStore.php EnterpriseClusterEdge.php EnterpriseClusterPbxContract.php EnterpriseClusterIncidentStore.php api/sls-mass-notify/peer.php api/sls-mass-notify/edge.php api/sls-mass-notify/edge-view.php bin/sls_mass_notify_cluster_worker.php bin/sls_mass_notify_cluster_effect.php bin/sls_mass_notify/sls_cluster_guard.py \
-  EnterpriseIdentity.php EnterpriseIdentityConfig.php EnterpriseIdentityHttp.php EnterpriseIdentityManagement.php EnterpriseIdentityOidc.php EnterpriseIdentitySaml.php EnterpriseIdentityStore.php DirectoryConfig.php DirectorySync.php SubscriberConfig.php SubscriberService.php identity-libs/.htaccess identity-libs/composer.json identity-libs/composer.lock identity-libs/vendor/autoload.php portal/sso.php portal/subscriber.php \
+  EnterpriseIdentity.php EnterpriseIdentityConfig.php EnterpriseIdentityHttp.php EnterpriseIdentityManagement.php EnterpriseIdentityOidc.php EnterpriseIdentitySaml.php EnterpriseIdentityStore.php DirectoryConfig.php DirectorySync.php SubscriberConfig.php SubscriberService.php identity-libs/.htaccess identity-libs/composer.json identity-libs/composer.lock identity-libs/SLS_VENDOR_BASELINE.json identity-libs/SLS_VENDOR_PATCHES.json identity-libs/vendor/autoload.php portal/sso.php portal/subscriber.php \
   EnterpriseIntegrations.php EnterpriseIntegrationsConfig.php EnterpriseIntegrationsProvider.php EnterpriseIntegrationsService.php EnterpriseIntegrationsStore.php EnterprisePublicWarning.php views/integrations.php views/integrations.css views/integrations.js bin/sls_mass_notify/sls_mass_notify_incident_response.php \
   views/detected_phones.php bin/sls_mass_notify/sls_upgrade_trust.py bin/sls_mass_notify/freepbx-mirror-signing.pub \
-  module.xml Slsmassnotifyserver.class.php StatusHealth.php LocalWebProbe.php AdvertisedAddress.php EncryptedConfig.php AdminAudit.php OperationalBackup.php AnnouncementDelivery.php AnnouncementPreview.php SpeechRules.php DesktopFleet.php AnnouncementAdmission.php ScheduledDelivery.php SchedulePresentation.php ScheduleCalendar.php views/schedule_calendar.php UpdatePolicy.php DesktopCapacity.php PhoneEventService.php OutboundVoice.php AnnouncementEmail.php AnnouncementSms.php RecipientSelection.php TestProfiles.php SupportDiagnostics.php DeploymentReadiness.php DeploymentAcceptance.php DeviceAcceptance.php views/deployment_readiness.php views/device_acceptance.php views/device_acceptance.js Backup.php Restore.php install.php uninstall.php \
+  module.xml Slsmassnotifyserver.class.php ImmediateSettings.php InitializationJournal.php StatusHealth.php LocalWebProbe.php AdvertisedAddress.php EncryptedConfig.php AdminAudit.php OperationalBackup.php AnnouncementDelivery.php AnnouncementPreview.php SpeechRules.php DesktopFleet.php AnnouncementAdmission.php ScheduledDelivery.php SchedulePresentation.php ScheduleCalendar.php views/schedule_calendar.php UpdatePolicy.php DesktopCapacity.php PhoneEventService.php OutboundVoice.php AnnouncementEmail.php AnnouncementSms.php RecipientSelection.php TestProfiles.php SupportDiagnostics.php DeploymentReadiness.php DeploymentAcceptance.php DeviceAcceptance.php views/deployment_readiness.php views/device_acceptance.php views/device_acceptance.js Backup.php Restore.php install.php uninstall.php \
   views/outbound_voice.php views/recipient_selection.php views/announcement_email.php views/announcement_email_selector.php views/announcement_sms.php views/announcement_sms_selector.php \
   ApiCredentialManagement.php ApiPermissionGuards.php views/api_credentials.php api/sls-mass-notify/index.php api/sls-mass-notify/security.php api/sls-mass-notify/event-log.php api/sls-mass-notify/sms-callback.php api/sls-mass-notify/sms/Config.php api/sls-mass-notify/sms/Store.php api/sls-mass-notify/sms/Continuity.php api/sls-mass-notify/sms/Provider.php api/sls-mass-notify/sms/Service.php api/sls-mass-notify/sms/.htaccess api/sls-mass-notify/sms/vendor/twilio/RequestValidator.php api/sls-mass-notify/sms/vendor/twilio/Values.php api/sls-mass-notify/sms/vendor/twilio/LICENSE api/sls-mass-notify/sms/vendor/twilio/UPSTREAM.json \
   OperatorAuth.php OperatorPortal.php OperatorRecovery.php OperatorRecoveryService.php OperatorLoginRate.php SecurityAudit.php portal/index.php portal/.htaccess views/portal.css OperatorAccess.php Operators.php DeliveryAuthorization.php WeatherDeliveryReceipts.php page.slsmassnotifyserver_operations.php page.slsmassnotifyserver_operators.php views/operations.php views/operations.js views/operators.php views/operators.js views/operators.css \

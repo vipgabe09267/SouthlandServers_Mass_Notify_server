@@ -119,7 +119,18 @@
         if(saved&&programmeSelect.value!==saved.id){var option=document.createElement('option');option.value=saved.id;option.textContent=saved.name+' — unavailable; choose another source';option.dataset.missingProgramme='1';programmeSelect.appendChild(option);programmeSelect.value=saved.id;}
         chooseProgramme(saved&&saved.selected_types);toggle();
     }
-    function request(data){return fetch('config.php?display=slsmassnotifyserver_scheduling',{method:'POST',credentials:'same-origin',cache:'no-store',body:data}).then(function(response){return response.json().catch(function(){throw new Error(<?php echo json_encode(_('The PBX returned an unreadable calendar response. Reload the page and check the PHP error log. HTTP status:')); ?>+' '+response.status);}).then(function(body){if(!response.ok||!body.success)throw new Error(body.message||(body.errors||[]).join(' ')||<?php echo json_encode(_('Calendar review failed. Reload the page and try again.')); ?>);return body;});});}
+    async function request(data){
+        var signal=AbortSignal.timeout(20000);
+        try {
+            var response=await fetch('config.php?display=slsmassnotifyserver_scheduling',{method:'POST',credentials:'same-origin',cache:'no-store',body:data,signal:signal});
+            var body;
+            try {body=await response.json();}
+            catch(error){if(signal.aborted)throw error;throw new Error('The PBX returned an unreadable calendar response (HTTP '+response.status+'). Reload the page and check the PHP error log.');}
+            if(!response.ok||!body||body.success!==true)throw new Error(body&&body.message||(body&&Array.isArray(body.errors)?body.errors.join(' '):'')||'Calendar review failed. Reload the page and try again.');
+            return body;
+        } catch(error){if(signal.aborted)throw new Error('Calendar review exceeded 20 seconds. Try the review again. No schedule was saved or notification sent.');throw error;}
+    }
+
     function setBusy(value){busy=value;preview.disabled=value;importButton.disabled=value;panel.setAttribute('aria-busy',String(value));}
     function tokenData(action){var data=new FormData();data.set('slsmassnotifyserver_action',action);data.set('slsmassnotifyserver_csrf',form.querySelector('[name="slsmassnotifyserver_csrf"]').value);return data;}
     panel.addEventListener('input',function(){invalidate();serialize();});

@@ -19,6 +19,35 @@ if [ "${1:-}" = '--inspect' ]; then
   shift
 fi
 
+# Invocation modes are intentionally small and mutually exclusive.  Reject
+# misspelled flags and surplus arguments before any host inspection or package
+# operation.  Tests source this file to exercise individual helpers, so only an
+# executed installer owns and validates the caller's positional arguments.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  if [ -n "$REQUESTED_RECOVERY" ] && [ "${SLS_MASS_NOTIFY_INVENTORY_ONLY:-0}" = 1 ]; then
+    printf 'Use either --recover TRANSACTION or --inspect [TGZ_URL], not both.\n' >&2
+    exit 2
+  fi
+  if [ -n "$REQUESTED_RECOVERY" ]; then
+    [ "$#" -eq 0 ] || {
+      printf 'Usage: %s --recover /var/lib/sls-mass-notify-installer/transaction-ID\n' "$0" >&2
+      exit 2
+    }
+  else
+    [ "$#" -le 1 ] || {
+      printf 'Usage: %s [--inspect] [SIGNED_GITHUB_TGZ_URL]\n' "$0" >&2
+      exit 2
+    }
+    case "${1:-}" in
+      --*) printf 'Unknown installer option: %s\n' "$1" >&2; exit 2 ;;
+    esac
+    if [ "$#" -eq 1 ] && [ -n "${SLS_MASS_NOTIFY_TGZ_URL:-}" ]; then
+      printf 'Supply the release URL either as SLS_MASS_NOTIFY_TGZ_URL or as one positional argument, not both.\n' >&2
+      exit 2
+    fi
+  fi
+fi
+
 MODULE="slsmassnotifyserver"
 if [ -n "${SLS_MASS_NOTIFY_MODULE:-}" ] \
   && [ "${SLS_MASS_NOTIFY_MODULE}" != "$MODULE" ]; then
@@ -26,12 +55,12 @@ if [ -n "${SLS_MASS_NOTIFY_MODULE:-}" ] \
     "SLS_MASS_NOTIFY_MODULE is fixed to the FreePBX raw module name '$MODULE'; refusing an alternate value." >&2
   exit 2
 fi
-TGZ="${SLS_MASS_NOTIFY_TGZ:-/tmp/slsmassnotifyserver-0.1.6-beta.tgz}"
+TGZ="${SLS_MASS_NOTIFY_TGZ:-/tmp/slsmassnotifyserver-0.1.7-beta.tgz}"
 URL="${SLS_MASS_NOTIFY_TGZ_URL:-${1:-}}"
 SHA256="${SLS_MASS_NOTIFY_SHA256:-}"
 TOKEN="${SLS_MASS_NOTIFY_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
 LOG_FILE="${SLS_MASS_NOTIFY_INSTALL_LOG:-/tmp/slsmassnotifyserver-install.log}"
-EXPECTED_TGZ_SHA256="729948df8fbc54e5dae01c9b26cd714dc86ee11e42671a9a2fdfef0a07f159ca"
+EXPECTED_TGZ_SHA256="a516ec2f707caedba5f04d9613d3a4043265a2b10156a0dba1904b2934a78558"
 DATA_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin"
 CONFIG_FILE="$DATA_DIR/mass-notifications.config"
 CONFIG_SNAPSHOT=""
@@ -42,7 +71,6 @@ PENDING_CONFIG_STATE=""
 PENDING_CONFIG_PATH=""
 PENDING_CONFIG_SNAPSHOT=""
 PENDING_CONFIG_HASH=""
-CONFIG_LOCK_FD=""
 WORKER_LOCK_RESPONSE_FD=""
 SETTINGS_LOCK="$DATA_DIR/mass-notifications.config.lock"
 STAGING_DIR=""
@@ -91,14 +119,12 @@ FREEPBX_CHOWN_CONFIG="/etc/asterisk/freepbx_chown.conf"
 INSTALL_TRANSACTION_ROOT="/var/lib/sls-mass-notify-installer"
 INSTALL_TRANSACTION_DIR=""
 TRANSACTION_TOOL=""
-INSTALL_SIGNAL=""
 RECOVERY_REQUEST_MODE=0
 SERVED_PHP_PROFILES=""
 
 # A successful child exit does not turn an interrupted shell into a successful
 # installation. Recovery is coordinated by the parent, before locks are released.
 handle_install_signal() {
-  INSTALL_SIGNAL="$1"
   trap '' TERM INT HUP
   log "Installation interrupted by $1; preserving evidence and restoring the approved previous state."
   terminate_install_children
@@ -136,8 +162,38 @@ PYSIGNAL
 
 check_interrupted_installation() {
   /usr/bin/python3 -I - "$INSTALL_TRANSACTION_ROOT" <<'PYDISCOVER'
-import json, os, pathlib, stat, sys
+import json, math, os, pathlib, re, stat, sys, time
 root = pathlib.Path(sys.argv[1])
+FIELDS = {'RECOVERY_DIR', 'INSTALL_BOOTSTRAP_DIR', 'UPGRADE_TRUST_DIR',
+          'CONFIG_SNAPSHOT', 'CONFIG_HASH_BEFORE', 'PENDING_CONFIG_STATE',
+          'PENDING_CONFIG_PATH', 'PENDING_CONFIG_SNAPSHOT', 'PENDING_CONFIG_HASH',
+          'MODULE_BACKUP_DIR', 'STAGING_DIR', 'HAD_EXISTING_MODULE',
+          'MODULE_WAS_ENABLED', 'MODULE_ACTIVATED', 'STATIC_MUTATION_STARTED',
+          'ORIGINAL_SYSTEM_TIMEZONE', 'SYSTEM_TIMEZONE_CHANGED'}
+PHASES = {'preparing', 'prepared', 'mutating', 'recovering', 'recovery_failed',
+          'committed', 'rolled_back', 'abandoned'}
+STAGES = {'initialization', 'hardware admission', 'platform validation',
+          'release download and validation', 'publisher and stock approval',
+          'FreePBX ownership protection', 'legacy configuration and runtime permissions',
+          'authenticated prerequisite validation', 'previous phone collector recovery',
+          'notification worker coordination', 'configuration coordination',
+          'dependency installation', 'timezone validation', 'protected runtime preparation',
+          'module activation', 'runtime integration', 'post-install verification',
+          'interrupted installation recovery'}
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise RuntimeError('Duplicate transaction metadata member')
+        value[key] = item
+    return value
+def finite_float(text):
+    value = float(text)
+    if not math.isfinite(value):
+        raise RuntimeError('Nonfinite transaction metadata number')
+    return value
+def invalid_constant(text):
+    raise RuntimeError('Nonfinite transaction metadata number')
 if not root.exists() and not root.is_symlink(): raise SystemExit(0)
 fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
 try:
@@ -150,16 +206,58 @@ try:
     names = os.listdir(fd)
     if len(names) > 100: raise RuntimeError('Installer evidence needs administrator archival')
     for name in names:
+        if not re.fullmatch(r'transaction-[a-f0-9]{24}', name): raise RuntimeError('Unknown installer evidence directory')
         child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
         try:
             info = os.fstat(child)
             if info.st_uid != 0 or info.st_mode & 0o077: raise RuntimeError('Unsafe transaction evidence')
-            item = os.open('transaction.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=child)
-            with os.fdopen(item, 'rb') as stream:
-                info = os.fstat(stream.fileno())
-                if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > 65536: raise RuntimeError('Unsafe transaction journal')
-                value = json.loads(stream.read(65537))
-            if value.get('schema') != 1 or value.get('directory') != str(root / name): raise RuntimeError('Invalid transaction journal')
+            try:
+                item = os.open('transaction.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=child)
+            except FileNotFoundError:
+                if stat.S_IMODE(info.st_mode) != 0o700 or os.listdir(child):
+                    raise RuntimeError('Missing transaction metadata has unknown evidence; preserve it for review')
+                created=max(0,int(info.st_mtime))
+                value={'schema':1,'directory':str(root/name),'phase':'preparing','settings':{},
+                       'created_at':created,'updated_at':created,'empty_preparation':True}
+            else:
+                with os.fdopen(item, 'rb') as stream:
+                    info = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > 65536: raise RuntimeError('Unsafe transaction journal')
+                    value = json.loads(stream.read(65537), object_pairs_hook=unique_object,
+                                       parse_float=finite_float, parse_constant=invalid_constant)
+            if (type(value) is not dict or type(value.get('schema')) is not int or value.get('schema') != 1
+                    or type(value.get('directory')) is not str or value.get('directory') != str(root / name)
+                    or value.get('phase') not in PHASES
+                    or type(value.get('created_at')) is not int or value.get('created_at') < 0
+                    or type(value.get('updated_at')) is not int or value.get('updated_at') < value.get('created_at')
+                    or value.get('updated_at') > 2 ** 63 - 1
+                    or type(value.get('settings')) is not dict
+                    or set(value.get('settings', {})) - FIELDS):
+                raise RuntimeError('Invalid transaction journal')
+            for key, setting in value['settings'].items():
+                if (type(setting) is not str or len(setting) > 4096
+                        or any(ord(character) < 32 or ord(character) == 127 for character in setting)):
+                    raise RuntimeError('Invalid transaction journal setting: ' + key)
+            if (('stage' in value or 'stage_at' in value)
+                    and (value.get('stage') not in STAGES or type(value.get('stage_at')) is not int
+                         or not value['created_at'] <= value['stage_at'] <= value['updated_at'])):
+                raise RuntimeError('Invalid transaction journal stage')
+            if value.get('phase') == 'preparing':
+                settings=value.get('settings')
+                if not isinstance(settings,dict) or any(settings.get(key,'0') not in ('','0') for key in ('STATIC_MUTATION_STARTED','MODULE_ACTIVATED','SYSTEM_TIMEZONE_CHANGED')):
+                    raise RuntimeError('Preparation record claims a live mutation; preserve it for administrator review')
+                value['phase']='abandoned';value['updated_at']=max(int(time.time()),value.get('created_at',0),value.get('updated_at',0))
+                temporary='.new-'+os.urandom(12).hex()
+                record=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=child)
+                try:
+                    with os.fdopen(record,'wb') as output:
+                        output.write((json.dumps(value,sort_keys=True,separators=(',',':'))+'\n').encode())
+                        output.flush();os.fsync(output.fileno())
+                    os.replace(temporary,'transaction.json',src_dir_fd=child,dst_dir_fd=child);os.fsync(child)
+                finally:
+                    try:os.unlink(temporary,dir_fd=child)
+                    except FileNotFoundError:pass
+                print('Archived incomplete preparation; no SLS mutation had started. Evidence: '+str(root/name))
             if value.get('phase') not in ('committed', 'rolled_back', 'abandoned'):
                 print('An interrupted SLS installation requires recovery before retrying. Evidence: ' + str(root / name), file=sys.stderr)
                 print('Run the publisher-authenticated installer with --recover ' + str(root / name) + '; preserve this directory.', file=sys.stderr)
@@ -230,6 +328,8 @@ retain_configuration_snapshots() {
 
 recover_interrupted_installation() {
   local requested="$1" field i
+  acquire_update_coordination || return 1
+  acquire_maintenance_coordination || return 1
   # Verify saved programs before executing any of them. The durable journal is
   # a locator, not a new signing authority or a baseline of live installed files.
   /usr/bin/python3 -I - "$INSTALL_TRANSACTION_ROOT" "$requested" <<'PYRECOVERYAUTH' || return 1
@@ -271,6 +371,11 @@ with tarfile.open(path / 'package.tgz', 'r:gz') as archive:
         member = archive.getmember('slsmassnotifyserver/bin/sls_mass_notify/' + helper.name)
         if not member.isfile() or member.size > 2097152: raise RuntimeError('Unsafe authenticated recovery helper')
         if read(helper,2097152) != archive.extractfile(member).read(2097153): raise RuntimeError('Recovery helper does not match its signed package')
+transaction = json.loads(read(path / 'transaction.json', 65536))
+if (not isinstance(transaction, dict) or transaction.get('schema') != 1
+        or transaction.get('directory') != str(path)
+        or transaction.get('phase') not in ('prepared', 'mutating', 'recovering', 'recovery_failed')):
+    raise RuntimeError('Only an unfinished installation can supply operational recovery settings; completed evidence cannot be recovered again')
 print('Recovery programs authenticated. No live hashes were approved.')
 PYRECOVERYAUTH
   if [ "$INSTALLER_SOURCE_PATH" != "$requested/installer.sh" ]; then
@@ -289,8 +394,6 @@ PYRECOVERYAUTH
   RECOVERY_TOOL="$INSTALL_BOOTSTRAP_DIR/sls_installer_recovery.py"; IDLE_TOOL="$INSTALL_BOOTSTRAP_DIR/sls_install_idle.py"
   WORKER_GUARD_TOOL="$INSTALL_BOOTSTRAP_DIR/sls_install_guard.py"
   LEGACY_PERMISSION_TOOL="$INSTALL_BOOTSTRAP_DIR/sls_legacy_permissions.py"
-  acquire_update_coordination || return 1
-  acquire_maintenance_coordination || return 1
   INSTALL_LOG_FD=""; open_root_owned_file INSTALL_LOG_FD "$LOG_FILE" log || return 1
   INSTALL_LOG_OUTPUT="/proc/${BASHPID}/fd/$INSTALL_LOG_FD"
   # Signed recovery programs and their retained approvals were authenticated
@@ -317,7 +420,7 @@ sls_as_asterisk() {
   local uid
   uid="$(id -u asterisk 2>/dev/null)" || { log 'The asterisk service account is missing.'; return 1; }
   [[ "$uid" =~ ^[0-9]+$ ]] && [ "$uid" -ne 0 ] || { log 'The asterisk service account must have a nonzero UID.'; return 1; }
-  run_without_install_maintenance_lock /usr/sbin/runuser -u asterisk -- "$@"
+  run_without_install_maintenance_lock /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u asterisk -- "$@"
 }
 
 php() { sls_as_asterisk /usr/bin/php "$@"; }
@@ -457,6 +560,7 @@ PY
 preflight_authenticated_prerequisites() {
   run_logged /usr/bin/python3 -I "$PRIVILEGED_INSTALL_BOOTSTRAP" --trust-root "$UPGRADE_TRUST_DIR/registry" preflight || return 1
   /usr/bin/python3 -I "$RECOVERY_TOOL" --snapshot "$UPGRADE_TRUST_DIR/service-preview" preflight-services || return 1
+  /usr/bin/python3 -I "$RECOVERY_TOOL" --snapshot "$UPGRADE_TRUST_DIR/static-preview" preflight-inventory || return 1
 }
 
 repair_authenticated_legacy_permissions() {
@@ -695,9 +799,26 @@ log() {
 
 run_logged() {
   local output status
-  if output="$("$@" 2>&1)"; then status=0; else status=$?; fi
-  [ -z "$output" ] || log "$output"
-  return "$status"
+  local -a pipeline_status=()
+  # Stream child output instead of retaining it in a shell variable. Package
+  # managers and FreePBX repair commands can be verbose, and buffering their
+  # complete output makes a recoverable host problem an installer memory spike.
+  if "$@" 2>&1 | while IFS= read -r output || [ -n "$output" ]; do
+    printf '%s\n' "$output"
+    if [ -n "${INSTALL_LOG_FD:-}" ]; then
+      printf '%s\n' "$output" >&"$INSTALL_LOG_FD"
+    fi
+  done; then
+    return 0
+  else
+    pipeline_status=("${PIPESTATUS[@]}")
+    status="${pipeline_status[0]:-1}"
+    # A log/console write failure is also fatal even if the child succeeded.
+    if [ "$status" -eq 0 ]; then
+      status="${pipeline_status[1]:-1}"
+    fi
+    return "$status"
+  fi
 }
 
 set_install_stage() {
@@ -725,25 +846,35 @@ import pwd
 import stat
 
 path = os.environ["DATA_DIRECTORY_PATH"]
-parts = [part for part in path.split("/") if part]
-if not path.startswith("/") or not parts or "\x00" in path:
+parts = path.split("/")[1:]
+if not path.startswith("/") or not parts or any(part in {'', '.', '..'} for part in parts) or "\x00" in path:
     raise SystemExit(2)
-flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+account = pwd.getpwnam("asterisk")
+owners = {0, account.pw_uid}
+groups = {0, account.pw_gid}
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
 parent_fd = os.open("/", flags)
 try:
     for component in parts[:-1]:
         next_fd = os.open(component, flags, dir_fd=parent_fd)
         os.close(parent_fd)
         parent_fd = next_fd
+        metadata = os.fstat(parent_fd)
+        sticky_root = metadata.st_uid == 0 and bool(metadata.st_mode & stat.S_ISVTX)
+        if metadata.st_uid not in owners or metadata.st_gid not in groups or (metadata.st_mode & 0o022 and not sticky_root):
+            raise RuntimeError('The SLS data directory has an unreviewed parent; no ownership was changed')
     try:
         directory_fd = os.open(parts[-1], flags, dir_fd=parent_fd)
     except FileNotFoundError:
         os.mkdir(parts[-1], 0o750, dir_fd=parent_fd)
         directory_fd = os.open(parts[-1], flags, dir_fd=parent_fd)
     try:
-        if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
-            raise SystemExit(3)
-        account = pwd.getpwnam("asterisk")
+        metadata = os.fstat(directory_fd)
+        named = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid not in owners
+                or metadata.st_gid not in groups or stat.S_IMODE(metadata.st_mode) not in (0o700, 0o750, 0o755)
+                or (metadata.st_dev, metadata.st_ino) != (named.st_dev, named.st_ino)):
+            raise RuntimeError('The existing SLS data directory has unreviewed ownership or permissions; preserve it for review')
         os.fchmod(directory_fd, 0o750)
         os.fchown(directory_fd, account.pw_uid, account.pw_gid)
     finally:
@@ -1080,9 +1211,14 @@ try {
         $marks = implode(",", array_fill(0, count($row), "?"));
         $db->prepare("INSERT INTO modules (" . $columns . ") VALUES (" . $marks . ")")->execute(array_values($row));
     }
-    $lookup = $db->prepare("SELECT * FROM recordings WHERE filename = ? ORDER BY id");
-    $delete = $db->prepare("DELETE FROM recordings WHERE filename = ?");
-    foreach ($data["recordings"] as $filename => $rows) {
+    $exists = $db->prepare("SHOW TABLES LIKE ?"); $exists->execute(["recordings"]);
+    $recordingsPresent = (bool)$exists->fetchColumn();
+    if (!$recordingsPresent && array_filter($data["recordings"])) { throw new \RuntimeException("Saved System Recordings cannot be restored because their table is unavailable"); }
+    if ($recordingsPresent) {
+        $lookup = $db->prepare("SELECT * FROM recordings WHERE filename = ? ORDER BY id");
+        $delete = $db->prepare("DELETE FROM recordings WHERE filename = ?");
+    }
+    foreach ($recordingsPresent ? $data["recordings"] : [] as $filename => $rows) {
         $lookup->execute([$filename]);
         $current = $lookup->fetchAll(\PDO::FETCH_ASSOC);
         if ($current === $rows) { continue; }
@@ -1104,6 +1240,7 @@ try {
     }
     $db->commit();
 } catch (\Throwable $error) { if ($db->inTransaction()) { $db->rollBack(); } throw $error; }
+if (!$data["backup_enrollment"]) { exit(0); }
 $backup = \FreePBX::Create()->Backup;
 $jobs = (array)$backup->getAll("backupList");
 foreach ($data["backup_enrollment"] as $entry) {
@@ -1182,6 +1319,7 @@ rollback_module_install() {
   /usr/bin/python3 -I "$RECOVERY_TOOL" --snapshot "$RECOVERY_DIR/static" restore-services >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 \
     || rollback_failure "the prior collector/Apache process state could not be restored safely"
   restore_module_registration || rollback_failure "the original module registration and Dashboard hook index could not be restored"
+  refresh_served_php_workers || rollback_failure "the restored PHP-FPM serving processes could not be refreshed safely"
   /usr/bin/python3 -I "$RECOVERY_TOOL" --snapshot "$RECOVERY_DIR/static" verify >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 \
     || rollback_failure "restored static integration differs from its preserved snapshot"
   if [ "$HAD_EXISTING_MODULE" -eq 1 ] && [ "$ROLLBACK_FAILED" -eq 0 ]; then
@@ -1405,7 +1543,7 @@ set_system_timezone() {
 }
 
 configure_system_timezone() {
-  local detected_timezone requested_timezone response confirmed_timezone
+  local detected_timezone requested_timezone confirmed_timezone
 
   detected_timezone="$(detect_system_timezone 2>/dev/null || true)"
   [ -n "$detected_timezone" ] || {
@@ -1533,7 +1671,12 @@ exit(0);
     log "FreePBX bootstrap or database access failed. See $LOG_FILE."
     exit 1
   }
-  fwconsole --version 2>/dev/null | grep -Eq '(^|[[:space:]])17\.' || {
+  local freepbx_version
+  freepbx_version="$(fwconsole --version 2>/dev/null)" || {
+    log "FreePBX could not report its version. Resolve that CLI failure before installing."
+    exit 1
+  }
+  grep -Eq '(^|[[:space:]])17\.' <<<"$freepbx_version" || {
     log "This release requires FreePBX 17."
     exit 1
   }
@@ -1670,7 +1813,7 @@ ensure_freepbx_prerequisites() {
   local prerequisite module_list
   module_list="$(fwconsole ma list 2>/dev/null)"
   for prerequisite in framework dashboard backup recordings; do
-    if ! printf '%s\n' "$module_list" | grep -Eq "\\|[[:space:]]*${prerequisite}[[:space:]]*\\|"; then
+    if ! grep -Eq "\\|[[:space:]]*${prerequisite}[[:space:]]*\\|" <<< "$module_list"; then
       log "Installing required FreePBX module: $prerequisite"
       fwconsole ma --no-interaction --ignorecache downloadinstall "$prerequisite" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || {
         log "Required FreePBX module could not be installed: $prerequisite. See $LOG_FILE."
@@ -1678,7 +1821,7 @@ ensure_freepbx_prerequisites() {
       }
     fi
     module_list="$(fwconsole ma list 2>/dev/null)"
-    if ! printf '%s\n' "$module_list" | grep -Eq "\\|[[:space:]]*${prerequisite}[[:space:]]*\\|[^|]*\\|[[:space:]]*Enabled[[:space:]]*\\|"; then
+    if ! grep -Eq "\\|[[:space:]]*${prerequisite}[[:space:]]*\\|[^|]*\\|[[:space:]]*Enabled[[:space:]]*\\|" <<< "$module_list"; then
       log "Enabling required FreePBX module: $prerequisite"
       fwconsole ma --no-interaction enable "$prerequisite" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || {
         log "Required FreePBX module could not be enabled without an administrator-managed upgrade: $prerequisite. See $LOG_FILE."
@@ -2011,23 +2154,148 @@ asterisk_module_starts_persistently() {
   local module_name="$1"
   local modules_config="${2:-/etc/asterisk/modules.conf}"
   [ -r "$modules_config" ] || return 1
-  /usr/bin/awk -v wanted="${module_name,,}" '
-    BEGIN { autoload = 0; explicit = 0; blocked = 0; modules = 0 }
-    {
-      line = $0
-      sub(/[;#].*$/, "", line)
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
-      if (line ~ /^\[/) { modules = (tolower(line) == "[modules]"); next }
-      if (!modules) next
-      split(line, fields, /[[:space:]]*=>?[[:space:]]*/)
-      key = tolower(fields[1])
-      value = tolower(fields[2])
-      if (key == "autoload" && value == "yes") autoload = 1
-      if ((key == "load" || key == "preload" || key == "require" || key == "preload-require") && value == wanted) explicit = 1
-      if (key == "noload" && value == wanted) blocked = 1
-    }
-    END { exit(blocked || (!autoload && !explicit) ? 1 : 0) }
-  ' "$modules_config"
+  /usr/bin/python3 -I - "$module_name" "$modules_config" <<'PYASTERISKSTART'
+import glob
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+wanted = sys.argv[1].lower().removesuffix('.so')
+base = Path(sys.argv[2]).absolute().parent
+categories = []
+current = None
+opened_files = 0
+read_bytes = 0
+row_count = 0
+stack = []
+
+def read_file(path):
+    global current, opened_files, read_bytes, row_count
+    if len(stack) >= 10 or path in stack:
+        raise ValueError('include cycle or depth limit')
+    opened_files += 1
+    if opened_files > 128:
+        raise ValueError('include file limit')
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 1048576:
+            raise ValueError('nonregular or oversized configuration')
+        with os.fdopen(fd, 'rb') as stream:
+            fd = -1
+            raw = stream.read(1048577)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    read_bytes += len(raw)
+    if read_bytes > 2097152:
+        raise ValueError('aggregate configuration limit')
+    text = raw.decode('utf-8')
+    stack.append(path)
+    comment_depth = 0
+    try:
+        for source in text.splitlines():
+            if len(source) > 4096:
+                raise ValueError('configuration line limit')
+            line = ''
+            index = 0
+            while index < len(source):
+                if source.startswith(';--', index):
+                    comment_depth += 1
+                    if comment_depth > 128:
+                        raise ValueError('nested comment limit')
+                    index += 3
+                elif comment_depth and source.startswith('--;', index):
+                    comment_depth -= 1
+                    index += 3
+                elif comment_depth:
+                    index += 1
+                elif source[index] == ';' and (index == 0 or source[index-1] != '\\'):
+                    break
+                else:
+                    line += source[index]
+                    index += 1
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('#'):
+                directive = re.fullmatch(r'#(include|tryinclude)\s+(.+)', line, re.I)
+                if not directive:
+                    raise ValueError('unsupported directive; #exec is never executed by this check')
+                name = directive[2].strip()
+                if name[0] in ('"', '<'):
+                    end = '"' if name[0] == '"' else '>'
+                    if not name.endswith(end):
+                        raise ValueError('malformed include')
+                    name = name[1:-1]
+                target = Path(name)
+                if not target.is_absolute():
+                    target = base / target
+                matches = []
+                for match in glob.iglob(str(target)):
+                    matches.append(match)
+                    if len(matches) > 128:
+                        raise ValueError('include match limit')
+                matches.sort()
+                if not matches and directive[1].lower() == 'include':
+                    raise ValueError('required include is missing')
+                for match in matches:
+                    read_file(Path(match).absolute())
+                continue
+            if line.startswith('['):
+                section = re.fullmatch(r'\[([^]\x00-\x1f]{1,79})\]\s*(?:\(([^()]*)\))?', line)
+                if not section:
+                    raise ValueError('unsupported category syntax')
+                name = section[1].lower()
+                modifiers = [part.strip().lower() for part in (section[2] or '').split(',') if part.strip()]
+                if '+' in modifiers:
+                    if modifiers != ['+']:
+                        raise ValueError('unsupported category append')
+                    current = next((cat for cat in categories if cat['name'] == name and not cat['ignored']), None)
+                    if current is None:
+                        raise ValueError('appended category is missing')
+                else:
+                    current = {'name': name, 'ignored': '!' in modifiers, 'rows': []}
+                    for template in modifiers:
+                        if template == '!':
+                            continue
+                        inherited = next((cat for cat in categories if cat['name'] == template), None)
+                        if inherited is None:
+                            raise ValueError('inherited category is missing')
+                        current['rows'].extend(inherited['rows'])
+                    categories.append(current)
+                    if len(categories) > 4096:
+                        raise ValueError('category limit')
+                continue
+            entry = re.fullmatch(r'([^=+]+?)\s*=>(.*)|([^=+]+?)\s*=(.*)', line)
+            if entry is None or current is None:
+                raise ValueError('unsupported setting or missing category')
+            key, value = (entry[1], entry[2]) if entry[1] else (entry[3], entry[4])
+            current['rows'].append((key.strip().lower(), value.strip().lower()))
+            row_count += 1
+            if row_count > 100000:
+                raise ValueError('setting limit')
+        if comment_depth:
+            raise ValueError('unterminated block comment')
+    finally:
+        stack.pop()
+
+try:
+    read_file(Path(sys.argv[2]).absolute())
+    modules = []
+    for category in categories:
+        if category['name'] == 'modules' and not category['ignored']:
+            modules.extend(category['rows'])
+    autoload = next((value for key, value in reversed(modules) if key == 'autoload'), 'no') in ('yes', 'true', 'y', 't', '1', 'on')
+    blocked = any(key == 'noload' and value.removesuffix('.so') == wanted for key, value in modules)
+    explicit = any(key in ('load', 'preload', 'require', 'preload-require') and value.removesuffix('.so') == wanted for key, value in modules)
+    sys.exit(1 if blocked or not (autoload or explicit) else 0)
+except (OSError, ValueError, UnicodeError) as error:
+    print('Asterisk startup configuration could not be qualified: ' + str(error)[:200] + '. Review modules.conf and its includes; no configuration was changed.', file=sys.stderr)
+    sys.exit(2)
+PYASTERISKSTART
 }
 
 verify_asterisk_module_startup_persistence() {
@@ -2037,7 +2305,8 @@ verify_asterisk_module_startup_persistence() {
     pbx_spool.so format_wav.so res_pjsip_header_funcs.so \
     func_pjsip_contact.so func_pjsip_aor.so func_strings.so func_channel.so \
     func_logic.so func_db.so func_callerid.so app_exec.so \
-    app_page.so app_confbridge.so app_stack.so app_verbose.so; do
+    app_page.so app_confbridge.so app_stack.so app_verbose.so \
+    res_agi.so app_read.so app_playback.so; do
     asterisk_module_starts_persistently "$module_name" || {
       log "Required Asterisk module is available now but is blocked after restart by /etc/asterisk/modules.conf: $module_name"
       log "Enable Asterisk module autoloading or explicitly load that module through the PBX-managed module configuration, then rerun the installer."
@@ -2271,7 +2540,13 @@ for extension, details in sorted(inventory.items()):
         raise SystemExit(f"endpoint {extension} has no registered contacts")
     if phone_format not in supported_formats or any(value not in supported_formats for value in normalized_formats):
         raise SystemExit(f"endpoint {extension} has an unsupported phone format")
-    user_agent = " ".join(str(details.get("user_agent") or "").replace("\t", " ").split())[:300]
+    raw_user_agent = str(details.get("user_agent") or "")
+    # AMI values originate at handsets. Keep terminal controls, bidi marks,
+    # and other non-ASCII bytes out of root's console and installer log.
+    user_agent = " ".join("".join(
+        character if 0x20 <= ord(character) <= 0x7e else "?"
+        for character in raw_user_agent
+    ).split())[:300]
     unique_formats = sorted(set(normalized_formats))
     unknown = "1" if phone_format == "unknown" or "unknown" in unique_formats else "0"
     mixed = "1" if len(unique_formats) > 1 else "0"
@@ -2305,8 +2580,10 @@ transport retains its separate stream limit and requires JSON-poll fallback.
 """
 import argparse
 import json
+import math
 import os
 from pathlib import Path
+import pwd
 
 import re
 import stat
@@ -2391,7 +2668,7 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
     size = lambda name: int(measured.get(name, {}).get('allocated_bytes', 0))
     recovery_size = lambda name: max(size(name), int(measured.get(name, {}).get('logical_bytes', 0)))
     unit = lambda path: max(4096, int(units.get(path, 4096)))
-    # Accepted releases contain at most2000 entries and50MiB regular-file data.
+    # Accepted releases contain at most 2,000 entries and 50 MiB of regular-file data.
     payloads = payloads or {}
     payload = lambda path: (int(payloads[path]['bytes']) + int(payloads[path]['entries']) * unit(path)
                             if path in payloads else 50 * MIB + 2000 * unit(path))
@@ -2402,8 +2679,9 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
     model_temporary = rounded(max(VOICE_BYTES.values()), unit(voices))
     if missing_voices is None:
         missing_voices = voice_total
-    # Phone/Weather 16 MiB; encrypted configuration 3 MiB; schedule reserve at least its10MiB backup
-    #limit or its actual size. Up to25 queued jobs may write2MiB records.
+    # Phone and weather state reserve 16 MiB each; encrypted configuration
+    # reserves 3 MiB; schedules reserve at least their 10 MiB backup limit or
+    # their actual size. Up to 25 queued jobs may write 2 MiB records.
     atomic_state = sum(max(limit * MIB, size(name)) for name, limit in
                        (('phone_ledger', 16), ('weather_ledger', 16), ('schedule_ledger', 10), ('config', 3))) + 25 * 2 * MIB
     # Retain 20 encrypted configuration backups, each bounded to 3 MiB.
@@ -2424,12 +2702,12 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
         data: {'bounded_atomic_state_writes': atomic_state},
         MANAGED_TREES['config_backups']: {'remaining_bounded_config_backups': backup_growth},
         MANAGED_TREES['module']: {'new_module_payload': payload(MANAGED_TREES['module'])},
-        #Independent target mounts each need room for a legal package payload.
+        # Independent target mounts each need room for a legal package payload.
         MANAGED_TREES['web']: {'public_asset_payload': payload(MANAGED_TREES['web'])},
         MANAGED_TREES['sip_api']: {'sip_api_payload': payload(MANAGED_TREES['sip_api'])},
         MANAGED_TREES['control_api']: {'control_api_payload': payload(MANAGED_TREES['control_api'])},
         MANAGED_TREES['operator_portal']: {'operator_portal_payload': payload(MANAGED_TREES['operator_portal'])},
-        #Maintenance compacts logs sequentially, using backup+retained temporary.
+        # Maintenance compacts logs sequentially, using backup and retained temporary files.
         '/var/log': {'event_log_backup_and_retained_copy': 2 * 64 * MIB},
         '/var/lib/sls-mass-notify-trust': {'new_authenticated_generation': payload('/var/lib/sls-mass-notify-trust'),
                                          'stock_and_release_manifests': 8 * MIB},
@@ -2504,9 +2782,11 @@ def measure_tree(path, deadline, maximum_entries=50000, *, cache=None):
     """Metadata only, without following directory/file links or printing names."""
     result = {'allocated_bytes': 0, 'logical_bytes': 0, 'files': 0, 'directories': 0, 'largest_file_bytes': 0}
     root = Path(path)
-    if not root.exists():
+    try:
+        root_metadata = root.lstat()
+    except FileNotFoundError:
         return result
-    if root.is_symlink() or not root.is_dir():
+    if not stat.S_ISDIR(root_metadata.st_mode):
         raise ValueError('An SLS storage root is not a real directory')
     cache = {} if cache is None else cache
     if str(root) in cache: return dict(cache[str(root)])
@@ -2816,23 +3096,59 @@ def configured_limits(path):
     path = Path(path)
     if not path.is_absolute() or '..' in path.parts:
         raise ValueError('Configuration path must be absolute')
+    account = pwd.getpwnam('asterisk')
+    allowed_owners = {0, account.pw_uid}
+    allowed_groups = {0, account.pw_gid}
     parent = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         for component in path.parts[1:-1]:
             child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
             os.close(parent)
             parent = child
+            info = os.fstat(parent)
+            sticky_root = info.st_uid == 0 and bool(info.st_mode & stat.S_ISVTX)
+            if (info.st_uid not in allowed_owners or info.st_gid not in allowed_groups
+                    or info.st_mode & 0o002 and not sticky_root
+                    or info.st_mode & 0o020 and info.st_gid != account.pw_gid and not sticky_root):
+                raise ValueError('Configuration parent ownership or permissions are unsafe')
         descriptor = os.open(path.name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent)
     finally:
         os.close(parent)
     with os.fdopen(descriptor, 'rb') as handle:
         metadata = os.fstat(handle.fileno())
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > 16 * 1024 * 1024:
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                or metadata.st_uid not in allowed_owners or metadata.st_gid not in allowed_groups
+                or metadata.st_mode & 0o022 or metadata.st_size > 16 * 1024 * 1024):
             raise ValueError('Configuration is not a bounded private regular file')
         raw = handle.read(16 * 1024 * 1024 + 1)
+        after = os.fstat(handle.fileno())
+        if (len(raw) != metadata.st_size
+                or (metadata.st_ino, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
+                != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+            raise ValueError('Configuration changed during inspection')
     if len(raw) > 16 * 1024 * 1024:
         raise ValueError('Configuration exceeded its size limit')
-    value = json.loads(raw)
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError('Configuration contains duplicate JSON members')
+            result[key] = value
+        return result
+
+    def finite_float(text):
+        value = float(text)
+        if not math.isfinite(value):
+            raise ValueError('Configuration contains a nonfinite number')
+        return value
+
+    def invalid_constant(text):
+        raise ValueError('Configuration contains a nonfinite number')
+
+    try:
+        value = json.loads(raw, object_pairs_hook=pairs, parse_float=finite_float, parse_constant=invalid_constant)
+    except RecursionError:
+        raise ValueError('Configuration exceeds JSON nesting limits') from None
     if isinstance(value, dict) and any(field in value for field in ('format', 'ciphertext', 'key_id', 'nonce')):
         if value.get('format') != 'sls-mass-notify-config-aes256gcm-v1':
             raise ValueError('The protected configuration encryption format is unsupported or damaged')
@@ -3229,7 +3545,7 @@ preflight_platform() {
   local apache_module apache_modules utility
   # Runtime and dialplan paths are conventional FreePBX paths. Detect a
   # relocated installation explicitly instead of creating a second, unused tree.
-  /usr/bin/timeout 20 /usr/sbin/runuser -u asterisk -- /usr/bin/php <<'PHP' || {
+  /usr/bin/timeout 20 /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u asterisk -- /usr/bin/php <<'PHP' || {
 <?php
 require '/etc/freepbx.conf';
 $expected = ['AMPWEBROOT'=>'/var/www/html', 'ASTETCDIR'=>'/etc/asterisk',
@@ -3272,7 +3588,7 @@ PHP
   }
   apache_modules="$(/usr/sbin/apache2ctl -M 2>/dev/null)"
   for apache_module in rewrite_module setenvif_module; do
-    printf '%s\n' "$apache_modules" | grep -Fq "$apache_module" || {
+    grep -Fq "$apache_module" <<<"$apache_modules" || {
       log "Required Apache module is not loaded: $apache_module"
       exit 1
     }
@@ -3328,41 +3644,52 @@ account = pwd.getpwnam('asterisk')
 flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 parent = os.open('/', flags)
 handles = []
+def safe(info, owners, groups, writable_mask):
+    return (stat.S_ISDIR(info.st_mode) and info.st_uid in owners and
+            info.st_gid in groups and not info.st_mode & (0o7000 | writable_mask))
 try:
     for part in ('var', 'spool', 'asterisk'):
         child = os.open(part, flags, dir_fd=parent)
         os.close(parent); parent = child
         info = os.fstat(parent)
         allowed = (0, account.pw_uid) if part == 'asterisk' else (0,)
-        if info.st_uid not in allowed or part != 'asterisk' and info.st_mode & 0o022:
+        groups = (0, account.pw_gid) if part == 'asterisk' else (0,)
+        if not safe(info, allowed, groups, 0o002 if part == 'asterisk' else 0o022):
             raise RuntimeError('Unsafe Asterisk spool parent; no spool permissions were changed')
     for name, mode in (('tmp', 0o775), ('outgoing', 0o775), ('outgoing_done', 0o750)):
         try: child = os.open(name, flags, dir_fd=parent)
         except FileNotFoundError:
-            os.mkdir(name, 0o750, dir_fd=parent)
-            child = os.open(name, flags, dir_fd=parent)
+            handles.append((name, None, mode))
+            continue
         handles.append((name, child, mode))
         info = os.fstat(child)
         current = os.stat(name, dir_fd=parent, follow_symlinks=False)
-        if info.st_uid not in (0, account.pw_uid) or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):
-            raise RuntimeError('Unsafe Asterisk spool directory; no spool permissions were changed')
+        if not safe(info, (0, account.pw_uid), (0, account.pw_gid), 0o002) or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):
+            raise RuntimeError('Unsafe Asterisk spool directory ownership or permissions; review the directory before retrying. No spool permissions were changed')
     # Validate all existing destinations before applying any permission repair.
+    for index, (name, child, mode) in enumerate(handles):
+        if child is None:
+            os.mkdir(name, 0o750, dir_fd=parent)
+            child = os.open(name, flags, dir_fd=parent)
+            handles[index] = (name, child, mode)
     for name, child, mode in handles:
         current = os.stat(name, dir_fd=parent, follow_symlinks=False)
         info = os.fstat(child)
-        if (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):
+        if not safe(info, (0, account.pw_uid), (0, account.pw_gid), 0o002) or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):
             raise RuntimeError('Asterisk spool directory changed during preparation')
+    for name, child, mode in handles:
         os.fchown(child, account.pw_uid, account.pw_gid)
         os.fchmod(child, mode)
 finally:
-    for _, child, _ in handles: os.close(child)
+    for _, child, _ in handles:
+        if child is not None: os.close(child)
     os.close(parent)
 PYSPOOL
 }
 
 validate_piper_wrapper_ownership() {
   local wrapper="${1:-/usr/local/bin/piper}"
-  local target
+  local target wrapper_uid wrapper_gid wrapper_links wrapper_size wrapper_mode wrapper_permissions wrapper_hash
   if [ ! -e "$wrapper" ] && [ ! -L "$wrapper" ]; then
     return 0
   fi
@@ -3370,11 +3697,39 @@ validate_piper_wrapper_ownership() {
     target="$(readlink "$wrapper" 2>/dev/null || true)"
     case "$target" in
       /usr/local/bin/sls_mass_notify/piper/venv/bin/piper|/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/venv/bin/piper)
+        if [ "$wrapper" = /usr/local/bin/piper ] \
+          && [ "$(stat -c '%u:%g:%h' -- "$wrapper" 2>/dev/null || true)" != "0:0:1" ]; then
+          log "$wrapper has unsafe ownership or link metadata. SLS Mass Notify did not replace it."
+          return 1
+        fi
         return 0
         ;;
     esac
-  elif [ -f "$wrapper" ] && grep -Eq 'sls_mass_notify/piper|SLS_Mass_Notifications_Plugin/piper' "$wrapper" 2>/dev/null; then
-    return 0
+  elif [ -f "$wrapper" ]; then
+    IFS=: read -r wrapper_uid wrapper_gid wrapper_links wrapper_size wrapper_mode \
+      <<<"$(stat -c '%u:%g:%h:%s:%a' -- "$wrapper" 2>/dev/null || true)"
+    [[ "$wrapper_uid" =~ ^[0-9]+$ && "$wrapper_gid" =~ ^[0-9]+$ \
+      && "$wrapper_links" = 1 && "$wrapper_size" =~ ^[0-9]+$ \
+      && "$wrapper_size" -le 16384 && "$wrapper_mode" =~ ^[0-7]{3,4}$ ]] || {
+      log "$wrapper has unsafe ownership, link count, size, or permissions. SLS Mass Notify did not replace it."
+      return 1
+    }
+    wrapper_permissions=$((8#$wrapper_mode))
+    if (( (wrapper_permissions & 07022) != 0 )); then
+      log "$wrapper has unsafe permissions. SLS Mass Notify did not replace it."
+      return 1
+    fi
+    if [ "$wrapper" = /usr/local/bin/piper ] && { [ "$wrapper_uid" -ne 0 ] || [ "$wrapper_gid" -ne 0 ]; }; then
+      log "$wrapper is not owned by root:root. SLS Mass Notify did not replace it."
+      return 1
+    fi
+    wrapper_hash="$(/usr/bin/sha256sum -- "$wrapper" 2>/dev/null || true)"
+    wrapper_hash="${wrapper_hash%% *}"
+    case "$wrapper_hash" in
+      a2f9671cb1f69acc055a88f58b9fb610578f5efea43a047938b16ed8634f4d56|97792a8e4ca9f3f48be0be0c24202921008807da030ac85438b58034f21130e4|4c6c0dfe69c1b59b8650c0c5a9d38adf5a9c6cbe311c283a929a7fc5580015c0)
+        return 0
+        ;;
+    esac
   fi
   log "$wrapper already belongs to another application. SLS Mass Notify did not overwrite it."
   log "Move or rename that wrapper explicitly, then rerun the installer if SLS should own the compatibility path."
@@ -3475,10 +3830,10 @@ install_dependencies() {
       add_missing_package php-curl
       add_missing_package php-xml
     fi
-    local served_profile served_version served_sapi served_package
+    local served_profile served_version served_package
     while IFS= read -r served_profile; do
       [ -n "$served_profile" ] || continue
-      served_version="${served_profile%:*}"; served_sapi="${served_profile#*:}"
+      served_version="${served_profile%:*}"
       for served_package in cli common sqlite3 curl xml mbstring; do
         dpkg-query -W -f='${Status}' "php${served_version}-${served_package}" 2>/dev/null | grep -Fqx 'install ok installed' \
           || add_missing_package "php${served_version}-${served_package}"
@@ -3553,10 +3908,10 @@ install_dependencies() {
     }
   done
   if [ "$STATIC_MUTATION_STARTED" -eq 1 ] && [ "$FREEPBX_CONFIRMED" -eq 1 ]; then
-  systemctl is-active --quiet cron || {
-    log 'Starting the stock cron scheduler after authenticated upgrade approval.'
-    systemctl start cron || { log 'The stock cron scheduler could not start; no module activation was attempted.'; return 1; }
-  }
+    systemctl is-active --quiet cron || {
+      log 'Starting the stock cron scheduler after authenticated upgrade approval.'
+      systemctl start cron || { log 'The stock cron scheduler could not start; no module activation was attempted.'; return 1; }
+    }
   fi
 }
 
@@ -3746,6 +4101,28 @@ if ($missing) { fwrite(STDERR,"Served PHP configuration missing: ".implode(", ",
   done <<<"$SERVED_PHP_PROFILES"
 }
 
+refresh_served_php_workers() {
+  local profile version sapi unit
+  local -A units=()
+  [ -n "$SERVED_PHP_PROFILES" ] || detect_served_php_profiles || return 1
+  # Validate the complete set before any service action. Apache is refreshed by
+  # protected activation/recovery; a separate FPM master has its own opcode cache.
+  while IFS= read -r profile; do
+    [[ "$profile" =~ ^[0-9]{1,2}\.[0-9]{1,2}:(apache2|fpm)$ ]] || {
+      log 'The served PHP profile is invalid; no PHP-FPM service was reloaded.'
+      return 1
+    }
+    version="${profile%:*}"; sapi="${profile#*:}"
+    [ "$sapi" != fpm ] || units["php${version}-fpm"]=1
+  done <<<"$SERVED_PHP_PROFILES"
+  for unit in "${!units[@]}"; do
+    /usr/bin/timeout --signal=TERM --kill-after=5 25 /usr/bin/systemctl reload "$unit" || {
+      log "The qualified PHP-FPM service $unit could not reload. Review its service journal; old cached PHP may still be served. SLS will not restart Asterisk or change PHP settings."
+      return 1
+    }
+  done
+}
+
 fetch_release_asset() {
   SLS_ASSET_URL="$1" SLS_ASSET_OUTPUT="$2" SLS_ASSET_LIMIT="$3" SLS_ASSET_TOKEN="$TOKEN" /usr/bin/timeout --signal=TERM --kill-after=5 905 /usr/bin/python3 -I - <<'PY'
 import os
@@ -3867,6 +4244,11 @@ PYASSET
 
 download_tgz() {
   local original_tgz="$TGZ"
+  if [ -n "$URL" ]; then
+    TGZ_REQUEST_BASENAME="${URL##*/}"
+  else
+    TGZ_REQUEST_BASENAME="$(basename -- "$original_tgz")"
+  fi
   DOWNLOAD_DIR="$(mktemp -d "$INSTALL_TEMP_ROOT/sls-mass-notify-download.XXXXXX")" || return 1
   if [ -n "$URL" ]; then
     TGZ="$DOWNLOAD_DIR/package.tgz"
@@ -3884,11 +4266,19 @@ download_tgz() {
 }
 
 verify_tgz() {
-  actual_sha="$(sha256sum "$TGZ" | awk '{print $1}')"
+  local requested_basename="${TGZ_REQUEST_BASENAME:-$(basename -- "$TGZ")}"
+  actual_sha="$(sha256sum -- "$TGZ" | awk '{print $1}')"
   if [ -n "$SHA256" ]; then
-    echo "$SHA256  $TGZ" | sha256sum -c -
-  elif [ "$(basename "$TGZ")" = "slsmassnotifyserver-0.1.6-beta.tgz" ] && [ "$actual_sha" != "$EXPECTED_TGZ_SHA256" ]; then
-		log "$TGZ does not match the current slsmassnotifyserver-0.1.6-beta package."
+    if [[ ! "$SHA256" =~ ^[[:xdigit:]]{64}$ ]]; then
+      log 'SLS_MASS_NOTIFY_SHA256 must contain exactly 64 hexadecimal characters.'
+      return 1
+    fi
+    if [ "${SHA256,,}" != "$actual_sha" ]; then
+      log 'The release archive does not match the explicitly trusted SLS_MASS_NOTIFY_SHA256.'
+      return 1
+    fi
+  elif [ "$requested_basename" = "slsmassnotifyserver-0.1.7-beta.tgz" ] && [ "$actual_sha" != "$EXPECTED_TGZ_SHA256" ]; then
+    log "$TGZ does not match the current slsmassnotifyserver-0.1.7-beta package."
     log "Expected SHA256: $EXPECTED_TGZ_SHA256"
     log "Actual SHA256:   $actual_sha"
     log "Remove the stale local TGZ or install with SLS_MASS_NOTIFY_TGZ_URL so the current release is downloaded."
@@ -3916,17 +4306,31 @@ with tarfile.open(archive, "r:gz") as handle:
     members = handle.getmembers()
     if not members or len(members) > 2000:
         raise SystemExit("TGZ has an invalid file count")
+    seen = set()
     for member in members:
-        path = pathlib.PurePosixPath(member.name)
-        if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != module:
+        raw_name = member.name[:-1] if member.isdir() and member.name.endswith('/') else member.name
+        raw_parts = raw_name.split('/')
+        path = pathlib.PurePosixPath(raw_name)
+        if (path.is_absolute() or not raw_parts or any(part in ('', '.', '..') for part in raw_parts)
+                or not path.parts or path.parts[0] != module):
             raise SystemExit(f"Unsafe or unexpected TGZ path: {member.name}")
-        if len(member.name) > 240 or member.mode & 0o6000:
+        identity = path.as_posix()
+        if (identity in seen or len(member.name) > 240
+                or any(not part or any(ord(character) < 32 or ord(character) == 127
+                                      for character in part) for part in path.parts)):
+            raise SystemExit(f"Duplicate or malformed TGZ path: {member.name}")
+        seen.add(identity)
+        if member.mode & 0o7022:
             raise SystemExit(f"Unsafe TGZ metadata: {member.name}")
-        if member.issym() or member.islnk() or member.isdev() or member.isfifo():
+        if not (member.isfile() or member.isdir()):
             raise SystemExit(f"Unsupported TGZ member type: {member.name}")
         if member.isfile():
+            if member.size < 0 or member.size > 50 * 1024 * 1024:
+                raise SystemExit(f"Unsafe TGZ member size: {member.name}")
             total += member.size
             if member.name == f"{module}/module.xml":
+                if member.size > 1024 * 1024:
+                    raise SystemExit("module.xml exceeds its 1 MiB limit")
                 seen_module_xml = True
     if total > 50 * 1024 * 1024:
         raise SystemExit("TGZ expands beyond the 50 MB module limit")
@@ -3935,11 +4339,16 @@ with tarfile.open(archive, "r:gz") as handle:
     module_xml = handle.extractfile(f"{module}/module.xml")
     if module_xml is None:
         raise SystemExit("Unable to read module.xml")
-    root = ET.fromstring(module_xml.read())
-    if (root.findtext("rawname") or "").strip() != module:
+    module_xml_body = module_xml.read(1024 * 1024 + 1)
+    if len(module_xml_body) > 1024 * 1024 or b'<!DOCTYPE' in module_xml_body.upper() or b'<!ENTITY' in module_xml_body.upper():
+        raise SystemExit("module.xml contains an unsupported declaration or exceeds its limit")
+    root = ET.fromstring(module_xml_body)
+    rawname = root.findall("rawname")
+    version = root.findall("version")
+    if len(rawname) != 1 or (rawname[0].text or "").strip() != module:
         raise SystemExit("module.xml rawname does not match the requested module")
-    if (root.findtext("version") or "").strip() != "0.1.6-beta":
-        raise SystemExit("module.xml does not contain the expected 0.1.6-beta version")
+    if len(version) != 1 or (version[0].text or "").strip() != "0.1.7-beta":
+        raise SystemExit("module.xml does not contain the expected 0.1.7-beta version")
 PY
 }
 
@@ -3969,7 +4378,7 @@ url = os.environ['SLS_RELEASE_URL']
 match = re.fullmatch(r'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/download/slsmassnotifyserver-([0-9]+\.[0-9]+\.[0-9]+(?:-beta)?)/(slsmassnotifyserver-\1\.tgz)', url)
 if url and not match:
     raise SystemExit('Use a signed GitHub release URL or a signed offline package.')
-version, package = match.groups() if match else ('0.1.6-beta', 'slsmassnotifyserver-0.1.6-beta.tgz')
+version, package = match.groups() if match else ('0.1.7-beta', 'slsmassnotifyserver-0.1.7-beta.tgz')
 public_key = b'-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAFMDOgOaBGcaI8d+v0w/NX4RbwGlBsoktNc2V2F8UkUQ=\n-----END PUBLIC KEY-----\n'
 try:
     with tempfile.TemporaryDirectory(prefix='sls-release-verification-') as directory:
@@ -4164,7 +4573,17 @@ def open_regular(path, flags):
     return file_fd
 
 source_fd = open_regular(source_path, os.O_RDONLY)
-snapshot_fd = open_regular(snapshot_path, os.O_WRONLY | os.O_TRUNC)
+source_before = os.fstat(source_fd)
+if source_before.st_nlink != 1 or source_before.st_size > limit:
+    os.close(source_fd)
+    raise RuntimeError("protected config is linked or exceeds the size limit")
+snapshot_fd = open_regular(snapshot_path, os.O_WRONLY)
+snapshot_before = os.fstat(snapshot_fd)
+if snapshot_before.st_uid != 0 or snapshot_before.st_nlink != 1 or snapshot_before.st_mode & 0o077:
+    os.close(snapshot_fd)
+    os.close(source_fd)
+    raise RuntimeError("config snapshot is not a private root-owned file")
+os.ftruncate(snapshot_fd, 0)
 digest = hashlib.sha256()
 total = 0
 try:
@@ -4179,7 +4598,13 @@ try:
         view = memoryview(chunk)
         while view:
             written = os.write(snapshot_fd, view)
+            if written <= 0:
+                raise RuntimeError("config snapshot write made no progress")
             view = view[written:]
+    source_after = os.fstat(source_fd)
+    stable = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
+    if total != source_before.st_size or stable(source_before) != stable(source_after):
+        raise RuntimeError("protected config changed during snapshot")
     os.fsync(snapshot_fd)
 finally:
     os.close(snapshot_fd)
@@ -4210,14 +4635,22 @@ finally:
     os.close(parent_fd)
 try:
     metadata = os.fstat(file_fd)
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 16 * 1024 * 1024:
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > 16 * 1024 * 1024:
         raise SystemExit(3)
     digest = hashlib.sha256()
+    total = 0
     while True:
         chunk = os.read(file_fd, 1024 * 1024)
         if not chunk:
             break
+        total += len(chunk)
+        if total > 16 * 1024 * 1024:
+            raise SystemExit(3)
         digest.update(chunk)
+    after = os.fstat(file_fd)
+    stable = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
+    if total != metadata.st_size or stable(metadata) != stable(after):
+        raise SystemExit(4)
 finally:
     os.close(file_fd)
 print(digest.hexdigest())
@@ -4256,9 +4689,11 @@ try:
     source_fd = os.open(source_name, os.O_RDONLY | os.O_NONBLOCK | file_nofollow, dir_fd=source_parent_fd)
 finally:
     os.close(source_parent_fd)
-if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+source_before = os.fstat(source_fd)
+if (not stat.S_ISREG(source_before.st_mode) or source_before.st_nlink != 1
+        or source_before.st_uid != 0 or source_before.st_mode & 0o077 or source_before.st_size > limit):
     os.close(source_fd)
-    raise SystemExit("config snapshot is not a regular file")
+    raise SystemExit("config snapshot is not a bounded, private root-owned regular file")
 
 destination_parent_fd, destination_name = open_parent(destination_path)
 temporary_name = ".mass-notifications.config.restore." + secrets.token_hex(8)
@@ -4283,7 +4718,13 @@ try:
         view = memoryview(chunk)
         while view:
             written = os.write(temporary_fd, view)
+            if written <= 0:
+                raise RuntimeError("config restore write made no progress")
             view = view[written:]
+    source_after = os.fstat(source_fd)
+    stable = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
+    if total != source_before.st_size or stable(source_before) != stable(source_after):
+        raise RuntimeError("config snapshot changed during restoration")
     account = pwd.getpwnam("asterisk")
     os.fchmod(temporary_fd, 0o640)
     os.fchown(temporary_fd, account.pw_uid, account.pw_gid)
@@ -4303,11 +4744,17 @@ try:
         ):
             raise RuntimeError("restored config metadata is invalid")
         restored = hashlib.sha256()
+        restored_total = 0
         while True:
             chunk = os.read(restored_fd, 1024 * 1024)
             if not chunk:
                 break
+            restored_total += len(chunk)
+            if restored_total > limit:
+                raise RuntimeError("restored config exceeds the size limit")
             restored.update(chunk)
+        if restored_total != total or stable(metadata) != stable(os.fstat(restored_fd)):
+            raise RuntimeError("restored config changed during verification")
         if restored.digest() != digest.digest():
             raise RuntimeError("restored config digest mismatch")
     finally:
@@ -4510,16 +4957,29 @@ verify_config_unchanged() {
 }
 
 module_known() {
-  fwconsole ma list 2>/dev/null | grep -Eq "\\|[[:space:]]*$1[[:space:]]*\\|"
+  local module_list
+  module_list="$(fwconsole ma list 2>/dev/null)" || return $?
+  grep -Eq "\\|[[:space:]]*$1[[:space:]]*\\|" <<<"$module_list"
 }
 
 stage_module_directory() {
-  if { [ "${SLS_MASS_NOTIFY_INVENTORY_ONLY:-0}" = 1 ] && [ -f "/var/www/html/admin/modules/$MODULE/module.xml" ]; } || { [ "${SLS_MASS_NOTIFY_INVENTORY_ONLY:-0}" != 1 ] && module_known "$MODULE"; }; then
-    HAD_EXISTING_MODULE=1
+  local module_list inventory_status
+  if [ "${SLS_MASS_NOTIFY_INVENTORY_ONLY:-0}" = 1 ]; then
+    if [ -f "/var/www/html/admin/modules/$MODULE/module.xml" ]; then HAD_EXISTING_MODULE=1; fi
+  else
+    module_list="$(fwconsole ma list 2>/dev/null)" || {
+      inventory_status=$?
+      log 'FreePBX could not return its module inventory. Installation stopped before staging; no existing module was classified as absent.'
+      return "$inventory_status"
+    }
+    if grep -Eq "\\|[[:space:]]*${MODULE}[[:space:]]*\\|" <<<"$module_list"; then HAD_EXISTING_MODULE=1; fi
+  fi
+  if [ "$HAD_EXISTING_MODULE" -eq 1 ]; then
     [ -e "$CONFIG_FILE" ] || { log "An existing SLS module is missing its protected configuration. Restore a configuration backup before upgrading."; return 1; }
-    if [ "${SLS_MASS_NOTIFY_INVENTORY_ONLY:-0}" != 1 ] && fwconsole ma list 2>/dev/null \
-      | grep -Eq "\\|[[:space:]]*${MODULE}[[:space:]]*\\|[^|]*\\|[[:space:]]*Enabled[[:space:]]*\\|"; then
-      MODULE_WAS_ENABLED=1
+    if [ "${SLS_MASS_NOTIFY_INVENTORY_ONLY:-0}" != 1 ]; then
+      if grep -Eq "\\|[[:space:]]*${MODULE}[[:space:]]*\\|[^|]*\\|[[:space:]]*Enabled[[:space:]]*\\|" <<<"$module_list"; then
+        MODULE_WAS_ENABLED=1
+      fi
     fi
     log "Existing SLS Mass Notify module detected; preserving config and preparing a recoverable upgrade."
   fi
@@ -4683,7 +5143,7 @@ $module = getenv("SLS_MASS_NOTIFY_MODULE") ?: "slsmassnotifyserver";
 $stmt = \FreePBX::Database()->prepare("SELECT version FROM modules WHERE modulename = ? LIMIT 1");
 $stmt->execute([$module]);
 $version = $stmt->fetchColumn();
-exit(is_string($version) && trim($version) === "0.1.6-beta" ? 0 : 1);
+exit(is_string($version) && trim($version) === "0.1.7-beta" ? 0 : 1);
 ' >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1
 }
 
@@ -4777,7 +5237,7 @@ ensure_runtime_installed() {
 install_module_with_autoenable() {
   local install_output install_status
 
-  if install_output="$(run_without_install_maintenance_lock fwconsole ma install --autoenable "$MODULE" 2>&1)"; then
+  if install_output="$(run_without_install_maintenance_lock fwconsole ma install --autoenable "$MODULE" 2>&1 | /usr/bin/tail -c 131072)"; then
     printf '%s\n' "$install_output" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}"
     return 0
   else
@@ -4785,13 +5245,20 @@ install_module_with_autoenable() {
   fi
   printf '%s\n' "$install_output" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}"
 
-  if ! printf '%s\n' "$install_output" | grep -Eqi \
-    '(unknown|unrecognized|invalid|no such)[[:space:]-]+option[^[:cntrl:]]*autoenable|option[^[:cntrl:]]*autoenable[^[:cntrl:]]*(does not exist|is not defined|is unknown|is unrecognized)|autoenable[^[:cntrl:]]*option[^[:cntrl:]]*(does not exist|is not defined|is unknown|is unrecognized)'; then
+  if ! grep -Eqi \
+    '(unknown|unrecognized|invalid|no such)[[:space:]-]+option[^[:cntrl:]]*autoenable|option[^[:cntrl:]]*autoenable[^[:cntrl:]]*(does not exist|is not defined|is unknown|is unrecognized)|autoenable[^[:cntrl:]]*option[^[:cntrl:]]*(does not exist|is not defined|is unknown|is unrecognized)' <<<"$install_output"; then
     return "$install_status"
   fi
 
   log "This fwconsole build requires global options before the module action; retrying compatible --autoenable syntax."
-  run_without_install_maintenance_lock fwconsole ma --autoenable install "$MODULE" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1
+  if install_output="$(run_without_install_maintenance_lock fwconsole ma --autoenable install "$MODULE" 2>&1 | /usr/bin/tail -c 131072)"; then
+    printf '%s\n' "$install_output" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}"
+    return 0
+  else
+    install_status=$?
+  fi
+  printf '%s\n' "$install_output" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}"
+  return "$install_status"
 }
 
 verify_runtime_shell_syntax() {
@@ -4812,7 +5279,7 @@ verify_announcement_worker_health() {
   local runtime_dir="${1:-/usr/local/bin/sls_mass_notify}"
   /usr/bin/php -l "$runtime_dir/sls_announcement_jobs.php" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || return $?
   /usr/bin/php -l "$runtime_dir/sls_mass_notify_announcement_worker.php" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || return $?
-  run_without_install_maintenance_lock /usr/sbin/runuser -u asterisk -- /usr/bin/timeout 45 \
+  run_without_install_maintenance_lock /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u asterisk -- /usr/bin/timeout 45 \
     /usr/bin/php "$runtime_dir/sls_mass_notify_announcement_worker.php" --health-check --record-health >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1
 }
 
@@ -4839,7 +5306,7 @@ EOF
   for model in en_US-lessac-low.onnx en_US-amy-low.onnx en_US-ryan-low.onnx; do
     synthesis_file="$DATA_DIR/sounds/tts/installer-voice-check-${model%.onnx}-$$.wav"
     rm -f "$synthesis_file"
-    if ! printf '%s\n' 'SLS voice check.' | runuser -u asterisk -- /usr/bin/timeout 90 /usr/local/bin/piper \
+    if ! printf '%s\n' 'SLS voice check.' | /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u asterisk -- /usr/bin/timeout 90 /usr/local/bin/piper \
       --model "$voice_dir/$model" --output-file "$synthesis_file" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1; then
       rm -f "$synthesis_file"
       log "Piper could not synthesize audio with $model. See $LOG_FILE."
@@ -4923,7 +5390,7 @@ verify_ami_with_repair() (
   }
   trap 'rm -f -- "$probe_dir/health.json" "$probe_dir/health.err"; rmdir -- "$probe_dir" 2>/dev/null || true' EXIT
   for attempt in 1 2 3; do
-    if /usr/bin/timeout 15 /usr/sbin/runuser -u asterisk -- /usr/bin/python3 /usr/local/bin/sls_mass_notify/sls_notify.py --ami-health-json \
+    if /usr/bin/timeout 15 /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u asterisk -- /usr/bin/python3 /usr/local/bin/sls_mass_notify/sls_notify.py --ami-health-json \
       >"$probe_dir/health.json" 2>"$probe_dir/health.err"; then
       if validate_ami_health_file "$probe_dir/health.json" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1
       then
@@ -4974,14 +5441,14 @@ verify_phone_collector() (
     }
   probe_dir="$(mktemp -d "$INSTALL_TEMP_ROOT/sls-phone-collector-check.XXXXXX")" || return 1
   trap 'rm -f -- "$probe_dir/ami.json" "$probe_dir/health.json"; rmdir -- "$probe_dir" 2>/dev/null || true' EXIT
-  if ! /usr/bin/timeout --kill-after=1 15 /usr/sbin/runuser -u asterisk -- /usr/bin/python3 -I \
+  if ! /usr/bin/timeout --kill-after=1 15 /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u asterisk -- /usr/bin/python3 -I \
       /usr/local/bin/sls_mass_notify/sls_phone_admission.py --probe-ami >"$probe_dir/ami.json" 2>>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" \
     || ! validate_phone_collector_probe_file ami "$probe_dir/ami.json" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1; then
     log "The SLS phone runtime could not confirm AMI Ping and ShowDialPlan reporting authorization. Review the local AMI connection and run Repair Installation."
     return 1
   fi
   for attempt in 1 2 3; do
-    if /usr/bin/timeout --kill-after=1 5 /usr/sbin/runuser -u asterisk -- /usr/bin/python3 -I \
+    if /usr/bin/timeout --kill-after=1 5 /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u asterisk -- /usr/bin/python3 -I \
         /usr/local/bin/sls_mass_notify/sls_phone_events.py --health >"$probe_dir/health.json" 2>>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" \
       && validate_phone_collector_probe_file health "$probe_dir/health.json" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1; then
       return 0
@@ -5040,6 +5507,8 @@ except (OSError, ValueError, AssertionError):
 if result.get('ok') is not True or sys.argv[2] != '200':
     missing = [name for name in result['missing'] if name in ('pdo_sqlite','curl','dom','mbstring','posix','openssl','sodium','php_8_2_or_newer','exec_enabled','proc_open_enabled','posix_geteuid_enabled','posix_getpwnam_enabled','openssl_encrypt_enabled','openssl_decrypt_enabled','sodium_crypto_aead_xchacha20poly1305_ietf_encrypt_enabled','sodium_crypto_pwhash_str_enabled','web_runtime_must_run_as_asterisk')]
     raise SystemExit('The PHP runtime serving Apache is missing: ' + ', '.join(missing) + '. Enable these for the active Apache/FPM PHP version and retry; installing CLI extensions alone does not repair another PHP handler.')
+if result.get('module_version') != '0.1.7-beta':
+    raise SystemExit('The web PHP handler is still serving another SLS release. Review Apache/PHP-FPM reload errors and draining requests, then retry; a CLI file check cannot verify cached web code.')
 print('Served PHP prerequisites verified through the local API route.')
 PY
 )
@@ -5181,7 +5650,7 @@ if not stat.S_ISREG(console_info.st_mode) or console_info.st_uid != 0 or console
 PY
 }
 
-verify_desktop_sse_handshake() {
+verify_desktop_transport() {
   local desktop_status=0
   php -r '
 $path = "/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config";
@@ -5222,10 +5691,12 @@ if (!is_string($password) || $password === "" || $username === "") {
     exit(1);
 }
 require_once "/var/www/html/admin/modules/slsmassnotifyserver/LocalWebProbe.php";
+$authorization = "Authorization: Basic " . base64_encode($username . ":" . $password);
+$pollingAdvertised = false;
 foreach (\FreePBX\modules\SlsLocalWebProbe::responses(
     (string)($settings["public_pbx_host"] ?? ""),
     "/api/sipnotify/desktop/stream?stream_seconds=1",
-    ["Authorization: Basic " . base64_encode($username . ":" . $password), "Accept: text/event-stream"],
+    [$authorization, "Accept: text/event-stream"],
     8
 ) as $response) {
     $headers = implode("\n", (array)$response["headers"]);
@@ -5236,6 +5707,46 @@ foreach (\FreePBX\modules\SlsLocalWebProbe::responses(
         && strpos($body, "\"transport\":\"live_sse\"") !== false) {
         exit(0);
     }
+    if ((int)$response["status"] !== 429 || stripos($headers, "Content-Type: application/json") === false) {
+        continue;
+    }
+    try { $reply = \SLS\MassNotify\ApiSecurity::jsonObject($body, false, 16); }
+    catch (\Throwable $error) { continue; }
+    $fallback = $reply["fallback"] ?? null;
+    if (($reply["ok"] ?? null) === false && ($reply["error"] ?? null) === "stream_capacity_reached"
+        && is_array($fallback) && ($fallback["transport"] ?? null) === "json_poll"
+        && ($fallback["path"] ?? null) === "/api/sipnotify/desktop"
+        && ($fallback["cursor_parameter"] ?? null) === "last_event_id"
+        && ($fallback["poll_interval_seconds"] ?? null) === 5) {
+        $pollingAdvertised = true;
+        break;
+    }
+}
+if (!$pollingAdvertised) { exit(1); }
+// The empty cursor establishes a live baseline without fetching old alerts.
+// Never send credentials to a response-supplied URL.
+foreach (\FreePBX\modules\SlsLocalWebProbe::responses(
+    (string)($settings["public_pbx_host"] ?? ""),
+    "/api/sipnotify/desktop?last_event_id=&limit=1",
+    [$authorization, "Accept: application/json"],
+    8
+) as $response) {
+    $headers = implode("\n", (array)$response["headers"]);
+    if ((int)$response["status"] !== 200 || stripos($headers, "Content-Type: application/json") === false
+        || !preg_match("/^Cache-Control:[^\\r\\n]*\\bno-store\\b/im", $headers)) { continue; }
+    try { $reply = \SLS\MassNotify\ApiSecurity::jsonObject((string)$response["body"], false, 16); }
+    catch (\Throwable $error) { continue; }
+    $identity = is_array($reply["client"] ?? null) ? ($reply["client"]["client_id"] ?? null) : null;
+    $cursor = $reply["last_event_id"] ?? null;
+    if (($reply["ok"] ?? null) === true && ($reply["transport"] ?? null) === "json_poll"
+        && ($reply["cursor_parameter"] ?? null) === "last_event_id"
+        && ($reply["poll_interval_seconds"] ?? null) === 5
+        && is_string($identity) && $identity !== "" && $identity === ($selected["client_id"] ?? null)
+        && ($reply["events"] ?? null) === [] && ($reply["count"] ?? null) === 0
+        && ($reply["has_more"] ?? null) === false && ($reply["limit"] ?? null) === 1
+        && is_string($cursor) && strlen($cursor) <= 2048 && preg_match("/^[^\\x00-\\x20\\x7f]+$/D", $cursor)) {
+        exit(4);
+    }
 }
 exit(1);
 ' >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || desktop_status=$?
@@ -5244,15 +5755,19 @@ exit(1);
     return 0
   fi
   if [ "$desktop_status" -eq 3 ]; then
-    log "Desktop live SSE handshake skipped because all desktop clients are disabled."
+    log "Desktop transport handshake skipped because all desktop clients are disabled."
     return 0
   fi
-  log "Desktop live SSE authentication failed on the detected local Apache ports. Check virtual-host routing, Authorization-header forwarding, and $LOG_FILE."
+  if [ "$desktop_status" -eq 4 ]; then
+    log "Desktop JSON polling authentication and live cursor baseline verified (stream capacity policy)."
+    return 0
+  fi
+  log "Desktop authenticated transport verification failed on the detected local Apache ports. Check virtual-host routing, Authorization-header forwarding, stream/polling policy, and $LOG_FILE."
   return 1
 }
 
 verify_media_access() {
-  if ! runuser -u asterisk -- /usr/bin/php -r '
+  if ! /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u asterisk -- /usr/bin/php -r '
 require_once "/var/www/html/admin/modules/slsmassnotifyserver/LocalWebProbe.php";
 require_once "/var/www/html/api/sls-mass-notify/media-policy.php";
 require_once "/usr/local/bin/sls_mass_notify/sls_config_crypto.php";
@@ -5483,13 +5998,12 @@ verify_install() {
     }
   module_list="$(fwconsole ma list)"
   printf '%s\n' "$module_list" | grep -Ei 'slsmassnotifyserver|dashboard|framework|Module'
-  printf '%s\n' "$module_list" | grep -Eq '\|[[:space:]]*slsmassnotifyserver[[:space:]]*\|[^|]*\|[[:space:]]*Enabled[[:space:]]*\|' || {
+  grep -Eq '\|[[:space:]]*slsmassnotifyserver[[:space:]]*\|[^|]*\|[[:space:]]*Enabled[[:space:]]*\|' <<<"$module_list" || {
     log "The SLS Mass Notify module is not enabled after installation."
     exit 1
   }
   for required_module in framework dashboard backup recordings; do
-    printf '%s\n' "$module_list" \
-      | grep -Eq "\\|[[:space:]]*${required_module}[[:space:]]*\\|[^|]*\\|[[:space:]]*Enabled[[:space:]]*\\|" || {
+    grep -Eq "\\|[[:space:]]*${required_module}[[:space:]]*\\|[^|]*\\|[[:space:]]*Enabled[[:space:]]*\\|" <<<"$module_list" || {
         log "Required FreePBX module is not enabled after installation: $required_module"
         exit 1
       }
@@ -5538,50 +6052,50 @@ exit(0);
     log "The SLS audio paging context is missing its multi-contact Page/ConfBridge auto-answer and audio handler."
     exit 1
   fi
-  if printf '%s\n' "$audio_dialplan" | grep -Fq 'Dial(${SLS_DIAL}'; then
+  if grep -Fq 'Dial(${SLS_DIAL}' <<<"$audio_dialplan"; then
     log "The SLS audio paging context still uses first-answer Dial semantics instead of multi-contact Page semantics."
     exit 1
   fi
-  if ! printf '%s\n' "$audio_dialplan" | grep -Fq 'AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,origin)' \
-    || printf '%s\n' "$audio_dialplan" | grep -Fq 'Set(SLS_DIAL=${PJSIP_DIAL_CONTACTS'; then
+  if ! grep -Fq 'AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,origin)' <<<"$audio_dialplan" \
+    || grep -Fq 'Set(SLS_DIAL=${PJSIP_DIAL_CONTACTS' <<<"$audio_dialplan"; then
     log "The SLS audio context lacks frozen-contact admission or still resolves new contacts after admission."
     exit 1
   fi
-  if printf '%s\n' "$audio_dialplan" | grep -Eq 'macro-autoanswer|b\(autoanswer\^'; then
+  if grep -Eq 'macro-autoanswer|b\(autoanswer\^' <<<"$audio_dialplan"; then
     log "The SLS audio paging context still depends on a FreePBX internal auto-answer context."
     exit 1
   fi
   autoanswer_dialplan="$(asterisk -rx "dialplan show s@sls-alert-autoanswer" 2>&1)"
   outbound_playback_dialplan="$(asterisk -rx "dialplan show s@sls-outbound-playback" 2>&1)"
-  if ! printf '%s\n' "$outbound_playback_dialplan" | grep -Fq 'AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,playback)' \
-    || ! printf '%s\n' "$outbound_playback_dialplan" | grep -Fq 'GotoIf($["${SLS_PHONE_ALLOW}"!="1"]?done)' \
-    || ! printf '%s\n' "$outbound_playback_dialplan" | grep -Fq 'Playback(${SLS_SAFE_SOUND})' \
-    || ! printf '%s\n' "$outbound_playback_dialplan" | grep -Fq 'Read(SLS_ACK,${SLS_ACK_PROMPT},1,,1,${SLS_ACK_TIMEOUT})' \
-    || ! printf '%s\n' "$outbound_playback_dialplan" | grep -Fq 'AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,ack)'; then
+  if ! grep -Fq 'AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,playback)' <<<"$outbound_playback_dialplan" \
+    || ! grep -Fq 'GotoIf($["${SLS_PHONE_ALLOW}"!="1"]?done)' <<<"$outbound_playback_dialplan" \
+    || ! grep -Fq 'Playback(${SLS_SAFE_SOUND})' <<<"$outbound_playback_dialplan" \
+    || ! grep -Fq 'Read(SLS_ACK,${SLS_ACK_PROMPT},1,,1,${SLS_ACK_TIMEOUT})' <<<"$outbound_playback_dialplan" \
+    || ! grep -Fq 'AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,ack)' <<<"$outbound_playback_dialplan"; then
     log "External voice playback lacks its per-recipient answer or keypad-result handling. No external test call was made."
     exit 1
   fi
-  printf '%s\n' "$autoanswer_dialplan" | grep -Fq 'AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,contact)' || {
+  grep -Fq 'AGI(/usr/local/bin/sls_mass_notify/sls_mass_notify_phone_agi.py,contact)' <<<"$autoanswer_dialplan" || {
     log "The SLS auto-answer context lacks its exact-contact admission guard."
     exit 1
   }
-  printf '%s\n' "$autoanswer_dialplan" | grep -Fq 'PJSIP_HEADER(add,Alert-Info)' || {
+  grep -Fq 'PJSIP_HEADER(add,Alert-Info)' <<<"$autoanswer_dialplan" || {
     log "The SLS PJSIP auto-answer header context is missing."
     exit 1
   }
-  printf '%s\n' "$autoanswer_dialplan" | grep -Fq 'PJSIP_HEADER(add,Call-Info)' || {
+  grep -Fq 'PJSIP_HEADER(add,Call-Info)' <<<"$autoanswer_dialplan" || {
     log "The SLS PJSIP Call-Info auto-answer header is missing."
     exit 1
   }
-  printf '%s\n' "$autoanswer_dialplan" | grep -Fq 'Set(SLS_AUTOANSWER_CONTACT=${CHANNEL(contact)})' || {
+  grep -Fq 'Set(SLS_AUTOANSWER_CONTACT=${CHANNEL(contact)})' <<<"$autoanswer_dialplan" || {
     log "The SLS PJSIP auto-answer context is missing per-contact user-agent discovery."
     exit 1
   }
-  printf '%s\n' "$autoanswer_dialplan" | grep -Fq 'PJSIP_AOR(${SLS_AUTOANSWER_AOR},contact)' || {
+  grep -Fq 'PJSIP_AOR(${SLS_AUTOANSWER_AOR},contact)' <<<"$autoanswer_dialplan" || {
     log "The SLS PJSIP auto-answer context is missing its extension/AOR contact fallback."
     exit 1
   }
-  printf '%s\n' "$autoanswer_dialplan" | grep -Fq '${SLS_AUTOANSWER_UA:0:7}"="yealink"]?Set(SLS_ALERT_INFO=Intercom)' || {
+  grep -Fq '${SLS_AUTOANSWER_UA:0:7}"="yealink"]?Set(SLS_ALERT_INFO=Intercom)' <<<"$autoanswer_dialplan" || {
     log "The SLS PJSIP auto-answer context is missing the Yealink Intercom Alert-Info policy."
     exit 1
   }
@@ -5594,8 +6108,8 @@ exit(0);
       log "Required Asterisk call-file spool directory is missing: $spool_dir"
       exit 1
     }
-    if ! runuser -u asterisk -- test -w "$spool_dir" \
-      || ! runuser -u asterisk -- test -x "$spool_dir"; then
+    if ! /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u asterisk -- test -w "$spool_dir" \
+      || ! /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u asterisk -- test -x "$spool_dir"; then
       log "The asterisk service account cannot search and write to $spool_dir."
       exit 1
     fi
@@ -5632,8 +6146,8 @@ exit(0);
     fi
   done
   for writable_dir in "$DATA_DIR/sounds/tts" "$DATA_DIR/sounds/tones" /var/www/html/sls_mass_notify; do
-    if ! runuser -u asterisk -- test -w "$writable_dir" \
-      || ! runuser -u asterisk -- test -x "$writable_dir"; then
+    if ! /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u asterisk -- test -w "$writable_dir" \
+      || ! /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u asterisk -- test -x "$writable_dir"; then
       log "The asterisk service account cannot search and write to $writable_dir."
       exit 1
     fi
@@ -5676,7 +6190,7 @@ exit(0);
     exit 1
   }
   asterisk_file_formats="$(asterisk -rx "core show file formats" 2>&1)"
-  printf '%s\n' "$asterisk_file_formats" | grep -Eq '(^|[[:space:]])wav([[:space:]]|$)' || {
+  grep -Eq '(^|[[:space:]])wav([[:space:]]|$)' <<<"$asterisk_file_formats" || {
     log "Asterisk WAV file-format support is unavailable."
     exit 1
   }
@@ -5770,6 +6284,8 @@ exit(0);
     /usr/local/bin/sls_mass_notify/sls_release_verify.py
     /usr/local/bin/sls_mass_notify/sls_release_trust.py
     /usr/local/bin/sls_mass_notify/sls_install_doctor.py
+    /usr/local/bin/sls_mass_notify/sls_update_status.py
+    /usr/local/bin/sls_mass_notify/sls_atomic_json.py
     /usr/local/bin/sls_mass_notify/sls_install_transaction.py
     /usr/local/bin/sls_mass_notify/sls_phone_inventory.py
     /usr/local/bin/sls_mass_notify/sls_speech_admission.py
@@ -5807,7 +6323,7 @@ PY
   media_probe="/var/www/html/sls_mass_notify/installer-render-check-$$.png"
   media_fetch="$(mktemp "$INSTALL_TEMP_ROOT/sls-mass-notify-render-fetch.XXXXXX")"
   rm -f "$media_probe"
-  if ! runuser -u asterisk -- convert -size 480x272 xc:'#991b1b' -font DejaVu-Sans-Bold \
+  if ! /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u asterisk -- convert -size 480x272 xc:'#991b1b' -font DejaVu-Sans-Bold \
     -fill white -gravity center -pointsize 24 -annotate +0+0 'SLS render test' \
     -colorspace sRGB -depth 8 -interlace none -strip "PNG24:$media_probe"; then
     rm -f "$media_probe" "$media_fetch"
@@ -5862,7 +6378,7 @@ PY
   fi
   verify_phone_collector || exit 1
   notify_capabilities="$(mktemp "$INSTALL_TEMP_ROOT/sls-mass-notify-notify-capabilities.XXXXXX")"
-  if ! /usr/bin/timeout 15 /usr/sbin/runuser -u asterisk -- /usr/bin/python3 /usr/local/bin/sls_mass_notify/sls_notify.py --notify-capabilities-json >"$notify_capabilities"; then
+  if ! /usr/bin/timeout 15 /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u asterisk -- /usr/bin/python3 /usr/local/bin/sls_mass_notify/sls_notify.py --notify-capabilities-json >"$notify_capabilities"; then
     rm -f "$notify_capabilities"
     log "SLS could not inspect Asterisk SIP NOTIFY routing capabilities."
     exit 1
@@ -5898,7 +6414,7 @@ PY
   # differently, and an empty PBX is a valid installation state.
   endpoint_inventory="$(mktemp "$INSTALL_TEMP_ROOT/sls-mass-notify-endpoints.XXXXXX")"
   endpoint_inventory_err="$(mktemp "$INSTALL_TEMP_ROOT/sls-mass-notify-endpoints-error.XXXXXX")"
-  if ! /usr/bin/timeout 15 /usr/sbin/runuser -u asterisk -- /usr/bin/python3 /usr/local/bin/sls_mass_notify/sls_notify.py --list-endpoints-json \
+  if ! /usr/bin/timeout 15 /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u asterisk -- /usr/bin/python3 /usr/local/bin/sls_mass_notify/sls_notify.py --list-endpoints-json \
     >"$endpoint_inventory" 2>"$endpoint_inventory_err"; then
     cat "$endpoint_inventory_err" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>/dev/null || true
     rm -f "$endpoint_inventory" "$endpoint_inventory_err"
@@ -5961,7 +6477,7 @@ PY
   # DirectorySlash 301 before the protected API front controller runs.
   verify_local_api_route /api/sls-mass-notify/ '^(401|403|405|429)$' '401/403/405/429' 'Control API route smoke test' || exit 1
   verify_local_api_route /api/sls-mass-notify/sms-callback.php '^405$' '405' 'SMS callback route without a provider submission' || exit 1
-  verify_desktop_sse_handshake || exit 1
+  verify_desktop_transport || exit 1
   [ "$(stat -c '%U:%G' /usr/local/bin/sls_mass_notify)" = "root:root" ] || {
     log "Executable runtime is not owned by root:root."
     exit 1
@@ -5977,7 +6493,7 @@ PY
   root_cron="$(crontab -l 2>/dev/null || true)"
   asterisk_cron="$(crontab -u asterisk -l 2>/dev/null || true)"
   verify_install_cron "$root_cron" "$asterisk_cron" || exit 1
-  if ! runuser -u asterisk -- /usr/bin/timeout 20 /usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php --self-test >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1; then
+  if ! /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u asterisk -- /usr/bin/timeout 20 /usr/local/bin/sls_mass_notify/sls_mass_notify_schedule_worker.php --self-test >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1; then
     log "Scheduled-announcement worker failed its Asterisk-account self-test."
     exit 1
   fi
@@ -5987,7 +6503,7 @@ PY
   printf '%s\n' '{"enabled":"0","xweather":{"enabled":"0"}}' >"$scheduler_probe/disabled.config"
   chown asterisk:asterisk "$scheduler_probe/disabled.config"
   chmod 0640 "$scheduler_probe/disabled.config"
-  if ! runuser -u asterisk -- /usr/bin/env \
+  if ! /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u asterisk -- /usr/bin/env \
     CONFIG_FILE="$scheduler_probe/disabled.config" \
     DATA_DIR="$scheduler_probe" \
     LOG="$scheduler_probe/weather.log" \
@@ -6010,7 +6526,7 @@ inspect_installation() {
   # Inspection uses only existing utilities and private evidence. It does not
   # bootstrap PHP/FreePBX, repair packages, acquire/create worker locks or enroll
   # trust pointers. All active and pending settings remain untouched.
-  local utility report
+  local utility report inspection_status
   for utility in /usr/bin/python3 /usr/bin/openssl /usr/bin/tar /usr/bin/php /usr/bin/sha256sum; do
     [ -x "$utility" ] || { printf 'Inspection needs the existing utility %s; it will not install packages.\n' "$utility" >&2; return 1; }
   done
@@ -6028,9 +6544,24 @@ inspect_installation() {
   open_root_owned_file INSTALL_LOG_FD "$LOG_FILE" log || return 1
   INSTALL_LOG_OUTPUT="/proc/${BASHPID}/fd/$INSTALL_LOG_FD"
   printf '%s\n' "$report" >>"$INSTALL_LOG_OUTPUT"
-  download_tgz && verify_tgz && stage_module_directory && prepare_installer_bootstrap && prepare_authenticated_installer || {
-    printf 'Inspection failed. Evidence and diagnostics: %s\n' "$LOG_FILE" >&2; return 1;
-  }
+  if download_tgz && verify_tgz && stage_module_directory && prepare_installer_bootstrap && prepare_authenticated_installer; then
+    inspection_status=0
+  else
+    inspection_status=$?
+  fi
+  # The reviewed approval directory is the inspection result. Candidate
+  # downloads, extracted payloads, and executable bootstrap copies are scratch
+  # data; retaining them after each inspection can consume hundreds of MiB.
+  [ -z "$DOWNLOAD_DIR" ] || rm -rf -- "$DOWNLOAD_DIR"
+  [ -z "$STAGING_DIR" ] || rm -rf -- "$STAGING_DIR"
+  [ -z "$INSTALL_BOOTSTRAP_DIR" ] || rm -rf -- "$INSTALL_BOOTSTRAP_DIR"
+  DOWNLOAD_DIR=""
+  STAGING_DIR=""
+  INSTALL_BOOTSTRAP_DIR=""
+  if [ "$inspection_status" -ne 0 ]; then
+    printf 'Inspection failed. Evidence and diagnostics: %s\n' "$LOG_FILE" >&2
+    return "$inspection_status"
+  fi
   printf 'Inspection passed. Evidence: %s; log: %s\n' "$UPGRADE_TRUST_DIR" "$LOG_FILE"
 }
 
@@ -6049,7 +6580,6 @@ main() {
     recover_interrupted_installation "$REQUESTED_RECOVERY"
     return $?
   fi
-  check_interrupted_installation || exit $?
   preflight_profile_identity || exit $?
   for coordination_utility in flock timeout runuser; do
     command -v "$coordination_utility" >/dev/null || { printf 'Installation coordination requires %s before bootstrap. Install coreutils/util-linux and retry; no PBX state was changed.\n' "$coordination_utility" >&2; exit 2; }
@@ -6057,6 +6587,7 @@ main() {
   # Coordinate before appending the shared transaction log or starting repairs.
   acquire_update_coordination || exit 1
   acquire_maintenance_coordination || exit 1
+  check_interrupted_installation || exit $?
   INSTALL_LOG_FD=""
   open_root_owned_file INSTALL_LOG_FD "$LOG_FILE" log || {
     printf 'The installer log could not be opened safely: %s. Check for a symlink, hardlink, special file, or unexpected owner. No module files were changed.\n' "$LOG_FILE" >&2
@@ -6148,6 +6679,7 @@ main() {
   # performs readiness checks. Install already wrote the loopback AMI user.
   sls_as_asterisk /usr/sbin/asterisk -rx "manager reload" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || true
   protected_install_phase activate --apply
+  refresh_served_php_workers
   SLS_MASS_NOTIFY_PRESERVE_PENDING=1 run_without_install_maintenance_lock fwconsole reload
   protected_install_phase verify
   sls_as_asterisk /usr/sbin/asterisk -rx "module reload res_pjsip_notify.so" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || true

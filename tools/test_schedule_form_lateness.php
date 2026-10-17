@@ -13,7 +13,9 @@ $methods = '';
 foreach (['saveScheduledAnnouncement', 'previewScheduleCalendar', 'resolveScheduleCalendarInput', 'getScheduledAnnouncements', 'normalizeScheduledAnnouncements', 'findLiveScheduledOccurrence', 'scheduleExecutionRecord',
     'validateScheduledAnnouncementRecurrences', 'sanitizeScheduleText', 'normalizeScheduleRecurrenceMode',
     'scheduleRecurrenceIntervalDays', 'buildScheduledOccurrences', 'scheduleRecurrenceMatchesOccurrences',
-    'resolveScheduleLocalDateTime', 'parseScheduleUtcTimestamp', 'normalizeAnnouncementAudioMode', 'normalizeToneName', 'announcementTone', 'validateAudienceWebhookIds'] as $name) {
+	'resolveScheduleLocalDateTime', 'parseScheduleUtcTimestamp', 'normalizeAnnouncementAudioMode', 'normalizeToneName', 'announcementTone',
+	'validateAudienceWebhookIds', 'normalizeExtensionSelector', 'validateExtensionSelectorList', 'validateDesktopSelectorList',
+	'normalizeStoredFlag', 'aggregateSavedAudienceTargets', 'validateAggregateSavedAudienceTargets'] as $name) {
     $method = $reflection->getMethod($name);
     $methods .= implode('', array_slice($source, $method->getStartLine() - 1, $method->getEndLine() - $method->getStartLine() + 1));
 }
@@ -59,7 +61,7 @@ class ScheduleFormLatenessFixture {
         return ['success'=>true, 'message'=>'Mock submission accepted.'];
     }
 FIXTURE;
-foreach (['MAX_WEBHOOK_DESTINATIONS', 'MAX_SCHEDULES', 'MAX_SCHEDULE_OCCURRENCES', 'MAX_SCHEDULE_YEARS', 'SCHEDULE_GRACE_SECONDS'] as $name) {
+foreach (['MAX_WEBHOOK_DESTINATIONS', 'MAX_SAVED_CHANNEL_RECIPIENTS', 'MAX_EXTERNAL_VOICE_RECIPIENTS', 'MAX_SCHEDULES', 'MAX_SCHEDULE_OCCURRENCES', 'MAX_SCHEDULE_YEARS', 'SCHEDULE_GRACE_SECONDS'] as $name) {
     $fixture .= 'const ' . $name . ' = ' . var_export($reflection->getConstant($name), true) . ';';
 }
 $fixture .= 'const SCHEDULE_LOCK_FILE = ' . var_export($directory . '/schedule.lock', true) . ';'

@@ -6,7 +6,7 @@ require_once __DIR__.'/IncidentConfig.php';
 /** Partition a frozen audience using reviewed wording; never translate text. */
 final class IncidentLanguages
 {
-    public const CHANNELS = ['extensions','desktop_clients','voice_recipient_ids','email_recipient_ids','sms_recipient_ids','webhook_ids'];
+    public const CHANNELS = ['extensions','desktop_clients','voice_recipient_ids','email_recipient_ids','sms_recipient_ids','webhook_ids','browser_recipient_ids','connector_ids'];
 
     public static function plan(array $template, array $delivery, array $preferences, array $fields, string $fallback, bool $drill, callable $speech): array
     {
@@ -16,7 +16,7 @@ final class IncidentLanguages
         $variants = array_column($template['language_variants'] ?? [], null, 'locale');
         $groups = []; $matched = false;
         foreach (self::CHANNELS as $channel) {
-            foreach ($delivery[$channel] as $id) {
+            foreach ($delivery[$channel] ?? [] as $id) {
                 $requested = $routes[$channel][$id] ?? $fallback;
                 $locale = isset($variants[$requested]) ? $requested : $fallback;
                 $matched = $matched || isset($routes[$channel][$id]);

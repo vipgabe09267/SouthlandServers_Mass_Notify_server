@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 
 ROOT = Path('/var/lib/sls-mass-notify-trust')
@@ -502,10 +503,61 @@ def enroll_sls(root: Path, archive: Path, manifest_path: Path, signature_path: P
     return name
 
 
+def storage_report(root: Path) -> dict:
+    """Read protected generation usage without deleting recovery authority."""
+    descriptor = directory(root, protected=True)
+    rows = []
+    active = set()
+    deadline = time.monotonic() + 3
+    inspected = 0
+    def measure(fd):
+        nonlocal inspected
+        total = files = 0
+        with os.scandir(fd) as entries:
+            for entry in entries:
+                inspected += 1
+                if inspected > 100000 or time.monotonic() > deadline:
+                    raise TrustError('trust usage reached its file/time bound; no cleanup was performed')
+                info = entry.stat(follow_symlinks=False)
+                if info.st_uid != 0 or info.st_mode & 0o022:
+                    raise TrustError('trust usage found an unprotected entry; preserve it for review')
+                if stat.S_ISDIR(info.st_mode):
+                    child = os.open(entry.name, os.O_DIRECTORY | os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+                    try:
+                        child_bytes, child_files = measure(child)
+                        total += child_bytes; files += child_files
+                    finally: os.close(child)
+                elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                    total += info.st_size; files += 1
+                else: raise TrustError('trust usage found a link or special file; no cleanup was performed')
+        return total, files
+    try:
+        if os.fstat(descriptor).st_mode & 0o077:
+            raise TrustError('trust usage requires root-private storage')
+        names = os.listdir(descriptor)
+        if len(names) > 1000: raise TrustError('trust generation directory needs administrator review')
+        for name in names:
+            if re.fullmatch(r'[a-z][a-z0-9_]{0,63}\.active\.json', name):
+                _, generation = load(root, name[:-12]); active.add(generation.name)
+        for name in sorted(names):
+            if not re.fullmatch(r'[a-z][a-z0-9_]{0,63}-[a-f0-9]{64}', name): continue
+            child = os.open(name, os.O_DIRECTORY | os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor)
+            try: allocated, files = measure(child)
+            finally: os.close(child)
+            rows.append({'generation': name, 'active': name in active, 'bytes': allocated, 'files': files,
+                         'retention': 'active' if name in active else 'recovery_review_required'})
+        return {'schema': 1, 'read_only': True, 'generation_count': len(rows),
+                'generation_bytes': sum(row['bytes'] for row in rows), 'generations': rows,
+                'cleanup_performed': False,
+                'cleanup_policy': 'Preserve active, pending and recovery references. This usage report does not authorize deletion.'}
+    finally: os.close(descriptor)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=ROOT)
     commands = parser.add_subparsers(dest='command', required=True)
+    commands.add_parser('storage')
     enrollment = commands.add_parser('enroll-reviewed')
     enrollment.add_argument('--inventory', type=Path, required=True)
     enrollment.add_argument('--sha256', required=True)
@@ -527,7 +579,9 @@ def main() -> int:
     args = parser.parse_args()
     if os.geteuid() != 0:
         raise TrustError('module trust operations require root')
-    if args.command == 'signature-file':
+    if args.command == 'storage':
+        print(json.dumps(storage_report(args.root), separators=(',', ':')))
+    elif args.command == 'signature-file':
         if args.action != 'remove' and args.path is None:
             raise TrustError('signature operation requires a protected input/output path')
         print(signature_file(args.module, args.web_root, args.action, args.path, args.web_user))

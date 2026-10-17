@@ -12,6 +12,7 @@ const DESKTOP_ACK_DIRECTORY = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/s
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
 const RETENTION_MAX_EVENTS = 1000;
+const MAX_EVENT_ID_BYTES = 2048;
 
 function desktop_response_headers(?int $now = null): array
 {
@@ -31,6 +32,17 @@ header('Referrer-Policy: no-referrer');
 
 function respond(int $status, array $payload): void
 {
+    if (!empty($GLOBALS['slsDesktopSseActive'])) {
+        if ($status >= 500 && !array_key_exists('retryable', $payload)) {
+            $payload['retryable'] = true;
+        }
+        $encoded = json_encode($payload, JSON_UNESCAPED_SLASHES);
+        echo "event: reconnect\ndata: "
+            . ($encoded === false ? '{"ok":false,"error":"encoding_failed","retryable":true}' : $encoded)
+            . "\n\n";
+        if (function_exists('desktop_stream_flush')) { desktop_stream_flush(); }
+        exit;
+    }
     http_response_code($status);
     $encoded = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
     echo ($encoded === false ? '{"ok":false,"error":"encoding_failed"}' : $encoded) . "\n";
@@ -41,7 +53,8 @@ function request_header_value(string $name): string
 {
     $serverKey = 'HTTP_' . strtoupper(str_replace('-', '_', $name));
     foreach ([$serverKey, 'REDIRECT_' . $serverKey] as $key) {
-        $value = trim((string)($_SERVER[$key] ?? ''));
+        $raw = $_SERVER[$key] ?? '';
+        $value = is_string($raw) && strlen($raw) <= 8192 ? trim($raw) : '';
         if ($value !== '') {
             return $value;
         }
@@ -55,8 +68,8 @@ function request_header_value(string $name): string
             continue;
         }
         foreach ($headers as $key => $value) {
-            if (strcasecmp((string)$key, $name) === 0) {
-                return trim((string)$value);
+            if (is_string($key) && strcasecmp($key, $name) === 0) {
+                return is_string($value) && strlen($value) <= 8192 ? trim($value) : '';
             }
         }
     }
@@ -65,8 +78,9 @@ function request_header_value(string $name): string
 
 function basic_credentials(): array
 {
-    $username = (string)($_SERVER['PHP_AUTH_USER'] ?? '');
-    $password = (string)($_SERVER['PHP_AUTH_PW'] ?? '');
+    $username = is_string($_SERVER['PHP_AUTH_USER'] ?? null) ? $_SERVER['PHP_AUTH_USER'] : '';
+    $password = is_string($_SERVER['PHP_AUTH_PW'] ?? null) ? $_SERVER['PHP_AUTH_PW'] : '';
+    if (strlen($username) > 80 || strlen($password) > 1024) { return ['', '']; }
     if ($username !== '' || $password !== '') {
         return [$username, $password];
     }
@@ -79,7 +93,8 @@ function basic_credentials(): array
     if (!is_string($decoded) || strpos($decoded, ':') === false) {
         return ['', ''];
     }
-    return explode(':', $decoded, 2);
+    [$username, $password] = explode(':', $decoded, 2);
+    return strlen($username) <= 80 && strlen($password) <= 1024 ? [$username, $password] : ['', ''];
 }
 
 function endpoint_slug(): string
@@ -174,7 +189,8 @@ function api_state_open(string $path, bool $create = false, bool $exclusive = fa
         if ($handle === false) { throw new RuntimeException('state_open_failed'); }
     } else {
         if (!is_array($before)) { return null; }
-        if (($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1) {
+        if (($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1
+            || ($before['mode'] & 0137) || !in_array($before['uid'], [0, posix_geteuid()], true)) {
             throw new RuntimeException('state_unsafe');
         }
         // Linux opens O_RDWR FIFOs without waiting for another endpoint. A
@@ -187,6 +203,7 @@ function api_state_open(string $path, bool $create = false, bool $exclusive = fa
     $current = @lstat($path);
     if (!is_array($metadata) || !is_array($current)
         || !api_state_metadata_matches($metadata, $current)
+        || ($metadata['mode'] & 0137) || !in_array($metadata['uid'], [0, posix_geteuid()], true)
         || ($before !== false && !api_state_metadata_matches($before, $metadata))) {
         fclose($handle);
         throw new RuntimeException('state_changed_or_unsafe');
@@ -200,8 +217,12 @@ function api_state_parent_matches(string $directory, $handle): bool
     $current = @lstat($directory);
     $opened = fstat($handle);
     return is_array($current) && is_array($opened)
-        && ($current['mode'] & 0170000) === 0040000
-        && $current['dev'] === $opened['dev'] && $current['ino'] === $opened['ino'];
+        && ($current['mode'] & 0170000) === 0040000 && ($opened['mode'] & 0170000) === 0040000
+        && $current['dev'] === $opened['dev'] && $current['ino'] === $opened['ino']
+        && $current['uid'] === $opened['uid'] && $current['gid'] === $opened['gid']
+        && $current['mode'] === $opened['mode']
+        && in_array($current['uid'], [0, posix_geteuid()], true)
+        && ($current['mode'] & 0022) === 0;
 }
 
 function api_state_lock($handle, float $deadline): bool
@@ -233,7 +254,11 @@ function api_state_transaction(string $path, int $maximum, callable $update, int
             $component .= '/' . $part;
             clearstatcache(true, $component);
             $metadata = @lstat($component);
-            if (!is_array($metadata) || ($metadata['mode'] & 0170000) !== 0040000) {
+            $sharedTemporary = is_array($metadata) && $metadata['uid'] === 0
+                && ($metadata['mode'] & 01000) !== 0 && ($metadata['mode'] & 0002) !== 0;
+            if (!is_array($metadata) || ($metadata['mode'] & 0170000) !== 0040000
+                || !in_array($metadata['uid'], [0, posix_geteuid()], true)
+                || (($metadata['mode'] & 0022) !== 0 && !$sharedTemporary)) {
                 throw new RuntimeException('state_directory_unsafe');
             }
         }
@@ -265,8 +290,9 @@ function api_state_transaction(string $path, int $maximum, callable $update, int
             if ($original['size'] > $maximum) { throw new RuntimeException('state_oversized'); }
             $raw = stream_get_contents($legacy, $maximum + 1);
             if (!is_string($raw) || strlen($raw) > $maximum) { throw new RuntimeException('state_oversized'); }
-            $data = json_decode($raw, true, 32);
-            if (!is_array($data) || ($data !== [] && array_is_list($data)) || json_last_error() !== JSON_ERROR_NONE) {
+            try { $data = \SLS\MassNotify\ApiSecurity::jsonObject($raw, true); }
+            catch (Throwable $error) { throw new RuntimeException('state_invalid'); }
+            if (!is_array($data) || ($data !== [] && array_is_list($data))) {
                 throw new RuntimeException('state_invalid');
             }
         }
@@ -329,9 +355,9 @@ function api_rate_entries_valid(array $data, int $maximum, bool $desktop): bool
 {
     if (count($data) > $maximum) { return false; }
     foreach ($data as $key => $entry) {
-        if (!is_string($key) || !preg_match($desktop ? '/^(ok:|failed:)?[a-f0-9]{64}$/' : '/^[a-f0-9]{64}$/', $key)
+        if (!is_string($key) || !preg_match($desktop ? '/^(ok:|failed:)?[a-f0-9]{64}$/D' : '/^[a-f0-9]{64}$/D', $key)
             || !is_array($entry) || !is_string($entry['bucket'] ?? null)
-            || !preg_match('/^[0-9]{12}$/', $entry['bucket'])
+            || !preg_match('/^[0-9]{12}$/D', $entry['bucket'])
             || !is_int($entry['count'] ?? null) || $entry['count'] < 0) {
             return false;
         }
@@ -484,26 +510,86 @@ function retention_days(array $settings): int
     return min(365, max(1, (int)($settings['log_retention_days'] ?? 90)));
 }
 
+function desktop_timestamp(string $value): ?int
+{
+    if (!preg_match('/^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]{1,9}))?(Z|[+-](?:(?:0[0-9]|1[0-3]):[0-5][0-9]|14:00))$/D', $value, $parts)) {
+        return null;
+    }
+    // Python publishes microseconds. Use whole seconds for comparisons without
+    // changing the original timestamp or extending an announcement lifetime.
+    $fraction = str_pad(substr($parts[2], 0, 6), 6, '0');
+    $canonical = $parts[1] . '.' . $fraction . ($parts[3] === 'Z' ? '+00:00' : $parts[3]);
+    $parsed = \DateTimeImmutable::createFromFormat('!Y-m-d\TH:i:s.uP', $canonical);
+    $errors = \DateTimeImmutable::getLastErrors();
+    if (!$parsed || (is_array($errors) && ($errors['warning_count'] !== 0 || $errors['error_count'] !== 0))
+        || $parsed->format('Y-m-d\TH:i:s.uP') !== $canonical) {
+        return null;
+    }
+    return $parsed->getTimestamp();
+}
+
+function desktop_event_id_valid(string $value): bool
+{
+    return $value !== '' && strlen($value) <= MAX_EVENT_ID_BYTES && trim($value) === $value
+        && preg_match('/[\x00-\x1f\x7f]/', $value) === 0;
+}
+
+function desktop_event_id(array $event): ?string
+{
+    $value = $event['id'] ?? $event['event_id'] ?? null;
+    return is_string($value) && desktop_event_id_valid($value) ? $value : null;
+}
+
+function desktop_private_directory_open(string $directory)
+{
+    if ($directory === '' || $directory[0] !== '/' || strpos($directory, "\0") !== false
+        || realpath($directory) !== $directory) {
+        return false;
+    }
+    $component = '';
+    foreach (explode('/', trim($directory, '/')) as $part) {
+        $component .= '/' . $part;
+        clearstatcache(true, $component);
+        $metadata = @lstat($component);
+        $sharedTemporary = is_array($metadata) && $metadata['uid'] === 0
+            && ($metadata['mode'] & 01000) !== 0 && ($metadata['mode'] & 0002) !== 0;
+        if (!is_array($metadata) || ($metadata['mode'] & 0170000) !== 0040000
+            || !in_array($metadata['uid'], [0, posix_geteuid()], true)
+            || (($metadata['mode'] & 0022) !== 0 && !$sharedTemporary)) {
+            return false;
+        }
+    }
+    $handle = @fopen($directory, 'r');
+    if ($handle === false || !api_state_parent_matches($directory, $handle)) {
+        if (is_resource($handle)) { fclose($handle); }
+        return false;
+    }
+    return $handle;
+}
+
 function atomic_replace_journal(string $eventsFile, string $contents, ?callable $replaceFile = null, ?array $expectedMetadata = null): bool
 {
     // Shared with acknowledgement persistence; its single JSON object is not
     // subject to the per-event JSONL line limit.
     if (strlen($contents) > 67108864) { return false; }
-    $directory = realpath(dirname($eventsFile));
-    if (!is_string($directory) || $directory !== dirname($eventsFile)) { return false; }
-    clearstatcache(true, $eventsFile);
-    $before = @lstat($eventsFile);
-    if (is_array($before) && (($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1)) { return false; }
-    if ($expectedMetadata !== null && (!is_array($before) || $before['dev'] !== $expectedMetadata['dev'] || $before['ino'] !== $expectedMetadata['ino'])) { return false; }
-    $directoryHandle = @fopen($directory, 'r');
+    $directory = dirname($eventsFile);
+    $directoryHandle = desktop_private_directory_open($directory);
     if ($directoryHandle === false) { return false; }
-    $temporary = $directory . '/.sipnotify_events.' . bin2hex(random_bytes(16));
+    $before = null;
+    $temporary = '';
     $temporaryHandle = null;
     $committed = false;
     try {
+        clearstatcache(true, $eventsFile);
+        $before = @lstat($eventsFile);
+        if (is_array($before) && (($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1
+            || ($before['mode'] & 0137) || !in_array($before['uid'], [0, posix_geteuid()], true))) { return false; }
+        if ($expectedMetadata !== null && (!is_array($before) || $before['dev'] !== $expectedMetadata['dev'] || $before['ino'] !== $expectedMetadata['ino'])) { return false; }
+        $temporary = $directory . '/.sipnotify_events.' . bin2hex(random_bytes(16));
         $previousMask = umask(0027);
         try { $temporaryHandle = @fopen($temporary, 'x+b'); } finally { umask($previousMask); }
-        if ($temporaryHandle === false || !desktop_journal_identity($temporaryHandle, $temporary)) { return false; }
+        if ($temporaryHandle === false || !desktop_journal_identity($temporaryHandle, $temporary)
+            || !api_state_parent_matches($directory, $directoryHandle)) { return false; }
         $length = strlen($contents);
         for ($offset = 0; $offset < $length;) {
             $written = @fwrite($temporaryHandle, substr($contents, $offset, 65536));
@@ -511,20 +597,24 @@ function atomic_replace_journal(string $eventsFile, string $contents, ?callable 
             $offset += $written;
         }
         if (!@fflush($temporaryHandle) || (function_exists('fsync') && !@fsync($temporaryHandle))
-            || !desktop_journal_identity($temporaryHandle, $temporary)) { return false; }
+            || !desktop_journal_identity($temporaryHandle, $temporary)
+            || !api_state_parent_matches($directory, $directoryHandle)) { return false; }
         clearstatcache(true, $eventsFile);
         $current = @lstat($eventsFile);
         if (is_array($before)) {
             if (!is_array($current) || ($current['mode'] & 0170000) !== 0100000 || $current['nlink'] !== 1
+                || ($current['mode'] & 0137) || !in_array($current['uid'], [0, posix_geteuid()], true)
                 || $current['dev'] !== $before['dev'] || $current['ino'] !== $before['ino']) { return false; }
         } elseif ($current !== false) { return false; }
         $replaceFile = $replaceFile ?? static function (string $source, string $destination): bool { return @rename($source, $destination); };
-        if (!$replaceFile($temporary, $eventsFile)) { return false; }
+        if (!api_state_parent_matches($directory, $directoryHandle)
+            || !$replaceFile($temporary, $eventsFile)) { return false; }
         $committed = true;
         if (function_exists('fsync') && !@fsync($directoryHandle)) { return false; }
         return true;
     } finally {
-        if (!$committed && is_resource($temporaryHandle) && desktop_journal_identity($temporaryHandle, $temporary)) { @unlink($temporary); }
+        if (!$committed && is_resource($temporaryHandle) && api_state_parent_matches($directory, $directoryHandle)
+            && desktop_journal_identity($temporaryHandle, $temporary)) { @unlink($temporary); }
         if (is_resource($temporaryHandle)) { fclose($temporaryHandle); }
         fclose($directoryHandle);
     }
@@ -537,20 +627,35 @@ function desktop_journal_identity($handle, string $path): bool
     return is_array($opened) && is_array($named)
         && ($opened['mode'] & 0170000) === 0100000 && ($named['mode'] & 0170000) === 0100000
         && $opened['nlink'] === 1 && $named['nlink'] === 1
+        && !($opened['mode'] & 0137) && !($named['mode'] & 0137)
+        && in_array($opened['uid'], [0, posix_geteuid()], true)
+        && in_array($named['uid'], [0, posix_geteuid()], true)
         && $opened['dev'] === $named['dev'] && $opened['ino'] === $named['ino'];
 }
 
 function desktop_journal_open(string $path, string $error)
 {
     clearstatcache(true, $path);
-    if (realpath(dirname($path)) !== dirname($path)) { throw new RuntimeException($error); }
+    $directory = dirname($path);
+    $directoryHandle = desktop_private_directory_open($directory);
+    if ($directoryHandle === false) { throw new RuntimeException($error); }
     $before = @lstat($path);
-    if (is_array($before) && (($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1)) { throw new RuntimeException($error); }
+    if (is_array($before) && (($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1
+        || ($before['mode'] & 0137) || !in_array($before['uid'], [0, posix_geteuid()], true))) {
+        fclose($directoryHandle);
+        throw new RuntimeException($error);
+    }
     // O_RDWR makes opening a raced-in FIFO nonblocking before fstat rejects it.
     $previousMask = umask(0027);
     try { $handle = @fopen($path, 'c+b'); } finally { umask($previousMask); }
-    if ($handle === false) { throw new RuntimeException($error); }
-    if (!desktop_journal_identity($handle, $path)) { fclose($handle); throw new RuntimeException($error); }
+    if ($handle === false) { fclose($directoryHandle); throw new RuntimeException($error); }
+    $opened = fstat($handle);
+    if (!desktop_journal_identity($handle, $path) || (is_array($before)
+        && ($opened['dev'] !== $before['dev'] || $opened['ino'] !== $before['ino']))
+        || !api_state_parent_matches($directory, $directoryHandle)) {
+        fclose($handle); fclose($directoryHandle); throw new RuntimeException($error);
+    }
+    fclose($directoryHandle);
     return $handle;
 }
 
@@ -600,7 +705,10 @@ function retained_events(array $settings): array
     try {
         clearstatcache(true, $eventsFile);
         $metadata = @lstat($eventsFile);
-        if (is_array($metadata) && (($metadata['mode'] & 0170000) !== 0100000 || $metadata['nlink'] !== 1)) { throw new RuntimeException('journal_unavailable'); }
+        if (is_array($metadata) && (($metadata['mode'] & 0170000) !== 0100000 || $metadata['nlink'] !== 1
+            || ($metadata['mode'] & 0137) || !in_array($metadata['uid'], [0, posix_geteuid()], true))) {
+            throw new RuntimeException('journal_unavailable');
+        }
         if (is_array($metadata) && $metadata['size'] > 67108864) { throw new RuntimeException('journal_too_large'); }
         $fingerprint = is_array($metadata) ? implode(':', [$metadata['dev'], $metadata['ino'], $metadata['size'], $metadata['mtime'], $metadata['ctime'], retention_days($settings)]) : '';
         if ($fingerprint !== '' && $fingerprint === $cachedFingerprint && time() - $cachedAt < 15) { return $cachedEvents; }
@@ -626,11 +734,14 @@ function retained_events(array $settings): array
             if (strlen($line) > 262144) { throw new RuntimeException('journal_line_too_large'); }
             if (trim($line) === '') { $changed = true; continue; }
             desktop_journal_memory(max(4194304, strlen($line) * 32));
-            $event = json_decode($line, true, 64);
-            if (!is_array($event) || json_last_error() !== JSON_ERROR_NONE || substr(ltrim($line), 0, 1) !== '{') { throw new RuntimeException('journal_corrupt'); }
-            if (isset($event['created_at']) && !is_string($event['created_at'])) { throw new RuntimeException('journal_corrupt'); }
-            $created = strtotime((string)($event['created_at'] ?? ''));
-            if ($created !== false && $created < $cutoff) { $changed = true; continue; }
+            try { $event = \SLS\MassNotify\ApiSecurity::jsonObject($line); }
+            catch (Throwable $error) { throw new RuntimeException('journal_corrupt'); }
+            if (isset($event['created_at']) && (!is_string($event['created_at'])
+                || ($created = desktop_timestamp($event['created_at'])) === null)) {
+                throw new RuntimeException('journal_corrupt');
+            }
+            $created = isset($event['created_at']) ? $created : null;
+            if ($created !== null && $created < $cutoff) { $changed = true; continue; }
             $events[$sequence] = $event; $lines[$sequence] = rtrim($line, "\r\n") . "\n"; $sequence++;
             if (substr($line, -1) !== "\n") { $changed = true; }
             if (count($events) > RETENTION_MAX_EVENTS) { unset($events[$sequence - RETENTION_MAX_EVENTS - 1], $lines[$sequence - RETENTION_MAX_EVENTS - 1]); $changed = true; }
@@ -660,12 +771,25 @@ function retained_events(array $settings): array
 function desktop_stream_slot(string $username)
 {
     $directory = dirname(EVENTS_FILE) . '/stream-slots';
-    if (is_link($directory) || (!is_dir($directory) && !@mkdir($directory, 0750))
-        || realpath($directory) !== $directory) {
+    $parentDirectory = dirname($directory);
+    $parentHandle = desktop_private_directory_open($parentDirectory);
+    if ($parentHandle === false) {
+        respond(503, ['ok' => false, 'error' => 'stream_capacity_unavailable']);
+    }
+    try {
+        if (is_link($directory) || (!is_dir($directory) && !@mkdir($directory, 0750))
+            || !api_state_parent_matches($parentDirectory, $parentHandle)
+            || realpath($directory) !== $directory) {
+            respond(503, ['ok' => false, 'error' => 'stream_capacity_unavailable']);
+        }
+    } finally { fclose($parentHandle); }
+    $directoryHandle = desktop_private_directory_open($directory);
+    if ($directoryHandle === false) {
         respond(503, ['ok' => false, 'error' => 'stream_capacity_unavailable']);
     }
     $handles = [];
-    foreach (['client-' . hash('sha256', $username) => 2, 'global' => 32] as $prefix => $limit) {
+    try {
+      foreach (['client-' . hash('sha256', $username) => 2, 'global' => 32] as $prefix => $limit) {
         $claimed = false;
         for ($slot = 0; $slot < $limit; $slot++) {
             $path = $directory . '/' . $prefix . '-' . $slot . '.lock';
@@ -676,7 +800,8 @@ function desktop_stream_slot(string $username)
             }
             $mask = umask(0027);
             try { $handle = @fopen($path, 'c+b'); } finally { umask($mask); }
-            if ($handle !== false && desktop_journal_identity($handle, $path)
+            if ($handle !== false && api_state_parent_matches($directory, $directoryHandle)
+                && desktop_journal_identity($handle, $path)
                 && flock($handle, LOCK_EX | LOCK_NB) && desktop_journal_identity($handle, $path)) {
                 $handles[] = $handle;
                 $claimed = true;
@@ -702,6 +827,9 @@ function desktop_stream_slot(string $username)
                 ],
             ]);
         }
+      }
+    } finally {
+        fclose($directoryHandle);
     }
     return $handles;
 }
@@ -739,10 +867,8 @@ function announcement_display_expired(array $event, ?int $now = null): bool
     if ($expiresAt === '') {
         return false;
     }
-    $expiresTimestamp = strtotime($expiresAt);
-    if ($expiresTimestamp === false) {
-        return false;
-    }
+    $expiresTimestamp = desktop_timestamp($expiresAt);
+    if ($expiresTimestamp === null) { return true; }
     return $expiresTimestamp <= ($now ?? time());
 }
 
@@ -758,23 +884,35 @@ function desktop_event_display_expired(array $event, ?int $now = null): bool
     if ($expiresAt === '') {
         return false;
     }
-    $expiresTimestamp = strtotime($expiresAt);
-    return $expiresTimestamp !== false && $expiresTimestamp <= ($now ?? time());
+    $expiresTimestamp = desktop_timestamp($expiresAt);
+    return $expiresTimestamp === null || $expiresTimestamp <= ($now ?? time());
 }
 
-function desktop_event_routed_to_client(array $event, string $username): bool
+function desktop_event_routed_to_client(array $event, string $username, ?string $clientId = null): bool
 {
+    if ($clientId !== null) {
+        $bindings = $event['desktop_client_ids'] ?? null;
+        if (!is_array($bindings)) { return false; }
+        $binding = $bindings[$username] ?? null;
+        if ($clientId === '' || !is_string($binding) || !hash_equals($clientId, $binding)) { return false; }
+    }
     // Legacy records without explicit desktop routing remain denied so one
     // desktop cannot read another client's history.
     if (!array_key_exists('desktop_all', $event) && !array_key_exists('desktop_recipients', $event)) {
         return false;
     }
-    $recipients = is_array($event['desktop_recipients'] ?? null) ? $event['desktop_recipients'] : [];
-    return !empty($event['desktop_all']) || in_array($username, $recipients, true);
+    $all = $event['desktop_all'] ?? false;
+    $recipients = $event['desktop_recipients'] ?? [];
+    if (!is_bool($all) || !is_array($recipients)) { return false; }
+    foreach ($recipients as $recipient) {
+        if (!is_string($recipient) || strlen($recipient) > 80) { return false; }
+    }
+    return $all === true || in_array($username, $recipients, true);
 }
 
 function desktop_event_public_payload(array $event, array $settings): array
 {
+    unset($event['desktop_client_ids']);
     // Old retained records predate the explicit flag. Only boolean true marks
     // a test; wording and truthy strings must never change alert semantics.
     $event['is_test'] = ($event['is_test'] ?? false) === true;
@@ -791,6 +929,7 @@ function desktop_event_public_payload(array $event, array $settings): array
         || ($parts[1] !== '' && ((int)$parts[1] < 1 || (int)$parts[1] > 65535))) { return $event; }
 
     $authority = $host;
+    $configuredAuthority = false;
     $sip = is_array($settings['sipnotify'] ?? null) ? $settings['sipnotify'] : [];
     foreach (['base_url' => '/api/sipnotify', 'media_base_url' => '/sls_mass_notify'] as $key => $path) {
         $configured = $sip[$key] ?? '';
@@ -799,6 +938,7 @@ function desktop_event_public_payload(array $event, array $settings): array
             . '(?::([0-9]{1,5}))?' . preg_quote($path, '#') . '/?\z#iD', $configured, $matches)
             && (!isset($matches[1]) || ((int)$matches[1] >= 1 && (int)$matches[1] <= 65535))) {
             $authority = $host . (isset($matches[1]) ? ':' . (int)$matches[1] : '');
+            $configuredAuthority = isset($matches[1]) && $matches[1] !== '';
             break;
         }
     }
@@ -806,7 +946,7 @@ function desktop_event_public_payload(array $event, array $settings): array
     // SERVER_PORT (the backend listener) nor untrusted proxy headers do that.
     $requestHost = $_SERVER['HTTP_HOST'] ?? '';
     $matches = [];
-    if (is_string($requestHost) && preg_match('#\A' . preg_quote($host, '#')
+    if (!$configuredAuthority && is_string($requestHost) && preg_match('#\A' . preg_quote($host, '#')
         . '(?::([0-9]{1,5}))?\z#iD', $requestHost, $matches)
         && (!isset($matches[1]) || ((int)$matches[1] >= 1 && (int)$matches[1] <= 65535))) {
         $authority = $host . (isset($matches[1]) ? ':' . (int)$matches[1] : '');
@@ -819,19 +959,20 @@ function desktop_stream_events_after_cursor(
     array $events,
     string $username,
     string $lastEventId,
-    ?int $now = null
+    ?int $now = null,
+    ?string $clientId = null
 ): array {
     $routedEvents = [];
     $latestAlertIds = [];
     foreach ($events as $event) {
-        if (!is_array($event) || !desktop_event_routed_to_client($event, $username)) {
+        if (!is_array($event) || !desktop_event_routed_to_client($event, $username, $clientId)) {
             continue;
         }
-        $eventId = trim((string)($event['id'] ?? $event['event_id'] ?? ''));
-        if ($eventId !== '') {
+        $eventId = desktop_event_id($event);
+        if ($eventId !== null) {
             $routedEvents[] = [$eventId, $event];
-            $chainKey = trim((string)($event['chain_key'] ?? ''));
-            if (($event['kind'] ?? '') === 'alert' && $chainKey !== '') {
+            $chainKey = is_string($event['chain_key'] ?? null) ? trim($event['chain_key']) : '';
+            if (($event['kind'] ?? null) === 'alert' && $chainKey !== '') {
                 $latestAlertIds[$chainKey] = $eventId;
             }
         }
@@ -854,13 +995,24 @@ function desktop_stream_events_after_cursor(
     }
     $cursorGap = $lastIndex < 0 && $lastEventId !== '@sls:empty';
 
+    if ($cursorGap) {
+        // A missing cursor means this client was away longer than retained
+        // history (or its device binding changed). Re-baseline at the current
+        // tail; replaying retained records would violate live-only delivery.
+        return [
+            'last_event_id' => empty($routedEvents) ? '@sls:empty' : (string)$routedEvents[count($routedEvents) - 1][0],
+            'events' => [],
+            'cursor_gap' => true,
+        ];
+    }
+
     foreach (array_slice($routedEvents, $lastIndex + 1) as $routedEvent) {
         [$eventId, $event] = $routedEvent;
         // Advance across every routed journal record, including expired and
         // superseded alerts. Otherwise an expired cursor can disappear from the
         // visible set and cause the following live event to be skipped.
         $lastEventId = (string)$eventId;
-        $chainKey = trim((string)($event['chain_key'] ?? ''));
+        $chainKey = is_string($event['chain_key'] ?? null) ? trim($event['chain_key']) : '';
         if (desktop_event_display_expired($event, $now)
             || (($event['kind'] ?? '') === 'alert' && $chainKey !== ''
                 && ($latestAlertIds[$chainKey] ?? $eventId) !== $eventId)) {
@@ -872,9 +1024,9 @@ function desktop_stream_events_after_cursor(
     return ['last_event_id' => $lastEventId, 'events' => $nextEvents, 'cursor_gap' => $cursorGap];
 }
 
-function desktop_poll_events_after_cursor(array $events, string $username, string $lastEventId, int $limit, ?int $now = null): array
+function desktop_poll_events_after_cursor(array $events, string $username, string $lastEventId, int $limit, ?int $now = null, ?string $clientId = null): array
 {
-    $batch = desktop_stream_events_after_cursor($events, $username, $lastEventId, $now);
+    $batch = desktop_stream_events_after_cursor($events, $username, $lastEventId, $now, $clientId);
     $limit = min(MAX_LIMIT, max(1, $limit));
     $hasMore = count($batch['events']) > $limit;
     $selected = array_slice($batch['events'], 0, $limit);
@@ -893,9 +1045,9 @@ function desktop_poll_events_after_cursor(array $events, string $username, strin
     ];
 }
 
-function desktop_poll_snapshot(array $events, string $username, int $limit, ?int $now = null): array
+function desktop_poll_snapshot(array $events, string $username, int $limit, ?int $now = null, ?string $clientId = null): array
 {
-    $batch = desktop_stream_events_after_cursor($events, $username, '@sls:empty', $now);
+    $batch = desktop_stream_events_after_cursor($events, $username, '@sls:empty', $now, $clientId);
     $limit = min(MAX_LIMIT, max(1, $limit));
     return [
         'events' => array_slice(array_column($batch['events'], 1), -$limit),
@@ -914,29 +1066,33 @@ function record_desktop_acknowledgement(array $settings, array $client, array $e
 {
     $username = (string)($client['username'] ?? '');
     $clientId = (string)($client['client_id'] ?? '');
-    $eventId = (string)($event['id'] ?? $event['event_id'] ?? '');
-    if ($username === '' || $eventId === '' || strlen($eventId) > 1024) {
+    $eventId = desktop_event_id($event);
+    if ($username === '' || $eventId === null) {
         return false;
     }
     $directory = DESKTOP_ACK_DIRECTORY;
-    if (is_link($directory) || (!is_dir($directory) && !@mkdir($directory, 0750) && !is_dir($directory))) {
-        return false;
-    }
-    $directoryMetadata = @lstat($directory);
-    if (!$directoryMetadata || ($directoryMetadata['mode'] & 0170000) !== 0040000
-        || ($directoryMetadata['mode'] & 0022) || realpath($directory) !== $directory) {
-        return false;
-    }
+    $parentDirectory = dirname($directory);
+    $parentHandle = desktop_private_directory_open($parentDirectory);
+    if ($parentHandle === false) { return false; }
+    try {
+        if (is_link($directory) || (!is_dir($directory) && !@mkdir($directory, 0750) && !is_dir($directory))
+            || !api_state_parent_matches($parentDirectory, $parentHandle)) { return false; }
+    } finally { fclose($parentHandle); }
+    $directoryHandle = desktop_private_directory_open($directory);
+    if ($directoryHandle === false) { return false; }
     $path = $directory . '/' . hash('sha256', $clientId !== '' ? 'id:' . $clientId : 'user:' . $username) . '.json';
     $lockPath = $path . '.lock';
     if (is_link($path) || is_link($lockPath)) {
+        fclose($directoryHandle);
         return false;
     }
-    $lockHandle = @fopen($lockPath, 'c+');
+    try { $lockHandle = desktop_journal_open($lockPath, 'acknowledgement_lock_unavailable'); }
+    catch (Throwable $error) { fclose($directoryHandle); return false; }
     if ($lockHandle === false || !flock($lockHandle, LOCK_EX | LOCK_NB)) {
         if (is_resource($lockHandle)) {
             fclose($lockHandle);
         }
+        fclose($directoryHandle);
         return false;
     }
     try {
@@ -947,17 +1103,28 @@ function record_desktop_acknowledgement(array $settings, array $client, array $e
             || $metadata['ino'] !== $pathMetadata['ino'] || $metadata['dev'] !== $pathMetadata['dev']) {
             return false;
         }
-        @chmod($lockPath, 0640);
         $acknowledgements = [];
+        $original = null;
         clearstatcache(true, $path);
         if (file_exists($path) || is_link($path)) {
             $metadata = @lstat($path);
             if (!is_array($metadata) || ($metadata['mode'] & 0170000) !== 0100000
-                || $metadata['nlink'] !== 1 || $metadata['size'] > 2097152) {
+                || $metadata['nlink'] !== 1 || ($metadata['mode'] & 0137)
+                || !in_array($metadata['uid'], [0, posix_geteuid()], true) || $metadata['size'] > 2097152) {
                 return false;
             }
-            $raw = @file_get_contents($path);
-            $stored = is_string($raw) ? json_decode($raw, true) : null;
+            $reader = desktop_journal_open($path, 'acknowledgement_unavailable');
+            try {
+                $original = fstat($reader);
+                if ($original['size'] > 2097152) { return false; }
+                $raw = stream_get_contents($reader, 2097153);
+                $after = fstat($reader);
+                if (!is_string($raw) || strlen($raw) > 2097152 || strlen($raw) !== $original['size']
+                    || !desktop_journal_identity($reader, $path)
+                    || $after['size'] !== $original['size'] || $after['mtime'] !== $original['mtime']
+                    || $after['ctime'] !== $original['ctime']) { return false; }
+                $stored = \SLS\MassNotify\ApiSecurity::jsonObject($raw);
+            } finally { fclose($reader); }
             // Preserve unreadable/corrupt history for diagnosis instead of
             // silently replacing it with a success-shaped empty store.
             if (!is_array($stored) || ($stored['schema'] ?? null) !== 1
@@ -976,7 +1143,8 @@ function record_desktop_acknowledgement(array $settings, array $client, array $e
         $now = $now ?? time();
         $cutoff = $now - retention_days($settings) * 86400;
         $acknowledgements = array_filter($acknowledgements, static function ($entry) use ($cutoff): bool {
-            return is_array($entry) && strtotime((string)($entry['ack_at'] ?? '')) >= $cutoff;
+            return is_array($entry) && is_string($entry['ack_at'] ?? null)
+                && ($timestamp = desktop_timestamp($entry['ack_at'])) !== null && $timestamp >= $cutoff;
         });
         $key = hash('sha256', $eventId);
         if (isset($acknowledgements[$key]) && (!is_array($acknowledgements[$key])
@@ -1004,10 +1172,14 @@ function record_desktop_acknowledgement(array $settings, array $client, array $e
             'username' => $username,
             'acknowledgements' => $acknowledgements,
         ], JSON_UNESCAPED_SLASHES);
-        return is_string($encoded) && atomic_replace_journal($path, $encoded . "\n");
+        return is_string($encoded) && strlen($encoded) < 2097152
+            && atomic_replace_journal($path, $encoded . "\n", null, $original);
+    } catch (Throwable $error) {
+        return false;
     } finally {
         flock($lockHandle, LOCK_UN);
         fclose($lockHandle);
+        fclose($directoryHandle);
     }
 }
 
@@ -1063,10 +1235,14 @@ if ($endpoint === 'desktop/incident' || $endpoint === 'desktop/incident/respond'
     $id = is_string($_GET['incident_id'] ?? null) ? $_GET['incident_id'] : '';
     $input = [];
     if ($endpoint === 'desktop/incident/respond') {
-        if (stripos((string)($_SERVER['CONTENT_TYPE'] ?? ''), 'application/json') !== 0) { respond(415, ['ok' => false, 'error' => 'content_type_must_be_json']); }
+        $contentType = $_SERVER['CONTENT_TYPE'] ?? '';
+        if (!is_string($contentType) || !preg_match('/^application\/json(?:\s*;|$)/iD', $contentType)) {
+            respond(415, ['ok' => false, 'error' => 'content_type_must_be_json']);
+        }
         $raw = (string)file_get_contents('php://input', false, null, 0, 8193);
         if (strlen($raw) > 8192) { respond(413, ['ok' => false, 'error' => 'request_too_large']); }
-        $input = json_decode($raw, true, 16);
+        try { $input = \SLS\MassNotify\ApiSecurity::jsonObject($raw); }
+        catch (Throwable $error) { respond(400, ['ok' => false, 'error' => 'invalid_incident_response']); }
         if (!is_array($input) || array_is_list($input) || array_diff(array_keys($input), ['incident_id', 'request_id', 'response', 'note'])) {
             respond(400, ['ok' => false, 'error' => 'invalid_incident_response']);
         }
@@ -1091,11 +1267,13 @@ if ($endpoint === 'desktop/incident' || $endpoint === 'desktop/incident/respond'
 }
 if ($endpoint === 'desktop/ack') {
     $raw = (string)file_get_contents('php://input', false, null, 0, 4097);
-    $ack = strlen($raw) <= 4096 ? json_decode($raw, true) : null;
-    $eventId = is_array($ack) && is_string($ack['event_id'] ?? null) ? $ack['event_id'] : '';
+    try { $ack = strlen($raw) <= 4096 ? \SLS\MassNotify\ApiSecurity::jsonObject($raw) : null; }
+    catch (Throwable $error) { $ack = null; }
+    $eventId = is_array($ack) && is_string($ack['event_id'] ?? null)
+        && desktop_event_id_valid($ack['event_id']) ? $ack['event_id'] : '';
     foreach (retained_events($settings) as $event) {
         if ($eventId !== '' && hash_equals((string)($event['id'] ?? $event['event_id'] ?? ''), $eventId)
-            && desktop_event_routed_to_client($event, $username)) {
+            && desktop_event_routed_to_client($event, $username, (string)($client['client_id'] ?? ''))) {
             if (!record_desktop_acknowledgement($settings, $client, $event)) {
                 header('Retry-After: 5');
                 respond(503, ['ok' => false, 'error' => 'acknowledgement_persist_failed', 'retryable' => true]);
@@ -1106,11 +1284,32 @@ if ($endpoint === 'desktop/ack') {
     }
     respond(400, ['ok' => false, 'error' => 'unknown_or_unauthorized_event']);
 }
+$streamParameter = $_GET['stream'] ?? '';
 $streamRequested = $endpoint === 'desktop/stream'
-    || (string)($_GET['stream'] ?? '') === '1'
+    || (is_string($streamParameter) && $streamParameter === '1')
     || stripos(request_header_value('Accept'), 'text/event-stream') !== false;
 
 if ($streamRequested) {
+    $lastEventId = trim(request_header_value('Last-Event-ID'));
+    if ($lastEventId === '') {
+        $queryCursor = $_GET['last_event_id'] ?? '';
+        if (!is_string($queryCursor)) { respond(400, ['ok' => false, 'error' => 'invalid_cursor']); }
+        $lastEventId = trim($queryCursor);
+    }
+	if ($lastEventId !== '' && $lastEventId !== '@sls:empty' && !desktop_event_id_valid($lastEventId)) { respond(400, ['ok' => false, 'error' => 'invalid_cursor']); }
+    $requestedStreamSeconds = $_GET['stream_seconds'] ?? '300';
+    if (!is_string($requestedStreamSeconds) || !preg_match('/^[0-9]{1,3}$/D', $requestedStreamSeconds)) {
+        respond(400, ['ok' => false, 'error' => 'invalid_stream_seconds']);
+    }
+	$streamSeconds = min(300, max(1, (int)$requestedStreamSeconds));
+    // A long stream occupies one FPM worker. Keep shared PBX pools available
+    // for short authenticated polling, acknowledgements and admin requests.
+    if (PHP_SAPI === 'fpm-fcgi') {
+        header('Retry-After: 300');
+        respond(429, ['ok'=>false, 'error'=>'stream_capacity_reached', 'reason'=>'php_fpm_worker_pool',
+            'fallback'=>['transport'=>'json_poll', 'path'=>'/api/sipnotify/desktop',
+                'cursor_parameter'=>'last_event_id', 'poll_interval_seconds'=>5]]);
+    }
     $streamSlots = desktop_stream_slot($username);
     register_shutdown_function(static function () use (&$streamSlots): void {
         desktop_stream_release_slots($streamSlots);
@@ -1132,15 +1331,11 @@ if ($streamRequested) {
             respond(503, ['ok' => false, 'error' => 'stream_output_buffer_unavailable']);
         }
     }
-    $lastEventId = trim(request_header_value('Last-Event-ID'));
-    if ($lastEventId === '') {
-        $lastEventId = trim((string)($_GET['last_event_id'] ?? ''));
-    }
 	$sessionId = bin2hex(random_bytes(16));
     // Establish the baseline before the handshake; later arrivals, including
     // the first targeted record ever written, must be emitted by the loop.
     if ($lastEventId === '') {
-        $baseline = desktop_stream_events_after_cursor(retained_events($settings), $username, '');
+        $baseline = desktop_stream_events_after_cursor(retained_events($settings), $username, '', null, (string)($client['client_id'] ?? ''));
         $lastEventId = $baseline['last_event_id'];
     }
     echo "retry: 1000\n";
@@ -1148,27 +1343,32 @@ if ($streamRequested) {
     echo "event: authenticated\n";
     echo 'data: ' . json_encode(['ok' => true, 'transport' => 'live_sse', 'protocol_version' => 2, 'ack_path' => '/api/sipnotify/desktop/ack', 'session_id' => $sessionId, 'client_id' => (string)($client['client_id'] ?? ''), 'name' => (string)($client['name'] ?? ''), 'heartbeat_seconds' => 15, 'connected_at' => gmdate('c')], JSON_UNESCAPED_SLASHES) . "\n\n";
     desktop_stream_flush();
-    $started = time();
-	$streamSeconds = min(300, max(1, (int)($_GET['stream_seconds'] ?? 300)));
-    $lastKeepalive = 0;
-    $lastAuthCheck = 0;
-    while (!connection_aborted() && time() - $started < $streamSeconds) {
-        if (time() - $lastAuthCheck >= 5) {
+    $GLOBALS['slsDesktopSseActive'] = true;
+    $started = hrtime(true) / 1e9;
+    $lastKeepalive = $started - 15;
+    $lastAuthCheck = $started - 5;
+    while (!connection_aborted() && hrtime(true) / 1e9 - $started < $streamSeconds) {
+        $tick = hrtime(true) / 1e9;
+        if ($tick - $lastAuthCheck >= 5) {
             $settings = settings_config();
-            if (empty(authorized_desktop_client($settings, $basicUser, $basicPass))) {
+            $currentClient = authorized_desktop_client($settings, $basicUser, $basicPass);
+            if (empty($currentClient) || !hash_equals((string)($client['client_id'] ?? ''), (string)($currentClient['client_id'] ?? ''))) {
                 echo "event: revoked\ndata: {\"ok\":false,\"error\":\"credentials_revoked\"}\n\n";
                 desktop_stream_flush();
-                break;
+                desktop_stream_release_slots($streamSlots);
+                exit;
             }
-            $lastAuthCheck = time();
+            $lastAuthCheck = $tick;
         }
 		$streamBatch = desktop_stream_events_after_cursor(
 			retained_events($settings),
 			$username,
-			$lastEventId
+            $lastEventId,
+            null,
+            (string)($client['client_id'] ?? '')
 		);
         if (!empty($streamBatch['cursor_gap'])) {
-            echo "event: cursor_reset\ndata: {\"reason\":\"history_gap\",\"replay\":true}\n\n";
+            echo "event: cursor_reset\ndata: {\"reason\":\"history_gap\",\"replay\":false}\n\n";
         }
 		$hasOutput = !empty($streamBatch['cursor_gap']);
 		foreach ($streamBatch['events'] as $streamEvent) {
@@ -1180,10 +1380,10 @@ if ($streamRequested) {
 			echo 'data: ' . json_encode($event, JSON_UNESCAPED_SLASHES) . "\n\n";
 		}
 		$lastEventId = (string)$streamBatch['last_event_id'];
-        if (time() - $lastKeepalive >= 15) {
+        if ($tick - $lastKeepalive >= 15) {
             update_desktop_seen($client, ['connected_until' => time() + 30], $settings);
             echo ': keepalive ' . time() . "\n\n";
-            $lastKeepalive = time();
+            $lastKeepalive = $tick;
             $hasOutput = true;
         }
         if ($hasOutput) { desktop_stream_flush(); }
@@ -1195,20 +1395,27 @@ if ($streamRequested) {
     exit;
 }
 
-$limit = min(MAX_LIMIT, max(1, (int)($_GET['limit'] ?? DEFAULT_LIMIT)));
+$requestedLimit = $_GET['limit'] ?? (string)DEFAULT_LIMIT;
+if (!is_string($requestedLimit) || !preg_match('/^[0-9]{1,3}$/D', $requestedLimit)) {
+    respond(400, ['ok' => false, 'error' => 'invalid_limit']);
+}
+$limit = min(MAX_LIMIT, max(1, (int)$requestedLimit));
 $resumeCursor = trim(request_header_value('Last-Event-ID'));
 $cursorRequested = $resumeCursor !== '' || array_key_exists('last_event_id', $_GET);
 if ($resumeCursor === '') {
-    $resumeCursor = trim((string)($_GET['last_event_id'] ?? ''));
+    $queryCursor = $_GET['last_event_id'] ?? '';
+    if (!is_string($queryCursor)) { respond(400, ['ok' => false, 'error' => 'invalid_cursor']); }
+    $resumeCursor = trim($queryCursor);
 }
+if ($resumeCursor !== '' && $resumeCursor !== '@sls:empty' && !desktop_event_id_valid($resumeCursor)) { respond(400, ['ok' => false, 'error' => 'invalid_cursor']); }
 $journalEvents = retained_events($settings);
 if ($cursorRequested) {
-    $pollBatch = desktop_poll_events_after_cursor($journalEvents, $username, $resumeCursor, $limit);
+    $pollBatch = desktop_poll_events_after_cursor($journalEvents, $username, $resumeCursor, $limit, null, (string)($client['client_id'] ?? ''));
     $events = $pollBatch['events'];
 } else {
     // Preserve the legacy JSON history response while applying the same expiry,
     // cancellation, and routing rules as resumable SSE and JSON requests.
-    $pollBatch = desktop_poll_snapshot($journalEvents, $username, $limit);
+    $pollBatch = desktop_poll_snapshot($journalEvents, $username, $limit, null, (string)($client['client_id'] ?? ''));
     $events = $pollBatch['events'];
 }
 $events = array_map(static function (array $event) use ($settings): array {

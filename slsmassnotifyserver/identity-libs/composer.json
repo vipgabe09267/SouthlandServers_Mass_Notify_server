@@ -6,7 +6,12 @@
     "php": ">=8.2",
     "onelogin/php-saml": "^4.3",
     "firebase/php-jwt": "^7.0",
-    "league/oauth2-client": "^2.8"
+    "league/oauth2-client": "^2.8",
+    "robrichards/xmlseclibs": "4.0.0 as 3.1.999"
   },
-  "config": {"allow-plugins": {}, "sort-packages": true, "optimize-autoloader": true}
+  "config": {
+    "allow-plugins": {},
+    "sort-packages": true,
+    "optimize-autoloader": true
+  }
 }

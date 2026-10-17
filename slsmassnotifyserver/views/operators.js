@@ -4,29 +4,49 @@
   if (!root) return;
   const data = JSON.parse(document.getElementById('sls-operator-data').textContent);
   const state = data.state;
+  try {
+    const saved = sessionStorage.getItem('sls-operator-save-success');
+    sessionStorage.removeItem('sls-operator-save-success');
+    if (saved === '1') root.querySelector('#ops-result').textContent = 'Operator accounts saved. Changes apply immediately; no Apply Config is required.';
+  } catch (_) {}
   const keys = ['id','username','source','name','email','role','enabled','site_ids','location_ids','group_ids','personal_members','actions','channels','expires_at','expires_local'];
   const rows = state.access.accounts.map(row => ({...row, rebind:false}));
   const list = root.querySelector('#ops-accounts');
   const modal = root.querySelector('#ops-modal');
   const body = root.querySelector('#ops-editor');
   const error = root.querySelector('#ops-editor-error');
-  const channels = {extensions:'Phone extensions',desktop_client_ids:'Desktop applications',voice_recipient_ids:'External calls',sms_recipient_ids:'SMS / MMS',email_recipient_ids:'Email',webhook_ids:'Webhooks'};
+  const channels = {extensions:'Phone extensions',desktop_client_ids:'Desktop applications',voice_recipient_ids:'External calls',sms_recipient_ids:'SMS / MMS',email_recipient_ids:'Email',webhook_ids:'Webhooks',browser_recipient_ids:'Browser subscribers · Labs',connector_ids:'Notification connectors · Labs'};
   const actions = {view:'View assigned work',send:'Send announcements and incident updates',schedule:'Create and manage own schedules',roll_call:'Record assigned human responses'};
   const presets = {viewer:['view'],sender:['view','send'],scheduler:['view','schedule'],warden:['view','roll_call'],administrator:Object.keys(actions)};
   let focus = null;
   let dirty = false;
   const resetModal = root.querySelector('#ops-reset-modal');
   let resetFocus = null;
+  let requestBusy = false;
   for (const id of ['ops-portal-enabled','ops-enforce']) root.querySelector('#'+id).addEventListener('change',() => { dirty = true; });
 
   async function request(action,payload) {
-    const form = new URLSearchParams({slsmassnotifyserver_action:action,slsmassnotifyserver_csrf:data.csrf,payload:JSON.stringify(payload)});
-    const response = await fetch(data.endpoint,{method:'POST',body:form,credentials:'same-origin',cache:'no-store'});
-    const answer = await response.json();
-    if (!response.ok || !answer.success) throw new Error(answer.message || 'The operator request was rejected.');
-    return answer;
+    if (requestBusy) throw new Error('An operator request is already in progress. Wait for its result.');
+    requestBusy = true;
+    const controls = [...root.querySelectorAll('input,select,textarea,button')], disabled = controls.map(control => control.disabled);
+    controls.forEach(control => { control.disabled = true; });
+    const controller = new AbortController(), timer = window.setTimeout(() => controller.abort(), 20000);
+    try {
+      const form = new URLSearchParams({slsmassnotifyserver_action:action,slsmassnotifyserver_csrf:data.csrf,payload:typeof payload === 'string' ? payload : JSON.stringify(payload)});
+      const response = await fetch(data.endpoint,{method:'POST',body:form,credentials:'same-origin',cache:'no-store',signal:controller.signal});
+      const answer = await response.json();
+      if (!response.ok || !answer || answer.success !== true) throw new Error(answer?.message || 'The operator request was rejected.');
+      return answer;
+    } catch (error) {
+      if (controller.signal.aborted || error instanceof TypeError) throw new Error('The operator change was not confirmed within 20 seconds. Reload saved accounts before retrying; do not assume the change failed.');
+      throw error;
+    } finally {
+      window.clearTimeout(timer); requestBusy = false;
+      controls.forEach((control,index) => { if (control.isConnected) control.disabled = disabled[index]; });
+    }
   }
   function closeReset() {
+    if (requestBusy) return;
     resetModal.hidden = true;
     root.querySelector('#ops-reset-url').value = '';
     root.querySelector('#ops-reset-result').textContent = '';
@@ -110,7 +130,7 @@
   });
 
   function edit(index) {
-    const row = index < 0 ? {id:'',name:'',email:'',role:'viewer',enabled:true,site_ids:[],location_ids:[],group_ids:[],personal_members:{},actions:['view'],channels:Object.keys(channels),source:'portal',username:'',expires_at:0,expires_local:''} : rows[index];
+    const row = index < 0 ? {id:'',name:'',email:'',role:'viewer',enabled:true,site_ids:[],location_ids:[],group_ids:[],personal_members:{},actions:['view'],channels:Object.keys(channels).filter(k=>!['browser_recipient_ids','connector_ids'].includes(k)),source:'portal',username:'',expires_at:0,expires_local:''} : rows[index];
     const local = row.source === 'portal';
     focus = document.activeElement;
     body.replaceChildren(); error.textContent = '';
@@ -146,7 +166,7 @@
     actionBox.append(node('h3','Allowed actions')); channelBox.append(node('h3','Allowed channels'));
     const actionChecks = Object.entries(actions).map(([key,label]) => [key,check(actionBox,label,(row.actions || presets[row.role]).includes(key))]);
     actionChecks[0][1].checked = true; actionChecks[0][1].disabled = true;
-    const channelChecks = Object.entries(channels).map(([key,label]) => [key,check(channelBox,label,(row.channels || Object.keys(channels)).includes(key))]);
+    const channelChecks = Object.entries(channels).map(([key,label]) => [key,check(channelBox,label,(row.channels || Object.keys(channels).filter(k=>!['browser_recipient_ids','connector_ids'].includes(k))).includes(key))]);
     const permissionGrid = node('div','',{class:'ops-grid'}); permissionGrid.append(actionBox,channelBox); restricted.append(permissionGrid);
     restricted.append(node('h3','Who can receive notifications'));
     restricted.append(node('p','Site, location and audience grants are combined. Sites and locations include their descendants. Select personal devices alone to allow notifications only to this person.',{class:'ops-muted'}));
@@ -230,12 +250,8 @@
       const payload = JSON.stringify({revision:state.revision,enabled:root.querySelector('#ops-enforce').checked,portal_enabled:root.querySelector('#ops-portal-enabled').checked,accounts});
       const maximum = data.endpoint.startsWith('/mass-notify/') ? 65536 : 131072;
       if (new TextEncoder().encode(payload).length > maximum) throw new Error('The account form exceeds '+(maximum/1024)+' KiB. Use site or audience grants for large device lists.');
-      const form = new URLSearchParams({slsmassnotifyserver_action:'save_access',slsmassnotifyserver_csrf:data.csrf,
-        payload});
-      const response = await fetch(data.endpoint,{method:'POST',body:form,credentials:'same-origin',cache:'no-store'});
-      const answer = await response.json();
-      if (!response.ok || !answer.success) throw new Error(answer.message || 'Account save was rejected.');
-      rows.forEach(row => { delete row.password; }); result.textContent = answer.message; location.reload();
+      const answer = await request('save_access',payload);
+      rows.forEach(row => { delete row.password; }); dirty = false; result.textContent = answer.message; try { sessionStorage.setItem('sls-operator-save-success','1'); } catch (_) {} location.reload();
     } catch (error) { result.textContent = error.message; button.disabled = false; }
   });
   render();

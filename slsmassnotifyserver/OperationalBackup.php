@@ -17,7 +17,7 @@ trait SlsOperationalBackup
         $process = null; $pipes = [];
         try {
             $process = @proc_open($command, [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']],
-                $pipes, null, null, ['bypass_shell' => true]);
+                $pipes, null, ['PATH'=>'/usr/sbin:/usr/bin:/sbin:/bin','LANG'=>'C.UTF-8','LC_ALL'=>'C.UTF-8'], ['bypass_shell' => true]);
             if (!is_resource($process)) { throw new \RuntimeException(_('The operational backup helper could not start. Verify the installed runtime and PHP process support.')); }
             $output = stream_get_contents($pipes[1], 4097); fclose($pipes[1]); unset($pipes[1]);
             $exit = proc_close($process); $process = null;

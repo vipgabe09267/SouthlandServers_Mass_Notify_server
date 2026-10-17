@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import tarfile
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -160,10 +161,187 @@ rm -rf -- "$DOWNLOAD_DIR"
             handle.addfile(info, io.BytesIO(xml))
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
         script = 'source "$1"; URL=""; TGZ="$2"; SHA256="$3"; verify_publisher_release() { return 0; }; verify_tgz'
-        for supplied, accepted in ((digest, True), ('', False), ('0' * 64, False)):
+        for supplied, accepted in (
+            (digest, True), (digest.upper(), True), ('', False), ('0' * 64, False),
+            ('xyz', False), (digest + '\n' + '0' * 64, False),
+        ):
             result = subprocess.run(['bash', '-c', script, '_', str(INSTALLER), str(archive), supplied],
                                     capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
+
+    def test_current_release_basename_keeps_pinned_digest_after_private_copy(self):
+        archive = self.directory / f'slsmassnotifyserver-{VERSION}.tgz'
+        archive.write_bytes(b'not-the-published-package')
+        script = r'''
+source "$1"
+TGZ="$2"
+URL="https://github.com/example/project/releases/download/slsmassnotifyserver-0.1.7-beta/slsmassnotifyserver-0.1.7-beta.tgz"
+SHA256=""
+fetch_release_asset() { printf 'not-the-published-package' >"$2"; }
+verify_publisher_release() { return 0; }
+download_tgz
+verify_tgz
+'''
+        result = subprocess.run(
+            ['bash', '-c', script, '_', str(INSTALLER), str(archive)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('does not match the current', result.stdout + result.stderr)
+
+    def test_archive_rejects_ambiguous_paths_unsafe_modes_and_special_members(self):
+        xml = f'<module><rawname>slsmassnotifyserver</rawname><version>{VERSION}</version></module>'.encode()
+        regular = ('slsmassnotifyserver/module.xml', 0o644, xml, tarfile.REGTYPE)
+        for label, entries in (
+            ('duplicate', [regular, regular]),
+            ('dot-alias', [regular, ('slsmassnotifyserver/./module.xml', 0o644, xml, tarfile.REGTYPE)]),
+            ('empty-component-alias', [regular, ('slsmassnotifyserver//module.xml', 0o644, xml, tarfile.REGTYPE)]),
+            ('group-writable', [('slsmassnotifyserver/module.xml', 0o664, xml, tarfile.REGTYPE)]),
+            ('sticky', [('slsmassnotifyserver/module.xml', 0o1644, xml, tarfile.REGTYPE)]),
+            ('fifo', [regular, ('slsmassnotifyserver/runtime.pipe', 0o600, b'', tarfile.FIFOTYPE)]),
+        ):
+            archive = self.directory / f'{label}.tgz'
+            with tarfile.open(archive, 'w:gz') as handle:
+                for name, mode, body, member_type in entries:
+                    info = tarfile.TarInfo(name)
+                    info.mode = mode
+                    info.type = member_type
+                    info.size = len(body)
+                    handle.addfile(info, io.BytesIO(body))
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            script = 'source "$1"; URL=""; TGZ="$2"; SHA256="$3"; verify_publisher_release() { return 0; }; verify_tgz'
+            result = subprocess.run(['bash', '-c', script, '_', str(INSTALLER), str(archive), digest],
+                                    capture_output=True, text=True, timeout=15)
+            self.assertNotEqual(result.returncode, 0, label)
+
+    def test_archive_rejects_ambiguous_or_unsafe_module_metadata(self):
+        valid = f'<module><rawname>slsmassnotifyserver</rawname><version>{VERSION}</version></module>'.encode()
+        cases = {
+            'duplicate-identity': valid.replace(b'</module>', b'<rawname>slsmassnotifyserver</rawname></module>'),
+            'duplicate-version': valid.replace(b'</module>', f'<version>{VERSION}</version></module>'.encode()),
+            'entity-declaration': (b'<!DOCTYPE module [<!ENTITY x "slsmassnotifyserver">]>'
+                                   + valid.replace(b'slsmassnotifyserver', b'&x;', 1)),
+            'oversized': valid + b' ' * (1024 * 1024),
+        }
+        script = 'source "$1"; URL=""; TGZ="$2"; SHA256="$3"; verify_publisher_release() { return 0; }; verify_tgz'
+        for label, body in cases.items():
+            archive = self.directory / f'{label}.tgz'
+            with tarfile.open(archive, 'w:gz') as handle:
+                info = tarfile.TarInfo('slsmassnotifyserver/module.xml')
+                info.mode = 0o644; info.size = len(body)
+                handle.addfile(info, io.BytesIO(body))
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            result = subprocess.run(['bash', '-c', script, '_', str(INSTALLER), str(archive), digest],
+                                    capture_output=True, text=True, timeout=15)
+            self.assertNotEqual(result.returncode, 0, (label, result.stdout, result.stderr))
+
+    def test_module_install_output_is_bounded_and_preserves_failure_status(self):
+        with tempfile.TemporaryDirectory(prefix='sls-install-output-') as name:
+            log = Path(name) / 'install.log'
+            script = r'''
+source "$1"
+LOG_FILE="$2"
+run_without_install_maintenance_lock() {
+  /usr/bin/python3 -c 'import sys; sys.stdout.write("x" * 262144 + "\nEND-SENTINEL\n"); raise SystemExit(7)'
+}
+if install_module_with_autoenable; then
+  exit 99
+else
+  status=$?
+fi
+printf '%s\n' "$status"
+'''
+            result = subprocess.run(
+                ['bash', '-c', script, '_', str(INSTALLER), str(log)],
+                capture_output=True, text=True, timeout=15,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, '7\n')
+            body = log.read_bytes()
+            self.assertLessEqual(len(body), 131073)
+            self.assertTrue(body.endswith(b'END-SENTINEL\n'))
+
+    def test_legacy_module_install_retry_is_also_bounded(self):
+        with tempfile.TemporaryDirectory(prefix='sls-install-retry-output-') as name:
+            log = Path(name) / 'install.log'
+            calls = Path(name) / 'calls'
+            script = r'''
+source "$1"
+LOG_FILE="$2"
+calls="$3"
+run_without_install_maintenance_lock() {
+  count=0
+  [[ ! -f "$calls" ]] || count="$(cat "$calls")"
+  count=$((count + 1)); printf '%s' "$count" >"$calls"
+  if [[ "$count" -eq 1 ]]; then
+    /usr/bin/python3 -c 'import sys; sys.stdout.write("x" * 262144 + "\nunknown option autoenable\n"); raise SystemExit(2)'
+  else
+    /usr/bin/python3 -c 'import sys; sys.stdout.write("y" * 262144 + "\nRETRY-SENTINEL\n"); raise SystemExit(9)'
+  fi
+}
+if install_module_with_autoenable; then
+  exit 99
+else
+  status=$?
+fi
+printf '%s\n' "$status"
+'''
+            result = subprocess.run(
+                ['bash', '-c', script, '_', str(INSTALLER), str(log), str(calls)],
+                capture_output=True, text=True, timeout=15,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(result.stdout.endswith('9\n'), result.stdout)
+            self.assertIn('requires global options before the module action', result.stdout)
+            self.assertEqual(calls.read_text(), '2')
+            body = log.read_bytes()
+            self.assertLessEqual(len(body), 262146)
+            self.assertTrue(body.endswith(b'RETRY-SENTINEL\n'))
+
+    def test_executed_installer_rejects_ambiguous_or_unknown_arguments(self):
+        cases = (
+            (['--unknown'], {}),
+            (['https://github.com/one', 'https://github.com/two'], {}),
+            (['--recover', '/var/lib/sls-mass-notify-installer/transaction-' + 'a' * 24, '--inspect'], {}),
+            (['https://github.com/positional'], {'SLS_MASS_NOTIFY_TGZ_URL': 'https://github.com/environment'}),
+        )
+        for arguments, extra_environment in cases:
+            environment = os.environ.copy()
+            environment.update(extra_environment)
+            result = subprocess.run(['bash', str(INSTALLER), *arguments], env=environment,
+                                    capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 2, (arguments, result.stdout, result.stderr))
+        # Helper fixtures and administrators may source the library in a shell
+        # that already has unrelated positional arguments; sourcing must not
+        # seize or reject those arguments.
+        result = subprocess.run(
+            ['bash', '-c', 'source "$1"; printf sourced', '_', str(INSTALLER), 'unrelated', 'arguments'],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual((result.returncode, result.stdout), (0, 'sourced'), result.stderr)
+
+    def test_logged_commands_stream_output_and_preserve_failure_status(self):
+        script = r'''
+source "$1"
+INSTALL_LOG_FD=""
+if run_logged bash -c 'printf "first\n"; sleep 1; printf "second\n"; exit 7'; then
+  exit 99
+else
+  exit $?
+fi
+'''
+        started = time.monotonic()
+        process = subprocess.Popen(
+            ['bash', '-c', script, '_', str(INSTALLER)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.assertEqual(process.stdout.readline(), 'first\n')
+        self.assertLess(time.monotonic() - started, 0.8, 'child output was buffered until process exit')
+        stdout, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 7, stderr)
+        self.assertEqual(stdout, 'second\n')
 
 
 if __name__ == '__main__':

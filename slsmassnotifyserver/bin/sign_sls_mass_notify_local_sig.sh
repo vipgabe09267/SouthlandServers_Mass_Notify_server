@@ -92,7 +92,7 @@ load_freepbx_metadata() {
 	local metadata_file="$WORKDIR/freepbx-signing-metadata"
 	local -a metadata
 
-	if ! /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 -r '
+	if ! /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 -r '
 $bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
 require "/etc/freepbx.conf";
 $webUser = trim((string)\FreePBX::Config()->get("AMPASTERISKWEBUSER"));
@@ -238,62 +238,117 @@ validate_freepbx_metadata() {
 }
 
 acquire_signing_lock() {
-	local lock_parent
-
-	validate_absolute_path "$LOCK_FILE" || {
-		log "Unsafe signer lock path."
-		return 1
-	}
-	[ ! -L "$LOCK_FILE" ] || {
-		log "Refusing a symbolic-link signer lock: $LOCK_FILE"
-		return 1
-	}
-	lock_parent="$(dirname "$LOCK_FILE")"
-	install -d -m 0755 -o root -g root "$lock_parent"
-	exec 9>"$LOCK_FILE"
-	chown root:root "$LOCK_FILE"
-	chmod 0600 "$LOCK_FILE"
-	flock -w 120 9 || {
-		log "Timed out waiting for another local-signing operation to finish."
-		return 1
-	}
+    local lock_identity
+    validate_absolute_path "$LOCK_FILE" || { log 'Unsafe signer lock path.'; return 1; }
+    lock_identity="$(/usr/bin/python3 -I - "$LOCK_FILE" <<'PYSIGNLOCK'
+import os
+from pathlib import Path
+import stat
+import sys
+path = Path(sys.argv[1])
+parent = path.parent
+try:
+    if not parent.exists() and not parent.is_symlink():
+        parent.mkdir(mode=0o750)
+    pm = parent.lstat()
+    if (not stat.S_ISDIR(pm.st_mode) or pm.st_uid != 0 or parent.resolve() != parent
+            or pm.st_mode & 0o022 and not pm.st_mode & stat.S_ISVTX):
+        raise ValueError('unsafe parent directory')
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+    try:
+        info = os.fstat(fd)
+        named = path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != 0 or info.st_gid != 0
+                or info.st_size != 0 or info.st_mode & 0o7022
+                or (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino)):
+            raise ValueError('unsafe lock file')
+        os.fchmod(fd, 0o600)
+        print(str(info.st_dev) + ':' + str(info.st_ino))
+    finally:
+        os.close(fd)
+except (OSError, ValueError) as error:
+    print('Signer lock rejected: ' + str(error), file=sys.stderr)
+    sys.exit(1)
+PYSIGNLOCK
+)" || return 1
+    exec 9<>"$LOCK_FILE"
+    /usr/bin/python3 -I - "$lock_identity" <<'PYSIGNIDENTITY' || return 1
+import os
+import stat
+import sys
+info = os.fstat(9)
+if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != 0 or info.st_size != 0
+        or str(info.st_dev) + ':' + str(info.st_ino) != sys.argv[1]):
+    sys.exit('Signer lock changed before acquisition.')
+PYSIGNIDENTITY
+    flock -w 120 9 || { log 'Timed out waiting for another local-signing operation to finish.'; return 1; }
 }
 
 prepare_signing_home() {
-	local signing_home_symlink=""
+    validate_absolute_path "$SIGN_HOME" || { log 'Unsafe private signing-home path.'; return 1; }
+    /usr/bin/python3 -I - "$SIGN_HOME" <<'PYPRIVATEHOME'
+import os
+from pathlib import Path
+import stat
+import sys
+import time
 
-	validate_absolute_path "$SIGN_HOME" || {
-		log "Unsafe private signing-home path."
-		return 1
-	}
-	[ ! -L "$SIGN_HOME" ] || {
-		log "Refusing a symbolic-link private signing home: $SIGN_HOME"
-		return 1
-	}
-	install -d -m 0700 -o root -g root "$SIGN_HOME" || {
-		log "Unable to prepare the private signing home."
-		return 1
-	}
-	if ! signing_home_symlink="$(find "$SIGN_HOME" -xdev -type l -print -quit)"; then
-		log "Unable to inspect the private signing home."
-		return 1
-	fi
-	if [ -n "$signing_home_symlink" ]; then
-		log "Refusing a private signing home containing symbolic links."
-		return 1
-	fi
-	chown -R -h root:root "$SIGN_HOME" || {
-		log "Unable to repair private signing-home ownership."
-		return 1
-	}
-	find "$SIGN_HOME" -xdev -type d -exec chmod 0700 {} + || {
-		log "Unable to secure private signing-home directories."
-		return 1
-	}
-	find "$SIGN_HOME" -xdev -type f -exec chmod 0600 {} + || {
-		log "Unable to secure private signing-home files."
-		return 1
-	}
+path=Path(sys.argv[1])
+if not path.is_absolute() or '..' in path.parts:
+    raise RuntimeError('Private signing home requires an absolute canonical path')
+flags=os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC
+parent=os.open('/',flags)
+root=-1
+handles=[]
+inspected=0
+deadline=time.monotonic()+10
+sockets={'S.gpg-agent','S.gpg-agent.browser','S.gpg-agent.extra','S.gpg-agent.ssh','S.dirmngr'}
+try:
+    for index,part in enumerate(path.parts[1:]):
+        try:os.mkdir(part,0o700,dir_fd=parent)
+        except FileExistsError:pass
+        child=os.open(part,flags,dir_fd=parent)
+        os.close(parent);parent=child
+        info=os.fstat(parent)
+        sticky=index<len(path.parts)-2 and info.st_mode&stat.S_ISVTX
+        if info.st_uid!=0 or info.st_mode&0o022 and not sticky:
+            raise RuntimeError('Private signing ancestors must be root-owned and protected; no ownership was adopted')
+    root=parent;parent=-1
+    def inspect(descriptor):
+        global inspected
+        for name in os.listdir(descriptor):
+            inspected+=1
+            if inspected>5000 or time.monotonic()>deadline:
+                raise RuntimeError('Private signing tree exceeds its inspection bound')
+            before=os.stat(name,dir_fd=descriptor,follow_symlinks=False)
+            if before.st_uid!=0 or before.st_gid!=0 or before.st_mode&0o022:
+                raise RuntimeError('Private signing entries must already be root-owned and protected; preserve unknown keys for review')
+            if descriptor==root and name in sockets and stat.S_ISSOCK(before.st_mode) and before.st_nlink==1:
+                continue
+            if stat.S_ISDIR(before.st_mode):
+                child=os.open(name,flags,dir_fd=descriptor)
+            elif stat.S_ISREG(before.st_mode) and before.st_nlink==1 and before.st_size<=32*1024*1024:
+                child=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC,dir_fd=descriptor)
+            else:
+                raise RuntimeError('Private signing tree contains a link, oversized file or unsupported entry')
+            handles.append((descriptor,name,child,before))
+            opened=os.fstat(child)
+            if (opened.st_dev,opened.st_ino,opened.st_mode,opened.st_nlink)!=(before.st_dev,before.st_ino,before.st_mode,before.st_nlink):
+                raise RuntimeError('Private signing entry changed during inspection')
+            if stat.S_ISDIR(opened.st_mode):inspect(child)
+    inspect(root)
+    for descriptor,name,child,before in handles:
+        opened=os.fstat(child);named=os.stat(name,dir_fd=descriptor,follow_symlinks=False)
+        if ((opened.st_dev,opened.st_ino)!=(named.st_dev,named.st_ino) or opened.st_uid!=0 or opened.st_gid!=0
+                or opened.st_mode&0o022 or not stat.S_ISDIR(opened.st_mode) and opened.st_nlink!=1):
+            raise RuntimeError('Private signing entry changed before permission repair')
+        os.fchmod(child,0o700 if stat.S_ISDIR(opened.st_mode) else 0o600)
+    os.fchmod(root,0o700)
+finally:
+    for unused,name,child,unused_info in reversed(handles):os.close(child)
+    if root>=0:os.close(root)
+    if parent>=0:os.close(parent)
+PYPRIVATEHOME
 }
 
 signing_home_gpg() {
@@ -482,7 +537,7 @@ run_freepbx_gpg() {
 	local attempt
 
 	for attempt in 1 2 3; do
-		if timeout 45 runuser -u "$FREEPBX_WEB_USER" -- \
+		if timeout 45 /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u "$FREEPBX_WEB_USER" -- \
 			env HOME="$(dirname "$FREEPBX_GPG_HOME")" PATH="$PATH" \
 			gpg --homedir "$FREEPBX_GPG_HOME" --batch --yes --no-permission-warning "$@" \
 			<"$stdin_file" >"$stdout_file"; then
@@ -602,7 +657,7 @@ EOF
 }
 
 verify_published_signature() {
-	SIGN_MODULE="$MODULE" /usr/sbin/runuser -u "$FREEPBX_WEB_USER" -- /usr/bin/php -d pcre.jit=0 -r '
+	SIGN_MODULE="$MODULE" /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u "$FREEPBX_WEB_USER" -- /usr/bin/php -d pcre.jit=0 -r '
 $bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
 require "/etc/freepbx.conf";
 $module = (string)getenv("SIGN_MODULE");

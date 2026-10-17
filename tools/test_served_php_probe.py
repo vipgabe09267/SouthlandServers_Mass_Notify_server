@@ -14,13 +14,18 @@ import unittest
 import urllib.error
 import urllib.request
 
+if os.environ.get('SLS_TEST_NAMESPACE') != 'entered' or any(
+    os.environ.get('SLS_TEST_PARENT_' + label + '_NS') in (None, '', os.readlink('/proc/self/ns/' + kind))
+    for label, kind in [('MOUNT', 'mnt'), ('NET', 'net'), ('PID', 'pid')]
+):
+    raise SystemExit('Use the private fixture runner; served-PHP isolation verification failed.')
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class ServedPhp(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if os.environ.get('SLS_TEST_NAMESPACE') != 'entered': raise RuntimeError('Run through the isolation wrapper')
         cls.workspace=tempfile.TemporaryDirectory(prefix='sls-served-php-')
         cls.web=Path(cls.workspace.name);cls.web.chmod(0o755)
         shutil.copytree(ROOT/'slsmassnotifyserver',cls.web,dirs_exist_ok=True,ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
@@ -58,7 +63,6 @@ class ServedPhp(unittest.TestCase):
     def test_disabled_process_functions_are_rejected(self): self.prerequisite_failure(True)
 
     def test_probe_is_read_only_get_and_rejects_forwarded_requests(self):
-        if os.environ.get('SLS_TEST_NAMESPACE') != 'entered': self.fail('Run through the isolation wrapper')
         with socket.socket() as sock:
             sock.bind(('127.0.0.1',0)); port = sock.getsockname()[1]
         process = subprocess.Popen(['/usr/sbin/runuser','-u','asterisk','--','php','-S',f'127.0.0.1:{port}','-t',str(self.web)],
@@ -78,9 +82,10 @@ class ServedPhp(unittest.TestCase):
             self.assertEqual(body['probe'],'sls_served_php_v1');self.assertTrue(body['ok']);self.assertEqual(body['missing'],[])
             self.assertTrue(body['runtime_account_ok']);self.assertRegex(body['php_version'],r'^8\.[0-9]+\.[0-9]+')
             self.assertEqual(body['php_sapi'],'cli-server')
+            self.assertEqual(body['module_version'],'0.1.7-beta')
             self.assertTrue(all(value is True for value in body['extensions'].values()))
             self.assertTrue(all(value is True for value in body['functions'].values()))
-            self.assertEqual(set(body),{'probe','ok','missing','php_version','php_sapi','runtime_account_ok','extensions','functions'})
+            self.assertEqual(set(body),{'probe','ok','missing','module_version','php_version','php_sapi','runtime_account_ok','extensions','functions'})
             self.assertEqual(headers['Cache-Control'],'no-store')
             spec=importlib.util.spec_from_file_location('served_php_doctor_fixture',ROOT/'slsmassnotifyserver/bin/sls_mass_notify/sls_install_doctor.py')
             doctor=importlib.util.module_from_spec(spec);spec.loader.exec_module(doctor)

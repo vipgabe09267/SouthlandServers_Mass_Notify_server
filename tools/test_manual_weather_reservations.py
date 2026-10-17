@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Exercise the real manual Weather queue function against temporary reservations."""
 import json
+import fcntl
+import concurrent.futures
 import os
 from pathlib import Path
 import shlex
@@ -14,9 +16,118 @@ FUNCTION = SOURCE[SOURCE.index('queue_test_audio_to_recipients() {'):SOURCE.inde
 AUTHORITY_FUNCTION = SOURCE[SOURCE.index('require_direct_test_authority() {'):SOURCE.index('refresh_api_test_permissions() {')]
 PERMISSION_FUNCTION = SOURCE[SOURCE.index('refresh_api_test_permissions() {'):SOURCE.index('claim_test_cooldown() {')]
 HELPER_MODULES = ROOT / 'slsmassnotifyserver/bin/sls_mass_notify'
+COOLDOWN_FUNCTION = SOURCE[SOURCE.index('claim_test_cooldown() {'):SOURCE.index('\n# Periodic storage maintenance', SOURCE.index('claim_test_cooldown() {'))]
 
 
 class ManualWeatherReservationTests(unittest.TestCase):
+    def test_status_writer_returns_helper_failure(self):
+        function = SOURCE[SOURCE.index('update_status() {'):SOURCE.index('\nreport_fault() {')]
+        script = 'STATUS_FILE=/unused/private-fixture\npython3() { return 9; }\nchmod() { :; }\nchown() { :; }\n'
+        script += function + '\nupdate_status "{}"\nexit "$?"'
+        result = subprocess.run(['bash'], input=script, text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 9, 'Status helper failure was hidden by metadata commands')
+
+    def test_final_status_failure_marks_test_result_as_partial(self):
+        start = SOURCE.index("\nif ! update_status \"$(printf '{\"last_delivery_at")
+        end = SOURCE.index('\nCURRENT_TIME=', start)
+        block = SOURCE[start:end]
+        script = '''
+DELIVERY_TS=fixture TEST_DELIVERY_STATUS=submitted TEST_AUDIO_LABEL=fixture TEST_DELIVERY_MESSAGE=fixture
+DELIVERY_TARGETS=1000 DESKTOP_DELIVERY_TARGETS=fixture TEST_DELIVERY_STAGE=
+NWS_ALERT_RECIPIENTS=(1000) NWS_DESKTOP_CLIENTS=(fixture) DELIVERY_FAILURES=()
+update_status() { return 9; }
+'''
+        script += block + '\n[ "${#DELIVERY_FAILURES[@]}" -gt 0 ]'
+        result = subprocess.run(['bash'], input=script, text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, 'Failed status persistence still presented a successful test')
+
+    def test_status_writer_does_not_change_a_substituted_target(self):
+        function = SOURCE[SOURCE.index('update_status() {'):SOURCE.index('\nreport_fault() {')]
+        with tempfile.TemporaryDirectory(prefix='sls-test-status-substitution-') as temporary:
+            root = Path(temporary)
+            target = root / 'evidence'
+            target.write_bytes(b'preserve'); target.chmod(0o600)
+            before = target.stat()
+            status = root / 'status.json'
+            script = 'STATUS_FILE=' + shlex.quote(str(status)) + '\nTARGET=' + shlex.quote(str(target))
+            script += '\npython3() { ln -s "$TARGET" "$STATUS_FILE"; }\n' + function + '\nupdate_status "{}"'
+            result = subprocess.run(['bash'], input=script, text=True, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            after = target.stat()
+            self.assertEqual((before.st_mode, before.st_uid, before.st_gid), (after.st_mode, after.st_uid, after.st_gid))
+            self.assertEqual(target.read_bytes(), b'preserve')
+
+    def cooldown(self, path):
+        script = 'COOLDOWN_FILE=' + shlex.quote(str(path)) + '\nCOOLDOWN_SECONDS=60\n' + COOLDOWN_FUNCTION + '\nclaim_test_cooldown'
+        return subprocess.run(['/usr/bin/timeout', '--kill-after=1', '4', 'bash'], input=script,
+                              text=True, capture_output=True, timeout=6)
+
+    def test_cooldown_refuses_malformed_history_without_reopening_admission(self):
+        with tempfile.TemporaryDirectory(prefix='sls-manual-cooldown-history-') as temporary:
+            path = Path(temporary) / 'cooldown.ts'
+            for raw in [b'broken evidence', b'123\xff\n', b'0' * 65 + b'\n']:
+                path.write_bytes(raw); path.chmod(0o640)
+                result = self.cooldown(path)
+                self.assertNotEqual(result.returncode, 0, 'Malformed cooldown became a new test claim')
+                self.assertEqual(path.read_bytes(), raw)
+
+    def test_cooldown_rejects_hard_links_and_unknown_modes_before_repair(self):
+        with tempfile.TemporaryDirectory(prefix='sls-manual-cooldown-metadata-') as temporary:
+            root = Path(temporary)
+            for kind in ['hardlink', 'mode']:
+                path = root / (kind + '.ts')
+                path.write_bytes(b'0\n'); path.chmod(0o640)
+                if kind == 'hardlink': os.link(path, root / 'other-name')
+                else: path.chmod(0o666)
+                before = path.stat()
+                result = self.cooldown(path)
+                self.assertNotEqual(result.returncode, 0, 'Unknown cooldown file was adopted')
+                self.assertEqual(path.read_bytes(), b'0\n')
+                self.assertEqual(path.stat().st_mode, before.st_mode)
+
+    def test_busy_cooldown_is_bounded_and_does_not_repair_an_unleased_lock(self):
+        with tempfile.TemporaryDirectory(prefix='sls-manual-cooldown-busy-') as temporary:
+            path = Path(temporary) / 'cooldown.ts'
+            lock = Path(str(path) + '.lock')
+            lock.touch(mode=0o644)
+            with lock.open('r+') as descriptor:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                before = lock.stat()
+                result = self.cooldown(path)
+                self.assertNotEqual(result.returncode, 124, 'Cooldown waited without its own deadline')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(lock.stat().st_mode, before.st_mode)
+                self.assertFalse(path.exists())
+
+    def test_cooldown_preserves_valid_legacy_history_and_required_lock_inode(self):
+        with tempfile.TemporaryDirectory(prefix='sls-manual-cooldown-marker-') as temporary:
+            path = Path(temporary) / 'cooldown.ts'
+            path.write_bytes(b'0\n'); path.chmod(0o640)
+            first = self.cooldown(path)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(first.stdout.strip(), 'CLAIMED')
+            lock = Path(str(path) + '.lock')
+            inode = lock.stat().st_ino
+            self.assertEqual(lock.read_bytes(), b'SLS_MANUAL_TEST_COOLDOWN_V1\n')
+            before = path.read_bytes()
+            second = self.cooldown(path)
+            self.assertEqual(second.returncode, 3, second.stderr)
+            self.assertTrue(second.stdout.startswith('COOLDOWN '))
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(lock.stat().st_ino, inode)
+            path.unlink()
+            missing = self.cooldown(path)
+            self.assertEqual(missing.returncode, 2, missing.stderr)
+            self.assertFalse(path.exists())
+            self.assertEqual(lock.stat().st_ino, inode)
+
+    def test_concurrent_cooldown_claims_allow_only_one_test(self):
+        with tempfile.TemporaryDirectory(prefix='sls-manual-cooldown-concurrent-') as temporary:
+            path = Path(temporary) / 'cooldown.ts'
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as workers:
+                results = list(workers.map(lambda _: self.cooldown(path), range(2)))
+            self.assertEqual(sorted(result.returncode for result in results), [0, 3])
+
     def run_queue(self, *, blocked=False, recipients=None, invalid_count=0, all_invalid=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

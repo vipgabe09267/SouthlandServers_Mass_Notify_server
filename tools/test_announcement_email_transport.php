@@ -3,17 +3,23 @@ declare(strict_types=1);
 require dirname(__DIR__).'/slsmassnotifyserver/AnnouncementDelivery.php';
 class EmailTransportFixture {
     use \FreePBX\modules\SlsAnnouncementDelivery;
-    public $helper, $mode;
+    public string $helper, $mode;
     protected function startAnnouncementEmailProcess(&$pipes) {
         $pipes=[];
         if($this->mode==='not_started')return false;
         return proc_open(['/usr/bin/timeout','--kill-after=0.1', $this->mode==='timeout'?'0.15':'2', '/usr/bin/php',$this->helper,$this->mode],
             [0=>['pipe','r'],1=>['pipe','w'],2=>['file','/dev/null','w']],$pipes,null,[],['bypass_shell'=>true]);
     }
-    public function send($envelope) { return $this->submitAnnouncementEmail($envelope); }
+    public function send(array $envelope): array { return $this->submitAnnouncementEmail($envelope); }
 }
-$root=sys_get_temp_dir().'/sls-email-cli-'.bin2hex(random_bytes(8));mkdir($root,0700);
-$helper=$root.'/fake.php';file_put_contents($helper, <<<'STUB'
+class EmailHelperPreflightFixture {
+    use \FreePBX\modules\SlsAnnouncementDelivery;
+    public const RUNTIME_DIR = '/sls-mass-notify-test-missing-runtime';
+    public function send(array $envelope): array { return $this->submitAnnouncementEmail($envelope); }
+}
+$root=sys_get_temp_dir().'/sls-email-cli-'.bin2hex(random_bytes(8));
+if(!mkdir($root,0700)){throw new RuntimeException('Unable to create the private email fixture.');}
+$helper=$root.'/fake.php';$helperSource=<<<'STUB'
 <?php
 $e=json_decode(stream_get_contents(STDIN),true);$mode=$argv[1];
 if($mode==='timeout'){sleep(20);exit(0);}
@@ -30,8 +36,9 @@ echo json_encode(['ok'=>$state==='accepted','state'=>$state,'retryable'=>$mode==
  'recipient_id'=>$e['recipient_id'],'message_id'=>$mode==='wrong_id'?'wrong':$e['message_id'],
  'error_code'=>$mode==='temporary'?'sendmail_temporary_failure':'']);
 STUB
-);
+;
 try {
+    if(file_put_contents($helper,$helperSource,LOCK_EX)!==strlen($helperSource)){throw new RuntimeException('Unable to create the private email helper.');}
     $fixture=new EmailTransportFixture();$fixture->helper=$helper;
     $envelope=['recipient_id'=>'email_'.str_repeat('a',24),'address'=>'fixture@example.com','sender'=>['name'=>'Fixture','address'=>'notify@example.com'],
         'title'=>'Test','message'=>str_repeat('Body line\n',6000),'is_test'=>true,'severity'=>'info','message_id'=>'<sls-'.str_repeat('b',32).'-'.str_repeat('a',24).'@example.com>','created_at'=>gmdate('c')];
@@ -44,5 +51,12 @@ try {
         $fixture->mode=$mode;$result=$fixture->send($envelope);
         if($result['state']!=='failed'||$result['retryable']!==false||$result['submission_started']!==false||!str_contains($result['detail'],'mail'))throw new RuntimeException('Mail admission refusal was not surfaced safely: '.$mode);
     }
+    if (file_exists(EmailHelperPreflightFixture::RUNTIME_DIR) || is_link(EmailHelperPreflightFixture::RUNTIME_DIR)) {
+        throw new RuntimeException('Missing-helper fixture path unexpectedly exists.');
+    }
+    $missing=(new EmailHelperPreflightFixture())->send($envelope);
+    if (($missing['state']??null)!=='failed'||($missing['retryable']??null)!==true||($missing['submission_started']??null)!==false) {
+        throw new RuntimeException('Missing production email helper was not reported as a confirmed pre-submission failure.');
+    }
     echo "Actual private CLI stdin/protocol/timeout/oversized-output handling passed; no real mailer invoked.\n";
-}finally{unlink($helper);rmdir($root);}
+}finally{if(is_file($helper)||is_link($helper)){unlink($helper);}if(is_dir($root)){rmdir($root);}}

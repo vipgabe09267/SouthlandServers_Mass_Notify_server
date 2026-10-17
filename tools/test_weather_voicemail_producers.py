@@ -18,12 +18,13 @@ from unittest import mock
 import wave
 
 
-if (os.environ.get('SLS_TEST_NAMESPACE') != 'entered'
-        or not os.environ.get('SLS_TEST_PARENT_NET_NS')
-        or not os.environ.get('SLS_TEST_PARENT_MOUNT_NS')
-        or os.environ['SLS_TEST_PARENT_NET_NS'] == os.readlink('/proc/self/ns/net')
-        or os.environ['SLS_TEST_PARENT_MOUNT_NS'] == os.readlink('/proc/self/ns/mnt')):
-    raise SystemExit('Use the isolated fixture runner; no PBX transport was contacted.')
+if os.environ.get('SLS_TEST_NAMESPACE') != 'entered' or any(
+    os.environ.get('SLS_TEST_PARENT_' + label + '_NS') in
+    (None, '', os.readlink('/proc/self/ns/' + kind))
+    for label, kind in [('MOUNT', 'mnt'), ('NET', 'net'), ('PID', 'pid')]
+):
+    raise SystemExit('Use tools/run_isolated_tests.sh; no production Weather or Asterisk resources were accessed.')
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / 'slsmassnotifyserver/bin/sls_mass_notify'
@@ -42,7 +43,7 @@ def nws_python(marker, ending):
     return NWS_SOURCE[start + len(marker):NWS_SOURCE.index(ending, start)]
 
 
-NWS_REQUEST = compile(nws_python('      /usr/bin/python3 -I - "$CONFIG_JSON_FILE" <<\'PY\'\n', '\nPY\n'),
+NWS_REQUEST = compile(nws_python('      /usr/bin/python3 -I - "$CONFIG_JSON_FILE" 3<<<"$ALERT_B64" <<\'PY\'\n', '\nPY\n'),
                       'NWS admission request heredoc', 'exec')
 NWS_RESULT = compile(nws_python("  if ! admission_lines=\"$(printf '%s' \"$admission_json\" | /usr/bin/python3 -c '\n", "\n')\"; then"),
                      'NWS admission result parser', 'exec')
@@ -73,9 +74,15 @@ class WeatherVoicemailProducers(unittest.TestCase):
         crypto = types.ModuleType('sls_config_crypto')
         crypto.read_config = reader
         output = io.StringIO()
+        original_fdopen = os.fdopen
+        def feature_input(descriptor, *args, **kwargs):
+            if descriptor == 3:
+                return io.BytesIO(environment['SLS_VM_FEATURE'].encode() + b'\n')
+            return original_fdopen(descriptor, *args, **kwargs)
         original_path = list(sys.path)
         try:
             with mock.patch.dict(os.environ, environment), \
+                 mock.patch.object(os, 'fdopen', side_effect=feature_input), \
                  mock.patch.dict(sys.modules, {'sls_config_crypto': crypto,
                                                'sls_notification_destinations': destinations}), \
                  mock.patch.object(sys, 'argv', ['fixture', '/unreadable/protected.config']), redirect_stdout(output):
@@ -118,6 +125,15 @@ class WeatherVoicemailProducers(unittest.TestCase):
         self.assertEqual(self.request()[0]['correlation'], expected)
         self.assertNotEqual(self.request({'SLS_VM_EVENT_ID': 'next-weather'})[0]['correlation'], expected)
 
+    def test_nws_large_feature_stdin_preserves_voicemail_validity(self):
+        self.feature['geometry'] = {'type': 'LineString', 'coordinates': [[41, -90]] * 10000}
+        payload = base64.b64encode(json.dumps(self.feature).encode()).decode()
+        self.assertGreater(len(payload), 131072)
+        request, reader = self.request({'SLS_VM_FEATURE': payload})
+        reader.assert_not_called()
+        self.assertEqual(request['voicemail_context']['source_validity']['provider_event_id'], self.feature['id'])
+        self.assertEqual(request['voicemail_scope'], self.scope)
+
     def test_nws_legacy_zone_uses_same_scope_as_current_source_policy(self):
         config = {'enabled': '1', 'nws_zones': [{'name': '  Fixture   Area  ', 'zone': 'TXC453'}]}
         request, reader = self.request({'SLS_VM_SCOPE': ''}, config)
@@ -149,7 +165,7 @@ class WeatherVoicemailProducers(unittest.TestCase):
 
     def lightning_fixture(self, stack, result):
         directory = Path(stack.enter_context(tempfile.TemporaryDirectory(
-            prefix='sls-weather-voicemail-', dir='/var/spool/asterisk')))
+            prefix='sls-weather-voicemail-')))
         sounds = directory / 'sounds'
         audio = sounds / self.environ['SLS_VM_SOUND']
         audio.parent.mkdir(parents=True)
@@ -158,10 +174,17 @@ class WeatherVoicemailProducers(unittest.TestCase):
             handle.writeframes(b'\x20\x00' * 8000)
         outgoing = directory / 'outgoing'
         outgoing.mkdir()
-        Path('/var/spool/asterisk/tmp').mkdir(parents=True, exist_ok=True)
+        spool_tmp = directory / 'tmp'
+        spool_tmp.mkdir()
+        real_mkstemp = tempfile.mkstemp
+        def isolated_mkstemp(*args, **kwargs):
+            if kwargs.get('dir') == '/var/spool/asterisk/tmp':
+                kwargs['dir'] = spool_tmp
+            return real_mkstemp(*args, **kwargs)
         stack.enter_context(mock.patch.multiple(lightning,
             ASTERISK_SOUNDS_DIR=sounds, SPOOL_DIR=outgoing, SPOOL_DONE_DIR=directory / 'outgoing_done',
             CURRENT_GROUP_ID='lightning_fixture'))
+        stack.enter_context(mock.patch.object(lightning.tempfile, 'mkstemp', side_effect=isolated_mkstemp))
         # Only external contact admission, queue scheduling and delivery are doubled.
         admit = stack.enter_context(mock.patch.object(admission, 'admit_internal', return_value={
             'token': '2' * 32, 'targets': [], 'voicemail_targets': [], 'voicemail_failure_code': None, **result}))

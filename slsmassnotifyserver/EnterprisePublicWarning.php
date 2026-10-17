@@ -22,24 +22,38 @@ final class EnterprisePublicWarning
     }
     private static function at($value,string $label): int
     {
-        if (!is_string($value) || !preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/D',$value)) { throw new \InvalidArgumentException($label.' requires an ISO timestamp with timezone.'); }
-        $date=new \DateTimeImmutable($value); $errors=\DateTimeImmutable::getLastErrors(); if ($errors && ($errors['warning_count'] || $errors['error_count'])) { throw new \InvalidArgumentException($label.' is invalid.'); }
+        if (!is_string($value) || !preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-](?:(?:0[0-9]|1[0-3]):[0-5][0-9]|14:00))$/D',$value)) { throw new \InvalidArgumentException($label.' requires an ISO timestamp with timezone.'); }
+        try{$date=new \DateTimeImmutable($value);}
+        catch(\Throwable $error){throw new \InvalidArgumentException($label.' is invalid.',0,$error);}
+        $errors=\DateTimeImmutable::getLastErrors(); if ($errors && ($errors['warning_count'] || $errors['error_count'])) { throw new \InvalidArgumentException($label.' is invalid.'); }
         return $date->getTimestamp();
+    }
+    private static function safeXml(\DOMDocument $document): void
+    {
+        if($document->doctype!==null){throw new \InvalidArgumentException('Public warning XML must not contain document types or entities.');}
+        $nodes=[$document->documentElement];
+        while($nodes){$node=array_pop($nodes);if(!$node instanceof \DOMNode){continue;}
+            if(in_array($node->nodeType,[XML_ENTITY_REF_NODE,XML_ENTITY_NODE,XML_DOCUMENT_TYPE_NODE],true)){throw new \InvalidArgumentException('Public warning XML must not contain document types or entities.');}
+            foreach($node->childNodes as $child){$nodes[]=$child;}
+        }
     }
     public static function author(array $input,int $now): array
     {
         $input=IncidentConfig::object($input,['identifier','sender','sent','status','msg_type','references','language','category','event','urgency','severity','certainty','expires','headline','description','instruction','area_description','polygon','geocodes','event_code','ipaws_profile'],'Public warning');
         if (isset($input['ipaws_profile']) && !is_bool($input['ipaws_profile'])) { throw new \InvalidArgumentException('IPAWS profile selection must be a boolean.'); }
         $identifier=IncidentConfig::identifier($input['identifier']??'','/^[A-Za-z0-9_.:-]{1,128}$/D','CAP identifier');
-        $sender=IncidentConfig::identifier($input['sender']??'','/^[^\s,<>]{1,128}$/uD','CAP sender');
+        $senderText=IncidentConfig::text($input['sender']??'',128,'CAP sender');
+        $sender=IncidentConfig::identifier($senderText,'/^[^\s,<>]{1,128}$/uD','CAP sender');
         $sent=self::at($input['sent']??'','CAP sent time'); $expires=self::at($input['expires']??'','CAP expiry');
-        if (abs($sent-$now)>300 || $expires<=$sent || $expires>$sent+86400) { throw new \InvalidArgumentException('Public warnings require a current sent time and expiry within 24 hours.'); }
+        if (abs($sent-$now)>300 || $expires<=$sent || $expires<=$now || $expires>$sent+86400) { throw new \InvalidArgumentException('Public warnings require a current sent time and a future expiry within 24 hours.'); }
         $status=self::choice($input['status']??'Test',['Actual','Test','Exercise'],'status'); $type=self::choice($input['msg_type']??'Alert',['Alert','Update','Cancel'],'message type');
         $references=[]; foreach (IncidentConfig::listOf($input['references']??[],20,'CAP references') as $ref) {
             $ref=IncidentConfig::object($ref,['sender','identifier','sent'],'CAP reference');
-            $refSender=IncidentConfig::identifier($ref['sender']??'','/^[^\s,<>]{1,128}$/uD','Reference sender');
+            $refSenderText=IncidentConfig::text($ref['sender']??'',128,'Reference sender');
+            $refSender=IncidentConfig::identifier($refSenderText,'/^[^\s,<>]{1,128}$/uD','Reference sender');
             if ($refSender!==$sender) { throw new \InvalidArgumentException('Updates and cancellations must reference the same sender.'); }
-            $refId=IncidentConfig::identifier($ref['identifier']??'','/^[A-Za-z0-9_.:-]{1,128}$/D','Reference identifier'); self::at($ref['sent']??'','Reference sent time');
+            $refId=IncidentConfig::identifier($ref['identifier']??'','/^[A-Za-z0-9_.:-]{1,128}$/D','Reference identifier'); $refTime=self::at($ref['sent']??'','Reference sent time');
+            if($refTime>=$sent){throw new \InvalidArgumentException('CAP references must identify an earlier warning from the same sender.');}
             $references[]=$refSender.','.$refId.','.$ref['sent'];
         }
         if (($type!=='Alert' && !$references) || ($type==='Alert' && $references)) { throw new \InvalidArgumentException('Update/Cancel require references; a new Alert must not claim references.'); }
@@ -64,9 +78,18 @@ final class EnterprisePublicWarning
             if (!is_string($polygon) || strlen($polygon)>8192) { throw new \InvalidArgumentException('CAP polygon exceeds its bound.'); }
             $points=preg_split('/\s+/',trim($polygon));
             if (count($points)<4 || count($points)>100 || $points[0]!==end($points)) { throw new \InvalidArgumentException('CAP polygons need 4–100 coordinates and a matching closing point.'); }
+            $coordinates=[];
             foreach ($points as $point) {
                 if (!preg_match('/^(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)$/D',$point,$parts) || abs((float)$parts[1])>90 || abs((float)$parts[2])>180) { throw new \InvalidArgumentException('CAP polygon coordinates must be latitude,longitude in range.'); }
-            } self::node($area,'polygon',implode(' ',$points));
+                $coordinates[]=[(float)$parts[1],(float)$parts[2]];
+            }
+            $unique=[];$areaValue=0.0;
+            for($index=0;$index<count($coordinates)-1;$index++){
+                $unique[sprintf('%.12F,%.12F',$coordinates[$index][0],$coordinates[$index][1])]=true;
+                $areaValue+=$coordinates[$index][1]*$coordinates[$index+1][0]-$coordinates[$index+1][1]*$coordinates[$index][0];
+            }
+            if(count($unique)<3||abs($areaValue)<1.0e-12){throw new \InvalidArgumentException('CAP polygon must enclose a nonzero area with at least three distinct coordinates.');}
+            self::node($area,'polygon',implode(' ',$points));
         }
         foreach (IncidentConfig::listOf($input['geocodes']??[],50,'CAP geocodes') as $value) {
             $code=self::node($area,'geocode',''); self::node($code,'valueName','SAME'); self::node($code,'value',IncidentConfig::identifier($value,'/^[0-9]{6}$/D','SAME area code'));
@@ -78,14 +101,26 @@ final class EnterprisePublicWarning
     }
     private static function keys(array $config,int $now): array
     {
-        $certificate=@openssl_x509_read($config['certificate_pem']??''); $key=@openssl_pkey_get_private($config['private_key_pem']??'',$config['private_key_password']??'');
+        $certificatePem=$config['certificate_pem']??null;$privateKeyPem=$config['private_key_pem']??null;
+        $password=$config['private_key_password']??'';$cog=$config['cog_id']??null;
+        if(!is_string($certificatePem)||$certificatePem===''||strlen($certificatePem)>20000
+            ||!is_string($privateKeyPem)||$privateKeyPem===''||strlen($privateKeyPem)>20000
+            ||!is_string($password)||strlen($password)>1024||!is_string($cog)||$cog===''||strlen($cog)>100){
+            throw new \DomainException('IPAWS certificate, key or COG identity is missing or invalid.');
+        }
+        try{$canonicalCog=IncidentConfig::text($cog,100,'IPAWS COG identifier');}
+        catch(\Throwable $error){throw new \DomainException('IPAWS certificate, key or COG identity is missing or invalid.',0,$error);}
+        if($canonicalCog!==$cog){throw new \DomainException('IPAWS COG identity must already be normalized.');}
+        $certificate=@openssl_x509_read($certificatePem); $key=@openssl_pkey_get_private($privateKeyPem,$password);
         $meta=$certificate?openssl_x509_parse($certificate):false; $details=$key?openssl_pkey_get_details($key):false;
         if (!$certificate || !$key || !is_array($meta) || !is_array($details) || $details['type']!==OPENSSL_KEYTYPE_RSA || $details['bits']<2048
             || !openssl_x509_check_private_key($certificate,$key) || ($meta['validFrom_time_t']??PHP_INT_MAX)>$now || ($meta['validTo_time_t']??0)<=$now
-            || ($config['cog_id']??'')==='' || !str_contains((string)($meta['subject']['CN']??''),$config['cog_id'])) {
+            || !str_contains((string)($meta['subject']['CN']??''),$cog)) {
             throw new \DomainException('IPAWS needs a current matching RSA certificate/key whose CN contains the authorized COG identifier.');
         }
-        openssl_x509_export($certificate,$pem); $der=preg_replace('/-----[^-]+-----|\s/','',$pem);
+        if(!openssl_x509_export($certificate,$pem)) { throw new \DomainException('IPAWS certificate export failed.'); }
+        $der=preg_replace('/-----[^-]+-----|\s/','',$pem);
+        if(!is_string($der)||$der===''){throw new \DomainException('IPAWS certificate export is invalid.');}
         return [$key,$der];
     }
     private static function signature(\DOMElement $target,\DOMElement $parent,string $reference,$key,string $certificate,bool $enveloped): \DOMElement
@@ -106,8 +141,9 @@ final class EnterprisePublicWarning
     public static function signCap(string $xml,array $config,int $now): string
     {
         [$key,$certificate]=self::keys($config,$now); $document=new \DOMDocument();
-        if (strlen($xml)>65536 || preg_match('/<!DOCTYPE|<!ENTITY/i',$xml) || !@$document->loadXML($xml,LIBXML_NONET)
+        if (strlen($xml)>65536 || preg_match('/<!DOCTYPE|<!ENTITY/i',$xml) || !@$document->loadXML($xml,LIBXML_NONET|LIBXML_NOBLANKS|LIBXML_COMPACT)
             || $document->documentElement->namespaceURI!==self::CAP || $document->documentElement->localName!=='alert') { throw new \InvalidArgumentException('Provide one bounded CAP 1.2 alert.'); }
+        self::safeXml($document);
         if ($document->getElementsByTagNameNS(self::DS,'Signature')->length) { throw new \InvalidArgumentException('The draft already contains a signature.'); }
         self::signature($document->documentElement,$document->documentElement,'',$key,$certificate,true); return $document->saveXML();
     }
@@ -115,9 +151,13 @@ final class EnterprisePublicWarning
     public static function acknowledgementEnvelope(array $config,int $now): string
     {
         [$key,$certificate]=self::keys($config,$now); $document=new \DOMDocument('1.0','UTF-8');
+        $rawLogon=$config['logon_user']??null;
+        try{$logon=IncidentConfig::text($rawLogon,100,'IPAWS logon user');}
+        catch(\Throwable $error){throw new \DomainException('IPAWS logon identity is missing or invalid.',0,$error);}
+        if($logon!==$rawLogon){throw new \DomainException('IPAWS logon identity must already be normalized.');}
         $envelope=$document->createElementNS(self::SOAP,'soap:Envelope'); $document->appendChild($envelope);
         $header=self::node($envelope,'soap:Header','',self::SOAP); $identity=self::node($header,'ipaws:CAPHeaderTypeDef','','http://gov.fema.ipaws.services/IPAWS_CAPService/');
-        self::node($identity,'ipaws:logonUser',IncidentConfig::text($config['logon_user']??'',100,'IPAWS logon user'),'http://gov.fema.ipaws.services/IPAWS_CAPService/');
+        self::node($identity,'ipaws:logonUser',$logon,'http://gov.fema.ipaws.services/IPAWS_CAPService/');
         self::node($identity,'ipaws:logonCogId',$config['cog_id'],'http://gov.fema.ipaws.services/IPAWS_CAPService/');
         $security=self::node($header,'wsse:Security','',self::WSSE); $security->setAttributeNS(self::SOAP,'soap:mustUnderstand','1');
         $binary=self::node($security,'wsse:BinarySecurityToken',$certificate,self::WSSE); $binary->setAttributeNS(self::WSU,'wsu:Id','certificate');
@@ -131,15 +171,28 @@ final class EnterprisePublicWarning
     /** Validate an authority's WSDL-generated signed postCAP envelope without inventing its wrapper. */
     public static function verifyPreparedEnvelope(string $envelope,string $draft,array $config,int $now): void
     {
-        self::keys($config,$now); $document=new \DOMDocument();
-        if (strlen($envelope)>131072 || preg_match('/<!DOCTYPE|<!ENTITY/i',$envelope) || !@$document->loadXML($envelope,LIBXML_NONET)
+        [, $configuredCertificate]=self::keys($config,$now); $document=new \DOMDocument();
+        $rawLogon=$config['logon_user']??null;
+        try{$logon=IncidentConfig::text($rawLogon,100,'IPAWS logon user');}
+        catch(\Throwable $error){throw new \DomainException('IPAWS logon identity is missing or invalid.',0,$error);}
+        if($logon!==$rawLogon){throw new \DomainException('IPAWS logon identity must already be normalized.');}
+        if (strlen($envelope)>131072 || preg_match('/<!DOCTYPE|<!ENTITY/i',$envelope) || !@$document->loadXML($envelope,LIBXML_NONET|LIBXML_NOBLANKS|LIBXML_COMPACT)
             || $document->documentElement->namespaceURI!==self::SOAP || $document->documentElement->localName!=='Envelope') { throw new \InvalidArgumentException('Provide a bounded signed IPAWS SOAP envelope generated from the authority-issued WSDL.'); }
+        self::safeXml($document);
         $xpath=new \DOMXPath($document); foreach (['s'=>self::SOAP,'c'=>self::CAP,'d'=>self::DS,'u'=>self::WSU,'w'=>self::WSSE,'i'=>'http://gov.fema.ipaws.services/IPAWS_CAPService/'] as $name=>$namespace) { $xpath->registerNamespace($name,$namespace); }
         $bodies=$xpath->query('/s:Envelope/s:Body'); $headers=$xpath->query('/s:Envelope/s:Header'); $alerts=$xpath->query('/s:Envelope/s:Body//c:alert');
+        $identities=$xpath->query('/s:Envelope/s:Header/i:CAPHeaderTypeDef');
+        $users=$xpath->query('/s:Envelope/s:Header/i:CAPHeaderTypeDef/i:logonUser');
+        $cogs=$xpath->query('/s:Envelope/s:Header/i:CAPHeaderTypeDef/i:logonCogId');
+        $securityNodes=$xpath->query('/s:Envelope/s:Header/w:Security');
+        $tokens=$xpath->query('/s:Envelope/s:Header/w:Security/w:BinarySecurityToken');
+        $tokenCertificate=$tokens->length===1?preg_replace('/\s+/','',$tokens->item(0)->textContent):null;
         if ($bodies->length!==1 || $headers->length!==1 || $alerts->length!==1
             || $xpath->query('//c:alert')->length!==1 || $xpath->query('//s:Body')->length!==1 || $xpath->query('//d:Signature')->length!==2
+            || $identities->length!==1 || $users->length!==1 || $cogs->length!==1 || $securityNodes->length!==1 || $tokens->length!==1
             || $xpath->evaluate('string(/s:Envelope/s:Header/i:CAPHeaderTypeDef/i:logonCogId)')!==($config['cog_id']??'')
-            || $xpath->evaluate('string(/s:Envelope/s:Header/i:CAPHeaderTypeDef/i:logonUser)')!==($config['logon_user']??'')) { throw new \DomainException('IPAWS envelope identity, alert count or signed message structure is invalid.'); }
+            || $xpath->evaluate('string(/s:Envelope/s:Header/i:CAPHeaderTypeDef/i:logonUser)')!==$logon
+            || !is_string($tokenCertificate) || !hash_equals($configuredCertificate,$tokenCertificate)) { throw new \DomainException('IPAWS envelope identity, certificate, alert count or signed message structure is invalid.'); }
         $body=$bodies->item(0); $alert=$alerts->item(0); $bodyId=$body->getAttributeNS(self::WSU,'Id');
         if ($bodyId==='' || $xpath->query('//*[@u:Id]')->length!==count(array_unique(array_map(static fn($node)=>$node->getAttributeNS(self::WSU,'Id'),iterator_to_array($xpath->query('//*[@u:Id]')))))) { throw new \DomainException('IPAWS signing identifiers are missing or ambiguous.'); }
         $capSignatures=$xpath->query('./d:Signature',$alert); $soapSignatures=$xpath->query('/s:Envelope/s:Header/w:Security/d:Signature');
@@ -163,7 +216,21 @@ final class EnterprisePublicWarning
         };
         $verify($capSignatures->item(0),$alert,'',true); $verify($soapSignatures->item(0),$body,'#'.$bodyId,false);
         $copy=new \DOMDocument(); $copy->appendChild($copy->importNode($alert,true));
-        foreach (iterator_to_array($copy->documentElement->childNodes) as $child) { if ($child instanceof \DOMElement && $child->namespaceURI===self::DS) { $copy->documentElement->removeChild($child); } }
-        $expected=new \DOMDocument(); if (!@$expected->loadXML($draft,LIBXML_NONET) || !hash_equals(hash('sha256',$expected->documentElement->C14N(true,false)),hash('sha256',$copy->documentElement->C14N(true,false)))) { throw new \DomainException('Signed IPAWS alert differs from the reviewed CAP draft.'); }
+        foreach (iterator_to_array($copy->documentElement->childNodes) as $child) {
+            if (!$child instanceof \DOMElement || $child->namespaceURI!==self::DS) { continue; }
+            if ($child->localName!=='Signature') { throw new \DomainException('The signed CAP alert contains an unexpected XML Signature namespace element.'); }
+            $copy->documentElement->removeChild($child);
+        }
+        $expected=new \DOMDocument();
+        if (strlen($draft)>65536 || preg_match('/<!DOCTYPE|<!ENTITY/i',$draft)
+            || !@$expected->loadXML($draft,LIBXML_NONET|LIBXML_NOBLANKS|LIBXML_COMPACT)
+            || !$expected->documentElement || $expected->documentElement->namespaceURI!==self::CAP
+            || $expected->documentElement->localName!=='alert') {
+            throw new \DomainException('The reviewed CAP draft is invalid or exceeds its bound.');
+        }
+        self::safeXml($expected);
+        $expectedCanonical=$expected->documentElement->C14N(true,false);$actualCanonical=$copy->documentElement->C14N(true,false);
+        if (!is_string($expectedCanonical)||!is_string($actualCanonical)
+            || !hash_equals(hash('sha256',$expectedCanonical),hash('sha256',$actualCanonical))) { throw new \DomainException('Signed IPAWS alert differs from the reviewed CAP draft.'); }
     }
 }

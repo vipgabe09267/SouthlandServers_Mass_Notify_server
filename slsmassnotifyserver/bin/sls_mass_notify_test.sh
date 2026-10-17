@@ -145,53 +145,100 @@ claim_test_cooldown() {
   python3 - <<'PY'
 import fcntl
 import os
-import stat
+import re
 import sys
 import time
+from pathlib import Path
+sys.dont_write_bytecode = True
+sys.path.insert(0, '/usr/local/bin/sls_mass_notify')
+from sls_nws_delivery_claims import (_open_directory, _validate_parent_directory, _checked_file_metadata,
+                                   _secure_file_metadata, _identity, _write_bytes)
 
-path = os.environ["COOLDOWN_FILE_PATH"]
+path = Path(os.environ['COOLDOWN_FILE_PATH'])
+marker_value = b'SLS_MANUAL_TEST_COOLDOWN_V1\n'
 try:
     cooldown = max(1, min(3600, int(os.environ.get("COOLDOWN_SECONDS_VALUE", "60"))))
 except ValueError:
     cooldown = 60
 
-parent = os.path.dirname(path)
-if not parent or not os.path.isdir(parent) or os.path.islink(parent):
-    print("ERROR invalid cooldown directory")
-    raise SystemExit(2)
-
-lock_path = path + ".lock"
-common_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-lock_fd = os.open(lock_path, common_flags | getattr(os, "O_NONBLOCK", 0), 0o640)
+parent = _open_directory(path.parent)
+lock_fd = None
+cooldown_fd = None
 try:
-    if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
-        print("ERROR invalid cooldown lock")
-        raise SystemExit(2)
-    os.fchmod(lock_fd, 0o640)
-    fcntl.flock(lock_fd, fcntl.LOCK_EX)
-
-    cooldown_fd = os.open(path, common_flags | getattr(os, "O_NONBLOCK", 0), 0o640)
+    _validate_parent_directory(parent)
+    lock_name = path.name + '.lock'
+    lock_fd = os.open(lock_name, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                      0o640, dir_fd=parent)
+    lock_meta, _uid, _gid = _checked_file_metadata(lock_fd)
+    if lock_meta.st_size > len(marker_value):
+        raise ValueError('cooldown lock contains unknown data')
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise ValueError('cooldown is busy; retry after the current test')
+            time.sleep(0.01)
+    marker = os.pread(lock_fd, len(marker_value) + 1, 0)
+    if not marker_value.startswith(marker):
+        raise ValueError('cooldown history marker is invalid')
+    if _identity(os.stat(lock_name, dir_fd=parent, follow_symlinks=False)) != _identity(os.fstat(lock_fd)):
+        raise ValueError('cooldown lock changed before admission')
     try:
-        if not stat.S_ISREG(os.fstat(cooldown_fd).st_mode):
-            print("ERROR invalid cooldown state")
-            raise SystemExit(2)
-        os.fchmod(cooldown_fd, 0o640)
-        raw = os.read(cooldown_fd, 64).decode("ascii", "ignore").strip()
-        last_run = int(raw) if raw.isdigit() else 0
-        now = int(time.time())
-        remaining = min(cooldown, cooldown - (now - last_run))
-        if last_run > 0 and remaining > 0:
-            print(f"COOLDOWN {remaining}")
-            raise SystemExit(3)
-        os.lseek(cooldown_fd, 0, os.SEEK_SET)
-        os.ftruncate(cooldown_fd, 0)
-        os.write(cooldown_fd, f"{now}\n".encode("ascii"))
-        os.fsync(cooldown_fd)
-        print("CLAIMED")
+        cooldown_fd = os.open(path.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    except FileNotFoundError:
+        if marker:
+            raise ValueError('established cooldown history is missing; restore it before testing')
+        state_meta = None
+        raw = b''
+    else:
+        state_meta, _uid, _gid = _checked_file_metadata(cooldown_fd)
+        if state_meta.st_size > 13:
+            raise ValueError('cooldown timestamp is oversized')
+        raw = os.read(cooldown_fd, 14)
+        if len(raw) != state_meta.st_size or _identity(os.fstat(cooldown_fd)) != _identity(state_meta):
+            raise ValueError('cooldown timestamp changed while reading')
+    if raw and not re.fullmatch(rb'(?:0|[1-9][0-9]{0,11})\n?', raw):
+        raise ValueError('cooldown timestamp is invalid; retained evidence was preserved')
+    if not raw and marker:
+        raise ValueError('established cooldown timestamp is empty; retained evidence was preserved')
+    last_run = int(raw) if raw else 0
+    now = int(time.time())
+    remaining = min(cooldown, cooldown - (now - last_run))
+    if last_run > 0 and remaining > 0:
+        print(f'COOLDOWN {remaining}')
+        raise SystemExit(3)
+    named_parent = _open_directory(path.parent)
+    try:
+        _validate_parent_directory(named_parent)
+        if ((os.fstat(parent).st_dev, os.fstat(parent).st_ino)
+                != (os.fstat(named_parent).st_dev, os.fstat(named_parent).st_ino)):
+            raise ValueError('cooldown parent changed before admission')
     finally:
-        os.close(cooldown_fd)
+        os.close(named_parent)
+    if _identity(os.stat(lock_name, dir_fd=parent, follow_symlinks=False)) != _identity(os.fstat(lock_fd)):
+        raise ValueError('cooldown lease changed before admission')
+    _secure_file_metadata(lock_fd)
+    _write_bytes(parent, path.name, f'{now}\n'.encode('ascii'), state_meta, path.parent)
+    offset = len(marker)
+    while offset < len(marker_value):
+        written = os.pwrite(lock_fd, marker_value[offset:], offset)
+        if written <= 0:
+            raise ValueError('cooldown marker write failed; preserve the timestamp')
+        offset += written
+    os.fsync(lock_fd)
+    print('CLAIMED')
+except Exception as error:
+    print('ERROR manual test cooldown was not claimed: ' + str(error))
+    raise SystemExit(2)
 finally:
-    os.close(lock_fd)
+    if cooldown_fd is not None:
+        os.close(cooldown_fd)
+    if lock_fd is not None:
+        os.close(lock_fd)
+    os.close(parent)
 PY
 }
 
@@ -203,35 +250,15 @@ update_status() {
   STATUS_FILE_PATH="$STATUS_FILE" \
   STATUS_PATCH_JSON="$patch_json" \
   python3 - <<'PY'
-import fcntl
 import json
 import os
-
-path = os.environ["STATUS_FILE_PATH"]
-patch = json.loads(os.environ["STATUS_PATCH_JSON"])
-
-os.makedirs(os.path.dirname(path), mode=0o750, exist_ok=True)
-with open(path, "a+", encoding="utf-8") as handle:
-    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-    handle.seek(0)
-    try:
-        loaded = json.load(handle)
-        data = loaded if isinstance(loaded, dict) else {}
-    except Exception:
-        data = {}
-    data.update(patch)
-    handle.seek(0)
-    handle.truncate(0)
-    json.dump(data, handle, indent=2, sort_keys=True)
-    handle.write("\n")
-    handle.flush()
-    os.fsync(handle.fileno())
-    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-os.chmod(path, 0o640)
+import sys
+sys.path.insert(0, '/usr/local/bin/sls_mass_notify')
+from sls_atomic_json import locked_json
+with locked_json(os.environ['STATUS_FILE_PATH'], runtime_owner=True) as data:
+    data.update(json.loads(os.environ['STATUS_PATCH_JSON']))
 PY
 
-  chmod 0640 "$STATUS_FILE" 2>/dev/null || true
-  chown asterisk:asterisk "$STATUS_FILE" 2>/dev/null || true
 }
 
 report_fault() {
@@ -269,7 +296,6 @@ append_event_log() {
   EVENT_STATUS="$TEST_DELIVERY_STATUS" \
   EVENTS_LOG_PATH="$EVENTS_LOG" \
   python3 - <<'PY'
-import fcntl
 import json
 import os
 from datetime import datetime, timezone
@@ -278,6 +304,7 @@ payload = {
     "event_id": os.environ["EVENT_ID"],
     "logged_at": datetime.now(timezone.utc).astimezone().isoformat(),
     "type": "test",
+    "is_test": True,
     "status": os.environ.get("EVENT_STATUS", "triggered"),
     "system_name": os.environ.get("SOURCE_NAME", ""),
     "source_extension": os.environ.get("SOURCE_EXTENSION", ""),
@@ -297,13 +324,10 @@ payload = {
     "mail_body": os.environ.get("BODY", ""),
 }
 
-with open(os.environ["EVENTS_LOG_PATH"], "a", encoding="utf-8") as handle:
-    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-    handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
-    handle.flush()
-    os.fsync(handle.fileno())
-    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-os.chmod(os.environ["EVENTS_LOG_PATH"], 0o640)
+import sys
+sys.path.insert(0, '/usr/local/bin/sls_mass_notify')
+from sls_atomic_json import append_json_line
+append_json_line(os.environ["EVENTS_LOG_PATH"], payload)
 PY
 }
 
@@ -393,7 +417,7 @@ generate_test_tts_audio() {
   fi
 
   chown asterisk:asterisk "$output_file" 2>/dev/null || true
-  chmod 644 "$output_file"
+  chmod 640 "$output_file"
   echo "$(date): Generated manual test Piper TTS — ${base_name}.wav" >> "$LOG"
   printf '%s\n' "$base_name"
 }
@@ -436,7 +460,7 @@ build_audio_sequence() {
       && timeout --kill-after=2 30 sox "$silence_file" "${files[@]}" -r 8000 -c 1 -b 16 "$combined_file" >> "$LOG" 2>&1; then
       rm -f "$silence_file"
       chown asterisk:asterisk "$combined_file" 2>/dev/null || true
-      chmod 644 "$combined_file"
+      chmod 640 "$combined_file"
       printf '%s' "${SLS_TTS_SOUND_PREFIX}/${combined_base}"
       return 0
     fi
@@ -946,21 +970,28 @@ elif [ "${#DELIVERY_FAILURES[@]}" -gt 0 ]; then
   TEST_DELIVERY_MESSAGE="Manual Weather test completed with channel failures: ${TEST_FAILURE_MESSAGE}. Every requested local channel was attempted; successful submissions were not replayed"
   report_fault "delivery" "$TEST_DELIVERY_MESSAGE"
 fi
-update_status "$(printf '{"last_delivery_at":%s,"last_delivery_status":%s,"last_delivery_source":"test","last_delivery_event":"Manual NWS Test","last_delivery_audio":%s,"last_delivery_message":%s,"last_delivery_page_group":%s,"last_delivery_desktop_clients":%s}' \
+if ! update_status "$(printf '{"last_delivery_at":%s,"last_delivery_status":%s,"last_delivery_source":"test","last_delivery_event":"Manual NWS Test","last_delivery_audio":%s,"last_delivery_message":%s,"last_delivery_page_group":%s,"last_delivery_desktop_clients":%s}' \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DELIVERY_TS")" \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_DELIVERY_STATUS")" \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_AUDIO_LABEL")" \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_DELIVERY_MESSAGE")" \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DELIVERY_TARGETS")" \
-  "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DESKTOP_DELIVERY_TARGETS")")"
-update_status "$(printf '{"last_test_at":%s,"last_test_status":%s,"last_test_stage":%s,"last_test_message":%s,"last_test_audio":%s,"last_test_phone_count":%d,"last_test_desktop_count":%d}' \
+  "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DESKTOP_DELIVERY_TARGETS")")"; then
+  DELIVERY_FAILURES+=("delivery status could not be saved; submission may already have occurred")
+  echo "ERROR: Delivery status could not be saved. Check receipts before sending another test."
+fi
+if ! update_status "$(printf '{"last_test_at":%s,"last_test_status":%s,"last_test_stage":%s,"last_test_message":%s,"last_test_audio":%s,"last_test_phone_count":%d,"last_test_desktop_count":%d}' \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DELIVERY_TS")" \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_DELIVERY_STATUS")" \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_DELIVERY_STAGE")" \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_DELIVERY_MESSAGE")" \
   "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEST_AUDIO_LABEL")" \
   "${#NWS_ALERT_RECIPIENTS[@]}" \
-  "${#NWS_DESKTOP_CLIENTS[@]}")"
+  "${#NWS_DESKTOP_CLIENTS[@]}")"; then
+  DELIVERY_FAILURES+=("test status could not be saved; submission may already have occurred")
+  echo "ERROR: Test status could not be saved. Check receipts before sending another test."
+fi
+
 CURRENT_TIME="$(date)"
 MAIL_SUBJECT="$(render_template "$TEST_EMAIL_SUBJECT" \
   "event=Manual NWS Test" \
@@ -992,14 +1023,17 @@ MAIL_BODY="$(render_template "$TEST_EMAIL_BODY" \
   "trigger_extension=$TRIGGER_EXTENSION" \
   "trigger_name=$TRIGGER_NAME" \
   "audio_sequence=${AUDIO_SEQUENCE}")"
+if ! append_event_log "$MAIL_SUBJECT" "$MAIL_BODY" "$AUDIO_SEQUENCE"; then
+  DELIVERY_FAILURES+=("audit evidence could not be saved; submission may already have occurred")
+fi
+if [ "${#DELIVERY_FAILURES[@]}" -gt 0 ]; then
+  printf -v TEST_FAILURE_MESSAGE '%s; ' "${DELIVERY_FAILURES[@]}"
+  TEST_FAILURE_MESSAGE="${TEST_FAILURE_MESSAGE%; }"
+  echo "ERROR: Manual Weather test completed with delivery or evidence failures: ${TEST_FAILURE_MESSAGE}. Every requested local channel was attempted; successful submissions were not replayed. Check receipts before sending another test."
+  exit 1
+fi
 if [ "$NWS_ALERTS_DRY_RUN" = "1" ]; then
-  append_event_log "$MAIL_SUBJECT" "$MAIL_BODY" "$AUDIO_SEQUENCE"
   echo "Dry run complete. No phones were notified."
 else
-  append_event_log "$MAIL_SUBJECT" "$MAIL_BODY" "$AUDIO_SEQUENCE"
-  if [ "${#DELIVERY_FAILURES[@]}" -gt 0 ]; then
-    echo "ERROR: Manual Weather test completed with channel failures: ${TEST_FAILURE_MESSAGE}. Every requested local channel was attempted; successful submissions were not replayed."
-    exit 1
-  fi
   echo "Weather test local submission completed for ${#NWS_ALERT_RECIPIENTS[@]} phone recipient(s) and ${#NWS_DESKTOP_CLIENTS[@]} desktop recipient(s). Endpoint display and handset acceptance are not confirmed. Email and webhooks were not sent."
 fi

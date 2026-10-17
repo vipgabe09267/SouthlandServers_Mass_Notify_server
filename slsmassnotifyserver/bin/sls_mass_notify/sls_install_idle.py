@@ -35,6 +35,8 @@ MODULE = Path('/var/www/html/admin/modules/slsmassnotifyserver/module.xml')
 SPOOLS = (Path('/var/spool/asterisk/outgoing'), Path('/var/spool/asterisk/tmp'))
 MAX_STATE = 16 * 1024 * 1024
 MAX_HISTORY = 10000
+MAX_PHONE_TARGETS = 1000
+MAX_PHONE_CHANNELS = 4096
 TOKEN = re.compile(r'[a-f0-9]{32}')
 HASH = re.compile(r'[a-f0-9]{64}')
 ACTIVE_SCRIPTS = {'sls_mass_notify_test.sh', 'sls_mass_notify_live_paging.php', 'sls_mass_notify_phone_agi.py'}
@@ -42,6 +44,31 @@ ENTERPRISE_SCRIPTS = {'sls_mass_notify_cluster_worker.php', 'sls_mass_notify_clu
                       'sls_mass_notify_incident_response.php'}
 
 class IdleError(RuntimeError): pass
+
+def bounded_utf8(value, limit):
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        return len(value.encode('utf-8')) <= limit
+    except UnicodeError:
+        return False
+
+def json_pairs(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError('Duplicate inspection JSON field')
+        value[key] = item
+    return value
+
+def json_constant(value):
+    raise ValueError('Nonfinite inspection JSON value')
+
+def json_float(value):
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError('Nonfinite inspection JSON number')
+    return number
 
 
 def directory(path, *, protected=False):
@@ -71,7 +98,7 @@ def entries(fd, limit=20000, seconds=2):
             yield entry.name
 
 
-def read_json(path, limit=MAX_STATE, *, optional=False, protected=False):
+def read_json(path, limit=MAX_STATE, *, optional=False, protected=False, private=False):
     parent = fd = -1
     try:
         parent = directory(Path(path).parent, protected=protected)
@@ -82,6 +109,8 @@ def read_json(path, limit=MAX_STATE, *, optional=False, protected=False):
         account = pwd.getpwnam('asterisk')
         if info.st_uid not in (0, account.pw_uid) or protected and (info.st_uid != 0 or info.st_mode & 0o077):
             raise IdleError('Inspection state ownership or private baseline mode is unsafe: ' + Path(path).name)
+        if private and (info.st_gid != account.pw_gid or stat.S_IMODE(info.st_mode) & 0o137):
+            raise IdleError('Inspection heartbeat permissions are unsafe: ' + Path(path).name)
         fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         body = bytearray()
         while len(body) <= limit:
@@ -93,13 +122,13 @@ def read_json(path, limit=MAX_STATE, *, optional=False, protected=False):
         def identity(value): return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns, value.st_nlink
         if len(body) > limit or identity(info) != identity(after) or identity(after) != identity(current):
             raise IdleError('Inspection state changed while being read; retry after the worker becomes idle')
-        value = json.loads(body, parse_constant=lambda unused: (_ for _ in ()).throw(ValueError('nonfinite JSON')))
+        value = json.loads(body, object_pairs_hook=json_pairs, parse_constant=json_constant, parse_float=json_float)
         if not isinstance(value, dict): raise IdleError('Inspection state is not an object: ' + Path(path).name)
         return value
     except FileNotFoundError:
         if optional: return None
         raise IdleError('Required inspection state is missing: ' + Path(path).name) from None
-    except (ValueError, BlockingIOError) as error:
+    except (ValueError, RecursionError, BlockingIOError) as error:
         raise IdleError('Inspection state is corrupt or busy: ' + Path(path).name) from None
     finally:
         if fd >= 0: os.close(fd)
@@ -271,8 +300,26 @@ class IdleCheck:
         failures = batch.get('voicemail_failures', {})
         if not isinstance(targets, dict) or not isinstance(channels, dict) or not isinstance(failures, dict):
             raise IdleError('Phone voicemail targets cannot be inspected safely')
+        if (len(targets) > MAX_PHONE_TARGETS or len(failures) > MAX_PHONE_TARGETS
+                or len(channels) > MAX_PHONE_CHANNELS):
+            raise IdleError('Phone voicemail history exceeds its inspection bounds')
+        contacts_by_dial = {}
+        contact_count = 0
+        for channel_name, channel in channels.items():
+            if not isinstance(channel_name, str) or not isinstance(channel, dict):
+                raise IdleError('Phone voicemail channel history is malformed')
+            if channel.get('kind') != 'contact':
+                continue
+            dial = channel.get('dial')
+            if not bounded_utf8(dial, 2048):
+                raise IdleError('Phone voicemail channel contact is malformed')
+            contact_count += 1
+            if contact_count > MAX_PHONE_CHANNELS:
+                raise IdleError('Phone voicemail history exceeds its inspection bounds')
+            contacts_by_dial.setdefault(dial, []).append(channel)
+        dial_count = 0
         for recipient, row in targets.items():
-            if not isinstance(row, dict) or not isinstance(row.get('dials'), list):
+            if not isinstance(recipient, str) or not recipient or not isinstance(row, dict) or not isinstance(row.get('dials'), list):
                 raise IdleError('Phone voicemail target is malformed')
             claimed = row.get('claimed_token')
             if claimed is not None and (not isinstance(claimed, str) or not TOKEN.fullmatch(claimed)):
@@ -281,10 +328,12 @@ class IdleCheck:
                 continue
             eligible = True
             for dial in row['dials']:
-                if not isinstance(dial, str) or not dial:
+                dial_count += 1
+                if dial_count > MAX_PHONE_CHANNELS:
+                    raise IdleError('Phone voicemail history exceeds its inspection bounds')
+                if not bounded_utf8(dial, 2048):
                     raise IdleError('Phone voicemail contact is malformed')
-                contacts = [entry for entry in channels.values()
-                            if isinstance(entry, dict) and entry.get('kind') == 'contact' and entry.get('dial') == dial]
+                contacts = contacts_by_dial.get(dial, [])
                 if (len(contacts) != 1 or contacts[0].get('ended_at') is None
                         or contacts[0].get('answered_at') is not None or contacts[0].get('joined_at') is not None
                         or contacts[0].get('outcome_uncertain')
@@ -302,7 +351,8 @@ class IdleCheck:
             self.repair_missing = installed
             return {}
         batches = state.get('batches')
-        if state.get('schema') != 1 or not isinstance(batches, dict) or len(batches) > MAX_HISTORY:
+        if type(state.get('schema')) is not int or state.get('schema') != 1 \
+                or not isinstance(batches, dict) or len(batches) > MAX_HISTORY:
             raise IdleError('Phone admission history cannot be inspected safely')
         history = {}
         for token, batch in batches.items():
@@ -326,6 +376,19 @@ class IdleCheck:
                 self.boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
             if not isinstance(health, dict) or health.get('boot_id') != self.boot_id or not TOKEN.fullmatch(str(health.get('generation', ''))):
                 raise IdleError('Phone collector identity is unavailable; restore collector health before installation')
+            anchor_tick = health.get('heartbeat_tick')
+            if isinstance(anchor_tick, bool) or not isinstance(anchor_tick, (int, float)) or not math.isfinite(anchor_tick):
+                raise IdleError('Phone collector heartbeat anchor is invalid; restore collector health before installation')
+            pulse = read_json(self.data / 'phone-collector-heartbeat.json', 1024, optional=True, private=True)
+            if pulse is not None:
+                fields = {'schema', 'generation', 'boot_id', 'anchor_tick', 'heartbeat_tick'}
+                if set(pulse) != fields or type(pulse.get('schema')) is not int or pulse['schema'] != 1:
+                    raise IdleError('Phone collector heartbeat file is invalid; restore collector health before installation')
+                pulse_anchor = pulse.get('anchor_tick')
+                if (not isinstance(pulse_anchor, bool) and isinstance(pulse_anchor, (int, float))
+                        and math.isfinite(pulse_anchor) and pulse_anchor == anchor_tick
+                        and pulse.get('generation') == health['generation'] and pulse.get('boot_id') == self.boot_id):
+                    health = pulse
             tick = health.get('heartbeat_tick')
             if isinstance(tick, bool) or not isinstance(tick, (int, float)) or not math.isfinite(tick) or not 0 <= self.monotonic() - tick <= 15:
                 raise IdleError('Phone collector heartbeat is stale or invalid; restore collector health before installation')
@@ -339,8 +402,10 @@ class IdleCheck:
         if baseline is not None:
             before = read_json(Path(baseline), 2 * 1024 * 1024, protected=True)
             known = before.get('phone_history')
-            if (before.get('schema') != 1 or before.get('ok') is not True or not isinstance(known, dict)
-                    or len(known) > MAX_HISTORY or before.get('closed_phone_batches') != len(known)
+            if (type(before.get('schema')) is not int or before.get('schema') != 1
+                    or before.get('ok') is not True or not isinstance(known, dict)
+                    or len(known) > MAX_HISTORY or type(before.get('closed_phone_batches')) is not int
+                    or before.get('closed_phone_batches') != len(known)
                     or any(not isinstance(key, str) or not HASH.fullmatch(key) or not isinstance(value, str) or not HASH.fullmatch(value) for key, value in known.items())):
                 raise IdleError('Installation phone-history baseline is invalid')
             if any(history.get(key) != value for key, value in known.items()):

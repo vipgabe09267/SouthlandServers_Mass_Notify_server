@@ -62,8 +62,19 @@ $current = $method->invoke($fixture, [
 if (($current['period_state'] ?? '') !== 'current'
 	|| ($current['snapshot_current'] ?? false) !== true
 	|| ($current['snapshot_age_seconds'] ?? 0) !== 3600
-	|| ($current['estimated_days_remaining'] ?? null) !== 5.2) {
+	|| ($current['estimated_days_remaining'] ?? null) !== 4.2) {
 	xweather_usage_fail('A current Xweather snapshot did not retain its deterministic usage metadata.');
+}
+$tempest = $method->invoke($fixture, [
+	'xweather_rate_limit_period' => 15000,
+	'xweather_rate_remaining_period' => 14990,
+	'xweather_rate_reset_epoch' => strtotime('Thu, 17 Sep 2026 00:00:00 GMT'),
+	'xweather_rate_observed_at' => '2026-08-21T23:00:00+00:00',
+	'xweather_last_query_cost_tokens' => 10,
+], ['xweather'=>['provider'=>'tempest','query_interval_minutes'=>10]], $now);
+if (($tempest['interval_minutes'] ?? 0) !== 10 || ($tempest['max_queries_per_day'] ?? 0) !== 144
+	|| ($tempest['estimated_tokens_per_day'] ?? 0) !== 1440 || ($tempest['estimated_days_remaining'] ?? null) !== 10.4) {
+	xweather_usage_fail('A non-Xweather provider was incorrectly costed at the Xweather four-minute ceiling.');
 }
 
 $unknown = $method->invoke($fixture, [

@@ -72,6 +72,8 @@ $copy=$settings;$copy['location_directory']=Directory::defaults();operatorCheck(
 $root=sys_get_temp_dir().'/sls-operators-'.bin2hex(random_bytes(8));mkdir($root,0700);
 define('SLS_TEST_OP_DIRECTORY',$root);
 class OperatorFixture {
+    public array $normalizationDefaults=[];
+    private function normalizeSettings(array $settings): array { return array_replace($this->normalizationDefaults,$settings); }
     public $FreePBX;
     const PLUGIN_DATA_DIR=SLS_TEST_OP_DIRECTORY;
     const SETTINGS_JSON=self::PLUGIN_DATA_DIR.'/mass-notifications.config';
@@ -85,7 +87,8 @@ class OperatorFixture {
     public function getAnnouncementSmsRecipients($settings){return [];}
     public function getPbxDateTimeZone(){return new DateTimeZone('UTC');}
     public array $settings=[], $sent=[], $written=[];
-    public function getActiveSettings(){return $this->settings;}
+    public int $operatorConfigCommits=0, $recordingCatalogueCalls=0;
+    public function getActiveSettings(){return $this->normalizeSettings($this->settings);}
     public function getPendingSettings(){return null;}
     public function operatorDirectory():array {$this->currentOperator();return ['accounts'=>[['username'=>'alex','source'=>'database','identity'=>\SLS\MassNotify\OperatorAccess::identity(ampuser::$rows['database:alex']),'eligible'=>true]],'warnings'=>[]];}
     public function getConfiguredPjsipExtensionNumbers(){return ['1000','2000'];}
@@ -98,7 +101,7 @@ class OperatorFixture {
     private function phoneDisplayInventory():array{return $this->inventory;}
     public function announcementDesktopPresence():array{return $this->presence;}
     public function getAvailableSystemSounds(){return [['value'=>'system:custom/test.wav','label'=>'Saved test recording']];}
-    public function getSystemRecordingCatalogue($query='', $offset=0, $limit=100):array{return ['items'=>$this->getAvailableSystemSounds(),'next_offset'=>null,'has_more'=>false,'warning'=>''];}
+    public function getSystemRecordingCatalogue($query='', $offset=0, $limit=100):array{$this->recordingCatalogueCalls++;return ['items'=>$this->getAvailableSystemSounds(),'next_offset'=>null,'has_more'=>false,'warning'=>''];}
     public array $recordingImports=[];
     private function announcementTone($selection,$label,array &$errors):string{$this->recordingImports[]=$selection;return 'recording_fixture';}
     private function acquireAnnouncementActivityLock(...$args){return null;}
@@ -110,11 +113,19 @@ class OperatorFixture {
     private function releaseSettingsLock($lock){}
     private function loadSettingsFile($path){return $this->written[$path]??$this->settings;}
     private function writeSettingsFileUnlocked($path,$settings,$active){$this->written[$path]=$settings;if($active)$this->settings=$settings;}
-    public function accessRevision(){return $this->operatorRevision($this->settings);}
+    protected function commitOperatorConfigFiles(array $active, ?array $pending):void{$this->operatorConfigCommits++;if($pending!==null){$this->writeSettingsFileUnlocked(self::PENDING_SETTINGS_JSON,$pending,false);}$this->writeSettingsFileUnlocked(self::SETTINGS_JSON,$active,true);}
+    public function accessRevision(){return $this->operatorRevision($this->getActiveSettings());}
     public function project($record){return $this->operatorIncidentProjection($record,$this->currentOperator());}
 }
 eval('class LocalOperatorFixture extends OperatorFixture { const PLUGIN_DATA_DIR='.var_export($root,true).'; const SETTINGS_JSON= self::PLUGIN_DATA_DIR."/mass-notifications.config"; const PENDING_SETTINGS_JSON=self::PLUGIN_DATA_DIR."/mass-notifications.pending.config"; }');
 try {
+    $_SESSION['AMP_user']=new ampuser('owner');
+    $legacy=new LocalOperatorFixture();$legacy->settings=$settings;
+    $legacy->normalizationDefaults=['location_directory'=>$settings['location_directory']];
+    unset($legacy->settings['location_directory']);
+    $legacySaved=$legacy->saveOperatorAccess(['revision'=>$legacy->accessRevision(),'enabled'=>false,'portal_enabled'=>false,'accounts'=>[]]);
+    operatorCheck($legacySaved['success'],'Normalized editor revision rejected unchanged legacy settings: '.($legacySaved['message']??''));
+    operatorCheck($legacy->settings['location_directory']===$settings['location_directory'],'Legacy save lost the normalized location context');
     $m=new LocalOperatorFixture();$m->settings=$settings;$_SESSION['AMP_user']=new ampuser('alex');
     $m->inventory = ['available'=>true,'observed_at'=>gmdate('c'),'endpoints'=>['1000'=>['contacts'=>[[],[]]],'2000'=>['contacts'=>[[]]]]];
     $m->presence = ['alex_pc'=>['client_id'=>'cli_alex','connected_until'=>time()+60], 'other_pc'=>['client_id'=>'cli_other','connected_until'=>time()+60]];
@@ -162,7 +173,9 @@ try {
             ['name'=>'Off-site follow-up','after_seconds'=>120,'delivery'=>['extensions'=>['2000']]]]]]);
     $m->settings['incident_workflows']['templates'][]=$ladder;
     operatorCheck(!in_array($ladder['id'],array_column($m->operatorOperationsState()['templates'],'id'),true),'A later off-site escalation bypassed template scope.');
+    $catalogueCalls=$m->recordingCatalogueCalls;
     operatorCheck(!$m->operatorAction('start_incident',['template_id'=>$ladder['id'],'request_id'=>str_repeat('f',32),'fields'=>[],'is_test'=>true])['success'],'Scoped sender launched an unauthorized later step.');
+    operatorCheck($m->recordingCatalogueCalls===$catalogueCalls,'Incident authorization rebuilt the full Operations page state.');
     $projected=$m->project(array_replace($incident,['template'=>$ladder]));
     operatorCheck($projected && !$projected['can_update'],'Later-step permission was ignored when projecting incident update authority.');
     $m->settings['operator_access']['accounts'][0]['role']='warden';
@@ -187,6 +200,7 @@ try {
     $m->written[LocalOperatorFixture::PENDING_SETTINGS_JSON]=['unrelated'=>'pending-value'];
     $save=['revision'=>$m->accessRevision(),'enabled'=>true,'accounts'=>[array_diff_key($row,['identity'=>true]) + ['rebind'=>false]]];
     $saved=$m->saveOperatorAccess($save);operatorCheck($saved['success'],'Valid administrator role save failed: '.($saved['message']??''));
+    operatorCheck($m->operatorConfigCommits===1,'Operator save bypassed the immediate configuration commit boundary.');
     operatorCheck($m->written[LocalOperatorFixture::PENDING_SETTINGS_JSON]['unrelated']==='pending-value' && $m->written[LocalOperatorFixture::PENDING_SETTINGS_JSON]['operator_access']===$m->settings['operator_access'],'Role save lost staged configuration or failed to mirror permissions.');
     operatorCheck(!$m->saveOperatorAccess($save)['success'],'Stale role revision overwrote a new policy.');
     $_SESSION['AMP_user']=new ampuser('alex');operatorCheck(!$m->saveOperatorAccess($save)['success'],'Sender changed module-wide permissions.');

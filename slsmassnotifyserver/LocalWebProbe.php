@@ -1,5 +1,6 @@
 <?php
 namespace FreePBX\modules;
+require_once __DIR__.'/api/sls-mass-notify/security.php';
 
 /** Read-only local Apache probes. Never resolve a public address or follow redirects. */
 final class SlsLocalWebProbe
@@ -11,10 +12,13 @@ final class SlsLocalWebProbe
 		$path = '/sls_mass_notify/media_probe_' . bin2hex(random_bytes(12)) . '.png';
 		$observations = $observations ?? self::responses($settings['public_pbx_host'] ?? '', $path, ['Accept: application/json'], 2);
 		foreach ($observations as $response) {
+				if (!is_array($response) || !is_int($response['status'] ?? null) || !is_array($response['headers'] ?? null)
+					|| count($response['headers']) > 100 || !is_string($response['body'] ?? null) || strlen($response['body']) > 262144) { continue; }
 			$marked = false;
-			foreach ($response['headers'] ?? [] as $header) { if (preg_match('/^X-SLS-Media-Policy:\s*1\s*$/iD', $header)) { $marked = true; break; } }
+				foreach ($response['headers'] as $header) { if (is_string($header) && preg_match('/^X-SLS-Media-Policy:\s*1\s*$/iD', $header)) { $marked = true; break; } }
 			if (!$marked) { continue; }
-			$body = json_decode($response['body'] ?? '', true);
+					try { $body = \SLS\MassNotify\ApiSecurity::jsonObject($response['body'], false, 16); }
+					catch (\Throwable $error) { continue; }
 			if (($response['status'] === 404 && ($body['error'] ?? '') === 'media_not_found')
 				|| ($response['status'] === 403 && ($body['error'] ?? '') === 'media_network_denied')) {
 				return ['ok'=>true, 'message'=>_('Generated media passes through the configured access policy. No file was created or notification sent.')];
@@ -28,7 +32,7 @@ final class SlsLocalWebProbe
 
 	public static function targets($publicHost, $vhostDump = null)
 	{
-		$publicHost = strtolower(trim((string)$publicHost));
+			$publicHost = is_string($publicHost) ? strtolower(trim($publicHost)) : '';
 		$validHost = preg_match('/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/D', $publicHost)
 			&& !in_array($publicHost, ['127.0.0.1', 'localhost'], true);
 		if ($vhostDump === null) {
@@ -37,13 +41,14 @@ final class SlsLocalWebProbe
 			@exec('/usr/bin/timeout 5 /usr/sbin/apache2ctl -t -D DUMP_VHOSTS 2>/dev/null', $output, $status);
 			$vhostDump = $status === 0 ? implode("\n", $output) : '';
 		}
-		$ports = [80 => ['127.0.0.1'], 443 => ['127.0.0.1']];
+			if ($vhostDump !== null && !is_string($vhostDump)) { throw new \InvalidArgumentException('Apache virtual-host inventory must be text.'); }
+			$ports = [80 => ['127.0.0.1'], 443 => ['127.0.0.1']];
 		$preferred = [];
 		foreach (explode("\n", substr((string)$vhostDump, 0, 262144)) as $line) {
 			if (!preg_match('/^\s*(?:(\*|[0-9.]+|\[[0-9a-f:]+\]):([0-9]+)\s+|port\s+([0-9]+)\s+namevhost\b)/i', $line, $match)) {
 				continue;
 			}
-			$port = (int)($match[2] !== '' ? $match[2] : ($match[3] ?? 0));
+				$port = (int)(($match[2] ?? '') !== '' ? $match[2] : ($match[3] ?? 0));
 			if ($port < 1 || $port > 65535 || (!isset($ports[$port]) && count($ports) >= 16)) {
 				continue;
 			}
@@ -70,6 +75,7 @@ final class SlsLocalWebProbe
 							'host' => $host,
 							'host_header' => $host . (in_array($scheme . ':' . $port, ['http:80', 'https:443'], true) ? '' : ':' . $port),
 							'resolve' => $host . ':' . $port . ':' . $connectHost,
+								'host_matched' => $validHost && $host === $publicHost && isset($preferred[$port]),
 						];
 					}
 				}
@@ -80,19 +86,37 @@ final class SlsLocalWebProbe
 
 	public static function responses($publicHost, $path, array $headers, $timeoutSeconds, $vhostDump = null)
 	{
+			if ((!is_int($timeoutSeconds) && !is_float($timeoutSeconds)) || !is_finite((float)$timeoutSeconds) || $timeoutSeconds <= 0
+				|| count($headers) > 32) { throw new \RuntimeException('Local Apache verification rejected invalid request bounds.'); }
 		if (!preg_match('#^/[A-Za-z0-9/_?&=.-]{1,511}$#D', (string)$path)) {
 			throw new \RuntimeException('Local Apache verification rejected an invalid probe path.');
 		}
-		$headerText = '';
+			$headerText = ''; $sensitive = false;
 		foreach ($headers as $header) {
-			$header = trim((string)$header);
-			if ($header === '' || strpos($header, "\r") !== false || strpos($header, "\n") !== false) {
+				if (!is_string($header)) { throw new \RuntimeException('Local Apache verification rejected an invalid probe header.'); }
+				$header = trim($header);
+				if (!preg_match('/^[A-Za-z0-9-]{1,64}:[^\x00-\x08\x0a-\x1f\x7f]{0,8192}$/D', $header)) {
 				throw new \RuntimeException('Local Apache verification rejected an invalid probe header.');
 			}
+				$name = strtolower(substr($header, 0, (int)strpos($header, ':')));
+				if (!in_array($name, ['accept','cache-control'], true)) { $sensitive = true; }
 			$headerText .= $header . "\r\n";
 		}
 		$deadline = microtime(true) + 25;
-		foreach (self::targets($publicHost, $vhostDump) as $target) {
+			$targets = self::targets($publicHost, $vhostDump);
+			if ($sensitive) {
+				$matched = array_values(array_filter($targets, static fn(array $target): bool => ($target['host_matched'] ?? false) === true));
+				if ($matched) { $targets = $matched; }
+				else {
+					$normalizedHost = is_string($publicHost) ? strtolower(trim($publicHost)) : '';
+					$targets = array_values(array_filter($targets, static function(array $target) use($normalizedHost): bool {
+						$port = parse_url($target['url'], PHP_URL_PORT);
+						return in_array($port, [80,443], true)
+							&& ($normalizedHost === '' ? $target['host'] === '127.0.0.1' : $target['host'] === $normalizedHost);
+					}));
+				}
+			}
+			foreach ($targets as $target) {
 			$remaining = $deadline - microtime(true);
 			if ($remaining <= 0) {
 				break;

@@ -9,13 +9,13 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 if (os.environ.get('SLS_TEST_NAMESPACE') != 'entered'
-        or os.environ.get('SLS_TEST_PARENT_NET_NS') == os.readlink('/proc/self/ns/net')):
+        or os.environ.get('SLS_TEST_PARENT_NET_NS') in (None, '', os.readlink('/proc/self/ns/net'))):
     raise SystemExit('Use the isolated fixture runner; no browser was started.')
 driver = os.environ.get('SLS_UI_PYTHON_PATH')
 browser = os.environ.get('SLS_UI_CHROMIUM')
 if not driver or not browser or not Path(browser).is_file():
     print('SKIPPED optional voicemail browser checks: set SLS_UI_PYTHON_PATH and SLS_UI_CHROMIUM. No downloads ran.')
-    raise SystemExit(0)
+    raise SystemExit(1 if os.environ.get('SLS_UI_REQUIRED') == '1' else 0)
 sys.path.insert(0, driver)
 from playwright.sync_api import sync_playwright
 

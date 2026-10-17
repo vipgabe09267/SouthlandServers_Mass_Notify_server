@@ -20,6 +20,22 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 DATA = Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin')
 
+def desktop_snapshot(config, names):
+    """Bind a delayed audience to its original enabled enrollments."""
+    selected = {str(name).lower() for name in names if name}
+    return {str(row.get('username', '')).lower(): row['client_id']
+            for row in config.get('desktop_clients', [])
+            if isinstance(row, dict) and isinstance(row.get('client_id'), str)
+            and row['client_id'] and str(row.get('username', '')).lower() in selected
+            and str(row.get('enabled', '0')).lower() in {'1', 'true', 'yes', 'on'}}
+
+def authorized_desktops(config, names, original):
+    if not isinstance(original, dict) or len(original) > 1000:
+        return []
+    current = desktop_snapshot(config, names)
+    return [str(name) for name in names if name and current.get(str(name).lower())
+            and current[str(name).lower()] == original.get(str(name).lower())]
+
 def fingerprint(config, kind, identifier):
     section=config.get('outbound_voice' if kind=='voice' else 'announcement_sms') or {}
     row=next((r for r in section.get('recipients',[]) if isinstance(r,dict) and r.get('id')==identifier),None)

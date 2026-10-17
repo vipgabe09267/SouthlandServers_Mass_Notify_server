@@ -52,6 +52,21 @@ if (count($legacy['groups'] ?? []) !== 1
 	xweather_group_fail('Legacy singleton Lightning config did not migrate into one compatible trigger area.');
 }
 
+$invalidProvider = $normalize->invoke($module, [
+	'provider' => 'unsupported',
+	'query_interval_minutes' => 10,
+], 25);
+if (($invalidProvider['provider'] ?? '') !== 'xweather' || ($invalidProvider['query_interval_minutes'] ?? 0) !== 4) {
+	xweather_group_fail('An invalid Lightning provider retained a polling interval that Xweather does not allow.');
+}
+$tempestProvider = $normalize->invoke($module, [
+	'provider' => 'tempest',
+	'query_interval_minutes' => 10,
+], 25);
+if (($tempestProvider['provider'] ?? '') !== 'tempest' || ($tempestProvider['query_interval_minutes'] ?? 0) !== 10) {
+	xweather_group_fail('Tempest polling normalization no longer preserves its supported interval.');
+}
+
 $groups = [];
 for ($index = 0; $index < 6; $index++) {
 	$groups[] = [
@@ -83,6 +98,35 @@ $invalidStrike = $validate->invoke($module, [[
 if (stripos(implode(' ', $invalidStrike), 'strike type') === false) {
 	xweather_group_fail('An unsupported Lightning strike type was not rejected.');
 }
+
+$validBaseGroup = [
+	'id' => 'north', 'name' => 'North', 'enabled' => '1', 'location' => 'North Campus',
+	'radius_miles' => 10, 'extensions' => ['1000'], 'desktop_clients' => [],
+	'email_recipients' => [], 'voice_recipient_ids' => [], 'sms_recipient_ids' => [],
+];
+$expectNormalizationFailure = static function (array $groups, string $description) use ($normalize, $module): void {
+	try {
+		$normalize->invoke($module, ['enabled' => '1', 'groups' => $groups], 25);
+	} catch (DomainException|InvalidArgumentException $error) {
+		return;
+	}
+	xweather_group_fail($description);
+};
+$malformedId = $validBaseGroup;
+$malformedId['id'] = 'north!';
+$expectNormalizationFailure([$malformedId], 'A malformed Lightning group ID was silently rewritten.');
+$duplicateId = $validBaseGroup;
+$duplicateId['name'] = 'Second North';
+$expectNormalizationFailure([$validBaseGroup, $duplicateId], 'Duplicate Lightning group IDs were silently renamed.');
+$malformedExtension = $validBaseGroup;
+$malformedExtension['extensions'] = ['10!00'];
+$expectNormalizationFailure([$malformedExtension], 'A malformed Lightning phone selector was silently retargeted or dropped.');
+$malformedDesktop = $validBaseGroup;
+$malformedDesktop['desktop_clients'] = ['Bad User'];
+$expectNormalizationFailure([$malformedDesktop], 'A malformed Lightning desktop selector was silently retargeted or dropped.');
+$malformedSite = $validBaseGroup;
+$malformedSite['site_id'] = 'loc_invalid';
+$expectNormalizationFailure([$malformedSite], 'A malformed Lightning site ID was silently removed.');
 
 $view = (string)file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/views/lightning.php');
 foreach (['xweather[groups][', 'data-lightning-desktop', 'data-lightning-field="strike_type"', 'data-lightning-field="quiet_hours_enabled"', 'Forecast-aware adaptive protection:', 'cloud-to-cloud strikes', 'Each enabled area uses its own Xweather query while active', 'groups_present'] as $marker) {
@@ -193,4 +237,21 @@ if (strpos($rendered, 'Current account-period usage') !== false) {
 	xweather_group_fail('An expired provider snapshot was rendered as current usage.');
 }
 
+$method = (new ReflectionClass(FreePBX\modules\Slsmassnotifyserver::class))->getMethod('triggerLightningTest');
+$lines=file($method->getFileName());
+$body=implode('',array_slice($lines,$method->getStartLine()-1,$method->getEndLine()-$method->getStartLine()+1));
+eval('class LightningSelectionFixture {
+ public int $cooldownClaims=0;
+ private function isSetupComplete($settings){return true;}
+ private function getSetupRequiredMessage(){return "fixture";}
+ private function getActiveSettings(){return ["xweather"=>["groups"=>[["id"=>"known","enabled"=>"1"]]]];}
+ private function normalizeXweatherSettings($value,$volume){return $value;}
+ private function claimLightningTestCooldown(){$this->cooldownClaims++;return ["claimed"=>false];}
+ '.$body.'}');
+foreach ([['known','missing'],['known!'],[['known']],['']] as $ids) {
+ $fixture=new LightningSelectionFixture();$result=$fixture->triggerLightningTest('inert fixture',$ids);
+ if (($result['error_code']??'')!=='invalid_group_selection' || $fixture->cooldownClaims!==0) {
+  xweather_group_fail('A malformed or partially unavailable Lightning selection was normalized or silently ignored.');
+ }
+}
 echo "Lightning trigger-area configuration regressions passed.\n";

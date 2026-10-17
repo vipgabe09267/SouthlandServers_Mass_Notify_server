@@ -26,6 +26,7 @@ on:
           - fresh
           - 0.1.4-beta
           - 0.1.5-beta
+          - 0.1.6-beta
 permissions:
   contents: read
 jobs:
@@ -87,10 +88,19 @@ jobs:
           QUAL_IMAGE_SHA: ${{ inputs.image_sha256 }}
           QUAL_BASELINE: ${{ inputs.baseline }}
         run: |
-          scenarios='install inactive-cron term int hup power-loss'
+          scenarios='install repair uninstall purge inactive-cron term int hup power-loss preparation-power-loss'
           if [ "$QUAL_BASELINE" = fresh ]; then scenarios="$scenarios missing-dashboard"; fi
           sudo --preserve-env=LIBGUESTFS_BACKEND,LIBGUESTFS_MEMSIZE python3 tools/qualify_installer_vm.py \
             --allow-disposable-vm --image /tmp/sls-qualification-image --image-sha256 "$QUAL_IMAGE_SHA" \
             --bundle /tmp/sls-qualification-bundle --baseline "$QUAL_BASELINE" \
             --scenarios $scenarios --report /tmp/sls-vm-qualification.json
           sudo cat /tmp/sls-vm-qualification.json
+      - name: Retain qualification results and sanitized guest logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4, pinned
+        with:
+          name: sls-freepbx-installer-qualification
+          path: |
+            /tmp/sls-vm-qualification.json
+            /tmp/sls-vm-qualification-evidence/
+          if-no-files-found: warn

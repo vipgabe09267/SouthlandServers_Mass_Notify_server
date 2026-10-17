@@ -6,8 +6,10 @@ transport retains its separate stream limit and requires JSON-poll fallback.
 """
 import argparse
 import json
+import math
 import os
 from pathlib import Path
+import pwd
 
 import re
 import stat
@@ -92,7 +94,7 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
     size = lambda name: int(measured.get(name, {}).get('allocated_bytes', 0))
     recovery_size = lambda name: max(size(name), int(measured.get(name, {}).get('logical_bytes', 0)))
     unit = lambda path: max(4096, int(units.get(path, 4096)))
-    # Accepted releases contain at most2000 entries and50MiB regular-file data.
+    # Accepted releases contain at most 2,000 entries and 50 MiB of regular-file data.
     payloads = payloads or {}
     payload = lambda path: (int(payloads[path]['bytes']) + int(payloads[path]['entries']) * unit(path)
                             if path in payloads else 50 * MIB + 2000 * unit(path))
@@ -103,8 +105,9 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
     model_temporary = rounded(max(VOICE_BYTES.values()), unit(voices))
     if missing_voices is None:
         missing_voices = voice_total
-    # Phone/Weather 16 MiB; encrypted configuration 3 MiB; schedule reserve at least its10MiB backup
-    #limit or its actual size. Up to25 queued jobs may write2MiB records.
+    # Phone and weather state reserve 16 MiB each; encrypted configuration
+    # reserves 3 MiB; schedules reserve at least their 10 MiB backup limit or
+    # their actual size. Up to 25 queued jobs may write 2 MiB records.
     atomic_state = sum(max(limit * MIB, size(name)) for name, limit in
                        (('phone_ledger', 16), ('weather_ledger', 16), ('schedule_ledger', 10), ('config', 3))) + 25 * 2 * MIB
     # Retain 20 encrypted configuration backups, each bounded to 3 MiB.
@@ -125,12 +128,12 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
         data: {'bounded_atomic_state_writes': atomic_state},
         MANAGED_TREES['config_backups']: {'remaining_bounded_config_backups': backup_growth},
         MANAGED_TREES['module']: {'new_module_payload': payload(MANAGED_TREES['module'])},
-        #Independent target mounts each need room for a legal package payload.
+        # Independent target mounts each need room for a legal package payload.
         MANAGED_TREES['web']: {'public_asset_payload': payload(MANAGED_TREES['web'])},
         MANAGED_TREES['sip_api']: {'sip_api_payload': payload(MANAGED_TREES['sip_api'])},
         MANAGED_TREES['control_api']: {'control_api_payload': payload(MANAGED_TREES['control_api'])},
         MANAGED_TREES['operator_portal']: {'operator_portal_payload': payload(MANAGED_TREES['operator_portal'])},
-        #Maintenance compacts logs sequentially, using backup+retained temporary.
+        # Maintenance compacts logs sequentially, using backup and retained temporary files.
         '/var/log': {'event_log_backup_and_retained_copy': 2 * 64 * MIB},
         '/var/lib/sls-mass-notify-trust': {'new_authenticated_generation': payload('/var/lib/sls-mass-notify-trust'),
                                          'stock_and_release_manifests': 8 * MIB},
@@ -205,9 +208,11 @@ def measure_tree(path, deadline, maximum_entries=50000, *, cache=None):
     """Metadata only, without following directory/file links or printing names."""
     result = {'allocated_bytes': 0, 'logical_bytes': 0, 'files': 0, 'directories': 0, 'largest_file_bytes': 0}
     root = Path(path)
-    if not root.exists():
+    try:
+        root_metadata = root.lstat()
+    except FileNotFoundError:
         return result
-    if root.is_symlink() or not root.is_dir():
+    if not stat.S_ISDIR(root_metadata.st_mode):
         raise ValueError('An SLS storage root is not a real directory')
     cache = {} if cache is None else cache
     if str(root) in cache: return dict(cache[str(root)])
@@ -517,23 +522,59 @@ def configured_limits(path):
     path = Path(path)
     if not path.is_absolute() or '..' in path.parts:
         raise ValueError('Configuration path must be absolute')
+    account = pwd.getpwnam('asterisk')
+    allowed_owners = {0, account.pw_uid}
+    allowed_groups = {0, account.pw_gid}
     parent = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         for component in path.parts[1:-1]:
             child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
             os.close(parent)
             parent = child
+            info = os.fstat(parent)
+            sticky_root = info.st_uid == 0 and bool(info.st_mode & stat.S_ISVTX)
+            if (info.st_uid not in allowed_owners or info.st_gid not in allowed_groups
+                    or info.st_mode & 0o002 and not sticky_root
+                    or info.st_mode & 0o020 and info.st_gid != account.pw_gid and not sticky_root):
+                raise ValueError('Configuration parent ownership or permissions are unsafe')
         descriptor = os.open(path.name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent)
     finally:
         os.close(parent)
     with os.fdopen(descriptor, 'rb') as handle:
         metadata = os.fstat(handle.fileno())
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > 16 * 1024 * 1024:
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                or metadata.st_uid not in allowed_owners or metadata.st_gid not in allowed_groups
+                or metadata.st_mode & 0o022 or metadata.st_size > 16 * 1024 * 1024):
             raise ValueError('Configuration is not a bounded private regular file')
         raw = handle.read(16 * 1024 * 1024 + 1)
+        after = os.fstat(handle.fileno())
+        if (len(raw) != metadata.st_size
+                or (metadata.st_ino, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
+                != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+            raise ValueError('Configuration changed during inspection')
     if len(raw) > 16 * 1024 * 1024:
         raise ValueError('Configuration exceeded its size limit')
-    value = json.loads(raw)
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError('Configuration contains duplicate JSON members')
+            result[key] = value
+        return result
+
+    def finite_float(text):
+        value = float(text)
+        if not math.isfinite(value):
+            raise ValueError('Configuration contains a nonfinite number')
+        return value
+
+    def invalid_constant(text):
+        raise ValueError('Configuration contains a nonfinite number')
+
+    try:
+        value = json.loads(raw, object_pairs_hook=pairs, parse_float=finite_float, parse_constant=invalid_constant)
+    except RecursionError:
+        raise ValueError('Configuration exceeds JSON nesting limits') from None
     if isinstance(value, dict) and any(field in value for field in ('format', 'ciphertext', 'key_id', 'nonce')):
         if value.get('format') != 'sls-mass-notify-config-aes256gcm-v1':
             raise ValueError('The protected configuration encryption format is unsupported or damaged')

@@ -5,8 +5,10 @@ import configparser
 import importlib.util
 import json
 import multiprocessing
+import os
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -43,6 +45,159 @@ def concurrent_append(journal_path, process_index, iterations, barrier):
 
 
 class JournalPersistenceTests(unittest.TestCase):
+    def test_real_python_publication_is_readable_without_timestamp_or_history_rewrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / 'events.jsonl'
+            published = datetime.now(timezone.utc).replace(microsecond=473064)
+            class PublicationClock(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return published
+            config = journal_config(journal)
+            config['desktop'] = {'client_ids': '{"alice":"device-a"}'}
+            with mock.patch.object(SENDER_MODULE, 'datetime', PublicationClock):
+                SENDER_MODULE.append_sipnotify_event(config, {
+                    'id': 'python-publication', 'kind': 'announcement',
+                    'desktop_all': False, 'desktop_recipients': ['alice'],
+                })
+            original = journal.read_bytes()
+            event = json.loads(original)
+            self.assertRegex(event['created_at'], r'\.473064[+-][0-9]{2}:[0-9]{2}$')
+            identities = (journal.stat().st_ino, journal.with_suffix('.jsonl.lock').stat().st_ino)
+            result = self.run_php_journal_harness(journal,
+                'echo json_encode(retained_events([]), JSON_THROW_ON_ERROR);')
+            self.assertEqual(result, [event])
+            self.assertEqual(journal.read_bytes(), original)
+            self.assertEqual((journal.stat().st_ino, journal.with_suffix('.jsonl.lock').stat().st_ino), identities)
+
+    def test_event_identifier_uses_the_same_bounded_byte_contract_as_the_reader(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / 'events.jsonl'
+            config = journal_config(journal)
+            accepted = 'é' * 1024
+            SENDER_MODULE.append_sipnotify_event(config, {'kind': 'announcement', 'id': accepted})
+            original = journal.read_bytes()
+            for rejected in ('é' * 1025, ' padded', 'trailing ', 'bad\x7fvalue', '\ud800'):
+                with self.subTest(identifier=repr(rejected)), self.assertRaises(OSError):
+                    SENDER_MODULE.append_sipnotify_event(config, {'kind': 'announcement', 'id': rejected})
+                self.assertEqual(journal.read_bytes(), original)
+
+    def test_alert_inputs_fail_before_delivery_when_their_event_id_cannot_be_journaled(self):
+        import base64
+        for identifier in ('é' * 1025, ' padded', 'trailing ', 'bad\x7fvalue', '\ud800'):
+            payload = json.dumps({'id': identifier, 'properties': {}}, ensure_ascii=True).encode()
+            with self.subTest(identifier=repr(identifier)), self.assertRaises(RuntimeError):
+                SENDER_MODULE.alert_from_json_b64(base64.b64encode(payload).decode())
+        for identifier in ('bad\x7fvalue', ' padded', '\ud800'):
+            with self.subTest(synthetic=repr(identifier)), self.assertRaises(ValueError):
+                SENDER_MODULE.synthetic_alert('Weather Test', 'Severe', 'Area', 'Description', 5, identifier)
+        with self.assertRaises(ValueError):
+            SENDER_MODULE.synthetic_alert('Bad\nEvent', 'Severe', 'Area', 'Description', 5, '')
+
+        for identifier in ('é' * 1025, ' padded', 'bad\x7fvalue', '\ud800'):
+            with self.subTest(direct=repr(identifier)), \
+                    mock.patch.object(SENDER_MODULE, 'build_xml') as render, \
+                    mock.patch.object(SENDER_MODULE, 'AmiClient') as ami, \
+                    self.assertRaises(ValueError):
+                SENDER_MODULE.push_alert(
+                    configparser.ConfigParser(interpolation=None),
+                    {'id': identifier, 'properties': {}},
+                    targets={'1000'},
+                )
+            render.assert_not_called()
+            ami.assert_not_called()
+
+    def test_invalid_inherited_timezone_falls_back_before_argument_parsing(self):
+        environment = dict(os.environ)
+        environment['TZ'] = 'Invalid/Zone/That/Does/Not/Exist'
+        result = subprocess.run(
+            [sys.executable, str(SENDER), '--help'],
+            cwd='/', env=environment, text=True, capture_output=True, timeout=15, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('SLS Mass Notify SIP NOTIFY', result.stdout)
+
+    def test_enrollment_bindings_are_strict_and_fail_before_journal_creation(self):
+        invalid = [
+            '{"alice":"client_a","alice":"client_b"}',
+            '{"alice":NaN}',
+            '["alice"]',
+            '{"bad name":"client_a"}',
+            '{"alice":"bad.client"}',
+        ]
+        for raw in invalid:
+            with self.subTest(raw=raw), tempfile.TemporaryDirectory() as directory:
+                journal = Path(directory) / 'events.jsonl'
+                config = journal_config(journal)
+                config['desktop'] = {'client_ids': raw}
+                with self.assertRaises(OSError):
+                    SENDER_MODULE.append_sipnotify_event(config, {
+                        'kind': 'announcement', 'id': 'fixture',
+                        'desktop_recipients': ['alice'], 'desktop_all': False,
+                    })
+                self.assertFalse(journal.exists())
+
+    def test_read_only_legacy_mode_is_tightened_but_writable_mode_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / 'events.jsonl'
+            journal.write_bytes(b'{"kind":"announcement","id":"original"}\n')
+            journal.chmod(0o644)
+            SENDER_MODULE.append_sipnotify_event(journal_config(journal), {
+                'kind': 'announcement', 'id': 'new',
+            })
+            self.assertEqual(journal.stat().st_mode & 0o777, 0o640)
+            before = journal.read_bytes()
+            journal.chmod(0o660)
+            with self.assertRaisesRegex(OSError, 'unsafe'):
+                SENDER_MODULE.append_sipnotify_event(journal_config(journal), {
+                    'kind': 'announcement', 'id': 'blocked',
+                })
+            self.assertEqual(journal.read_bytes(), before)
+
+    def test_repeated_event_cannot_narrow_all_desktops_or_change_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / 'events.jsonl'
+            config = journal_config(journal)
+            original = {
+                'kind': 'alert', 'id': 'stable-alert', 'is_test': False,
+                'desktop_all': True, 'desktop_recipients': [], 'recipients': [],
+            }
+            SENDER_MODULE.append_sipnotify_event(config, original)
+            SENDER_MODULE.append_sipnotify_event(config, {
+                **original, 'desktop_all': False, 'desktop_recipients': ['alice'],
+            })
+            saved = json.loads(journal.read_text())
+            self.assertIs(saved['desktop_all'], True)
+            before = journal.read_bytes()
+            for changed in ({**original, 'kind': 'announcement'}, {**original, 'is_test': True}):
+                with self.assertRaises(OSError):
+                    SENDER_MODULE.append_sipnotify_event(config, changed)
+                self.assertEqual(journal.read_bytes(), before)
+
+    def test_repeated_announcement_keeps_its_original_desktop_audience(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / 'events.jsonl'
+            config = journal_config(journal)
+            config['desktop'] = {'client_ids': json.dumps({'alice': 'client-a', 'bob': 'client-b'})}
+            SENDER_MODULE.append_sipnotify_event(config, {
+                'kind': 'announcement', 'id': 'stable-announcement', 'is_test': False,
+                'desktop_all': True, 'desktop_recipients': [],
+            })
+            SENDER_MODULE.append_sipnotify_event(config, {
+                'kind': 'announcement', 'id': 'stable-announcement', 'is_test': False,
+                'desktop_all': False, 'desktop_recipients': ['bob'],
+            })
+            saved = json.loads(journal.read_text())
+            self.assertIs(saved['desktop_all'], True)
+            self.assertEqual(saved['desktop_recipients'], [])
+            self.assertEqual(saved['desktop_client_ids'], {'alice': 'client-a', 'bob': 'client-b'})
+
+    def test_imagemagick_commands_use_installer_verified_absolute_paths(self):
+        source = SENDER.read_text(encoding='utf-8')
+        self.assertNotRegex(source, r'(?m)^\s*["\'](?:convert|identify)["\'],')
+        self.assertGreaterEqual(source.count('"/usr/bin/convert"'), 3)
+        self.assertIn('["/usr/bin/identify", "-format"', source)
+
     def test_scheduled_deadline_after_fsync_preserves_existing_journal(self):
         with tempfile.TemporaryDirectory() as directory:
             journal = Path(directory) / 'events.jsonl'
@@ -72,6 +227,13 @@ class JournalPersistenceTests(unittest.TestCase):
     def run_php_journal_harness(self, journal, statements, raw=False):
         source = DESKTOP_API.read_text(encoding="utf-8")
         prefix = source.split("function announcement_display_expired", 1)[0]
+        # Python publication sets asterisk ownership. Model the web reader's
+        # actual account while retaining root-owned synthetic fixture inputs.
+        prefix = prefix.replace('declare(strict_types=1);', '''declare(strict_types=1);
+namespace JournalFixture;
+use \\RuntimeException; use \\Throwable;
+function posix_geteuid() { return \\posix_getpwnam('asterisk')['uid']; }
+''', 1)
         include = "require_once dirname(__DIR__) . '/sls-mass-notify/security.php';"
         self.assertIn(include, prefix)
         prefix = prefix.replace(include, "require_once " + json.dumps(str(DESKTOP_API.parent.parent / "sls-mass-notify/security.php")) + ";", 1)
@@ -144,6 +306,29 @@ class JournalPersistenceTests(unittest.TestCase):
             records = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
             self.assertEqual([record["id"] for record in records], ["original", "new"])
             self.assertEqual(journal.stat().st_mode & 0o777, 0o640)
+
+    def test_same_inode_mutation_at_final_boundary_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / 'events.jsonl'
+            SENDER_MODULE.append_sipnotify_event(journal_config(journal), {'id': 'original'})
+            inode = journal.stat().st_ino
+            evidence = b'{"id":"external-evidence"}\n'
+
+            def mutate_before_publication(*_args, **_kwargs):
+                with journal.open('r+b') as handle:
+                    handle.seek(0)
+                    handle.write(evidence)
+                    handle.truncate()
+                    handle.flush()
+                return {'fixture': True}
+
+            with mock.patch.object(SENDER_MODULE._cluster_guard, 'begin', side_effect=mutate_before_publication), \
+                    mock.patch.object(SENDER_MODULE._cluster_guard, 'finish'):
+                with self.assertRaisesRegex(OSError, 'publication boundary'):
+                    SENDER_MODULE.append_sipnotify_event(journal_config(journal), {'id': 'new'})
+            self.assertEqual(journal.read_bytes(), evidence)
+            self.assertEqual(journal.stat().st_ino, inode)
+            self.assertEqual(list(journal.parent.glob('.events.jsonl.tmp.*')), [])
 
     def test_concurrent_atomic_replacements_do_not_lose_events(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -375,6 +560,22 @@ class JournalPersistenceTests(unittest.TestCase):
                 self.assertEqual(journal.read_bytes(), original)
                 self.assertEqual(journal.stat().st_ino, before)
 
+    def test_ambiguous_records_preserve_journal_and_refuse_publication(self):
+        for raw in (
+            b'{"id":"earlier","id":"matching"}\n',
+            b'{"id":"matching","desktop_client_ids":{"app":"old","app":"new"}}\n',
+            b'{"id":"matching","unknown":1e309}\n',
+        ):
+            with self.subTest(raw=raw), tempfile.TemporaryDirectory() as directory:
+                journal = Path(directory) / 'events.jsonl'
+                journal.write_bytes(raw)
+                inode = journal.stat().st_ino
+                with self.assertRaisesRegex(OSError, 'corrupt'):
+                    SENDER_MODULE.append_sipnotify_event(journal_config(journal), {'id':'matching'})
+                self.assertEqual(journal.read_bytes(), raw)
+                self.assertEqual(journal.stat().st_ino, inode)
+                self.assertEqual(list(journal.parent.glob('.events.jsonl.tmp.*')), [])
+
     def test_file_byte_bound_rejects_sparse_oversized_journal_without_rewrite(self):
         with tempfile.TemporaryDirectory() as directory:
             journal = Path(directory) / 'events.jsonl'
@@ -479,6 +680,24 @@ class JournalPersistenceTests(unittest.TestCase):
             self.assertIn('event: reconnect\ndata: {"ok":false,"error":"journal_corrupt","retryable":true}\n\n', output)
             self.assertNotIn('\n{\n', output)
             self.assertEqual(journal.read_bytes(), b'corrupt-evidence\n')
+
+    def test_post_handshake_config_failure_is_an_sse_reconnect_frame(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / 'events.jsonl'
+            output = self.run_php_journal_harness(journal,
+                'echo "event: authenticated\\ndata: {}\\n\\n"; '
+                '$GLOBALS["slsDesktopSseActive"] = true; '
+                'respond(503, ["ok"=>false,"error"=>"config_unavailable"]);', raw=True)
+            self.assertEqual(output,
+                'event: authenticated\ndata: {}\n\n'
+                'event: reconnect\ndata: {"ok":false,"error":"config_unavailable","retryable":true}\n\n')
+
+    def test_revocation_closes_without_a_success_reconnect(self):
+        source = DESKTOP_API.read_text(encoding='utf-8')
+        revoked = source.split('if (empty($currentClient)', 1)[1].split('$lastAuthCheck = $tick;', 1)[0]
+        self.assertIn('desktop_stream_release_slots($streamSlots);', revoked)
+        self.assertIn('exit;', revoked)
+        self.assertNotIn('break;', revoked)
 
 
 if __name__ == "__main__":

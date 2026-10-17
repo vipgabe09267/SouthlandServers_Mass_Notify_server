@@ -37,8 +37,11 @@ function languageEditor(parent, initial) {
 
 function editRecipientLanguages() {
     open('Recipient language preferences', 'Save preferences', 'Apply Config activates preferences for new incidents. Existing incidents keep their saved wording, voices and recipients.');
-    const channels = [['extensions','Phone extension'],['desktop_clients','Desktop client'],['voice_recipient_ids','External voice'],['email_recipient_ids','Email'],['sms_recipient_ids','SMS'],['webhook_ids','Webhook']];
+    const channels = [['extensions','Phone extension'],['desktop_clients','Desktop client'],['voice_recipient_ids','External voice'],['email_recipient_ids','Email'],['sms_recipient_ids','SMS'],['webhook_ids','Webhook'],
+        ['browser_recipient_ids','Browser subscribers · Labs'],['connector_ids','Notification connectors · Labs']];
     const entries = (data.recipient_languages || []).map(row => Object.assign({},row));
+    const recipientLabels = new Map(Object.entries(data.choices).map(([channel, rows]) =>
+        [channel, new Map(rows.map(row => [row.id, row.name]))]));
     const languages = new Map();
     data.templates.forEach(template => (template.language_variants || []).forEach(row => languages.set(row.locale,row.label+' · '+row.locale)));
     entries.forEach(row => { if(!languages.has(row.locale))languages.set(row.locale,row.locale+' · no current reviewed variant'); });
@@ -58,7 +61,7 @@ function editRecipientLanguages() {
     add.prepend(node('i',{class:'fa fa-plus','aria-hidden':'true'}),document.createTextNode(' '));actions.append(add);body.append(actions);
     const search=field(body,'Find saved preferences',input('',120,false)),listing=node('div',{class:'sls-inc-table-wrap'}),pager=node('div',{class:'sls-inc-actions'});body.append(listing,pager);
     let page=0;
-    function label(row) { const target=(data.choices[row.channel]||[]).find(candidate=>candidate.id===row.recipient_id);return target ? target.name : row.recipient_id+' · unavailable'; }
+    function label(row) { return recipientLabels.get(row.channel)?.get(row.recipient_id) ?? row.recipient_id+' · unavailable'; }
     function render() {
         const matches=entries.filter(row=>(label(row)+' '+row.locale+' '+row.channel).toLowerCase().includes(search.value.toLowerCase()));
         page=Math.max(0,Math.min(page,Math.ceil(matches.length/40)-1));listing.replaceChildren();pager.replaceChildren();

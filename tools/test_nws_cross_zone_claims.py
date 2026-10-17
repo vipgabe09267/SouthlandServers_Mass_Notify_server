@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import fcntl
 import json
 import os
 import subprocess
@@ -28,6 +29,147 @@ SPEC.loader.exec_module(claims)
 
 
 class CrossZoneClaimTests(unittest.TestCase):
+    def test_ambiguous_claim_history_is_preserved(self):
+        with tempfile.TemporaryDirectory(prefix='sls-nws-ambiguous-') as directory:
+            path = Path(directory) / 'claims.json'
+            claims.claim_destinations(path, 'retained', 'phone', ['1000'], now=100)
+            for raw in ('{"version":1,"claims":{"retained":{}},"claims":{},"cycles":{}}',
+                        '{"version":true,"claims":{},"cycles":{}}',
+                        '{"version":1,"claims":{},"cycles":{},"extra":1e309}'):
+                with self.subTest(raw=raw):
+                    path.write_text(raw)
+                    inode = path.stat().st_ino
+                    with self.assertRaises(claims.CoordinationError):
+                        claims.claim_destinations(path, 'new', 'phone', ['1001'], now=101)
+                    self.assertEqual(path.read_text(), raw)
+                    self.assertEqual(path.stat().st_ino, inode)
+
+    def test_malformed_claim_is_not_pruned_into_repeat_delivery(self):
+        with tempfile.TemporaryDirectory(prefix='sls-nws-invalid-history-') as directory:
+            path = Path(directory) / 'claims.json'
+            claims.claim_destinations(path, 'retained', 'phone', ['1000'], now=100)
+            state = json.loads(path.read_bytes())
+            next(iter(state['claims'].values()))['claimed_at'] = 'unknown'
+            path.write_text(json.dumps(state))
+            before = path.read_bytes()
+            with self.assertRaises(claims.CoordinationError):
+                claims.claim_destinations(path, 'retained', 'phone', ['1000'], now=101)
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_large_supported_cohort_can_finalize_exactly_once(self):
+        with tempfile.TemporaryDirectory(prefix='sls-nws-large-cohort-') as directory:
+            path = Path(directory) / 'claims.json'
+            recipients = [str(1000 + index) for index in range(1000)]
+            result = claims.claim_destinations(path, 'large', 'phone', recipients,
+                                               now=100, reservation_id='private_reservation')
+            self.assertEqual(result['claimed'], recipients)
+            committed = claims.finalize_reservation(path, 'large', 'private_reservation', ['phone'],
+                                                    'commit', len(recipients), now=101)
+            self.assertEqual(committed['changed'], len(recipients))
+            self.assertEqual(claims.claim_destinations(path, 'large', 'phone', recipients, now=102)['duplicates'], recipients)
+
+    def test_lock_wait_has_a_bounded_failure(self):
+        with tempfile.TemporaryDirectory(prefix='sls-nws-lock-wait-') as directory:
+            path = Path(directory) / 'claims.json'
+            claims.claim_destinations(path, 'retained', 'phone', ['1000'], now=100)
+            with Path(str(path) + '.lock').open('r+b') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                source = '''import sys,importlib.util,pathlib
+sys.dont_write_bytecode=True
+spec=importlib.util.spec_from_file_location('private_claims',sys.argv[1]);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+try: module.claim_destinations(pathlib.Path(sys.argv[2]),'new','phone',['1001'],now=101)
+except module.CoordinationError: raise SystemExit(2)
+raise SystemExit(0)
+'''
+                started = time.monotonic()
+                result = subprocess.run([sys.executable, '-c', source, str(HELPER), str(path)],
+                                        capture_output=True, text=True, timeout=2)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertLess(time.monotonic() - started, 1.5)
+
+    def test_unknown_lock_metadata_and_replaced_state_remain_unchanged(self):
+        with tempfile.TemporaryDirectory(prefix='sls-nws-storage-identity-') as directory:
+            root = Path(directory)
+            path = root / 'claims.json'
+            claims.claim_destinations(path, 'retained', 'phone', ['1000'], now=100)
+            lock = Path(str(path) + '.lock')
+            owner, group = claims._account_ids()
+            for mode, gid in ((0o666, group), (0o2640, group), (0o640, group + 1000)):
+                with self.subTest(mode=mode, gid=gid):
+                    lock.chmod(mode)
+                    os.chown(lock, owner, gid)
+                    before = lock.stat()
+                    with self.assertRaises(claims.CoordinationError):
+                        claims.claim_destinations(path, 'new', 'phone', ['1001'], now=101)
+                    after = lock.stat()
+                    self.assertEqual((after.st_ino, after.st_mode, after.st_uid, after.st_gid),
+                                     (before.st_ino, before.st_mode, before.st_uid, before.st_gid))
+            lock.chmod(0o640)
+            os.chown(lock, owner, group)
+            before = path.read_bytes()
+            with self.assertRaises(claims.CoordinationError):
+                with claims.LockedState(path) as locked:
+                    path.rename(root / 'preserved.json')
+                    path.write_bytes(before)
+                    path.chmod(0o640)
+                    os.chown(path, owner, group)
+                    locked.commit()
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual((root / 'preserved.json').read_bytes(), before)
+
+    def test_replaced_named_lock_cannot_authorize_a_second_journal(self):
+        with tempfile.TemporaryDirectory(prefix='sls-nws-lock-identity-') as directory:
+            root = Path(directory)
+            path = root / 'claims.json'
+            claims.claim_destinations(path, 'retained', 'phone', ['1000'], now=100)
+            lock = Path(str(path) + '.lock')
+            real_flock = claims.fcntl.flock
+            before = path.read_bytes()
+            swapped = False
+            def replace_after_acquiring(descriptor, operation):
+                nonlocal swapped
+                result = real_flock(descriptor, operation)
+                if operation & fcntl.LOCK_EX and not swapped:
+                    swapped = True
+                    lock.rename(root / 'preserved.lock')
+                    lock.touch(mode=0o640)
+                    os.chown(lock, *claims._account_ids())
+                return result
+            with mock.patch.object(claims.fcntl, 'flock', side_effect=replace_after_acquiring):
+                with self.assertRaises(claims.CoordinationError):
+                    claims.claim_destinations(path, 'new', 'phone', ['1001'], now=101)
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_missing_established_history_cannot_authorize_repeat_weather_claims(self):
+        with tempfile.TemporaryDirectory(prefix='sls-nws-missing-history-') as directory:
+            path = Path(directory) / 'claims.json'
+            claims.claim_destinations(path, 'retained', 'phone', ['1000'], now=100)
+            lock = Path(str(path) + '.lock')
+            inode = lock.stat().st_ino
+            path.unlink()
+            with self.assertRaises(claims.CoordinationError):
+                claims.claim_destinations(path, 'retained', 'phone', ['1000'], now=101)
+            self.assertFalse(path.exists())
+            self.assertEqual(lock.stat().st_ino, inode)
+
+    def test_interrupted_marker_commit_resumes_without_duplicate_claims(self):
+        with tempfile.TemporaryDirectory(prefix='sls-nws-marker-interruption-') as directory:
+            path = Path(directory) / 'claims.json'
+            real_pwrite = claims.os.pwrite
+            def short_write(descriptor, raw, offset):
+                return real_pwrite(descriptor, raw[:8], offset)
+            with mock.patch.object(claims.os, 'pwrite', side_effect=short_write):
+                with self.assertRaises(claims.CoordinationError):
+                    claims.claim_destinations(path, 'retained', 'phone', ['1000'], now=100)
+            before = path.read_bytes()
+            lock = Path(str(path) + '.lock')
+            inode = lock.stat().st_ino
+            result = claims.claim_destinations(path, 'retained', 'phone', ['1000'], now=101)
+            self.assertEqual(result['duplicates'], ['1000'])
+            self.assertEqual(json.loads(path.read_bytes()), json.loads(before))
+            self.assertEqual(lock.read_bytes(), claims.HISTORY_MARKER)
+            self.assertEqual(lock.stat().st_ino, inode)
+
     def test_state_byte_limit_can_hold_documented_claim_capacity(self):
         record = {
             "chain": "a" * 64,
@@ -85,7 +227,7 @@ class CrossZoneClaimTests(unittest.TestCase):
 
     def test_shell_claim_adapter_builds_and_consumes_real_helper_protocol(self):
         poller = NWS_POLLER.read_text(encoding="utf-8")
-        function_prefix = poller.split('\nexec 9>"$LOCK_FILE"', 1)[0]
+        function_prefix = poller.split('\nstart_nws_lock() {', 1)[0]
         with tempfile.TemporaryDirectory(prefix="sls-nws-shell-adapter-") as directory:
             root = Path(directory)
             state = root / "claims.json"
@@ -273,8 +415,13 @@ class CrossZoneClaimTests(unittest.TestCase):
                 now=1_800_000_000,
                 reservation_id="group_north_1234",
             )
-            state.unlink()
+            before = state.read_bytes()
             with self.assertRaisesRegex(claims.CoordinationError, "count changed"):
+                claims.finalize_reservation(state, "Warning|count-chain", "group_north_1234", ["phone"],
+                                            "commit", 2, now=1_800_000_001)
+            self.assertEqual(state.read_bytes(), before)
+            state.unlink()
+            with self.assertRaisesRegex(claims.CoordinationError, "history is missing"):
                 claims.finalize_reservation(
                     state,
                     "Warning|count-chain",

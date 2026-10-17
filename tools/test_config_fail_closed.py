@@ -15,6 +15,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 MAIN = ROOT / "slsmassnotifyserver/Slsmassnotifyserver.class.php"
+PHP_BINARY = "/usr/bin/php"
+FIXTURE_ENV = {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin"}
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location("sls_fail_closed_crypto", ROOT / "slsmassnotifyserver/bin/sls_mass_notify/sls_config_crypto.py")
 crypto = importlib.util.module_from_spec(spec)
@@ -106,6 +108,12 @@ namespace {
             case 'cache_pending_unreadable':
                 $module->getPendingSettings(); chmod($module::PENDING_SETTINGS_JSON, 0000);
                 $result = $module->getPendingSettings(); break;
+            case 'cleanup_replaced':
+                $temporary = dirname($module::SETTINGS_JSON) . '/cleanup-fixture';
+                file_put_contents($temporary, 'created'); $identity = lstat($temporary);
+                unlink($temporary); file_put_contents($temporary, 'replacement');
+                $module->unlinkNamedFileIfIdentity($temporary, $identity);
+                $result = file_get_contents($temporary); unlink($temporary); break;
             default: throw new \LogicException('Unknown fixture operation.');
         }
         echo json_encode(['ok'=>true, 'result'=>$result, 'calls'=>$module->calls], JSON_THROW_ON_ERROR);
@@ -131,6 +139,7 @@ class ConfigFailClosedTest(unittest.TestCase):
         foreach(['loadSettingsFile','settingsFileFingerprint','configurationPathMetadata','rememberSettingsFingerprint',
                  'settingsCacheFingerprint','getActiveSettings','getPendingSettings','readNativeBackupFile',
                  'installUnprivilegedPhase','requireRuntimeAccount','writeSettingsFileUnlocked',
+                 'unlinkNamedFileIfIdentity',
                  'applySettings','applyPendingSettingsTransaction','persistAppliedSettings','persistPendingSettings'] as $name){
             $method=$class->getMethod($name);
             $methods.=implode('',array_slice($source,$method->getStartLine()-1,$method->getEndLine()-$method->getStartLine()+1));
@@ -139,7 +148,8 @@ class ConfigFailClosedTest(unittest.TestCase):
         echo json_encode(['methods'=>$methods,'exception'=>implode('',array_slice($source,
             $exception->getStartLine()-1,$exception->getEndLine()-$exception->getStartLine()+1))],JSON_THROW_ON_ERROR);
         '''
-        extracted = subprocess.run(["php", "-r", extract, str(MAIN)], capture_output=True, text=True, timeout=5, check=True)
+        extracted = subprocess.run([PHP_BINARY, "-r", extract, str(MAIN)], capture_output=True,
+                                   text=True, timeout=5, check=True, env=FIXTURE_ENV)
         if extracted.stderr:
             raise RuntimeError(extracted.stderr)
         json.loads(extracted.stdout)
@@ -149,11 +159,15 @@ class ConfigFailClosedTest(unittest.TestCase):
         cls.source.chmod(0o750)
         (cls.source / "methods.json").write_text(extracted.stdout, encoding="utf-8")
         shutil.copyfile(ROOT / "slsmassnotifyserver/api/sls-mass-notify/config-crypto.php", cls.source / "config-crypto.php")
-        for name in ("EnterpriseAdministration.php", "LabsSafety.php", "BetaNotice.php"):
+        for name in ("EnterpriseAdministration.php", "LabsSafety.php", "BetaNotice.php", "ImmediateSettings.php"):
             shutil.copyfile(ROOT / "slsmassnotifyserver" / name, cls.source / name)
-        for path in cls.source.iterdir():
+        helper_directory = cls.source / "bin/sls_mass_notify"
+        helper_directory.mkdir(parents=True)
+        shutil.copyfile(ROOT / "slsmassnotifyserver/bin/sls_mass_notify/sls_atomic_json.php",
+                        helper_directory / "sls_atomic_json.php")
+        for path in cls.source.rglob("*"):
             os.chown(path, 0, cls.account.pw_gid)
-            path.chmod(0o640)
+            path.chmod(0o750 if path.is_dir() else 0o640)
 
     @classmethod
     def tearDownClass(cls):
@@ -194,8 +208,9 @@ class ConfigFailClosedTest(unittest.TestCase):
             os.setgroups([self.account.pw_gid])
             os.setgid(self.account.pw_gid)
             os.setuid(self.account.pw_uid)
-        process = subprocess.run(["php", str(self.script), str(self.source), str(self.root), operation, str(data or self.data)],
-                                 preexec_fn=drop_privileges, capture_output=True, text=True, timeout=5)
+        process = subprocess.run([PHP_BINARY, str(self.script), str(self.source), str(self.root), operation,
+                                  str(data or self.data)], preexec_fn=drop_privileges, capture_output=True,
+                                 text=True, timeout=5, env=FIXTURE_ENV)
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertEqual(process.stderr, "")
         return json.loads(process.stdout)
@@ -302,6 +317,11 @@ class ConfigFailClosedTest(unittest.TestCase):
         self.write_private(self.pending, self.original)
         self.assertFalse(self.run_php("cache_pending_unreadable")["ok"])
         self.assertEqual(self.pending.read_bytes(), self.original)
+
+    def test_cleanup_never_unlinks_a_replacement_path(self):
+        result = self.run_php("cleanup_replaced")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["result"], "replacement")
 
     def test_genuinely_absent_files_and_directories_remain_safe_for_fresh_install(self):
         self.active.unlink()

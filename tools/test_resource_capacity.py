@@ -202,6 +202,15 @@ class ResourceCapacityTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 RESOURCE.measure_tree(root / 'link', time.monotonic() + 2)
 
+    def test_dangling_storage_root_is_rejected_instead_of_measured_as_absent(self):
+        with tempfile.TemporaryDirectory(prefix='sls-storage-missing-') as name:
+            root=Path(name)
+            absent=root/'absent'
+            self.assertEqual(RESOURCE.measure_tree(absent,RESOURCE.time.monotonic()+2)['files'],0)
+            linked=root/'linked';linked.symlink_to(absent)
+            with self.assertRaises(ValueError):
+                RESOURCE.measure_tree(linked,RESOURCE.time.monotonic()+2)
+
     def test_actual_managed_mounts_get_independent_headroom(self):
         voices = RESOURCE.MANAGED_TREES['voices']
         budgets = {voices: 100, '/tmp': 200}
@@ -478,6 +487,10 @@ class ResourceCapacityTests(unittest.TestCase):
                     path.write_text(json.dumps({key: value}))
                     with self.assertRaises(ValueError):
                         RESOURCE.configured_limits(path)
+            path.chmod(0o666)
+            with self.assertRaisesRegex(ValueError, 'private regular file'):
+                RESOURCE.configured_limits(path)
+            path.chmod(0o644)
             path.unlink()
             os.mkfifo(path)
             with self.assertRaises(ValueError):
@@ -496,6 +509,18 @@ class ResourceCapacityTests(unittest.TestCase):
         self.assertEqual(status, 3)
         self.assertNotIn('secret-token', output.getvalue())
         self.assertEqual(json.loads(output.getvalue())['eligible_limit'], 0)
+
+    def test_ambiguous_legacy_capacity_config_is_rejected(self):
+        with tempfile.TemporaryDirectory(prefix='sls-capacity-ambiguous-') as name:
+            path=Path(name)/'config'
+            for raw in ('{"desktop_client_limit":25,"desktop_client_limit":1000}',
+                        '{"phone_device_limit":25,"scope":{"id":1,"id":2}}',
+                        '{"desktop_client_limit":25,"other":1e309}',
+                        '{"desktop_client_limit":25,"other":NaN}'):
+                with self.subTest(raw=raw):
+                    path.write_text(raw)
+                    with self.assertRaises(ValueError): RESOURCE.configured_limits(path)
+                    self.assertEqual(path.read_text(),raw)
 
     def test_damaged_encryption_never_uses_default_capacity(self):
         envelopes = [

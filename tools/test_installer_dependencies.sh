@@ -1,7 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 [[ "${SLS_TEST_NAMESPACE:-}" == entered ]] || { printf 'Use the verified private test wrapper.\n' >&2; exit 2; }
-[[ "$(readlink /proc/self/ns/mnt)" != "${SLS_TEST_PARENT_MOUNT_NS:-}" ]] || exit 2
+for kind in MOUNT NET PID; do
+  variable="SLS_TEST_PARENT_${kind}_NS"
+  case "$kind" in MOUNT) namespace=mnt ;; NET) namespace=net ;; PID) namespace=pid ;; esac
+  [[ -n "${!variable:-}" && "$(readlink "/proc/self/ns/$namespace")" != "${!variable}" ]] || {
+    printf 'Dependency fixture isolation verification failed; no mounts were made.\n' >&2
+    exit 2
+  }
+done
 task_dir="$(mktemp -d /tmp/sls-dependency-fixture.XXXXXX)"
 php_target="$(readlink -f /usr/bin/php)"
 trap 'umount "$php_target"; rm -rf "$task_dir"' EXIT

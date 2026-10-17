@@ -32,8 +32,9 @@ final class AutomationService
     }
     public function activate(string $ruleId, array $input, string $source): array
     {
-        RuntimeState::requireRunning(($this->settings)());
-        $resolved=AutomationConfig::resolve(($this->settings)(),$ruleId); $rule=$resolved['rule']; $now=($this->clock)();
+        $settings=($this->settings)();
+        RuntimeState::requireRunning($settings);
+        $resolved=AutomationConfig::resolve($settings,$ruleId); $rule=$resolved['rule']; $now=($this->clock)();
         $phone=$source==='panic_phone' && $rule['kind']==='panic' && ($rule['dial_extension'] ?? '')!=='';
         if ($rule['kind']!==$source && !$phone) { throw new \DomainException('The enrolled source does not permit this activation method.'); }
         IncidentConfig::object($input,['request_id','sent_at','expires_at','event','message','caller','is_test','confirmation','references','invalidate','operation'],'Trigger event');
@@ -48,7 +49,7 @@ final class AutomationService
         if (!in_array($operation,['alert','update','cancel'],true) || ($operation!=='alert' && $source!=='cap')) { throw new \DomainException('Only trusted CAP sources can update or cancel source events.'); }
         $event=IncidentConfig::text($input['event'] ?? '',80,'Event name');
         if (isset($rule['event']) && !hash_equals($rule['event'],$event)) { throw new \DomainException('Event name does not match this trigger’s configured event.'); }
-        $message=IncidentConfig::text($input['message'] ?? '',500,'Event message',true);
+        $message=IncidentConfig::text($input['message'] ?? '',$source==='cap' ? 3000 : 500,'Event message',true);
         $caller=IncidentConfig::text($input['caller'] ?? '',20,'Observed caller',true);
         if ($phone && !in_array($caller,$rule['callers'],true)) { throw new \DomainException('This phone is not authorized for the selected panic activation.'); }
         if (!$phone && $source!=='emergency_call' && $caller!=='') { throw new \DomainException('Caller identity is reserved for verified PBX call observations.'); }
@@ -61,7 +62,15 @@ final class AutomationService
         }
         $expires=min($expires,$sent+$rule['max_age_seconds']);
         $context=['rule_id'=>$ruleId,'revision'=>$resolved['revision'],'event_id'=>$id,'expires_at'=>$expires];
-        $fingerprint=hash('sha256',json_encode([$ruleId,$input],JSON_THROW_ON_ERROR));
+        sort($references,SORT_STRING); sort($invalidate,SORT_STRING);
+        if (count($references)!==count(array_unique($references)) || count($invalidate)!==count(array_unique($invalidate))) {
+            throw new \DomainException('CAP references must not contain duplicate event identities.');
+        }
+        $fingerprintPayload=['rule_id'=>$ruleId,'request_id'=>$requestId,'source'=>$source,'sent_at'=>$sent,
+            'expires_at'=>$expires,'event'=>$event,'message'=>$message,'caller'=>$caller,'is_test'=>$test,
+            'operation'=>$operation,'confirmation'=>is_string($input['confirmation']??null)?$input['confirmation']:'',
+            'references'=>$references,'invalidate'=>$invalidate];
+        $fingerprint=hash('sha256',json_encode($fingerprintPayload,JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR));
         return $this->store->transaction(static function(array &$state) use($resolved,$rule,$source,$now,$id,$input,$requestId,$context,$fingerprint,$event,$message,$caller,$test,$references,$invalidate,$operation,$phone): array {
             AutomationStore::prune($state,$now);
             if (isset($state['events'][$id])) {
@@ -75,12 +84,22 @@ final class AutomationService
                     throw new \DomainException('Panic confirmation is missing, too early, expired, or configuration changed. Review a new confirmation before activating.');
                 }
             }
-            // Cancellations bypass cooldown, so a burst cannot hold an invalidated alert open.
+            // CAP supersession bypasses cooldown so updates and cancellations
+            // cannot leave a known-stale alert active.
             if (!$invalidate && ($state['cooldowns'][$rule['id']] ?? 0)>$now) { throw new \DomainException('This trigger is cooling down. The event was not queued; preserve its identifier and retry after the configured cooldown.', 429); }
             if (count($state['events'])>=500 || count($state['invalidated'])+count($invalidate)>2048) { throw new \RuntimeException('Trigger journal capacity is full. Preserve history and review the source’s event volume.'); }
+            $previouslyInvalidated=array_keys($state['invalidated']);$lineage=array_values(array_unique(array_merge($references,$invalidate)));
+            foreach($state['events'] as $previous){
+                if(array_intersect($previous['references']??[],$invalidate)){$lineage=array_values(array_unique(array_merge($lineage,$previous['references']??[])));}
+            }
+            sort($lineage,SORT_STRING);
+            // A cancellation may arrive before the alert/update it names. Check
+            // the event's own identity and every known superseded ancestor, not
+            // only the direct invalidate list of an update.
+            $blocked=$operation==='cancel'||isset($state['invalidated'][$id])||(bool)array_intersect($lineage,$previouslyInvalidated);
             foreach ($invalidate as $reference) { $state['invalidated'][$reference]=$now+86400; }
             foreach ($state['events'] as &$previous) {
-                if (array_intersect($previous['references'] ?? [],$invalidate)) { $previous['blocked']=true; if ($previous['state']==='queued') { $previous['state']='cancelled'; } }
+                if (in_array($previous['id']??'', $invalidate, true) || array_intersect($previous['references'] ?? [],$invalidate)) { $previous['blocked']=true; if ($previous['state']==='queued') { $previous['state']='cancelled'; } }
             } unset($previous);
             $fields=[];
             foreach ($rule['fields'] as $key=>$binding) { $fields[$key]=match($binding) {
@@ -88,19 +107,25 @@ final class AutomationService
             if ($resolved['template'] && $operation!=='cancel') { IncidentConfig::render($resolved['template'],$fields); }
             $cancel=$operation==='cancel';
             $row=['id'=>$id,'fingerprint'=>$fingerprint,'rule_id'=>$rule['id'],'rule_name'=>$rule['name'],'source'=>$source,
-                'created_at'=>$now,'state'=>$cancel ? 'cancelled' : 'queued','context'=>$context,'references'=>$references,
-                'blocked'=>$cancel || (bool)array_intersect($references,array_keys($state['invalidated'])),
+                'created_at'=>$now,'state'=>($cancel||$blocked) ? 'cancelled' : 'queued','context'=>$context,'references'=>$lineage,
+                'blocked'=>$blocked,
                 'event'=>$event,'message'=>$message,'caller'=>$caller,'is_test'=>$test,'fields'=>$fields,'results'=>[]];
             $state['events'][$id]=$row; unset($state['challenges'][$id]);
             $state['cooldowns'][$rule['id']]=$now+$rule['cooldown_seconds'];
             return $row;
         });
     }
+    private function permittedResolution(array $context): ?array
+    {
+        $settings=($this->settings)();
+        if (!RuntimeState::running($settings)) { return null; }
+        $now=($this->clock)();
+        $resolved=AutomationConfig::resolvePermitted($settings,$context,$now);
+        return $resolved!==null && $this->store->permits($context,$now) ? $resolved : null;
+    }
     public function permits(array $context): bool
     {
-        if (!RuntimeState::running(($this->settings)())) { return false; }
-        $now=($this->clock)();
-        return AutomationConfig::permits(($this->settings)(),$context,$now) && $this->store->permits($context,$now);
+        return $this->permittedResolution($context)!==null;
     }
     public function process(string $id): array
     {
@@ -119,8 +144,8 @@ final class AutomationService
         if (!$row['claimed']) { unset($row['claimed']); return $row; } unset($row['claimed']);
         $results=[]; $state='complete';
         try {
-            if (!$this->permits($row['context'])) { throw new \DomainException('Trigger authorization changed or this source event expired/superseded. No remaining actions were submitted.'); }
-            $resolved=AutomationConfig::resolve(($this->settings)(),$row['rule_id']);
+            $resolved=$this->permittedResolution($row['context']);
+            if ($resolved===null) { throw new \DomainException('Trigger authorization changed or this source event expired/superseded. No remaining actions were submitted.'); }
             if ($resolved['template']) {
                 $result=($this->announce)($resolved,$row);
                 $results['announcement']=$result;
@@ -128,14 +153,43 @@ final class AutomationService
                 $this->progress($id,$results);
             }
             foreach ($resolved['actions'] as $action) {
-                if (!$this->permits($row['context'])) { $results[$action['id']]=['state'=>'cancelled','detail'=>'Trigger expired, changed, or was superseded before this action.']; $state='failed'; }
+                if ($this->permittedResolution($row['context'])===null) { $results[$action['id']]=['state'=>'cancelled','detail'=>'Trigger expired, changed, or was superseded before this action.']; $state='failed'; }
                 else { $results[$action['id']]=($this->action)($action,$row); if (!in_array($results[$action['id']]['state'] ?? '',['submitted','completed'],true)) { $state='failed'; } }
                 $this->progress($id,$results);
             }
-        } catch (\DomainException $error) { $results['guard']=['state'=>'cancelled','detail'=>$error->getMessage()]; $state='cancelled'; }
+        } catch (\DomainException $error) {
+            $results['guard']=['state'=>'cancelled','detail'=>$error->getMessage()];
+            // A domain guard before the first effect is a clean cancellation.
+            // Once any result has been recorded, retain a failure state so the
+            // operator is not told that the entire event was cancelled.
+            $state=count($results)>1 ? 'failed' : 'cancelled';
+        }
         catch (\Throwable $error) { $results['worker']=['state'=>'uncertain','detail'=>'Trigger worker could not confirm completion. Review saved action results before any manual resend.']; $state='uncertain'; }
         return $this->store->transaction(static function(array &$journal) use($id,$results,$state): array {
             $journal['events'][$id]['results']=$results; $journal['events'][$id]['state']=$state; return $journal['events'][$id];
+        });
+    }
+    public function reconcile(): void
+    {
+        $now = ($this->clock)();
+        $rules = AutomationConfig::normalize((($this->settings)())['automations'] ?? [])['rules'];
+        $enabled = array_column(array_filter($rules, static fn($rule) => $rule['enabled']), null, 'id');
+        $this->store->transaction(static function (array &$state) use ($now, $enabled): void {
+            foreach ($state['events'] as &$row) {
+                if ($row['state'] === 'running' && ($row['claimed_at'] ?? 0) < $now - 240) {
+                    $row['state'] = 'uncertain';
+                    $row['error'] = 'The worker stopped after claiming this event. Actions will not be replayed automatically.';
+                } elseif ($row['state'] === 'queued') {
+                    if (($row['context']['expires_at'] ?? 0) <= $now || !empty($row['blocked'])) {
+                        $row['state'] = 'expired';
+                        $row['error'] = 'This queued trigger expired or was superseded before execution.';
+                    } elseif (!isset($enabled[$row['rule_id'] ?? ''])) {
+                        $row['state'] = 'cancelled';
+                        $row['error'] = 'This trigger rule was removed or disabled before execution.';
+                    }
+                }
+            }
+            unset($row);
         });
     }
     private function progress(string $id, array $results): void

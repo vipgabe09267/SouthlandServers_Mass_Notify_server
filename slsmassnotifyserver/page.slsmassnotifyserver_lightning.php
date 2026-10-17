@@ -1,7 +1,12 @@
 <?php
+require_once __DIR__.'/AdminResponse.php';
 
 $slsmassnotifyserver = \FreePBX::create()->Slsmassnotifyserver;
 $slsmassnotifyserver->enforceOperatorPageAccess('slsmassnotifyserver_lightning');
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST'
+    && (($_POST['ajax'] ?? '') === '1' || ($_POST['slsmassnotifyserver_action'] ?? '') === 'test_delivery_status')) {
+    \SLS\MassNotify\AdminResponse::requireClearBuffers();
+}
 $saveResult = $_SESSION['slsmassnotifyserver_lightning_save_result'] ?? null;
 $applyResult = $_SESSION['slsmassnotifyserver_lightning_apply_result'] ?? null;
 $testResult = $_SESSION['slsmassnotifyserver_lightning_test_result'] ?? null;

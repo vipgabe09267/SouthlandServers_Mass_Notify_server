@@ -7,6 +7,25 @@ use Firebase\JWT\JWT;
 /** RFC 8291 encryption and RFC 8292 VAPID using OpenSSL and the vendored JWT library. */
 final class BrowserPush
 {
+    public const MAX_PAYLOAD_BYTES=3000;
+    public static function validateContent(string $title,string $message,bool $isTest): void
+    {
+        // Reserve the complete supported ID and expiry width before queueing;
+        // JSON escaping and multibyte text count toward the encrypted wire limit.
+        self::payload(['event_id'=>str_repeat('x',128),'title'=>$title,'message'=>$message,
+            'expires_at'=>PHP_INT_MAX,'is_test'=>$isTest]);
+    }
+    private static function payload(array $event): string
+    {
+        if(!is_string($event['title']??null)||!is_string($event['message']??null)
+            ||!preg_match('//u',$event['title'])||!preg_match('//u',$event['message'])
+            ||mb_strlen($event['title'],'UTF-8')>80||!is_bool($event['is_test']??null)){
+            throw new \DomainException('Browser push requires valid UTF-8 text, a title of at most 80 characters and an explicit test flag.');
+        }
+        $payload=json_encode(array_intersect_key($event,array_flip(['event_id','title','message','expires_at','is_test'])),JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR);
+        if(strlen($payload)>self::MAX_PAYLOAD_BYTES){throw new \DomainException('Browser push exceeds 3,000 encoded bytes including the title, JSON escaping and reserved event metadata. Shorten the message or remove browser recipients; no browser request was sent.');}
+        return $payload;
+    }
     public static function available(): bool
     {
         return extension_loaded('openssl')&&extension_loaded('curl')&&function_exists('openssl_pkey_derive')&&in_array('aes-128-gcm',openssl_get_cipher_methods(),true);
@@ -14,7 +33,8 @@ final class BrowserPush
     public static function encode(string $bytes): string { return rtrim(strtr(base64_encode($bytes),'+/','-_'),'='); }
     public static function decode(string $value,int $length): string
     {
-        if(!preg_match('/^[A-Za-z0-9_-]+$/D',$value)){throw new \InvalidArgumentException('Push key is not base64url.');}
+        if($length<1||$length>4096||strlen($value)!==intdiv($length*8+5,6)
+            ||!preg_match('/^[A-Za-z0-9_-]+$/D',$value)){throw new \InvalidArgumentException('Push key is not canonical base64url for the required length.');}
         $bytes=base64_decode(strtr($value,'-_','+/'),true);
         if(!is_string($bytes)||strlen($bytes)!==$length||self::encode($bytes)!==$value){throw new \InvalidArgumentException('Push key has an invalid length or encoding.');}return $bytes;
     }
@@ -52,7 +72,7 @@ final class BrowserPush
     private static function expand(string $prk,string $info,int $length): string { return substr(hash_hmac('sha256',$info."\x01",$prk,true),0,$length); }
     public static function encrypt(array $subscription,string $payload,?string $privatePem=null,?string $salt=null): string
     {
-        $subscription=self::subscription($subscription);if(strlen($payload)>3000){throw new \InvalidArgumentException('Browser push payload exceeds 3000 bytes.');}
+        $subscription=self::subscription($subscription);if(strlen($payload)>self::MAX_PAYLOAD_BYTES){throw new \InvalidArgumentException('Browser push payload exceeds 3000 bytes.');}
         $ua=self::decode($subscription['keys']['p256dh'],65);$auth=self::decode($subscription['keys']['auth'],16);
         $private=$privatePem!==null?openssl_pkey_get_private($privatePem):openssl_pkey_new(['private_key_type'=>OPENSSL_KEYTYPE_EC,'curve_name'=>'prime256v1']);
         if(!$private||!openssl_pkey_export($private,$pem)){throw new \RuntimeException('Push encryption key generation failed.');}
@@ -75,13 +95,18 @@ final class BrowserPush
         return ['Content-Type: application/octet-stream','Content-Encoding: aes128gcm','TTL: '.($expires-$now),
             'Urgency: high','Authorization: vapid t='.$jwt.', k='.self::encode($point)];
     }
+    public static function validateEvent(array $event,int $now): string
+    {
+        $expires=$event['expires_at']??0;
+        if(!is_int($expires)||$expires<=$now||$expires>$now+600||!is_string($event['event_id']??null)||!preg_match('/^[A-Za-z0-9_-]{1,128}$/D',$event['event_id'])
+            ||!is_string($event['title']??null)||!is_string($event['message']??null)||!preg_match('//u',$event['title'])||mb_strlen($event['title'],'UTF-8')>80||strlen($event['message'])>3000||!is_bool($event['is_test']??null)){throw new \InvalidArgumentException('Invalid or expired browser announcement; titles support at most 80 characters.');}
+        return self::payload($event);
+    }
     public static function send(array $subscription,array $config,array $event,int $now,?callable $transport=null): array
     {
         if(($config['enabled']??'0')!=='1'){throw new \DomainException('Browser push is disabled.');}
         $subscription=self::subscription($subscription);$expires=$event['expires_at']??0;
-        if(!is_int($expires)||$expires<=$now||$expires>$now+600||!is_string($event['event_id']??null)||!preg_match('/^[A-Za-z0-9_-]{1,128}$/D',$event['event_id'])
-            ||!is_string($event['title']??null)||!is_string($event['message']??null)||strlen($event['title'])>200||strlen($event['message'])>2000||!is_bool($event['is_test']??null)){throw new \InvalidArgumentException('Invalid or expired browser announcement.');}
-        $payload=json_encode(array_intersect_key($event,array_flip(['event_id','title','message','expires_at','is_test'])),JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR);
+        $payload=self::validateEvent($event,$now);
         $headers=self::headers($subscription,$config,$now,$expires);$body=self::encrypt($subscription,$payload);
         if($transport){$result=$transport($subscription['endpoint'],$body,$headers);}
         else{$result=self::transmit($subscription['endpoint'],$body,$headers);}
@@ -90,9 +115,10 @@ final class BrowserPush
     }
     public static function transmit(string $url,string $body,array $headers): array
     {
-        $curl=curl_init($url);$received=0;curl_setopt_array($curl,[CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>$body,CURLOPT_HTTPHEADER=>$headers,CURLOPT_PROTOCOLS=>CURLPROTO_HTTPS,
+        if(!function_exists('curl_init')){throw new \RuntimeException('Browser push HTTPS support is unavailable.');}$curl=curl_init($url);if($curl===false){throw new \RuntimeException('Browser push HTTPS request could not be initialized.');}$received=0;$configured=curl_setopt_array($curl,[CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>$body,CURLOPT_HTTPHEADER=>$headers,CURLOPT_PROTOCOLS=>CURLPROTO_HTTPS,
             CURLOPT_FOLLOWLOCATION=>false,CURLOPT_SSL_VERIFYPEER=>true,CURLOPT_SSL_VERIFYHOST=>2,CURLOPT_SSLVERSION=>CURL_SSLVERSION_TLSv1_2,CURLOPT_PROXY=>'',CURLOPT_CONNECTTIMEOUT=>3,CURLOPT_TIMEOUT=>10,
             CURLOPT_WRITEFUNCTION=>static function($handle,string $chunk)use(&$received):int{$received+=strlen($chunk);return $received>8192?0:strlen($chunk);}]);
+        if(!$configured){curl_close($curl);throw new \RuntimeException('Browser push HTTPS safeguards could not be configured.');}
         try{$ok=curl_exec($curl);return ['status'=>(int)curl_getinfo($curl,CURLINFO_RESPONSE_CODE),'error'=>$ok===false?curl_errno($curl):0];}finally{curl_close($curl);}
     }
 }

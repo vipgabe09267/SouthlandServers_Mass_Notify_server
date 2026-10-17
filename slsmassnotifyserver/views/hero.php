@@ -1,15 +1,19 @@
-<?php // Southland Servers Mass Notification Module ?>
+<?php
+declare(strict_types=1);
+// Southland Servers Mass Notification Module
+$heroImage = is_string($hero_image ?? null) ? $hero_image : '';
+?>
 <style>
 /* FreePBX's table layout otherwise grows to a child table's minimum width. */
 #page_body { display:block; }
-.sls-hero { display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 13px;margin-bottom:16px;border:1px solid #dfe5ec;border-radius:8px;background:#fff;box-shadow:0 1px 4px rgba(15,23,42,.05); }
+.sls-hero { display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 13px;margin-bottom:16px;border:1px solid var(--sls-border,#dfe5ec);border-radius:8px;background:var(--sls-surface,#fff);color:var(--sls-text,#263246);box-shadow:0 1px 4px rgba(15,23,42,.05); }
 @media(max-width:767px) { .sls-hero { flex-direction:column;align-items:stretch; } .sls-hero > div { justify-content:flex-start !important; } }
 </style>
 <div class="sls-hero">
 	<a href="https://southlandservers.xyz" target="_blank" rel="noopener noreferrer" style="display:flex;align-items:center;gap:12px;min-width:0;text-decoration:none;">
-		<img src="<?php echo htmlspecialchars($hero_image); ?>" alt="<?php echo _('Southland Servers Group'); ?>" style="width:52px;height:52px;object-fit:contain;flex:0 0 52px;">
+		<img src="<?php echo htmlspecialchars($heroImage, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>" alt="<?php echo _('Southland Servers Group'); ?>" style="width:52px;height:52px;object-fit:contain;flex:0 0 52px;">
 		<span style="min-width:0;">
-			<span style="display:block;font-size:16px;font-weight:700;line-height:1.2;color:#1f2937;"><?php echo _('SLS Mass Notification System'); ?></span>
+			<span style="display:block;font-size:16px;font-weight:700;line-height:1.2;color:var(--sls-text,#1f2937);"><?php echo _('SLS Mass Notification System'); ?></span>
 			<span class="text-muted" style="display:block;font-size:12px;line-height:1.35;margin-top:3px;"><?php echo _('Southland Servers Group · FreePBX alert delivery and system status'); ?></span>
 		</span>
 	</a>

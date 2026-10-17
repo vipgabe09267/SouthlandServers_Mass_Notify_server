@@ -40,6 +40,10 @@ trait SlsLocations
             $catalog['webhook_ids'][$id] = ['id' => $id, 'label' => (string)$row['name'], 'available' => !empty($row['enabled']),
                 'reason' => 'This webhook is disabled. Review its delivery provider settings.'];
         }
+        foreach (\SLS\MassNotify\ApiSecurity::labsDirectory($settings) as $field=>$rows) {
+            $catalog[$field]=$rows;
+            foreach ($catalog[$field] as &$row) { unset($row['identity']);$row['reason']='This Labs channel or enrollment is disabled. Review Enterprise Labs.'; } unset($row);
+        }
         foreach ($catalog as &$choices) { ksort($choices, SORT_STRING); } unset($choices);
         return $catalog;
     }
@@ -53,7 +57,8 @@ trait SlsLocations
         // A stale browser must not overwrite a directory edit or copy an audience
         // after identities, channel availability, or existing groups changed.
         $revision = hash('sha256', json_encode([$directory, $catalog, $settings['announcement_groups'] ?? [],
-            $settings['outbound_voice']['recipients'] ?? [], $settings['announcement_email']['recipients'] ?? [], $settings['announcement_sms']['recipients'] ?? []], JSON_THROW_ON_ERROR));
+            $settings['outbound_voice']['recipients'] ?? [], $settings['announcement_email']['recipients'] ?? [], $settings['announcement_sms']['recipients'] ?? [],
+            \SLS\MassNotify\ApiSecurity::labsDirectory($settings)], JSON_THROW_ON_ERROR));
         return ['directory' => $directory, 'catalog' => $catalog, 'revision' => $revision,
             'audiences' => $this->locationAudienceCards($settings),
             'positions' => GeographicTargeting::positions($directory), 'observed_at' => time(),
@@ -79,14 +84,15 @@ trait SlsLocations
             $members = array_fill_keys(array_keys(LocationDirectory::MEMBERS), []);
             foreach ($members as $key => $_) { if ($key !== 'desktop_client_ids') { $members[$key] = $group[$key] ?? []; } }
             $bindings = $group['location_snapshot']['desktop_bindings'] ?? $group['desktop_bindings'] ?? null;
+            $boundDesktops = $bindings === null ? $desktops : array_column($bindings, 'client_id', 'username');
             foreach ($group['desktop_clients'] ?? [] as $username) {
-                $id = $bindings === null ? ($desktops[$username] ?? null) : (array_column($bindings, 'client_id', 'username')[$username] ?? null);
+                $id = $boundDesktops[$username] ?? null;
                 // Preserve missing identities for explicit correction in the editor.
                 $members['desktop_client_ids'][] = $id ?? ('missing_' . substr(hash('sha256', $username), 0, 24));
             }
             $result[] = ['id' => $group['id'], 'name' => $group['name'], 'members' => $members,
                 'reviewed_location' => $group['location_snapshot']['path'] ?? '',
-                'identities_current' => \SLS\MassNotify\ApiSecurity::groupDesktopBindingsValid($group, $settings)];
+                'identities_current' => \SLS\MassNotify\ApiSecurity::groupDesktopBindingsValid($group, $settings) && \SLS\MassNotify\ApiSecurity::groupLabsBindingsValid($group,$settings)];
         }
         return $result;
     }
@@ -122,6 +128,8 @@ trait SlsLocations
                 'voice_recipient_ids' => $members['voice_recipient_ids'], 'email_recipient_ids' => $members['email_recipient_ids'],
                 'sms_recipient_ids' => $members['sms_recipient_ids'], 'webhook_ids' => $members['webhook_ids'],
                 'desktop_bindings' => LocationDirectory::bindings($bindings, $desktops)];
+            foreach (['browser_recipient_ids','connector_ids'] as $field) { $candidate[$field]=$members[$field]; }
+            $candidate['labs_bindings']=\SLS\MassNotify\ApiSecurity::labsBindings($members,$settings);
             if ($existing === null) { $groups[] = $candidate; } else { $groups[$existing] = $candidate; }
             \SLS\MassNotify\LivePagingConfig::resolvedGroups(\SLS\MassNotify\LivePagingConfig::normalize($settings['live_paging'] ?? []), $groups);
             $settings['announcement_groups'] = $groups;
@@ -350,6 +358,8 @@ trait SlsLocations
                 'voice_recipient_ids' => $members['voice_recipient_ids'], 'email_recipient_ids' => $members['email_recipient_ids'], 'sms_recipient_ids' => $members['sms_recipient_ids'],
                 'webhook_ids' => $members['webhook_ids'],
                 'location_snapshot' => LocationDirectory::snapshot($snapshot, $desktops)];
+            foreach (['browser_recipient_ids','connector_ids'] as $field) { $group[$field]=$members[$field]; }
+            $group['labs_bindings']=\SLS\MassNotify\ApiSecurity::labsBindings($members,$settings);
             $settings['announcement_groups'][] = $group;
             $this->persistPendingSettings($settings);
             return ['success' => true, 'group_id' => $id, 'state' => $this->locationState($settings),

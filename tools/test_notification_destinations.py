@@ -191,17 +191,15 @@ def assert_discord_limits(payload):
 # Keep every user-controlled Discord field comfortably inside Discord's
 # documented webhook/embed limits, including the aggregate 6000-character cap.
 assert_discord_limits(discord_payload)
-oversized_discord_payload = destinations.build_discord_payload(
-    {},
-    "S" * 2000,
-    "\n".join(["B" * 2000] * 12),
-    "E" * 1000,
-    "Extreme",
-    fields=[("N" * 1000, "V" * 4000) for _index in range(30)],
-    timestamp="2026-08-15T12:00:00Z",
-)
-assert_discord_limits(oversized_discord_payload)
-assert len(oversized_discord_payload["embeds"][0]["fields"]) == 6
+try:
+    destinations.build_discord_payload(
+        {}, "S" * 2000, "\n".join(["B" * 2000] * 12), "E" * 1000, "Extreme",
+        fields=[("N" * 1000, "V" * 4000) for _index in range(30)],
+        timestamp="2026-08-15T12:00:00Z",
+    )
+    raise AssertionError('Oversized Discord content was shortened instead of rejected')
+except destinations.DestinationError as error:
+    assert error.code == 'payload_too_large' and not error.submission_possible
 
 config = {
     "discord_webhooks": [

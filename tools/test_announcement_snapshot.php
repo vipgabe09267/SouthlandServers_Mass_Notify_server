@@ -8,7 +8,7 @@ mkdir($directory, 0700);
 $source = file(dirname(__DIR__) . '/slsmassnotifyserver/Slsmassnotifyserver.class.php');
 $reflection = new ReflectionClass(\FreePBX\modules\Slsmassnotifyserver::class);
 $methods = '';
-foreach (['sendSipNotifyAnnouncement', 'resolveAnnouncementRequest', 'dispatchAnnouncementWebhooks', 'sendAnnouncementTtsAudio', 'normalizeAnnouncementAudioMode', 'webhookPayloadFormat', 'webhookDestinationFingerprint', 'validateAudienceWebhookIds', 'announcementTone'] as $name) {
+foreach (['sendSipNotifyAnnouncement', 'resolveAnnouncementRequest', 'dispatchAnnouncementWebhooks', 'collectBoundedProcessOutput', 'sendAnnouncementTtsAudio', 'normalizeAnnouncementAudioMode', 'normalizeControlGroupSelectors', 'webhookPayloadFormat', 'webhookDestinationFingerprint', 'aggregateSavedAudienceTargets', 'validateAggregateSavedAudienceTargets', 'validateAudienceWebhookIds', 'normalizeExtensionSelector', 'announcementTone'] as $name) {
     $method = $reflection->getMethod($name);
     $methods .= implode('', array_slice($source, $method->getStartLine() - 1, $method->getEndLine() - $method->getStartLine() + 1));
 }
@@ -21,7 +21,10 @@ class AnnouncementSnapshotFixture {
     use \FreePBX\modules\SlsAnnouncementEmail; use \FreePBX\modules\SlsAnnouncementSms;
     use \FreePBX\modules\SlsOutboundVoice;
     use \FreePBX\modules\SlsApiPermissionGuards;
+    use \FreePBX\modules\SlsWeatherChannels;
     const MAX_WEBHOOK_DESTINATIONS = 10;
+    const MAX_SAVED_CHANNEL_RECIPIENTS = 50;
+    const MAX_EXTERNAL_VOICE_RECIPIENTS = 1000;
     const PIPER_VOICE = 'built-in-voice';
     const PIPER_BIN = '/usr/bin/true';
     const VISUAL_PUSH_SCRIPT = '/usr/bin/true';
@@ -43,7 +46,7 @@ class AnnouncementSnapshotFixture {
     private function normalizeDesktopUsername($value) { return strtolower($value); }
     private function normalizeDesktopClientId($value) { return strtolower($value); }
     private function normalizeWebhookDestinations($rows, $kind) { return $rows; }
-    private function getAnnouncementGroups() { return [['id'=>'offline-group', 'extensions'=>['1002'], 'desktop_clients'=>[]]]; }
+    private function getAnnouncementGroups() { return $this->settings['announcement_groups'] ?? [['id'=>'offline-group', 'extensions'=>['1002'], 'desktop_clients'=>[]]]; }
     private function getAvailableTones() { return []; }
     private function normalizeToneName($name) { return $name; }
     private function normalizeHexColor($color, $fallback) { return $color; }
@@ -61,7 +64,12 @@ class AnnouncementSnapshotFixture {
     private function queueAnnouncementAudioCalls($phones, $sequence, $duration, $priority) { return count($phones); }
     private function updateStatusData($data) {}
     private function appendAnnouncementAudioLog(...$args) {}
+    protected function weatherChannelAuthorization(array $context): array {
+        return ['status'=>'eligible','voice_recipient_ids'=>['voice_'.str_repeat('a',24)],'sms_recipient_ids'=>[]];
+    }
+    private function startAnnouncementWorker($id) { return true; }
     public function audio($context) { return $this->sendAnnouncementTtsAudio(['1000'], 'Original message', $context); }
+    public function apiGroups($selectors) { return $this->normalizeControlGroupSelectors($selectors); }
     public function webhook($request) {
         return $this->dispatchAnnouncementWebhooks($request['webhooks'], $request['message'], $request['title'],
             $request['background_color'], [['Sent by', $request['sender']]], $request['delivery_id'],
@@ -91,6 +99,77 @@ $module->settings = ['announcement_piper_voice'=>'original-voice', 'announcement
     ['id'=>'hook', 'enabled'=>'1', 'name'=>'Original receiver', 'url'=>'https://hooks.example.com/original-secret'],
 ]];
 try {
+    foreach ([['array message'], 1234, true, "Invalid \xFF text"] as $invalidMessage) {
+        set_error_handler(static function () { return true; });
+        try {
+            $invalid = $module->sendSipNotifyAnnouncement(['1000'], $invalidMessage, true, false);
+        } finally { restore_error_handler(); }
+        if (($invalid['error_code'] ?? '') !== 'invalid_message' || ($invalid['delivery_started'] ?? true)) {
+            throw new RuntimeException('Malformed announcement text reached delivery orchestration.');
+        }
+    }
+    $unicode = $module->sendSipNotifyAnnouncement(['1000'], "Aviso: evacuación — 日本語", true, false);
+    if (($unicode['request']['message'] ?? '') !== "Aviso: evacuación — 日本語") {
+        throw new RuntimeException('Valid multilingual announcement text was changed or rejected.');
+    }
+    $originalGroup='grp_'.str_repeat('a',12);$otherGroup='grp_'.str_repeat('b',12);
+    $module->settings['announcement_groups']=[['id'=>$originalGroup,'name'=>'Original audience'],['id'=>$otherGroup,'name'=>$originalGroup]];
+    if ($module->apiGroups([$originalGroup])!==[$originalGroup]) { throw new RuntimeException('A group name shadowed another saved audience ID.'); }
+    if ($module->apiGroups(['Original audience'])!==[$originalGroup]) { throw new RuntimeException('A valid legacy group-name alias was lost.'); }
+    $mixed=$module->apiGroups([$originalGroup,'removed-group']);
+    if (!in_array('removed-group',$mixed,true)) { throw new RuntimeException('An unavailable API audience was silently omitted.'); }
+    $rejectedGroups=$module->sendSipNotifyAnnouncement([], 'Private selection fixture',false,false,$mixed);
+    if (($rejectedGroups['error_code']??'')!=='unavailable_group'||($rejectedGroups['delivery_started']??true)) {
+        throw new RuntimeException('A mixed available/unavailable API audience reached delivery.');
+    }
+    $module->settings['announcement_groups'][0]['name']='Shared name';$module->settings['announcement_groups'][1]['name']='Shared name';
+    if ($module->apiGroups(['Shared name'])!==['Shared name']) { throw new RuntimeException('An ambiguous group name silently selected one audience.'); }
+    unset($module->settings['announcement_groups']);
+    $module->settings['nws_piper_voice']='original-voice';$module->settings['nws_tts_volume']=25;
+    $module->settings['outbound_voice']=['enabled'=>'1','recipients'=>[
+        ['id'=>'voice_'.str_repeat('a',24),'name'=>'Private external recipient','number'=>'+15551230000','enabled'=>'1']]];
+    $weatherText=str_repeat('Review the complete weather instructions. ',20);
+    $weatherContext=['source_validity'=>['version'=>1,'provider'=>'nws','group_id'=>'fixture'],
+        'event'=>'Fixture warning','severity'=>'Severe','deadline_at'=>time()+300,
+        'channels'=>['voice_recipient_ids'=>['voice_'.str_repeat('a',24)],'sms_recipient_ids'=>[],
+            'fingerprints'=>['voice:voice_'.str_repeat('a',24)=>str_repeat('d',64)]]];
+    $weatherGate=(new SlsAnnouncementJobStore($directory))->admissionLock();
+    if (!is_resource($weatherGate)) { throw new RuntimeException('Weather shared-admission fixture could not acquire its gate.'); }
+    try {
+        $gatedWeather=$module->queueWeatherChannels(['key'=>str_repeat('e',64),'context'=>$weatherContext,
+            'title'=>'Private gated weather fixture','body'=>$weatherText]);
+        if (($gatedWeather['status']??'')!=='deferred') { throw new RuntimeException('Weather queue bypassed the shared announcement gate.'); }
+    } finally { SlsAnnouncementJobStore::unlock($weatherGate); }
+    $invalidWeatherContext=$weatherContext;$invalidWeatherContext['channels']['voice_recipient_ids'][]='voice_bad';
+    $invalidWeatherRejected=false;
+    try { $module->queueWeatherChannels(['key'=>str_repeat('f',64),'context'=>$invalidWeatherContext,
+        'title'=>'Private malformed weather fixture','body'=>$weatherText]); }
+    catch (InvalidArgumentException $error) { $invalidWeatherRejected=true; }
+    if (!$invalidWeatherRejected) { throw new RuntimeException('Malformed frozen Weather recipients reached authorization or queue storage.'); }
+    $weather=$module->queueWeatherChannels(['key'=>str_repeat('b',64),'context'=>$weatherContext,
+        'title'=>'Private weather fixture','body'=>$weatherText]);
+    if (empty($weather['success'])) { throw new RuntimeException('Valid complete weather speech was rejected: '.json_encode($weather)); }
+    $weatherJob=(new SlsAnnouncementJobStore($directory.'/announcement-jobs'))->read($weather['job_id']);
+    if (($weatherJob['request']['message']??'')!==trim($weatherText)) { throw new RuntimeException('Weather instructions were truncated before queue storage.'); }
+    $weatherJob['state']='complete';(new SlsAnnouncementJobStore($directory.'/announcement-jobs'))->write($weatherJob);
+    $weatherAgain=$module->queueWeatherChannels(['key'=>str_repeat('b',64),'context'=>$weatherContext,
+        'title'=>'Private weather fixture','body'=>$weatherText]);
+    if (($weatherAgain['success']??false)!==true||($weatherAgain['status']??'')!=='accepted'||($weatherAgain['job_id']??'')!==$weather['job_id']) {
+        throw new RuntimeException('A completed Weather handoff was not acknowledged with the producer contract.');
+    }
+    $weatherConflict=false;
+    try {$module->queueWeatherChannels(['key'=>str_repeat('b',64),'context'=>$weatherContext,
+        'title'=>'Private weather fixture','body'=>$weatherText.' changed']);}
+    catch (DomainException $error) {$weatherConflict=str_contains($error->getMessage(),'different content');}
+    if (!$weatherConflict) { throw new RuntimeException('A Weather delivery key was reused with different immutable content.'); }
+    $oversizedRejected=false;
+    try { $module->queueWeatherChannels(['key'=>str_repeat('c',64),'context'=>$weatherContext,
+        'title'=>'Private oversized weather fixture','body'=>str_repeat('a',3001)]); }
+    catch (InvalidArgumentException $error) { $oversizedRejected=true; }
+    if (!$oversizedRejected) { throw new RuntimeException('Weather text exceeded its existing 3000-byte boundary.'); }
+    $longOrdinary=$module->sendSipNotifyAnnouncement(['1000'],$weatherText,true,false,[],['message_limit'=>3000]);
+    if (($longOrdinary['error_code']??'')!=='message_too_long') { throw new RuntimeException('The trusted Weather path expanded ordinary announcement limits.'); }
+    unset($module->settings['outbound_voice']);
     $GLOBALS['sls_control_principal']=['username'=>'fixture_operator','id'=>'api_'.str_repeat('a',24)];
     $operator=$module->sendSipNotifyAnnouncement(['1000'],'Operator fixture',true,false,[],
         ['audio_mode'=>'none','trigger_source'=>'SLS Operator Portal','sender'=>'spoofed sender']);
@@ -196,6 +275,7 @@ try {
     if (($ordinaryCapture['SLS_DESTINATION_INCIDENT_JSON'] ?? '') !== '') { throw new RuntimeException('An inherited environment forged typed incident metadata.'); }
     echo "Frozen announcement voice/routes, no-fallback failures, stable webhook handoff and offline-only audience checks passed.\n";
 } finally {
-    foreach (glob($directory . '/*') ?: [] as $path) { unlink($path); }
+    $files=new RecursiveIteratorIterator(new RecursiveDirectoryIterator($directory,FilesystemIterator::SKIP_DOTS),RecursiveIteratorIterator::CHILD_FIRST);
+    foreach ($files as $file) { $file->isDir()&&!$file->isLink()?rmdir($file->getPathname()):unlink($file->getPathname()); }
     rmdir($directory);
 }

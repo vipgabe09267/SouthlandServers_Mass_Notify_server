@@ -2,6 +2,10 @@
 set -euo pipefail
 
 umask 027
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+# Removal is local and never needs publisher download credentials.
+unset GITHUB_TOKEN GH_TOKEN SLS_MASS_NOTIFY_GITHUB_TOKEN
 
 MODULE="slsmassnotifyserver"
 if [ -n "${SLS_MASS_NOTIFY_MODULE:-}" ] \
@@ -13,15 +17,24 @@ fi
 DATA_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin"
 SIGN_HOME="/root/.gnupg-sls-mass-notify"
 PURGE_CONFIG="${SLS_MASS_NOTIFY_PURGE_CONFIG:-0}"
-CONFIG_TMP=""
+case "$PURGE_CONFIG" in
+  0|1) ;;
+  *)
+    printf '%s\n' 'SLS_MASS_NOTIFY_PURGE_CONFIG must be 0 or 1.' >&2
+    exit 2
+    ;;
+esac
 SIGNING_FINGERPRINT=""
 KEEP_SIGNING_TRUST=0
 RECOVERY_SIGNER_DIR=""
 RECOVERY_SIGNER=""
 UNINSTALL_APPROVED_SOURCE=""
+UNINSTALL_TRANSACTION_DIR=""
 CONFIGURED_AMI_USERNAME=""
+CONFIGURED_AMI_SECRET_HASH=""
 RECOVERY_DECODER_DIR=""
 RECOVERY_CONFIG_DECODER="/usr/local/bin/sls_mass_notify/sls_config_crypto.php"
+RECOVERY_AMI_OWNERSHIP_HELPER=""
 UNINSTALL_MAINTENANCE_LOCK_FD=""
 STOCK_RESTORE_LOG_PATH="/tmp/slsmassnotifyserver-uninstall-stock-modules.log"
 MODULE_UNINSTALL_LOG_PATH="/tmp/slsmassnotifyserver-uninstall-module.log"
@@ -31,8 +44,29 @@ STOCK_RESTORE_LOG_FD=""
 MODULE_UNINSTALL_LOG_FD=""
 MODULE_REGISTRY_PRESENT=0
 PBX_RUNNING=0
-PBX_RELOAD_WARNING=0
 UNINSTALL_WORKER_PID=""
+
+run_as_asterisk() {
+  local -a child_environment=(
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    "LANG=C.UTF-8"
+    "LC_ALL=C.UTF-8"
+  )
+  while [ "$#" -gt 0 ] && [[ "$1" == *=* ]]; do
+    case "$1" in
+      SLS_MODULE_NAME=*|SLS_CONFIG=*|SLS_UNINSTALL_CONFIG_DECODER=*|SLS_CONFIGURED_AMI_USERNAME=*|SLS_AMI_SECRET_HASH=*|SLS_AMI_OWNERSHIP_HELPER=*|SLS_DATA_DIR=*|SLS_VERIFY_MODULE=*)
+        child_environment+=("$1")
+        ;;
+      *)
+        printf '%s\n' "Refusing an unapproved runtime-account environment variable." >&2
+        return 64
+        ;;
+    esac
+    shift
+  done
+  [ "$#" -gt 0 ] || return 64
+  /usr/bin/env -i "${child_environment[@]}" /usr/sbin/runuser -u asterisk -- "$@"
+}
 UNINSTALL_WORKER_PIPE=""
 UNINSTALL_GUARD_REQUIRED=0
 
@@ -43,7 +77,7 @@ UNINSTALL_GUARD_REQUIRED=0
 open_root_owned_file() {
   local output_variable="$1" protected_path="$2" file_purpose="${3:-lock}"
   local protected_identity opened_identity protected_fd
-  protected_identity="$(/usr/bin/python3 - "$protected_path" "$file_purpose" <<'PY'
+  protected_identity="$(/usr/bin/python3 -I - "$protected_path" "$file_purpose" <<'PY'
 import os
 import pwd
 import stat
@@ -129,6 +163,7 @@ prepare_uninstall_logs() {
   MODULE_UNINSTALL_LOG="/proc/${BASHPID}/fd/$MODULE_UNINSTALL_LOG_FD"
   STOCK_RESTORE_LOG="/proc/${BASHPID}/fd/$STOCK_RESTORE_LOG_FD"
   : >"$MODULE_UNINSTALL_LOG"
+  : >"$STOCK_RESTORE_LOG"
 }
 
 log() {
@@ -136,17 +171,17 @@ log() {
 }
 
 require_freepbx() {
-	local required_command
-	  [ "${EUID:-$(id -u)}" -eq 0 ] || {
+  local required_command
+  [ "${EUID:-$(id -u)}" -eq 0 ] || {
     log "Run the uninstaller as root."
     exit 1
   }
-	  for required_command in /usr/sbin/fwconsole /usr/sbin/asterisk /usr/sbin/runuser /usr/bin/php /usr/bin/python3 /usr/bin/gpg /usr/bin/crontab /usr/bin/flock /usr/bin/readlink /usr/bin/timeout /usr/bin/base64 /usr/bin/sha256sum /usr/bin/systemctl /usr/bin/su; do
-	    [ -x "$required_command" ] || {
-	      log "Required uninstall prerequisite is unavailable: $required_command. No uninstall changes were made."
-	      exit 1
-	    }
-	  done
+  for required_command in /usr/sbin/fwconsole /usr/sbin/asterisk /usr/sbin/runuser /usr/bin/php /usr/bin/python3 /usr/bin/gpg /usr/bin/crontab /usr/bin/flock /usr/bin/readlink /usr/bin/timeout /usr/bin/base64 /usr/bin/sha256sum /usr/bin/systemctl /usr/bin/su; do
+    [ -x "$required_command" ] || {
+      log "Required uninstall prerequisite is unavailable: $required_command. No uninstall changes were made."
+      exit 1
+    }
+  done
   [ -d /var/www/html/admin/modules ] || {
     log "/var/www/html/admin/modules not found. This does not look like a FreePBX server."
     exit 1
@@ -155,7 +190,7 @@ require_freepbx() {
     log "/etc/freepbx.conf is missing or unreadable."
     exit 1
   }
-  /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 -r '
+  run_as_asterisk /usr/bin/php -d pcre.jit=0 -r '
 $bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
 require "/etc/freepbx.conf";
 \FreePBX::Database()->query("SELECT 1");
@@ -168,13 +203,17 @@ exit(0);
 
 acquire_maintenance_coordination() {
   local lock_file="${SLS_MASS_NOTIFY_MAINTENANCE_LOCK:-/run/lock/sls-mass-notify-maintenance.lock}"
-  local descriptor descriptor_path descriptor_target
+  local descriptor descriptor_path descriptor_target lock_parent
 
   [[ "$lock_file" = /* ]] && [ "$lock_file" != "/" ] || {
     log "Unsafe maintenance lock path."
     return 1
   }
-  mkdir -p "$(dirname "$lock_file")"
+  lock_parent="$(dirname -- "$lock_file")"
+  [ -d "$lock_parent" ] && [ ! -L "$lock_parent" ] || {
+    log "The maintenance lock parent must already exist as a real directory: $lock_parent"
+    return 1
+  }
   [ ! -L "$lock_file" ] || {
     log "Refusing a symbolic-link maintenance lock: $lock_file"
     return 1
@@ -202,15 +241,114 @@ acquire_maintenance_coordination() {
   }
 }
 
+uninstall_recovery_workspace() {
+  /usr/bin/python3 -I - "$1" <<'PYUNINSTALLSPACE'
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import sys
+import tempfile
+prefix = sys.argv[1]
+if not re.fullmatch(r'sls-uninstall-(?:signer|decoder|transaction)', prefix):
+    raise SystemExit('Invalid uninstall recovery workspace.')
+parent = Path('/var/lib/sls-mass-notify-uninstaller')
+account = pwd.getpwnam('asterisk')
+fd = os.open(parent.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+try:
+    pm = os.fstat(fd)
+    if pm.st_uid != 0 or pm.st_mode & 0o022:
+        raise SystemExit('Uninstall recovery parent is unsafe.')
+    try:
+        os.mkdir(parent.name, 0o750, dir_fd=fd)
+        created = True
+    except FileExistsError:
+        created = False
+    child = os.open(parent.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+    try:
+        if created:
+            os.fchown(child, 0, account.pw_gid)
+            os.fchmod(child, 0o750)
+            os.fsync(fd)
+        info = os.fstat(child)
+        if info.st_uid != 0 or info.st_gid != account.pw_gid or stat.S_IMODE(info.st_mode) != 0o750:
+            raise SystemExit('Existing uninstall recovery storage requires review; it was not adopted.')
+    finally:
+        os.close(child)
+finally:
+    os.close(fd)
+print(tempfile.mkdtemp(prefix=prefix+'.', dir=parent))
+PYUNINSTALLSPACE
+}
+
+record_uninstall_stage() {
+  [ -n "$UNINSTALL_TRANSACTION_DIR" ] || return 1
+  /usr/bin/python3 -I - "$UNINSTALL_TRANSACTION_DIR" "$1" "$UNINSTALL_APPROVED_SOURCE" "$RECOVERY_SIGNER_DIR" "$RECOVERY_DECODER_DIR" "$PURGE_CONFIG" <<'PYREMOVALSTATE'
+import json, os, secrets, stat, sys, time
+from pathlib import Path
+path=Path(sys.argv[1]);phase=sys.argv[2]
+if os.geteuid()!=0 or phase not in {'prepared','services','module','integration','runtime','verification','complete','failed'}:
+    raise SystemExit('Invalid uninstall transaction stage.')
+if path.resolve()!=path:
+    raise SystemExit('Uninstall transaction path is not canonical.')
+fd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+temporary='.state-'+secrets.token_hex(12)
+try:
+    info=os.fstat(fd)
+    if info.st_uid!=0 or stat.S_IMODE(info.st_mode)!=0o700:
+        raise SystemExit('Uninstall transaction directory is unsafe.')
+    before=None
+    try:
+        handle=os.open('transaction.json',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=fd)
+    except FileNotFoundError:
+        state={'schema':1,'created_at':int(time.time()),'history':[]}
+    else:
+        try:
+            before=os.fstat(handle)
+            if not stat.S_ISREG(before.st_mode) or before.st_uid!=0 or before.st_nlink!=1 or before.st_mode&0o077 or before.st_size>16384:
+                raise SystemExit('Uninstall transaction file is unsafe.')
+            def unique_object(pairs):
+                result={}
+                for key,value in pairs:
+                    if key in result: raise ValueError('duplicate JSON member')
+                    result[key]=value
+                return result
+            state=json.loads(os.read(handle,16385), object_pairs_hook=unique_object,
+                             parse_constant=lambda value: (_ for _ in ()).throw(ValueError('non-finite JSON number')))
+        finally:os.close(handle)
+        if not isinstance(state,dict) or state.get('schema')!=1 or not isinstance(state.get('history'),list) or len(state['history'])>=64:
+            raise SystemExit('Uninstall transaction is damaged or full; preserve it for review.')
+    state.update(phase=phase,updated_at=max(int(time.time()),state['created_at']),approved_source=sys.argv[3],
+                 recovery_signer=sys.argv[4],recovery_decoder=sys.argv[5],configuration_snapshot='',purge=sys.argv[6]=='1')
+    state['history'].append({'phase':phase,'at':state['updated_at']})
+    body=(json.dumps(state,separators=(',',':'))+'\n').encode()
+    if len(body)>16384:raise SystemExit('Uninstall transaction exceeds its bound.')
+    output=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=fd)
+    with os.fdopen(output,'wb') as target:target.write(body);target.flush();os.fsync(target.fileno())
+    try:current=os.stat('transaction.json',dir_fd=fd,follow_symlinks=False)
+    except FileNotFoundError:current=None
+    if (before is None)!=(current is None) or (before is not None and (before.st_dev,before.st_ino)!=(current.st_dev,current.st_ino)):
+        raise SystemExit('Uninstall transaction changed during its commit.')
+    os.replace(temporary,'transaction.json',src_dir_fd=fd,dst_dir_fd=fd);os.fsync(fd)
+finally:
+    try:
+        os.unlink(temporary,dir_fd=fd)
+        os.fsync(fd)
+    except FileNotFoundError:pass
+    os.close(fd)
+PYREMOVALSTATE
+}
+
 snapshot_local_signer() {
   local candidate=""
   local trust_helper="${SLS_MASS_NOTIFY_TRUST_HELPER_SOURCE:-/usr/local/bin/sls_mass_notify/sls_module_trust.py}"
   local -a candidates=()
 
   if [ -n "$UNINSTALL_APPROVED_SOURCE" ]; then
-    RECOVERY_SIGNER_DIR="$(mktemp -d /tmp/sls-uninstall-signer.XXXXXX)" || return 1
+    RECOVERY_SIGNER_DIR="$(uninstall_recovery_workspace sls-uninstall-signer)" || return 1
     chmod 0700 "$RECOVERY_SIGNER_DIR" || return 1
-    RECOVERY_DECODER_DIR="$(mktemp -d /tmp/sls-uninstall-decoder.XXXXXX)" || return 1
+    RECOVERY_DECODER_DIR="$(uninstall_recovery_workspace sls-uninstall-decoder)" || return 1
     chown root:asterisk "$RECOVERY_DECODER_DIR" && chmod 0750 "$RECOVERY_DECODER_DIR" || return 1
     /usr/bin/python3 -I - "$UNINSTALL_APPROVED_SOURCE/bin/sls_mass_notify/sls_module_trust.py" "$UNINSTALL_APPROVED_SOURCE" "$RECOVERY_SIGNER_DIR" "$RECOVERY_DECODER_DIR" <<'PYAPPROVEDSNAPSHOT' || return 1
 from pathlib import Path
@@ -262,9 +400,19 @@ fd = os.open(decoder / 'sls_config_crypto.php', os.O_WRONLY | os.O_CREAT | os.O_
 with os.fdopen(fd, 'wb') as output:
     os.fchown(output.fileno(), 0, pwd.getpwnam('asterisk').pw_gid)
     output.write(body); output.flush(); os.fsync(output.fileno())
+name = 'AmiUserOwnership.php'
+entry = data['files'].get(name)
+if not entry: raise SystemExit('The current local uninstaller requires its signed AMI ownership helper. Preserve the approved generation; no teardown was started.')
+body = module.read(source / name, 2 * 1024 * 1024, protected=True)
+if module.digest(body) != entry['sha256']: raise SystemExit('Signed AMI ownership helper changed')
+fd = os.open(decoder / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
+with os.fdopen(fd, 'wb') as output:
+    os.fchown(output.fileno(), 0, pwd.getpwnam('asterisk').pw_gid)
+    output.write(body); output.flush(); os.fsync(output.fileno())
 PYAPPROVEDSNAPSHOT
     RECOVERY_SIGNER="$RECOVERY_SIGNER_DIR/sign_sls_mass_notify_local_sig.sh"
     RECOVERY_CONFIG_DECODER="$RECOVERY_DECODER_DIR/sls_config_crypto.php"
+    RECOVERY_AMI_OWNERSHIP_HELPER="$RECOVERY_DECODER_DIR/AmiUserOwnership.php"
     bash -n "$RECOVERY_SIGNER" || return 1
     return 0
   fi
@@ -296,7 +444,7 @@ PYAPPROVEDSNAPSHOT
       log "The installed PBX-local signer is not valid Bash: $candidate"
       return 1
     }
-    RECOVERY_SIGNER_DIR="$(mktemp -d /tmp/sls-uninstall-signer.XXXXXX)" || return 1
+    RECOVERY_SIGNER_DIR="$(uninstall_recovery_workspace sls-uninstall-signer)" || return 1
     chmod 0700 "$RECOVERY_SIGNER_DIR"
     RECOVERY_SIGNER="$RECOVERY_SIGNER_DIR/sign_sls_mass_notify_local_sig.sh"
     install -m 0700 -o root -g root "$candidate" "$RECOVERY_SIGNER" || return 1
@@ -322,7 +470,7 @@ with os.fdopen(fd, "rb") as handle:
         raise SystemExit("Protected module trust helper is unsafe")
     body = handle.read(256 * 1024 + 1)
     after = os.fstat(handle.fileno())
-    if len(body) > 256 * 1024 or (info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+    if len(body) != info.st_size or len(body) > 256 * 1024 or (info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
         raise SystemExit("Protected module trust helper changed during snapshot")
 fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700)
 with os.fdopen(fd, "wb") as handle:
@@ -471,11 +619,11 @@ run_fwconsole() (
   if [ -n "${UNINSTALL_WORKER_PIPE:-}" ]; then exec {UNINSTALL_WORKER_PIPE}>&-; fi
   # PCRE JIT allocation can be denied by otherwise healthy unprivileged LXC
   # containers. Limit this compatibility override to the uninstall process.
-  /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 /usr/sbin/fwconsole "$@"
+  run_as_asterisk /usr/bin/php -d pcre.jit=0 /usr/sbin/fwconsole "$@"
 )
 
 module_registry_exists() {
-  SLS_MODULE_NAME="$MODULE" /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 -r '
+  run_as_asterisk "SLS_MODULE_NAME=$MODULE" /usr/bin/php -d pcre.jit=0 -r '
 $bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
 require "/etc/freepbx.conf";
 $statement = \FreePBX::Database()->prepare("SELECT COUNT(*) FROM modules WHERE modulename = ?");
@@ -509,7 +657,7 @@ remove_module_registration() {
   inspect_module_registry || return 1
   if [ "$MODULE_REGISTRY_PRESENT" = 1 ]; then
     log "FreePBX left the $MODULE registry row behind; removing that single stale row before deleting module files."
-    SLS_MODULE_NAME="$MODULE" /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 -r '
+    run_as_asterisk "SLS_MODULE_NAME=$MODULE" /usr/bin/php -d pcre.jit=0 -r '
 $bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
 require "/etc/freepbx.conf";
 $statement = \FreePBX::Database()->prepare("DELETE FROM modules WHERE modulename = ?");
@@ -544,23 +692,116 @@ capture_pbx_running_state() {
 
 reload_removed_pbx_integration() {
   if [ "$PBX_RUNNING" != 1 ]; then
-    PBX_RELOAD_WARNING=1
     log "SLS removal was verified. Asterisk is stopped or its control socket is unavailable; run fwconsole reload after PBX service is available. No PBX service was started."
     return 0
   fi
   if ! run_fwconsole reload >>"$MODULE_UNINSTALL_LOG" 2>&1; then
-    PBX_RELOAD_WARNING=1
     log "SLS removal was verified, but the PBX integration reload failed. Review $MODULE_UNINSTALL_LOG_PATH, resolve the PBX reload error, and run fwconsole reload."
   fi
 }
 
 capture_configured_ami_username() {
-  CONFIGURED_AMI_USERNAME="$(SLS_CONFIG="$DATA_DIR/mass-notifications.config" SLS_UNINSTALL_CONFIG_DECODER="$RECOVERY_CONFIG_DECODER" /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 <<'PHPAMI'
+  local ownership snapshot="$RECOVERY_DECODER_DIR/central-config.snapshot"
+  /usr/bin/python3 -I - "$DATA_DIR/mass-notifications.config" "$snapshot" <<'PYAMISNAPSHOT' || return 1
+import fcntl
+import os
+import pwd
+import stat
+import sys
+
+source, target = sys.argv[1:]
+account = pwd.getpwnam('asterisk')
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+def parent(path, allowed_owners, allowed_groups):
+    parts = path.split('/')[1:]
+    if not path.startswith('/') or not parts or any(part in ('', '.', '..') for part in parts):
+        raise RuntimeError('invalid configuration snapshot path')
+    descriptor = os.open('/', directory_flags)
+    try:
+        for component in parts[:-1]:
+            child = os.open(component, directory_flags, dir_fd=descriptor)
+            metadata = os.fstat(child)
+            sticky_root = metadata.st_uid == 0 and bool(metadata.st_mode & stat.S_ISVTX)
+            if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid not in allowed_owners
+                    or metadata.st_gid not in allowed_groups
+                    or metadata.st_mode & 0o022 and not sticky_root):
+                os.close(child)
+                raise RuntimeError('unsafe configuration snapshot parent')
+            os.close(descriptor)
+            descriptor = child
+        return descriptor, parts[-1]
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+source_parent, source_name = parent(source, {0, account.pw_uid}, {0, account.pw_gid})
+try:
+    try:
+        descriptor = os.open(source_name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                             dir_fd=source_parent)
+    except FileNotFoundError:
+        raise SystemExit(0)
+    try:
+        before = os.fstat(descriptor)
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or before.st_uid not in (0, account.pw_uid)
+                or before.st_gid not in (0, account.pw_gid)
+                or stat.S_IMODE(before.st_mode) not in (0o600, 0o640, 0o644)
+                or before.st_size > 3 * 1024 * 1024):
+            raise RuntimeError('central configuration is unsafe')
+        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        body = bytearray()
+        while len(body) <= 3 * 1024 * 1024:
+            chunk = os.read(descriptor, min(65536, 3 * 1024 * 1024 + 1 - len(body)))
+            if not chunk:
+                break
+            body.extend(chunk)
+        after = os.fstat(descriptor)
+        named = os.stat(source_name, dir_fd=source_parent, follow_symlinks=False)
+        identity = lambda row: (row.st_dev, row.st_ino, row.st_uid, row.st_gid,
+                                row.st_mode, row.st_size, row.st_mtime_ns,
+                                row.st_ctime_ns, row.st_nlink)
+        if len(body) > 3 * 1024 * 1024 or len(body) != before.st_size \
+                or identity(before) != identity(after) or identity(after) != identity(named):
+            raise RuntimeError('central configuration changed while being snapshotted')
+    finally:
+        os.close(descriptor)
+finally:
+    os.close(source_parent)
+
+target_parent, target_name = parent(target, {0}, {0, account.pw_gid})
+try:
+    output = os.open(target_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     0o600, dir_fd=target_parent)
+    try:
+        view = memoryview(body)
+        while view:
+            written = os.write(output, view)
+            if written <= 0:
+                raise OSError('short configuration snapshot write')
+            view = view[written:]
+        os.fchown(output, 0, account.pw_gid)
+        os.fchmod(output, 0o640)
+        os.fsync(output)
+    finally:
+        os.close(output)
+    os.fsync(target_parent)
+finally:
+    os.close(target_parent)
+PYAMISNAPSHOT
+  if [ ! -f "$snapshot" ] || [ -L "$snapshot" ]; then
+    CONFIGURED_AMI_USERNAME=""
+    CONFIGURED_AMI_SECRET_HASH=""
+    return 0
+  fi
+  ownership="$(run_as_asterisk "SLS_CONFIG=$snapshot" "SLS_UNINSTALL_CONFIG_DECODER=$RECOVERY_CONFIG_DECODER" /usr/bin/php -d pcre.jit=0 <<'PHPAMI'
 <?php
 $path = (string)getenv('SLS_CONFIG');
-if ($path === '' || (!file_exists($path) && !is_link($path))) { exit(0); }
+if ($path === '' || !file_exists($path)) { exit(0); }
 $metadata = lstat($path);
-if (is_link($path) || !is_file($path) || !is_array($metadata) || $metadata['nlink'] !== 1 || $metadata['size'] > 3 * 1024 * 1024) {
+if (is_link($path) || !is_file($path) || !is_array($metadata) || $metadata['nlink'] !== 1
+    || ($metadata['mode'] & 0022) !== 0 || $metadata['size'] > 3 * 1024 * 1024) {
     fwrite(STDERR, "The central configuration is unsafe; preserve it for review before uninstalling.\n"); exit(1);
 }
 require_once (string)getenv('SLS_UNINSTALL_CONFIG_DECODER');
@@ -576,9 +817,11 @@ $username = (string)($settings['ami']['username'] ?? '');
 if ($username !== '' && !preg_match('/^[A-Za-z0-9_.-]{1,80}$/D', $username)) {
     fwrite(STDERR, "The configured SLS AMI username is invalid; no manager account was removed.\n"); exit(1);
 }
-echo $username;
+echo $username, "\t", hash('sha256', (string)($settings['ami']['password'] ?? ''));
 PHPAMI
 )" || return 1
+  rm -f -- "$snapshot"
+  IFS=$'\t' read -r CONFIGURED_AMI_USERNAME CONFIGURED_AMI_SECRET_HASH <<<"$ownership"
 }
 
 validate_retained_user_data() {
@@ -596,370 +839,183 @@ try:
         except FileNotFoundError: raise SystemExit(0)
         os.close(fd); fd = child
         info = os.fstat(fd)
-        if info.st_uid not in (0, account.pw_uid) or info.st_mode & 0o002 and not (info.st_uid == 0 and info.st_mode & stat.S_ISVTX):
+        if info.st_uid not in (0, account.pw_uid) or info.st_gid not in (0, account.pw_gid) or info.st_mode & 0o022 and not (info.st_uid == 0 and info.st_mode & stat.S_ISVTX):
             raise SystemExit('Retained SLS data has an unsafe owner or writable parent; no data was deleted')
 finally: os.close(fd)
 PYRETAIN
 }
 
-preserve_user_data() {
-  [ "$PURGE_CONFIG" != "1" ] || return 0
-  CONFIG_TMP="$(mktemp -d /tmp/slsmassnotifyserver-config.XXXXXX)"
-  chmod 0700 "$CONFIG_TMP"
-
-  # DATA_DIR is service-writable while this script runs as root. Anchor every
-  # read to no-follow directory descriptors and reject links/special files so
-  # preservation cannot disclose a root-only file or restore an unsafe object.
-  if ! /usr/bin/python3 - "$DATA_DIR" "$CONFIG_TMP" <<'PY'
-import errno
-import os
-import stat
-import sys
-
-source_root, target_root = sys.argv[1:3]
-no_follow = getattr(os, "O_NOFOLLOW", 0)
-read_flags = os.O_RDONLY | os.O_CLOEXEC | no_follow
-directory_flags = read_flags | os.O_DIRECTORY
-
-try:
-    source_fd = os.open(source_root, directory_flags)
-except FileNotFoundError:
-    raise SystemExit(0)
-except OSError as exc:
-    raise SystemExit(f"refusing unsafe preserved-data directory: {exc}")
-
-target_fd = os.open(target_root, directory_flags)
-
-
-def open_optional(parent_fd, name, flags):
-    try:
-        return os.open(name, flags, dir_fd=parent_fd)
-    except FileNotFoundError:
-        return None
-
-
-def copy_regular(source_parent_fd, target_parent_fd, name):
-    source_file_fd = open_optional(source_parent_fd, name, read_flags)
-    if source_file_fd is None:
-        return
-    try:
-        if not stat.S_ISREG(os.fstat(source_file_fd).st_mode):
-            raise RuntimeError(f"refusing non-regular preserved file: {name}")
-        target_file_fd = os.open(
-            name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | no_follow,
-            0o600,
-            dir_fd=target_parent_fd,
-        )
-        try:
-            while True:
-                chunk = os.read(source_file_fd, 1024 * 1024)
-                if not chunk:
-                    break
-                view = memoryview(chunk)
-                while view:
-                    written = os.write(target_file_fd, view)
-                    if written <= 0:
-                        raise OSError(errno.EIO, "short write while preserving user data")
-                    view = view[written:]
-            os.fsync(target_file_fd)
-        finally:
-            os.close(target_file_fd)
-    finally:
-        os.close(source_file_fd)
-
-
-def copy_tree(source_parent_fd, target_parent_fd, name):
-    source_directory_fd = open_optional(source_parent_fd, name, directory_flags)
-    if source_directory_fd is None:
-        return
-    try:
-        os.mkdir(name, 0o700, dir_fd=target_parent_fd)
-        target_directory_fd = os.open(name, directory_flags, dir_fd=target_parent_fd)
-        try:
-            for entry in sorted(os.listdir(source_directory_fd)):
-                if entry in {"", ".", ".."} or "/" in entry or "\x00" in entry:
-                    raise RuntimeError("refusing invalid preserved-data entry")
-                entry_stat = os.stat(entry, dir_fd=source_directory_fd, follow_symlinks=False)
-                if stat.S_ISLNK(entry_stat.st_mode):
-                    raise RuntimeError(f"refusing symbolic link in preserved data: {entry}")
-                if stat.S_ISDIR(entry_stat.st_mode):
-                    copy_tree(source_directory_fd, target_directory_fd, entry)
-                elif stat.S_ISREG(entry_stat.st_mode):
-                    copy_regular(source_directory_fd, target_directory_fd, entry)
-                else:
-                    raise RuntimeError(f"refusing special file in preserved data: {entry}")
-        finally:
-            os.close(target_directory_fd)
-    finally:
-        os.close(source_directory_fd)
-
-
-try:
-    for filename in (
-        "mass-notifications.config",
-        "mass-notifications.pending.config",
-        "schedule-executions.json",
-    ):
-        copy_regular(source_fd, target_fd, filename)
-    copy_tree(source_fd, target_fd, "config-backups")
-    sounds_fd = open_optional(source_fd, "sounds", directory_flags)
-    if sounds_fd is not None:
-        try:
-            os.mkdir("sounds", 0o700, dir_fd=target_fd)
-            target_sounds_fd = os.open("sounds", directory_flags, dir_fd=target_fd)
-            try:
-                copy_tree(sounds_fd, target_sounds_fd, "tones")
-            finally:
-                os.close(target_sounds_fd)
-        finally:
-            os.close(sounds_fd)
-finally:
-    os.close(target_fd)
-    os.close(source_fd)
-PY
-  then
-    log "Refusing to preserve unsafe configuration or uploaded-tone data. No uninstall changes were made."
-    return 1
+handle_uninstall_exit() {
+  local status=$?
+  trap - EXIT
+  if [ -n "$UNINSTALL_TRANSACTION_DIR" ] && [ "$status" != 0 ]; then
+    record_uninstall_stage failed || log "Uninstall transaction could not record failure; preserve $UNINSTALL_TRANSACTION_DIR."
   fi
+  if [ "$status" = 0 ]; then
+    cleanup_recovery_signer
+  else
+    log "Uninstall transaction retained: ${UNINSTALL_TRANSACTION_DIR:-not created}."
+    log "Uninstall recovery evidence retained: ${RECOVERY_SIGNER_DIR:-not created}; ${RECOVERY_DECODER_DIR:-not created}."
+    if [ -n "${UNINSTALL_APPROVED_SOURCE:-}" ]; then
+      log "Local authenticated retry entry: $UNINSTALL_APPROVED_SOURCE/bin/sls_mass_notify_uninstall.sh. Preserve the trust generation; no download is required."
+    fi
+  fi
+  exit "$status"
 }
 
-restore_user_data() {
-  [ -n "$CONFIG_TMP" ] && [ -d "$CONFIG_TMP" ] || return 0
-  if find "$CONFIG_TMP" -type f -print -quit | grep -q .; then
-    if ! /usr/bin/python3 - "$CONFIG_TMP" "$DATA_DIR" <<'PY'
-import errno
+rewrite_managed_text_file() {
+  local path="$1" operation="$2" name="${3:-}" action="${4:-apply}"
+  run_as_asterisk /usr/bin/python3 -I - "$path" "$operation" "$name" "$action" <<'PYREWRITE'
+import fcntl
 import os
 import pwd
+import re
 import secrets
 import stat
 import sys
 
-source_root, destination_root = sys.argv[1:3]
-no_follow = getattr(os, "O_NOFOLLOW", 0)
-directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | no_follow
-read_flags = os.O_RDONLY | os.O_CLOEXEC | no_follow
-write_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | no_follow
-account = pwd.getpwnam("asterisk")
-file_count = 0
-byte_count = 0
-
-
-def open_parent(path):
-    parts = [part for part in path.split("/") if part]
-    if not path.startswith("/") or not parts or "\x00" in path:
-        raise RuntimeError("invalid restore path")
-    parent_fd = os.open("/", directory_flags)
+path, operation, name, action = sys.argv[1:]
+parts = path.split('/')[1:]
+if (not path.startswith('/') or not parts or any(part in ('', '.', '..') for part in parts)
+        or operation not in ('menu', 'legacy-dashboard', 'managed-block')
+        or action not in ('apply', 'check')):
+    raise SystemExit('Invalid managed text rewrite request')
+account = pwd.getpwnam('asterisk')
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+parent = os.open('/', directory_flags)
+descriptor = -1
+temporary = None
+try:
     for component in parts[:-1]:
-        next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
-        os.close(parent_fd)
-        parent_fd = next_fd
-    return parent_fd, parts[-1]
-
-
-def open_or_create_directory(parent_fd, name):
+        child = os.open(component, directory_flags, dir_fd=parent)
+        metadata = os.fstat(child)
+        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid not in (0, account.pw_uid)
+                or metadata.st_gid not in (0, account.pw_gid) or metadata.st_mode & 0o002):
+            os.close(child)
+            raise RuntimeError('managed text parent is unsafe')
+        os.close(parent)
+        parent = child
     try:
-        os.mkdir(name, 0o700, dir_fd=parent_fd)
-    except FileExistsError:
-        pass
-    directory_fd = os.open(name, directory_flags, dir_fd=parent_fd)
-    if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
-        os.close(directory_fd)
-        raise RuntimeError("restore destination is not a directory")
-    return directory_fd
-
-
-def restore_regular(source_parent_fd, destination_parent_fd, name, relative_path):
-    global file_count, byte_count
-    source_fd = os.open(name, read_flags, dir_fd=source_parent_fd)
-    if not stat.S_ISREG(os.fstat(source_fd).st_mode):
-        os.close(source_fd)
-        raise RuntimeError(f"refusing non-regular restore source: {relative_path}")
-    temporary_name = ".sls-restore-" + secrets.token_hex(8)
-    temporary_fd = os.open(temporary_name, write_flags, 0o600, dir_fd=destination_parent_fd)
+        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                             dir_fd=parent)
+    except FileNotFoundError:
+        raise SystemExit(0)
+    before = os.fstat(descriptor)
+    if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+            or before.st_uid not in (0, account.pw_uid)
+            or before.st_gid not in (0, account.pw_gid)
+            or before.st_mode & 0o002
+            or before.st_size > 8 * 1024 * 1024):
+        raise RuntimeError('managed text file is unsafe or oversized')
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    body = bytearray()
+    while len(body) <= 8 * 1024 * 1024:
+        chunk = os.read(descriptor, min(65536, 8 * 1024 * 1024 + 1 - len(body)))
+        if not chunk:
+            break
+        body.extend(chunk)
+    after = os.fstat(descriptor)
+    named = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+    identity = lambda row: (row.st_dev, row.st_ino, row.st_uid, row.st_gid,
+                            row.st_mode, row.st_size, row.st_mtime_ns,
+                            row.st_ctime_ns, row.st_nlink)
+    if len(body) > 8 * 1024 * 1024 or identity(before) != identity(after) or identity(after) != identity(named):
+        raise RuntimeError('managed text file changed during inspection')
     try:
-        while True:
-            chunk = os.read(source_fd, 1024 * 1024)
-            if not chunk:
-                break
-            byte_count += len(chunk)
-            if byte_count > 256 * 1024 * 1024:
-                raise RuntimeError("preserved data exceeds the restore size limit")
-            view = memoryview(chunk)
-            while view:
-                written = os.write(temporary_fd, view)
-                if written <= 0:
-                    raise OSError(errno.EIO, "short write while restoring user data")
-                view = view[written:]
-        file_count += 1
-        if file_count > 2000:
-            raise RuntimeError("preserved data exceeds the restore file limit")
-        mode = 0o644 if relative_path.startswith("sounds/tones/") else 0o640
-        os.fchmod(temporary_fd, mode)
-        os.fchown(temporary_fd, account.pw_uid, account.pw_gid)
-        os.fsync(temporary_fd)
-        os.close(temporary_fd)
-        temporary_fd = -1
-        os.replace(temporary_name, name, src_dir_fd=destination_parent_fd, dst_dir_fd=destination_parent_fd)
+        data = bytes(body).decode('utf-8')
+    except UnicodeDecodeError:
+        raise RuntimeError('managed text file is not valid UTF-8')
+
+    if operation == 'menu':
+        updated = re.sub(
+            r"\t// SLS Mass Notifications menu placement:.*?(?=\telse if \(\$a == 'other'\)\n\t\treturn (?:1|true);\n)",
+            "", data, flags=re.S)
+        for label in ('mass notifications', 'mass notify'):
+            for block in (
+                f"\telse if ($a == '{label}' && $b == 'other')\n\t\treturn -1;\n",
+                f"\telse if ($a == 'other' && $b == '{label}')\n\t\treturn 1;\n",
+                f"\telse if ($a == '{label}' && $b == 'user panel')\n\t\treturn 1;\n",
+                f"\telse if ($a == 'user panel' && $b == '{label}')\n\t\treturn -1;\n",
+                f"\telse if ($a == '{label}')\n\t\treturn 1;\n",
+                f"\telse if ($b == '{label}')\n\t\treturn -1;\n",
+            ):
+                updated = updated.replace(block, '')
+    elif operation == 'legacy-dashboard':
+        updated = re.sub(
+            r"\n\s*\$final\[\$i\]\s*=\s*\$this->checkSlsMassNotify\(\);\s*"
+            r"\$final\[\$i\]\['title'\]\s*=\s*_\(\"Mass Notifications (?:Plugin|Module)\"\);\s*\$i\+\+;\s*",
+            "\n", data, flags=re.S)
+        updated = re.sub(
+            r"\n\s*private function checkSlsMassNotify\(\)\s*\{.*?"
+            r"(?=\n\s*private function genAlertGlyphicon\(\))",
+            "\n", updated, flags=re.S)
+    else:
+        if not name or len(name.encode('utf-8')) > 160 or any(character in name for character in '\r\n\x00'):
+            raise RuntimeError('invalid managed block name')
+        updated = data
+        def remove_complete_block(value, start_marker, end_marker):
+            pattern = (r'(?m)^' + re.escape(start_marker) + r'\r?\n'
+                       + r'(?s:.*?)^' + re.escape(end_marker) + r'(?:\r?\n|\Z)')
+            return re.sub(pattern, '', value)
+        for prefix in (';', '#'):
+            updated = remove_complete_block(
+                updated, prefix + ' BEGIN ' + name, prefix + ' END ' + name)
+        updated = remove_complete_block(
+            updated, ';-- BEGIN ' + name + ' --', ';-- END ' + name + ' --')
+
+    if updated == data:
+        raise SystemExit(0)
+    encoded = updated.encode('utf-8')
+    temporary = '.sls-uninstall-rewrite-' + secrets.token_hex(12)
+    output = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     stat.S_IMODE(before.st_mode) & 0o777, dir_fd=parent)
+    try:
+        view = memoryview(encoded)
+        while view:
+            written = os.write(output, view)
+            if written <= 0:
+                raise OSError('short managed text write')
+            view = view[written:]
+        os.fchmod(output, stat.S_IMODE(before.st_mode) & 0o777)
+        # Preserve the exact existing owner/group. The unprivileged rewrite
+        # aborts rather than silently adopting a root-owned local file.
+        os.fchown(output, before.st_uid, before.st_gid)
+        os.fsync(output)
     finally:
-        if temporary_fd >= 0:
-            os.close(temporary_fd)
-        os.close(source_fd)
+        os.close(output)
+    current = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+    if identity(current) != identity(after):
+        raise RuntimeError('managed text file changed before replacement')
+    if action == 'check':
+        raise SystemExit(0)
+    os.replace(temporary, parts[-1], src_dir_fd=parent, dst_dir_fd=parent)
+    temporary = None
+    os.fsync(parent)
+finally:
+    if descriptor >= 0:
+        os.close(descriptor)
+    if temporary is not None:
         try:
-            os.unlink(temporary_name, dir_fd=destination_parent_fd)
+            os.unlink(temporary, dir_fd=parent)
+            os.fsync(parent)
         except FileNotFoundError:
             pass
-
-
-def restore_tree(source_fd, destination_fd, prefix=""):
-    for name in sorted(os.listdir(source_fd)):
-        if name in {"", ".", ".."} or "/" in name or "\x00" in name:
-            raise RuntimeError("invalid preserved-data name")
-        relative_path = f"{prefix}/{name}" if prefix else name
-        metadata = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
-        if stat.S_ISLNK(metadata.st_mode):
-            raise RuntimeError(f"refusing symbolic link in preserved data: {relative_path}")
-        if stat.S_ISDIR(metadata.st_mode):
-            source_child_fd = os.open(name, directory_flags, dir_fd=source_fd)
-            destination_child_fd = open_or_create_directory(destination_fd, name)
-            try:
-                os.fchmod(destination_child_fd, 0o700)
-                os.fchown(destination_child_fd, 0, 0)
-                restore_tree(source_child_fd, destination_child_fd, relative_path)
-                mode = 0o755 if relative_path in {"sounds", "sounds/tones"} else 0o750
-                os.fchown(destination_child_fd, account.pw_uid, account.pw_gid)
-                os.fchmod(destination_child_fd, mode)
-                os.fsync(destination_child_fd)
-            finally:
-                os.close(destination_child_fd)
-                os.close(source_child_fd)
-        elif stat.S_ISREG(metadata.st_mode):
-            restore_regular(source_fd, destination_fd, name, relative_path)
-        else:
-            raise RuntimeError(f"refusing special file in preserved data: {relative_path}")
-
-
-source_fd = os.open(source_root, directory_flags)
-destination_parent_fd, destination_name = open_parent(destination_root)
-try:
-    destination_fd = open_or_create_directory(destination_parent_fd, destination_name)
-    try:
-        os.fchmod(destination_fd, 0o700)
-        os.fchown(destination_fd, 0, 0)
-        restore_tree(source_fd, destination_fd)
-        os.fchown(destination_fd, account.pw_uid, account.pw_gid)
-        os.fchmod(destination_fd, 0o750)
-        os.fsync(destination_fd)
-        os.fsync(destination_parent_fd)
-    finally:
-        os.close(destination_fd)
-finally:
-    os.close(destination_parent_fd)
-    os.close(source_fd)
-PY
-    then
-      log "Unable to restore preserved user data without following symbolic links. The root-owned recovery copy remains at $CONFIG_TMP."
-      return 1
-    fi
-  fi
-  rm -rf "$CONFIG_TMP"
-  CONFIG_TMP=""
-}
-
-restore_user_data_on_exit() {
-  local status=$?
-  trap - EXIT
-  if [ -n "$CONFIG_TMP" ] && [ -d "$CONFIG_TMP" ]; then
-    log "Uninstall did not complete; restoring the preserved central configuration and user audio."
-    restore_user_data || true
-  fi
-  cleanup_recovery_signer
-  exit "$status"
+    os.close(parent)
+PYREWRITE
 }
 
 remove_menu_patch() {
-  local path="/var/www/html/admin/views/menu_items.php"
-  [ -w "$path" ] || return 0
-  /usr/sbin/runuser -u asterisk -- /usr/bin/python3 -I - "$path" <<'PY'
-import re
-import sys
-
-path = sys.argv[1]
-with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-    data = handle.read()
-
-data = re.sub(
-    r"\t// SLS Mass Notifications menu placement:.*?(?=\telse if \(\$a == 'other'\)\n\t\treturn (?:1|true);\n)",
-    "",
-    data,
-    flags=re.S,
-)
-for label in ("mass notifications", "mass notify"):
-    for block in (
-        f"\telse if ($a == '{label}' && $b == 'other')\n\t\treturn -1;\n",
-        f"\telse if ($a == 'other' && $b == '{label}')\n\t\treturn 1;\n",
-        f"\telse if ($a == '{label}' && $b == 'user panel')\n\t\treturn 1;\n",
-        f"\telse if ($a == 'user panel' && $b == '{label}')\n\t\treturn -1;\n",
-        f"\telse if ($a == '{label}')\n\t\treturn 1;\n",
-        f"\telse if ($b == '{label}')\n\t\treturn -1;\n",
-    ):
-        data = data.replace(block, "")
-
-with open(path, "w", encoding="utf-8") as handle:
-    handle.write(data)
-PY
+  rewrite_managed_text_file "/var/www/html/admin/views/menu_items.php" menu
 }
 
 remove_legacy_dashboard_patch() {
-  local path="/var/www/html/admin/modules/dashboard/sections/Overview.class.php"
-  [ -w "$path" ] || return 0
-  /usr/sbin/runuser -u asterisk -- /usr/bin/python3 -I - "$path" <<'PY'
-import re
-import sys
-
-path = sys.argv[1]
-with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-    data = handle.read()
-data = re.sub(
-    r"\n\s*\$final\[\$i\]\s*=\s*\$this->checkSlsMassNotify\(\);\s*"
-    r"\$final\[\$i\]\['title'\]\s*=\s*_\(\"Mass Notifications (?:Plugin|Module)\"\);\s*\$i\+\+;\s*",
-    "\n",
-    data,
-    flags=re.S,
-)
-data = re.sub(
-    r"\n\s*private function checkSlsMassNotify\(\)\s*\{.*?"
-    r"(?=\n\s*private function genAlertGlyphicon\()",
-    "\n",
-    data,
-    flags=re.S,
-)
-with open(path, "w", encoding="utf-8") as handle:
-    handle.write(data)
-PY
+  rewrite_managed_text_file "/var/www/html/admin/modules/dashboard/sections/Overview.class.php" legacy-dashboard
 }
 
 remove_managed_block() {
   local path="$1"
   local name="$2"
-  [ -f "$path" ] || return 0
-  /usr/sbin/runuser -u asterisk -- /usr/bin/python3 -I - "$path" "$name" <<'PY'
-import re
-import sys
-
-path, name = sys.argv[1], sys.argv[2]
-with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-    data = handle.read()
-for prefix in (";", "#"):
-    start = re.escape(prefix + " BEGIN " + name)
-    end = re.escape(prefix + " END " + name)
-    data = re.sub(r"\n?" + start + r".*?" + end + r"\n?", "\n", data, flags=re.S)
-legacy_start = re.escape(";-- BEGIN " + name + " --")
-legacy_end = re.escape(";-- END " + name + " --")
-data = re.sub(r"\n?" + legacy_start + r".*?" + legacy_end + r"\n?", "\n", data, flags=re.S)
-with open(path, "w", encoding="utf-8") as handle:
-    handle.write(data.strip() + ("\n" if data.strip() else ""))
-PY
+  rewrite_managed_text_file "$path" managed-block "$name"
 }
 
 verify_uninstall_collector_unit() {
@@ -984,9 +1040,9 @@ restore_uninstall_collector() {
     log 'Uninstall stopped before removing module files, but the collector service changed during recovery. Preserve its definition and history for review.'
     return 1
   fi
-  current="$(/usr/bin/timeout --kill-after=2 10 systemctl show --property=UnitFileState --value sls-mass-notify-phone-events.service)" || return 1
+  current="$(/usr/bin/timeout --kill-after=2 10 /usr/bin/systemctl show --property=UnitFileState --value sls-mass-notify-phone-events.service)" || return 1
   if [ "$enabled" = enabled ] && [ "$current" = disabled ]; then
-    /usr/bin/timeout --kill-after=2 20 systemctl enable sls-mass-notify-phone-events.service || {
+    /usr/bin/timeout --kill-after=2 20 /usr/bin/systemctl enable sls-mass-notify-phone-events.service || {
       log 'Uninstall stopped before removing module files, but the collector enablement could not be restored. Preserve its unit/history and restore its previous enabled state after reviewing systemd.'
       return 1
     }
@@ -995,8 +1051,8 @@ restore_uninstall_collector() {
     return 1
   fi
   [ "$previous" = active ] || return 0
-  if ! /usr/bin/timeout --kill-after=2 20 systemctl start sls-mass-notify-phone-events.service \
-    || [ "$(/usr/bin/timeout --kill-after=2 10 systemctl show --property=ActiveState --value sls-mass-notify-phone-events.service)" != active ]; then
+  if ! /usr/bin/timeout --kill-after=2 20 /usr/bin/systemctl start sls-mass-notify-phone-events.service \
+    || [ "$(/usr/bin/timeout --kill-after=2 10 /usr/bin/systemctl show --property=ActiveState --value sls-mass-notify-phone-events.service)" != active ]; then
     log 'Uninstall stopped before removing module files, but the previously active collector could not be restored. Preserve its service definition and history; review systemctl status/journalctl and restart the approved collector after resolving the named fault.'
     return 1
   fi
@@ -1007,20 +1063,20 @@ remove_phone_collector_service() {
   local unit="/etc/systemd/system/sls-mass-notify-phone-events.service" active_state previous_state fragment dropins enabled_state
   [ -e "$unit" ] || [ -L "$unit" ] || return 0
   verify_uninstall_collector_unit "$unit" || return 1
-  previous_state="$(/usr/bin/timeout --kill-after=2 10 systemctl show --property=ActiveState --value sls-mass-notify-phone-events.service)" || return 1
-  fragment="$(/usr/bin/timeout --kill-after=2 10 systemctl show --property=FragmentPath --value sls-mass-notify-phone-events.service)" || return 1
-  dropins="$(/usr/bin/timeout --kill-after=2 10 systemctl show --property=DropInPaths --value sls-mass-notify-phone-events.service)" || return 1
-  enabled_state="$(/usr/bin/timeout --kill-after=2 10 systemctl show --property=UnitFileState --value sls-mass-notify-phone-events.service)" || return 1
+  previous_state="$(/usr/bin/timeout --kill-after=2 10 /usr/bin/systemctl show --property=ActiveState --value sls-mass-notify-phone-events.service)" || return 1
+  fragment="$(/usr/bin/timeout --kill-after=2 10 /usr/bin/systemctl show --property=FragmentPath --value sls-mass-notify-phone-events.service)" || return 1
+  dropins="$(/usr/bin/timeout --kill-after=2 10 /usr/bin/systemctl show --property=DropInPaths --value sls-mass-notify-phone-events.service)" || return 1
+  enabled_state="$(/usr/bin/timeout --kill-after=2 10 /usr/bin/systemctl show --property=UnitFileState --value sls-mass-notify-phone-events.service)" || return 1
   case "$previous_state:$enabled_state" in active:enabled|active:disabled|inactive:enabled|inactive:disabled|failed:enabled|failed:disabled) ;; *) log 'Collector enablement or process state is unsupported. No service was changed; review masks or custom supervision before retrying.'; return 1 ;; esac
   if [ "$fragment" != "$unit" ] || [ -n "$dropins" ]; then
     log 'Collector systemd fragments or overrides differ from the signed service. No service was changed; preserve custom supervision for review.'
     return 1
   fi
-  if ! /usr/bin/timeout --kill-after=2 20 systemctl stop sls-mass-notify-phone-events.service; then
+  if ! /usr/bin/timeout --kill-after=2 20 /usr/bin/systemctl stop sls-mass-notify-phone-events.service; then
     restore_uninstall_collector "$unit" "$previous_state" "$enabled_state" || true
     return 1
   fi
-  active_state="$(/usr/bin/timeout --kill-after=2 10 systemctl show --property=ActiveState --value sls-mass-notify-phone-events.service)" || {
+  active_state="$(/usr/bin/timeout --kill-after=2 10 /usr/bin/systemctl show --property=ActiveState --value sls-mass-notify-phone-events.service)" || {
     restore_uninstall_collector "$unit" "$previous_state" "$enabled_state" || true
     return 1
   }
@@ -1031,7 +1087,7 @@ remove_phone_collector_service() {
     restore_uninstall_collector "$unit" "$previous_state" "$enabled_state" || true
     return 1
   fi
-  if ! /usr/bin/timeout --kill-after=2 20 systemctl disable sls-mass-notify-phone-events.service; then
+  if ! /usr/bin/timeout --kill-after=2 20 /usr/bin/systemctl disable sls-mass-notify-phone-events.service; then
     log 'The collector stopped but its enablement could not be removed. Its service and module files remain; review systemd and retry.'
     restore_uninstall_collector "$unit" "$previous_state" "$enabled_state" || true
     return 1
@@ -1040,24 +1096,157 @@ remove_phone_collector_service() {
     restore_uninstall_collector "$unit" "$previous_state" "$enabled_state" || true
     return 1
   fi
-  /usr/bin/timeout --kill-after=2 10 systemctl daemon-reload || {
+  /usr/bin/timeout --kill-after=2 10 /usr/bin/systemctl daemon-reload || {
     log 'The collector service was removed but systemd reload failed. Module and history remain; preserve signed recovery evidence, resolve systemd and retry the included uninstaller.'
     return 1
   }
 }
 
+remove_managed_root_file() {
+  local path="$1" kind="$2" action="${3:-remove}"
+  /usr/bin/python3 -I - "$path" "$kind" "$action" "$UNINSTALL_APPROVED_SOURCE/bin/sls_mass_notify/sls_privileged_install.py" <<'PYMANAGEDROOT'
+import ast
+import os
+from pathlib import Path
+import stat
+import sys
+
+path, kind, action, approved_helper = sys.argv[1:]
+if kind not in ('apache-enabled', 'apache-available', 'logrotate') or action not in ('check', 'remove'):
+    raise SystemExit('Unknown managed root-file type')
+
+def protected_read(name, maximum):
+    item = Path(name)
+    for parent in reversed(item.parents):
+        metadata = parent.lstat()
+        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0
+                or metadata.st_mode & 0o022 and not metadata.st_mode & stat.S_ISVTX):
+            raise RuntimeError('managed source has an unsafe parent')
+    descriptor = os.open(item, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        before = os.fstat(descriptor)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_nlink != 1
+                or before.st_mode & 0o022 or before.st_size > maximum):
+            raise RuntimeError('managed source is unsafe')
+        body = os.read(descriptor, maximum + 1)
+        after = os.fstat(descriptor)
+        if (len(body) != before.st_size or before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns or before.st_ctime_ns != after.st_ctime_ns):
+            raise RuntimeError('managed source changed during inspection')
+        return body
+    finally:
+        os.close(descriptor)
+
+parts = path.split('/')[1:]
+if not path.startswith('/') or not parts or any(part in ('', '.', '..') for part in parts):
+    raise RuntimeError('invalid managed root-file path')
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+parent = os.open('/', flags)
+try:
+    for component in parts[:-1]:
+        child = os.open(component, flags, dir_fd=parent)
+        metadata = os.fstat(child)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            os.close(child)
+            raise RuntimeError('managed root-file parent is unsafe')
+        os.close(parent)
+        parent = child
+    try:
+        before = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        raise SystemExit(0)
+    if kind == 'apache-enabled':
+        expected = '../conf-available/sls-mass-notify.conf'
+        if (not stat.S_ISLNK(before.st_mode) or before.st_uid != 0 or before.st_nlink != 1
+                or os.readlink(parts[-1], dir_fd=parent) != expected):
+            raise RuntimeError('Apache enablement path is not the managed SLS link')
+    else:
+        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                             dir_fd=parent)
+        try:
+            opened = os.fstat(descriptor)
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != 0 or opened.st_gid != 0
+                    or opened.st_nlink != 1 or opened.st_mode & 0o022 or opened.st_size > 1024 * 1024):
+                raise RuntimeError('managed root file is unsafe')
+            body = os.read(descriptor, 1024 * 1024 + 1)
+            after = os.fstat(descriptor)
+            named = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+            identity = lambda row: (row.st_dev, row.st_ino, row.st_uid, row.st_gid,
+                                    row.st_mode, row.st_size, row.st_mtime_ns,
+                                    row.st_ctime_ns, row.st_nlink)
+            if len(body) != opened.st_size or identity(before) != identity(opened) \
+                    or identity(opened) != identity(after) or identity(after) != identity(named):
+                raise RuntimeError('managed root file changed during inspection')
+        finally:
+            os.close(descriptor)
+        if kind == 'apache-available':
+            tree = ast.parse(protected_read(approved_helper, 2 * 1024 * 1024), filename=approved_helper)
+            expected = None
+            for node in tree.body:
+                if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    if any(isinstance(target, ast.Name) and target.id == 'APACHE' for target in targets):
+                        expected = ast.literal_eval(node.value).encode()
+                        break
+            if expected is None or body != expected:
+                raise RuntimeError('Apache configuration differs from the authenticated SLS template')
+        else:
+            match = __import__('re').fullmatch(
+                rb'/var/log/sls_mass_notify\.log \{\n'
+                rb'    daily\n'
+                rb'    maxsize 2M\n'
+                rb'    rotate ([0-9]{1,3})\n'
+                rb'    maxage \1\n'
+                rb'    missingok\n'
+                rb'    notifempty\n'
+                rb'    compress\n'
+                rb'    delaycompress\n'
+                rb'    copytruncate\n'
+                rb'    su root asterisk\n'
+                rb'\}\n', body)
+            if match is None or not 1 <= int(match.group(1)) <= 365:
+                raise RuntimeError('Logrotate configuration differs from an SLS-managed template')
+    current = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+    if (before.st_dev, before.st_ino, before.st_ctime_ns) != (current.st_dev, current.st_ino, current.st_ctime_ns):
+        raise RuntimeError('managed root file changed before removal')
+    if action == 'check':
+        raise SystemExit(0)
+    os.unlink(parts[-1], dir_fd=parent)
+    os.fsync(parent)
+finally:
+    os.close(parent)
+PYMANAGEDROOT
+}
+
 disable_apache_conf() {
-  rm -f /etc/logrotate.d/sls-mass-notify
-  command -v a2disconf >/dev/null && a2disconf sls-mass-notify >/dev/null 2>&1 || true
-  rm -f /etc/apache2/conf-enabled/sls-mass-notify.conf
-  rm -f /etc/apache2/conf-available/sls-mass-notify.conf
+  remove_managed_root_file /etc/logrotate.d/sls-mass-notify logrotate check
+  remove_managed_root_file /etc/apache2/conf-enabled/sls-mass-notify.conf apache-enabled check
+  remove_managed_root_file /etc/apache2/conf-available/sls-mass-notify.conf apache-available check
+  remove_managed_root_file /etc/logrotate.d/sls-mass-notify logrotate
+  remove_managed_root_file /etc/apache2/conf-enabled/sls-mass-notify.conf apache-enabled
+  remove_managed_root_file /etc/apache2/conf-available/sls-mass-notify.conf apache-available
   rm -f /var/lib/apache2/conf/enabled_by_admin/sls-mass-notify
-	  rm -f /var/lib/apache2/conf/disabled_by_admin/sls-mass-notify
-  systemctl reload apache2 >/dev/null 2>&1 || true
+  rm -f /var/lib/apache2/conf/disabled_by_admin/sls-mass-notify
+  /usr/bin/systemctl reload apache2 >/dev/null 2>&1 || log "Apache configuration was removed, but Apache reload failed. Reload Apache after reviewing its configuration."
+}
+
+preflight_uninstall_integrations() {
+  local unit="/etc/systemd/system/sls-mass-notify-phone-events.service"
+  if [ -e "$unit" ] || [ -L "$unit" ]; then
+    verify_uninstall_collector_unit "$unit"
+  fi
+  rewrite_managed_text_file /var/www/html/admin/views/menu_items.php menu "" check
+  rewrite_managed_text_file /var/www/html/admin/modules/dashboard/sections/Overview.class.php legacy-dashboard "" check
+  rewrite_managed_text_file /etc/asterisk/sip_notify_custom.conf managed-block "SLS Mass Notifications SIP NOTIFY Templates" check
+  rewrite_managed_text_file /etc/asterisk/extensions_custom.conf managed-block "SLS Mass Notifications Dialplan" check
+  rewrite_managed_text_file /etc/asterisk/manager_custom.conf managed-block "SLS Mass Notifications AMI" check
+  remove_managed_root_file /etc/logrotate.d/sls-mass-notify logrotate check
+  remove_managed_root_file /etc/apache2/conf-enabled/sls-mass-notify.conf apache-enabled check
+  remove_managed_root_file /etc/apache2/conf-available/sls-mass-notify.conf apache-available check
 }
 
 remove_freepbx_manager_users() {
-  SLS_CONFIGURED_AMI_USERNAME="$CONFIGURED_AMI_USERNAME" /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 <<'PHP'
+  run_as_asterisk "SLS_CONFIGURED_AMI_USERNAME=$CONFIGURED_AMI_USERNAME" "SLS_AMI_SECRET_HASH=$CONFIGURED_AMI_SECRET_HASH" "SLS_AMI_OWNERSHIP_HELPER=$RECOVERY_AMI_OWNERSHIP_HELPER" /usr/bin/php -d pcre.jit=0 <<'PHP'
 <?php
 $bootstrap_settings = ['freepbx_auth' => false, 'skip_astman' => true];
 require '/etc/freepbx.conf';
@@ -1065,27 +1254,16 @@ $candidates = ['slsmassnotify', 'sls_mass_notify', 'nws_push'];
 $configured = (string)getenv('SLS_CONFIGURED_AMI_USERNAME');
 if ($configured !== '') { $candidates[] = $configured; }
 $candidates = array_values(array_unique(array_filter($candidates)));
-try {
-    $manager = \FreePBX::Manager();
-    foreach ($candidates as $username) {
-        if ($manager->isExist_manager($username, true)) {
-            $manager->del_manager($username, true);
-        }
-    }
-} catch (Throwable $managerError) {
-    $database = \FreePBX::Database();
-    $statement = $database->prepare('DELETE FROM manager WHERE name = ?');
-    foreach ($candidates as $username) {
-        $statement->execute([$username]);
-    }
-}
+require_once (string)getenv('SLS_AMI_OWNERSHIP_HELPER');
+\SLS\MassNotify\AmiUserOwnership::remove(\FreePBX::Database(), $candidates,
+    (string)getenv('SLS_AMI_SECRET_HASH'), (string)\FreePBX::Config()->get('AMPMGRUSER'));
 exit(0);
 PHP
   rm -f /etc/asterisk/slsmassnotify
 }
 
 remove_bundled_system_recordings() {
-  SLS_DATA_DIR="$DATA_DIR" /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 <<'PHP'
+  run_as_asterisk "SLS_DATA_DIR=$DATA_DIR" /usr/bin/php -d pcre.jit=0 <<'PHP'
 <?php
 $bootstrap_settings = ['freepbx_auth' => false, 'skip_astman' => true];
 require '/etc/freepbx.conf';
@@ -1123,12 +1301,12 @@ PHP
 }
 
 verify_freepbx_cleanup() {
-      inspect_module_registry || return 1
-	  if [ "$MODULE_REGISTRY_PRESENT" = 1 ]; then
-	    log "Uninstall verification failed; the $MODULE FreePBX registry row remains."
-	    return 1
-	  fi
-  SLS_CONFIGURED_AMI_USERNAME="$CONFIGURED_AMI_USERNAME" /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 <<'PHP'
+  inspect_module_registry || return 1
+  if [ "$MODULE_REGISTRY_PRESENT" = 1 ]; then
+    log "Uninstall verification failed; the $MODULE FreePBX registry row remains."
+    return 1
+  fi
+  run_as_asterisk "SLS_CONFIGURED_AMI_USERNAME=$CONFIGURED_AMI_USERNAME" "SLS_AMI_SECRET_HASH=$CONFIGURED_AMI_SECRET_HASH" "SLS_AMI_OWNERSHIP_HELPER=$RECOVERY_AMI_OWNERSHIP_HELPER" /usr/bin/php -d pcre.jit=0 <<'PHP'
 <?php
 $bootstrap_settings = ['freepbx_auth' => false, 'skip_astman' => true];
 require '/etc/freepbx.conf';
@@ -1137,24 +1315,27 @@ $configured = (string)getenv('SLS_CONFIGURED_AMI_USERNAME');
 if ($configured !== '') { $candidates[] = $configured; }
 $candidates = array_values(array_unique(array_filter($candidates)));
 $database = \FreePBX::Database();
-$statement = $database->prepare('SELECT COUNT(*) FROM manager WHERE name = ?');
+require_once (string)getenv('SLS_AMI_OWNERSHIP_HELPER');
+$statement = $database->prepare('SELECT * FROM manager WHERE name = ?');
 foreach ($candidates as $username) {
+    if ($username === (string)\FreePBX::Config()->get('AMPMGRUSER')) { continue; }
     $statement->execute([$username]);
-    if ((int)$statement->fetchColumn() > 0) {
+    $row = $statement->fetch(PDO::FETCH_ASSOC);
+    if (is_array($row) && \SLS\MassNotify\AmiUserOwnership::matches($row, $username, (string)getenv('SLS_AMI_SECRET_HASH'))) {
         file_put_contents("php://stderr", "FreePBX AMI user remains after uninstall: {$username}\n");
         exit(1);
     }
 }
 exit(0);
 PHP
-	  local stock_module
-	  for stock_module in dashboard framework; do
-	    [ -d "/var/www/html/admin/modules/$stock_module" ] || continue
-	    if ! verify_stock_module "$stock_module"; then
-	      log "Uninstall verification failed; FreePBX did not trust the restored $stock_module module."
-	      return 1
-	    fi
-	  done
+  local stock_module
+  for stock_module in dashboard framework; do
+    [ -d "/var/www/html/admin/modules/$stock_module" ] || continue
+    if ! verify_stock_module "$stock_module"; then
+      log "Uninstall verification failed; FreePBX did not trust the restored $stock_module module."
+      return 1
+    fi
+  done
   local artifact
   for artifact in \
     /etc/apache2/conf-enabled/sls-mass-notify.conf \
@@ -1169,8 +1350,6 @@ PHP
     /var/www/html/api/sls-mass-notify \
     /var/www/html/mass-notify \
     /var/www/html/sls_mass_notify \
-    /var/lib/asterisk/sounds/SLS_Mass_Notifications_Plugin \
-    /var/lib/asterisk/sounds/en/SLS_Mass_Notifications_Plugin \
     /var/www/html/admin/modules/dashboard/sections/SlsMassNotifyAnnouncement.class.php \
     /var/www/html/admin/modules/dashboard/views/sections/sls-mass-notify-announcement.php; do
     if [ -e "$artifact" ] || [ -L "$artifact" ]; then
@@ -1178,15 +1357,21 @@ PHP
       return 1
     fi
   done
-  for managed_file in \
-    /etc/asterisk/sip_notify_custom.conf \
-    /etc/asterisk/extensions_custom.conf \
-    /etc/asterisk/manager_custom.conf; do
-    if grep -Fq 'SLS Mass Notifications' "$managed_file" 2>/dev/null; then
-      log "Uninstall verification failed; a managed Asterisk block remains in $managed_file."
-      return 1
-    fi
-  done
+  verify_managed_sound_link_removed /var/lib/asterisk/sounds/SLS_Mass_Notifications_Plugin || return 1
+  verify_managed_sound_link_removed /var/lib/asterisk/sounds/en/SLS_Mass_Notifications_Plugin || return 1
+  local managed_file managed_name managed_marker
+  while IFS='|' read -r managed_file managed_name; do
+    for managed_marker in "; BEGIN $managed_name" "# BEGIN $managed_name" ";-- BEGIN $managed_name --"; do
+      if grep -Fq "$managed_marker" "$managed_file" 2>/dev/null; then
+        log "Uninstall verification failed; a managed Asterisk block remains in $managed_file."
+        return 1
+      fi
+    done
+  done <<'SLSMANAGEDFILES'
+/etc/asterisk/sip_notify_custom.conf|SLS Mass Notifications SIP NOTIFY Templates
+/etc/asterisk/extensions_custom.conf|SLS Mass Notifications Dialplan
+/etc/asterisk/manager_custom.conf|SLS Mass Notifications AMI
+SLSMANAGEDFILES
   verify_removed_cron || return 1
   if grep -Fq 'SLS Mass Notifications menu placement:' /var/www/html/admin/views/menu_items.php 2>/dev/null; then
     log "Uninstall verification failed; the managed FreePBX menu placement remains."
@@ -1197,7 +1382,7 @@ PHP
 
 verify_stock_module() {
   local stock_module="$1"
-  SLS_VERIFY_MODULE="$stock_module" /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 -r '
+  run_as_asterisk "SLS_VERIFY_MODULE=$stock_module" /usr/bin/php -d pcre.jit=0 -r '
 $bootstrap_settings = ["freepbx_auth" => false, "skip_astman" => true];
 require "/etc/freepbx.conf";
 $gpg = \FreePBX::GPG();
@@ -1216,12 +1401,6 @@ exit($valid ? 0 : 1);
 
 locally_sign_stock_module() {
   local stock_module="$1"
-  local module_dir="/var/www/html/admin/modules/$stock_module"
-  local workdir
-  local keyid
-  local fingerprint
-  local freepbx_gpg_home
-  local signedby
 
   if [ -n "$RECOVERY_SIGNER" ]; then
     [ -f "$RECOVERY_SIGNER" ] && [ ! -L "$RECOVERY_SIGNER" ] && [ -x "$RECOVERY_SIGNER" ] || {
@@ -1249,14 +1428,90 @@ locally_sign_stock_module() {
 }
 
 remove_piper_wrapper() {
-  local wrapper="/usr/local/bin/piper"
-  local legacy_piper_bin="$DATA_DIR/piper/venv/bin/piper"
-  local piper_bin="/usr/local/bin/sls_mass_notify/piper/venv/bin/piper"
-  if [ -L "$wrapper" ] && { [ "$(readlink "$wrapper")" = "$piper_bin" ] || [ "$(readlink "$wrapper")" = "$legacy_piper_bin" ]; }; then
-    rm -f "$wrapper"
-  elif [ -f "$wrapper" ] && grep -Eq "SLS_Mass_Notifications_Plugin/piper|sls_mass_notify/piper" "$wrapper" 2>/dev/null; then
-    rm -f "$wrapper"
-  fi
+  /usr/bin/python3 -I - "/usr/local/bin/piper" "$UNINSTALL_APPROVED_SOURCE/bin/sls_mass_notify_install_piper_voices.sh" "$DATA_DIR/piper/venv/bin/piper" <<'PYPIPERREMOVE'
+import fcntl
+import os
+import re
+import stat
+import sys
+
+wrapper, approved_installer, legacy_target = sys.argv[1:]
+runtime_target = '/usr/local/bin/sls_mass_notify/piper/venv/bin/piper'
+
+def protected_read(path, maximum):
+    for parent in reversed(__import__('pathlib').Path(path).parents):
+        metadata = parent.lstat()
+        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0
+                or metadata.st_mode & 0o022 and not metadata.st_mode & stat.S_ISVTX):
+            raise RuntimeError('approved Piper source has an unsafe parent')
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        before = os.fstat(descriptor)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0
+                or before.st_nlink != 1 or before.st_mode & 0o022 or before.st_size > maximum):
+            raise RuntimeError('approved Piper source is unsafe')
+        body = bytearray()
+        while len(body) <= maximum:
+            chunk = os.read(descriptor, min(65536, maximum + 1 - len(body)))
+            if not chunk:
+                break
+            body.extend(chunk)
+        after = os.fstat(descriptor)
+        if (len(body) != before.st_size or before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns or before.st_ctime_ns != after.st_ctime_ns):
+            raise RuntimeError('approved Piper source changed during inspection')
+        return bytes(body)
+    finally:
+        os.close(descriptor)
+
+parent = os.open('/usr/local/bin', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+try:
+    try:
+        before = os.stat('piper', dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        raise SystemExit(0)
+    if stat.S_ISLNK(before.st_mode):
+        target = os.readlink('piper', dir_fd=parent)
+        if before.st_uid == 0 and before.st_nlink == 1 and target in (runtime_target, legacy_target):
+            current = os.stat('piper', dir_fd=parent, follow_symlinks=False)
+            if (before.st_dev, before.st_ino, before.st_ctime_ns) != (current.st_dev, current.st_ino, current.st_ctime_ns):
+                raise RuntimeError('Piper wrapper link changed before removal')
+            os.unlink('piper', dir_fd=parent)
+            os.fsync(parent)
+        else:
+            print('Leaving non-SLS Piper symbolic link unchanged.', file=sys.stderr)
+        raise SystemExit(0)
+    match = re.search(rb"expected=\"\$\(cat <<'EOF'\n(.*?)\nEOF\n\)\"", protected_read(approved_installer, 2 * 1024 * 1024), re.S)
+    if match is None:
+        raise RuntimeError('approved Piper wrapper template is unavailable')
+    descriptor = os.open('piper', os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=parent)
+    try:
+        opened = os.fstat(descriptor)
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != 0 or opened.st_gid != 0
+                or opened.st_nlink != 1 or stat.S_IMODE(opened.st_mode) != 0o755
+                or opened.st_size > 16384):
+            print('Leaving non-SLS Piper wrapper unchanged.', file=sys.stderr)
+            raise SystemExit(0)
+        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        body = os.read(descriptor, 16385)
+        after = os.fstat(descriptor)
+        current = os.stat('piper', dir_fd=parent, follow_symlinks=False)
+        identity = lambda row: (row.st_dev, row.st_ino, row.st_uid, row.st_gid,
+                                row.st_mode, row.st_size, row.st_mtime_ns,
+                                row.st_ctime_ns, row.st_nlink)
+        if identity(before) != identity(opened) or identity(opened) != identity(after) or identity(after) != identity(current):
+            raise RuntimeError('Piper wrapper changed during inspection')
+        if body != match.group(1) + b'\n':
+            print('Leaving modified Piper wrapper unchanged.', file=sys.stderr)
+            raise SystemExit(0)
+    finally:
+        os.close(descriptor)
+    os.unlink('piper', dir_fd=parent)
+    os.fsync(parent)
+finally:
+    os.close(parent)
+PYPIPERREMOVE
 }
 
 remove_managed_sound_link() {
@@ -1278,6 +1533,14 @@ remove_managed_sound_link() {
   fi
 }
 
+verify_managed_sound_link_removed() {
+  local link_path="$1"
+  if [ -L "$link_path" ] && [ "$(readlink -- "$link_path" 2>/dev/null || true)" = "$DATA_DIR/sounds" ]; then
+    log "Uninstall verification failed; managed sound link remains: $link_path"
+    return 1
+  fi
+}
+
 remove_runtime_files() {
   remove_piper_wrapper
   if [ -L "$DATA_DIR/piper/venv/bin/piper" ] && [ "$(readlink "$DATA_DIR/piper/venv/bin/piper")" = "/usr/local/bin/piper" ]; then
@@ -1288,7 +1551,6 @@ remove_runtime_files() {
   rm -f /usr/local/bin/slsconsole
   rm -f /usr/local/bin/nwsalerts_ensure_menu_patch.sh
   rm -f /usr/local/sbin/sign_sls_mass_notify_local_sig.sh
-  rm -f /usr/local/sbin/sign_sls_mass_notify_local_sig.sh.bak-*
   rm -f /etc/freepbx.secure/slsmassnotifyserver.sig
   remove_managed_sound_link /var/lib/asterisk/sounds/SLS_Mass_Notifications_Plugin
   remove_managed_sound_link /var/lib/asterisk/sounds/en/SLS_Mass_Notifications_Plugin
@@ -1298,18 +1560,14 @@ remove_runtime_files() {
   rm -rf /var/www/html/api/sipnotify
   rm -rf /var/www/html/mass-notify
   rm -rf /var/www/html/sls_mass_notify
-  rm -rf /etc/asterisk/slsmassnotify
   if [ "$PURGE_CONFIG" = 1 ]; then
     rm -rf "$DATA_DIR"
     rm -f /var/log/sls_mass_notify.log
     rm -f /var/log/sls_mass_notify_events.jsonl
     rm -f /var/log/sls_mass_notify_push.log
   fi
-  rm -f /tmp/slsmassnotifyserver-*.tgz
-  rm -f /tmp/slsmassnotifyserver-install.log
-  rm -f /tmp/sls-install.sh /tmp/sls-install.sh.bak-*
-  rm -f /tmp/sls-uninstall.sh /tmp/sls-uninstall.sh.bak-*
-  rm -rf /tmp/sls-mass-notify-*
+  # Leave downloaded installers and unrelated recovery directories untouched;
+  # remove only the obsolete SLS weather-poller timestamp.
   rm -f /var/tmp/nws_last_clear.ts
 }
 
@@ -1343,7 +1601,8 @@ PYCRON
 }
 
 remove_cron() {
-  local user work
+  local user restore_user work rollback_failed=0
+  local -a changed_users=()
   work="$(mktemp -d /tmp/slsmassnotifyserver-cron.XXXXXX)" || return 1
   # Both reads succeed before either user's crontab may be replaced.
   for user in root asterisk; do
@@ -1364,9 +1623,20 @@ remove_cron() {
   for user in root asterisk; do
     cmp -s "$work/$user.before" "$work/$user.after" && continue
     if ! crontab -u "$user" "$work/$user.after" 2>/dev/null; then
-      log "The $user SLS cron entries could not be removed. Original crontabs were retained in $work; review cron permissions and retry."
+      for restore_user in "${changed_users[@]}"; do
+        if ! crontab -u "$restore_user" "$work/$restore_user.before" 2>/dev/null; then
+          rollback_failed=1
+          log "The $restore_user crontab could not be restored after the $user replacement failed. Its authenticated original remains in $work."
+        fi
+      done
+      if [ "$rollback_failed" = 1 ]; then
+        log "The $user SLS cron entries could not be removed and cron rollback was incomplete. Preserve $work and restore the named crontab before retrying."
+      else
+        log "The $user SLS cron entries could not be removed. Earlier replacements were rolled back; original crontabs remain in $work for review."
+      fi
       return 1
     fi
+    changed_users+=("$user")
   done
   rm -rf "$work"
 }
@@ -1421,7 +1691,7 @@ restore_stock_modules() {
 }
 
 refresh_dashboard_hook_index() {
-  /usr/sbin/runuser -u asterisk -- /usr/bin/php -d pcre.jit=0 <<'PHP'
+  run_as_asterisk /usr/bin/php -d pcre.jit=0 <<'PHP'
 <?php
 $bootstrap_settings = ['freepbx_auth' => false, 'skip_astman' => true];
 require '/etc/freepbx.conf';
@@ -1465,7 +1735,6 @@ remove_trusted_signing_key() {
   for home in /root/.gnupg /home/asterisk/.gnupg /var/lib/asterisk/.gnupg; do
     [ -d "$home" ] || continue
     if [ "$home" = "/root/.gnupg" ]; then
-      user="root"
       GNUPGHOME="$home" gpg --batch --yes --delete-key "$SIGNING_FINGERPRINT" >/dev/null 2>&1 || true
       printf '%s:2:\n' "$SIGNING_FINGERPRINT" | GNUPGHOME="$home" gpg --import-ownertrust >/dev/null 2>&1 || true
     else
@@ -1485,6 +1754,15 @@ import hashlib, json, os, re, stat, sys, types
 from pathlib import Path
 sys.dont_write_bytecode = True
 root = Path('/var/lib/sls-mass-notify-trust')
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result: raise RuntimeError('Duplicate uninstall evidence member')
+        result[key] = value
+    return result
+def decode(body):
+    return json.loads(body, object_pairs_hook=unique_object,
+                      parse_constant=lambda value: (_ for _ in ()).throw(RuntimeError('Non-finite uninstall evidence number')))
 def read(path, maximum):
     for parent in reversed(path.parents):
         info = parent.lstat()
@@ -1499,7 +1777,7 @@ def read(path, maximum):
         if len(body) != info.st_size or (info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
             raise RuntimeError('Uninstall evidence changed during inspection')
         return body
-reference = json.loads(read(root / 'slsmassnotifyserver.active.json', 1024))
+reference = decode(read(root / 'slsmassnotifyserver.active.json', 1024))
 if not isinstance(reference, dict): raise SystemExit('Invalid protected SLS publisher reference')
 digest = reference.get('sha256', '')
 if not isinstance(digest, str) or not re.fullmatch('[a-f0-9]{64}', digest) or reference.get('generation') != 'slsmassnotifyserver-' + digest:
@@ -1507,7 +1785,7 @@ if not isinstance(digest, str) or not re.fullmatch('[a-f0-9]{64}', digest) or re
 generation = root / reference['generation']
 raw = read(generation / 'inventory.json', 8 * 1024 * 1024)
 if hashlib.sha256(raw).hexdigest() != digest: raise SystemExit('Protected SLS publisher inventory changed')
-inventory = json.loads(raw)
+inventory = decode(raw)
 if not isinstance(inventory, dict) or not isinstance(inventory.get('files'), dict): raise SystemExit('Invalid protected SLS publisher inventory')
 name = 'bin/sls_mass_notify/sls_module_trust.py'
 entry = inventory.get('files', {}).get(name)
@@ -1529,6 +1807,7 @@ required = {
     'bin/sls_mass_notify/sls_install_idle.py':'/usr/local/bin/sls_mass_notify/sls_install_idle.py',
     'bin/sls_mass_notify/sls_audio_state.py':'/usr/local/bin/sls_mass_notify/sls_audio_state.py',
     'bin/sls_mass_notify/sls_config_crypto.py':'/usr/local/bin/sls_mass_notify/sls_config_crypto.py',
+    'bin/slsconsole':'/usr/local/bin/slsconsole',
 }
 optional = 'bin/sls_mass_notify/sls_legacy_permissions.py'
 if optional in data['files']: required[optional] = '/usr/local/bin/sls_mass_notify/sls_legacy_permissions.py'
@@ -1546,7 +1825,7 @@ PYGUARD
 }
 
 remove_sls_chown_exclusion() {
-  # The complete root runtime was publisher-verified before teardown. Remove
+  # The required teardown helpers were publisher-verified before mutation. Remove
   # only this module's exact managed native exclusion before deleting its helper.
   local helper="$RECOVERY_SIGNER_DIR/sls_legacy_permissions.py"
   if [ -f "$helper" ] && [ ! -L "$helper" ]; then
@@ -1586,28 +1865,35 @@ main() {
   admit_root_runtime || { log "Signed uninstall evidence is missing or changed. Preserve the trust store and review the named file; no uninstall changes were made. Missing stock inventories require independently verified local packages, not approval of live hashes."; return 1; }
   acquire_maintenance_coordination
   prepare_uninstall_logs
-  trap restore_user_data_on_exit EXIT
+  trap handle_uninstall_exit EXIT
   snapshot_local_signer
   [ -n "$RECOVERY_SIGNER" ] || { log "An approved-inventory signer is required before uninstall can preserve the reviewed FreePBX modules."; return 1; }
   verify_uninstall_inventories
   verify_uninstall_cron_access
   capture_signing_fingerprint
   validate_retained_user_data
+  preflight_uninstall_integrations
   capture_pbx_running_state
   acquire_uninstall_workers
   inspect_uninstall_idle
   capture_configured_ami_username
+  UNINSTALL_TRANSACTION_DIR="$(uninstall_recovery_workspace sls-uninstall-transaction)"
+  record_uninstall_stage prepared
+  log "Persistent uninstall transaction: $UNINSTALL_TRANSACTION_DIR"
   assert_uninstall_workers
+  record_uninstall_stage services
   remove_phone_collector_service
-	  assert_uninstall_workers
-	  remove_freepbx_manager_users
-	  assert_uninstall_workers
-	  remove_module_registration
+  assert_uninstall_workers
+  remove_freepbx_manager_users
+  assert_uninstall_workers
+  record_uninstall_stage module
+  remove_module_registration
   assert_uninstall_workers
   remove_bundled_system_recordings
   remove_cron
+  record_uninstall_stage integration
   remove_menu_patch
-	  remove_legacy_dashboard_patch
+  remove_legacy_dashboard_patch
   remove_managed_block /etc/asterisk/sip_notify_custom.conf "SLS Mass Notifications SIP NOTIFY Templates"
   remove_managed_block /etc/asterisk/extensions_custom.conf "SLS Mass Notifications Dialplan"
   remove_managed_block /etc/asterisk/manager_custom.conf "SLS Mass Notifications AMI"
@@ -1616,9 +1902,10 @@ main() {
   refresh_dashboard_hook_index
   remove_sls_chown_exclusion
   assert_uninstall_workers
+  record_uninstall_stage runtime
   remove_runtime_files
-  restore_user_data
   remove_trusted_signing_key
+  record_uninstall_stage verification
   verify_freepbx_cleanup
   reload_removed_pbx_integration
   remove_freepbx_manager_users
@@ -1627,6 +1914,7 @@ main() {
   fi
   verify_freepbx_cleanup
   assert_uninstall_workers
+  record_uninstall_stage complete
   cleanup_recovery_signer
   trap - EXIT
   if [ "$PURGE_CONFIG" = "1" ]; then

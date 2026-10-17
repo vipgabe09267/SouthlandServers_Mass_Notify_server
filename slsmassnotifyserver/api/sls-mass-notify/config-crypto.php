@@ -21,8 +21,28 @@ final class SlsConfigCrypto
         try { $value = json_decode($raw, true, 64, JSON_THROW_ON_ERROR); }
         catch (\JsonException $error) { throw new \RuntimeException('The protected configuration contains invalid JSON.', 0, $error); }
         if (!is_array($value) || array_is_list($value)) { throw new \RuntimeException('The protected configuration must contain a JSON object.'); }
+        self::rejectNonfinite($value);
         self::rejectDuplicateKeys($raw);
         return $value;
+    }
+
+    /** Strict JSON object parsing for protected transaction metadata. */
+    public static function strictObject(string $raw, int $maximum): array
+    {
+        if ($maximum < 1 || $maximum > 16 * 1024 * 1024) {
+            throw new \InvalidArgumentException('The protected JSON size limit is invalid.');
+        }
+        return self::object($raw, $maximum);
+    }
+
+    private static function rejectNonfinite(array $value): void
+    {
+        foreach ($value as $item) {
+            if (is_array($item)) { self::rejectNonfinite($item); }
+            elseif (is_float($item) && !is_finite($item)) {
+                throw new \RuntimeException('The protected configuration contains a non-finite JSON number.');
+            }
+        }
     }
 
     /** PHP otherwise silently overwrites duplicate keys that Python rejects. */
@@ -91,11 +111,19 @@ final class SlsConfigCrypto
     /** No links, shared inodes, public read access, or unsafe keyring ownership. */
     private static function readProtected(string $path, int $maximum, bool $keyring): string
     {
+        $runtimeUid=function_exists('posix_geteuid')?posix_geteuid():-1;$runtimeGid=function_exists('posix_getegid')?posix_getegid():-1;
+        $asterisk=function_exists('posix_getpwnam')?@posix_getpwnam('asterisk'):false;
+        $owners=array_values(array_unique(array_filter([0,$runtimeUid,is_array($asterisk)?($asterisk['uid']??-1):-1],static fn($id)=>is_int($id)&&$id>=0)));
+        $groups=array_values(array_unique(array_filter([0,$runtimeGid,is_array($asterisk)?($asterisk['gid']??-1):-1],static fn($id)=>is_int($id)&&$id>=0)));
+        $safeFile=static function($meta)use($maximum,$keyring,$owners,$groups):bool{
+            if(!is_array($meta)||($meta['mode']&0170000)!==0100000||$meta['nlink']!==1||$meta['size']<1||$meta['size']>$maximum){return false;}
+            $mode=$meta['mode']&07777;
+            return in_array($mode,[0600,0640],true)&&in_array($meta['uid'],$keyring?[0]:$owners,true)
+                &&($mode===0600||in_array($meta['gid'],$groups,true));
+        };
         clearstatcache(true, $path);
         $before = @lstat($path);
-        if (!is_array($before) || ($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1
-            || ($before['mode'] & 0007) !== 0 || ($before['mode'] & 0022) !== 0
-            || ($keyring && $before['uid'] !== 0) || $before['size'] < 1 || $before['size'] > $maximum) {
+        if (!$safeFile($before)) {
             throw new \RuntimeException('The protected configuration or encryption key file is missing or has unsafe permissions.');
         }
         if ($keyring) {
@@ -122,18 +150,18 @@ final class SlsConfigCrypto
         if ($handle === false) { throw new \RuntimeException('The protected configuration or encryption key cannot be read.'); }
         try {
             $opened = fstat($handle);
-            if (!is_array($opened) || ($opened['mode'] & 0170000) !== 0100000 || $opened['nlink'] !== 1) {
+            if (!$safeFile($opened)) {
                 throw new \RuntimeException('The opened configuration is not a safe regular file.');
             }
-            foreach (['dev', 'ino', 'nlink', 'size', 'mtime', 'ctime'] as $field) {
+            foreach (['dev', 'ino', 'mode', 'uid', 'gid', 'nlink', 'size', 'mtime', 'ctime'] as $field) {
                 if ($opened[$field] !== $before[$field]) { throw new \RuntimeException('The protected configuration changed while it was being opened.'); }
             }
             $raw = stream_get_contents($handle, $maximum + 1);
             $after = fstat($handle);
             clearstatcache(true, $path);
             $current = @lstat($path);
-            foreach (['dev', 'ino', 'nlink', 'size', 'mtime', 'ctime'] as $field) {
-                if (!is_array($current) || $before[$field] !== $after[$field] || $after[$field] !== $current[$field]) {
+            foreach (['dev', 'ino', 'mode', 'uid', 'gid', 'nlink', 'size', 'mtime', 'ctime'] as $field) {
+                if (!$safeFile($after)||!$safeFile($current)||$before[$field] !== $after[$field] || $after[$field] !== $current[$field]) {
                     throw new \RuntimeException('The protected configuration changed while it was being read.');
                 }
             }

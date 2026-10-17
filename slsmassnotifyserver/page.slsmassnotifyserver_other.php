@@ -1,8 +1,10 @@
 <?php
+require_once __DIR__.'/AdminResponse.php';
 // Southland Servers Mass Notifications Server by the Southland Servers Group
 
 $slsmassnotifyserver = \FreePBX::create()->Slsmassnotifyserver;
 $slsmassnotifyserver->enforceOperatorPageAccess('slsmassnotifyserver_other');
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') { \SLS\MassNotify\AdminResponse::requireClearBuffers(); }
 $saveResult = $_SESSION['slsmassnotifyserver_other_save_result'] ?? null;
 $applyResult = $_SESSION['slsmassnotifyserver_other_apply_result'] ?? null;
 $tokenResult = $_SESSION['slsmassnotifyserver_other_token_result'] ?? null;
@@ -10,6 +12,7 @@ $importResult = $_SESSION['slsmassnotifyserver_other_import_result'] ?? null;
 unset($_SESSION['slsmassnotifyserver_other_save_result'], $_SESSION['slsmassnotifyserver_other_apply_result'], $_SESSION['slsmassnotifyserver_other_token_result'], $_SESSION['slsmassnotifyserver_other_import_result']);
 
 if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['sls_update_status'] ?? '') === '1') {
+	\SLS\MassNotify\AdminResponse::requireClearBuffers();
 	header('Content-Type: application/json; charset=utf-8');
 	header('Cache-Control: no-store, max-age=0');
 	echo json_encode($slsmassnotifyserver->getManualUpdateProgress(), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
@@ -17,6 +20,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['sls_update_status'] ?? '') =
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['sls_maintenance_status'] ?? '') === '1') {
+	\SLS\MassNotify\AdminResponse::requireClearBuffers();
 	header('Content-Type: application/json; charset=utf-8');
 	header('Cache-Control: no-store, max-age=0');
 	echo json_encode($slsmassnotifyserver->getMaintenanceProgress(), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
@@ -24,7 +28,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['sls_maintenance_status'] ?? 
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action'] ?? '') === 'recording_catalogue') {
-	while (ob_get_level() > 0) { @ob_end_clean(); }
+	\SLS\MassNotify\AdminResponse::requireClearBuffers();
 	header('Content-Type: application/json; charset=utf-8'); header('Cache-Control: private, no-store'); header('X-Content-Type-Options: nosniff');
 	if (!$slsmassnotifyserver->validateCsrfToken($_POST['slsmassnotifyserver_csrf'] ?? '')) {
 		http_response_code(403); echo json_encode(['success'=>false,'message'=>'The security token expired. Reload this page.']); exit;

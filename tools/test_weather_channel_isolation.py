@@ -24,20 +24,24 @@ class IsolationTests(unittest.TestCase):
                   'cluster_started': 1, 'message': 'Fixture warning', 'subject': 'Fixture',
                   'event_name': 'Lightning', 'severity': 'Severe', 'state_label': 'active',
                   'alert_id': 'fixture-alert', 'correlation_key': 'fixture-key', 'observed_at': time.time(),
-                  'routing_snapshot': {'phones': ['1000'], 'desktops': ['fixture-desktop'], 'emails': [], 'webhooks': []}}
+                  'routing_snapshot': {'phones': ['1000'], 'desktops': ['fixture-desktop'],
+                                       'desktop_client_ids': {'fixture-desktop': 'fixture-enrollment'}, 'emails': [], 'webhooks': []}}
         order = []
         def audio(*args):
             order.append('audio')
             if audio_error:
                 raise RuntimeError('fixture synthesis failure')
             return 'fixture-sound'
+        def visual(*args, **kwargs):
+            self.assertEqual(kwargs['desktop_bindings'], {'fixture-desktop': 'fixture-enrollment'})
+            order.append('desktop')
         with mock.patch.multiple(lightning,
-             load_config=mock.Mock(return_value=({'desktop_clients': [{'username': 'fixture-desktop', 'enabled': '1'}]}, {})),
+             load_config=mock.Mock(return_value=({'desktop_clients': [{'username': 'fixture-desktop', 'client_id': 'fixture-enrollment', 'enabled': '1'}]}, {})),
              select_group=mock.Mock(return_value=area), configure_group_runtime=mock.Mock(),
              lightning_area_identity=mock.Mock(return_value='a' * 64), quiet_hours_active=mock.Mock(return_value=False),
              CURRENT_GROUP_ID='fixture',
              read_state=mock.Mock(return_value=observation or {'last_observed_at': time.time(), 'active': True, 'cluster_started': 1}),
-             send_visual=mock.Mock(side_effect=lambda *args: order.append('desktop')),
+             send_visual=mock.Mock(side_effect=visual),
              generate_audio=mock.Mock(side_effect=audio),
              submit_local_channels=mock.Mock(side_effect=lambda *args, **kwargs: (order.append('phone') or 1, [])),
              queue_external_delivery=mock.Mock(side_effect=lambda *args, **kwargs: order.append('external-queue')),
@@ -99,7 +103,7 @@ class IsolationTests(unittest.TestCase):
             with self.subTest(preparation=preparation), tempfile.TemporaryDirectory() as directory:
                 script = '''
 LOCAL_INTENT_COMMITTED=1 LOCAL_RECOVERY=0 LOCAL_PHONE_REQUESTED=1 LOCAL_VISUAL_REQUESTED=1
-LOCAL_SUBMISSION_OK=1 LOCAL_AUDIO_QUEUE_FAILED=0 LOCAL_INTENT_NEW=1
+LOCAL_SUBMISSION_OK=1 LOCAL_AUDIO_QUEUE_FAILED=0
 NWS_AUDIO_LOCK_FD= NWS_LAST_PAGE_HOLD_SECONDS=0
 EVENT=fixture ALERT_ID=fixture ALERT_KEY=fixture ALERT_B64=fixture AUDIO_SEQUENCE=fixture
 LOG=/dev/null

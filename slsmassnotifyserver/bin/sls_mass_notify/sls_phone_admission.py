@@ -34,6 +34,8 @@ MAX_CLOSED = 1000
 MAX_CLOSED_BYTES = 4 * 1024 * 1024
 MAX_CONTACTS = 1000
 MAX_CHANNELS = 4000
+MAX_AMI_ACTION_BYTES = 32 * 1024 * 1024
+HISTORY_MARKER = b'SLS_PHONE_ADMISSION_V1\n'
 HISTORY_SECONDS = 7 * 86400
 TOKEN = re.compile(r'[a-f0-9]{32}')
 EXTENSION = re.compile(r'[0-9]{1,20}')
@@ -52,6 +54,28 @@ VOICEMAIL_REFUSALS = {'phone_voicemail_audio_invalid', 'phone_voicemail_audio_un
 
 class PhoneAdmissionError(RuntimeError):
     """A fixed operator-safe category; never embeds contact URIs or credentials."""
+
+
+def checked_json(raw):
+    try:
+        return json.loads(raw, object_pairs_hook=_config_crypto._pairs,
+                          parse_constant=_config_crypto._invalid_constant,
+                          parse_float=_config_crypto._finite_float)
+    except (ValueError, UnicodeError, RecursionError) as error:
+        raise PhoneAdmissionError('phone_state_invalid') from error
+
+
+def checked_lock_metadata(metadata):
+    owner, group = _account_ids()
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size != 0
+            or metadata.st_uid not in (0, owner) or metadata.st_gid not in (0, group)
+            or stat.S_IMODE(metadata.st_mode) not in (0o600, 0o640, 0o644)):
+        raise PhoneAdmissionError('phone_state_lock_unsafe')
+
+
+def file_identity(metadata):
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid,
+            metadata.st_gid, metadata.st_nlink, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
 
 
 def checked_time(value):
@@ -243,6 +267,8 @@ class PhoneAdmissionStore:
         self.lock_seconds = lock_seconds
         self.monotonic = monotonic or (time.monotonic if clock is time.time else clock)
         self.boot_id = boot_id or Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        self._correlation_revision = None
+        self._correlation_index = set()
         if not re.fullmatch(r'[A-Za-z0-9-]{1,64}', self.boot_id):
             raise PhoneAdmissionError('phone_boot_identity_unavailable')
 
@@ -254,7 +280,7 @@ class PhoneAdmissionStore:
             _validate_parent_directory(directory_fd)
             fd = os.open('phone-admission.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o640, dir_fd=directory_fd)
             with os.fdopen(fd, 'a+') as lock:
-                _secure_file_metadata(lock.fileno())
+                checked_lock_metadata(os.fstat(lock.fileno()))
                 deadline = time.monotonic() + self.lock_seconds
                 while True:
                     try:
@@ -264,9 +290,19 @@ class PhoneAdmissionStore:
                         if time.monotonic() >= deadline:
                             raise PhoneAdmissionError('phone_state_busy')
                         time.sleep(0.01)
+                opened = os.fstat(lock.fileno())
+                named = os.stat('phone-admission.lock', dir_fd=directory_fd, follow_symlinks=False)
+                checked_lock_metadata(opened)
+                if file_identity(opened) != file_identity(named):
+                    raise PhoneAdmissionError('phone_state_lock_changed')
+                _secure_file_metadata(lock.fileno())
+                self.verify_directory_identity(directory_fd)
+                history_marker = self.read_history_marker(directory_fd)
                 try:
                     source = os.open('phone-admission.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
                 except FileNotFoundError:
+                    if history_marker is not None:
+                        raise PhoneAdmissionError('phone_state_history_missing') from None
                     state = {'schema': 1, 'batches': {}, 'collector': None}
                 else:
                     with os.fdopen(source, 'r', encoding='utf-8') as handle:
@@ -279,15 +315,30 @@ class PhoneAdmissionStore:
                         if len(raw.encode()) > MAX_BYTES:
                             raise PhoneAdmissionError('phone_state_oversized')
                         try:
-                            state = json.loads(raw)
+                            state = checked_json(raw)
                         except (ValueError, UnicodeError):
                             raise PhoneAdmissionError('phone_state_invalid') from None
                 self.validate(state)
+                previous = json.dumps(state, separators=(',', ':'), allow_nan=False).encode()
                 yield state
+                self.verify_directory_identity(directory_fd)
+                named = os.stat('phone-admission.lock', dir_fd=directory_fd, follow_symlinks=False)
+                if file_identity(os.fstat(lock.fileno())) != file_identity(named):
+                    raise PhoneAdmissionError('phone_state_lock_changed')
+                try:
+                    current = os.stat('phone-admission.json', dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    current = None
+                if ((current is None) != ('metadata' not in locals())
+                        or (current is not None and file_identity(current) != file_identity(metadata))):
+                    raise PhoneAdmissionError('phone_state_changed')
                 self.compact(state)
                 encoded = json.dumps(state, separators=(',', ':'), allow_nan=False).encode()
                 if len(encoded) > MAX_BYTES:
                     raise PhoneAdmissionError('phone_state_capacity_exceeded')
+                if encoded == previous and 'metadata' in locals():
+                    self.commit_history_marker(directory_fd, history_marker)
+                    return
                 temporary = '.phone-admission-' + os.urandom(16).hex()
                 target = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640, dir_fd=directory_fd)
                 with os.fdopen(target, 'wb') as handle:
@@ -303,6 +354,7 @@ class PhoneAdmissionStore:
                     # The mutation may already be visible. Do not return a token
                     # or replay a channel action after this uncertain commit.
                     raise PhoneAdmissionError('phone_state_commit_uncertain') from None
+                self.commit_history_marker(directory_fd, history_marker)
         finally:
             if temporary is not None:
                 try:
@@ -311,9 +363,67 @@ class PhoneAdmissionStore:
                     pass
             os.close(directory_fd)
 
+    def verify_directory_identity(self, descriptor):
+        named = _open_directory(self.directory)
+        try:
+            _validate_parent_directory(named)
+            opened, current = os.fstat(descriptor), os.fstat(named)
+            if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+                raise PhoneAdmissionError('phone_state_directory_changed')
+        finally:
+            os.close(named)
+
+    def read_history_marker(self, parent):
+        try:
+            descriptor = os.open('.phone-admission-required', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
+        except FileNotFoundError:
+            return None
+        try:
+            metadata = os.fstat(descriptor)
+            owner, group = _account_ids()
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                    or metadata.st_uid not in (0, owner) or metadata.st_gid not in (0, group)
+                    or stat.S_IMODE(metadata.st_mode) not in (0o600, 0o640) or metadata.st_size > len(HISTORY_MARKER)):
+                raise PhoneAdmissionError('phone_state_history_marker_unsafe')
+            raw = os.read(descriptor, len(HISTORY_MARKER) + 1)
+            if not HISTORY_MARKER.startswith(raw):
+                raise PhoneAdmissionError('phone_state_history_marker_invalid')
+            return raw, file_identity(metadata)
+        finally:
+            os.close(descriptor)
+
+    def commit_history_marker(self, parent, previous):
+        current = self.read_history_marker(parent)
+        if current != previous:
+            raise PhoneAdmissionError('phone_state_history_marker_changed')
+        if previous is not None and previous[0] == HISTORY_MARKER:
+            return
+        flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        if previous is None:
+            flags |= os.O_CREAT | os.O_EXCL
+        descriptor = os.open('.phone-admission-required', flags, 0o640, dir_fd=parent)
+        try:
+            opened = os.fstat(descriptor)
+            named = os.stat('.phone-admission-required', dir_fd=parent, follow_symlinks=False)
+            if (file_identity(opened) != file_identity(named)
+                    or (previous is not None and file_identity(opened) != previous[1])):
+                raise PhoneAdmissionError('phone_state_history_marker_changed')
+            _secure_file_metadata(descriptor)
+            if os.pwrite(descriptor, HISTORY_MARKER, 0) != len(HISTORY_MARKER):
+                raise PhoneAdmissionError('phone_state_commit_uncertain')
+            os.ftruncate(descriptor, len(HISTORY_MARKER))
+            os.fsync(descriptor)
+            self.verify_directory_identity(parent)
+            named = os.stat('.phone-admission-required', dir_fd=parent, follow_symlinks=False)
+            if file_identity(os.fstat(descriptor)) != file_identity(named):
+                raise PhoneAdmissionError('phone_state_history_marker_changed')
+            os.fsync(parent)
+        finally:
+            os.close(descriptor)
+
     @staticmethod
     def validate(state):
-        if not isinstance(state, dict) or state.get('schema') != 1 or not isinstance(state.get('batches'), dict):
+        if not isinstance(state, dict) or type(state.get('schema')) is not int or state['schema'] != 1 or not isinstance(state.get('batches'), dict):
             raise PhoneAdmissionError('phone_state_invalid')
         if len(state['batches']) > MAX_CLOSED + MAX_CONTACTS:
             raise PhoneAdmissionError('phone_state_capacity_exceeded')
@@ -821,6 +931,43 @@ class PhoneAdmissionStore:
             batch.update(updated_at=now, updated_tick=self.monotonic())
         return True
 
+    def _ledger_revision(self):
+        parent = _open_directory(self.directory)
+        try:
+            _validate_parent_directory(parent)
+            fd = os.open('phone-admission.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            try:
+                info = os.fstat(fd)
+                owner, group = _account_ids()
+                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > MAX_BYTES
+                        or info.st_uid not in (0, owner) or info.st_gid != group or stat.S_IMODE(info.st_mode) & 0o137):
+                    raise PhoneAdmissionError('phone_config_unsafe')
+                return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+                        info.st_uid, info.st_gid, info.st_mode, info.st_nlink)
+            finally:
+                os.close(fd)
+        finally:
+            os.close(parent)
+
+    def _possibly_correlated(self, uniqueid, channel):
+        """Negative prefilter only; relevant events still use the authoritative lock."""
+        revision = self._ledger_revision()
+        if revision != self._correlation_revision:
+            for attempt in range(2):
+                snapshot = read_private_json('phone-admission.json', self.directory)
+                self.validate(snapshot)
+                index = {(uid, row['channel']) for batch in snapshot['batches'].values()
+                         if batch['status'] != 'closed' for uid, row in batch['channels'].items()}
+                after = self._ledger_revision()
+                if after == revision:
+                    self._correlation_index = index
+                    self._correlation_revision = revision
+                    break
+                revision = after
+            else:
+                return True  # Busy state must never suppress a potentially relevant event.
+        return (uniqueid, channel) in self._correlation_index
+
     def record_event(self, event):
         """Retain only correlated outcome evidence, never the raw AMI message."""
         if not isinstance(event, dict) or event.get('Event') not in {'DialBegin', 'DialEnd', 'ConfbridgeJoin', 'Hangup'}:
@@ -842,11 +989,7 @@ class PhoneAdmissionStore:
             # Do not acquire a writer lock/fsync the full ledger for unrelated
             # PBX traffic. Bound identities are durable before their Dial starts;
             # any candidate is still checked authoritatively under the lock.
-            snapshot = read_private_json('phone-admission.json', self.directory)
-            self.validate(snapshot)
-            if not any(batch['status'] != 'closed' and source_uid in batch['channels']
-                       and batch['channels'][source_uid]['channel'] == source_name
-                       for batch in snapshot['batches'].values()):
+            if not self._possibly_correlated(source_uid, source_name):
                 return False
         now = self.clock()
         with self.locked() as state:
@@ -1027,28 +1170,96 @@ class PhoneAdmissionStore:
                     if any(VOICE_ID.fullmatch(row['recipient']) and row['kind'] == 'origin' for row in batch['channels'].values()):
                         batch['external_event_gap'] = True
 
+    def has_open_batches(self):
+        revision = self._ledger_revision()
+        if getattr(self, '_open_revision', None) != revision:
+            state = read_private_json('phone-admission.json', self.directory)
+            self.validate(state)
+            self._open_batches = any(batch['status'] != 'closed' for batch in state['batches'].values())
+            self._open_revision = revision
+        return self._open_batches
+
+    def display_snapshot(self):
+        revision = self._ledger_revision()
+        if getattr(self, '_display_revision', None) != revision:
+            state = read_private_json('phone-admission.json', self.directory)
+            self.validate(state)
+            self._display_state = state
+            self._display_revision = revision
+        state = self._display_state
+        health = self.require_collector(state)
+        from sls_atomic_json import locked_json
+        with locked_json(self.directory / 'phone-collector-display.json', maximum=1024, runtime_owner=True) as view:
+            view.clear()
+            view.update({'schema': 1, 'connected': True, 'boot_id': self.boot_id,
+                         'heartbeat_tick': health['heartbeat_tick'], 'updated_at': int(self.clock()),
+                         'active_batches': sum(batch['status'] != 'closed' for batch in state['batches'].values()),
+                         'reserved_contacts': self.used_contacts(state)})
+
     def collector_heartbeat(self, generation):
         accountcode(generation)
-        with self.locked() as state:
-            old = state.get('collector') or {}
-            if old.get('generation') != generation or old.get('boot_id') != self.boot_id:
+        try:
+            revision = self._ledger_revision()
+        except FileNotFoundError:
+            revision = None
+        if not hasattr(self, '_heartbeat_anchor') or getattr(self, '_heartbeat_revision', None) != revision:
+            state = read_private_json('phone-admission.json', self.directory) if revision is not None else {'schema': 1, 'batches': {}, 'collector': None}
+            self.validate(state)
+            if revision is not None:
+                parent = _open_directory(self.directory)
+                try:
+                    _validate_parent_directory(parent)
+                    marker = self.read_history_marker(parent)
+                finally:
+                    os.close(parent)
+                if marker is None or marker[0] != HISTORY_MARKER:
+                    with self.locked():
+                        pass
+            self._heartbeat_anchor = state.get('collector')
+            self._heartbeat_revision = revision
+        anchor = self._heartbeat_anchor or {}
+        if anchor.get('generation') != generation or anchor.get('boot_id') != self.boot_id:
+            with self.locked() as state:
                 for batch in state['batches'].values():
                     if batch['status'] != 'closed':
                         batch['outcome_uncertain'] = True
                         if any(VOICE_ID.fullmatch(row['recipient']) and row['kind'] == 'origin' for row in batch['channels'].values()):
                             batch['external_event_gap'] = True
-            state['collector'] = {'generation': generation, 'boot_id': self.boot_id, 'heartbeat_tick': self.monotonic()}
+                state['collector'] = {'generation': generation, 'boot_id': self.boot_id, 'heartbeat_tick': self.monotonic()}
+                anchor = dict(state['collector'])
+            self._heartbeat_anchor = anchor
+            self._heartbeat_revision = self._ledger_revision()
+        from sls_atomic_json import locked_json
+        with locked_json(self.directory / 'phone-collector-heartbeat.json', maximum=1024, runtime_owner=True) as pulse:
+            pulse.clear()
+            pulse.update({'schema': 1, 'generation': generation, 'boot_id': self.boot_id,
+                          'anchor_tick': anchor['heartbeat_tick'], 'heartbeat_tick': self.monotonic()})
 
     def require_collector(self, state):
-        health = state.get('collector')
-        if (not isinstance(health, dict) or health.get('boot_id') != self.boot_id
-                or not isinstance(health.get('generation'), str) or not TOKEN.fullmatch(health['generation'])
-                or not 0 <= self.monotonic() - checked_time(health.get('heartbeat_tick')) <= 15):
+        anchor = state.get('collector')
+        if (not isinstance(anchor, dict) or anchor.get('boot_id') != self.boot_id
+                or not isinstance(anchor.get('generation'), str) or not TOKEN.fullmatch(anchor['generation'])):
+            raise PhoneAdmissionError('phone_event_collector_unavailable')
+        anchor_tick = checked_time(anchor.get('heartbeat_tick'))
+        health = anchor
+        try:
+            pulse = read_private_json('phone-collector-heartbeat.json', self.directory)
+        except FileNotFoundError:
+            pulse = None
+        if pulse is not None:
+            if (set(pulse) != {'schema', 'generation', 'boot_id', 'anchor_tick', 'heartbeat_tick'}
+                    or type(pulse.get('schema')) is not int or pulse['schema'] != 1):
+                raise PhoneAdmissionError('phone_event_collector_unavailable')
+            if (pulse.get('generation') == anchor['generation'] and pulse.get('boot_id') == self.boot_id
+                    and pulse.get('anchor_tick') == anchor_tick):
+                health = {key: pulse[key] for key in ('generation', 'boot_id', 'heartbeat_tick')}
+        if not 0 <= self.monotonic() - checked_time(health.get('heartbeat_tick')) <= 15:
             raise PhoneAdmissionError('phone_event_collector_unavailable')
         return health
 
 
 ERROR_MESSAGES = {
+    'phone_state_history_missing': 'Established phone admission history is missing. Preserve its permanent marker and restore a verified backup before repairing collector health. The history and external-call budget were not reset.',
     'phone_event_collector_state_missing': 'The private phone admission ledger has not been created. Check collector service status and its saved local AMI login and permissions.',
     'phone_event_collector_state_permission': 'The collector health probe cannot read the private admission ledger. Review its asterisk ownership and protected data permissions.',
     'phone_event_collector_never_connected': 'No authenticated collector heartbeat has been recorded. Review the collector service journal and the saved loopback AMI login and permissions.',
@@ -1126,7 +1337,7 @@ def operator_message(code):
 
 
 def read_private_json(name, directory=DATA):
-    if name not in {'mass-notifications.config', 'phone-admission.json'}:
+    if name not in {'mass-notifications.config', 'phone-admission.json', 'phone-collector-heartbeat.json'}:
         raise PhoneAdmissionError('phone_config_unsafe')
     directory_fd = _open_directory(Path(directory))
     try:
@@ -1138,7 +1349,10 @@ def read_private_json(name, directory=DATA):
             if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > MAX_BYTES
                     or metadata.st_uid not in {0, owner} or metadata.st_gid != group or stat.S_IMODE(metadata.st_mode) & 0o137):
                 raise PhoneAdmissionError('phone_config_unsafe')
-            value = _config_crypto.decode_config(handle.read(MAX_BYTES + 1)) if name == "mass-notifications.config" else json.load(handle)
+            raw = handle.read(MAX_BYTES + 1)
+            if len(raw.encode()) > MAX_BYTES:
+                raise PhoneAdmissionError('phone_config_unsafe')
+            value = _config_crypto.decode_config(raw) if name == "mass-notifications.config" else checked_json(raw)
         if not isinstance(value, dict):
             raise PhoneAdmissionError('phone_config_invalid')
         return value
@@ -1165,12 +1379,20 @@ def collector_health(directory=DATA):
             raise PhoneAdmissionError('phone_event_collector_never_connected')
         if heartbeat.get('boot_id') != store.boot_id:
             raise PhoneAdmissionError('phone_event_collector_rebooted')
-        tick=heartbeat.get('heartbeat_tick')
+        try:
+            health = store.require_collector(state)
+        except PhoneAdmissionError:
+            tick=heartbeat.get('heartbeat_tick')
+            if type(tick) not in (int,float) or not math.isfinite(tick) or store.monotonic()-tick<0:
+                raise PhoneAdmissionError('phone_event_collector_clock_invalid')
+            if store.monotonic()-tick>15:
+                raise PhoneAdmissionError('phone_event_collector_stale')
+            raise
+        tick=health.get('heartbeat_tick')
         if type(tick) not in (int,float) or not math.isfinite(tick) or store.monotonic()-tick<0:
             raise PhoneAdmissionError('phone_event_collector_clock_invalid')
         if store.monotonic()-tick>15:
             raise PhoneAdmissionError('phone_event_collector_stale')
-        health = store.require_collector(state)
         return {'ok': True, 'connected': True,
                 'heartbeat_age_seconds': round(store.monotonic() - health['heartbeat_tick'], 3),
                 'active_batches': sum(batch['status'] != 'closed' for batch in state['batches'].values()),
@@ -1229,6 +1451,8 @@ class PhoneAmi:
         self.sock.sendall(('\r\n'.join(lines) + '\r\n\r\n').encode())
 
     def receive(self, deadline):
+        if time.monotonic() >= deadline:
+            raise TimeoutError('phone_ami_timeout')
         while b'\r\n\r\n' not in self.buffer:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1244,13 +1468,35 @@ class PhoneAmi:
         if len(raw) > 131072:
             raise PhoneAdmissionError('phone_ami_message_oversized')
         message = {}
-        for line in raw.decode('utf-8', errors='strict').split('\r\n'):
+        seen = set()
+        canonical = {name.lower(): name for name in (
+            'Event', 'Response', 'ActionID', 'Message', 'Uniqueid', 'DestUniqueid', 'Linkedid',
+            'Channel', 'DestChannel', 'AccountCode', 'DestAccountCode', 'DialStatus', 'Cause',
+            'ChannelState', 'ChannelStateDesc', 'Value', 'Family', 'Key', 'Val', 'ObjectName',
+            'EndpointName', 'URI', 'Contact', 'Status', 'Context', 'Extension', 'Priority',
+            'Application', 'AppData', 'ChanVariable', 'Variable', 'Output')}
+        try:
+            lines = raw.decode('utf-8', errors='strict').split('\r\n')
+        except UnicodeError as error:
+            raise PhoneAdmissionError('phone_ami_message_invalid') from error
+        if len(lines) > 128:
+            raise PhoneAdmissionError('phone_ami_message_oversized')
+        for line in lines:
             if ':' not in line:
                 continue  # The AMI greeting precedes the first response.
             key, value = line.split(':', 1)
-            if key in message or len(message) >= 128:
+            if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,79}', key) or '\x00' in value:
                 raise PhoneAdmissionError('phone_ami_message_invalid')
-            message[key] = value.lstrip()
+            folded = key.lower()
+            key = canonical.get(folded, key)
+            if folded in seen:
+                if folded not in {'chanvariable', 'variable', 'output'}:
+                    raise PhoneAdmissionError('phone_ami_message_invalid')
+                prior = message[key]
+                message[key] = (prior if isinstance(prior, list) else [prior]) + [value.lstrip()]
+            else:
+                seen.add(folded)
+                message[key] = value.lstrip()
         return message
 
     def action(self, fields, complete_event=None, *, missing_database=False):
@@ -1259,8 +1505,12 @@ class PhoneAmi:
         deadline = time.monotonic() + 5
         response = None
         rows = []
+        received_bytes = 0
         for _ in range(25000):
             message = self.receive(deadline)
+            received_bytes += len(json.dumps(message, ensure_ascii=False, separators=(',', ':')).encode())
+            if received_bytes > MAX_AMI_ACTION_BYTES:
+                raise PhoneAdmissionError('phone_ami_response_oversized')
             if message.get('ActionID') != action_id:
                 if self.callback and 'Event' in message:
                     self.callback(message)
@@ -1517,9 +1767,7 @@ def exclude_live_contact(ami, targets, origin, channel, uniqueid):
         if len(source) != 1: raise PhoneAdmissionError('phone_live_contact_unidentified')
         matched = source
     caller_uri = matched[0].split('/', 2)[-1]
-    caller_address = address(matched[0], True)
-    return {recipient: [dial for dial in dials if dial.split('/', 2)[-1] != caller_uri
-            and (caller_address is None or address(dial, True) != caller_address)]
+    return {recipient: [dial for dial in dials if dial.split('/', 2)[-1] != caller_uri]
             for recipient, dials in targets.items()}
 
 
@@ -1696,7 +1944,7 @@ def main():
             raw = sys.stdin.buffer.read(1048577)
             if len(raw) > 1048576:
                 raise PhoneAdmissionError('phone_request_oversized')
-            request = json.loads(raw)
+            request = checked_json(raw)
             if not isinstance(request, dict) or set(request) - {'internal', 'outbound', 'service', 'correlation', 'wait_seconds', 'duration', 'sound', 'live_origin', 'live_group', 'live_external', 'live_caller_number', 'live_channel', 'live_uniqueid', 'latest_start', 'voicemail', 'voicemail_scope', 'voicemail_context'}:
                 raise PhoneAdmissionError('phone_request_invalid')
             result = admit_audience(request.get('internal', []), outbound=request.get('outbound', []),

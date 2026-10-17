@@ -31,6 +31,45 @@ class InstallerPrivilegeTests(unittest.TestCase):
         return subprocess.run(['bash','-c','source "$1"; WORKER_GUARD_TOOL="$FIXTURE_GUARD_PATH"; '+code,'fixture',str(self.installer)],
             env={**os.environ,'FIXTURE_GUARD_PATH':str(self.guard),**env},capture_output=True,text=True,timeout=20)
 
+    @unittest.skipUnless(os.geteuid()==0, 'requires root for directory identity checks')
+    def test_data_directory_refuses_unknown_metadata_without_adoption(self):
+        account = pwd.getpwnam('asterisk')
+        for label, uid, gid, mode in (
+            ('owner', 12345, 0, 0o750), ('group', 0, 12345, 0o750),
+            ('writable', account.pw_uid, account.pw_gid, 0o777),
+        ):
+            with self.subTest(label=label):
+                data = self.root / label
+                data.mkdir()
+                evidence = data / 'preserved'
+                evidence.write_bytes(b'Unreviewed directory contents')
+                os.chown(data, uid, gid)
+                data.chmod(mode)
+                before = data.stat()
+                result = self.shell('DATA_DIR="$DATA"; ensure_data_directory', DATA=str(data))
+                self.assertNotEqual(result.returncode, 0)
+                after = data.stat()
+                self.assertEqual((after.st_ino, after.st_uid, after.st_gid, after.st_mode),
+                                 (before.st_ino, before.st_uid, before.st_gid, before.st_mode))
+                self.assertEqual(evidence.read_bytes(), b'Unreviewed directory contents')
+
+    @unittest.skipUnless(os.geteuid()==0, 'requires root for directory identity checks')
+    def test_data_directory_creation_and_recognized_legacy_owner(self):
+        account = pwd.getpwnam('asterisk')
+        for label, owner in (('fresh', None), ('root', (0, 0)), ('service', (account.pw_uid, account.pw_gid))):
+            data = self.root / label
+            inode = None
+            if owner is not None:
+                data.mkdir(mode=0o755)
+                os.chown(data, *owner)
+                inode = data.stat().st_ino
+            result = self.shell('DATA_DIR="$DATA"; ensure_data_directory', DATA=str(data))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            after = data.stat()
+            self.assertEqual((after.st_uid, after.st_gid, after.st_mode & 0o7777),
+                             (account.pw_uid, account.pw_gid, 0o750))
+            if inode is not None: self.assertEqual(after.st_ino, inode)
+
     @unittest.skipUnless(os.geteuid()==0,'requires root to exercise real privilege dropping')
     def test_php_executes_as_real_nonroot_asterisk(self):
         expected=pwd.getpwnam('asterisk').pw_uid

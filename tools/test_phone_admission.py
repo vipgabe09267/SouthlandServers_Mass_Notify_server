@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import time
@@ -40,6 +41,148 @@ class PhoneAdmissionTests(unittest.TestCase):
 
     def contents(self):
         return json.loads((self.root / 'phone-admission.json').read_text())
+
+    def test_ambiguous_state_is_preserved_by_locked_and_read_only_readers(self):
+        path = self.root / 'phone-admission.json'
+        for raw in (
+            '{"schema":1,"batches":{"retained":{}},"batches":{},"collector":null}',
+            '{"schema":1,"batches":{},"collector":null,"extra":1e309}',
+            '{"schema":1,"batches":{},"collector":null,"extra":NaN}',
+        ):
+            with self.subTest(raw=raw):
+                path.write_text(raw)
+                before = path.stat()
+                with self.assertRaises(phone.PhoneAdmissionError):
+                    phone.read_private_json(path.name, self.root)
+                with self.assertRaises(phone.PhoneAdmissionError):
+                    with self.store.locked():
+                        pass
+                self.assertEqual(path.read_text(), raw)
+                self.assertEqual(path.stat().st_ino, before.st_ino)
+
+    def test_boolean_schema_does_not_validate_as_version_one(self):
+        with self.assertRaises(phone.PhoneAdmissionError):
+            self.store.validate({'schema': True, 'batches': {}, 'collector': None})
+
+    def test_missing_established_phone_history_does_not_reset_daily_budget(self):
+        with self.store.locked() as state:
+            self.store.reserve_outbound_budget(state, 1, 1, self.now)
+        path = self.root / 'phone-admission.json'
+        marker = self.root / '.phone-admission-required'
+        path.unlink()
+        with self.assertRaisesRegex(phone.PhoneAdmissionError, 'phone_state_history_missing'):
+            self.store.collector_heartbeat(self.generation)
+        self.assertFalse(path.exists())
+        self.assertTrue(marker.exists())
+
+    def test_interrupted_phone_marker_recovery_preserves_history_and_inode(self):
+        marker = self.root / '.phone-admission-required'
+        marker.write_bytes(b'SLS_PHONE')
+        marker.chmod(0o640)
+        os.chown(marker, *phone._account_ids())
+        inode = marker.stat().st_ino
+        before = (self.root / 'phone-admission.json').read_bytes()
+        with self.store.locked():
+            pass
+        self.assertEqual(marker.read_bytes(), b'SLS_PHONE_ADMISSION_V1\n')
+        self.assertEqual(marker.stat().st_ino, inode)
+        self.assertEqual((self.root / 'phone-admission.json').read_bytes(), before)
+        marker.write_bytes(b'unknown marker')
+        with self.assertRaises(phone.PhoneAdmissionError):
+            with self.store.locked():
+                pass
+        self.assertEqual(marker.read_bytes(), b'unknown marker')
+
+    def test_first_phone_marker_short_write_is_retryable_without_resetting_history(self):
+        child = self.root / 'interrupted-first-start'
+        child.mkdir(mode=0o700)
+        store = phone.PhoneAdmissionStore(child, clock=lambda: self.now)
+        real_pwrite = phone.os.pwrite
+        def short_write(descriptor, body, offset):
+            return real_pwrite(descriptor, body[:8], offset)
+        with mock.patch.object(phone.os, 'pwrite', side_effect=short_write):
+            with self.assertRaisesRegex(phone.PhoneAdmissionError, 'phone_state_commit_uncertain'):
+                store.collector_heartbeat(self.generation)
+        marker = child / '.phone-admission-required'
+        before = (child / 'phone-admission.json').read_bytes()
+        inode = marker.stat().st_ino
+        store.collector_heartbeat(self.generation)
+        self.assertEqual((child / 'phone-admission.json').read_bytes(), before)
+        self.assertEqual(marker.read_bytes(), phone.HISTORY_MARKER)
+        self.assertEqual(marker.stat().st_ino, inode)
+
+    def test_lock_refuses_unknown_metadata_without_adopting_it(self):
+        path = self.root / 'phone-admission.lock'
+        before_state = (self.root / 'phone-admission.json').read_bytes()
+        owner, group = phone._account_ids()
+        for mode, gid, body in ((0o666, group, b''), (0o2640, group, b''),
+                                (0o640, group + 1000, b''), (0o640, group, b'unknown')):
+            with self.subTest(mode=mode, gid=gid, body=body):
+                path.write_bytes(body)
+                path.chmod(mode)
+                os.chown(path, owner, gid)
+                before = path.stat()
+                with self.assertRaises(phone.PhoneAdmissionError):
+                    with self.store.locked():
+                        pass
+                after = path.stat()
+                self.assertEqual((after.st_ino, after.st_mode, after.st_uid, after.st_gid),
+                                 (before.st_ino, before.st_mode, before.st_uid, before.st_gid))
+                self.assertEqual(path.read_bytes(), body)
+                self.assertEqual((self.root / 'phone-admission.json').read_bytes(), before_state)
+        path.write_bytes(b'')
+        os.chown(path, owner, group)
+        path.chmod(0o644)
+        inode = path.stat().st_ino
+        with self.store.locked():
+            pass
+        self.assertEqual(path.stat().st_ino, inode)
+        self.assertEqual(path.stat().st_mode & 0o7777, 0o640)
+
+    def test_replaced_named_lock_cannot_authorize_state_access(self):
+        path = self.root / 'phone-admission.lock'
+        preserved = self.root / 'old-lock'
+        real_flock = phone.fcntl.flock
+        before = (self.root / 'phone-admission.json').read_bytes()
+        def replace_after_acquiring(descriptor, operation):
+            result = real_flock(descriptor, operation)
+            path.rename(preserved)
+            path.touch(mode=0o640)
+            os.chown(path, *phone._account_ids())
+            return result
+        with mock.patch.object(phone.fcntl, 'flock', side_effect=replace_after_acquiring):
+            with self.assertRaises(phone.PhoneAdmissionError):
+                with self.store.locked():
+                    pass
+        self.assertEqual((self.root / 'phone-admission.json').read_bytes(), before)
+
+    def test_replaced_state_and_parent_stop_commit_without_overwriting_evidence(self):
+        path = self.root / 'phone-admission.json'
+        retained = self.root / 'retained-state.json'
+        before = path.read_bytes()
+        with self.assertRaisesRegex(phone.PhoneAdmissionError, 'phone_state_changed'):
+            with self.store.locked() as state:
+                state['fixture'] = 'changed'
+                path.rename(retained)
+                path.write_bytes(before)
+                path.chmod(0o640)
+                os.chown(path, *phone._account_ids())
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(retained.read_bytes(), before)
+        child = self.root / 'child'
+        child.mkdir(mode=0o700)
+        store = phone.PhoneAdmissionStore(child, clock=lambda: self.now)
+        store.collector_heartbeat(self.generation)
+        before = (child / path.name).read_bytes()
+        moved = self.root / 'preserved-child'
+        with self.assertRaisesRegex(phone.PhoneAdmissionError, 'phone_state_directory_changed'):
+            with store.locked() as state:
+                state['fixture'] = 'changed'
+                child.rename(moved)
+                child.mkdir(mode=0o700)
+                (child / path.name).write_bytes(b'private replacement evidence')
+        self.assertEqual((child / path.name).read_bytes(), b'private replacement evidence')
+        self.assertEqual((moved / path.name).read_bytes(), before)
 
     def test_counts_contacts_and_rejects_whole_audience_without_mutation(self):
         self.admit()
@@ -532,6 +675,61 @@ class PhoneAdmissionTests(unittest.TestCase):
         self.assertEqual(child.writes['SLS_PHONE_ALLOW'], '0')
 
 
+class PhoneAgiTransportTests(unittest.TestCase):
+    def setUp(self):
+        self.path = Path(__file__).resolve().parents[1] / 'slsmassnotifyserver/bin/sls_mass_notify_phone_agi.py'
+        spec = importlib.util.spec_from_file_location('bounded_agi_fixture', self.path)
+        self.agi_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.agi_module)
+
+    def source(self, payload):
+        reader, writer = os.pipe()
+        self.addCleanup(os.close, writer)
+        handle = os.fdopen(reader, 'r')
+        self.addCleanup(handle.close)
+        os.write(writer, payload)
+        return handle
+
+    def test_buffered_environment_and_consecutive_replies_keep_their_order(self):
+        source = self.source(b'agi_request: fixture\r\nagi_uniqueid: 1.1\r\n\r\n'
+                             b'200 result=1 (first)\r\n200 result=1 (second)\r\n')
+        output = io.StringIO()
+        agi = self.agi_module.PhoneAgi(source, output)
+        self.assertEqual(agi.environment['agi_uniqueid'], '1.1')
+        self.assertEqual(agi.variable('${FIRST}'), 'first')
+        self.assertEqual(agi.variable('${SECOND}'), 'second')
+        self.assertEqual(output.getvalue().splitlines(), ['GET FULL VARIABLE "${FIRST}"', 'GET FULL VARIABLE "${SECOND}"'])
+
+    def test_duplicate_or_malformed_environment_is_refused(self):
+        for payload in (b'agi_uniqueid: 1.1\nagi_uniqueid: 2.2\n\n', b'not-an-environment-field\n\n', b': value\n\n'):
+            with self.subTest(payload=payload), self.assertRaisesRegex(phone.PhoneAdmissionError, 'environment_invalid'):
+                self.agi_module.PhoneAgi(self.source(payload), io.StringIO())
+
+    def test_partial_reply_uses_the_whole_response_deadline(self):
+        code = '''import importlib.util,io,os,time
+spec=importlib.util.spec_from_file_location('private_agi',PATH)
+m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+r,w=os.pipe();source=os.fdopen(r,'r');os.write(w,b'\\n200 result=1 (unfinished')
+agi=m.PhoneAgi(source,io.StringIO());start=time.monotonic()
+try:agi.command('GET VARIABLE FIXTURE',timeout=.05)
+except m.PhoneAdmissionError as e:
+ assert str(e)=='phone_agi_response_timeout';assert time.monotonic()-start<1
+else:raise AssertionError('Unfinished response was accepted')
+source.close();os.close(w)
+'''.replace('PATH', repr(str(self.path)))
+        result = subprocess.run([sys.executable, '-I', '-B', '-c', code], capture_output=True, text=True, timeout=2)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_oversized_and_expired_buffered_replies_are_refused(self):
+        agi = self.agi_module.PhoneAgi(self.source(b'\n'), io.StringIO())
+        agi.buffer = bytearray(b'200 result=1 ' + b'x' * 131073 + b'\n')
+        with self.assertRaisesRegex(phone.PhoneAdmissionError, 'response_invalid'):
+            agi.command('GET VARIABLE FIXTURE')
+        agi.buffer = bytearray(b'200 result=1 (late)\n')
+        with self.assertRaisesRegex(phone.PhoneAdmissionError, 'response_timeout'):
+            agi.line(131072, time.monotonic() - 1, 'phone_agi_response_invalid')
+
+
 class LiveGroupAdmissionTests(unittest.TestCase):
     def test_contact_origin_excludes_only_the_caller_on_shared_endpoint_and_alias(self):
         caller = 'PJSIP/6000/sip:desk@192.0.2.1:5060;transport=UDP'
@@ -638,6 +836,28 @@ class LiveGroupAdmissionTests(unittest.TestCase):
 
 
 class PhoneAmiTests(unittest.TestCase):
+    def test_buffered_message_cannot_outlive_its_deadline(self):
+        ami = phone.PhoneAmi({})
+        ami.buffer = b'Response: Success\r\n\r\n'
+        with self.assertRaises(TimeoutError):
+            ami.receive(time.monotonic() - 1)
+
+    def test_action_rejects_excess_aggregate_evidence_before_retaining_rows(self):
+        ami = phone.PhoneAmi({})
+        current = {}
+        ami.send = lambda fields: current.update(fields)
+        received = 0
+        def receive(deadline):
+            nonlocal received
+            received += 1
+            if received == 1:
+                return {'Response': 'Success', 'ActionID': current['ActionID']}
+            return {'Event': 'PrivateComplete', 'ActionID': current['ActionID'], 'Output': 'x' * 2000}
+        ami.receive = receive
+        with mock.patch.object(phone, 'MAX_AMI_ACTION_BYTES', 1024, create=True):
+            with self.assertRaisesRegex(phone.PhoneAdmissionError, 'response_oversized'):
+                ami.action({'Action': 'PrivateFixture'}, 'PrivateComplete')
+
     class Socket:
         def __init__(self, respond): self.respond = respond; self.buffer = b''; self.sent = []
         def settimeout(self, value): pass

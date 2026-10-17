@@ -18,6 +18,11 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
+if os.environ.get('SLS_TEST_NAMESPACE') != 'entered' or os.environ.get(
+    'SLS_TEST_PARENT_NET_NS'
+) in (None, '', os.readlink('/proc/self/ns/net')):
+    raise SystemExit('Use the private fixture runner; doctor network isolation verification failed.')
+
 ROOT=Path(__file__).resolve().parents[1]
 def load(name,path):
     spec=importlib.util.spec_from_file_location(name,path)
@@ -28,6 +33,11 @@ VM=load('vm_fixture',ROOT/'tools/qualify_installer_vm.py')
 
 
 class Doctor(unittest.TestCase):
+    def test_diagnostic_and_transaction_stages_share_the_installer_contract(self):
+        transaction=load('transaction_stages',ROOT/'slsmassnotifyserver/bin/sls_mass_notify/sls_install_transaction.py')
+        self.assertEqual(DOCTOR.STAGES,transaction.STAGES)
+        emitted=set(re.findall(r"""^\s*set_install_stage ['"]([^'"$]+)['"]""", (ROOT/'tools/install_release.sh').read_text(), re.M))
+        self.assertLessEqual(emitted,DOCTOR.STAGES)
     def php_payload(self):
         return {'probe':'sls_served_php_v1','ok':True,'missing':[],'php_version':'8.2.29','php_sapi':'fpm-fcgi',
                 'runtime_account_ok':True,'extensions':dict.fromkeys(DOCTOR.PHP_EXTENSIONS,True),
@@ -88,6 +98,36 @@ class Doctor(unittest.TestCase):
     def test_slow_headers_obey_absolute_probe_deadline(self):
         started=time.monotonic();value=DOCTOR.served_php_probe(self.php_server({},slow=True),.15)
         self.assertFalse(value['available']);self.assertLess(time.monotonic()-started,.6)
+    def test_each_probe_deadline_remains_bound_to_its_own_socket(self):
+        payload=json.dumps(self.php_payload()).encode()
+        class Socket:
+            def __init__(self):self.shutdowns=0;self.closes=0
+            def shutdown(self,unused):self.shutdowns+=1
+            def close(self):self.closes+=1
+        class Response:
+            def __init__(self,status,body=b''):self.status=status;self.body=body
+            def read(self,unused):return self.body
+        class Connection:
+            def __init__(self,response):self.sock=Socket();self.response=response
+            def connect(self):pass
+            def request(self,*unused,**ignored):pass
+            def getresponse(self):return self.response
+            def close(self):pass
+        class Timer:
+            instances=[]
+            def __init__(self,unused,callback):self.callback=callback;self.daemon=False;self.cancelled=False;self.instances.append(self)
+            def start(self):pass
+            def cancel(self):self.cancelled=True
+        connections=[Connection(Response(404)),Connection(Response(200,payload))]
+        with patch.object(DOCTOR.http.client,'HTTPConnection',side_effect=connections),patch.object(DOCTOR.threading,'Timer',Timer):
+            value=DOCTOR.served_php_probe([
+                ('http','127.0.0.1',8001,'first.example.test'),
+                ('http','127.0.0.1',8002,'second.example.test'),
+            ])
+        self.assertTrue(value['ok'])
+        Timer.instances[0].callback()
+        self.assertEqual((connections[0].sock.shutdowns,connections[0].sock.closes),(1,1))
+        self.assertEqual((connections[1].sock.shutdowns,connections[1].sock.closes),(0,0))
     def test_parsed_vhosts_change_headers_and_ports_without_public_resolution(self):
         targets=DOCTOR.served_php_targets('*:8443 pbx.example.test (/etc/apache2/pbx.conf:1)\n port 9443 namevhost secondary.example.test (/etc/apache2/secondary:1)\n[::]:8080 ipv6.example.test (/etc/apache2/ipv6:1)')
         self.assertEqual(targets[0],('https','127.0.0.1',8443,'pbx.example.test'))
@@ -206,6 +246,13 @@ class OfflineBundle(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'differs'):BUNDLE.release(self.directory)
         self.installer.write_bytes(b'#!/bin/bash\nexit 0\n');self.package.write_bytes(b'altered')
         with self.assertRaisesRegex(ValueError,'differs'):BUNDLE.release(self.directory)
+    def test_offline_environment_retains_the_authenticated_digest_and_clears_remote_url(self):
+        values=BUNDLE.installer_environment(self.directory)
+        self.assertEqual(values['SLS_MASS_NOTIFY_SHA256'],hashlib.sha256(self.package.read_bytes()).hexdigest())
+        self.assertEqual(values['SLS_MASS_NOTIFY_TGZ_URL'],'')
+        self.assertEqual(values['SLS_MASS_NOTIFY_TGZ'],str(self.package))
+        self.installer.write_bytes(b'altered')
+        with self.assertRaisesRegex(ValueError,'differs'):BUNDLE.installer_environment(self.directory)
     def test_unsigned_and_publicly_writable_inputs_are_rejected(self):
         (self.directory/'release-manifest.sig').write_bytes(b'0'*64)
         with self.assertRaises(subprocess.CalledProcessError):BUNDLE.release(self.directory)

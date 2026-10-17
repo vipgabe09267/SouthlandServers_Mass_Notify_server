@@ -1,6 +1,10 @@
 (() => {
   'use strict';
   const runs = new Map();
+  window.addEventListener('pagehide', () => {
+    runs.forEach(run => { clearTimeout(run.timer); run.abort.abort(); });
+    runs.clear();
+  });
   const element = (tag, text, className = '') => {
     const node = document.createElement(tag);
     node.textContent = text;
@@ -58,7 +62,7 @@
         refresh.disabled = true;
         try {
           const csrf = form.querySelector('[name="slsmassnotifyserver_csrf"]')?.value;
-          const response = await fetch(form.action, {method: 'POST', credentials: 'same-origin', cache: 'no-store', signal: run.abort.signal,
+          const response = await fetch(form.action, {method: 'POST', credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.any([run.abort.signal, AbortSignal.timeout(15000)]),
             body: new URLSearchParams({slsmassnotifyserver_action: 'test_delivery_status', slsmassnotifyserver_csrf: csrf || '', delivery_ticket: data.delivery_ticket, ajax: '1'})});
           const answer = await response.json();
           if (!response.ok || !answer.success || !answer.delivery) throw new Error(answer.message || 'Receipt status could not be read.');

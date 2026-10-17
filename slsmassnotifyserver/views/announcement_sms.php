@@ -106,14 +106,17 @@ function provider(){
 root.querySelector('[data-sms-check-sender]').addEventListener('click',async function(){
     var result=root.querySelector('[data-sms-check-result]'),button=this,form=root.closest('form');
     button.disabled=true;result.textContent='Checking the saved sending number…';
+    var controller=new AbortController(),timer=window.setTimeout(function(){controller.abort();},20000);
     try {
         var response=await fetch('config.php?display=slsmassnotifyserver_other',{method:'POST',credentials:'same-origin',cache:'no-store',
-            body:new URLSearchParams({slsmassnotifyserver_action:'check_bulkvs_sender',slsmassnotifyserver_csrf:form.querySelector('[name="slsmassnotifyserver_csrf"]').value})});
+            body:new URLSearchParams({slsmassnotifyserver_action:'check_bulkvs_sender',slsmassnotifyserver_csrf:form.querySelector('[name="slsmassnotifyserver_csrf"]').value}),signal:controller.signal});
         var value=await response.json();
         result.textContent=value.message||'The sender check did not return a result. Reload General Settings.';
-        result.className=response.ok&&value.success&&!value.issues.length?'text-success':'text-warning';
-    } catch(error) {result.className='text-warning';result.textContent='The sender check was interrupted. Reload General Settings and try again. No SMS was sent.';}
-    finally {button.disabled=false;}
+        result.className=response.ok&&value.success===true&&Array.isArray(value.issues)&&!value.issues.length?'text-success':'text-warning';
+    } catch(error) {result.className='text-warning';result.textContent=controller.signal.aborted
+        ? 'The sender check exceeded 20 seconds. Try the saved sender check again. No SMS was sent.'
+        : 'The sender check was interrupted. Reload General Settings and try again. No SMS was sent.';}
+    finally {window.clearTimeout(timer);button.disabled=false;}
 });
 root.querySelectorAll('[data-sms-money]').forEach(function(input){input.addEventListener('blur',function(){
     if(!/^(?:0|[1-9][0-9]{0,5})(?:\.[0-9]{1,6})?$/.test(input.value))return;

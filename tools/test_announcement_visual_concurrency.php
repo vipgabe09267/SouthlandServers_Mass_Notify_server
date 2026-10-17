@@ -13,19 +13,23 @@ class VisualPoolFixture {
     public $directory;
     public $limits = ['concurrency' => 2, 'child_seconds' => 1, 'phase_seconds' => 2];
     public $durations = [];
-    public $currentTargets = ['phones' => ['1001', '1002', '1003', '1004'], 'desktops' => ['desktop'], 'webhooks' => ['hook']];
+    public $currentTargets = ['phones' => ['1001', '1002', '1003', '1004'], 'desktops' => ['desktop'], 'desktop_client_ids'=>['desktop'=>'fixture-desktop'], 'webhooks' => ['hook']];
     public function __construct(string $directory) { $this->directory = $directory; }
     protected function announcementPhoneVisualLimits(): array { return $this->limits; }
     protected function startAnnouncementPhoneVisualProcess(string $command, float $seconds) {
         if ($command === 'simulate_start_failure') { return false; }
         return $this->startRealVisualProcess($command, $seconds);
     }
-    public function batch(array $commands, callable $completed, ?int $deadline=null): void { $this->executeAnnouncementPhoneVisualBatch($commands, $completed, $deadline); }
+    public function batch(array $commands, callable $completed, ?int $deadline = null, ?callable $authorized = null): void {
+        $this->executeAnnouncementPhoneVisualBatch($commands, $completed, $deadline, $authorized);
+    }
     public function command(string $target, float $delay, array $extra = []): string {
         $args = array_merge(['target' => $target, 'delay' => $delay, 'log' => $this->directory . '/events.jsonl'], $extra);
         return '/usr/bin/timeout --foreground --signal=TERM --kill-after=1 90 /usr/bin/python3 -I '
             . escapeshellarg($this->directory . '/child.py') . ' ' . escapeshellarg(json_encode($args));
     }
+    public function getActiveSettings() { return ['desktop_clients'=>[['client_id'=>'fixture-desktop','username'=>'desktop','enabled'=>true]]]; }
+    private function announcementDesktopPresence(): array { return []; }
     private function currentAnnouncementDestinationIds() { return $this->currentTargets; }
     private function startAnnouncementWorker($id) {}
     private function acquireAnnouncementActivityLock($exclusive = false, $timeoutSeconds = 30) { return null; }
@@ -42,7 +46,8 @@ class VisualPoolFixture {
     }
     private function executeAnnouncementVisualPushCommand($command) {
         checkVisual($command === 'fixture_desktop', 'Phone command escaped the bounded pool.');
-        return ['success' => true];
+        return ['success' => true, 'output' => ['SLS_DESKTOP_PUBLICATION '
+            . json_encode(['event_id' => 'announcement-20261015000000000000-' . str_repeat('a', 32)], JSON_THROW_ON_ERROR)]];
     }
     private function sendAnnouncementTtsAudio($phones, $message, $context) {
         $this->lastAudioQueueResults = array_fill_keys($phones, true);
@@ -50,7 +55,9 @@ class VisualPoolFixture {
     }
     private function dispatchAnnouncementWebhooks(...$args) { return ['accepted' => $args[0] ? [['id' => 'hook', 'name' => 'Fixture']] : [], 'failed' => []]; }
     private function setAnnouncementCooldown() {}
-    private function recordInteractiveAnnouncementAdmission(array $request): void {}
+    private function recordInteractiveAnnouncementAdmission(array $request, ?callable $commit = null, string $jobId = '') {
+        return $commit === null ? null : $commit();
+    }
     private function getAnnouncementCooldownState() { return ['remaining' => 0]; }
     private function appendAnnouncementNotifyLog(...$args) {}
 }
@@ -145,6 +152,25 @@ try {
     echo "Launch failures, nonzero exit and fast-child exit-status checks passed.\n";
 
     clearVisualEvents($directory);
+    $fixture->limits = ['concurrency' => 1, 'child_seconds' => 1, 'phase_seconds' => 0.05];
+    $results = [];
+    $fixture->batch(['late_after_auth' => $fixture->command('late_after_auth', 0)],
+        static function ($target, $result) use (&$results) { $results[$target] = $result; }, null,
+        static function (): bool { usleep(80000); return true; });
+    checkVisual(($results['late_after_auth']['reason'] ?? '') === 'phase_timeout'
+        && empty($results['late_after_auth']['started']) && visualEvents($directory) === [],
+        'A slow authorization check launched a phone sender after the phase deadline.');
+    $results = [];
+    $fixture->limits = ['concurrency' => 1, 'child_seconds' => 1, 'phase_seconds' => 2];
+    $fixture->batch(['authorization_error' => $fixture->command('authorization_error', 0)],
+        static function ($target, $result) use (&$results) { $results[$target] = $result; }, null,
+        static function (): bool { throw new RuntimeException('simulated authorization failure'); });
+    checkVisual(($results['authorization_error']['reason'] ?? '') === 'permission_changed'
+        && empty($results['authorization_error']['started']) && visualEvents($directory) === [],
+        'An authorization failure escaped the batch or started a phone sender.');
+    echo "Authorization failures and slow checks remain fail-closed within the phone phase deadline.\n";
+
+    clearVisualEvents($directory);
     $fixture->limits = ['concurrency' => 3, 'child_seconds' => 4, 'phase_seconds' => 5];
     $threw = false; $started = microtime(true);
     try {
@@ -170,7 +196,7 @@ try {
     $fixture->limits = ['concurrency' => 2, 'child_seconds' => 1, 'phase_seconds' => 0.25];
     $fixture->durations = ['1001' => 3, '1002' => 0.01, '1003' => 3, '1004' => 3];
     $request = ['message' => 'Isolated fixture', 'sender' => 'Fixture', 'phones' => ['1001', '1002', '1003', '1004', '1005'],
-        'unavailable_phones' => ['1006'], 'desktops' => ['desktop'], 'webhooks' => ['hook'],
+        'unavailable_phones' => ['1006'], 'desktops' => ['desktop'], 'desktop_client_ids'=>['desktop'=>'fixture-desktop'], 'webhooks' => ['hook'],
         'audio_mode' => 'tts', 'timeout_mode' => 'none', 'display_timeout' => 0, 'opening_tone' => '', 'closing_tone' => '',
         'voice' => 'fixture', 'volume' => 25, 'trigger_source' => 'fixture', 'image' => false, 'title' => 'Fixture', 'background_color' => '#000000',
         'delivery_id' => 'announcement-fixture-visual', 'delivery_timestamp' => gmdate('c')];

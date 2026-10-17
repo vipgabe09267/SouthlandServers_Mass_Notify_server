@@ -31,7 +31,7 @@ that have never reported remain unknown; the server does not infer a version
 from successful authentication or receipt.
 
 An unrestricted Control API credential with the `read` scope can fetch
-`GET /api/sls-mass-notify?resource=desktop_fleet`. The response adds `schema: 1`,
+`GET /api/sls-mass-notify/?resource=desktop_fleet`. The response adds `schema: 1`,
 `generated_at`, `minimum_version` and a bounded `clients` list. Each row contains
 configured identity, enabled state, authenticated last-seen information, advisory
 receipt fields, `client_version`, `client_reported_at`, `payload_schema`,
@@ -40,7 +40,8 @@ receipt fields, `client_version`, `client_reported_at`, `payload_schema`,
 Connection values are `disabled`, `never`, `clock_error`, `streaming`, `recent`
 or `inactive`. Recent means authenticated activity within 90 seconds, which can
 include diagnostics. Compatibility values are `not_reported`, `stale_report`,
-`unsupported_protocol`, `upgrade_required`, `meets_minimum` or `no_minimum`.
+`protocol_not_reported`, `unsupported_protocol`, `upgrade_required`,
+`meets_minimum` or `no_minimum`.
 Neither connection nor compatibility confirms receipt or human reading; the
 existing exact-event acknowledgement ledger remains authoritative for app receipt.
 
@@ -48,3 +49,8 @@ The current desktop app must add these headers to populate version reporting.
 Fresh installations default to a minimum version of `1.0.10-beta`. Upgrades
 preserve an existing explicit policy. This is an advisory upgrade check;
 existing authenticated clients continue working.
+
+PHP-FPM uses the existing authenticated JSON polling path instead of holding a
+shared worker for each desktop stream. Stream requests return the existing
+`stream_capacity_reached` response with `reason: php_fpm_worker_pool`, polling
+instructions and `Retry-After`. Apache module PHP continues to support SSE.

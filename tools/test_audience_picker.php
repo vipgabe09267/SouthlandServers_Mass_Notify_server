@@ -24,6 +24,10 @@ pickerCheck($choices[1]['members']['sms_recipient_ids'] === [$sms] && $choices[1
 $weather = AudiencePicker::choices($settings, true);
 pickerCheck($weather[0]['members']['email_addresses'] === ['office@example.com'] && $weather[0]['members']['generic_webhook_ids'] === ['weather'], 'Weather picker lost saved email or equivalent webhook routing.');
 pickerCheck($weather[0]['weather_unmapped_webhooks'] === 0, 'Mapped webhook was marked unsupported.');
+$settings['discord_webhooks'] = [['id'=>'duplicate','url'=>'https://example.com/private-route','enabled'=>'1']];
+$ambiguous=AudiencePicker::choices($settings,true)[0];
+pickerCheck($ambiguous['members']['generic_webhook_ids']===[]&&$ambiguous['members']['discord_webhook_ids']===[]&&$ambiguous['weather_unmapped_webhooks']===1&&$ambiguous['unavailable'],'An ambiguous webhook was copied to multiple Weather destinations.');
+unset($settings['discord_webhooks']);
 $settings['generic_webhooks'][0]['payload_format'] = 'slack';
 pickerCheck(AudiencePicker::choices($settings, true)[0]['weather_unmapped_webhooks'] === 1, 'A different webhook format was treated as the same destination.');
 $settings['desktop_clients'][0]['client_id'] = 'cli_replacement';

@@ -136,9 +136,18 @@ $fixtureScheduleDefinition = [
 	'targets' => ['extensions' => ['1000']],
 	'delivery' => ['audio_mode' => 'none'],
 ];
-$normalized = $normalize->invoke($module, [$fixtureScheduleDefinition, array_replace($fixtureScheduleDefinition, ['name' => 'Duplicate identity'])]);
+$duplicateScheduleRejected = false;
+try {
+	$normalize->invoke($module, [$fixtureScheduleDefinition, array_replace($fixtureScheduleDefinition, ['name' => 'Duplicate identity'])]);
+} catch (DomainException $error) {
+	$duplicateScheduleRejected = stripos($error->getMessage(), 'unique') !== false;
+}
+if (!$duplicateScheduleRejected) {
+	scheduling_contract_fail('Duplicate saved schedule IDs were not rejected.');
+}
+$normalized = $normalize->invoke($module, [$fixtureScheduleDefinition]);
 if (count($normalized) !== 1 || count($normalized[0]['occurrences'] ?? []) !== 2) {
-	scheduling_contract_fail('Duplicate schedule/occurrence normalization failed.');
+	scheduling_contract_fail('Occurrence normalization failed.');
 }
 $occurrenceIds = array_column($normalized[0]['occurrences'], 'id');
 if (count(array_unique($occurrenceIds)) !== 2 || in_array('forged-duplicate', $occurrenceIds, true)) {
@@ -172,6 +181,58 @@ $validateRecurrences = $reflection->getMethod('validateScheduledAnnouncementRecu
 $validateRecurrences->setAccessible(true);
 if (!empty($validateRecurrences->invoke($module, $normalizedRecurring))) {
 	scheduling_contract_fail('A valid recurring occurrence series failed protected validation.');
+}
+$labsRecurring=$normalizedRecurring;
+$labsRecurring[0]['targets']['browser_recipient_ids']=['sub_'.str_repeat('a',24)];
+$labsRecurring[0]['targets']['connector_ids']=['conn_'.str_repeat('b',24)];
+$roundTripLabs=$normalize->invoke($module,$labsRecurring);
+if ($roundTripLabs[0]['targets']['browser_recipient_ids']!==$labsRecurring[0]['targets']['browser_recipient_ids']
+    || $roundTripLabs[0]['targets']['connector_ids']!==$labsRecurring[0]['targets']['connector_ids']
+    || $validateRecurrences->invoke($module,$roundTripLabs)) {
+    scheduling_contract_fail('Typed Labs schedule selectors did not round-trip through protected validation.');
+}
+$badLabs=$roundTripLabs;$badLabs[0]['targets']['browser_recipient_ids']=['unknown'];
+if (!$validateRecurrences->invoke($module,$badLabs)) { scheduling_contract_fail('Invalid Labs schedule recipient was accepted.'); }
+$knownGroupSchedule = $normalizedRecurring;
+$knownGroupSchedule[0]['targets']['groups'] = ['group_staff'];
+$knownGroups = [['id' => 'group_staff', 'voice_recipient_ids' => []]];
+if ($validateRecurrences->invoke($module, $knownGroupSchedule, $knownGroups)) {
+	scheduling_contract_fail('A schedule referencing an existing saved audience was rejected.');
+}
+$unknownGroupErrors = $validateRecurrences->invoke($module, $knownGroupSchedule, []);
+if (stripos(implode(' ', $unknownGroupErrors), 'unknown saved audience') === false) {
+	scheduling_contract_fail('A schedule referencing a removed saved audience was accepted.');
+}
+$invalidTimezone = $normalized;
+$invalidTimezone[0]['timezone'] = 'Mars/Olympus';
+if (stripos(implode(' ', $validateRecurrences->invoke($module, $invalidTimezone)), 'invalid timezone') === false) {
+	scheduling_contract_fail('An invalid one-time schedule timezone was accepted.');
+}
+$emptyOccurrences = $normalized;
+$emptyOccurrences[0]['occurrences'] = [];
+if (stripos(implode(' ', $validateRecurrences->invoke($module, $emptyOccurrences)), '1 to') === false) {
+	scheduling_contract_fail('A schedule without a protected occurrence was accepted.');
+}
+$missingOccurrenceIdentity = $normalized;
+unset($missingOccurrenceIdentity[0]['occurrences'][0]['id']);
+if (stripos(implode(' ', $validateRecurrences->invoke($module, $missingOccurrenceIdentity)), 'invalid or duplicate occurrence') === false) {
+	scheduling_contract_fail('A protected occurrence without a stable identity was accepted.');
+}
+$duplicateRunTime = $normalized;
+$duplicate = $duplicateRunTime[0]['occurrences'][0];
+$duplicate['id'] = 'different_occurrence_id';
+$duplicateRunTime[0]['occurrences'][] = $duplicate;
+if (stripos(implode(' ', $validateRecurrences->invoke($module, $duplicateRunTime)), 'invalid or duplicate occurrence') === false) {
+	scheduling_contract_fail('Duplicate protected occurrence times were accepted.');
+}
+$tooManySchedules = [];
+for ($index = 0; $index <= (int)$reflection->getConstant('MAX_SCHEDULES'); $index++) {
+	$row = $normalized[0];
+	$row['id'] = 'schedule_limit_' . $index;
+	$tooManySchedules[] = $row;
+}
+if (stripos(implode(' ', $validateRecurrences->invoke($module, $tooManySchedules)), 'limited to') === false) {
+	scheduling_contract_fail('The protected schedule-count limit was not enforced.');
 }
 $tamperedRecurring = $normalizedRecurring;
 $tamperedRecurring[0]['occurrences'][1]['run_at_utc'] = '2027-03-09T15:30:00Z';
@@ -226,6 +287,10 @@ foreach ([
 	if (!is_string($haystack) || strpos($haystack, $needle) === false) {
 		scheduling_contract_fail("Missing scheduling contract marker: {$needle}");
 	}
+}
+$schedulePersistenceBody = explode("\n\tprivate function scheduledAnnouncementsFingerprint", explode("\tprivate function persistScheduledAnnouncements", $class, 2)[1] ?? '', 2)[0] ?? '';
+if (strpos($schedulePersistenceBody, 'ImmediateSettings::commitFiles') === false) {
+	scheduling_contract_fail('Active and staged schedule changes bypass the crash-recoverable two-file transaction.');
 }
 
 $dashboardBody = explode("\n\tpublic function getEvents", explode("\tpublic function dashboardService", $class, 2)[1] ?? '', 2)[0] ?? '';

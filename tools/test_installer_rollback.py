@@ -131,12 +131,15 @@ class ApiDirectoryPermissionTests(unittest.TestCase):
             (source / '.htaccess').write_text('Options -Indexes\n')
         text = (ROOT / 'slsmassnotifyserver/Slsmassnotifyserver.class.php').read_text()
         methods = []
-        for name in ('copyRuntimeFile', 'copyRuntimeDirectory'):
+        for name in ('readManagedTextFile', 'unlinkNamedFileIfIdentity', 'writeManagedTextFile',
+                     'copyRuntimeFile', 'copyRuntimeDirectory'):
             start = text.index('\tprivate function ' + name + '(')
             end = text.index('\n\tprivate function ', start + 1)
-            methods.append(text[start:end].replace('private function', 'public function', 1))
+            method = text[start:end].replace('private function', 'public function', 1)
+            method = method.replace("'/var/www/html/'", repr(str(self.web) + '/'))
+            methods.append(method)
         self.php = self.root / 'copy.php'
-        self.php.write_text('<?php\numask(0027);\nclass CopyFixture {\n' + '\n'.join(methods) +
+        self.php.write_text('<?php\numask(0027);\nclass CopyFixture {\nconst PLUGIN_DATA_DIR = ' + repr(str(self.root)) + ';\n' + '\n'.join(methods) +
             '\n}\n(new CopyFixture())->copyRuntimeDirectory($argv[1], $argv[2], 0644, true, $argv[3] === "public" ? 0755 : null);\n')
         self.installer = self.root / 'installer.sh'
         self.installer.write_text(SOURCE.replace('/var/www/html/admin/modules', str(self.root / 'modules'))

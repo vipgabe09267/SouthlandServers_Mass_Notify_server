@@ -1,6 +1,7 @@
 <?php
 declare(strict_types=1);
 namespace SLS\MassNotify\Sms;
+require_once dirname(__DIR__) . '/security.php';
 
 /** Portable data only: a restore never executes SQL from a backup or replays a send. */
 trait Continuity
@@ -15,11 +16,20 @@ trait Continuity
         $this->verifyStorage(); $mask=umask(0077);
         try { $handle=@fopen($path,'x+b'); } finally { umask($mask); }
         if (!$handle) { throw new \RuntimeException('sms_backup_create_failed'); }
+        $created=fstat($handle);
+        if (!is_array($created) || ($created['mode']&0170000)!==0100000 || $created['nlink']!==1 || ($created['mode']&0077)) {
+            fclose($handle); throw new \RuntimeException('sms_backup_create_failed');
+        }
         try {
             $bytes=0;
             $write=static function(array $record) use ($handle,&$bytes) {
                 $line=json_encode($record,JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR)."\n"; $bytes+=strlen($line);
-                if ($bytes>self::BACKUP_MAX_BYTES || fwrite($handle,$line)!==strlen($line)) { throw new \RuntimeException('sms_backup_write_failed'); }
+                if ($bytes>self::BACKUP_MAX_BYTES) { throw new \RuntimeException('sms_backup_write_failed'); }
+                for ($offset=0,$length=strlen($line);$offset<$length;) {
+                    $written=fwrite($handle,substr($line,$offset,min(65536,$length-$offset)));
+                    if (!is_int($written) || $written<1) { throw new \RuntimeException('sms_backup_write_failed'); }
+                    $offset+=$written;
+                }
             };
             $this->db->exec('BEGIN');
             try {
@@ -33,7 +43,17 @@ trait Continuity
                 $this->db->exec('COMMIT');
             } catch (\Throwable $error) { $this->db->exec('ROLLBACK'); throw $error; }
             if (!fflush($handle) || !fsync($handle)) { throw new \RuntimeException('sms_backup_sync_failed'); }
-        } catch (\Throwable $error) { fclose($handle); @unlink($path); throw $error; }
+            $opened=fstat($handle);clearstatcache(true,$path);$named=@lstat($path);
+            $stable=['dev','ino','uid','gid','mode','nlink'];$changed=!is_array($opened)||!is_array($named);
+            foreach($stable as $field){$changed=$changed||$opened[$field]!==$created[$field]||$named[$field]!==$created[$field];}
+            if ($changed||$opened['size']!==$bytes||$named['size']!==$bytes) {
+                throw new \RuntimeException('sms_backup_changed');
+            }
+        } catch (\Throwable $error) {
+            fclose($handle);clearstatcache(true,$path);$named=@lstat($path);
+            if(is_array($named)&&$named['dev']===$created['dev']&&$named['ino']===$created['ino']&&($named['mode']&0170000)===0100000&&$named['nlink']===1){@unlink($path);}
+            throw $error;
+        }
         fclose($handle);
     }
     private static function validateBackupRow(string $table, array $row): void
@@ -73,20 +93,25 @@ trait Continuity
     public function mergeSnapshot(string $path): void
     {
         clearstatcache(true,$path); $meta=@lstat($path);
-        if (!$meta || ($meta['mode']&0170000)!==0100000 || $meta['nlink']!==1 || $meta['size']<1 || $meta['size']>self::BACKUP_MAX_BYTES) { throw new \DomainException('sms_backup_file_invalid'); }
-        $handle=@fopen($path,'r+b');
+        if (!$meta || ($meta['mode']&0170000)!==0100000 || $meta['nlink']!==1 || ($meta['mode']&0137)
+            || !in_array($meta['uid'],[0,posix_geteuid()],true) || $meta['size']<1 || $meta['size']>self::BACKUP_MAX_BYTES) { throw new \DomainException('sms_backup_file_invalid'); }
+        $handle=@fopen($path,'rb');
         if (!$handle) { throw new \RuntimeException('sms_backup_unreadable'); }
         try {
             $opened=fstat($handle);
-            if ($opened['dev']!==$meta['dev'] || $opened['ino']!==$meta['ino']) { throw new \RuntimeException('sms_backup_changed'); }
-            $this->transaction(function () use ($handle) {
-                $header=json_decode((string)fgets($handle,4097),true,4,JSON_THROW_ON_ERROR);
+            $identity=static fn(array $value):array=>array_intersect_key($value,array_flip(['dev','ino','uid','gid','mode','nlink','size','mtime','ctime']));
+            if (!is_array($opened) || $identity($opened)!==$identity($meta)) { throw new \RuntimeException('sms_backup_changed'); }
+            if (!flock($handle,LOCK_SH|LOCK_NB)) { throw new \RuntimeException('sms_backup_busy'); }
+            $this->transaction(function () use ($handle,$meta,$path,$identity) {
+                $headerRaw=fgets($handle,4097);
+                if (!is_string($headerRaw) || !str_ends_with($headerRaw,"\n")) { throw new \DomainException('sms_backup_schema_unsupported'); }
+                $header=\SLS\MassNotify\ApiSecurity::jsonObject($headerRaw);
                 if (!in_array($header,[['schema'=>'sls-sms-continuity-v1'],['schema'=>'sls-sms-continuity-v2']],true)) { throw new \DomainException('sms_backup_schema_unsupported'); }
                 $seen=[]; $counts=[]; $bytes=0;
                 while (($line=fgets($handle,4097))!==false) {
                     $bytes+=strlen($line);
                     if ($bytes>self::BACKUP_MAX_BYTES || !str_ends_with($line,"\n")) { throw new \DomainException('sms_backup_truncated_or_oversized'); }
-                    $entry=json_decode($line,true,5,JSON_THROW_ON_ERROR);
+                    $entry=\SLS\MassNotify\ApiSecurity::jsonObject($line);
                     if (!is_array($entry) || count($entry)!==2 || !is_string($entry['table']??null) || !is_array($entry['row']??null)) { throw new \DomainException('sms_backup_invalid_record'); }
                     $table=$entry['table']; $row=$entry['row']; self::validateBackupRow($table,$row);
                     if ($table==='message_formats' && $header['schema']!=='sls-sms-continuity-v2') { throw new \DomainException('sms_backup_schema_unsupported'); }
@@ -97,7 +122,7 @@ trait Continuity
                     if ($table==='deliveries') {
                         $old=$this->get($id);
                         if ($old) {
-                            foreach (['provider','route','recipient_id','number_hash','body_hash','currency','segments','cost_micros','created_at'] as $key) {
+                            foreach (['provider','route','recipient_id','job_id','number_hash','body_hash','expires_at','currency','segments','cost_micros','created_at'] as $key) {
                                 if ($old[$key]!==$row[$key]) { throw new \DomainException('sms_backup_delivery_conflict'); }
                             }
                             // The live ledger is authoritative, including receipts newer than this backup.
@@ -123,6 +148,10 @@ trait Continuity
                     }
                 }
                 if (!feof($handle)) { throw new \RuntimeException('sms_backup_read_failed'); }
+                clearstatcache(true,$path);$named=@lstat($path);$after=fstat($handle);
+                if (!is_array($named)||!is_array($after)||$identity($meta)!==$identity($named)||$identity($meta)!==$identity($after)) {
+                    throw new \RuntimeException('sms_backup_changed');
+                }
                 // Union of disjoint live/backup deliveries may exceed either original counter.
                 foreach (['D%Y-%m-%d','M%Y-%m'] as $format) {
                     $rows=$this->query("SELECT strftime(?,created_at,'unixepoch') AS period,sum(segments) AS segments,sum(cost_micros) AS amount,currency FROM deliveries GROUP BY period,currency",[$format]);

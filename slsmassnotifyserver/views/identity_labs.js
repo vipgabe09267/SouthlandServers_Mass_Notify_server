@@ -18,17 +18,31 @@
     control.className = 'form-control';
     if (options.choices) options.choices.forEach(choice => { const option = node('option', choice.name); option.value = choice.id; control.append(option); });
     else if (!options.multiline) { control.type = options.type ?? 'text'; if (options.type === 'password') { control.autocomplete = 'new-password'; control.placeholder = 'Blank preserves saved secret'; } }
-    control.value = value ?? ''; control.addEventListener('input', () => change(options.type === 'number' ? Number(control.value) : control.value)); wrapper.append(control); parent.append(wrapper); return control;
+    control.value = value ?? ''; control.readOnly = options.readonly === true; control.addEventListener('input', () => change(options.type === 'number' ? Number(control.value) : control.value)); wrapper.append(control); parent.append(wrapper); return control;
   };
   const toggle = (parent, label, enabled, change) => { const wrapper = node('label', undefined, 'sls-identity-toggle'), control = node('input'); control.type = 'checkbox'; control.checked = enabled === true; control.addEventListener('change', () => change(control.checked)); wrapper.append(control, document.createTextNode(label)); parent.append(wrapper); };
   const card = (parent, title, remove) => { const result = node('section', undefined, 'sls-identity-card'), heading = node('div', undefined, 'sls-identity-card-heading'), button = node('button', 'Remove', 'btn btn-link text-danger'); button.type = 'button'; button.addEventListener('click', remove); heading.append(node('h4', title), button); result.append(heading); parent.append(result); return result; };
   const call = async (action, inputValue) => {
     status.textContent = 'Working…';
+    status.className = 'alert alert-info';
     const body = new URLSearchParams({ slsmassnotifyserver_action: 'enterprise_labs', slsmassnotifyserver_csrf: boot.csrf, payload: JSON.stringify({ action, input: inputValue }) });
-    const response = await fetch(boot.endpoint, { method: 'POST', credentials: 'same-origin', body, headers: { Accept: 'application/json' } });
-    const result = await response.json(); feedback(result.message || 'Request completed.', !result.success);
-    if (!response.ok || !result.success) throw new Error(result.message || 'The operation was not confirmed.');
-    return result;
+    const signal = AbortSignal.timeout(25000);
+    try {
+      const response = await fetch(boot.endpoint, { method: 'POST', credentials: 'same-origin', body, cache: 'no-store', headers: { Accept: 'application/json' }, signal });
+      let result;
+      try {
+        result = await response.json();
+      } catch (error) {
+        throw new Error('The PBX returned an unreadable directory or operator SSO response. Reload saved settings before retrying.');
+      }
+      if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('The PBX did not return a valid directory or operator SSO response. Reload saved settings before retrying.');
+      feedback(result.message || 'Request completed.', result.success !== true);
+      if (!response.ok || result.success !== true) throw new Error(result.message || 'The operation was not confirmed.');
+      return result;
+    } catch (error) {
+      if (signal.aborted) throw new Error('The directory or operator SSO change was not confirmed within 25 seconds. Reload saved settings before retrying.');
+      throw error;
+    }
   };
   const run = fn => async event => {
     const button = event?.currentTarget; if (button) button.disabled = true;
@@ -37,9 +51,11 @@
   };
   const choices = (rows, prompt) => [{ id: '', name: prompt }, ...rows];
   function render() {
-    const identity = read('identity'), directory = read('directory'), subscriber = read('subscriber');
+    const identity = boot.identity ? read('identity') : null;
+    if (identity) {
+    identity.providers.forEach(provider => { provider.callback_url = boot.callback_url; }); write('identity', identity);
     const providers = find('[data-identity-providers]'); providers.replaceChildren();
-    toggle(providers, 'Enable enterprise login', identity.enabled, enabled => update('identity', value => { value.enabled = enabled; }));
+    toggle(providers, 'Enable operator SSO', identity.enabled, enabled => update('identity', value => { value.enabled = enabled; }));
     identity.providers.forEach((provider, index) => {
       const section = card(providers, `${provider.name} · ${provider.protocol.toUpperCase()}`, () => { update('identity', value => { value.providers.splice(index, 1); }); render(); });
       const fields = node('div', undefined, 'sls-identity-fields'); section.append(fields);
@@ -47,13 +63,15 @@
       toggle(section, 'Enabled', provider.enabled, value => change('enabled', value));
       input(fields, 'Display name', provider.name, value => change('name', value));
       input(fields, 'Exact issuer', provider.issuer, value => change('issuer', value));
-      input(fields, 'Registered HTTPS callback', provider.callback_url, value => change('callback_url', value));
+      input(fields, 'Registered HTTPS callback', boot.callback_url, () => {}, { readonly: true });
       if (provider.protocol === 'oidc') {
         for (const [key, label] of [['discovery_url', 'Discovery URL'], ['client_id', 'Client ID'], ['client_secret', 'Client secret'], ['hosted_domain', 'Workspace domain (Google only)']]) input(fields, label, provider[key], value => change(key, value), { type: key === 'client_secret' ? 'password' : 'text' });
         input(fields, 'Allowed endpoint hostnames (one per line)', provider.endpoint_hosts.join('\n'), value => change('endpoint_hosts', value.split(/\s+/).filter(Boolean)), { multiline: true });
+        input(fields, 'Private endpoint pins (host=IP, one per line)', (provider.private_endpoint_pins ?? []).map(pin => `${pin.host}=${pin.ip}`).join('\n'), value => change('private_endpoint_pins', value.split(/\r?\n/).map(line => line.trim()).filter(Boolean).map(line => { const split = line.lastIndexOf('='); return { host: split < 1 ? '' : line.slice(0, split).trim(), ip: split < 1 ? '' : line.slice(split + 1).trim() }; })), { multiline: true });
       } else {
         for (const [key, label] of [['idp_sso_url', 'IdP sign-in URL'], ['sp_entity_id', 'SP entity ID'], ['sp_certificate', 'SP certificate PEM'], ['sp_private_key', 'SP private key PEM']]) input(fields, label, provider[key], value => change(key, value), { multiline: key.includes('certificate') || key.includes('private_key') });
         input(section, 'Pinned IdP signing certificates (one complete PEM per block)', provider.idp_signing_certificates.join('\n'), value => change('idp_signing_certificates', value.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) ?? []), { multiline: true });
+        if (provider.certificate_warning) section.append(node('p', provider.certificate_warning, 'alert alert-warning'));
       }
     });
     const grants = find('[data-identity-grants]'); grants.replaceChildren();
@@ -65,6 +83,9 @@
       input(section, 'Existing local account', grant.operator_account_id, value => change('operator_account_id', value), { choices: choices(boot.accounts.map(account => ({ id: account.id, name: `${account.username} · ${account.role}` })), 'Select a local account') });
       toggle(section, 'Enabled', grant.enabled, value => change('enabled', value));
     });
+    }
+    if (!boot.directory || !boot.subscriber) return;
+    const directory = read('directory'), subscriber = read('subscriber');
     const sources = find('[data-directory-sources]'); sources.replaceChildren();
     toggle(sources, 'Enable directory synchronization', directory.enabled, enabled => update('directory', value => { value.enabled = enabled; }));
     directory.sources.forEach((source, index) => {
@@ -111,23 +132,23 @@
     fill('[data-invite-subscriber]', subscriber.people.filter(person => person.enabled), 'Select a subscriber');
     fill('[data-invite-incident]', boot.incidents, 'Select an open incident');
   }
-  const clearPlan = () => { plan = ''; confirmationRequired = false; find('[data-apply-directory]').disabled = true; find('[data-deactivation-warning]').hidden = true; find('[data-confirm-deactivation]').checked = false; };
+  const clearPlan = () => { plan = ''; confirmationRequired = false; if (!find('[data-apply-directory]')) return; find('[data-apply-directory]').disabled = true; find('[data-deactivation-warning]').hidden = true; find('[data-confirm-deactivation]').checked = false; };
   root.querySelectorAll('[data-config]').forEach(editor => editor.addEventListener('change', () => { try { clearPlan(); render(); } catch (error) { feedback(error.message, true); } }));
   root.querySelectorAll('[data-save-config]').forEach(button => button.addEventListener('click', run(async () => {
     const key = button.dataset.saveConfig, config = read(key);
-    if (key === 'identity' && config.enabled) { if (!window.SlsLabsSafety) throw new Error('Open Enterprise Labs to review the enterprise login warning.'); if (!await window.SlsLabsSafety.acknowledge()) return; }
+    if (key === 'identity' && config.enabled) { if (!window.SlsLabsSafety) throw new Error('Reload Operator Access to review the SSO warning.'); if (!await window.SlsLabsSafety.acknowledge()) return; }
     const result = await call({ identity: 'identity_save', directory: 'directory_save', subscriber: 'subscriber_save' }[key], { config, revision: boot.revisions[key] });
     write(key, result.config); boot.revisions[key] = result.revision; clearPlan(); render();
   })));
-  find('[data-add-provider]').addEventListener('click', run(() => {
+  find('[data-add-provider]')?.addEventListener('click', run(() => {
     const config = read('identity'), vendor = find('[data-provider-vendor]').value, protocol = find('[data-provider-protocol]').value;
-    const provider = { id: randomId('idp_'), vendor, protocol, name: { entra: 'Entra ID', okta: 'Okta', google: 'Google Workspace', keycloak: 'Keycloak', onelogin: 'OneLogin' }[vendor], enabled: false, issuer: '', callback_url: '' };
-    if (protocol === 'oidc') { Object.assign(provider, { discovery_url: '', client_id: '', client_secret: '', token_auth: vendor === 'onelogin' ? 'none' : 'client_secret_basic', endpoint_hosts: [], hosted_domain: '' }); if (vendor === 'google') { provider.issuer = 'https://accounts.google.com'; provider.discovery_url = provider.issuer + '/.well-known/openid-configuration'; provider.endpoint_hosts = ['accounts.google.com', 'oauth2.googleapis.com', 'www.googleapis.com']; } }
+    const provider = { id: randomId('idp_'), vendor, protocol, name: { entra: 'Entra ID', okta: 'Okta', google: 'Google Workspace', keycloak: 'Keycloak', onelogin: 'OneLogin' }[vendor], enabled: false, issuer: '', callback_url: boot.callback_url };
+    if (protocol === 'oidc') { Object.assign(provider, { discovery_url: '', client_id: '', client_secret: '', token_auth: vendor === 'onelogin' ? 'none' : 'client_secret_basic', endpoint_hosts: [], private_endpoint_pins: [], hosted_domain: '' }); if (vendor === 'google') { provider.issuer = 'https://accounts.google.com'; provider.discovery_url = provider.issuer + '/.well-known/openid-configuration'; provider.endpoint_hosts = ['accounts.google.com', 'oauth2.googleapis.com', 'www.googleapis.com']; } }
     else Object.assign(provider, { idp_sso_url: '', idp_signing_certificates: [], sp_entity_id: '', sp_certificate: '', sp_private_key: '', nameid_format: 'urn:oasis:names:tc:SAML:2.0:nameid-format:persistent' });
     config.providers.push(provider); write('identity', config); render(); feedback('Provider added disabled. Complete its registered settings before saving.');
   }));
-  find('[data-add-grant]').addEventListener('click', run(() => { update('identity', config => config.grants.push({ provider_id: '', subject: '', operator_account_id: '', enabled: false })); render(); }));
-  find('[data-add-source]').addEventListener('click', run(() => {
+  find('[data-add-grant]')?.addEventListener('click', run(() => { update('identity', config => config.grants.push({ provider_id: '', subject: '', operator_account_id: '', enabled: false })); render(); }));
+  find('[data-add-source]')?.addEventListener('click', run(() => {
     const config = read('directory'), type = find('[data-source-type]').value, source = { id: randomId('dir_'), name: `New ${type} source`, type, enabled: false, template_ids: [], sync_subscribers: false, records: [], maximum_deactivation_percent: 25 };
     if (type === 'ldap') Object.assign(source, { ldap_url: '', ldap_starttls: true, ldap_bind_dn: '', ldap_password: '', ldap_base_dn: '', ldap_filter: '(objectClass=person)', ldap_attributes: { external_id: 'entryUUID', name: 'displayName', email: 'mail', location: 'l', desktop_username: 'uid', active: '' }, ldap_inactive_values: ['false', '0'], ldap_inactive_mask: 0 });
     if (type === 'scim') Object.assign(source, { scim_base_url: '', scim_token: '', scim_attributes: { external_id: '/id', name: '/displayName', location: '', desktop_username: '' } });
@@ -140,13 +161,13 @@
     const result = await call('directory_preview', value); plan = result.plan_id; confirmationRequired = result.plan.requires_deactivation_confirmation === true;
     find('[data-directory-diff]').textContent = JSON.stringify(result.plan, null, 2); find('[data-deactivation-warning]').hidden = !confirmationRequired; find('[data-apply-directory]').disabled = confirmationRequired;
   };
-  find('[data-preview-directory]').addEventListener('click', run(() => preview(false)));
-  find('[data-preview-deprovision]').addEventListener('click', run(() => preview(true)));
-  find('[data-confirm-deactivation]').addEventListener('change', event => { find('[data-apply-directory]').disabled = !plan || (confirmationRequired && !event.target.checked); });
-  find('[data-apply-directory]').addEventListener('click', run(async () => { if (!plan) throw new Error('Run a dry run first.'); await call('directory_apply', { plan_id: plan, confirm_deactivation: find('[data-confirm-deactivation]').checked }); clearPlan(); location.reload(); }));
-  find('[data-add-subscriber]').addEventListener('click', run(() => { update('subscriber', config => config.people.push({ id: randomId('sub_'), person_id: '', name: '', email: '', enabled: false })); render(); }));
-  find('[data-invite-subscriber-button]').addEventListener('click', run(() => call('subscriber_invite', { subscriber_id: find('[data-invite-subscriber]').value, incident_id: find('[data-invite-incident]').value })));
-  find('[data-revoke-subscriber]').addEventListener('click', run(async () => { const result = await call('subscriber_revoke', { subscriber_id: find('[data-invite-subscriber]').value }); write('subscriber', result.config); boot.revisions.subscriber = result.revision; render(); }));
-  find('[data-browser-key]').addEventListener('click', run(async () => { const result = await call('subscriber_push_key', {}); write('subscriber', result.config); boot.revisions.subscriber = result.revision; render(); }));
+  find('[data-preview-directory]')?.addEventListener('click', run(() => preview(false)));
+  find('[data-preview-deprovision]')?.addEventListener('click', run(() => preview(true)));
+  find('[data-confirm-deactivation]')?.addEventListener('change', event => { find('[data-apply-directory]').disabled = !plan || (confirmationRequired && !event.target.checked); });
+  find('[data-apply-directory]')?.addEventListener('click', run(async () => { if (!plan) throw new Error('Run a dry run first.'); await call('directory_apply', { plan_id: plan, confirm_deactivation: find('[data-confirm-deactivation]').checked }); clearPlan(); location.reload(); }));
+  find('[data-add-subscriber]')?.addEventListener('click', run(() => { update('subscriber', config => config.people.push({ id: randomId('sub_'), person_id: '', name: '', email: '', enabled: false })); render(); }));
+  find('[data-invite-subscriber-button]')?.addEventListener('click', run(() => call('subscriber_invite', { subscriber_id: find('[data-invite-subscriber]').value, incident_id: find('[data-invite-incident]').value })));
+  find('[data-revoke-subscriber]')?.addEventListener('click', run(async () => { const result = await call('subscriber_revoke', { subscriber_id: find('[data-invite-subscriber]').value }); write('subscriber', result.config); boot.revisions.subscriber = result.revision; render(); }));
+  find('[data-browser-key]')?.addEventListener('click', run(async () => { const result = await call('subscriber_push_key', {}); write('subscriber', result.config); boot.revisions.subscriber = result.revision; render(); }));
   render();
 })();

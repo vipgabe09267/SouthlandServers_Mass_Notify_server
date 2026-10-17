@@ -1,4 +1,5 @@
 'use strict';
+const pendingDisplays = new Map();
 self.addEventListener('push', event => {
     event.waitUntil((async () => {
         let alert;
@@ -11,14 +12,20 @@ self.addEventListener('push', event => {
         const ledger = await caches.open('sls-browser-push-v1');
         const key = new Request(new URL('/mass-notify/subscriber.php?event=' + alert.event_id, self.location.origin));
         if (await ledger.match(key)) return;
-        await ledger.put(key, new Response(String(alert.expires_at)));
+        if (pendingDisplays.has(alert.event_id)) return pendingDisplays.get(alert.event_id);
+        const display = (async () => {
+            if (alert.expires_at <= Math.floor(Date.now() / 1000)) return;
+            await self.registration.showNotification('SLS · ' + (alert.is_test ? 'TEST · ' : '') + alert.title,
+                {body: alert.message, tag: alert.event_id, data: {expires_at: alert.expires_at}});
+            await ledger.put(key, new Response(String(alert.expires_at)));
+        })();
+        pendingDisplays.set(alert.event_id, display);
+        try { await display; } finally { pendingDisplays.delete(alert.event_id); }
         const keys = await ledger.keys();
         for (let i = 0; i < keys.length; i++) {
             const stored = await ledger.match(keys[i]);
-            if (i < keys.length - 100 || Number(await stored.text()) <= now) await ledger.delete(keys[i]);
+            if (!stored || i < keys.length - 100 || Number(await stored.text()) <= now) await ledger.delete(keys[i]);
         }
-        await self.registration.showNotification('SLS · ' + (alert.is_test ? 'TEST · ' : '') + alert.title,
-            {body: alert.message, tag: alert.event_id, data: {expires_at: alert.expires_at}});
     })());
 });
 self.addEventListener('notificationclick', event => {

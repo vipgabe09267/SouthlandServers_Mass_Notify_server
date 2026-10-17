@@ -35,12 +35,13 @@ def main():
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid() \
                     or info.st_mode & 0o077 or ROOT in key.resolve().parents:
                 parser.error('Private keys must be owner-private regular files outside the repository.')
-            public = subprocess.run(['/usr/bin/openssl', 'pkey', '-in', str(key), '-pubout'],
-                                    check=True, capture_output=True, timeout=10).stdout
+            key_material = trust.bounded_read(key, private_owner=os.geteuid())
+            public = subprocess.run(['/usr/bin/openssl', 'pkey', '-in', '/dev/stdin', '-pubout'],
+                                    input=key_material, check=True, capture_output=True, timeout=10).stdout
             identifier = trust.key_entry(public)['id']
             signed = Path(temporary) / 'signature'
-            subprocess.run(['/usr/bin/openssl', 'pkeyutl', '-sign', '-rawin', '-inkey', str(key),
-                            '-in', str(body), '-out', str(signed)], check=True, capture_output=True, timeout=10)
+            subprocess.run(['/usr/bin/openssl', 'pkeyutl', '-sign', '-rawin', '-inkey', '/dev/stdin',
+                            '-in', str(body), '-out', str(signed)], input=key_material, check=True, capture_output=True, timeout=10)
             proofs.append({'key_id': identifier, 'signature': base64.b64encode(signed.read_bytes()).decode('ascii')})
     envelope = {'schema': 1, 'policy': policy, 'proofs': proofs}
     # Refuse to overwrite an existing reviewed transition or follow a link.

@@ -10,7 +10,6 @@ import importlib.util
 import os
 import re
 import signal
-import stat
 import subprocess
 import sys
 from datetime import datetime
@@ -28,7 +27,7 @@ _mail_admission = importlib.util.module_from_spec(_mail_spec)
 _mail_spec.loader.exec_module(_mail_admission)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sls_branded_email import (LOGO_PATHS, build_announcement_html,
+from sls_branded_email import (LOGO_PATHS, build_announcement_html, read_logo,
                                normalized_sender_domain, valid_recipient)
 
 MAX_INPUT = 131072
@@ -97,35 +96,6 @@ def validate(payload):
     return created
 
 
-def read_logo(paths):
-    # Branding is optional; malformed/oversized assets never become attachments.
-    for path in paths:
-        descriptor = None
-        try:
-            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-            before = os.fstat(descriptor)
-            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or not 8 <= before.st_size <= MAX_LOGO:
-                continue
-            body = bytearray()
-            while len(body) <= MAX_LOGO:
-                chunk = os.read(descriptor, min(65536, MAX_LOGO + 1 - len(body)))
-                if not chunk:
-                    break
-                body.extend(chunk)
-            after = os.fstat(descriptor)
-            if ((before.st_size, before.st_mtime_ns, before.st_ctime_ns) !=
-                    (after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
-                continue
-            if len(body) == before.st_size and body.startswith(b'\x89PNG\r\n\x1a\n'):
-                return bytes(body)
-        except OSError:
-            continue
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
-    return None
-
-
 def build_message(payload, *, logo_paths=LOGO_PATHS):
     created = validate(payload)
     message = EmailMessage(policy=SMTP.clone(max_line_length=998))
@@ -139,7 +109,7 @@ def build_message(payload, *, logo_paths=LOGO_PATHS):
     message.set_content(payload['message'], subtype='plain', charset='utf-8')
     message.add_alternative(build_announcement_html(payload['title'], payload['message'],
                             is_test=payload['is_test'], severity=payload['severity']), subtype='html', charset='utf-8')
-    logo = read_logo(logo_paths)
+    logo = read_logo(logo_paths, MAX_LOGO)
     if logo is not None:
         message.get_payload()[1].add_related(logo, maintype='image', subtype='png',
                     cid='<sls-mass-notify-logo>', filename='Southland-Servers-Group.png', disposition='inline')

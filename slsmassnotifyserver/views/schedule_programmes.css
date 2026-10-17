@@ -1,22 +1,22 @@
-.sls-programmes { margin: 18px 0; border: 1px solid #dfe5ec; border-radius: 8px; background: #fff; }
+.sls-programmes { margin: 18px 0; border: 1px solid var(--sls-border,#dfe5ec); border-radius: 8px; background: var(--sls-surface,#fff); color: var(--sls-text,#263246); }
 .sls-programmes > summary { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 14px 16px; cursor: pointer; font-weight: 600; }
-.sls-programme-count { color: #64748b; font-size: 12px; font-weight: 400; white-space: nowrap; }
+.sls-programme-count { color: var(--sls-muted,#64748b); font-size: 12px; font-weight: 400; white-space: nowrap; }
 .sls-programmes-body { padding: 0 16px 16px; }
 .sls-programme-switch { display: flex; align-items: center; gap: 8px; margin: 14px 0; font-weight: 400; }
-.sls-programme-card { margin: 12px 0; border: 1px solid #dfe5ec; border-radius: 7px; background: #f8fafc; }
+.sls-programme-card { margin: 12px 0; border: 1px solid var(--sls-border,#dfe5ec); border-radius: 7px; background: var(--sls-bg,#f8fafc); }
 .sls-programme-card > summary { padding: 12px 14px; cursor: pointer; font-weight: 600; overflow-wrap: anywhere; }
 .sls-programme-editor { padding: 0 14px 14px; }
 .sls-programme-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px; }
 .sls-programme-field { display: block; margin: 0; font-weight: 600; }
 .sls-programme-field .form-control { margin-top: 5px; font-weight: 400; }
-.sls-programme-field small { display: block; color: #64748b; margin-top: 5px; font-weight: 400; }
+.sls-programme-field small { display: block; color: var(--sls-muted,#64748b); margin-top: 5px; font-weight: 400; }
 .sls-programme-days, .sls-programme-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
-.sls-programme-days label { margin: 0; padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 5px; font-weight: 400; background: #fff; }
-.sls-programme-empty { padding: 14px; color: #64748b; border: 1px dashed #cbd5e1; border-radius: 6px; }
+.sls-programme-days label { margin: 0; padding: 6px 10px; border: 1px solid var(--sls-border,#cbd5e1); border-radius: 5px; font-weight: 400; background: var(--sls-surface,#fff); }
+.sls-programme-empty { padding: 14px; color: var(--sls-muted,#64748b); border: 1px dashed var(--sls-border,#cbd5e1); border-radius: 6px; }
 .sls-programme-table { width: 100%; margin: 12px 0; table-layout: fixed; }
 .sls-programme-table th, .sls-programme-table td { padding: 5px; vertical-align: top; }
-.sls-programme-table th { color: #475569; font-size: 12px; }
+.sls-programme-table th { color: var(--sls-muted,#475569); font-size: 12px; }
 .sls-programme-table th:last-child { width: 46px; }
 .sls-programme-table .form-control { min-width: 0; }
-.sls-programme-notice { margin: 10px 0; padding: 10px 12px; border-left: 3px solid #7c3aed; background: #f5f3ff; color: #5b21b6; }
+.sls-programme-notice { margin: 10px 0; padding: 10px 12px; border-left: 3px solid var(--sls-gold,#7c3aed); background: var(--sls-raised,#f5f3ff); color: var(--sls-text,#5b21b6); }
 @media (max-width: 640px) { .sls-programme-grid { grid-template-columns: 1fr; } .sls-programme-actions .btn { flex: 1 1 auto; } .sls-programme-table { font-size: 12px; } }

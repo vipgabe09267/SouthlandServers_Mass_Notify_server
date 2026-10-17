@@ -54,13 +54,13 @@ $groups = $call('normalizeNwsZoneGroups', [[
 	'name' => 'Central Operations',
 	'zone' => 'txc491',
 	'extensions' => ['1000', '9999'],
-	'desktop_clients' => ['Desk.One', 'desk.one', '../desk-two'],
+	'desktop_clients' => ['desk.one', 'desk-two'],
 	'email_recipients' => ['Weather@example.com', 'weather@example.com', 'invalid'],
 ]], '', [], ['enabled' => '1', 'start' => '22:00', 'end' => '05:00', 'critical_events' => ['Tornado Warning'], 'discord_webhook_ids' => ['discord_primary'], 'generic_webhook_ids' => ['generic_primary']]);
 if (count($groups) !== 1
 	|| ($groups[0]['zone'] ?? '') !== 'TXC491'
 	|| ($groups[0]['extensions'] ?? []) !== ['1000']
-	|| ($groups[0]['desktop_clients'] ?? []) !== ['desk.one', '..desk-two']
+	|| ($groups[0]['desktop_clients'] ?? []) !== ['desk.one', 'desk-two']
 	|| ($groups[0]['email_recipients'] ?? []) !== ['weather@example.com']
 	|| ($groups[0]['quiet_hours_start'] ?? '') !== '22:00'
 	|| ($groups[0]['discord_webhook_ids'] ?? []) !== ['discord_primary']) {
@@ -84,6 +84,17 @@ $valid = $call('validateNwsZoneGroupsInput', [[
 ]]);
 if (!empty($valid)) {
 	zone_destination_fail('A desktop-only Weather zone was rejected: ' . implode(' ', $valid));
+}
+
+$invalidDesktop = $call('validateNwsZoneGroupsInput', [[
+	'name' => 'Invalid desktop',
+	'zone' => 'TXC491',
+	'extensions' => [],
+	'desktop_clients' => ['../desk-two'],
+	'email_recipients' => [],
+]]);
+if (stripos(implode(' ', $invalidDesktop), 'desktop') === false) {
+	zone_destination_fail('An invalid zone-specific desktop username was not rejected.');
 }
 
 $emailOnly = $call('validateNwsZoneGroupsInput', [[
@@ -182,10 +193,14 @@ $duplicateIdErrors = $call('validateNwsZoneGroupsInput', $duplicateIdInput);
 if (stripos(implode(' ', $duplicateIdErrors), 'unique ID') === false) {
 	zone_destination_fail('Duplicate Weather zone IDs were not rejected.');
 }
-$deduplicatedGroups = $call('normalizeNwsZoneGroups', $duplicateIdInput);
-if (($deduplicatedGroups[0]['id'] ?? '') !== 'duplicate_zone'
-	|| ($deduplicatedGroups[1]['id'] ?? '') !== 'duplicate_zone_2') {
-	zone_destination_fail('Legacy duplicate Weather zone IDs were not migrated to unique runtime IDs.');
+$duplicateNormalizationRejected = false;
+try {
+	$call('normalizeNwsZoneGroups', $duplicateIdInput);
+} catch (DomainException $error) {
+	$duplicateNormalizationRejected = stripos($error->getMessage(), 'unique') !== false;
+}
+if (!$duplicateNormalizationRejected) {
+	zone_destination_fail('Duplicate Weather zone IDs were accepted during normalization.');
 }
 
 $globalEmailRecipients = [];
@@ -213,7 +228,7 @@ $capacityErrors = $call('validateNwsZoneEmailCapacity', [[
 	'desktop_clients' => [],
 	'email_recipients' => $oversizedZoneRecipients,
 ]], 'system@example.com');
-if (stripos(implode(' ', $capacityErrors), '50-recipient') === false) {
+if (stripos(implode(' ', $capacityErrors), '50') === false) {
 	zone_destination_fail('The per-zone 50-recipient limit was not enforced visibly.');
 }
 

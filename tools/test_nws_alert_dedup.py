@@ -96,7 +96,7 @@ for marker in (
     "parsed_alerts.append((issued_key, type_order, source_index, values))",
     "for _issued, _type_order, _source_index, values in sorted(parsed_alerts):",
     "NWS_AUDIO_DELIVERY_LOCK",
-    "/usr/bin/flock -w 3300",
+    'start_nws_lock "$NWS_AUDIO_DELIVERY_LOCK" 3300 NWS_AUDIO_LOCK_FD',
     "release_audio_delivery_slot",
     "MaxRetries: 0",
 ):
@@ -241,6 +241,7 @@ def run_live_poller_case(
     force_replay=False,
     external_only=False,
     mail_rejected=False,
+    large_geometry=False,
 ):
     """Exercise the real shell flow with local-only fakes and no network."""
     with tempfile.TemporaryDirectory(prefix=f"sls-nws-intent-{case_name}-") as directory:
@@ -275,6 +276,10 @@ def run_live_poller_case(
             }),
             encoding="utf-8",
         )
+        if large_geometry:
+            collection = json.loads(payload_path.read_text())
+            collection['features'][0]['geometry'] = {'type': 'LineString', 'coordinates': [[41, -90]] * 10000}
+            payload_path.write_text(json.dumps(collection))
         config_path = root / "mass-notifications.config"
         config_path.write_text('{"enabled":"1"}\n', encoding="utf-8")
         loader_path = root / "config-loader.py"
@@ -592,6 +597,12 @@ assert fresh_key in fresh_processed
 assert fresh_status["last_delivery_status"] == "queued"
 assert fresh_key in json.loads(fresh_local)["intents"]
 assert fresh_external
+
+large_status, large_processed, large_visual, _, large_key, large_external, _ = run_live_poller_case(
+    'large-feature', large_geometry=True
+)
+assert large_visual == [large_key] and large_key in large_processed and large_external
+assert large_status['last_delivery_status'] == 'queued', large_status
 
 mail_status, mail_processed, mail_visual, _, mail_key, mail_external, _ = run_live_poller_case(
     "oversize-mail", mail_rejected=True

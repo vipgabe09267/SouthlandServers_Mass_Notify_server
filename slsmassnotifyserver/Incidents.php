@@ -79,7 +79,9 @@ trait SlsIncidents
             $batch=$operation['language_jobs'][$context['language_batch']-1] ?? null;
             $prior=is_array($operation) ? array_slice($operation['language_jobs'] ?? [],0,$context['language_batch']-1) : [];
             return is_array($operation) && is_array($batch) && $operation['state']==='submitting'
-                && (bool)array_filter($prior,static fn(array $row):bool=>$row['state']==='queued' && preg_match('/^job_[a-f0-9]{32}$/D',$row['job_id']))
+                && count($prior)===$context['language_batch']-1
+                && !array_filter($prior,static fn($row):bool=>!is_array($row) || ($row['state'] ?? '')!=='queued'
+                    || !is_string($row['job_id'] ?? null) || !preg_match('/^job_[a-f0-9]{32}$/D',$row['job_id']))
                 && $batch['state']==='submitting' && $operation['sequence']===$context['sequence']
                 && $operation['kind']===$context['kind'] && count($operation['language_jobs'])===$context['language_batches']
                 && $batch['locale']===$context['language_variant'] && $batch['delivery']===$proof['delivery']
@@ -122,12 +124,21 @@ trait SlsIncidents
     protected function incidentLanguageApprovalMaySubmit(array $request): bool
     {
         $context=$request['incident_context'] ?? null;
-        if (!is_array($context) || !isset($context['operation_request_id'])) { return true; }
+        if (!is_array($context)) { return true; }
         try {
             IncidentConfig::context($context);$record=$this->incidentStore()->read($context['incident_id']);
+            if (!is_array($record) || $record['state']!=='open'
+                || count($record['timeline']) + IncidentStore::pendingApprovalCount($record) > 4000) { return false; }
+            if (!isset($context['operation_request_id'])) {
+                foreach ($record['operations'] as $operation) {
+                    if (is_array($operation) && $operation['state']==='awaiting_approval' && $operation['sequence']===$context['sequence']
+                        && $operation['kind']===$context['kind'] && ($operation['review_id'] ?? '')===($request['_enterprise_approval']['id'] ?? '')) { return true; }
+                }
+                return false;
+            }
             $operation=$record['operations'][$context['operation_request_id']] ?? null;
             $batch=$operation['language_jobs'][$context['language_batch']-1] ?? null;
-            return is_array($record) && $record['state']==='open' && is_array($operation) && is_array($batch)
+            return is_array($operation) && is_array($batch)
                 && $operation['sequence']===$context['sequence'] && $operation['kind']===$context['kind']
                 && count($operation['language_jobs'])===$context['language_batches'] && $batch['locale']===$context['language_variant']
                 && $batch['state']==='awaiting_approval' && ($batch['review_id'] ?? '')===($request['_enterprise_approval']['id'] ?? '')
@@ -144,14 +155,17 @@ trait SlsIncidents
             if (!\SLS\MassNotify\ApiSecurity::groupDesktopBindingsValid($groups[$id], $settings)) {
                 throw new \InvalidArgumentException('A desktop identity in the location audience changed. Create a new reviewed audience from Locations.');
             }
-            foreach (['extensions', 'desktop_clients', 'voice_recipient_ids', 'email_recipient_ids', 'sms_recipient_ids', 'webhook_ids'] as $key) {
+            if (!\SLS\MassNotify\ApiSecurity::groupLabsBindingsValid($groups[$id],$settings)) { throw new \InvalidArgumentException('A browser or connector enrollment in this audience changed. Review its saved members before sending.'); }
+            foreach (['extensions', 'desktop_clients', 'voice_recipient_ids', 'email_recipient_ids', 'sms_recipient_ids', 'webhook_ids','browser_recipient_ids','connector_ids'] as $key) {
                 $delivery[$key] = array_values(array_unique(array_merge($delivery[$key], array_map('strval', $groups[$id][$key] ?? []))));
             }
         }
         $delivery['group_ids'] = [];
         $extensions = array_map('strval', $this->getConfiguredPjsipExtensionNumbers());
         if (array_diff($delivery['extensions'], $extensions)) { throw new \InvalidArgumentException('An incident phone extension no longer exists. Update its template.'); }
-        $identities = ['desktop_clients' => [], 'voice_recipient_ids' => [], 'webhook_ids' => [], 'email_recipient_ids' => [], 'sms_recipient_ids' => []];
+        $identities = ['desktop_clients' => [], 'voice_recipient_ids' => [], 'webhook_ids' => [], 'email_recipient_ids' => [], 'sms_recipient_ids' => [],'browser_recipient_ids'=>[],'connector_ids'=>[]];
+        $labs=\SLS\MassNotify\ApiSecurity::labsBindings($delivery,$settings);
+        foreach ($labs as $field=>$bindings) { $identities[$field]=$bindings; }
         $desktops = [];
         foreach ($this->getDesktopClients($settings) as $client) {
             if (!empty($client['enabled'])) {
@@ -266,6 +280,9 @@ trait SlsIncidents
             $frozenIdentities['email_recipient_ids'] = [];
         }
         if (is_array($frozenIdentities) && !array_key_exists('sms_recipient_ids',$frozenIdentities) && !$delivery['sms_recipient_ids']) { $frozenIdentities['sms_recipient_ids']=[]; }
+        foreach (['browser_recipient_ids','connector_ids'] as $field) {
+            if (is_array($frozenIdentities) && !array_key_exists($field,$frozenIdentities) && !$delivery[$field]) { $frozenIdentities[$field]=[]; }
+        }
         // Additive empty channels must not invalidate an older snapshot solely
         // because PHP's strict array comparison also compares map key order.
         if (is_array($frozenIdentities)) { ksort($frozenIdentities); }
@@ -288,7 +305,8 @@ trait SlsIncidents
             $principal = \SLS\MassNotify\ApiSecurity::currentCredential($settings, $actor['credential_id']);
             $resolved = ['phones' => $delivery['extensions'], 'desktops' => $delivery['desktop_clients'],
                 'webhooks' => $delivery['webhook_ids'], 'voice_recipient_ids' => $delivery['voice_recipient_ids'],
-                'email_recipient_ids' => $delivery['email_recipient_ids'], 'sms_recipient_ids' => $delivery['sms_recipient_ids']];
+                'email_recipient_ids' => $delivery['email_recipient_ids'], 'sms_recipient_ids' => $delivery['sms_recipient_ids'],
+                'browser_recipient_ids'=>$delivery['browser_recipient_ids'], 'connector_ids'=>$delivery['connector_ids']];
             if (!is_array($principal) || !\SLS\MassNotify\ApiSecurity::permitsResolvedAnnouncement($principal, $resolved, $settings)) {
                 return ['success' => false, 'delivery_started' => false, 'message' => 'The originating API credential was revoked, disabled or no longer permits this incident audience. No announcement was submitted.'];
             }
@@ -311,6 +329,7 @@ trait SlsIncidents
             in_array($delivery['audio_mode'], ['tts', 'tones_tts'], true), [], [
                 'desktop_clients' => $delivery['desktop_clients'], 'voice_recipient_ids' => $delivery['voice_recipient_ids'],
                 'email_recipient_ids' => $delivery['email_recipient_ids'], 'sms_recipient_ids' => $delivery['sms_recipient_ids'], 'webhook_ids' => $delivery['webhook_ids'], 'audio_mode' => $delivery['audio_mode'],
+                'browser_recipient_ids'=>$delivery['browser_recipient_ids'], 'connector_ids'=>$delivery['connector_ids'],
                 'opening_tone' => $delivery['opening_tone'], 'closing_tone' => $delivery['closing_tone'],
                 'piper_voice' => $speech['path'] ?? '',
                 'style' => $delivery['style'], 'background_color' => $delivery['background_color'], 'title' => $title,
@@ -462,6 +481,7 @@ trait SlsIncidents
     public function renderIncidentsPage(array $params = []): string
     {
         $settings = $this->getPendingSettings() ?? $this->getActiveSettings();
+        $directory = \SLS\MassNotify\LocationDirectory::effective($settings['location_directory'] ?? []);
         $choices = ['extensions' => [], 'desktop_clients' => [], 'group_ids' => [], 'voice_recipient_ids' => [], 'webhook_ids' => [], 'email_recipient_ids' => [], 'sms_recipient_ids' => []];
         foreach ($this->getExtensionNameMap() as $id => $name) { $choices['extensions'][] = ['id' => (string)$id, 'name' => $id . ' · ' . $name]; }
         foreach ($this->getDesktopClients($settings) as $row) { if (!empty($row['enabled'])) { $choices['desktop_clients'][] = ['id' => $row['username'], 'name' => $row['name'] . ' · ' . $row['username']]; } }
@@ -471,8 +491,12 @@ trait SlsIncidents
         $emailNames = array_column((array)($settings['announcement_email']['recipients'] ?? []), 'name', 'id');
         foreach ($this->announcementEmailTargets($settings) as $id => $row) { $choices['email_recipient_ids'][] = ['id' => $id, 'name' => $emailNames[$id] ?? $id]; }
         foreach (\SLS\MassNotify\Sms\Service::targets($settings) as $id=>$row) { $choices['sms_recipient_ids'][]=['id'=>$id,'name'=>$row['name']]; }
+        foreach (\SLS\MassNotify\ApiSecurity::labsDirectory($settings) as $field=>$rows) {
+            $choices[$field]=[];
+            foreach ($rows as $id=>$row) { if ($row['available']) { $choices[$field][]=['id'=>$id,'name'=>$row['label']]; } }
+        }
         return load_view(__DIR__ . '/views/incidents.php', ['templates' => $this->incidentTemplates(true), 'active_templates' => $this->incidentTemplates(),
-            'choices' => $choices + ['locations'=>array_map(static fn(array $row): array => ['id'=>$row['id'], 'name'=>\SLS\MassNotify\LocationDirectory::path(\SLS\MassNotify\LocationDirectory::effective($settings['location_directory'] ?? []), $row['id'])], \SLS\MassNotify\LocationDirectory::effective($settings['location_directory'] ?? [])['nodes'])], 'tones' => $this->getAvailableTones(), 'listing' => $this->listIncidents(50, is_string($params['cursor'] ?? null) ? $params['cursor'] : '', ($params['archived'] ?? false) === true),
+            'choices' => $choices + ['locations'=>array_map(static fn(array $row): array => ['id'=>$row['id'], 'name'=>\SLS\MassNotify\LocationDirectory::path($directory, $row['id'])], $directory['nodes'])], 'tones' => $this->getAvailableTones(), 'listing' => $this->listIncidents(50, is_string($params['cursor'] ?? null) ? $params['cursor'] : '', ($params['archived'] ?? false) === true),
             'retention' => IncidentConfig::retention($settings['incident_workflows']['retention'] ?? []), 'recipient_languages'=>IncidentConfig::recipientLanguages($settings['incident_workflows']['recipient_languages'] ?? []), 'active_recipient_languages'=>IncidentConfig::recipientLanguages($this->getActiveSettings()['incident_workflows']['recipient_languages'] ?? []), 'show_archived' => ($params['archived'] ?? false) === true,
             'incident' => !empty($params['incident_id']) ? $this->getIncident((string)$params['incident_id']) : null,
             'save_result' => $params['save_result'] ?? null, 'csrf_token' => $this->getCsrfToken(), 'hero_image' => self::HERO_IMAGE]);

@@ -6,7 +6,7 @@ final class RecipientSelection
     public const FIELDS = [
         'send_announcement' => ['announcement_extensions', 'announcement_groups', 'announcement_desktop_clients', 'announcement_webhooks', 'voice_recipient_ids', 'announcement_email_recipient_ids', 'announcement_sms_recipient_ids'],
         'save_announcement_group' => ['group_extensions', 'group_desktop_clients', 'group_voice_recipient_ids', 'group_email_recipient_ids', 'group_sms_recipient_ids', 'group_webhook_ids'],
-        'save_scheduled_announcement' => ['schedule_extensions', 'schedule_groups', 'schedule_desktop_clients', 'schedule_voice_recipient_ids', 'schedule_email_recipient_ids', 'schedule_sms_recipient_ids', 'schedule_webhook_ids'],
+        'save_scheduled_announcement' => ['schedule_extensions', 'schedule_groups', 'schedule_desktop_clients', 'schedule_voice_recipient_ids', 'schedule_email_recipient_ids', 'schedule_sms_recipient_ids', 'schedule_webhook_ids', 'schedule_browser_recipient_ids', 'schedule_connector_ids'],
     ];
 
     public static function decode(array $input): array
@@ -19,6 +19,11 @@ final class RecipientSelection
         }
         $value = json_decode($raw, true, 8);
         $fields = self::FIELDS[$action];
+        if (is_array($value)) {
+            foreach (['schedule_browser_recipient_ids','schedule_connector_ids'] as $field) {
+                if (in_array($field,$fields,true) && !array_key_exists($field,$value)) { $value[$field]=$input[$field]??[]; }
+            }
+        }
         if (is_array($value)) { foreach ($fields as $field) { if ((str_ends_with($field,'_sms_recipient_ids') || str_ends_with($field, '_webhook_ids')) && !array_key_exists($field,$value)) { $value[$field]=[]; } } }
         if (!is_array($value) || array_diff(array_keys($value), $fields) || array_diff($fields, array_keys($value))) {
             throw new \DomainException('The recipient selection is invalid or missing fields. Reload the page and select the recipients again.');
@@ -33,6 +38,12 @@ final class RecipientSelection
             $smsField = str_ends_with($field,'_sms_recipient_ids');
             if ($smsField && count($items)>50) { throw new \DomainException('Select at most 50 saved SMS recipients.'); }
             foreach ($items as $item) {
+                if (str_ends_with($field,'_browser_recipient_ids') && (!is_string($item) || !preg_match('/^sub_[a-f0-9]{24}$/D',$item))) {
+                    throw new \DomainException('Select saved browser subscriber IDs.');
+                }
+                if (str_ends_with($field,'_connector_ids') && (!is_string($item) || !preg_match('/^conn_[a-f0-9]{24}$/D',$item))) {
+                    throw new \DomainException('Select saved notification connector IDs.');
+                }
                 if ($smsField && (!is_string($item) || !preg_match('/^sms_[a-f0-9]{24}$/D',$item))) { throw new \DomainException('Select saved SMS recipients from General Settings.'); }
                 if ($emailField && (!is_string($item) || !preg_match('/^email_[a-f0-9]{24}$/D', $item))) { throw new \DomainException('An email recipient ID is invalid. Select saved email recipients from General Settings.'); }
                 if (!is_string($item) || $item === '' || strlen($item) > 100 || preg_match('/[\x00-\x20\x7f]/', $item)) {

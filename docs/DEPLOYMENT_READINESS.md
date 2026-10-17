@@ -32,7 +32,7 @@ not refresh either heartbeat.
 ## Monitor from a separate host
 
 An unrestricted, named Control API credential with only the **read** permission
-can request `GET /api/sls-mass-notify?resource=readiness` over the configured
+can request `GET /api/sls-mass-notify/?resource=readiness` over the configured
 HTTPS address, using the existing bearer authentication. Keep that credential in
 the monitor's secret store. Enabling the Control API or creating credentials
 remains an explicit administrator action.

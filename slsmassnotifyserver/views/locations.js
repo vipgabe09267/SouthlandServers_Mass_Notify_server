@@ -9,7 +9,7 @@
     const children = {site: 'building', building: 'floor', floor: 'room'};
     const channels = {
         extensions: ['Phones', 'phone'], desktop_client_ids: ['Desktops', 'desktop'],
-        voice_recipient_ids: ['External voice', 'volume-up'], email_recipient_ids: ['Email', 'envelope'], sms_recipient_ids: ['SMS', 'comment'], webhook_ids: ['Webhooks', 'link']
+        voice_recipient_ids: ['External voice', 'volume-up'], email_recipient_ids: ['Email', 'envelope'], sms_recipient_ids: ['SMS', 'comment'], webhook_ids: ['Webhooks', 'link'], browser_recipient_ids: ['Browser subscribers · Labs', 'flask'], connector_ids: ['Notification connectors · Labs', 'flask']
     };
     let state = data.state, selectedId = '', draft = null, dirty = false, inflight = false, preview = null, geography = null, audiences = null, recipientsDirty = false;
     const clone = value => JSON.parse(JSON.stringify(value));
@@ -234,7 +234,7 @@
             channels: Array.from(el('channels').querySelectorAll('input:checked')).map(input => input.value)};
     }
     el('form').addEventListener('submit', save);
-    ['name', 'description', 'parent'].forEach(name => el(name).addEventListener('input', changed));
+    ['name', 'description', 'parent', 'weather-zone'].forEach(name => el(name).addEventListener('input', changed));
     el('type').addEventListener('change', () => { draft.type = el('type').value; renderParents(''); renderPosition(); changed(); });
     el('parent').addEventListener('change', renderPosition);
     el('own-position').addEventListener('change', () => { renderPosition(); changed(); });

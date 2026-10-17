@@ -3,15 +3,18 @@ declare(strict_types=1);
 require dirname(__DIR__) . '/slsmassnotifyserver/AnnouncementEmail.php';
 // Load the actual pure sender normalizers without PBX bootstrap or settings I/O.
 $source = file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/Slsmassnotifyserver.class.php');
+if (!is_string($source)) { throw new RuntimeException('Unable to read sender normalizers.'); }
 $methods = '';
 foreach (['normalizeEmailSenderDomain', 'normalizeEmailSenderLocalPart'] as $name) {
-    if (!preg_match('/\tprivate function ' . $name . '\([^\n]*\)\n\t\{.*?\n\t\}/s', $source, $match)) throw new RuntimeException('Missing sender normalizer');
-    $methods .= $match[0] . "\n";
+    $matches=[];
+    $count=preg_match_all('/\tprivate function ' . preg_quote($name,'/') . '\([^\n]*\)\n\t\{.*?\n\t\}/s', $source, $matches);
+    if ($count !== 1 || !isset($matches[0][0])) { throw new RuntimeException('Expected exactly one sender normalizer: '.$name); }
+    $methods .= $matches[0][0] . "\n";
 }
 eval('class AnnouncementEmailFixture { use \\FreePBX\\modules\\SlsAnnouncementEmail; public $settings=[]; private function getActiveSettings(){return $this->settings;} public function norm($v,$create=false){return $this->normalizeAnnouncementEmail($v,$create);} public function valid($v){return $this->validateAnnouncementEmail($v);} public function form($v,$current=[]){return $this->readAnnouncementEmailForm($v,$current);} public function targets($v){return $this->announcementEmailTargets($v);} public function fingerprint($v){return $this->announcementEmailFingerprint($v);} public function ids($v){return $this->validateAnnouncementEmailRecipientIds($v);} ' . $methods . '}');
 $f = new AnnouncementEmailFixture(); $checks=0;
-$check = static function ($ok, $message) use (&$checks) { $checks++; if (!$ok) throw new RuntimeException($message); };
-$reject = static function ($fn, $message) use ($check) { try { $fn(); } catch (DomainException $e) { $check(true,$message); return; } $check(false,$message); };
+$check = static function (bool $ok, string $message) use (&$checks): void { $checks++; if (!$ok) throw new RuntimeException($message); };
+$reject = static function (callable $fn, string $message) use ($check): void { try { $fn(); } catch (DomainException $e) { $check($e->getMessage()!=='',$message); return; } $check(false,$message); };
 $id = 'email_' . str_repeat('a',24);
 $row = ['id'=>$id, 'name'=>'Front office', 'address'=>'office@example.com', 'enabled'=>'1'];
 $config = ['enabled'=>'1','recipients'=>[$row]];

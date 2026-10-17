@@ -1,5 +1,13 @@
 <?php
 declare(strict_types=1);
+foreach (['MOUNT'=>'mnt', 'NET'=>'net', 'PID'=>'pid'] as $label=>$kind) {
+    $parent=getenv('SLS_TEST_PARENT_'.$label.'_NS');
+    $current=@readlink('/proc/self/ns/'.$kind);
+    if (getenv('SLS_TEST_NAMESPACE')!=='entered' || !is_string($parent) || $parent==='' || !is_string($current) || $parent===$current) {
+        fwrite(STDERR, "Use the private fixture runner; no PBX configuration was changed.\n");
+        exit(1);
+    }
+}
 require dirname(__DIR__) . '/slsmassnotifyserver/DeploymentAcceptance.php';
 use SLS\MassNotify\DeviceAcceptance;
 $checks = 0;
@@ -23,13 +31,30 @@ foreach (DeviceAcceptance::CHECKS as $type => $behavior) {
 }
 $settings = ['public_pbx_host' => 'fixture.example', 'private_token' => 'fixture-private-never-exported', 'nested' => ['b' => 2, 'a' => 1]];
 $record = $observed + ['id' => 'dtest_' . str_repeat('a', 24), 'target_label' => '1000 fixture', 'recorded_at' => gmdate('c', $now),
-    'recorded_by' => 'test-admin', 'module_version' => '0.1.5-beta', 'configuration_fingerprint' => DeviceAcceptance::fingerprint($settings, '0.1.5-beta')];
+    'recorded_by' => 'test-admin', 'module_version' => '0.1.5-beta', 'configuration_fingerprint' => DeviceAcceptance::fingerprint($settings, '0.1.5-beta', 'phone', '1000')];
 $settings['device_acceptance'] = ['schema' => 1, 'records' => [$record], 'retired_records' => 0];
 $report = DeviceAcceptance::report($settings, '0.1.5-beta', $now);
 device_check($report['current_counts']['passed'] === 1 && !$report['records'][0]['configuration_changed'], 'Current passing observation not projected.');
 device_check(!str_contains(json_encode($report), 'fixture-private-never-exported') && !isset($report['records'][0]['configuration_fingerprint']), 'Configuration data/digest escaped into the report.');
 $reordered = ['nested' => ['a' => 1, 'b' => 2], 'private_token' => $settings['private_token'], 'public_pbx_host' => $settings['public_pbx_host']];
-device_check(DeviceAcceptance::fingerprint($reordered, '0.1.5-beta') === $record['configuration_fingerprint'], 'Object key order invalidated the observation.');
+device_check(DeviceAcceptance::fingerprint($reordered, '0.1.5-beta', 'phone', '1000') === $record['configuration_fingerprint'], 'Object key order invalidated the observation.');
+$irrelevant = $settings;
+$irrelevant['operator_access'] = ['accounts' => [['id' => 'op_fixture', 'auth' => ['password_hash' => 'rotated', 'totp_last_counter' => 99]]]];
+$irrelevant['control_api'] = ['credentials' => [['id' => 'api_fixture', 'secret_hash' => 'rotated']]];
+$irrelevant['updates'] = ['channel' => 'testing'];
+$irrelevant['announcement_sms'] = ['provider' => 'twilio', 'api_secret' => 'rotated'];
+device_check(DeviceAcceptance::report($irrelevant, '0.1.5-beta', $now)['current_counts']['passed'] === 1,
+    'Unrelated authentication, update policy or SMS credentials invalidated a phone observation.');
+$desktopSettings = ['desktop_auth_key' => base64_encode(str_repeat('d', 32)), 'desktop_minimum_version' => '1.0.10-beta',
+    'desktop_clients' => [['client_id' => 'cli_' . str_repeat('c', 24), 'username' => 'desktop-user', 'name' => 'Desk one', 'enabled' => true]]];
+$desktopId = $desktopSettings['desktop_clients'][0]['client_id'];
+$desktopFingerprint = DeviceAcceptance::fingerprint($desktopSettings, '0.1.5-beta', 'desktop', $desktopId);
+$desktopSettings['desktop_clients'][0]['enabled'] = false;
+device_check(!hash_equals($desktopFingerprint, DeviceAcceptance::fingerprint($desktopSettings, '0.1.5-beta', 'desktop', $desktopId)),
+    'Changing the selected desktop enrollment did not invalidate its qualification fingerprint.');
+$desktopSettings['desktop_clients'][0]['enabled'] = true; $desktopSettings['desktop_clients'][0]['name'] = 'Desk renamed';
+device_check(!hash_equals($desktopFingerprint, DeviceAcceptance::fingerprint($desktopSettings, '0.1.5-beta', 'desktop', $desktopId)),
+    'Desktop qualification was not bound to its immutable client identity.');
 $changed = $settings; $changed['public_pbx_host'] = 'changed.example';
 device_check(DeviceAcceptance::report($changed, '0.1.5-beta', $now)['current_counts']['review_required'] === 1, 'Changed settings silently retained qualification.');
 device_check(DeviceAcceptance::report($settings, '0.1.4-beta', $now)['current_counts']['review_required'] === 1, 'Changed SLS version did not request review.');
@@ -78,21 +103,26 @@ class DeviceTestFixture {
  use SlsDeploymentAcceptance;
  const NATIVE_BACKUP_MAX_CONFIG_BYTES=4194304;
  const MODULE_VERSION="0.1.5-beta"; const SETTINGS_JSON=' . var_export($root . '/active.json', true) . '; const PENDING_SETTINGS_JSON=' . var_export($root . '/pending.json', true) . ';
- public string $role="administrator"; public bool $fail=false; public int $writes=0; public int $catalogCalls=0;
+ public string $role="administrator"; public bool $fail=false; public bool $changeCatalogOnLock=false; public string $failPath=""; public int $writes=0; public int $catalogCalls=0; public int $catalogGeneration=0;
  function currentOperator(){return ["operator_role"=>$this->role,"username"=>"test-admin"];}
  function getActiveSettings(){ $value=$this->loadSettingsFile(self::SETTINGS_JSON); $value["phone_device_limit"]=(int)$value["phone_device_limit"]; return $value+["normalizer_only_default"=>true]; }
  function loadSettingsFile($path){return json_decode(file_get_contents($path),true,32,JSON_THROW_ON_ERROR);}
- function locationCatalog($settings){$this->catalogCalls++;return ["extensions"=>["1000"=>["label"=>"1000 fixture"]],"desktop_client_ids"=>["cli_fixture"=>["label"=>"Fixture desktop"]]];}
- function acquireSettingsLock($wait){$h=fopen(' . var_export($root . '/settings.lock', true) . ',"c+b");flock($h,LOCK_EX);return $h;}
+ function locationCatalog($settings){$this->catalogCalls++;return ["extensions"=>["1000"=>["label"=>"1000 fixture ".$this->catalogGeneration]],"desktop_client_ids"=>["cli_fixture"=>["label"=>"Fixture desktop"]]];}
+ function acquireSettingsLock($wait){$h=fopen(' . var_export($root . '/settings.lock', true) . ',"c+b");flock($h,LOCK_EX);if($this->changeCatalogOnLock){$this->catalogGeneration++;}return $h;}
  function releaseSettingsLock($handle){flock($handle,LOCK_UN);fclose($handle);}
- function writeSettingsFileUnlocked($path,$data,$backup){if($this->fail)throw new \\RuntimeException("private path must not escape");$this->writes++;file_put_contents($path,json_encode($data,JSON_THROW_ON_ERROR));}
+ function writeSettingsFileUnlocked($path,$data,$backup){if($this->fail||$path===$this->failPath)throw new \\RuntimeException("private path must not escape");$this->writes++;file_put_contents($path,json_encode($data,JSON_THROW_ON_ERROR));}
  function __call($name,$args){throw new \\RuntimeException("Unexpected action: ".$name);}
  ' . $snapshotSource . '}');
 $base = ['public_pbx_host' => 'fixture.example', 'preserved_secret' => 'private-placeholder', 'phone_device_limit' => '25'];
 $pending = $base + ['pending_owner_change' => ['keep' => true]];
-file_put_contents($root . '/active.json', json_encode($base)); file_put_contents($root . '/pending.json', json_encode($pending));
+file_put_contents($root . '/active.json', json_encode($base));chmod($root . '/active.json',0600);
+file_put_contents($root . '/pending.json', json_encode($pending));chmod($root . '/pending.json',0600);
 $fixture = new FreePBX\modules\DeviceTestFixture(); $state = $fixture->deviceAcceptanceState();
 device_check($state['success'] && $fixture->catalogCalls === 1 && $fixture->writes === 0, 'State repeats device discovery or performs a write.');
+$fixture->changeCatalogOnLock = true; $writes = $fixture->writes;
+$raced = $fixture->recordDeviceAcceptance($input + ['revision' => $state['revision']]);
+device_check(($raced['error_code'] ?? '') === 'configuration_changed' && $fixture->writes === $writes, 'A recipient identity changed at lock acquisition but was still qualified.');
+$fixture->changeCatalogOnLock = false; $state = $fixture->deviceAcceptanceState();
 $saved = $fixture->recordDeviceAcceptance($input + ['revision' => $state['revision']]);
 device_check($saved['success'] && $fixture->writes === 2, 'Actual trait failed to save both active and staged observations.');
 device_check($saved['report']['current_counts']['passed'] === 1 && $fixture->deviceAcceptanceState()['report']['current_counts']['passed'] === 1, 'Recording falsely invalidated its own normalized configuration fingerprint.');
@@ -107,9 +137,16 @@ device_check(!$fixture->recordDeviceAcceptance(array_replace($input, ['target_id
 $fixture->role = 'viewer';
 device_check($fixture->deviceAcceptanceState()['error_code'] === 'permission_denied' && $fixture->recordDeviceAcceptance($input)['error_code'] === 'permission_denied', 'Viewer could read/forge an acceptance record.');
 $fixture->role = 'administrator'; $fixture->fail = true;
+$activeBefore=file_get_contents($root.'/active.json');$pendingBefore=file_get_contents($root.'/pending.json');
 $failure = $fixture->recordDeviceAcceptance($input + ['revision' => $state['revision']]);
-device_check(!$failure['success'] && !str_contains(json_encode($failure), 'private path'), 'Storage error claimed success or exposed a private exception.');
+device_check(!$failure['success'] && !str_contains(json_encode($failure), 'private path')
+    &&file_get_contents($root.'/active.json')===$activeBefore&&file_get_contents($root.'/pending.json')===$pendingBefore,'Active storage error changed paired bytes, claimed success or exposed a private exception.');
 $fixture->fail = false;
+$fixture->failPath=$root.'/pending.json';
+$failure=$fixture->recordDeviceAcceptance($input + ['revision' => $state['revision']]);
+device_check(!$failure['success']&&file_get_contents($root.'/active.json')===$activeBefore
+    &&file_get_contents($root.'/pending.json')===$pendingBefore,'Staged storage error left acceptance evidence in one settings file.');
+$fixture->failPath='';
 unlink($root . '/pending.json');
 device_check($fixture->recordDeviceAcceptance($input + ['revision' => $state['revision']])['success'] && !file_exists($root . '/pending.json'), 'Recording created a previously absent pending configuration.');
 $active = json_decode(file_get_contents($root . '/active.json'), true);
@@ -168,15 +205,17 @@ $page = dirname(__DIR__) . '/slsmassnotifyserver/page.slsmassnotifyserver_help.p
 foreach ([['GET', true, '{}', true, 405, 0], ['POST', false, '{}', true, 403, 0], ['POST', true, '{broken', true, 400, 0],
     ['POST', true, '[]', true, 400, 0], ['POST', true, str_repeat('x', 8193), true, 400, 0],
     ['POST', true, '{"revision":"fixture"}', false, 403, 1], ['POST', true, '{"revision":"fixture"}', true, 200, 1]] as [$method, $csrf, $payload, $allowed, $expected, $calls]) {
-    $prefix = '<?php class FreePBX{static function create(){return (object)["Slsmassnotifyserver"=>new Fixture];}}
+    $prefix = '<?php require_once '.var_export(dirname(__DIR__).'/slsmassnotifyserver/api/sls-mass-notify/security.php',true).'; class FreePBX{static function create(){return (object)["Slsmassnotifyserver"=>new Fixture];}}
     class Fixture{function enforceOperatorPageAccess($page){} function validateCsrfToken($token){return ' . var_export($csrf, true) . ';}
     function recordDeviceAcceptance($input){$GLOBALS["calls"]++;return ' . var_export($allowed ? ['success' => true] : ['success' => false, 'error_code' => 'permission_denied', 'message' => 'Denied'], true) . ';}
     function __call($name,$args){throw new RuntimeException("Unexpected action: ".$name);}}
     $GLOBALS["calls"]=0;$_SESSION=[];$_SERVER["REQUEST_METHOD"]=' . var_export($method, true) . ';
-    $_POST=["slsmassnotifyserver_action"=>"record_device_acceptance","payload"=>' . var_export($payload, true) . ',"slsmassnotifyserver_csrf"=>"fixture"];$_REQUEST=$_POST;
+    $_POST=["slsmassnotifyserver_action"=>"record_device_acceptance","payload"=>' . var_export($payload, true) . ',"slsmassnotifyserver_csrf"=>"fixture"];$_GET=[];
+    if($_SERVER["REQUEST_METHOD"]==="GET"){$_GET=$_POST;$_POST=[];}$_REQUEST=array_merge($_GET,$_POST);
     register_shutdown_function(static function(){file_put_contents("php://stderr",json_encode([http_response_code()?:200,$GLOBALS["calls"]]));});require ' . var_export($page, true) . ';';
     $process = proc_open([PHP_BINARY], [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
     fwrite($pipes[0], $prefix); fclose($pipes[0]); $body = stream_get_contents($pipes[1]); fclose($pipes[1]); $meta = stream_get_contents($pipes[2]); fclose($pipes[2]);
-    device_check(proc_close($process) === 0 && json_decode($meta, true) === [$expected, $calls] && is_array(json_decode($body, true)), 'Actual controller failed method/CSRF/payload/permission enforcement: ' . $meta);
+    device_check(proc_close($process) === 0 && json_decode($meta, true) === [$expected, $calls] && is_array(json_decode($body, true)),
+        'Actual controller failed method/CSRF/payload/permission enforcement for '.$method.' expected '.$expected.'/'.$calls.': ' . $meta);
 }
 echo "Device acceptance: $checks observation, provenance, history, permission, actual save and HTTP controller checks passed.\n";

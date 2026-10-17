@@ -210,7 +210,7 @@ $help = static function (string $id, string $text) use ($escape): void {
                 </div>
                 <div id="sls-paging-independent-fields" data-sls-picker="paging">
                     <div class="sls-paging-editor-section"><h3><i class="fa fa-bullhorn text-primary" aria-hidden="true"></i> <?php echo _('Recipients and phone text'); ?></h3><div class="sls-paging-grid">
-                        <div><div class="sls-paging-label"><label id="sls-paging-audio-label"><?php echo _('Live audio recipients'); ?></label><?php $help('sls-paging-audio-tip', _('Choose at least one internal phone to hear live audio. Receiving phones must be registered with the PBX. If none are available, the caller is told to check registration; mixed groups page the available phones. The caller’s own phone is excluded during a page. Search by extension number or name. Up to 1,000 recipients.')); ?></div><div id="sls-paging-audio-selector"></div><span class="help-block"><?php echo _('Phones that hear the caller’s voice. At least one required.'); ?></span></div>
+                        <div><div class="sls-paging-label"><label id="sls-paging-audio-label"><?php echo _('Live audio recipients'); ?></label><?php $help('sls-paging-audio-tip', _('Choose at least one internal extension. Registered phones can hear live audio. With voicemail recording enabled, unanswered extensions with enabled mailboxes can receive the recording, including offline phones. The caller is excluded. Search by extension number or name. Up to 1,000 recipients.')); ?></div><div id="sls-paging-audio-selector"></div><span class="help-block"><?php echo _('Extensions receiving live audio or an eligible voicemail recording. At least one required.'); ?></span></div>
                         <div><div class="sls-paging-label"><label id="sls-paging-notify-label"><?php echo _('Phone text recipients'); ?></label><?php $help('sls-paging-notify-tip', _('Optional: send this group’s saved message to selected phones using SIP NOTIFY when paging starts. These phones may differ from the audio recipients. Display support depends on the phone. Up to 1,000 recipients.')); ?></div><div id="sls-paging-notify-selector"></div><span class="help-block"><?php echo _('Optional phones that display the saved message.'); ?></span></div>
                     </div></div>
                     <div class="sls-paging-editor-section">
@@ -276,7 +276,8 @@ $help = static function (string $id, string $text) use ($escape): void {
         'snapshotUnavailable' => _('Registration snapshot unavailable or stale. Check the phone-event collector in Help.'),
         'registeredExtensions' => _('receiving extensions registered'), 'contacts' => _('registered contacts'),
         'detectedDevices' => _('Detected devices'), 'unknownContacts' => _('unknown contacts'), 'offlineRecipients' => _('Unavailable extensions'),
-        'noReceivers' => _('No receiving phones are registered. Sign in a recipient phone before dialing.'),
+        'noReceivers' => _('No receiving phones are registered. Live audio requires a registered recipient phone.'),
+        'offlineVoicemail' => _('Voicemail recording is selected. Eligible unanswered mailboxes can receive a recording; this snapshot does not verify mailboxes.'),
         'registrationRechecked' => _('Registration is checked again when dialing; the caller’s phone is excluded.'),
         'snapshotObserved' => _('Snapshot'),
         'unsaved' => _('New PIN pending save'), 'defaultMessage' => _('Live page in progress.')
@@ -299,7 +300,7 @@ $help = static function (string $id, string $text) use ($escape): void {
         var result = {available:readinessInventory.available === true && readinessInventory.expires_at * 1000 > Date.now(),
             configured:recipients.length, registered:0, contacts:0, formats:[], unknown:0, unavailable:[]};
         if (!result.available) return result;
-        var brands = {yealink:'Yealink',yealink_text:'Yealink',poly:'Polycom',cisco:'Cisco',grandstream:'Grandstream',fanvil:'Fanvil',snom:'Snom'};
+        var brands = {yealink:'Yealink',yealink_text:'Yealink',poly:'Poly',polycom:'Polycom',cisco:'Cisco',grandstream:'Grandstream',fanvil:'Fanvil',snom:'Snom',aastra:'Aastra / Mitel',mitel:'Mitel',sangoma:'Sangoma',avaya:'Avaya',vtech:'VTech',ale:'ALE',alcatel:'Alcatel',panasonic:'Panasonic'};
         recipients.forEach(function (extension) {
             var endpoint = readinessInventory.endpoints[extension];
             if (!endpoint || !Number.isInteger(endpoint.contacts) || endpoint.contacts < 1) { result.unavailable.push(extension); return; }
@@ -318,6 +319,7 @@ $help = static function (string $id, string $text) use ($escape): void {
         panel.addClass(state.registered === state.configured && state.registered ? 'sls-paging-readiness-ready' : 'sls-paging-readiness-warning');
         panel.append($('<p>').append(icon(state.registered ? 'fa-check-circle' : 'fa-exclamation-circle'), ' ' + state.registered + ' / ' + state.configured + ' ' + labels.registeredExtensions + ' · ' + state.contacts + ' ' + labels.contacts));
         if (!state.registered) panel.append($('<p>').text(labels.noReceivers));
+        if (state.unavailable.length && $('#sls-paging-voicemail').prop('checked')) panel.append($('<p>').text(labels.offlineVoicemail));
         if (state.formats.length || state.unknown) panel.append($('<p>').text(labels.detectedDevices + ': ' + state.formats.join(', ') + (state.unknown ? (state.formats.length ? ' · ' : '') + state.unknown + ' ' + labels.unknownContacts : '')));
         if (state.unavailable.length) panel.append($('<p>').text(labels.offlineRecipients + ': ' + state.unavailable.slice(0, 20).join(', ') + (state.unavailable.length > 20 ? ' … (+' + (state.unavailable.length - 20) + ')' : '')));
         var observed = new Date(readinessInventory.observed_at);
@@ -421,16 +423,16 @@ $help = static function (string $id, string $text) use ($escape): void {
         if (!draft) { return; }
         if (pinRequest) { pinRequest.abort(); }
         error('', true); var activeDraft = draft;
-        $('#sls-paging-randomize,#sls-paging-save-group').prop('disabled', true);
+        $('#sls-paging-randomize,#sls-paging-save-group,#sls-paging-pin-length').prop('disabled', true);
         $('#sls-paging-pin-note').text(labels.pinPending);
-        pinRequest = $.ajax({url:'config.php?display=slsmassnotifyserver_paging', type:'POST', dataType:'json', cache:false,
+        pinRequest = $.ajax({url:'config.php?display=slsmassnotifyserver_paging', type:'POST', dataType:'json', cache:false, timeout:10000,
             data:{slsmassnotifyserver_action:'generate_paging_pin', slsmassnotifyserver_csrf:$('#sls-paging-form input[name="slsmassnotifyserver_csrf"]').val(), pin_length:$('#sls-paging-pin-length').val()}})
             .done(function (result) {
                 if (draft !== activeDraft) { return; }
-                if (!result || !result.success || !/^[0-9]{4,8}$/.test(result.pin) || result.pin.length !== Number($('#sls-paging-pin-length').val())) { error((result && result.message) || labels.pinFailure, true); return; }
+                if (!result || result.success !== true || !/^[0-9]{4,8}$/.test(result.pin) || result.pin.length !== Number($('#sls-paging-pin-length').val())) { error((result && result.message) || labels.pinFailure, true); return; }
                 $('#sls-paging-pin').val(result.pin);
             }).fail(function (_, status) { if (status !== 'abort' && draft === activeDraft) { error(labels.pinFailure, true); } })
-            .always(function () { if (draft === activeDraft) { pinRequest = null; $('#sls-paging-randomize,#sls-paging-save-group').prop('disabled', false); pinStatus(); } });
+            .always(function () { if (draft === activeDraft) { pinRequest = null; $('#sls-paging-randomize,#sls-paging-save-group,#sls-paging-pin-length').prop('disabled', false); pinStatus(); } });
     }
     function openEditor(index, source) {
         if (index < 0 && rows.length >= 10) { error(labels.maximum); return; }
@@ -443,7 +445,7 @@ $help = static function (string $id, string $text) use ($escape): void {
         $('#sls-paging-external-callers').val((draft.external_callers || []).join('\n'));
         $('#sls-paging-pin-length').val(draft.pin_length || 4);
         $('#sls-paging-pin').val(draft.pin || '').attr('placeholder', draft.has_pin ? labels.pinSaved : '');
-        $('#sls-paging-randomize,#sls-paging-save-group').prop('disabled', false);
+        $('#sls-paging-randomize,#sls-paging-save-group,#sls-paging-pin-length').prop('disabled', false);
         renderIndependent(); pinStatus(); editor.prop('hidden', false);
         $('#sls-paging-page-content').attr('inert', '').attr('aria-hidden', 'true');
         editor.find('.sls-paging-modal-body').scrollTop(0);
@@ -524,6 +526,7 @@ $help = static function (string $id, string $text) use ($escape): void {
     });
     $('#sls-paging-form').on('submit', function (event) {
         event.preventDefault();
+        if ($(this).attr('aria-busy') === 'true') { return; }
         $('#sls-paging-form-complete').val('0'); error('');
         try {
             if (!editor.prop('hidden')) { throw new Error(labels.edit); }
@@ -540,18 +543,20 @@ $help = static function (string $id, string $text) use ($escape): void {
             if (byteLength(encoded) > 800000 || byteLength(callers) > 25000) { throw new Error(labels.tooLarge); }
             $('#sls-paging-groups-json').val(encoded); $('#sls-paging-callers-json').val(callers);
             $('#sls-paging-form-complete').val('1');
-            var form = $(this), controls = $('#sls-live-paging button'), body = form.serialize() + '&ajax=1';
-            if (form.attr('aria-busy') === 'true') { return; }
+            var form = $(this), controls = $('#sls-live-paging').find('button,input,select,textarea'), body = form.serialize() + '&ajax=1';
+            var disabled = []; controls.each(function () { disabled.push([this, this.disabled]); });
             form.attr('aria-busy', 'true'); controls.prop('disabled', true);
             $.ajax({url:form.attr('action'), type:'POST', dataType:'json', data:body, timeout:30000})
                 .done(function (result) {
-                    if (result.success) { window.location.assign('config.php?display=slsmassnotifyserver_paging'); }
-                    else { error([result.message].concat(result.errors || []).filter(Boolean).join(' ')); }
+                    if (result && result.success === true) { window.location.assign('config.php?display=slsmassnotifyserver_paging'); }
+                    else if (result && result.success === false && typeof result.message === 'string') { error([result.message].concat(Array.isArray(result.errors) ? result.errors : []).filter(Boolean).join(' ')); }
+                    else { error('The save response could not be verified. Reload Paging to check your saved changes before trying again.'); }
                 }).fail(function () { error('The save response was interrupted. Reload Paging to check whether your changes were saved before trying again.'); })
-                .always(function () { form.removeAttr('aria-busy'); controls.prop('disabled', false); refresh(); });
+                .always(function () { form.removeAttr('aria-busy'); disabled.forEach(function (entry) { entry[0].disabled = entry[1]; }); refresh(); });
         } catch (failure) { event.preventDefault(); error(failure.message || labels.tooLarge); }
     });
     $('#sls-paging-callers').on('change click', function () { refresh(); });
+    $('#sls-paging-voicemail').on('change', function () { $('#sls-paging-rows .sls-paging-readiness').each(function () { renderReadiness($(this), $(this).data('recipients')); }); });
     refresh(); $('#sls-paging-submit').prop('disabled', false);
 })(jQuery);
 </script>

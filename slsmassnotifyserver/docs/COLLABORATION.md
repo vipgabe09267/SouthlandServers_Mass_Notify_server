@@ -19,3 +19,7 @@ Ordinary announcements and weather messages do not become incidents based on the
 Isolated tests exercise both payloads, the real PHP-to-Python incident identity handoff, durable worker context, forwarded/default ports, forged or mismatched URLs, literal alert text, ordinary-message isolation, immutable destinations, provider errors, and bounded payloads. Actual tenant/channel acceptance requires a configured destination and an explicitly authorized test; no provider message is sent by the release fixtures.
 
 Provider references: [Slack incoming webhooks](https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/), [Slack message and link formatting](https://docs.slack.dev/messaging/formatting-message-text/), [Microsoft Teams Workflows setup](https://support.microsoft.com/en-us/workflows/send-messages-in-teams-using-incoming-webhooks), and [Adaptive Cards OpenUrl action](https://learn.microsoft.com/en-us/adaptive-cards/schema-explorer/action-open-url).
+
+## Native Discord and SLS JSON
+
+Native messages retain complete paragraphs and instruction fields. Discord content is checked against its individual and combined [embed limits](https://docs.discord.com/developers/resources/message#embed-limits) before submission, using conservative Unicode counts. Native SLS JSON retains the complete body within its 64 KiB serialized envelope. Oversized content fails for that destination; valid destinations retain their own results. Explicit nonretryable payload failures are not resubmitted automatically, and failed delivery records remain in history.

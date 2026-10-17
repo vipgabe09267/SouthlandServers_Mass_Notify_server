@@ -27,21 +27,31 @@ POLICY_PATH=pathlib.Path(POLICY_DIRECTORY.name)/'disabled.config'
 POLICY_PATH.write_text(json.dumps({'enterprise_cluster':{'enabled':False}}))
 POLICY_PATH.chmod(0o600)
 MODULE._cluster_guard.CONFIG=POLICY_PATH
+VISUAL_DIRECTORY = tempfile.TemporaryDirectory(prefix='sls-portability-visual-')
+MODULE.PHONE_VISUAL_STATE = pathlib.Path(VISUAL_DIRECTORY.name)
 
 
 recording_unlink_guard = "if ($fileOwned && (!is_array($row) || $rowOwned))"
 assert CLASS_SOURCE.count(recording_unlink_guard) >= 2
 assert recording_unlink_guard in UNINSTALL_SOURCE
+runtime_method = CLASS_SOURCE.split("private function ensurePiperRuntime()", 1)[1].split(
+    "private function ensurePiperWrapper", 1
+)[0]
+assert runtime_method.index("$this->ensurePiperWrapper()") < runtime_method.index(
+    "$this->secureExecutableRuntimeTree()"
+)
 wrapper_method = CLASS_SOURCE.split("private function ensurePiperWrapper()", 1)[1].split(
     "private function isSlsOwnedPiperWrapper", 1
 )[0]
 assert wrapper_method.index("!$this->isSlsOwnedPiperWrapper($wrapper)") < wrapper_method.index(
-    "$this->repairPiperRuntimePermissions()"
+    "$this->writeManagedTextFile($wrapper"
 )
-permissions_method = CLASS_SOURCE.split("private function repairPiperRuntimePermissions()", 1)[1].split(
-    "private function secureExecutableRuntimeTree", 1
+removal_method = CLASS_SOURCE.split("private function removePiperWrapper()", 1)[1].split(
+    "private function removeRuntimeIntegrationFiles", 1
 )[0]
-assert "$this->isSlsOwnedPiperWrapper('/usr/local/bin/piper')" in permissions_method
+assert removal_method.index("$this->isSlsOwnedPiperWrapper($wrapper)") < removal_method.index(
+    "@unlink($wrapper)"
+)
 
 
 with mock.patch.object(MODULE.Path, "is_file", return_value=False):
@@ -78,6 +88,7 @@ for invalid_ami in (
 
 # Exercise the actual socket handoff with mocks, not a live AMI endpoint.
 with mock.patch.object(MODULE.socket, "create_connection") as connection:
+    connection.return_value.recv.return_value = b'Asterisk Call Manager/5.0\r\n'
     client = MODULE.AmiClient("::1", 5041, "fixture-user", "fixture-secret")
     with mock.patch.object(client, "action", return_value=({"Response": "Success"}, [])):
         client.connect()

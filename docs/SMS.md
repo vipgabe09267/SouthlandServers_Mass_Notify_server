@@ -7,7 +7,7 @@ contact a provider.
 
 ## Configure
 
-In **General Settings > Channels and providers > SMS alerts**, choose **Twilio**, **Telnyx** or **BulkVS** and an
+In **General Settings > Delivery providers > SMS and MMS alerts**, choose **Twilio**, **Telnyx** or **BulkVS** and an
 SMS-capable sending number from that account, in `+countrycode` format. Enter an
 organization label, which precedes the announcement title and complete message.
 All settings, credentials and saved recipients remain in `mass-notifications.config`.

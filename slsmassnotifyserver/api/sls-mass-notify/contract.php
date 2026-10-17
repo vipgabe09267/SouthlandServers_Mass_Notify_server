@@ -3,6 +3,7 @@ declare(strict_types=1);
 namespace SLS\MassNotify;
 require_once __DIR__ . '/security.php';
 
+if (!class_exists(ControlContract::class, false)) {
 /** Read-only API discovery. Recipient projections never contain delivery addresses or secrets. */
 final class ControlContract
 {
@@ -27,7 +28,7 @@ final class ControlContract
         $availableResources = [];
         if (ApiSecurity::permits($principal, 'read')) {
             foreach ($resources as $resource) {
-                if ($resource === 'config' && !ApiSecurity::permits($principal, 'config')) { continue; }
+                if (in_array($resource, ['config', 'recordings'], true) && !ApiSecurity::permits($principal, 'config')) { continue; }
                 if (in_array($resource, ['enterprise_capabilities','incident_templates'], true) && ($principal['id'] ?? '') === 'legacy') { continue; }
                 if (!$unrestricted && !in_array($resource, ['status', 'capabilities', 'audiences', 'delivery','enterprise_capabilities','incident_templates'], true)) { continue; }
                 $availableResources[] = $resource;
@@ -81,6 +82,16 @@ final class ControlContract
             throw new \InvalidArgumentException('Announcements accept only documented fields and options.');
         }
         foreach ([$body, $options] as $fields) {
+            foreach (['style' => ['standard', 'colored', 'image', 'nws'], 'audio_mode' => ['none', 'tones', 'tts', 'tones_tts']] as $field => $allowed) {
+                if (array_key_exists($field, $fields)
+                    && (!is_string($fields[$field]) || !in_array(strtolower(trim($fields[$field])), $allowed, true))) {
+                    throw new \InvalidArgumentException($field . ' contains an unsupported value.');
+                }
+            }
+            if (array_key_exists('background_color', $fields)
+                && (!is_string($fields['background_color']) || !preg_match('/^#[0-9A-Fa-f]{6}$/D', $fields['background_color']))) {
+                throw new \InvalidArgumentException('background_color must be a six-digit CSS hex color.');
+            }
             foreach (['preview', 'is_test'] as $field) {
                 if (array_key_exists($field, $fields) && !is_bool($fields[$field])) {
                     throw new \InvalidArgumentException($field . ' must be a JSON boolean.');
@@ -137,7 +148,7 @@ final class ControlContract
                 if (!is_array($row) || !is_string($row['id'] ?? null)) { continue; }
                 $permission = $collection === 'announcement_groups' ? 'announcement_group_ids' : 'nws_zone_ids';
                 if (!$unrestricted && !in_array($row['id'], $principal['audience'][$permission] ?? [], true)) { continue; }
-                if ($collection === 'announcement_groups' && !ApiSecurity::groupDesktopBindingsValid($row, $settings)) { continue; }
+                if ($collection === 'announcement_groups' && (!ApiSecurity::groupDesktopBindingsValid($row, $settings) || !ApiSecurity::groupLabsBindingsValid($row, $settings))) { continue; }
                 $result[$collection][] = self::metadata($row, $row['id']);
                 if ($unrestricted) { $phones = array_merge($phones, (array)($row['extensions'] ?? [])); }
             }
@@ -172,14 +183,17 @@ final class ControlContract
                 || (!$unrestricted && !in_array($row['id'], $allowed['webhooks'], true))) { continue; }
             $result['webhooks'][] = self::metadata($row, $row['id']);
         }
-        if ($unrestricted && ($principal['id']??'')!=='legacy') {
-            if (!empty($settings['subscriber_browser']['enabled']) && !empty($settings['subscriber_browser']['push']['enabled'])) {
-                foreach ((array)($settings['subscriber_browser']['people'] ?? []) as $row) { if (is_array($row) && self::enabled($row)) { $result['browser_recipients'][] = self::metadata($row, $row['id']); } }
-            }
-            if (self::enabled($settings['enterprise_integrations'] ?? []) && self::enabled($settings['enterprise_integrations']['connectors'] ?? [])) {
-                foreach ((array)($settings['enterprise_integrations']['connectors']['destinations'] ?? []) as $row) { if (is_array($row) && self::enabled($row)) { $result['connectors'][] = self::metadata($row, $row['id']); } }
+        if (($principal['id']??'')!=='legacy') {
+            foreach (ApiSecurity::labsDirectory($settings) as $field=>$rows) {
+                $output=$field==='browser_recipient_ids' ? 'browser_recipients' : 'connectors';
+                foreach ($rows as $id=>$row) {
+                    if ($row['available'] && ($unrestricted || in_array($id,$allowed[$field],true))) {
+                        $result[$output][]=['id'=>$id,'name'=>$row['label']];
+                    }
+                }
             }
         }
         return $result;
     }
+}
 }

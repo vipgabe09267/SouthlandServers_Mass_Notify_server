@@ -13,7 +13,7 @@ final class EnterpriseIdentity
         foreach($config['grants'] as $g){if(!$g['enabled']||$g['provider_id']!==$provider['id']||!hash_equals($g['subject'],$assertion['subject']??'')){continue;}
             foreach(OperatorAccess::normalize($settings['operator_access']??[])['accounts'] as $a){if($a['id']!==$g['operator_account_id']||$a['source']!=='portal'||!$a['enabled']||!OperatorAuth::ready($a)){continue;}
                 if(!OperatorAccess::principal($settings,$a['id'])){break;}
-                return ['account'=>$a,'binding'=>$assertion+['grant_revision'=>hash('sha256',json_encode($g,JSON_THROW_ON_ERROR)),'provider_revision'=>EnterpriseIdentityConfig::revision($provider)]];}
+                return ['account'=>$a,'binding'=>array_replace($assertion,['grant_revision'=>hash('sha256',json_encode($g,JSON_THROW_ON_ERROR)),'provider_revision'=>EnterpriseIdentityConfig::revision($provider)])];}
         }throw new \DomainException('This authenticated subject has no enabled local operator grant. Ask an administrator to bind its stable subject to an existing operator account.');
     }
     public static function current(array $settings,array $binding,string $accountId,int $now): bool

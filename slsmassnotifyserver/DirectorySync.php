@@ -4,6 +4,7 @@ namespace SLS\MassNotify;
 require_once __DIR__.'/DirectoryConfig.php';
 require_once __DIR__.'/EnterpriseIdentityHttp.php';
 require_once __DIR__.'/IncidentConfig.php';
+require_once __DIR__.'/LocationDirectory.php';
 
 /** Pull-only directory connectors. No login provisioning or remote directory writes. */
 final class DirectorySync
@@ -19,12 +20,14 @@ final class DirectorySync
     {
         $attribute=$source['ldap_attributes']['active']??'';
         if($attribute===''){if(($source['ldap_inactive_mask']??0)>0){throw new \DomainException('LDAP inactive mask requires an account-control attribute.');}return true;}
+        if(strlen($value)>80||preg_match('//u',$value)!==1||preg_match('/[\x00-\x1f\x7f]/',$value)){throw new \DomainException('LDAP active/account-control attribute is invalid. No import was made.');}
+        $value=trim($value);
         if($value===''){throw new \DomainException('LDAP active/account-control attribute is missing. No import was made.');}
         if(($source['ldap_inactive_mask']??0)>0){
             if(!preg_match('/^[0-9]{1,10}$/D',$value)||(float)$value>4294967295){throw new \DomainException('LDAP account-control attribute is not a valid unsigned integer. No import was made.');}
             return ((int)$value&$source['ldap_inactive_mask'])===0;
         }
-        return !in_array(strtolower($value),array_map('strtolower',$source['ldap_inactive_values']),true);
+        return !in_array(strtolower($value),$source['ldap_inactive_values'],true);
     }
     public static function ldap(array $s): array
     {
@@ -41,13 +44,18 @@ final class DirectorySync
                 if(!$result){throw new \DomainException('LDAP paged search failed.');}$code=0;$error='';$returned=[];
                 if(!ldap_parse_result($conn,$result,$code,$matched,$error,$referrals,$returned)||$code!==0){throw new \DomainException('LDAP returned a partial or failed result. No deprovisioning is permitted.');}
                 $entries=ldap_get_entries($conn,$result);ldap_free_result($result);
-                for($i=0;$i<$entries['count'];$i++){$r=[];foreach($s['ldap_attributes'] as $key=>$attribute){$value=$attribute===''?'':($entries[$i][strtolower($attribute)][0]??'');
+                for($i=0;$i<$entries['count'];$i++){$r=[];foreach($s['ldap_attributes'] as $key=>$attribute){
+                        if($attribute===''){$value='';}else{$values=$entries[$i][strtolower($attribute)]??null;
+                            if($values===null){$value='';}else{if(!is_array($values)||!is_int($values['count']??null)||$values['count']<0||$values['count']>1||($values['count']===1&&!array_key_exists(0,$values))){throw new \DomainException('LDAP returned an ambiguous mapped attribute. No import was made.');}$value=$values['count']===1?$values[0]:'';}}
+                        if(!is_string($value)){throw new \DomainException('LDAP returned an invalid attribute value. No import was made.');}
+                        if($key==='external_id'&&$value===''){throw new \DomainException('LDAP person is missing its stable ID attribute. No import or deprovisioning was made. Review the saved attribute mapping and directory read permissions.');}
                         if($key==='external_id'&&(strtolower($attribute)==='objectguid'||!preg_match('//u',$value)||preg_match('/[\x00-\x1f]/',$value))){$value='binary:'.base64_encode($value);}
                         if($key==='active'){
                             $r['active']=self::ldapActive($s,$value);
                         }else{$r[$key]=$value;}}
                     $rows[]=$r;if(count($rows)>1000){throw new \DomainException('LDAP result exceeds 1000 people; no partial import was made.');}}
-                if(!isset($returned[LDAP_CONTROL_PAGEDRESULTS]['value']['cookie'])){throw new \DomainException('LDAP server did not honor mandatory paging.');}$cookie=$returned[LDAP_CONTROL_PAGEDRESULTS]['value']['cookie'];if(++$pages>10){throw new \DomainException('LDAP paging failed to terminate.');}
+                $pageControl=$returned[LDAP_CONTROL_PAGEDRESULTS]??null;$pageValue=is_array($pageControl)?($pageControl['value']??null):null;$nextCookie=is_array($pageValue)?($pageValue['cookie']??null):null;
+                if(!is_string($nextCookie)||strlen($nextCookie)>4096){throw new \DomainException('LDAP server did not honor mandatory bounded paging.');}$cookie=$nextCookie;if(++$pages>10){throw new \DomainException('LDAP paging failed to terminate.');}
             }while($cookie!=='');return DirectoryConfig::records($rows);
         }finally{ldap_unbind($conn);}
     }
@@ -59,7 +67,8 @@ final class DirectorySync
             // query is supplied via a narrowly constructed SCIM request below.
             $url=$s['scim_base_url'].'/Users?startIndex='.$start.'&count=200';
             $d=$http($url,[$host],'GET',[],['Accept: application/scim+json','Authorization: Bearer '.$s['scim_token']]);
-            if(!in_array('urn:ietf:params:scim:api:messages:2.0:ListResponse',$d['schemas']??[],true)||!is_int($d['totalResults']??null)||$d['totalResults']<0||$d['totalResults']>1000
+            if(!is_array($d['schemas']??null)||!array_is_list($d['schemas'])||count($d['schemas'])>16
+                ||!in_array('urn:ietf:params:scim:api:messages:2.0:ListResponse',$d['schemas'],true)||!is_int($d['totalResults']??null)||$d['totalResults']<0||$d['totalResults']>1000
                 ||!is_array($d['Resources']??null)||!array_is_list($d['Resources'])||($d['startIndex']??1)!==$start||count($d['Resources'])>200){throw new \DomainException('SCIM returned an invalid or oversized complete snapshot.');}
             if($total!==null&&$total!==$d['totalResults']){throw new \DomainException('SCIM changed during paging; retry the dry run.');}$total=$d['totalResults'];
             foreach($d['Resources'] as $u){if(!is_array($u)||!is_bool($u['active']??true)||!is_array($u['name']??[])||!is_string($u['name']['givenName']??'')||!is_string($u['name']['familyName']??'')){throw new \DomainException('SCIM user activity or name is invalid. No import was made.');}
@@ -78,10 +87,13 @@ final class DirectorySync
     }
     public static function plan(array $settings,array $source,array $incoming): array
     {
-        $incoming=DirectoryConfig::records($incoming);$old=array_column($source['records'],null,'external_id');$new=array_column($incoming,null,'external_id');$changes=[];
-        foreach($new as $id=>$row){if(!isset($old[$id])){$changes[]=['kind'=>$row['active']?'add':'inactive','external_id'=>$id,'person_id'=>DirectoryConfig::personId($source['id'],(string)$id),'name'=>$row['name']];}
-            elseif($row!==$old[$id]){$changes[]=['kind'=>!$row['active']?'deactivate':'update','external_id'=>$id,'person_id'=>DirectoryConfig::personId($source['id'],(string)$id),'name'=>$row['name']];}}
-        foreach($old as $id=>$row){if(!isset($new[$id])){$changes[]=['kind'=>'deactivate','external_id'=>$id,'person_id'=>DirectoryConfig::personId($source['id'],(string)$id),'name'=>$row['name']];}}
+        $incoming=DirectoryConfig::records($incoming);$old=[];$new=[];
+        foreach($source['records'] as $record){$old[hash('sha256',$record['external_id'])]=$record;}
+        foreach($incoming as $record){$new[hash('sha256',$record['external_id'])]=$record;}
+        $changes=[];
+        foreach($new as $identity=>$row){$id=$row['external_id'];if(!isset($old[$identity])){$changes[]=['kind'=>$row['active']?'add':'inactive','external_id'=>$id,'person_id'=>DirectoryConfig::personId($source['id'],$id),'name'=>$row['name']];}
+            elseif($row!==$old[$identity]){$changes[]=['kind'=>$old[$identity]['active']&&!$row['active']?'deactivate':'update','external_id'=>$id,'person_id'=>DirectoryConfig::personId($source['id'],$id),'name'=>$row['name']];}}
+        foreach($old as $identity=>$row){if(!isset($new[$identity])){$id=$row['external_id'];$changes[]=['kind'=>$row['active']?'deactivate':'remove_inactive','external_id'=>$id,'person_id'=>DirectoryConfig::personId($source['id'],$id),'name'=>$row['name']];}}
         // Reconcile now, so collisions and missing templates fail in preview.
         self::apply($settings,$source,$incoming);
         $deactivated=count(array_filter($changes,static fn($row)=>$row['kind']==='deactivate'));$previous=count(array_filter($source['records'],static fn($row)=>$row['active']));
@@ -91,18 +103,26 @@ final class DirectorySync
     }
     public static function apply(array $settings,array $source,array $incoming): array
     {
-        $incoming=DirectoryConfig::records($incoming);$prior=$source['records'];foreach($settings['directory_sync']['sources']??[] as $savedSource){if($savedSource['id']===$source['id']){$prior=array_merge($prior,$savedSource['records']);}}$owned=array_values(array_unique(array_map(static fn($r)=>DirectoryConfig::personId($source['id'],$r['external_id']),$prior)));$new=[];
+        $incoming=DirectoryConfig::records($incoming);
+        $locations=LocationDirectory::effective($settings['location_directory']??[]);$locationIds=array_fill_keys(array_column($locations['nodes'],'id'),true);
+        foreach($incoming as $record){if($record['location_id']!==''&&!isset($locationIds[$record['location_id']])){throw new \DomainException('An imported person references a location that no longer exists. Review the directory mapping before applying it.');}}
+        $prior=$source['records'];foreach($settings['directory_sync']['sources']??[] as $savedSource){if($savedSource['id']===$source['id']){$prior=array_merge($prior,$savedSource['records']);}}$owned=array_fill_keys(array_map(static fn($r)=>DirectoryConfig::personId($source['id'],$r['external_id']),$prior),true);$new=[];
         foreach($incoming as $r){if(!$r['active']){continue;}$row=['id'=>DirectoryConfig::personId($source['id'],$r['external_id']),'name'=>$r['name'],'location'=>$r['location'],'desktop_username'=>$r['desktop_username']];if($r['location_id']!==''){$row['location_id']=$r['location_id'];}$new[]=$row;}
+        $newIds=array_fill_keys(array_column($new,'id'),true);
         $settings['incident_workflows']=IncidentConfig::normalize($settings['incident_workflows']??[]);$found=[];
-        foreach($settings['incident_workflows']['templates'] as &$template){if(!in_array($template['id'],$source['template_ids'],true)){continue;}$found[]=$template['id'];$keep=array_values(array_filter($template['roster'],static fn($r)=>!in_array($r['id'],$owned,true)));
-            if(array_intersect(array_column($keep,'id'),array_column($new,'id'))){throw new \DomainException('An imported person ID collides with a local roster entry.');}$template['roster']=array_merge($keep,$new);$template=IncidentConfig::template($template);}unset($template);
+        foreach($settings['incident_workflows']['templates'] as &$template){if(!in_array($template['id'],$source['template_ids'],true)){continue;}$found[]=$template['id'];$keep=array_values(array_filter($template['roster'],static fn($r)=>!isset($owned[$r['id']])));
+            foreach($keep as $row){if(isset($newIds[$row['id']])){throw new \DomainException('An imported person ID collides with a local roster entry.');}}$template['roster']=array_merge($keep,$new);$template=IncidentConfig::template($template);}unset($template);
         if(array_diff($source['template_ids'],$found)){throw new \DomainException('A selected incident template no longer exists.');}
         foreach($settings['directory_sync']['sources'] as &$s){if($s['id']===$source['id']){$s['records']=$incoming;}}unset($s);
         if($source['sync_subscribers']){
             require_once __DIR__.'/SubscriberConfig.php';$subscriber=SubscriberConfig::normalize($settings['subscriber_browser']??[]);$map=array_column($subscriber['people'],null,'person_id');
-            foreach($source['records'] as $r){$pid=DirectoryConfig::personId($source['id'],$r['external_id']);if(isset($map[$pid])){$map[$pid]['enabled']=false;}}
-            foreach($incoming as $r){$pid=DirectoryConfig::personId($source['id'],$r['external_id']);if($r['email']===''){continue;}$prior=$map[$pid]??null;$map[$pid]=['id'=>$prior['id']??'sub_'.substr(hash('sha256',$pid),0,24),'person_id'=>$pid,'name'=>$r['name'],'email'=>$r['email'],'enabled'=>$r['active'],
-                    'version'=>$prior&&$prior['email']===$r['email']&&$prior['name']===$r['name']?$prior['version']:bin2hex(random_bytes(32)),'registered_at'=>$prior&&$prior['email']===$r['email']&&$prior['name']===$r['name']?$prior['registered_at']:time()];}
+            $now=time();$incomingByPerson=[];foreach($incoming as $r){$incomingByPerson[DirectoryConfig::personId($source['id'],$r['external_id'])]=$r;}
+            foreach($source['records'] as $r){$pid=DirectoryConfig::personId($source['id'],$r['external_id']);if(!isset($map[$pid])){continue;}$next=$incomingByPerson[$pid]??null;$willRemainEnabled=$next!==null&&$next['active']&&$next['email']!=='';
+                if(!$willRemainEnabled){if($map[$pid]['enabled']){$map[$pid]['version']=bin2hex(random_bytes(32));$map[$pid]['registered_at']=$now;}$map[$pid]['enabled']=false;}}
+            foreach($incoming as $r){$pid=DirectoryConfig::personId($source['id'],$r['external_id']);if($r['email']===''){continue;}$prior=$map[$pid]??null;
+                $same=$prior&&$prior['email']===$r['email']&&$prior['name']===$r['name']&&$prior['enabled']===$r['active'];
+                $map[$pid]=['id'=>$prior['id']??'sub_'.substr(hash('sha256',$pid),0,24),'person_id'=>$pid,'name'=>$r['name'],'email'=>$r['email'],'enabled'=>$r['active'],
+                    'version'=>$same?$prior['version']:bin2hex(random_bytes(32)),'registered_at'=>$same?$prior['registered_at']:$now];}
             $subscriber['people']=array_values($map);$settings['subscriber_browser']=SubscriberConfig::normalize($subscriber);
         }return $settings;
     }

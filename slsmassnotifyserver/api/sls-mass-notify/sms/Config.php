@@ -19,6 +19,22 @@ final class Config
     public static function number($value): bool { return is_string($value) && (bool)preg_match('/^\+[1-9][0-9]{7,14}$/D', $value); }
     public static function id($value): bool { return is_string($value) && (bool)preg_match('/^sms_[a-f0-9]{24}$/D', $value); }
     public static function uuid($value): bool { return is_string($value) && (bool)preg_match('/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/Di', $value); }
+    public static function host($value): bool
+    {
+        return is_string($value) && strlen($value)<=253 && (bool)preg_match(
+            '/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$/Di',
+            $value
+        );
+    }
+    private static function timestamp($value): bool
+    {
+        if (!is_string($value) || !preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/D',$value)) { return false; }
+        $canonical=str_ends_with($value,'Z')?substr($value,0,-1).'+00:00':$value;
+        $parsed=\DateTimeImmutable::createFromFormat('!Y-m-d\TH:i:sP',$canonical);
+        $errors=\DateTimeImmutable::getLastErrors();
+        return $parsed!==false && ($errors===false || ($errors['warning_count']===0 && $errors['error_count']===0))
+            && $parsed->format('Y-m-d\TH:i:sP')===$canonical;
+    }
     public static function amount($value): int
     {
         if (!is_string($value) || !preg_match('/^(?:0|[1-9][0-9]{0,5})(?:\.[0-9]{1,6})?$/D', $value)) {
@@ -80,7 +96,7 @@ final class Config
             if (($id!=='' && isset($ids[$id])) || isset($numbers[$row['number']])) { throw new \DomainException('An SMS recipient ID or number is duplicated.'); }
             if ($row['consent'] && trim($row['consent_note']??'')==='') { throw new \DomainException('Record how the SMS recipient agreed to receive alerts in the consent note.'); }
             $at=$row['consent_at']??'';
-            if (!is_string($at) || ($at!=='' && (!preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/D',$at) || strtotime($at)===false))) {
+            if (!is_string($at) || ($at!=='' && !self::timestamp($at))) {
                 throw new \DomainException('The SMS consent timestamp is invalid.');
             }
             if ($row['consent'] && $at==='') {

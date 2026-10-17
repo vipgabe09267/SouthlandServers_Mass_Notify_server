@@ -6,6 +6,7 @@ import html
 import ipaddress
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -37,6 +38,7 @@ DOMAIN_LABEL_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 LOCAL_PART_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9._+-]{0,62}[a-z0-9])?")
 SENDMAIL_TIMEOUT_SECONDS = 5.0
 WORKER_EXIT_SAFETY_SECONDS = 2.0
+MAX_BRANDED_LOGO = 2 * 1024 * 1024
 
 
 def normalized_sender_domain(value):
@@ -102,9 +104,11 @@ def sender_address(config):
     return "no-reply@localhost.localdomain"
 
 
-def alert_profile(subject, body, event="", severity=""):
+def alert_profile(subject, body, event="", severity="", *, is_test=False):
+    if type(is_test) is not bool:
+        raise ValueError('email_test_flag_invalid')
     text = " ".join((subject, body, event, severity)).lower()
-    if any(keyword in text for keyword in ("test only", "system test", "demo", "simulation", "simulated")):
+    if is_test:
         return "#6d28d9", "#ede9fe", "🧪", "SYSTEM TEST — NOT AN ACTUAL ALERT"
     profiles = (
         (("system fault", "fault detected", "configuration error", "maintenance failed"), "#b91c1c", "#fee2e2", "⚠️", "SYSTEM FAULT"),
@@ -114,7 +118,6 @@ def alert_profile(subject, body, event="", severity=""):
         (("winter storm", "blizzard", "ice storm", "snow squall"), "#1d4ed8", "#dbeafe", "❄️", "WINTER WEATHER"),
         (("fire warning", "red flag", "wildfire"), "#b91c1c", "#fee2e2", "🔥", "FIRE WEATHER"),
         (("lightning",), "#b45309", "#fef3c7", "⚡", "LIGHTNING WARNING"),
-        (("test",), "#6d28d9", "#ede9fe", "🧪", "SYSTEM TEST — NOT AN ACTUAL ALERT"),
     )
     for keywords, color, pale, icon, label in profiles:
         if any(keyword in text for keyword in keywords):
@@ -170,8 +173,8 @@ def weather_body(template_body, feature, spoken_message):
     return result
 
 
-def build_html(subject, body, event="", severity="", *, profile=None, full_body=False):
-    color, pale, icon, urgency = profile if profile is not None else alert_profile(subject, body, event, severity)
+def build_html(subject, body, event="", severity="", *, profile=None, full_body=False, is_test=False):
+    color, pale, icon, urgency = profile if profile is not None else alert_profile(subject, body, event, severity, is_test=is_test)
     lead, details, notes = (str(body), [], []) if full_body else body_sections(body)
     detail_rows = "".join(
         "<tr><td style='padding:9px 12px;border-bottom:1px solid #e5e7eb;color:#64748b;font-size:13px;width:35%'>"
@@ -222,7 +225,38 @@ def build_announcement_html(subject, body, *, is_test, severity):
     return build_html(subject, body, profile=profile, full_body=True)
 
 
-def send_branded_email(config, subject, body, event="", severity="", recipients_override=None):
+def read_logo(paths, maximum=262144):
+    """Read optional, bounded PNG branding without following file links."""
+    for path in paths:
+        descriptor = None
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or not 8 <= before.st_size <= maximum:
+                continue
+            body = bytearray()
+            while len(body) <= maximum:
+                chunk = os.read(descriptor, min(65536, maximum + 1 - len(body)))
+                if not chunk:
+                    break
+                body.extend(chunk)
+            after = os.fstat(descriptor)
+            if ((before.st_size, before.st_mtime_ns, before.st_ctime_ns) !=
+                    (after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+                continue
+            if len(body) == before.st_size and body.startswith(b'\x89PNG\r\n\x1a\n'):
+                return bytes(body)
+        except OSError:
+            continue
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+    return None
+
+
+def send_branded_email(config, subject, body, event="", severity="", recipients_override=None, *, is_test=False):
+    if type(is_test) is not bool:
+        raise ValueError('email_test_flag_invalid')
     recipient_source = config.get("system_notification_emails", "") if recipients_override is None else recipients_override
     candidates = re.split(r"[\s,;]+", str(recipient_source or ""))
     recipients = []
@@ -249,10 +283,10 @@ def send_branded_email(config, subject, body, event="", severity="", recipients_
     message["To"] = "Undisclosed recipients:;"
     message["Bcc"] = ", ".join(recipients)
     message.set_content(str(body), subtype="plain", charset="utf-8")
-    message.add_alternative(build_html(subject, body, event, severity), subtype="html", charset="utf-8")
-    logo = next((path for path in LOGO_PATHS if path.is_file() and path.stat().st_size > 0), None)
+    message.add_alternative(build_html(subject, body, event, severity, is_test=is_test), subtype="html", charset="utf-8")
+    logo = read_logo(LOGO_PATHS, MAX_BRANDED_LOGO)
     if logo is not None:
-        message.get_payload()[1].add_related(logo.read_bytes(), maintype="image", subtype="png", cid="<sls-mass-notify-logo>", filename="Southland-Servers-Group.png", disposition="inline")
+        message.get_payload()[1].add_related(logo, maintype="image", subtype="png", cid="<sls-mass-notify-logo>", filename="Southland-Servers-Group.png", disposition="inline")
     _cluster_guard.fence_legacy(config)
     _mail_admission.reserve('system' if event == 'System Fault' else 'alert', len(recipients))
     subprocess.run(

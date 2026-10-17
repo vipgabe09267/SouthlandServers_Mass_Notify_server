@@ -83,6 +83,139 @@ class Journal(unittest.TestCase):
     def setUpClass(cls):
         spec=importlib.util.spec_from_file_location('transaction_fixture',BIN/'sls_install_transaction.py')
         cls.module=importlib.util.module_from_spec(spec);spec.loader.exec_module(cls.module)
+    def test_busy_installer_does_not_abandon_another_preparation(self):
+        with tempfile.TemporaryDirectory(dir='/root') as name:
+            root=Path(name)/'journal';transaction=self.module.begin(root)
+            before=(transaction/'transaction.json').read_bytes()
+            harness=r'''
+source "$1"
+INSTALL_TRANSACTION_ROOT="$2"
+ensure_installer_log_prerequisites() { :; }
+preflight_profile_identity() { :; }
+acquire_update_coordination() { return 1; }
+acquire_maintenance_coordination() { :; }
+main
+'''
+            result=subprocess.run(['bash','-c',harness,'fixture',str(SOURCE),str(root)],capture_output=True,text=True,timeout=4)
+            self.assertEqual(result.returncode,1,result.stderr)
+            self.assertEqual((transaction/'transaction.json').read_bytes(),before)
+
+    def test_busy_recovery_takes_coordination_before_evidence_work(self):
+        with tempfile.TemporaryDirectory(dir='/root') as name:
+            harness=r'''
+source "$1"
+acquire_update_coordination() { printf 'busy\n'; return 1; }
+acquire_maintenance_coordination() { :; }
+recover_interrupted_installation "$2"
+'''
+            result=subprocess.run(['bash','-c',harness,'fixture',str(SOURCE),name+'/absent'],capture_output=True,text=True,timeout=4)
+            self.assertEqual(result.returncode,1)
+            self.assertEqual(result.stdout,'busy\n')
+            self.assertEqual(result.stderr,'')
+
+    def test_empty_transaction_creation_gap_can_be_retried(self):
+        with tempfile.TemporaryDirectory() as name:
+            root=Path(name)/'journal';root.mkdir(mode=0o700)
+            orphan=root/('transaction-'+'a'*24);orphan.mkdir(mode=0o700)
+            self.assertEqual(self.module.pending(root),[])
+            self.assertEqual(list(orphan.iterdir()),[],'Inspection changed the empty evidence directory')
+            retry=self.module.begin(root)
+            self.assertNotEqual(retry,orphan)
+            self.assertEqual(self.module.state(orphan)['phase'],'abandoned')
+            self.assertEqual(self.module.state(retry)['phase'],'preparing')
+
+    def test_standalone_discovery_handles_only_empty_creation_gap(self):
+        with tempfile.TemporaryDirectory(dir='/root') as name:
+            root=Path(name)/'journal';root.mkdir(mode=0o700)
+            orphan=root/('transaction-'+'c'*24);orphan.mkdir(mode=0o700)
+            harness='source "$1"; INSTALL_TRANSACTION_ROOT="$2"; check_interrupted_installation'
+            result=subprocess.run(['bash','-c',harness,'fixture',str(SOURCE),str(root)],capture_output=True,text=True,timeout=4)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(self.module.state(orphan)['phase'],'abandoned')
+            second=root/('transaction-'+'d'*24);second.mkdir(mode=0o700)
+            (second/'unknown').write_bytes(b'preserve')
+            result=subprocess.run(['bash','-c',harness,'fixture',str(SOURCE),str(root)],capture_output=True,text=True,timeout=4)
+            self.assertNotEqual(result.returncode,0)
+            self.assertEqual((second/'unknown').read_bytes(),b'preserve')
+            self.assertFalse((second/'transaction.json').exists())
+
+    @unittest.skipUnless(os.geteuid()==0,'requires root for private installer journals')
+    def test_standalone_discovery_rejects_ambiguous_or_mistyped_metadata(self):
+        harness='source "$1"; INSTALL_TRANSACTION_ROOT="$2"; check_interrupted_installation'
+        directory='/placeholder'
+        cases=(
+            ('boolean-schema', lambda path: json.dumps({
+                'schema':True,'directory':str(path),'phase':'prepared','settings':{},
+                'created_at':1,'updated_at':1,
+            })),
+            ('boolean-time', lambda path: json.dumps({
+                'schema':1,'directory':str(path),'phase':'prepared','settings':{},
+                'created_at':True,'updated_at':1,
+            })),
+            ('float-time', lambda path: json.dumps({
+                'schema':1,'directory':str(path),'phase':'prepared','settings':{},
+                'created_at':1,'updated_at':1.5,
+            })),
+            ('duplicate-phase', lambda path: (
+                '{"schema":1,"directory":'+json.dumps(str(path))+',"phase":"prepared",'
+                '"phase":"committed","settings":{},"created_at":1,"updated_at":1}'
+            )),
+        )
+        for label, body in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory(dir='/root') as name:
+                root=Path(name)/'journal';root.mkdir(mode=0o700)
+                transaction=root/('transaction-'+'e'*24);transaction.mkdir(mode=0o700)
+                journal=transaction/'transaction.json';journal.write_text(body(transaction)+'\n');journal.chmod(0o600)
+                before=journal.read_bytes()
+                result=subprocess.run(['bash','-c',harness,'fixture',str(SOURCE),str(root)],capture_output=True,text=True,timeout=4)
+                self.assertNotEqual(result.returncode,0,(label,result.stdout,result.stderr))
+                self.assertEqual(journal.read_bytes(),before)
+
+    def test_transaction_reader_rejects_duplicate_and_nonfinite_metadata(self):
+        with tempfile.TemporaryDirectory() as name:
+            root=Path(name)/'journal';transaction=self.module.begin(root)
+            journal=transaction/'transaction.json'
+            original=json.loads(journal.read_text())
+            cases=(
+                ('duplicate', journal.read_text().rstrip()[:-1]+',"phase":"prepared"}\n'),
+                ('nan', json.dumps({**original,'unknown':None}).replace('null','NaN')+'\n'),
+                ('overflow', json.dumps({**original,'unknown':None}).replace('null','1e309')+'\n'),
+            )
+            for label, body in cases:
+                with self.subTest(label=label):
+                    journal.write_text(body);journal.chmod(0o600)
+                    with self.assertRaises((ValueError,self.module.TransactionError)):
+                        self.module.state(transaction)
+            journal.write_text(json.dumps(original)+'\n');journal.chmod(0o600)
+
+    @unittest.skipUnless(os.geteuid()==0,'requires root for private installer journals')
+    def test_transaction_updates_require_bounded_unambiguous_string_settings(self):
+        tool=BIN/'sls_install_transaction.py'
+        with tempfile.TemporaryDirectory(dir='/root') as name:
+            root=Path(name)/'journal';transaction=self.module.begin(root)
+            command=['python3','-I',str(tool),'--root',str(root),'--transaction',str(transaction),
+                     '--phase','preparing','update']
+            for label, body in (
+                ('duplicate','{"RECOVERY_DIR":"first","RECOVERY_DIR":"second"}'),
+                ('boolean',json.dumps({'RECOVERY_DIR':False})),
+                ('oversized',' ' * (self.module.LIMIT + 1)),
+            ):
+                with self.subTest(label=label):
+                    before=(transaction/'transaction.json').read_bytes()
+                    result=subprocess.run(command,input=body,capture_output=True,text=True,timeout=5)
+                    self.assertNotEqual(result.returncode,0,(label,result.stdout,result.stderr))
+                    self.assertEqual((transaction/'transaction.json').read_bytes(),before)
+
+    def test_missing_transaction_metadata_never_adopts_unknown_contents(self):
+        with tempfile.TemporaryDirectory() as name:
+            root=Path(name)/'journal';root.mkdir(mode=0o700)
+            orphan=root/('transaction-'+'b'*24);orphan.mkdir(mode=0o700)
+            item=orphan/'unknown';item.write_bytes(b'preserve')
+            with self.assertRaises((OSError,self.module.TransactionError)): self.module.pending(root)
+            self.assertEqual(item.read_bytes(),b'preserve')
+            self.assertFalse((orphan/'transaction.json').exists())
+            item.unlink();orphan.chmod(0o750)
+            with self.assertRaises((OSError,self.module.TransactionError)): self.module.pending(root)
     def test_every_emitted_stage_matches_the_transaction_allowlist(self):
         stages={'initialization'}
         for line in SOURCE.read_text().splitlines():
@@ -104,12 +237,13 @@ class Journal(unittest.TestCase):
                     command=['python3','-I',str(tool),'--root',str(root),'--transaction',str(transaction),'--stage',stage]
                     result=subprocess.run([*command,'stage'],capture_output=True,text=True,timeout=5)
                     self.assertEqual(result.returncode,0,result.stderr)
-                    for phase in ('prepared','mutating','recovering','recovery_failed','recovering','rolled_back'):
-                        result=subprocess.run([*command,'--phase',phase,'update'],input='{"STATIC_MUTATION_STARTED":"1"}',capture_output=True,text=True,timeout=5)
+                    for phase in ('preparing','mutating','recovering','recovery_failed','recovering','rolled_back'):
+                        settings={'STATIC_MUTATION_STARTED':'0' if phase=='preparing' else '1'}
+                        result=subprocess.run([*command,'--phase',phase,'update'],input=json.dumps(settings),capture_output=True,text=True,timeout=5)
                         self.assertEqual(result.returncode,0,result.stderr)
                         value=self.module.state(transaction)
                         self.assertEqual((value['stage'],value['phase']),(stage,phase))
-                        self.assertEqual(value['settings'],{'STATIC_MUTATION_STARTED':'1'})
+                        self.assertEqual(value['settings'],settings)
             self.assertEqual(self.module.pending(root),[])
     def test_killed_transaction_survives_and_blocks_new_mutation(self):
         with tempfile.TemporaryDirectory() as name:
@@ -169,6 +303,17 @@ class Journal(unittest.TestCase):
             with self.assertRaises(self.module.TransactionError): self.module.update(transaction,'mutating',{'BASH_ENV':'evil'})
             with self.assertRaises(self.module.TransactionError): self.module.update(transaction,'mutating',{'CONFIG_SNAPSHOT':'foo\nbar'})
 
+    def test_boolean_schema_and_timestamps_are_not_accepted_as_integers(self):
+        with tempfile.TemporaryDirectory() as name:
+            transaction=self.module.begin(Path(name)/'journal')
+            original=self.module.state(transaction)
+            for field in ('schema','created_at','updated_at'):
+                with self.subTest(field=field):
+                    malformed={**original,field:True}
+                    self.module.atomic(transaction/'transaction.json',malformed)
+                    with self.assertRaises(self.module.TransactionError):self.module.state(transaction)
+                    self.module.atomic(transaction/'transaction.json',original)
+
     def test_durable_stage_changes_preserve_recovery_authority_and_legacy_metadata(self):
         with tempfile.TemporaryDirectory() as name:
             root=Path(name)/'journal';transaction=self.module.begin(root)
@@ -185,7 +330,7 @@ class Journal(unittest.TestCase):
             with self.assertRaises(self.module.TransactionError):self.module.state(transaction)
 
     def test_recovery_helpers_and_installer_require_the_saved_publisher_signature(self):
-        with tempfile.TemporaryDirectory() as name:
+        with tempfile.TemporaryDirectory(dir='/run') as name:
             root=Path(name);transaction=self.module.begin(root/'journal')
             bootstrap=transaction/'bootstrap';bootstrap.mkdir(mode=0o700)
             key=root/'key'
@@ -195,8 +340,15 @@ class Journal(unittest.TestCase):
             prefix="ANCHOR_PEM = ";begin=source.index(prefix);end=source.index('\n',begin)
             source=source[:begin]+prefix+repr(public)+source[end:]
             source=source.replace("DIRECTORY = Path('/var/lib/sls-mass-notify-trust')","DIRECTORY = Path("+repr(str(root/'unused-policy'))+")")
-            contents={'sls_release_trust.py':source.encode(),'sls_install_transaction.py':(BIN/'sls_install_transaction.py').read_bytes()}
-            for filename,body in contents.items():(bootstrap/filename).write_bytes(body);(bootstrap/filename).chmod(0o700)
+            helper_names = set(self.module.BOOTSTRAP_FILES)
+            contents = {
+                filename: (source.encode() if filename == 'sls_release_trust.py'
+                           else (BIN / filename).read_bytes())
+                for filename in helper_names
+            }
+            for filename,body in contents.items():
+                (bootstrap/filename).write_bytes(body)
+                (bootstrap/filename).chmod(0o600 if filename == 'freepbx-mirror-signing.pub' else 0o700)
             package=transaction/'package.tgz'
             with tarfile.open(package,'w:gz') as archive:
                 for filename,body in contents.items():
@@ -210,6 +362,37 @@ class Journal(unittest.TestCase):
             self.module.update(transaction,'mutating',{'INSTALL_BOOTSTRAP_DIR':str(bootstrap),'STATIC_MUTATION_STARTED':'1'})
             with patch.object(self.module,'__file__',str(bootstrap/'sls_install_transaction.py')):
                 self.assertEqual(self.module.authenticate(transaction)['phase'],'mutating')
+                missing = bootstrap/'sls_install_guard.py'
+                saved_missing = missing.read_bytes()
+                missing.unlink()
+                with self.assertRaisesRegex(self.module.TransactionError,'inventory'):
+                    self.module.authenticate(transaction)
+                missing.write_bytes(saved_missing);missing.chmod(0o700)
+                original=self.module.state(transaction)
+                for phase in ('committed','rolled_back','abandoned'):
+                    with self.subTest(phase=phase):
+                        value={**original,'phase':phase};self.module.atomic(transaction/'transaction.json',value)
+                        result=subprocess.run(['python3','-I',str(bootstrap/'sls_install_transaction.py'),
+                            '--root',str(root/'journal'),'--transaction',str(transaction),'values'],
+                            capture_output=True,text=True,timeout=4)
+                        self.assertNotEqual(result.returncode,0,'Completed recovery exported operational settings')
+                        self.assertIn('unfinished',result.stderr)
+                        caller=root/'caller.sh'
+                        caller.write_text(SOURCE.read_text().replace('/usr/local/bin/sls_mass_notify/sls_release_trust.py',
+                            str(bootstrap/'sls_release_trust.py')))
+                        harness=r'''
+source "$1"
+INSTALL_TRANSACTION_ROOT="$2"
+INSTALLER_SOURCE_PATH="$1"
+acquire_update_coordination() { :; }
+acquire_maintenance_coordination() { :; }
+recover_interrupted_installation "$3"
+'''
+                        result=subprocess.run(['bash','-c',harness,'fixture',str(caller),str(root/'journal'),str(transaction)],
+                            capture_output=True,text=True,timeout=4)
+                        self.assertNotEqual(result.returncode,0)
+                        self.assertIn('unfinished',result.stderr,'Completed transaction reached the previous installer')
+                self.module.atomic(transaction/'transaction.json',original)
                 (bootstrap/'sls_install_transaction.py').write_bytes(b'unknown recovery program')
                 with self.assertRaisesRegex(self.module.TransactionError,'differs'):self.module.authenticate(transaction)
                 (bootstrap/'sls_install_transaction.py').write_bytes(contents['sls_install_transaction.py'])
@@ -249,11 +432,13 @@ class Journal(unittest.TestCase):
                          'authenticated prerequisite validation','previous phone collector recovery',
                          'notification worker coordination','configuration coordination'}
                 text=contents['sls_install_transaction.py'].decode()
+                text=text.replace("'phase': 'preparing'","'phase': 'prepared'")
                 text=re.sub(r'^STAGES = .*?(?=^NAME =)',
                     lambda unused:'STAGES = '+repr(self.module.STAGES-missing)+'\n',text,flags=re.M|re.S)
                 contents['sls_install_transaction.py']=text.encode()
             for filename,body in contents.items():
-                (bootstrap/filename).write_bytes(body);(bootstrap/filename).chmod(0o700)
+                (bootstrap/filename).write_bytes(body)
+                (bootstrap/filename).chmod(0o600 if filename == 'freepbx-mirror-signing.pub' else 0o700)
             # Recovery authenticates the exact saved programs against this
             # fixture's signed package, including the permission helper.
             installer=root/'installer.sh'
@@ -372,7 +557,7 @@ recover_interrupted_installation "$3"
                 self.assertEqual(self.module.state(transaction)['stage'],'interrupted installation recovery')
                 retry=self.module.begin(root/'journal')
                 self.assertNotEqual(retry,transaction)
-                self.assertEqual(self.module.state(retry)['phase'],'prepared')
+                self.assertEqual(self.module.state(retry)['phase'],'preparing')
 
 
 if __name__=='__main__': unittest.main()

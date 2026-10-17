@@ -7,8 +7,10 @@ The output contains only finite numeric path coordinates and fixed markup.
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import sys
+import tempfile
 
 SOURCE_SHA256 = "9e0729ee253ca7d7a5c4ae9395fb1902264c5377c52e224d13dd85010e2835d9"
 
@@ -44,5 +46,28 @@ if __name__ == "__main__":
         raise SystemExit("Usage: build_location_basemap.py reviewed.geojson output.svg")
     with Path(sys.argv[1]).open("rb") as source:
         output = convert(source.read(2000001))
-    Path(sys.argv[2]).write_bytes(output)
+    target = Path(sys.argv[2])
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=target.name+'.', dir=target.parent)
+    try:
+        os.fchmod(descriptor, 0o644)
+        with os.fdopen(descriptor, 'wb') as stream:
+            descriptor = -1
+            if stream.write(output) != len(output):
+                raise OSError('Incomplete basemap output write')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        directory_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
     print(hashlib.sha256(output).hexdigest())

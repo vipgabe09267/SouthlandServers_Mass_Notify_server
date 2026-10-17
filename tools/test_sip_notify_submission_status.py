@@ -9,6 +9,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
@@ -52,8 +53,13 @@ class SipSubmissionTests(unittest.TestCase):
         self.cli_guard = mock.patch.object(MODULE.subprocess, "run", side_effect=AssertionError("live CLI forbidden"))
         self.socket_guard.start()
         self.cli_guard.start()
+        self.visual_state = tempfile.TemporaryDirectory(prefix='sls-notify-visual-state-')
+        self.visual_guard = mock.patch.object(MODULE, 'PHONE_VISUAL_STATE', Path(self.visual_state.name) / 'state')
+        self.visual_guard.start()
         self.addCleanup(self.socket_guard.stop)
         self.addCleanup(self.cli_guard.stop)
+        self.addCleanup(self.visual_guard.stop)
+        self.addCleanup(self.visual_state.cleanup)
 
     def batch(self, ami, info, capable=True, builder=None, unavailable_targets=None):
         output = io.StringIO()
@@ -112,6 +118,22 @@ class SipSubmissionTests(unittest.TestCase):
             self.assertIn(f"Content=<payload vendor='{source['format']}'/>", action["Variable"])
             self.assertEqual(target["actual_route"], "contact_uri")
             self.assertEqual(target["target_field"], "URI")
+
+    def test_same_extension_routes_yealink_acrobits_and_grandstream_individually(self):
+        agents = ['Yealink SIP-T48G', 'Acrobits Groundwire', 'Grandstream GXP2170']
+        formats = [MODULE.detect_phone_format(agent, '6767') for agent in agents]
+        self.assertEqual(formats, ['yealink', 'unknown', 'grandstream'])
+        contacts = [dict(contact(fmt, 'sip:6767@192.0.2.'+str(10+i)+':5060'), user_agent=agent)
+                    for i, (fmt, agent) in enumerate(zip(formats, agents))]
+        ami = FixtureAmi()
+        summary, error, count, _ = self.batch(ami, {'6767': endpoint(contacts)})
+        self.assertIsNone(error)
+        self.assertEqual(count, 3)
+        self.assertEqual(summary['submitted_contact_targets'], 3)
+        for action, original in zip(ami.actions, contacts):
+            self.assertEqual(action['URI'], original['contact'])
+            self.assertNotIn('Endpoint', action)
+            self.assertIn("Content=<payload vendor='"+original['format']+"'/>", action['Variable'])
 
     def test_mixed_unsupported_uri_uses_original_generic_fallback(self):
         ami = FixtureAmi()
@@ -292,6 +314,7 @@ class SipSubmissionTests(unittest.TestCase):
     def test_ami_login_error_does_not_echo_secret(self):
         ami = MODULE.AmiClient("127.0.0.1", 5038, "fixture", "not-a-real-password")
         sock = mock.Mock()
+        sock.recv.return_value = b'Asterisk Call Manager/5.0\r\n'
         ami.action = mock.Mock(return_value=({"Response": "Error", "Message": "Authentication failed secret=do-not-log"}, []))
         with mock.patch.object(MODULE.socket, "create_connection", return_value=sock):
             with self.assertRaisesRegex(RuntimeError, "AMI login failed: authorization_failed") as caught:

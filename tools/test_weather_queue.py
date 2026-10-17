@@ -3,6 +3,9 @@
 import importlib.util
 import json
 import os
+import pwd
+import signal
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -13,8 +16,8 @@ from unittest import mock
 from datetime import datetime, timezone
 
 ROOT = Path(__file__).resolve().parents[1] / 'slsmassnotifyserver/bin/sls_mass_notify'
-if not ROOT.exists():
-    ROOT = Path('/usr/local/bin/sls_mass_notify')
+if not ROOT.is_dir():
+    raise SystemExit('The candidate Weather runtime is missing; installed helpers are not a test substitute.')
 sys.path.insert(0, str(ROOT))
 CANDIDATE = Path(os.environ.get('SLS_WEATHER_QUEUE_CANDIDATE', str(ROOT / 'sls_weather_queue.py')))
 spec = importlib.util.spec_from_file_location('weather_queue_fixture', CANDIDATE)
@@ -56,10 +59,163 @@ class QueueTests(unittest.TestCase):
             return mock.Mock(pid=-1, poll=lambda: 0, wait=lambda **kwargs: 0)
         self.launch = mock.patch.object(queue, 'start_delivery', side_effect=inline_delivery)
         self.launch.start()
+        self.spawned_processes = []
 
 
     def tearDown(self):
+        self.stop_spawned_processes()
         self.launch.stop(); self.enabled.stop(); self.retry.stop(); self.lock_patch.stop(); self.patch.stop(); self.config_env.stop(); self.temp.cleanup()
+
+    def stop_spawned_processes(self):
+        for process in reversed(self.spawned_processes):
+            if process.poll() is not None:
+                continue
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=1)
+                continue
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=2)
+
+    def test_stubborn_fixture_process_reaches_bounded_hard_kill_cleanup(self):
+        class StubbornProcess:
+            pid = 48151
+
+            def __init__(self):
+                self.done = False
+
+            def poll(self):
+                return 0 if self.done else None
+
+            def wait(self, timeout):
+                if timeout == 1:
+                    raise subprocess.TimeoutExpired('weather-fixture', timeout)
+                self.done = True
+                return 0
+
+        process = StubbornProcess()
+        self.spawned_processes.append(process)
+        with mock.patch.object(os, 'killpg') as kill:
+            self.stop_spawned_processes()
+        self.assertEqual(kill.call_args_list, [
+            mock.call(process.pid, signal.SIGTERM),
+            mock.call(process.pid, signal.SIGKILL),
+        ])
+        self.assertEqual(process.poll(), 0)
+
+    def test_ambiguous_weather_history_is_preserved(self):
+        self.add('retained')
+        path = self.directory / 'weather-delivery.json'
+        for raw in ('{"schema":1,"jobs":{"retained":{}},"jobs":{},"snapshots":{}}',
+                    '{"schema":true,"jobs":{},"snapshots":{}}',
+                    '{"schema":1,"jobs":{},"snapshots":{},"extra":1e309}'):
+            with self.subTest(raw=raw):
+                path.write_text(raw)
+                inode = path.stat().st_ino
+                with self.assertRaises((RuntimeError, ValueError)):
+                    with queue.state_lock(write=False):
+                        pass
+                self.assertEqual(path.read_text(), raw)
+                self.assertEqual(path.stat().st_ino, inode)
+
+    def test_provider_duplicates_are_rejected_before_observation(self):
+        raw = json.dumps({'type': 'FeatureCollection', 'features': [feature()]})
+        raw = raw.replace('"features": [', '"features": [], "features": [', 1)
+        response = mock.Mock(returncode=0, stdout=raw.encode(), stderr=b'')
+        with mock.patch.object(queue.subprocess, 'run', return_value=response):
+            with self.assertRaises(ValueError):
+                queue.fetch_zone('TXC491')
+
+    def test_unknown_file_metadata_is_not_read_or_repaired(self):
+        path = self.directory / 'private-state.json'
+        path.write_text('{"fixture":true}')
+        owner = pwd.getpwnam('asterisk')
+        descriptor = queue._open_directory(self.directory)
+        try:
+            for mode, gid in ((0o666, owner.pw_gid), (0o2640, owner.pw_gid), (0o640, owner.pw_gid + 1000)):
+                with self.subTest(mode=mode, gid=gid):
+                    path.chmod(mode)
+                    os.chown(path, owner.pw_uid, gid)
+                    before = path.stat()
+                    with self.assertRaises(RuntimeError):
+                        queue.read_json_at(descriptor, path.name)
+                    after = path.stat()
+                    self.assertEqual((after.st_ino, after.st_mode, after.st_uid, after.st_gid),
+                                     (before.st_ino, before.st_mode, before.st_uid, before.st_gid))
+                    self.assertEqual(path.read_text(), '{"fixture":true}')
+        finally:
+            os.close(descriptor)
+
+    def test_missing_established_queue_is_not_recreated(self):
+        self.add('retained')
+        path = self.directory / 'weather-delivery.json'
+        lock = self.directory / 'weather-delivery.lock'
+        inode = lock.stat().st_ino
+        path.unlink()
+        with self.assertRaisesRegex(RuntimeError, 'history.*missing'):
+            self.add('retained')
+        self.assertFalse(path.exists())
+        self.assertEqual(lock.stat().st_ino, inode)
+
+    def test_replaced_state_and_lock_stop_outbox_commit(self):
+        self.add('retained')
+        path = self.directory / 'weather-delivery.json'
+        lock = self.directory / 'weather-delivery.lock'
+        before = path.read_bytes()
+        account = pwd.getpwnam('asterisk')
+        for replaced in (path, lock):
+            with self.subTest(replaced=replaced.name):
+                with self.assertRaises(RuntimeError):
+                    with queue.state_lock() as state:
+                        replaced.rename(self.directory / ('preserved-' + replaced.name))
+                        replaced.write_bytes(before if replaced == path else b'')
+                        replaced.chmod(0o640)
+                        os.chown(replaced, account.pw_uid, account.pw_gid)
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_incomplete_marker_recovers_without_rewriting_retained_state(self):
+        child = self.directory / 'first-commit'
+        child.mkdir(mode=0o700)
+        real_pwrite = queue.os.pwrite
+        def short_write(descriptor, raw, offset):
+            return real_pwrite(descriptor, raw[:8], offset)
+        with mock.patch.object(queue.os, 'pwrite', side_effect=short_write):
+            with self.assertRaisesRegex(RuntimeError, 'commit is uncertain'):
+                with self.real_lock(child):
+                    pass
+        path = child / 'weather-delivery.json'
+        lock = child / 'weather-delivery.lock'
+        before = path.read_bytes()
+        state_inode, lock_inode = path.stat().st_ino, lock.stat().st_ino
+        with self.real_lock(child):
+            pass
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(path.stat().st_ino, state_inode)
+        self.assertEqual(lock.read_bytes(), queue.HISTORY_MARKER)
+        self.assertEqual(lock.stat().st_ino, lock_inode)
+
+    def test_replaced_parent_preserves_old_and_new_queue_evidence(self):
+        child = self.directory / 'old-parent'
+        child.mkdir(mode=0o700)
+        with self.real_lock(child):
+            pass
+        before = (child / 'weather-delivery.json').read_bytes()
+        moved = self.directory / 'preserved-parent'
+        with self.assertRaisesRegex(RuntimeError, 'directory changed'):
+            with self.real_lock(child):
+                child.rename(moved)
+                child.mkdir(mode=0o700)
+                (child / 'weather-delivery.json').write_bytes(b'private replacement evidence')
+        self.assertEqual((moved / 'weather-delivery.json').read_bytes(), before)
+        self.assertEqual((child / 'weather-delivery.json').read_bytes(), b'private replacement evidence')
 
     def test_disabled_installer_probe_does_not_leave_background_children(self):
         with mock.patch.object(queue, 'services_enabled', return_value=False), \
@@ -398,7 +554,10 @@ class QueueTests(unittest.TestCase):
                    'original@example.com new@example.com', '0', '21:00', '06:00', '', 'generic:first,generic:new']
         job = {'group_id': 'north', 'payload': {'zone': 'TXC491', 'feature': feature(),
             'routing_snapshot': {'phones': ['1000'], 'desktops': ['original'],
+                                 'desktop_client_ids': {'original': 'original-enrollment'},
                                  'emails': ['original@example.com'], 'webhooks': ['generic:first']}}}
+        (self.directory/'mass-notifications.config').write_text(json.dumps({'desktop_clients': [
+            {'username': 'original', 'enabled': '1', 'client_id': 'original-enrollment'}]}))
         with mock.patch.object(queue, 'groups', return_value={'north': current}), \
              mock.patch.object(queue.subprocess, 'run', return_value=mock.Mock(returncode=0)) as run:
             self.assertEqual(queue.dispatch_nws('fixture', job)[0], 'complete')
@@ -460,10 +619,12 @@ q.dispatch_nws=inert
 raise SystemExit(q.deliver_claim(sys.argv[3],sys.argv[4]))
 ''')
         def launch(job_id, job):
-            return queue.subprocess.Popen([sys.executable, str(runner), str(ROOT), str(CANDIDATE), job_id, job['claim_token']],
+            process = queue.subprocess.Popen([sys.executable, str(runner), str(ROOT), str(CANDIDATE), job_id, job['claim_token']],
                 stdin=queue.subprocess.DEVNULL, stdout=queue.subprocess.DEVNULL, stderr=queue.subprocess.DEVNULL,
                 start_new_session=True, close_fds=True, env=dict(os.environ,
                     DATA_DIR=str(self.directory), FIXTURE_BEHAVIORS=json.dumps(behaviors)))
+            self.spawned_processes.append(process)
+            return process
         return launch
 
     def recipients(self, job_id, phones):

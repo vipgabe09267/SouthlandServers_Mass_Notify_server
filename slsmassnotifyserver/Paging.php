@@ -103,7 +103,11 @@ trait SlsLivePaging
                     if (!preg_match('/^[0-9]{4,8}$/D', $pin) || strlen($pin) !== $length) {
                         throw new \InvalidArgumentException(_('A paging PIN must match the selected 4–8 digit length.'));
                     }
-                    $hash = password_hash($pin, PASSWORD_DEFAULT);
+                    $generatedHash = password_hash($pin, PASSWORD_DEFAULT);
+                    if (!is_string($generatedHash) || $generatedHash === '') {
+                        throw new \RuntimeException(_('The paging PIN could not be secured. Check PHP password support and retry.'));
+                    }
+                    $hash = $generatedHash;
                     if (function_exists('sodium_memzero')) { sodium_memzero($pin); } else { $pin = ''; }
                 } elseif ($hash !== '' && $length !== (int)($saved['pin_length'] ?? 4)) {
                     throw new \InvalidArgumentException(_('Randomize or enter a new PIN when changing its length.'));
@@ -264,14 +268,9 @@ trait SlsLivePaging
                 || ($before['mode'] & 0777) !== 0640 || $before['uid'] !== $account['uid'] || $before['gid'] !== $account['gid'] || $before['size'] <= 44) {
                 throw new \DomainException($message);
             }
-            $handle = @fopen($path, 'rb');
-            if ($handle === false) { throw new \DomainException($message); }
-            try {
-                $opened = fstat($handle);
-                $header = fread($handle, 12);
-                if (!is_array($opened) || $opened['dev'] !== $before['dev'] || $opened['ino'] !== $before['ino'] || $opened['nlink'] !== 1
-                    || substr($header, 0, 4) !== 'RIFF' || substr($header, 8, 4) !== 'WAVE') { throw new \DomainException($message); }
-            } finally { fclose($handle); }
+            try { $valid = $this->isValidAnnouncementAudioCache($path); }
+            catch (\Throwable $error) { throw new \DomainException($message, 0, $error); }
+            if (!$valid) { throw new \DomainException($message); }
         }
     }
 
@@ -292,19 +291,22 @@ trait SlsLivePaging
         $voiceSettings['_tts_prompt_only'] = true;
         foreach ($files as $key => $relative) {
             $destination = $directory . '/' . basename($relative) . '.wav';
-            if (is_link($destination)) { throw new \RuntimeException(_('A live paging prompt path is unsafe. Run protected repair.')); }
-            if (is_file($destination) && is_readable($destination) && filesize($destination) > 44) {
-                $metadata = lstat($destination);
-                if (!is_array($metadata) || $metadata['nlink'] !== 1) { throw new \RuntimeException(_('A live paging prompt path is unsafe. Run protected repair.')); }
-                $handle = @fopen($destination, 'rb');
-                $header = ''; $opened = false;
-                if ($handle !== false) {
-                    try { $opened = fstat($handle); $header = fread($handle, 12); }
-                    finally { fclose($handle); }
-                }
-                if (is_array($opened) && $opened['dev'] === $metadata['dev'] && $opened['ino'] === $metadata['ino']
-                    && substr($header, 0, 4) === 'RIFF' && substr($header, 8, 4) === 'WAVE') {
+            clearstatcache(true, $destination); $destinationBefore = @lstat($destination);
+            if ($destinationBefore !== false && (($destinationBefore['mode'] & 0170000) !== 0100000
+                || $destinationBefore['nlink'] !== 1 || realpath($destination) !== $destination)) {
+                throw new \RuntimeException(_('A live paging prompt path is unsafe. Run protected repair.'));
+            }
+            if ($destinationBefore !== false && is_readable($destination) && $destinationBefore['size'] > 44) {
+                try { $valid = $this->isValidAnnouncementAudioCache($destination); }
+                catch (\RuntimeException $error) { $valid = false; }
+                if ($valid) {
                     $this->setPrivateOwnership($destination);
+                    clearstatcache(true, $destination); $secured = @lstat($destination);
+                    if (!is_array($secured) || $secured['dev'] !== $destinationBefore['dev']
+                        || $secured['ino'] !== $destinationBefore['ino'] || $secured['nlink'] !== 1
+                        || ($secured['mode'] & 0777) !== 0640) {
+                        throw new \RuntimeException(_('A live paging prompt changed while its ownership was secured. Run protected repair.'));
+                    }
                     continue;
                 }
             }
@@ -313,27 +315,44 @@ trait SlsLivePaging
                 throw new \RuntimeException(sprintf(_('Unable to generate the live paging %s prompt. Check Piper voice readiness.'), $key));
             }
             $source = self::TTS_DIR . '/' . $generated . '.wav';
-            $temporary = tempnam($directory, '.prompt-');
-            if ($temporary === false) { throw new \RuntimeException(_('Unable to stage a live paging prompt.')); }
+            clearstatcache(true, $source); $sourceIdentity = @lstat($source);
+            $temporary = $directory . '/.prompt-' . bin2hex(random_bytes(16));
+            $temporaryIdentity = null;
             try {
-                if (is_link($source) || !is_file($source) || !copy($source, $temporary)) { throw new \RuntimeException(_('Unable to copy the generated paging prompt.')); }
-                $handle = fopen($temporary, 'rb');
-                if ($handle === false) { throw new \RuntimeException(_('Unable to verify the generated paging prompt.')); }
-                $header = fread($handle, 12);
-                $synced = !function_exists('fsync') || fsync($handle);
-                fclose($handle);
-                if (substr($header, 0, 4) !== 'RIFF' || substr($header, 8, 4) !== 'WAVE' || !$synced) {
+                $bytes = $this->readNativeBackupFile($source, 64 * 1024 * 1024, _('Unable to read the generated paging prompt safely.'));
+                clearstatcache(true, $source); $sourceAfterRead = @lstat($source);
+                if (!is_array($sourceIdentity) || !is_array($sourceAfterRead)
+                    || $sourceAfterRead['dev'] !== $sourceIdentity['dev'] || $sourceAfterRead['ino'] !== $sourceIdentity['ino']
+                    || substr($bytes, 0, 4) !== 'RIFF' || substr($bytes, 8, 4) !== 'WAVE') {
+                    throw new \RuntimeException(_('The generated paging prompt is not a valid WAV file.'));
+                }
+                $this->writeNativeSnapshotFile($temporary, $bytes, 0600);
+                clearstatcache(true, $temporary); $temporaryIdentity = @lstat($temporary);
+                if (!is_array($temporaryIdentity) || !$this->isValidAnnouncementAudioCache($temporary)) {
                     throw new \RuntimeException(_('The generated paging prompt is not a valid WAV file.'));
                 }
                 $this->setPrivateOwnership($temporary);
-                if (!rename($temporary, $destination)) { throw new \RuntimeException(_('Unable to activate a live paging prompt.')); }
+                clearstatcache(true, $temporary); $staged = @lstat($temporary);
+                clearstatcache(true, $destination); $destinationAtCommit = @lstat($destination);
+                if (!is_array($staged) || $staged['dev'] !== $temporaryIdentity['dev'] || $staged['ino'] !== $temporaryIdentity['ino']
+                    || (($destinationBefore === false) !== ($destinationAtCommit === false))
+                    || ($destinationBefore !== false && ($destinationBefore['dev'] !== $destinationAtCommit['dev']
+                        || $destinationBefore['ino'] !== $destinationAtCommit['ino']))
+                    || !rename($temporary, $destination)) {
+                    throw new \RuntimeException(_('Unable to activate a live paging prompt.'));
+                }
+                clearstatcache(true, $destination); $committed = @lstat($destination);
+                if (!is_array($committed) || $committed['dev'] !== $temporaryIdentity['dev']
+                    || $committed['ino'] !== $temporaryIdentity['ino'] || $committed['nlink'] !== 1) {
+                    throw new \RuntimeException(_('The activated live paging prompt changed unexpectedly. Run protected repair.'));
+                }
                 $directoryHandle = fopen($directory, 'r');
                 if ($directoryHandle === false) { throw new \RuntimeException(_('Unable to persist the live paging prompt directory.')); }
                 try {
                     if (function_exists('fsync') && !fsync($directoryHandle)) { throw new \RuntimeException(_('Unable to persist the live paging prompt directory.')); }
                 } finally { fclose($directoryHandle); }
-                @unlink($source);
-            } finally { if (is_file($temporary)) { @unlink($temporary); } }
+                $this->unlinkNamedFileIfIdentity($source, $sourceIdentity);
+            } finally { $this->unlinkNamedFileIfIdentity($temporary, $temporaryIdentity); }
         }
         $this->pruneLivePagingPrompts($settings);
     }

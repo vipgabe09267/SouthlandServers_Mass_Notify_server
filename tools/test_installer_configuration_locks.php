@@ -29,7 +29,7 @@ eval('namespace SlsInstallerLocksFixture; use FreePBX\modules\SlsConfigCrypto; c
  const SETTINGS_LOCK='.var_export($root.'/settings.lock',true).';
  const ANNOUNCEMENT_ACTIVITY_LOCK_FILE='.var_export($root.'/activity.lock',true).';
  const NATIVE_BACKUP_MAX_CONFIG_BYTES=4194304;
- private $settingsActivityLocks=[];private $settingsReadFingerprints=[];
+ private $settingsActivityLocks=[];private $settingsReadFingerprints=[];private $normalizedSettingsCache=[];
  public $writes=0;public $pendingReads=0;
  public $capacityCalls=0;public $resourcesSufficient=true;
  protected function checkDesktopCapacityResources($limit,$phones=25){$this->capacityCalls++;return $this->resourcesSufficient?
@@ -46,6 +46,9 @@ eval('namespace SlsInstallerLocksFixture; use FreePBX\modules\SlsConfigCrypto; c
  private function rememberSettingsFingerprint($path){$this->settingsReadFingerprints[$path]=$this->settingsFileFingerprint($path);}
  private function isSetupComplete($settings){return false;}
  private function normalizeLivePagingSettings($settings){return ["enabled"=>"0"];}
+ private function automationDependencyChecks($settings){return [];}
+ private function getPanicExtensionUsage($reload=false,$settings=null){return false;}
+ private function removePendingSettingsFileUnlocked($message){if(is_file(self::PENDING_SETTINGS_JSON))unlink(self::PENDING_SETTINGS_JSON);}
  public function __call($name,$args){
   if(!in_array($name,["migrateLegacyTestStatus","ensureBundledSystemRecordings","ensureAmiUser","ensureDialplan","ensureSipNotifyTemplates","ensureMenuPlacement","ensureDashboardWidget","ensureCronJob","ensureFreePbxBackupEnrollment"],true))throw new \\LogicException("Unexpected fixture integration: ".$name);
   return $name==="ensureFreePbxBackupEnrollment"?["success"=>true]:null;

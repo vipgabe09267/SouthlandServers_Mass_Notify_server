@@ -159,7 +159,7 @@ def _identity(info):
             info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
-def _write(parent, value, uid, gid, expected):
+def _write(parent, value, uid, gid, expected, target=STATE):
     raw = json.dumps(value, separators=(',', ':'), allow_nan=False).encode()
     if len(raw) > MAX_STATE: raise MailAdmissionBlocked('mail_admission_unavailable')
     name = '.mail-admission-' + os.urandom(16).hex()
@@ -169,12 +169,12 @@ def _write(parent, value, uid, gid, expected):
         with os.fdopen(fd, 'wb', closefd=False) as handle:
             if handle.write(raw) != len(raw): raise MailAdmissionBlocked('mail_admission_unavailable')
             handle.flush(); os.fsync(fd)
-        try: current = os.stat(STATE, dir_fd=parent, follow_symlinks=False)
+        try: current = os.stat(target, dir_fd=parent, follow_symlinks=False)
         except FileNotFoundError: current = None
         if ((current is None) != (expected is None)
                 or current is not None and _identity(current) != _identity(expected)):
             raise MailAdmissionBlocked('mail_admission_unavailable')
-        os.replace(name, STATE, src_dir_fd=parent, dst_dir_fd=parent); os.fsync(parent)
+        os.replace(name, target, src_dir_fd=parent, dst_dir_fd=parent); os.fsync(parent)
     finally:
         os.close(fd)
         try: os.unlink(name, dir_fd=parent)
@@ -205,23 +205,53 @@ def reserve(category='alert', recipients=1, *, directory=DATA, clock=time.time, 
                 if time.monotonic() >= deadline: raise MailAdmissionBlocked('mail_admission_unavailable')
                 time.sleep(.01)
         marker = os.read(lock, len(MARKER) + 1)
-        if marker not in (b'', MARKER): raise MailAdmissionBlocked('mail_admission_unavailable')
         now = int(clock())
         if not 0 <= now <= 10**12: raise MailAdmissionBlocked('mail_admission_unavailable')
+        intent_name = '.mail-admission-initializing'
+        intent = None
+        try: intent_fd = os.open(intent_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
+        except FileNotFoundError: pass
+        else:
+            try:
+                _regular(intent_fd, parent, intent_name, uid, gid, 1024)
+                intent = _strict(os.read(intent_fd, 1025))
+            finally: os.close(intent_fd)
+            if not isinstance(intent, dict) or set(intent) != {'schema', 'initial'} or intent['schema'] != 1:
+                raise MailAdmissionBlocked('mail_admission_unavailable')
+            initial = _checked_state(intent['initial'])
+            if initial['probe'] is not None or any(initial['windows'].values()):
+                raise MailAdmissionBlocked('mail_admission_unavailable')
+        if marker not in (b'', MARKER) and not (intent is not None and MARKER.startswith(marker)):
+            raise MailAdmissionBlocked('mail_admission_unavailable')
         try: fd = os.open(STATE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
         except FileNotFoundError:
-            if marker: raise MailAdmissionBlocked('mail_admission_unavailable')
-            state = {'schema': 1, 'last_at': now, 'windows': {str(period): [] for period in LIMITS}, 'probe': None}
+            if marker and intent is None: raise MailAdmissionBlocked('mail_admission_unavailable')
+            state = intent['initial'] if intent is not None else {'schema': 1, 'last_at': now, 'windows': {str(period): [] for period in LIMITS}, 'probe': None}
             expected = None
         else:
             try:
                 info = _regular(fd, parent, STATE, uid, gid, MAX_STATE)
                 raw = os.read(fd, MAX_STATE + 1)
-                if not marker or len(raw) != info.st_size: raise MailAdmissionBlocked('mail_admission_unavailable')
+                if len(raw) != info.st_size: raise MailAdmissionBlocked('mail_admission_unavailable')
                 if _identity(info) != _identity(_regular(fd, parent, STATE, uid, gid, MAX_STATE)):
                     raise MailAdmissionBlocked('mail_admission_unavailable')
                 expected = info
                 state = _checked_state(_strict(raw))
+            finally: os.close(fd)
+            if not marker and intent is None: raise MailAdmissionBlocked('mail_admission_unavailable')
+            if intent is not None and state != intent['initial']: raise MailAdmissionBlocked('mail_admission_unavailable')
+        if intent is not None or expected is None:
+            if intent is None:
+                intent = {'schema': 1, 'initial': state}
+                _write(parent, intent, uid, gid, None, target=intent_name)
+            if expected is None: _write(parent, state, uid, gid, None)
+            os.lseek(lock, 0, os.SEEK_SET)
+            if os.write(lock, MARKER) != len(MARKER): raise MailAdmissionBlocked('mail_admission_unavailable')
+            os.ftruncate(lock, len(MARKER)); os.fsync(lock); os.fsync(parent)
+            os.unlink(intent_name, dir_fd=parent); os.fsync(parent)
+            marker = MARKER
+            fd = os.open(STATE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
+            try: expected = _regular(fd, parent, STATE, uid, gid, MAX_STATE)
             finally: os.close(fd)
         if now < state['last_at']: raise MailAdmissionBlocked('mail_admission_unavailable')
         state['last_at'] = now
@@ -251,9 +281,6 @@ def reserve(category='alert', recipients=1, *, directory=DATA, clock=time.time, 
                     row['counts'][name][0] += 1; row['counts'][name][1] += recipients
             probe['reserved'] += 1
         _write(parent, state, uid, gid, expected)
-        if not marker:
-            if os.write(lock, MARKER) != len(MARKER): raise MailAdmissionBlocked('mail_admission_unavailable')
-            os.fsync(lock); os.fsync(parent)
         if code: raise MailAdmissionBlocked(code)
         return {'ok': True}
     except MailAdmissionBlocked: raise

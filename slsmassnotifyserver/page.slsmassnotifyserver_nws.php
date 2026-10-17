@@ -1,7 +1,13 @@
 <?php
+require_once __DIR__.'/AdminResponse.php';
 
 $slsmassnotifyserver = \FreePBX::create()->Slsmassnotifyserver;
 $slsmassnotifyserver->enforceOperatorPageAccess('slsmassnotifyserver_nws');
+if (($_REQUEST['slsmassnotifyserver_action'] ?? '') === 'cooldowns'
+    || (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST'
+        && (($_POST['ajax'] ?? '') === '1' || ($_POST['slsmassnotifyserver_action'] ?? '') === 'test_delivery_status'))) {
+    \SLS\MassNotify\AdminResponse::requireClearBuffers();
+}
 $saveResult = $_SESSION['slsmassnotifyserver_save_result'] ?? null;
 $applyResult = $_SESSION['slsmassnotifyserver_apply_result'] ?? null;
 $testResult = $_SESSION['slsmassnotifyserver_test_result'] ?? null;
@@ -13,6 +19,7 @@ unset(
 
 if (($_REQUEST['slsmassnotifyserver_action'] ?? '') === 'cooldowns') {
 	header('Content-Type: application/json');
+	header('Cache-Control: private, no-store');
 	echo json_encode([
 		'success' => true,
 		'cooldowns' => $slsmassnotifyserver->getCooldownState(),

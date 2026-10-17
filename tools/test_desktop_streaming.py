@@ -3,6 +3,7 @@
 import fcntl
 import json
 import os
+import re
 import selectors
 import subprocess
 import time
@@ -21,7 +22,7 @@ class DesktopStreamingTests(DesktopApiDeliveryTests):
             file_put_contents(SETTINGS_FILE, json_encode($s));
             $_SERVER['HTTP_HOST'] = 'pbx.example.com:8443';
         """
-        setup += '\n$_GET["stream_seconds"] = ' + str(duration) + ';\n'
+        setup += '\n$_GET["stream_seconds"] = ' + repr(str(duration)) + ';\n'
         if events:
             (self.directory / 'events.jsonl').write_text(''.join(json.dumps(e) + '\n' for e in events))
         script.write_text(self.prefix + '\n' + setup + '\n$endpoint =' + self.endpoint)
@@ -55,6 +56,7 @@ class DesktopStreamingTests(DesktopApiDeliveryTests):
                 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S+00:00', time.gmtime()),
                 'title': 'Fixture', 'message': 'Private test only',
                 'desktop_enabled': True, 'desktop_all': False, 'desktop_recipients': [recipient],
+                'desktop_client_ids': {recipient: 'device-a' if recipient == 'alice' else 'device-b'},
                 'display_timeout_seconds': 0,
                 'image_url': 'http://pbx.example.com/sls_mass_notify/announcement_20260920235959_abcdef123456.png'}
 
@@ -91,6 +93,34 @@ class DesktopStreamingTests(DesktopApiDeliveryTests):
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fcntl.flock(handle, fcntl.LOCK_UN)
 
+    def simulate_backward_wall_clock(self):
+        pattern=r'(?<![A-Za-z0-9_])time\(\)'
+        self.prefix=re.sub(pattern,'fixture_wall_time()',self.prefix)
+        self.endpoint=re.sub(pattern,'fixture_wall_time()',self.endpoint)
+        clock='''function fixture_wall_time(): int {
+            static $started=null;$started??=hrtime(true)/1e9;
+            return time()-(hrtime(true)/1e9-$started>=1?3600:0);
+        }'''
+        self.prefix=self.prefix.replace('declare(strict_types=1);','declare(strict_types=1);\n'+clock,1)
+
+    def test_stream_duration_remains_bounded_after_clock_moves_backward(self):
+        self.simulate_backward_wall_clock()
+        process, selector=self.run_stream(2)
+        self.read_until(process,selector,b': keepalive ',2)
+        output,error=process.communicate(timeout=4)
+        self.assertEqual(error,b'');self.assertEqual(process.returncode,0)
+        self.assertIn(b'event: reconnect',output);self.assert_slots_reusable()
+
+    def test_revocation_is_rechecked_after_clock_moves_backward(self):
+        self.simulate_backward_wall_clock()
+        process,selector=self.run_stream(9)
+        self.read_until(process,selector,b': keepalive ',2)
+        time.sleep(1.1)
+        path=self.directory/'settings.json';settings=json.loads(path.read_text());settings['desktop_clients'][0]['enabled']='0';path.write_text(json.dumps(settings));path.chmod(0o640)
+        self.read_until(process,selector,b'event: revoked',6)
+        process.communicate(timeout=2);self.assertEqual(process.returncode,0)
+        self.assert_slots_reusable()
+
     def test_regular_heartbeat_is_flushed_before_stream_ends(self):
         process, selector = self.run_stream(20)
         first = self.read_until(process, selector, b': keepalive ', 2)
@@ -121,11 +151,13 @@ class DesktopStreamingTests(DesktopApiDeliveryTests):
 
 
 if __name__ == '__main__':
-    # Restrict this suite to the three real stream-loop tests; the base API
+    # Restrict this suite to the real stream-loop tests; the base API
     # suite is separately required by the build.
     suite = unittest.TestSuite(DesktopStreamingTests(name) for name in (
         'test_live_baseline_burst_projection_and_normal_slot_cleanup',
         'test_regular_heartbeat_is_flushed_before_stream_ends',
         'test_credentials_revoked_during_connection',
+        'test_stream_duration_remains_bounded_after_clock_moves_backward',
+        'test_revocation_is_rechecked_after_clock_moves_backward',
     ))
     raise SystemExit(not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful())

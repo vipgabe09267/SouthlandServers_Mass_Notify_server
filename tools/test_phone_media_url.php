@@ -2,20 +2,21 @@
 declare(strict_types=1);
 interface BMO {}
 $_SERVER['HTTP_HOST'] = 'pbx.example.test';
-$moduleDirectory = $argv[1] ?? dirname(__DIR__) . '/slsmassnotifyserver';
+$moduleDirectory = realpath(dirname(__DIR__) . '/slsmassnotifyserver');
+if (!is_string($moduleDirectory)) { throw new RuntimeException('Candidate module directory is unavailable.'); }
 require $moduleDirectory . '/Slsmassnotifyserver.class.php';
 $reflection = new ReflectionClass(FreePBX\modules\Slsmassnotifyserver::class);
 $module = $reflection->newInstanceWithoutConstructor();
 $normalizer = $reflection->getMethod('normalizeSipNotifySettings');
 $normalizer->setAccessible(true);
-$normalize = static function ($url, $scheme = 'https') use ($normalizer, $module) {
+$normalize = static function ($url, $scheme = 'https') use ($normalizer, $module): array {
     return $normalizer->invoke($module, [
         'pbx_host' => 'pbx.example.test', 'media_scheme' => $scheme,
         'media_base_url' => $url, 'format_overrides' => [], 'device_format_overrides' => [],
     ]);
 };
 $checks = 0;
-$assert = static function ($condition) use (&$checks) {
+$assert = static function (bool $condition) use (&$checks): void {
     $checks++;
     if (!$condition) { throw new RuntimeException('Phone media URL regression failed.'); }
 };

@@ -24,7 +24,9 @@ sys.dont_write_bytecode = True
 DATA = Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin')
 RUNTIME = '/usr/local/bin/sls_mass_notify'
 JOBS = {
-    'maintenance': (True, 900, ['/bin/bash', RUNTIME + '/sls_mass_notify_maintenance.sh']),
+    # Queued repair can include the bounded dependency phase, FreePBX reload,
+    # three approved-inventory signatures and post-repair verification.
+    'maintenance': (True, 7200, ['/bin/bash', RUNTIME + '/sls_mass_notify_maintenance.sh']),
     'update': (True, 1800, ['/bin/bash', RUNTIME + '/sls_mass_notify_update.sh']),
     'weather': (False, 5500, ['/bin/bash', RUNTIME + '/sls_mass_notify_weather_poll.sh']),
     'scheduling': (False, 1200, ['/usr/bin/php', RUNTIME + '/sls_mass_notify_schedule_worker.php']),
@@ -49,12 +51,14 @@ def directory(path, account):
         raise CronError('unsafe_directory')
     descriptor = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
-        for index, name in enumerate(path.parts[1:]):
+        parts = path.parts[1:]
+        for index, name in enumerate(parts):
             child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=descriptor)
             os.close(descriptor); descriptor = child
             info = os.fstat(descriptor)
-            sticky = info.st_uid == 0 and info.st_mode & stat.S_ISVTX and index < len(path.parts) - 2
-            if info.st_uid not in (0, account.pw_uid) or info.st_mode & 0o022 and not sticky:
+            sticky = info.st_uid == 0 and name == 'tmp' and info.st_mode & stat.S_ISVTX and index < len(parts)-1
+            group_write = info.st_mode & 0o020 and (index == len(parts)-1 or info.st_gid not in (0, account.pw_gid))
+            if info.st_uid not in (0, account.pw_uid) or not sticky and (info.st_mode & 0o002 or group_write):
                 raise CronError('unsafe_directory')
         return descriptor
     except BaseException:
@@ -116,10 +120,13 @@ def write_all(descriptor, body):
         body = body[written:]
 
 
-def record(parent, descriptor, job, values):
+def record(parent, descriptor, job, values, account):
     opened = os.fstat(descriptor)
     at = os.stat(job + '.jsonl', dir_fd=parent, follow_symlinks=False)
-    if identity(opened) != identity(at) or opened.st_size > LOG_BYTES:
+    if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+            or identity(opened) != identity(at)
+            or opened.st_uid != account.pw_uid or opened.st_gid != account.pw_gid
+            or stat.S_IMODE(opened.st_mode) != 0o640 or opened.st_size > LOG_BYTES):
         raise CronError('diagnostic_file_changed')
     row = {'at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'job': job, **values}
     body = (json.dumps(row, ensure_ascii=True, separators=(',', ':')) + '\n').encode()
@@ -176,7 +183,7 @@ def execute(job, data=DATA):
         try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError: return 0
         output = open_file(parent, job + '.jsonl', account, LOG_BYTES)
-        record(parent, output, job, {'event': 'started'})
+        record(parent, output, job, {'event': 'started'}, account)
         def interrupted_by(signum, _frame): interrupted.append(signum)
         for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             previous_handlers[signum] = signal.signal(signum, interrupted_by)
@@ -201,13 +208,13 @@ def execute(job, data=DATA):
         code = process.wait(timeout=2)
         if reason != 'completed': code = 128 + interrupted[0] if interrupted else (124 if reason == 'timeout' else 65)
         record(parent, output, job, {'event': 'finished', 'result': reason, 'exit_code': code,
-            'output_bytes': total, 'output_truncated': total > len(tail), 'output': tail.decode('utf-8', 'replace')})
+            'output_bytes': total, 'output_truncated': total > len(tail), 'output': tail.decode('utf-8', 'replace')}, account)
         if code != 0: emergency(job, reason if reason != 'completed' else 'worker_failed')
         return code if 0 <= code <= 255 else 1
     except Exception:
         if process is not None and process.poll() is None: terminate(process)
         if parent >= 0 and output >= 0:
-            try: record(parent, output, job, {'event': 'failed', 'result': 'runner_or_diagnostic_failure'})
+            try: record(parent, output, job, {'event': 'failed', 'result': 'runner_or_diagnostic_failure'}, account)
             except Exception: pass
         emergency(job, 'runner_or_diagnostic_failure')
         return 1

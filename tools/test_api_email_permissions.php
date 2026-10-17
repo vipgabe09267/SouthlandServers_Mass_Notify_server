@@ -56,6 +56,11 @@ foreach ([$legacy,$unrestricted] as $principal) {
     }
     checkEmailPermission(!Security::permitsResolvedAnnouncement($principal,['email_recipient_ids'=>['outside@example.com']],$settings),'Unrestricted accepted malformed email IDs.');
 }
+$channelLimited = $unrestricted;
+$channelLimited['allowed_channels'] = ['extensions'];
+checkEmailPermission(Security::permitsResolvedAnnouncement($channelLimited,['phones'=>['1000']],$settings),'Unrestricted recipient scope lost its permitted phone channel.');
+checkEmailPermission(!Security::permitsResolvedAnnouncement($channelLimited,['email_recipient_ids'=>[$a]],$settings),'Unrestricted recipient scope bypassed its channel restriction.');
+checkEmailPermission(!Security::permitsResolvedAnnouncement($channelLimited,['phones'=>['1000'],'webhooks'=>['hook']],$settings),'A mixed request bypassed an unrestricted operator channel restriction.');
 $settings['announcement_groups'][0]['email_recipient_ids']=[];
 checkEmailPermission(!Security::permitsResolvedAnnouncement($p,['email_recipient_ids'=>[$c]],$settings),'Group removal retained email permission.');
 $settings['announcement_email']['recipients'][0]['enabled']='0';

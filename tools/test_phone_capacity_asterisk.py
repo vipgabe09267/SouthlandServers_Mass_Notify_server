@@ -10,8 +10,10 @@ import tempfile
 import time
 import wave
 
-isolated = os.environ.get('SLS_TEST_NAMESPACE') == 'entered' and os.environ.get('SLS_TEST_PARENT_NET_NS') not in (None, os.readlink('/proc/self/ns/net'))
-if not isolated:
+if os.environ.get('SLS_TEST_NAMESPACE') != 'entered' or any(
+    os.environ.get('SLS_TEST_PARENT_' + label + '_NS') in (None, '', os.readlink('/proc/self/ns/' + kind))
+    for label, kind in [('MOUNT', 'mnt'), ('NET', 'net'), ('PID', 'pid')]
+):
     raise SystemExit('Run through tools/run_isolated_tests.sh; production Asterisk is never used.')
 with tempfile.TemporaryDirectory(prefix='sls-capacity-') as folder:
     root = Path(folder)

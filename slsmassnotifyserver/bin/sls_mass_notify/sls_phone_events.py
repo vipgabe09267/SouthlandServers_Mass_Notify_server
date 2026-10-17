@@ -36,15 +36,18 @@ def collect(store, settings, *, ami_factory=PhoneAmi, should_stop=lambda: False)
         with ami_factory(settings, events=True, callback=record) as ami:
             ami.action({'Action': 'Ping'})
             store.collector_heartbeat(generation)
+            store.display_snapshot()
             voicemail_stop = start_voicemail_worker(store.directory)
             heartbeat = time.monotonic()
             while not should_stop():
                 if time.monotonic() - heartbeat >= 5:
                     ami.action({'Action': 'Ping'})
                     store.collector_heartbeat(generation)
-                    inventory = ami.inventory(generation, store.boot_id)
-                    with store.locked() as state:
-                        store.reconcile(state, inventory)
+                    if store.has_open_batches():
+                        inventory = ami.inventory(generation, store.boot_id)
+                        with store.locked() as state:
+                            store.reconcile(state, inventory)
+                    store.display_snapshot()
                     heartbeat = time.monotonic()
                 try:
                     event = ami.receive(time.monotonic() + 1)

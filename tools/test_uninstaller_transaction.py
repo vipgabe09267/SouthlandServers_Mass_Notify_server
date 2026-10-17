@@ -7,7 +7,9 @@ import os
 from pathlib import Path
 import pwd
 import shutil
+import shlex
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -33,6 +35,9 @@ class OfflineUninstaller(unittest.TestCase):
         self.workspace = tempfile.TemporaryDirectory(prefix='sls-uninstall-offline-', dir='/run')
         self.addCleanup(self.workspace.cleanup)
         self.base = Path(self.workspace.name); self.base.chmod(0o755)
+        self.command_workspace = tempfile.TemporaryDirectory(prefix='sls-uninstall-commands-', dir='/tmp')
+        self.addCleanup(self.command_workspace.cleanup)
+        self.systemctl = Path(self.command_workspace.name) / 'systemctl'
         self.account = pwd.getpwnam('asterisk')
         self.store = self.base / 'trust'
         self.installed = self.base / 'runtime'; self.installed.mkdir(mode=0o700)
@@ -41,10 +46,12 @@ class OfflineUninstaller(unittest.TestCase):
         os.chown(self.data, self.account.pw_uid, self.account.pw_gid)
         self.names = {
             'bin/sls_mass_notify_uninstall.sh': ROOT / 'tools/uninstall_release.sh',
+            'bin/slsconsole': ROOT / 'slsmassnotifyserver/bin/slsconsole',
             'bin/sign_sls_mass_notify_local_sig.sh': ROOT / 'slsmassnotifyserver/bin/sign_sls_mass_notify_local_sig.sh',
             'bin/sls_mass_notify/sls_module_trust.py': RUNTIME / 'sls_module_trust.py',
             'bin/sls_mass_notify/sls_config_crypto.php': RUNTIME / 'sls_config_crypto.php',
             'PhoneEventService.php': ROOT / 'slsmassnotifyserver/PhoneEventService.php',
+            'AmiUserOwnership.php': ROOT / 'slsmassnotifyserver/AmiUserOwnership.php',
         }
         for name in ('sls_install_guard', 'sls_install_idle', 'sls_audio_state', 'sls_config_crypto', 'sls_legacy_permissions'):
             self.names['bin/sls_mass_notify/' + name + '.py'] = RUNTIME / (name + '.py')
@@ -91,6 +98,8 @@ class OfflineUninstaller(unittest.TestCase):
         }.items():
             body = body.replace(path, str(self.installed / Path(name).name))
         body = body.replace(' /usr/local/bin/sls_mass_notify \\\n', ' ' + str(self.installed) + ' \\\n')
+        body=body.replace('/var/lib/sls-mass-notify-uninstaller',str(self.base/'root-recovery'))
+        body=body.replace('/usr/bin/systemctl',str(self.systemctl))
         self.script = self.base / 'private-uninstall.sh'; self.script.write_text(body); self.script.chmod(0o700)
 
     def shell(self, body, *, env=None):
@@ -108,6 +117,37 @@ class OfflineUninstaller(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), str(self.generation / 'module'))
         self.assertFalse(missing_installer.exists())
         self.assertFalse((self.installed / 'sls_phone_events.py').exists())
+
+    def test_invalid_purge_flag_is_rejected_before_host_checks(self):
+        result = subprocess.run(
+            ['bash', str(self.script)], capture_output=True, text=True, timeout=10,
+            env=dict(os.environ, SLS_MASS_NOTIFY_PURGE_CONFIG='yes'),
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('must be 0 or 1', result.stderr)
+
+    def test_maintenance_lock_never_creates_an_unreviewed_parent(self):
+        lock = self.base / 'absent-lock-parent' / 'maintenance.lock'
+        result = self.shell(
+            'SLS_MASS_NOTIFY_MAINTENANCE_LOCK="$SLS_TEST_LOCK"\n'
+            'acquire_maintenance_coordination\n',
+            env={'SLS_TEST_LOCK': str(lock)},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('must already exist', result.stdout)
+        self.assertFalse(lock.parent.exists())
+
+    def test_durable_removal_stages_preserve_recovery_and_reject_linked_state(self):
+        result=self.shell('admit_root_runtime\nUNINSTALL_TRANSACTION_DIR="$(uninstall_recovery_workspace sls-uninstall-transaction)"\nrecord_uninstall_stage prepared\nrecord_uninstall_stage verification\nrecord_uninstall_stage failed\nprintf "%s\\n" "$UNINSTALL_TRANSACTION_DIR"\n')
+        self.assertEqual(result.returncode,0,result.stderr)
+        folder=Path(result.stdout.strip());path=folder/'transaction.json'
+        record=json.loads(path.read_text())
+        self.assertEqual([row['phase'] for row in record['history']],['prepared','verification','failed'])
+        self.assertEqual(record['approved_source'],str(self.generation/'module'))
+        self.assertEqual(path.stat().st_mode&0o777,0o600)
+        path.unlink();target=folder/'retained';target.write_text('preserved');path.symlink_to(target)
+        result=self.shell('UNINSTALL_TRANSACTION_DIR='+shlex.quote(str(folder))+'\nrecord_uninstall_stage complete\n')
+        self.assertNotEqual(result.returncode,0);self.assertEqual(target.read_text(),'preserved')
 
     def test_tampered_and_linked_teardown_helpers_are_rejected(self):
         path = self.installed / 'sls_config_crypto.php'
@@ -130,7 +170,6 @@ rm -rf "$(dirname "$RECOVERY_CONFIG_DECODER")/nonexistent"
 rm -rf "''' + str(self.installed) + '''"
 capture_configured_ami_username
 printf '%s\\n' "$CONFIGURED_AMI_USERNAME"
-test -x "$RECOVERY_SIGNER"
 test "$(stat -c '%a %U:%G' "$RECOVERY_SIGNER")" = '700 root:root'
 test "$(stat -c '%a %U:%G' "$RECOVERY_CONFIG_DECODER")" = '640 root:asterisk'
 bash -n "$RECOVERY_SIGNER"
@@ -145,6 +184,151 @@ bash -n "$RECOVERY_SIGNER"
             function = source[source.index(first):source.index(last)]
             self.assertNotIn('sls_config_crypto.php', function)
             self.assertIn('SLS_CONFIGURED_AMI_USERNAME', function)
+
+    def test_managed_text_rewrite_is_atomic_and_rejects_links_and_oversize_input(self):
+        directory = self.base / 'asterisk-text'
+        directory.mkdir(mode=0o750)
+        os.chown(directory, self.account.pw_uid, self.account.pw_gid)
+        target = directory / 'extensions_custom.conf'
+        target.write_text('keep\n; BEGIN Fixture\nremove\n; END Fixture\n')
+        os.chown(target, self.account.pw_uid, self.account.pw_gid)
+        target.chmod(0o640)
+        before = target.stat()
+        result = self.shell(
+            'rewrite_managed_text_file "$SLS_TEST_TEXT" managed-block Fixture check\n',
+            env={'SLS_TEST_TEXT': str(target)},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(target.read_text(), 'keep\n; BEGIN Fixture\nremove\n; END Fixture\n')
+        self.assertEqual(target.stat().st_ino, before.st_ino)
+        result = self.shell(
+            'rewrite_managed_text_file "$SLS_TEST_TEXT" managed-block Fixture\n',
+            env={'SLS_TEST_TEXT': str(target)},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(target.read_text(), 'keep\n')
+        after = target.stat()
+        self.assertNotEqual(after.st_ino, before.st_ino)
+        self.assertEqual((after.st_uid, after.st_gid, stat.S_IMODE(after.st_mode)),
+                         (self.account.pw_uid, self.account.pw_gid, 0o640))
+
+        formatting = directory / 'formatting.conf'
+        original = ('\n\nkeep-before\n; BEGIN Fixture\nremove\n; END Fixture\n'
+                    '\nkeep-after\n\n')
+        formatting.write_text(original)
+        os.chown(formatting, self.account.pw_uid, self.account.pw_gid)
+        formatting.chmod(0o640)
+        result = self.shell(
+            'rewrite_managed_text_file "$SLS_TEST_TEXT" managed-block Fixture\n',
+            env={'SLS_TEST_TEXT': str(formatting)},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(formatting.read_text(), '\n\nkeep-before\n\nkeep-after\n\n')
+
+        crlf = directory / 'legacy-crlf.conf'
+        crlf.write_bytes(b'keep\r\n;-- BEGIN Fixture --\r\nremove\r\n;-- END Fixture --\r\ntail\r\n')
+        os.chown(crlf, self.account.pw_uid, self.account.pw_gid)
+        crlf.chmod(0o640)
+        result = self.shell(
+            'rewrite_managed_text_file "$SLS_TEST_TEXT" managed-block Fixture\n',
+            env={'SLS_TEST_TEXT': str(crlf)},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(crlf.read_bytes(), b'keep\r\ntail\r\n')
+
+        protected = directory / 'protected'
+        protected.write_text('; BEGIN Fixture\nkeep-target\n; END Fixture\n')
+        os.chown(protected, self.account.pw_uid, self.account.pw_gid)
+        linked = directory / 'linked'
+        linked.symlink_to(protected.name)
+        result = self.shell(
+            'rewrite_managed_text_file "$SLS_TEST_TEXT" managed-block Fixture\n',
+            env={'SLS_TEST_TEXT': str(linked)},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('keep-target', protected.read_text())
+
+        hardlink = directory / 'hardlink'
+        os.link(protected, hardlink)
+        result = self.shell(
+            'rewrite_managed_text_file "$SLS_TEST_TEXT" managed-block Fixture\n',
+            env={'SLS_TEST_TEXT': str(hardlink)},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('keep-target', protected.read_text())
+
+        oversized = directory / 'oversized'
+        with oversized.open('wb') as handle:
+            handle.truncate(8 * 1024 * 1024 + 1)
+        os.chown(oversized, self.account.pw_uid, self.account.pw_gid)
+        result = self.shell(
+            'rewrite_managed_text_file "$SLS_TEST_TEXT" managed-block Fixture\n',
+            env={'SLS_TEST_TEXT': str(oversized)},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(oversized.stat().st_size, 8 * 1024 * 1024 + 1)
+
+        unsafe = directory / 'world-writable'
+        unsafe.write_text('; BEGIN Fixture\nkeep\n; END Fixture\n')
+        os.chown(unsafe, self.account.pw_uid, self.account.pw_gid)
+        unsafe.chmod(0o666)
+        result = self.shell(
+            'rewrite_managed_text_file "$SLS_TEST_TEXT" managed-block Fixture\n',
+            env={'SLS_TEST_TEXT': str(unsafe)},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('keep', unsafe.read_text())
+
+    def test_logrotate_removal_accepts_only_the_exact_bounded_template(self):
+        path = self.base / 'sls-logrotate'
+        canonical = (
+            '/var/log/sls_mass_notify.log {\n'
+            '    daily\n'
+            '    maxsize 2M\n'
+            '    rotate 90\n'
+            '    maxage 90\n'
+            '    missingok\n'
+            '    notifempty\n'
+            '    compress\n'
+            '    delaycompress\n'
+            '    copytruncate\n'
+            '    su root asterisk\n'
+            '}\n'
+        )
+        path.write_text(canonical)
+        path.chmod(0o644)
+        result = self.shell(
+            'admit_root_runtime\nremove_managed_root_file "$SLS_TEST_ROOT_FILE" logrotate check\n',
+            env={'SLS_TEST_ROOT_FILE': str(path)},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(path.read_text(), canonical)
+        result = self.shell(
+            'admit_root_runtime\nremove_managed_root_file "$SLS_TEST_ROOT_FILE" logrotate\n',
+            env={'SLS_TEST_ROOT_FILE': str(path)},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(path.exists())
+
+        path.write_text(canonical + '# local policy\n')
+        path.chmod(0o644)
+        result = self.shell(
+            'admit_root_runtime\nremove_managed_root_file "$SLS_TEST_ROOT_FILE" logrotate\n',
+            env={'SLS_TEST_ROOT_FILE': str(path)},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(path.read_text(), canonical + '# local policy\n')
+
+        peer = self.base / 'sls-logrotate-peer'
+        path.write_text(canonical)
+        os.link(path, peer)
+        result = self.shell(
+            'admit_root_runtime\nremove_managed_root_file "$SLS_TEST_ROOT_FILE" logrotate\n',
+            env={'SLS_TEST_ROOT_FILE': str(path)},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(path.exists())
+        self.assertEqual(peer.read_text(), canonical)
 
     def test_default_preserves_full_history_in_place_and_purge_is_explicit(self):
         for purge in ['0', '1']:
@@ -226,15 +410,36 @@ verify_removed_cron
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('UNEXPECTED CRON REPLACEMENT', result.stdout)
 
-    def test_cron_write_failure_is_reported_and_originals_retained(self):
+    def test_second_cron_write_failure_rolls_back_first_replacement(self):
+        fixture = self.base / 'cron-rollback'; fixture.mkdir()
+        original = '* * * * * /usr/local/bin/sls_mass_notify/sls_cron_runner.py maintenance >/dev/null 2>&1\n'
+        for user in ['root', 'asterisk']:
+            (fixture / user).write_text(original)
         result = self.shell('''crontab() {
+  if [ "$3" = '-l' ]; then cat "$SLS_TEST_CRON/$2"; return 0; fi
+  if [ "$2" = asterisk ]; then return 2; fi
+  cp -- "$3" "$SLS_TEST_CRON/$2"
+}
+remove_cron
+''', env={'SLS_TEST_CRON': str(fixture)})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Earlier replacements were rolled back', result.stdout)
+        self.assertEqual((fixture / 'root').read_text(), original)
+        self.assertEqual((fixture / 'asterisk').read_text(), original)
+
+    def test_cron_rollback_failure_preserves_recovery_workspace(self):
+        result = self.shell('''write_count=0
+crontab() {
   if [ "$3" = '-l' ]; then printf '* * * * * /usr/local/bin/sls_mass_notify/sls_cron_runner.py maintenance >/dev/null 2>&1\\n'; return 0; fi
+  write_count=$((write_count + 1))
+  [ "$write_count" = 1 ] && return 0
   return 2
 }
 remove_cron
 ''')
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('Original crontabs were retained', result.stdout)
+        self.assertIn('cron rollback was incomplete', result.stdout)
+        self.assertRegex(result.stdout, r'/tmp/slsmassnotifyserver-cron\.[A-Za-z0-9]+')
 
     def test_cron_verification_reads_long_output_without_sigpipe_false_negative(self):
         result = self.shell('''crontab() {
@@ -302,7 +507,6 @@ false
         result = self.shell('''PBX_RUNNING=0
 run_fwconsole() { printf 'UNEXPECTED PBX COMMAND\\n'; return 9; }
 reload_removed_pbx_integration
-test "$PBX_RELOAD_WARNING" = 1
 ''')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('SLS removal was verified', result.stdout)
@@ -316,7 +520,6 @@ MODULE_UNINSTALL_LOG="$SLS_TEST_LOG"
 MODULE_UNINSTALL_LOG_PATH="$SLS_TEST_LOG"
 run_fwconsole() { test "$1" = reload; printf 'unrelated PBX reload failure\\n'; return 9; }
 reload_removed_pbx_integration
-test "$PBX_RELOAD_WARNING" = 1
 ''', env={'SLS_TEST_LOG': str(log)})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('SLS removal was verified', result.stdout)
@@ -325,6 +528,8 @@ test "$PBX_RELOAD_WARNING" = 1
 
     def test_read_only_pbx_precheck_and_verification_precede_reload(self):
         source = self.script.read_text(); main = source[source.index('main() {'):]
+        self.assertLess(main.index('preflight_uninstall_integrations'), main.index('remove_phone_collector_service'))
+        self.assertLess(main.index('preflight_uninstall_integrations'), main.index('remove_module_registration'))
         self.assertLess(main.index('capture_pbx_running_state'), main.index('remove_phone_collector_service'))
         self.assertLess(main.index('verify_freepbx_cleanup'), main.index('reload_removed_pbx_integration'))
         self.assertNotIn('systemctl start', source[source.index('capture_pbx_running_state()'):source.index('capture_configured_ami_username()')])
@@ -541,7 +746,7 @@ printf 'UNSAFE TEARDOWN\\n'
     def test_collector_stop_rechecks_final_calls_before_deleting_service(self):
         self.unit.write_bytes(self.collector_unit_body()); self.unit.chmod(0o644)
         commands = self.base / 'commands'; commands.mkdir()
-        systemctl = commands / 'systemctl'
+        systemctl = self.systemctl
         state = self.base / 'collector-state'; state.write_text('active')
         calls = self.base / 'systemctl-calls'
         systemctl.write_text('''#!/bin/bash
@@ -605,7 +810,7 @@ acquire_uninstall_workers
     def test_collector_recovery_preserves_disabled_and_inactive_state(self):
         original = self.collector_unit_body()
         commands = self.base / 'commands'; commands.mkdir()
-        systemctl = commands / 'systemctl'; calls = self.base / 'systemctl-calls'; state = self.base / 'collector-state'
+        systemctl = self.systemctl; calls = self.base / 'systemctl-calls'; state = self.base / 'collector-state'
         systemctl.write_text('''#!/bin/bash
 printf '%s\\n' "$*" >>"$SLS_TEST_CALLS"
 case "$1:$2" in

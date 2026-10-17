@@ -1,3 +1,4 @@
+Options -Indexes -MultiViews
 <IfModule mod_rewrite.c>
 RewriteEngine On
 RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
@@ -5,3 +6,6 @@ RewriteCond %{REQUEST_FILENAME} !-f
 RewriteCond %{REQUEST_FILENAME} !-d
 RewriteRule ^ index.php [L,QSA]
 </IfModule>
+<FilesMatch "^(?!(?:index|edge|edge-view|media|peer|sms-callback|trigger)\.php$).+\.php$">
+    Require all denied
+</FilesMatch>

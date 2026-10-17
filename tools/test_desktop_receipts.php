@@ -1,12 +1,14 @@
 <?php
 declare(strict_types=1);
+require dirname(__DIR__) . '/slsmassnotifyserver/api/sls-mass-notify/security.php';
 // Only disposable fixture files and inert delivery adapters are used.
 $root = sys_get_temp_dir() . '/sls-desktop-receipts-' . bin2hex(random_bytes(8));
 mkdir($root, 0700); mkdir($root . '/sipnotify', 0750);
 define('DESKTOP_ACK_DIRECTORY', $root . '/sipnotify/acknowledgements');
 define('RETENTION_MAX_EVENTS', 1000);
+define('MAX_EVENT_ID_BYTES', 2048);
 $api = file_get_contents(dirname(__DIR__) . '/slsmassnotifyserver/api/sipnotify/index.php');
-foreach ([['function atomic_replace_journal', 'function retained_events'], ['function record_desktop_acknowledgement', "\n\n\$endpoint ="]] as [$start, $end]) {
+foreach ([['function api_state_parent_matches', 'function api_state_lock'], ['function desktop_timestamp', 'function atomic_replace_journal'], ['function atomic_replace_journal', 'function retained_events'], ['function record_desktop_acknowledgement', "\n\n\$endpoint ="]] as [$start, $end]) {
     $offset = strpos($api, $start); eval(substr($api, $offset, strpos($api, $end, $offset) - $offset));
 }
 function retention_days($settings) { return 90; }
@@ -18,6 +20,8 @@ class ReceiptDeliveryFixture {
     use \FreePBX\modules\SlsAnnouncementDelivery;
     public $earlyAck = false;
     public $id = '';
+    public $currentClientId = 'client-a';
+    private function getActiveSettings() { return ['desktop_clients'=>[['username'=>'alice','client_id'=>$this->currentClientId,'enabled'=>'1']], 'enterprise_cluster'=>['enabled'=>false]]; }
     private function announcementJobDirectory() { return self::PLUGIN_DATA_DIR; }
     private function currentAnnouncementDestinationIds() { return ['phones'=>[], 'desktops'=>['alice'], 'webhooks'=>[]]; }
     private function acquireAnnouncementActivityLock(...$args) { return null; }
@@ -44,6 +48,8 @@ $row = ['channel'=>'desktop', 'target'=>'alice', 'client_id'=>'client-a', 'event
 $now = time();
 try {
     expectReceipt($module->refresh([$row])['receipts'][0] === $row, 'Missing evidence fabricated receipt.');
+    $invalidSaved=$module->refresh([$row,'invalid-receipt']);
+    expectReceipt(count($invalidSaved['receipts'])===1 && isset($invalidSaved['receipt_status_error']), 'Malformed saved receipt reached status rendering.');
     $presence = $root . '/desktop-last-seen.json';
     file_put_contents($presence, json_encode(['alice'=>['client_id'=>'client-a','seen_at'=>gmdate('c', $now-120)]])); chmod($presence,0640);
     $waiting = $module->refresh([$row])['receipts'][0];

@@ -3,6 +3,7 @@
 
 import importlib.util
 import sys
+import tempfile
 from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr
@@ -100,5 +101,27 @@ with patch.dict(email.os.environ, {"SLS_WORKER_DEADLINE_EPOCH": "1001"}):
         raise AssertionError("exhausted worker budget allowed a sendmail submission")
     except RuntimeError as exc:
         assert "budget is exhausted" in str(exc)
+
+with tempfile.TemporaryDirectory(prefix='sls-mail-logo-boundary-') as temporary:
+    directory = Path(temporary)
+    private = directory / 'private-evidence'
+    private.write_bytes(b'private fixture evidence; never attach this')
+    linked = directory / 'logo-link.png'
+    linked.symlink_to(private)
+    oversized = directory / 'oversized.png'
+    with oversized.open('wb') as output:
+        output.write(b'\x89PNG\r\n\x1a\n'); output.truncate(2 * 1024 * 1024 + 1)
+    for logo in [linked, oversized]:
+        sendmail_calls.clear()
+        with patch.dict(email.os.environ, {'SLS_WORKER_DEADLINE_EPOCH': ''}), \
+             patch.object(email.Path, 'is_file', return_value=True), \
+             patch.object(email.os, 'access', return_value=True), \
+             patch.object(email.subprocess, 'run', side_effect=capture_sendmail), \
+             patch.object(email, 'LOGO_PATHS', (logo,)), \
+             patch.object(email._mail_admission, 'reserve', return_value={'ok': True}):
+            assert email.send_branded_email({'system_notification_emails': 'recipient@example.net'}, 'Fixture', 'Preserve the message')
+        message = BytesParser(policy=policy.default).parsebytes(sendmail_calls[0][1])
+        assert not any(part.get_content_maintype() == 'image' for part in message.walk()), 'Unsafe or oversized branding was attached'
+        assert private.read_bytes() == b'private fixture evidence; never attach this'
 
 print("Email sender-domain runtime tests passed.")

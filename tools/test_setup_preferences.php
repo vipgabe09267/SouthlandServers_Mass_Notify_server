@@ -2,13 +2,13 @@
 /** Setup parsing and actual view rendering without a PBX bootstrap or transport. */
 declare(strict_types=1);
 if (!interface_exists('BMO')) { interface BMO {} }
-if (!function_exists('load_view')) { function load_view($path, $data) { return ''; } }
+if (!function_exists('load_view')) { function load_view(string $path, array $data): string { return ''; } }
 require_once dirname(__DIR__) . '/slsmassnotifyserver/Slsmassnotifyserver.class.php';
 $class=new ReflectionClass(FreePBX\modules\Slsmassnotifyserver::class);
 $module=$class->newInstanceWithoutConstructor();
 $method=$class->getMethod('readSetupConnectionPreferences');$method->setAccessible(true);
 $count=0;
-$check=static function($value,$message)use(&$count){$count++;if(!$value){throw new RuntimeException($message);}};
+$check=static function(bool $value,string $message)use(&$count):void{$count++;if(!$value){throw new RuntimeException($message);}};
 $saved=['public_pbx_host'=>'pbx.example.test','desktop_client_limit'=>25,'phone_device_limit'=>25,
     'sipnotify'=>['pbx_host'=>'pbx.example.test','base_url'=>'https://pbx.example.test:9443/api/sipnotify','media_scheme'=>'https','media_base_url'=>'https://pbx.example.test:9443/sls_mass_notify'],
     'control_api'=>['base_url'=>'https://pbx.example.test:9443/api/sls-mass-notify','api_key'=>'fixture-secret'],
@@ -32,15 +32,22 @@ foreach (['desktop_client_limit','phone_device_limit'] as $key) {
     }
 }
 $settings=$saved;$csrf_token='fixture';$available_voices=[];
-ob_start();include dirname(__DIR__).'/slsmassnotifyserver/views/setup.php';$html=ob_get_clean();
-$dom=new DOMDocument();libxml_use_internal_errors(true);$dom->loadHTML($html);libxml_clear_errors();
+$check(ob_start(),'Unable to start setup rendering capture.');include dirname(__DIR__).'/slsmassnotifyserver/views/setup.php';$html=ob_get_clean();
+$check(is_string($html),'Unable to read rendered setup markup.');
+$dom=new DOMDocument();$previousErrors=libxml_use_internal_errors(true);$loaded=$dom->loadHTML($html);libxml_clear_errors();libxml_use_internal_errors($previousErrors);
+$check($loaded,'Rendered setup markup could not be parsed.');
 $xpath=new DOMXPath($dom);
 $check($xpath->query('//*[@id="sls-setup-address-change" and not(@checked)]')->length===1,'Address override enabled by default');
 $check($xpath->query('//*[@id="sls-setup-ports" and @disabled and @hidden]')->length===1,'Custom ports active before opt-in');
 $check($xpath->query('//input[@name="advertised_api_port" and @value="9443"]')->length===1,'Wizard did not retain the saved external port');
 $check($xpath->query('//input[@name="sls_setup_form_present"]')->length===1 && $xpath->query('//input[@name="sls_setup_form_complete"]')->length===1,'Setup truncation sentinels missing');
 $scripts=[];foreach($xpath->query('//script')as $script){$scripts[]=$script->textContent;}
-$pipes=[];$process=proc_open(['node','--check'],[0=>['pipe','r'],1=>['pipe','w'],2=>['pipe','w']],$pipes);
-fwrite($pipes[0],implode("\n",$scripts));fclose($pipes[0]);$output=stream_get_contents($pipes[1]);fclose($pipes[1]);$error=stream_get_contents($pipes[2]);fclose($pipes[2]);
-$check(proc_close($process)===0,'Rendered wizard JavaScript is invalid: '.$error);
+$pipes=[];$environment=['PATH'=>'/usr/bin:/bin','LANG'=>'C','LC_ALL'=>'C'];
+$process=proc_open(['/usr/bin/timeout','--signal=TERM','--kill-after=2s','10s','/usr/bin/node','--check'],[0=>['pipe','r'],1=>['pipe','w'],2=>['pipe','w']],$pipes,dirname(__DIR__),$environment,['bypass_shell'=>true]);
+$check(is_resource($process),'Unable to start the bounded JavaScript syntax checker.');
+$program=implode("\n",$scripts);$written=0;
+while($written<strlen($program)){$chunk=fwrite($pipes[0],substr($program,$written));$check(is_int($chunk)&&$chunk>0,'Unable to supply rendered JavaScript to the syntax checker.');$written+=$chunk;}
+fclose($pipes[0]);$output=stream_get_contents($pipes[1],262145);fclose($pipes[1]);$error=stream_get_contents($pipes[2],262145);fclose($pipes[2]);
+$check(is_string($output)&&strlen($output)<=262144&&is_string($error)&&strlen($error)<=262144,'JavaScript syntax checker output exceeded its bound.');
+$check(proc_close($process)===0,'Rendered wizard JavaScript is invalid or its checker timed out: '.$error);
 echo "Setup preferences: $count parsing, preservation and rendered view checks passed.\n";

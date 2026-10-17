@@ -14,6 +14,7 @@ $extra=<<<'PHP'
 PHP;
 eval($automationFixture . ' const PLUGIN_DATA_DIR = ' . var_export($automationDirectory,true)
     . '; const ANNOUNCEMENT_LOCK_FILE = ' . var_export($automationDirectory.'/announcement.lock',true)
+    . '; const SETTINGS_JSON = ' . var_export($automationDirectory.'/fixture.config',true)
     . '; const RUNTIME_DIR = ' . var_export($automationDirectory,true) . ';' . $extra . $methods . '}');
 $module=new AutomationIntegratedFixture();
 $template=\SLS\MassNotify\IncidentConfig::template(['id'=>'tpl_'.str_repeat('e',24),'name'=>'Sensor responders','title'=>'Sensor report','message'=>'{{event}} at {{location}}',
@@ -41,3 +42,35 @@ incident_integration_check(count($module->commands)===0,'Revoked trigger reached
 incident_integration_check(($job['receipts'][0]['state'] ?? '')==='cancelled','Revoked trigger has no explicit cancelled destination evidence.');
 incident_integration_check($job['request']['automation_context']['event_id']===$queued['event_id'],'Completed/cancelled job erased provenance.');
 echo "Integrated trigger → incident → durable announcement → current-source revocation checks passed.\n";
+
+$observer=new AutomationIntegratedFixture();$observer->settings=$module->settings;
+$observer->settings['automations']['rules']=[];
+for($index=0;$index<12;$index++){
+    $observer->settings['automations']['rules'][]=\SLS\MassNotify\AutomationConfig::rule([
+        'id'=>'trg_'.sprintf('%024x',$index),'name'=>'Private observer '.$index,'enabled'=>true,'kind'=>'emergency_call',
+        'callers'=>['1000'],'numbers'=>['911'],'location_id'=>$rule['location_id'],'template_id'=>$template['id'],
+        'fields'=>['event'=>'@event','location'=>'@location'],'allow_tests'=>true]);
+}
+file_put_contents($automationDirectory.'/fixture.config',json_encode($observer->settings,JSON_THROW_ON_ERROR));
+$digest=hash_file('sha256',$automationDirectory.'/fixture.config');
+$observations=new SlsAnnouncementJobStore($automationDirectory.'/emergency-observations');
+$now=time();
+foreach($observer->settings['automations']['rules'] as $index=>$observedRule){
+    $request=hash('sha256','private-observer-'.$index);
+    $observations->atomic('job_'.substr($request,0,32).'.json',[
+        'id'=>'job_'.substr($request,0,32),'schema'=>1,'state'=>'observed','rule_id'=>$observedRule['id'],'request_id'=>$request,'settings_sha256'=>$digest,
+        'sent_at'=>$now,'expires_at'=>$now+300,'event'=>'911','caller'=>'1000','message'=>'Private fixture','is_test'=>true]);
+}
+$result=$observer->processAutomationSources(false);
+incident_integration_check($result['success']&&$result['queued_for_reconciliation']===8&&count($observer->automationWorkers)===4,
+    'One source pass did not bound worker launches while retaining additional events: '.json_encode($result));
+$events=(new \SLS\MassNotify\AutomationStore($automationDirectory.'/automations'))->read()['events'];
+incident_integration_check(count(array_filter($events,static fn($event)=>$event['state']==='queued'))===12,
+    'Launch budgeting dropped durable events or marked deferred work complete.');
+foreach($observer->settings['automations']['rules'] as $index=>$observedRule){
+    $request=hash('sha256','private-observer-'.$index);$saved=$observations->read('job_'.substr($request,0,32));
+    incident_integration_check($saved['state']==='accepted'&&isset($events[$saved['event_id']]),'Source acceptance lost its queued event identity.');
+}
+$observer->processAutomationSources(false);
+incident_integration_check(count($observer->automationWorkers)===4,'A repeated source scan relaunched accepted observations.');
+echo "Source launch budget: four workers per pass, twelve durable events, explicit deferred count and no repeated observation launch passed.\n";

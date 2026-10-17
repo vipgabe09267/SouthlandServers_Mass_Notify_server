@@ -82,7 +82,10 @@ def hold(data, timeout=120, settings=False):
             child = os.open(part, flags, dir_fd=parent)
             os.close(parent); parent = child
             info = os.fstat(parent)
-            if info.st_uid not in (0, account.pw_uid) or (info.st_mode & 0o002 and not info.st_mode & stat.S_ISVTX):
+            sticky_root = info.st_uid == 0 and bool(info.st_mode & stat.S_ISVTX)
+            if (info.st_uid not in (0, account.pw_uid)
+                    or info.st_gid not in (0, account.pw_gid)
+                    or (info.st_mode & 0o022 and not sticky_root)):
                 raise RuntimeError('unsafe worker lock parent')
         names = os.listdir(parent)
         if len(names) > 20000: raise RuntimeError('worker guard inventory exceeds limit')
@@ -100,7 +103,11 @@ def hold(data, timeout=120, settings=False):
         except FileExistsError:
             paging = os.open('live-paging-slots', flags, dir_fd=parent)
         info = os.fstat(paging)
-        if info.st_uid not in (0, account.pw_uid) or info.st_mode & 0o002:
+        named = os.stat('live-paging-slots', dir_fd=parent, follow_symlinks=False)
+        if (info.st_uid not in (0, account.pw_uid)
+                or info.st_gid not in (0, account.pw_gid)
+                or stat.S_IMODE(info.st_mode) not in (0o700, 0o750, 0o755)
+                or (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino)):
             raise RuntimeError('unsafe live paging slot directory')
         deadline = time.monotonic() + timeout
         # Workers take this shared lease before module bootstrap and retain it
@@ -154,6 +161,7 @@ def hold(data, timeout=120, settings=False):
             if (info.st_dev, info.st_ino) != (entry.st_dev, entry.st_ino): raise RuntimeError('worker lock identity changed')
             if name == 'mass-notifications.config.lock':
                 settings_metadata(fd, lock_parent, account)
+        check_current_directory(data, parent)
         print('ready', flush=True)
         settings_held = settings
         while True:

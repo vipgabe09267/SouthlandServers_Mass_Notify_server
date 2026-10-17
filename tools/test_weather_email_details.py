@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -67,6 +68,22 @@ class WeatherEmailTests(unittest.TestCase):
         self.assertIn(self.feature['properties']['instruction'], result.stdout)
         self.assertIn(self.feature['properties']['description'], result.stdout)
         self.assertEqual(source.count('MAIL_BODY="$(complete_weather_email_body "$ALERT_B64" "$MAIL_BODY")"'), 2)
+
+    def test_large_geometry_preserves_complete_shell_email(self):
+        source = POLLER.read_text()
+        helper = source[source.index('complete_weather_email_body() {'):source.index('generate_tts_audio() {')]
+        self.feature['geometry'] = {'type': 'LineString', 'coordinates': [[41, -90]] * 10000}
+        feature = base64.b64encode(json.dumps(self.feature).encode()).decode()
+        self.assertGreater(len(feature), 131072)
+        with tempfile.TemporaryDirectory(prefix='sls-weather-large-mail-') as temporary:
+            path = Path(temporary) / 'feature.b64'
+            path.write_text(feature)
+            command = helper + '\nBRANDED_EMAIL_SCRIPT="$1"\nfeature="$(cat "$2")"\ncomplete_weather_email_body "$feature" "Event: Flood Warning"\n'
+            result = subprocess.run(['bash', '-c', command, 'fixture', str(EMAIL), str(path)],
+                                    capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(self.feature['properties']['instruction'], result.stdout)
+        self.assertIn(self.feature['properties']['description'], result.stdout)
 
 
 if __name__ == '__main__':

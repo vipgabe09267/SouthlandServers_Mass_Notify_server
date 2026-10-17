@@ -5,6 +5,7 @@ namespace SLS\MassNotify;
 require_once __DIR__ . '/security.php';
 require_once __DIR__ . '/config-crypto.php';
 
+if (!class_exists(MediaAccess::class, false)) {
 /** Anonymous device-compatible downloads, optionally limited by network and age. */
 final class MediaAccess
 {
@@ -117,4 +118,5 @@ final class MediaAccess
         if ($png && substr($file['bytes'], 0, 8) !== "\x89PNG\r\n\x1a\n") { return $error(404, 'media_not_found'); }
         return ['status' => 200, 'type' => $png ? 'image/png' : 'text/xml; charset=utf-8', 'body' => $file['bytes']];
     }
+}
 }

@@ -1,5 +1,6 @@
 <?php
 namespace FreePBX\modules;
+require_once __DIR__.'/api/sls-mass-notify/security.php';
 
 /** Read-only observations; no repair, notification, clock or service changes. */
 final class SlsDeploymentReadiness
@@ -9,31 +10,45 @@ final class SlsDeploymentReadiness
         clearstatcache(true, $path);
         $named = @lstat($path);
         if ($named === false) { return ['error'=>'missing']; }
-        if (($named['mode'] & 0170000) !== 0100000 || $named['nlink'] !== 1
-            || ($named['mode'] & 0022) || $named['size'] > 65536 || realpath($path) !== $path) {
+        $runtime=function_exists('posix_getpwnam')?posix_getpwnam('asterisk'):false;
+        $owners=array_values(array_unique([0,function_exists('posix_geteuid')?posix_geteuid():-1,is_array($runtime)?$runtime['uid']:-1]));
+        $safe=static fn($meta): bool=>is_array($meta)&&($meta['mode']&0170000)===0100000&&$meta['nlink']===1
+            && !($meta['mode']&0037)&&in_array($meta['uid'],$owners,true)&&$meta['size']<=65536;
+        $parent=@lstat(dirname($path));
+        if (!$safe($named) || !$parent || ($parent['mode']&0170000)!==0040000 || ($parent['mode']&0022)
+            || !in_array($parent['uid'],$owners,true) || realpath(dirname($path))!==dirname($path) || realpath($path) !== $path) {
             return ['error'=>'unsafe'];
         }
-        // r+b avoids blocking indefinitely if a FIFO replaces the checked path.
-        // Nothing is written, even if the snapshot is corrupt or absent.
-        $handle = @fopen($path, 'r+b');
+        $handle = @fopen($path, 'rb');
         if (!$handle) { return ['error'=>'unavailable']; }
         try {
             $opened = fstat($handle);
-            if (!$opened || ($opened['mode'] & 0170000) !== 0100000 || $opened['nlink'] !== 1
+            if (!$safe($opened)
                 || $opened['ino'] !== $named['ino'] || $opened['dev'] !== $named['dev']) {
                 return ['error'=>'changed'];
             }
             if (!flock($handle, LOCK_SH | LOCK_NB)) { return ['error'=>'busy']; }
             $raw = stream_get_contents($handle, 65537);
-            clearstatcache(true, $path); $current = @lstat($path);
-            if (!$current || $current['ino'] !== $opened['ino'] || $current['dev'] !== $opened['dev']) {
-                return ['error'=>'changed'];
+            $after=fstat($handle);clearstatcache(true, $path); $current = @lstat($path);
+            foreach(['dev','ino','mode','uid','gid','nlink','size','mtime','ctime'] as $field){
+                if(!$safe($after)||!$safe($current)||$named[$field]!==$opened[$field]
+                    ||$opened[$field]!==$after[$field]||$after[$field]!==$current[$field]){return ['error'=>'changed'];}
             }
             if (!is_string($raw) || strlen($raw) > 65536) { return ['error'=>'oversized']; }
-            $data = json_decode($raw, true, 32, JSON_THROW_ON_ERROR);
-            return is_array($data) && isset($raw[0]) && $raw[0] === '{' ? ['data'=>$data] : ['error'=>'invalid'];
+            $data = \SLS\MassNotify\ApiSecurity::jsonObject($raw,false,32);
+            return ['data'=>$data];
         } catch (\Throwable $error) { return ['error'=>'invalid']; }
         finally { fclose($handle); }
+    }
+
+    private static function timestamp(string $value): ?int
+    {
+        if(!preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/D',$value)){return null;}
+        $canonical=str_ends_with($value,'Z')?substr($value,0,-1).'+00:00':$value;
+        $parsed=\DateTimeImmutable::createFromFormat('!Y-m-d\TH:i:sP',$canonical);
+        $errors=\DateTimeImmutable::getLastErrors();
+        return $parsed!==false&&($errors===false||($errors['warning_count']===0&&$errors['error_count']===0))
+            &&$parsed->format('Y-m-d\TH:i:sP')===$canonical?$parsed->getTimestamp():null;
     }
 
     public static function check(string $id, string $label, string $state, string $detail): array
@@ -43,13 +58,15 @@ final class SlsDeploymentReadiness
 
     public static function heartbeat(string $id, string $label, array $snapshot, int $maximumAge, int $now): array
     {
-        $value = $snapshot['data']['checked_at'] ?? null;
+        $data = is_array($snapshot['data'] ?? null) ? $snapshot['data'] : [];
+        $value = $data['checked_at'] ?? null;
         $timestamp = null;
         if (is_int($value) && $value > 0) { $timestamp = $value; }
         elseif (is_string($value) && strlen($value) <= 40
             && preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/D', $value)) {
-            $parsed = strtotime($value); if ($parsed !== false) { $timestamp = $parsed; }
+            $timestamp = self::timestamp($value);
         }
+        if($maximumAge<1||$now<1){return self::check($id,$label,'warning',_('The health-check time boundary is invalid. Review the deployment readiness configuration.'));}
         if (isset($snapshot['error'])) {
             $detail = $snapshot['error'] === 'busy'
                 ? _('The health snapshot is being updated. Retry this check shortly.')
@@ -84,24 +101,34 @@ final class SlsDeploymentReadiness
 
     public static function audit(array $snapshot, bool $forwarding): array
     {
-        $storage = $snapshot['data'] ?? [];
+        $storage = is_array($snapshot['data'] ?? null) ? $snapshot['data'] : [];
         $localActive = $storage['audit_fault_active'] ?? (!empty($storage['audit_failed_records']) || !empty($storage['audit_failure_code']));
-        $localOk = !isset($snapshot['error']) && $localActive === false && empty($storage['audit_at_capacity']);
-        $local = self::check('audit_storage', _('Control API audit storage'), $localOk ? 'ok' : 'warning',
+        $complete = is_bool($storage['audit_fault_active'] ?? null) && is_bool($storage['audit_at_capacity'] ?? null)
+            && is_int($storage['audit_failed_records'] ?? null) && $storage['audit_failed_records']>=0;
+        $localOk = !isset($snapshot['error']) && $complete && $localActive === false && $storage['audit_at_capacity'] === false;
+        $localUnknown = !isset($snapshot['error']) && !$complete && $localActive === false && empty($storage['audit_at_capacity']);
+        $local = self::check('audit_storage', _('Control API audit storage'), $localOk ? 'ok' : ($localUnknown ? 'unknown' : 'warning'),
             $localOk ? sprintf(_('No current write fault. Historical missing records: %d; recovery does not reconstruct those records.'), (int)($storage['audit_failed_records'] ?? 0))
-                : _('Audit storage has a current fault or unreadable health data. Check storage capacity, control-api-audit-fault.json and the maintenance log. Do not replay accepted API actions.'));
+                : ($localUnknown ? _('Audit health measurements are incomplete. Check the next SLS maintenance snapshot; no healthy state was inferred.')
+                    : _('Audit storage has a current fault or unreadable health data. Check storage capacity, control-api-audit-fault.json and the maintenance log. Do not replay accepted API actions.')));
         $state = 'ok'; $detail = _('Optional forwarding to the system logger is disabled.');
         if ($forwarding) {
-            if (isset($snapshot['error']) || ($storage['audit_forwarding_enabled'] ?? false) !== true
-                || ($storage['audit_forwarding_active'] ?? false) !== false) {
+            $forwardingComplete=($storage['audit_forwarding_enabled']??null)===true
+                && is_bool($storage['audit_forwarding_active']??null)
+                && is_int($storage['audit_forwarding_last_success_at']??null)
+                && $storage['audit_forwarding_last_success_at']>=0
+                && is_int($storage['audit_forwarding_failed_records']??null)
+                && $storage['audit_forwarding_failed_records']>=0;
+            if (isset($snapshot['error']) || !$forwardingComplete
+                || $storage['audit_forwarding_active'] !== false) {
                 $state = 'warning';
                 $detail = _('Local audit forwarding could not be confirmed. Check /dev/log, system logger health and the next maintenance snapshot. Remote receipt must be checked at the collector.');
-            } elseif (empty($storage['audit_forwarding_last_success_at'])) {
+            } elseif ($storage['audit_forwarding_last_success_at'] === 0) {
                 $state = 'unknown';
                 $detail = _('Forwarding is enabled, but no successful local handoff has been recorded. Make an authorized read-only API request and check both local logging and the separate collector.');
             } else {
                 $detail = sprintf(_('Last local logger acceptance: %s UTC. Historical failed handoffs: %d. This does not confirm remote collector receipt.'),
-                    gmdate('Y-m-d H:i:s', (int)$storage['audit_forwarding_last_success_at']), (int)($storage['audit_forwarding_failed_records'] ?? 0));
+                    gmdate('Y-m-d H:i:s', $storage['audit_forwarding_last_success_at']), $storage['audit_forwarding_failed_records']);
             }
         }
         return [$local, self::check('audit_forwarding', _('Control API audit forwarding'), $state, $detail)];
@@ -117,8 +144,13 @@ final class SlsDeploymentReadiness
     public static function certificate(array $probe, int $now): array
     {
         if (($probe['ok'] ?? false) !== true) {
+            $message = $probe['message'] ?? null;
+            if (!is_string($message) || $message === '' || strlen($message) > 1024 || !preg_match('//u', $message)
+                || preg_match('/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/', $message)) {
+                $message = _('The local HTTPS certificate and API route could not be verified.');
+            }
             return self::check('certificate', _('Local HTTPS certificate'), 'warning',
-                (string)($probe['message'] ?? _('The local HTTPS certificate and API route could not be verified.')));
+                $message);
         }
         $expiry = $probe['certificate_expires_at'] ?? null;
         if (!is_int($expiry)) {
@@ -134,13 +166,30 @@ final class SlsDeploymentReadiness
 
     public static function capacity(array $probe): array
     {
-        $errors = is_array($probe['errors'] ?? null) ? $probe['errors'] : [];
-        if (($probe['schema'] ?? null) !== 1 && !$errors) {
+        $errorsValid = is_array($probe['errors'] ?? null);
+        $errors = $errorsValid ? $probe['errors'] : [];
+        if (!$errorsValid || (($probe['schema'] ?? null) !== 1 && !$errors)) {
             return self::check('capacity', _('PBX resources and SLS workspace'), 'unknown', _('The resource check did not return a valid measurement. Run Repair Installation and review the capacity checker.'));
+        }
+        $resourceChecks = is_array($probe['resource_checks'] ?? null) ? $probe['resource_checks'] : [];
+        if (!$errors) {
+            foreach (['cpu','memory','storage','temporary'] as $metric) {
+                $measurement = is_array($resourceChecks[$metric] ?? null) ? $resourceChecks[$metric] : [];
+                $ok=$measurement['ok'] ?? null;
+                if (!is_bool($ok)) {
+                    return self::check('capacity', _('PBX resources and SLS workspace'), 'unknown', _('Resource measurements are incomplete. Rerun the capacity check and inspect its diagnostics before increasing device limits.'));
+                }
+                if (!$ok) {
+                    return self::check('capacity', _('PBX resources and SLS workspace'), 'warning', _('A resource check failed without a shortage detail. Inspect the capacity diagnostics before increasing device limits.'));
+                }
+            }
         }
         $details = [];
         foreach (array_slice($errors, 0, 8) as $error) {
-            if (is_array($error) && is_string($error['message'] ?? null)) { $details[] = mb_substr($error['message'], 0, 1024); }
+            $message = is_array($error) ? ($error['message'] ?? null) : null;
+            if (is_string($message) && preg_match('//u', $message) && !preg_match('/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/u', $message)) {
+                $details[] = function_exists('mb_substr') ? mb_substr($message, 0, 1024, 'UTF-8') : substr($message, 0, 1024);
+            }
         }
         return self::check('capacity', _('PBX resources and SLS workspace'), $errors ? 'warning' : 'ok',
             $errors ? (implode(' ', $details) ?: _('The PBX does not meet its configured device capacity. Review CPU, RAM and free SLS workspace in capacity diagnostics.'))

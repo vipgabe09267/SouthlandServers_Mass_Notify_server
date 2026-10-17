@@ -18,6 +18,11 @@ final class LabsSafety
     {
         if (!in_array($feature, self::FEATURES, true)) { throw new \InvalidArgumentException('This feature has no dangerous-activation acknowledgment.'); }
     }
+    private static function validActorSession(string $actor, string $sessionId): bool
+    {
+        return $actor !== '' && strlen($actor) <= 200 && !preg_match('/[\x00-\x1f\x7f]/', $actor)
+            && $sessionId !== '' && strlen($sessionId) <= 256 && !preg_match('/[\x00-\x1f\x7f]/', $sessionId);
+    }
     public static function normalize($value): array
     {
         if (!is_array($value) || ($value && array_is_list($value)) || array_diff(array_keys($value), ['schema', 'receipts'])
@@ -57,9 +62,11 @@ final class LabsSafety
     public static function begin(array &$session, string $feature, string $actor, string $sessionId, ?int $now = null, ?int $monotonic = null): array
     {
         self::feature($feature);
-        if ($sessionId === '' || $actor === '') { throw new \DomainException('An authenticated administrator session is required.'); }
+        if (!self::validActorSession($actor, $sessionId)) { throw new \DomainException('An authenticated administrator session is required.'); }
         $now ??= time(); $monotonic ??= hrtime(true);
+        if ($now < 1 || $monotonic < 0) { throw new \DomainException('The warning clock is unavailable.'); }
         $nonce = bin2hex(random_bytes(32));
+        if (!is_array($session['_sls_labs_challenges'] ?? null)) { $session['_sls_labs_challenges'] = []; }
         $session['_sls_labs_challenges'][$feature] = ['nonce' => $nonce, 'actor' => $actor,
             'session' => hash('sha256', $sessionId), 'issued_at' => $now, 'monotonic' => $monotonic, 'revision' => self::revision()];
         return ['feature' => $feature, 'challenge' => $nonce, 'title' => self::TITLE, 'body' => self::BODY,
@@ -72,7 +79,14 @@ final class LabsSafety
             || ($input['agree'] ?? null) !== true) { throw new \InvalidArgumentException('Agree to the displayed warning before continuing.'); }
         $feature = $input['feature']; self::feature($feature); $now ??= time(); $monotonic ??= hrtime(true);
         $challenge = $session['_sls_labs_challenges'][$feature] ?? null;
-        if (!is_array($challenge) || $sessionId === '' || !hash_equals($challenge['nonce'], $input['challenge'])
+        $keys = is_array($challenge) ? array_keys($challenge) : []; sort($keys);
+        if (!self::validActorSession($actor, $sessionId) || !is_array($challenge)
+            || $keys !== ['actor','issued_at','monotonic','nonce','revision','session']
+            || !is_string($challenge['nonce']) || !preg_match('/^[a-f0-9]{64}$/D', $challenge['nonce'])
+            || !is_string($challenge['actor']) || !is_string($challenge['session']) || !preg_match('/^[a-f0-9]{64}$/D', $challenge['session'])
+            || !is_string($challenge['revision']) || !preg_match('/^[a-f0-9]{64}$/D', $challenge['revision'])
+            || !is_int($challenge['issued_at']) || !is_int($challenge['monotonic']) || $challenge['issued_at'] < 1 || $challenge['monotonic'] < 0
+            || $now < 1 || $monotonic < 0 || !hash_equals($challenge['nonce'], $input['challenge'])
             || !hash_equals($challenge['actor'], $actor) || !hash_equals($challenge['session'], hash('sha256', $sessionId))
             || !hash_equals($challenge['revision'], self::revision()) || $now < $challenge['issued_at']
             || $now - $challenge['issued_at'] > 600 || $monotonic < $challenge['monotonic']) {

@@ -38,9 +38,12 @@ WEB_ROOT = Path('/var/www/html')
 PHP_EXTENSIONS = ('pdo_sqlite', 'curl', 'dom', 'mbstring', 'posix', 'openssl', 'sodium')
 PHP_FUNCTIONS = ('exec', 'proc_open', 'posix_geteuid', 'posix_getpwnam', 'openssl_encrypt',
                  'openssl_decrypt', 'sodium_crypto_aead_xchacha20poly1305_ietf_encrypt', 'sodium_crypto_pwhash_str')
-PHASES = {'prepared', 'mutating', 'recovering', 'recovery_failed', 'committed', 'rolled_back', 'abandoned'}
+PHASES = {'preparing', 'prepared', 'mutating', 'recovering', 'recovery_failed', 'committed', 'rolled_back', 'abandoned'}
 STAGES = {'initialization', 'hardware admission', 'platform validation', 'release download and validation',
-          'publisher and stock approval', 'dependency installation', 'timezone validation',
+          'publisher and stock approval', 'FreePBX ownership protection',
+          'legacy configuration and runtime permissions', 'authenticated prerequisite validation',
+          'previous phone collector recovery', 'notification worker coordination',
+          'configuration coordination', 'dependency installation', 'timezone validation',
           'protected runtime preparation', 'module activation', 'runtime integration',
           'post-install verification', 'interrupted installation recovery'}
 
@@ -125,11 +128,12 @@ def served_php_probe(targets,timeout=4):
         connection=None;timer=None
         try:
             connection=LoopbackTLS(address,port,host,min(.8,remaining)) if scheme=='https' else http.client.HTTPConnection(address,port,timeout=min(.8,remaining))
-            connection.connect();active_socket=connection.sock
-            def expire():
-                try:active_socket.shutdown(socket.SHUT_RDWR)
+            connection.connect()
+            def expire(expired_socket=connection.sock):
+                try:expired_socket.shutdown(socket.SHUT_RDWR)
                 except OSError:pass
-                active_socket.close()
+                try:expired_socket.close()
+                except OSError:pass
             timer=threading.Timer(remaining,expire);timer.daemon=True;timer.start()
             connection.request('GET','/api/sls-mass-notify/?sls_installer_runtime=1',headers={'Host':host+':'+str(port),'Accept':'application/json','Connection':'close'})
             response=connection.getresponse()
@@ -161,7 +165,7 @@ def collector_probe():
     except KeyError:return {'ok':False,'failure_code':'phone_collector_runtime_account_missing'}
     if account.pw_uid<=0 or os.geteuid() not in (0,account.pw_uid):return {'ok':False,'failure_code':'phone_collector_web_uid_mismatch'}
     args=['/usr/bin/python3','-I',str(helper),'--health']
-    if os.geteuid()==0:args=['/usr/sbin/runuser','-u','asterisk','--']+args
+    if os.geteuid()==0:args=['/usr/bin/env','-u','GITHUB_TOKEN','-u','GH_TOKEN','-u','SLS_MASS_NOTIFY_GITHUB_TOKEN','/usr/sbin/runuser','-u','asterisk','--']+args
     status,raw=command(args,2)
     try:
         value=json.loads(raw)

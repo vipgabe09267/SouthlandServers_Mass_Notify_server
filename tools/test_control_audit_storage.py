@@ -170,9 +170,11 @@ class AuditStorageTests(unittest.TestCase):
         self.audit.write_bytes(self.old + b'broken\n' + b''.join(json.dumps(value).encode() + b'\n' for value in values))
         inode = self.audit.stat().st_ino
         result = storage.prune_audit(self.audit, self.now)
-        kept = [json.loads(line) for line in self.audit.read_text().splitlines()]
-        self.assertEqual((len(kept), kept[0]['ordinal'], kept[-1]['ordinal']), (10000, 3, 10002))
-        self.assertEqual(result['removed'], 5)
+        kept = self.audit.read_text().splitlines()
+        parsed = [json.loads(line) for line in kept[1:]]
+        self.assertEqual((len(kept), kept[0], parsed[0]['ordinal'], parsed[-1]['ordinal']),
+                         (10001, 'broken', 3, 10002))
+        self.assertEqual((result['removed'], result['preserved_invalid']), (4, 1))
         self.assertEqual(self.audit.stat().st_ino, inode)
         self.assertEqual(list(self.directory.glob('.sls-retention-*')), [])
 
@@ -350,6 +352,36 @@ class AuditStorageTests(unittest.TestCase):
         self.assertIn('audit_storage_busy', failed.stderr)
         self.assertNotIn('192.0.2.10', failed.stderr)
         self.assertEqual(self.fault_count(), 1)
+
+    def test_authenticated_response_is_audited_automatically_and_rejects_writable_helper(self):
+        helper = self.directory / 'helper.py'
+        (self.directory / 'sls_audio_state.py').write_bytes(HELPER.with_name('sls_audio_state.py').read_bytes())
+        (self.directory / 'sls_config_crypto.py').write_bytes(HELPER.with_name('sls_config_crypto.py').read_bytes())
+        helper.write_text(HELPER.read_text().replace("DATA = Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin')",
+                                                   'DATA = Path(' + repr(str(self.directory)) + ')'))
+        source = (ROOT / 'slsmassnotifyserver/api/sls-mass-notify/index.php').read_text()
+        functions = (source[source.index('function respond('):source.index('function config(')]
+                     + source[source.index('function request_header_value('):source.index('function client_ip(')]
+                     + source[source.index('function audit_control_api('):source.index('function read_json_file(')])
+        php = self.directory / 'automatic.php'
+        php.write_text('<?php\ndeclare(strict_types=1);\n'
+                       + 'define("CONTROL_API_AUDIT_HELPER", ' + json.dumps(str(helper)) + ');\n'
+                       + functions
+                       + '\n$GLOBALS["control"]=[]; $GLOBALS["sls_control_principal"]=["id"=>"api_".str_repeat("a",24)];'
+                       + '$GLOBALS["sls_control_audit_context"]=["ip"=>"192.0.2.8","action"=>"get_events","status"=>500,"ok"=>false,"recorded"=>false];'
+                       + '$_SERVER["REQUEST_METHOD"]="GET"; $_SERVER["HTTP_AUTHORIZATION"]="Bearer inert";'
+                       + 'respond(400,["ok"=>false,"error"=>"invalid_event_cursor"]);')
+        accepted = subprocess.run(['php', str(php)], capture_output=True, text=True, timeout=5, check=True)
+        self.assertEqual(json.loads(accepted.stdout)['error'], 'invalid_event_cursor')
+        row = json.loads(self.audit.read_text())
+        self.assertEqual((row['action'], row['status'], row['ok'], row['credential_id']),
+                         ('get_events', 400, False, 'api_' + 'a' * 24))
+        self.audit.unlink()
+        helper.chmod(0o666)
+        refused = subprocess.run(['php', str(php)], capture_output=True, text=True, timeout=5, check=True)
+        self.assertEqual(json.loads(refused.stdout)['error'], 'invalid_event_cursor')
+        self.assertFalse(self.audit.exists())
+        self.assertIn('audit_helper_unavailable', refused.stderr)
 
     def test_php_forwarding_is_opt_in_and_independent_of_local_storage(self):
         socket_path = str(self.directory / 'logger.sock')

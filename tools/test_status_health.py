@@ -33,7 +33,8 @@ CONFIG = {'enabled': '1', 'nws_zones': [{'id': 'county'}],
 
 def php(method, arguments):
     path = json.dumps(str(ROOT / 'slsmassnotifyserver/StatusHealth.php'))
-    code = ('require ' + path + '; $a=json_decode(stream_get_contents(STDIN),true,512,JSON_THROW_ON_ERROR);'
+    code = ('set_error_handler(static function($severity,$message,$file,$line){throw new ErrorException($message,0,$severity,$file,$line);});'
+            'require ' + path + '; $a=json_decode(stream_get_contents(STDIN),true,512,JSON_THROW_ON_ERROR);'
             'echo json_encode(\\FreePBX\\modules\\SlsStatusHealth::' + method + '(...$a));')
     result = subprocess.run(['php', '-r', code], input=json.dumps(arguments), text=True, capture_output=True, check=True)
     return json.loads(result.stdout)
@@ -90,12 +91,28 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(disabled['last_xweather_external_status'], '')
         self.assertEqual(disabled['last_schedule_worker_status'], '')
 
+    def test_malformed_nested_health_state_fails_closed_without_runtime_warnings(self):
+        status = {'last_fault_at': stamp(NOW), 'last_fault_source': 'nws', 'last_fault_stage': 'api',
+                  'last_fault_group_id': 'county', 'nws_groups': ['damaged'],
+                  'last_delivery_source': ['damaged'], 'last_delivery_group_id': {'bad': True},
+                  'xweather_groups': ['damaged']}
+        projected = self.project(status)
+        self.assertTrue(projected['last_fault_at'], 'Damaged recovery evidence improperly cleared an active API fault')
+        malformed_config = {'enabled': '1', 'nws_zones': 'damaged', 'xweather': ['damaged'],
+                            'scheduled_announcements': 'damaged'}
+        projected = self.project({'last_fault_at': stamp(NOW), 'last_fault_source': ['damaged'],
+                                  'last_fault_stage': ['damaged']}, malformed_config)
+        self.assertTrue(projected['last_fault_at'])
+
     def test_announcement_history_is_distinct_from_current_worker_health(self):
         state = {'state': 'failed', 'updated_at': stamp(NOW-20), 'failure_category': 'worker_bootstrap_failed'}
         probe = {'ok': True, 'bootstrap': True, 'module_loaded': True, 'checked_at': stamp(NOW)}
         self.assertFalse(php('announcementFailure', [state, probe, NOW]))
         state['failure_category'] = 'channel_submission_failed'
         self.assertTrue(php('announcementFailure', [state, probe, NOW]))
+        state['failure_category'] = 'weather_source_cancelled'
+        self.assertFalse(php('announcementFailure', [state, probe, NOW]))
+        state['failure_category'] = 'channel_submission_failed'
         state['finished_at'] = stamp(NOW-901)
         self.assertFalse(php('announcementFailure', [state, probe, NOW]))
         # Updating historical receipt metadata must not reset the warning age.

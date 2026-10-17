@@ -56,7 +56,7 @@ trait SlsScheduledDelivery
             return $this->scheduledRecordFromExisting($record, 'success',
                 (string)($job['message'] ?? _('Announcement submitted. Review channel receipts for delivery details.')));
         }
-        if (in_array($state, ['expired', 'failed', 'partial_or_failed'], true)) {
+        if (in_array($state, ['expired', 'failed', 'partial_or_failed', 'cancelled'], true)) {
             $submitted = !empty($job['result']['delivery_started']);
             foreach ((array)($job['receipts'] ?? []) as $receipt) {
                 if (!in_array($receipt['state'] ?? '', ['failed', 'cancelled', 'expired', 'skipped'], true)) { $submitted = true; }
@@ -79,6 +79,8 @@ trait SlsScheduledDelivery
             'email_recipient_ids' => $targets['email_recipient_ids'] ?? [],
             'sms_recipient_ids' => $targets['sms_recipient_ids'] ?? [],
             'webhook_ids' => $targets['webhook_ids'] ?? [],
+            'browser_recipient_ids' => $targets['browser_recipient_ids'] ?? [],
+            'connector_ids' => $targets['connector_ids'] ?? [],
             'style' => (string)($delivery['style'] ?? 'standard'), 'title' => (string)($delivery['title'] ?? 'Announcement'),
             'background_color' => (string)($delivery['background_color'] ?? '#1f2937'),
             'audio_mode' => $this->normalizeAnnouncementAudioMode($delivery['audio_mode'] ?? 'none'),
@@ -108,18 +110,18 @@ trait SlsScheduledDelivery
                 if (!empty($record['job_id'])) {
                     $record = $this->reconcileScheduledDeliveryRecord($record);
                     $store['occurrences'][$id] = $record;
-                    $this->writeScheduleExecutionStore($store);
+                    $this->writeScheduleExecutionStore($store,$id);
                     if (($record['job_state'] ?? '') === 'prepared' && !$this->scheduledTerminalState($record['state'])) {
                         // The durable queued ledger link must precede any worker activation.
                         $this->activateScheduledAnnouncementJob($record);
                         $store['occurrences'][$id] = $this->reconcileScheduledDeliveryRecord($record);
-                        $this->writeScheduleExecutionStore($store);
+                        $this->writeScheduleExecutionStore($store,$id);
                     }
                 } elseif (($record['state'] ?? '') === 'claimed'
                     && time() - (strtotime($record['claimed_at'] ?? '') ?: 0) > 300) {
                     $store['occurrences'][$id] = $this->scheduledRecordFromExisting($record, 'uncertain',
                         _('The previous worker stopped after claiming this delivery. It was not replayed to prevent duplicate announcements.'));
-                    $this->writeScheduleExecutionStore($store);
+                    $this->writeScheduleExecutionStore($store,$id);
                 }
             }
             $due = [];
@@ -157,7 +159,7 @@ trait SlsScheduledDelivery
                     if (time() >= $deadline) {
                         $store['occurrences'][$id] = $this->scheduleExecutionRecord($schedule, $occurrence, 'missed',
                             _('The allowed lateness window expired before delivery could start. Add a new future occurrence to try again.'), $current);
-                        $this->writeScheduleExecutionStore($store); continue;
+                        $this->writeScheduleExecutionStore($store,$id); continue;
                     }
                     $options = $this->scheduledRequestOptions($schedule);
                     $targets = $schedule['targets'] ?? [];
@@ -166,7 +168,7 @@ trait SlsScheduledDelivery
                     if (empty($resolved['success']) || !is_array($resolved['request'] ?? null)) {
                         $store['occurrences'][$id] = $this->scheduleExecutionRecord($schedule, $occurrence, 'failed',
                             (string)($resolved['message'] ?? _('The scheduled request could not be validated. No delivery was started.')), $current);
-                        $this->writeScheduleExecutionStore($store); continue;
+                        $this->writeScheduleExecutionStore($store,$id); continue;
                     }
                     if (array_key_exists('operator_credential_id', $schedule)) {
                         $principal = \SLS\MassNotify\ApiSecurity::currentCredential($settings, (string)$schedule['operator_credential_id']);
@@ -174,7 +176,7 @@ trait SlsScheduledDelivery
                             || !\SLS\MassNotify\ApiSecurity::permitsResolvedAnnouncement($principal, $resolved['request'], $settings)) {
                             $store['occurrences'][$id] = $this->scheduleExecutionRecord($schedule, $occurrence, 'failed',
                                 _('The originating operator login, role or audience is no longer authorized. No channels were submitted.'), $current);
-                            $this->writeScheduleExecutionStore($store); continue;
+                            $this->writeScheduleExecutionStore($store,$id); continue;
                         }
                         $resolved['request']['api_credential_id'] = $principal['id'];
                     }
@@ -187,20 +189,30 @@ trait SlsScheduledDelivery
                     $current['job_state'] = 'prepared';
                     $store['occurrences'][$id] = $this->scheduleExecutionRecord($schedule, $occurrence, 'preparing',
                         _('Saving the immutable scheduled announcement. No delivery has started.'), $current);
-                    $this->writeScheduleExecutionStore($store);
+                    $this->writeScheduleExecutionStore($store,$id);
                     $this->persistPreparedScheduledAnnouncementJob($job);
                     $record = $this->scheduledRecordFromExisting($store['occurrences'][$id], 'queued',
                         _('Announcement prepared; waiting for protected delivery admission.'));
                     $store['occurrences'][$id] = $record;
-                    $this->writeScheduleExecutionStore($store);
+                    $this->writeScheduleExecutionStore($store,$id);
                 } finally { $this->releaseNativeBackupFileLock($activity); }
                 $processed++;
                 $this->activateScheduledAnnouncementJob($record);
                 $store['occurrences'][$id] = $this->reconcileScheduledDeliveryRecord($record);
-                $this->writeScheduleExecutionStore($store);
+                $this->writeScheduleExecutionStore($store,$id);
             }
-            $attention = count(array_filter($store['occurrences'], static function ($record) {
-                return in_array($record['state'] ?? '', ['failed', 'missed', 'uncertain'], true);
+            $enabledScheduleIds = [];
+            foreach ((array)($this->getActiveSettings()['scheduled_announcements'] ?? []) as $schedule) {
+                if (is_array($schedule) && !empty($schedule['enabled']) && is_string($schedule['id'] ?? null)) {
+                    $enabledScheduleIds[$schedule['id']] = true;
+                }
+            }
+            $now = time();
+            $attention = count(array_filter($store['occurrences'], static function ($record) use ($enabledScheduleIds, $now) {
+                return is_array($record)
+                    && isset($enabledScheduleIds[$record['schedule_id'] ?? ''])
+                    && in_array($record['state'] ?? '', ['failed', 'missed', 'uncertain'], true)
+                    && SlsStatusHealth::recent($record['completed_at'] ?? $record['updated_at'] ?? '', $now);
             }));
             $this->updateStatusData(['last_schedule_worker_at' => gmdate('c'),
                 'last_schedule_worker_status' => $attention ? 'warning' : 'ok',

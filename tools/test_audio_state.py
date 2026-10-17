@@ -1,11 +1,14 @@
 #!/usr/bin/python3
 """Private durable audio journal failure fixtures; no PBX or playback."""
 import importlib.util
+import fcntl
 import json
 import os
 import pwd
 from pathlib import Path
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -43,6 +46,23 @@ class AudioState(unittest.TestCase):
         self.assertEqual(inode, self.lock.stat().st_ino)
         self.assertEqual(self.lock.read_bytes(), m.MARKER)
         self.assertEqual(stat.S_IMODE(self.state.stat().st_mode), 0o640)
+
+    def test_writer_contention_has_a_deadline_and_preserves_history(self):
+        self.commit(); before=self.state.read_bytes(); inode=self.lock.stat().st_ino
+        code='''import importlib.util,json,sys
+spec=importlib.util.spec_from_file_location('private_audio',sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+try:
+ with m.audio_state(sys.argv[2]) as state: state['recipients']['1000']=999
+except RuntimeError as error:
+ print(json.dumps({'rejected':True,'busy':'busy' in str(error)}))
+else: print(json.dumps({'rejected':False}))
+'''
+        with self.lock.open('r+b') as held:
+            fcntl.flock(held,fcntl.LOCK_EX)
+            result=subprocess.run([sys.executable,'-c',code,str(PATH),str(self.root)],capture_output=True,text=True,timeout=3)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertEqual(json.loads(result.stdout),{'rejected':True,'busy':True})
+        self.assertEqual(self.state.read_bytes(),before); self.assertEqual(self.lock.stat().st_ino,inode)
 
     def test_initialized_missing_and_existing_empty_are_rejected_preserved(self):
         self.commit()

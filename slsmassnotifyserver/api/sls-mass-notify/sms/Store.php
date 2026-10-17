@@ -2,6 +2,8 @@
 declare(strict_types=1);
 namespace SLS\MassNotify\Sms;
 require_once __DIR__.'/Continuity.php';
+require_once (is_file(dirname(__DIR__,3).'/InitializationJournal.php')
+    ? dirname(__DIR__,3).'/InitializationJournal.php' : '/var/www/html/admin/modules/slsmassnotifyserver/InitializationJournal.php');
 
 /** Submission claims, limits and receipts commit before provider requests. */
 final class Store
@@ -27,7 +29,18 @@ final class Store
             if ($at['dev']!==$open['dev'] || $at['ino']!==$open['ino']) { throw new \RuntimeException('sms_storage_changed'); }
             foreach (['-journal','-wal','-shm'] as $suffix) { $this->file($path.$suffix,true); }
             $exists=$this->file($path,true)!==null; $marked=$this->file($marker,true)!==null;
-            if ($exists!==$marked) { throw new \RuntimeException('sms_storage_initialization_incomplete'); }
+            if ($marked && \SLS\MassNotify\InitializationJournal::read($marker)!=="SLS_SMS_LEDGER_V1\n") {
+                throw new \RuntimeException('sms_storage_initialization_incomplete');
+            }
+            $intentPath=$this->directory.'/initialization.pending';
+            $intentBytes="SLS_SMS_INITIALIZATION_V1\n";
+            $intent=\SLS\MassNotify\InitializationJournal::read($intentPath);
+            if ($intent!==null && $intent!==$intentBytes) { throw new \RuntimeException('sms_storage_initialization_incomplete'); }
+            if ($intent===null && $exists!==$marked) { throw new \RuntimeException('sms_storage_initialization_incomplete'); }
+            if (!$exists && !$marked && $intent===null) {
+                \SLS\MassNotify\InitializationJournal::write($intentPath,$intentBytes);
+                $intent=$intentBytes;
+            }
             if (!$exists) {
                 $created=@fopen($path,'x+b');
                 if (!$created) { throw new \RuntimeException('sms_storage_create_failed'); }
@@ -35,7 +48,9 @@ final class Store
             }
             $this->db=new \PDO('sqlite:'.$path,null,null,[\PDO::ATTR_ERRMODE=>\PDO::ERRMODE_EXCEPTION,\PDO::ATTR_DEFAULT_FETCH_MODE=>\PDO::FETCH_ASSOC]);
             $this->db->exec('PRAGMA busy_timeout=250; PRAGMA trusted_schema=OFF; PRAGMA foreign_keys=ON; PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;');
-            if (!$exists) {
+            $schema=(int)$this->db->query('PRAGMA user_version')->fetchColumn();
+            if ($intent!==null && $schema===0) {
+                if ($this->db->query("SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")->fetchColumn()!=0) { throw new \RuntimeException('sms_storage_initialization_incomplete'); }
                 $this->db->exec('BEGIN IMMEDIATE');
                 try {
                     $this->db->exec("CREATE TABLE deliveries (id TEXT PRIMARY KEY, provider TEXT NOT NULL, route TEXT NOT NULL,
@@ -51,20 +66,23 @@ final class Store
                         PRAGMA user_version=1;");
                     $this->db->exec('COMMIT');
                 } catch (\Throwable $error) { $this->db->exec('ROLLBACK'); throw $error; }
-                $handle=@fopen($marker,'x+b');
-                if (!$handle) { throw new \RuntimeException('sms_storage_initialization_incomplete'); }
-                try { if (fwrite($handle,"SLS_SMS_LEDGER_V1\n")!==18 || !fflush($handle) || !fsync($handle)) { throw new \RuntimeException('sms_storage_initialization_incomplete'); } }
-                finally { fclose($handle); }
-                $parent=fopen($directory,'r');
-                try { if (!$parent || !fsync($parent)) { throw new \RuntimeException('sms_storage_sync_failed'); } }
-                finally { if ($parent) { fclose($parent); } }
+            }
+            if ($intent!==null) {
+                if ((int)$this->db->query('PRAGMA user_version')->fetchColumn()!==1) { throw new \RuntimeException('sms_storage_schema_unsupported'); }
+                $tables=$this->db->query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")->fetchAll(\PDO::FETCH_COLUMN);
+                if ($tables!==['budgets','deliveries','inbound_events','opt_outs']) { throw new \RuntimeException('sms_storage_initialization_incomplete'); }
+                foreach ($tables as $table) {
+                    if ((int)$this->db->query('SELECT count(*) FROM '.$table)->fetchColumn()!==0) { throw new \RuntimeException('sms_storage_initialization_contains_history'); }
+                }
+                \SLS\MassNotify\InitializationJournal::write($marker,"SLS_SMS_LEDGER_V1\n");
+                \SLS\MassNotify\InitializationJournal::finish($intentPath,$intentBytes);
             }
             if ((int)$this->db->query('PRAGMA user_version')->fetchColumn()!==1) { throw new \RuntimeException('sms_storage_schema_unsupported'); }
             // Additive diagnostics: existing V1 claims, budgets and opt-outs
             // remain readable by the previous implementation during rollback.
             $this->db->exec("CREATE TABLE IF NOT EXISTS provider_errors (id TEXT PRIMARY KEY REFERENCES deliveries(id) ON DELETE CASCADE, detail TEXT NOT NULL)");
             $this->db->exec("CREATE TABLE IF NOT EXISTS message_formats (id TEXT PRIMARY KEY REFERENCES deliveries(id) ON DELETE CASCADE, message_type TEXT NOT NULL, media_hash TEXT NOT NULL)");
-            if (file_get_contents($marker)!=="SLS_SMS_LEDGER_V1\n") { throw new \RuntimeException('sms_storage_initialization_incomplete'); }
+            if (\SLS\MassNotify\InitializationJournal::read($marker)!=="SLS_SMS_LEDGER_V1\n") { throw new \RuntimeException('sms_storage_initialization_incomplete'); }
             $this->identity=$this->file($path);
             $now=$this->directory();
             if ($now['ino']!==$meta['ino'] || $now['dev']!==$meta['dev']) { throw new \RuntimeException('sms_storage_changed'); }
@@ -92,7 +110,9 @@ final class Store
         $directory=$this->directory();
         if ($directory['dev']!==$this->directoryIdentity['dev'] || $directory['ino']!==$this->directoryIdentity['ino']) { throw new \RuntimeException('sms_storage_changed'); }
         $marker=$this->file($this->directory.'/initialized');
-        if ($marker['size']!==18) { throw new \RuntimeException('sms_storage_initialization_incomplete'); }
+        if ($marker['size']!==18 || \SLS\MassNotify\InitializationJournal::read($this->directory.'/initialized')!=="SLS_SMS_LEDGER_V1\n") {
+            throw new \RuntimeException('sms_storage_initialization_incomplete');
+        }
         $current=$this->file($this->directory.'/deliveries.sqlite');
         if ($current['dev']!==$this->identity['dev'] || $current['ino']!==$this->identity['ino']) { throw new \RuntimeException('sms_storage_changed'); }
         foreach (['-journal','-wal','-shm'] as $suffix) { $this->file($this->directory.'/deliveries.sqlite'.$suffix,true); }

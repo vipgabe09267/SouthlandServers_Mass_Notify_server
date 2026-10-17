@@ -5,6 +5,22 @@ installation does not rotate keys, initialize a stricter policy, or trust a
 downloaded public key. Module signatures and publisher verification are separate:
 this procedure changes publisher authority, not the existing local module signer.
 
+Verify a first installer before execution using [trusted host tools](FIRST_INSTALL_VERIFICATION.md).
+Published releases are immutable: a corrected package uses a newer version.
+Installed identity includes its authenticated inventory digest. The protected
+updater does not replace equal versions.
+
+Root can inspect retained generation storage without modifying it:
+
+```bash
+python3 -I /usr/local/bin/sls_mass_notify/sls_module_trust.py storage
+```
+
+The report marks active generations and retains every other generation for
+recovery review. It does not authorize deletion: installer transactions and
+previous-release approval may still reference those files. Preserve active,
+pending and recoverable references before separately reviewed storage cleanup.
+
 New release manifests carry signed `key_id`, `issued_at` and `expires_at`
 metadata. The release signer sets a one-year validity. Verification rejects
 future/expired metadata and signatures outside a key's active window, before

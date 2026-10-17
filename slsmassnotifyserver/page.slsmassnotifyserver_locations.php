@@ -1,21 +1,27 @@
 <?php
+declare(strict_types=1);
+require_once __DIR__.'/AdminResponse.php';
+require_once __DIR__.'/api/sls-mass-notify/security.php';
 $slsmassnotifyserver = \FreePBX::create()->Slsmassnotifyserver;
 $slsmassnotifyserver->enforceOperatorPageAccess('slsmassnotifyserver_locations');
 if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
-    while (ob_get_level() > 0) { @ob_end_clean(); }
+    \SLS\MassNotify\AdminResponse::requireClearBuffers();
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: private, no-store');
     header('X-Content-Type-Options: nosniff');
-    if (!$slsmassnotifyserver->validateCsrfToken($_POST['slsmassnotifyserver_csrf'] ?? '')) {
+    $csrf = $_POST['slsmassnotifyserver_csrf'] ?? null;
+    if (!is_string($csrf) || !$slsmassnotifyserver->validateCsrfToken($csrf)) {
         http_response_code(403);
         echo json_encode(['success' => false, 'message' => 'The security token expired. Reload Locations.']); exit;
     }
     try {
         $raw = $_POST['payload'] ?? null;
         if (!is_string($raw) || strlen($raw) > 786432) { throw new \InvalidArgumentException('The location request is missing or exceeds 768 KiB.'); }
-        $payload = json_decode($raw, true, 12, JSON_THROW_ON_ERROR);
+        $payload = \SLS\MassNotify\ApiSecurity::jsonObject($raw, false, 12);
         if (!is_array($payload) || array_is_list($payload)) { throw new \InvalidArgumentException('Location request must be an object.'); }
-        switch ($_POST['slsmassnotifyserver_action'] ?? '') {
+        $action = $_POST['slsmassnotifyserver_action'] ?? null;
+        if (!is_string($action)) { throw new \InvalidArgumentException('Unsupported location action.'); }
+        switch ($action) {
             case 'save_location': $result = $slsmassnotifyserver->saveLocation($payload); break;
             case 'delete_location': $result = $slsmassnotifyserver->deleteLocation($payload); break;
             case 'set_default_site': $result = $slsmassnotifyserver->setDefaultSite($payload); break;

@@ -8,19 +8,19 @@ the legacy top-level NWS fields are derived from the complete per-zone state.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import re
-import stat
 import sys
-import tempfile
 import time
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sls_atomic_json import locked_json, _object
 
 
 MAX_GROUPS = 16
@@ -94,123 +94,26 @@ def _local_dispatch_key(value: Any) -> str:
 
 @contextmanager
 def _locked_local_dispatch_state(path: Path):
-    """Serialize replace-based journal updates with a stable sidecar lock."""
-    state_path = Path(path)
+    """Keep local intents under the same checked atomic journal boundary."""
     try:
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        if state_path.is_symlink():
-            raise LocalDispatchStateError("local_dispatch_state_unsafe")
-        lock_path = state_path.with_name(state_path.name + ".lock")
-        descriptor = os.open(
-            lock_path,
-            os.O_RDWR
-            | os.O_CREAT
-            | os.O_CLOEXEC
-            | getattr(os, "O_NOFOLLOW", 0),
-            0o640,
-        )
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            os.close(descriptor)
-            raise LocalDispatchStateError("local_dispatch_lock_unsafe")
+        with locked_json(path, maximum=MAX_LOCAL_DISPATCH_STATE_BYTES,
+                         require_existing=True, runtime_owner=True) as state:
+            if not state and not path.exists():
+                state.update(version=1, intents={})
+            if (type(state.get('version')) is not int or state['version'] != 1
+                    or not isinstance(state.get('intents'), dict)
+                    or len(state['intents']) > MAX_LOCAL_DISPATCH_INTENTS):
+                raise LocalDispatchStateError('local_dispatch_state_corrupt')
+            for key, record in state['intents'].items():
+                if (_local_dispatch_key(key) != key or not isinstance(record, dict)
+                        or record.get('alert_key') != key or type(record.get('queued_at')) is not int
+                        or record['queued_at'] < 0):
+                    raise LocalDispatchStateError('local_dispatch_state_corrupt')
+            yield state
     except LocalDispatchStateError:
         raise
-    except OSError as exc:
-        raise LocalDispatchStateError("local_dispatch_lock_failed") from exc
-    try:
-        with os.fdopen(descriptor, "r+") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            if state_path.is_symlink():
-                raise LocalDispatchStateError("local_dispatch_state_unsafe")
-            yield state_path
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        os.chmod(lock_path, 0o640)
-    except LocalDispatchStateError:
-        raise
-    except OSError as exc:
-        raise LocalDispatchStateError("local_dispatch_lock_failed") from exc
-
-
-def _load_local_dispatch_state(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {"version": 1, "intents": {}}
-    try:
-        descriptor = os.open(
-            path,
-            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
-        )
-        try:
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_LOCAL_DISPATCH_STATE_BYTES:
-                raise LocalDispatchStateError("local_dispatch_state_unsafe")
-            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
-                descriptor = -1
-                loaded = json.load(handle)
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-    except LocalDispatchStateError:
-        raise
-    except (OSError, UnicodeError, ValueError) as exc:
-        raise LocalDispatchStateError("local_dispatch_state_corrupt") from exc
-    if (
-        not isinstance(loaded, dict)
-        or loaded.get("version") != 1
-        or not isinstance(loaded.get("intents"), dict)
-        or len(loaded["intents"]) > MAX_LOCAL_DISPATCH_INTENTS
-    ):
-        raise LocalDispatchStateError("local_dispatch_state_corrupt")
-    for key, record in loaded["intents"].items():
-        try:
-            safe_key = _local_dispatch_key(key)
-        except LocalDispatchStateError as exc:
-            raise LocalDispatchStateError("local_dispatch_state_corrupt") from exc
-        if (
-            safe_key != key
-            or not isinstance(record, dict)
-            or record.get("alert_key") != key
-            or not isinstance(record.get("queued_at"), int)
-            or record.get("queued_at", -1) < 0
-        ):
-            raise LocalDispatchStateError("local_dispatch_state_corrupt")
-    return {"version": 1, "intents": loaded["intents"]}
-
-
-def _write_local_dispatch_state(path: Path, state: dict[str, Any]) -> None:
-    encoded = (json.dumps(state, separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8")
-    if len(encoded) > MAX_LOCAL_DISPATCH_STATE_BYTES:
-        raise LocalDispatchStateError("local_dispatch_state_too_large")
-    descriptor = -1
-    temporary = ""
-    try:
-        descriptor, temporary = tempfile.mkstemp(
-            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
-        )
-        os.fchmod(descriptor, 0o640)
-        with os.fdopen(descriptor, "wb") as handle:
-            descriptor = -1
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        temporary = ""
-        directory_descriptor = os.open(
-            path.parent,
-            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
-    except OSError as exc:
-        raise LocalDispatchStateError("local_dispatch_state_write_failed") from exc
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        if temporary:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
+    except (OSError, RuntimeError, ValueError) as error:
+        raise LocalDispatchStateError('local_dispatch_journal_unavailable: ' + str(error)) from error
 
 
 def _prune_local_dispatch_state(state: dict[str, Any], now: int | None = None) -> bool:
@@ -230,10 +133,8 @@ def _prune_local_dispatch_state(state: dict[str, Any], now: int | None = None) -
 def local_dispatch_intent_recorded(path: Path, alert_key: Any) -> bool:
     """Return whether this alert chain already crossed the local intent gate."""
     key = _local_dispatch_key(alert_key)
-    with _locked_local_dispatch_state(Path(path)) as state_path:
-        state = _load_local_dispatch_state(state_path)
-        if _prune_local_dispatch_state(state):
-            _write_local_dispatch_state(state_path, state)
+    with _locked_local_dispatch_state(Path(path)) as state:
+        _prune_local_dispatch_state(state)
         return key in state["intents"]
 
 
@@ -249,8 +150,7 @@ def queue_local_dispatch_intent(
 ) -> bool:
     """Durably queue a local attempt; False means an older intent exists."""
     key = _local_dispatch_key(alert_key)
-    with _locked_local_dispatch_state(Path(path)) as state_path:
-        state = _load_local_dispatch_state(state_path)
+    with _locked_local_dispatch_state(Path(path)) as state:
         current = max(0, int(time.time() if now is None else now))
         _prune_local_dispatch_state(state, current)
         if key in state["intents"]:
@@ -265,20 +165,17 @@ def queue_local_dispatch_intent(
             "phone_requested": bool(phone_requested),
             "visual_requested": bool(visual_requested),
         }
-        _write_local_dispatch_state(state_path, state)
     return True
 
 
 def cancel_local_dispatch_intent(path: Path, alert_key: Any) -> bool:
     """Remove an intent only when the caller proved that zero local work ran."""
     key = _local_dispatch_key(alert_key)
-    with _locked_local_dispatch_state(Path(path)) as state_path:
-        state = _load_local_dispatch_state(state_path)
+    with _locked_local_dispatch_state(Path(path)) as state:
         _prune_local_dispatch_state(state)
         if key not in state["intents"]:
             return False
         state["intents"].pop(key, None)
-        _write_local_dispatch_state(state_path, state)
     return True
 
 
@@ -494,24 +391,6 @@ def _derive_legacy_fields(data: dict[str, Any], delivery_touched: bool) -> None:
                 data[key] = ""
 
 
-def _load_locked(handle: Any) -> dict[str, Any]:
-    handle.seek(0)
-    try:
-        loaded = json.load(handle)
-    except Exception:
-        loaded = {}
-    return loaded if isinstance(loaded, dict) else {}
-
-
-def _write_locked(handle: Any, data: dict[str, Any]) -> None:
-    handle.seek(0)
-    handle.truncate(0)
-    json.dump(data, handle, indent=2, sort_keys=True)
-    handle.write("\n")
-    handle.flush()
-    os.fsync(handle.fileno())
-
-
 def mutate_status(
     path: Path,
     group_id: str,
@@ -521,13 +400,10 @@ def mutate_status(
     configured_group_ids: Iterable[Any] | None = None,
 ) -> dict[str, Any]:
     """Apply one group mutation and derive all backward-compatible fields."""
-    path.parent.mkdir(parents=True, exist_ok=True)
     safe_id = normalize_group_id(group_id)
     allowed_ids = _configured_ids(configured_group_ids)
     delivery_touched = False
-    with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        data = _load_locked(handle)
+    with locked_json(path, runtime_owner=True) as data:
         groups = data.get("nws_groups") if isinstance(data.get("nws_groups"), dict) else {}
         groups = {
             normalize_group_id(key): value
@@ -541,9 +417,6 @@ def mutate_status(
         if authoritative_ids is not None and safe_id not in authoritative_ids:
             data["nws_groups"] = groups
             _derive_legacy_fields(data, delivery_touched=False)
-            _write_locked(handle, data)
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            os.chmod(path, 0o640)
             return {}
 
         group = dict(groups.get(safe_id) or {})
@@ -604,19 +477,13 @@ def mutate_status(
         groups[safe_id] = group
         data["nws_groups"] = groups
         _derive_legacy_fields(data, delivery_touched)
-        _write_locked(handle, data)
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    os.chmod(path, 0o640)
     return group
 
 
 def reconcile_status(path: Path, configured_group_ids: Iterable[Any]) -> None:
     """Remove status entries for Weather.gov groups no longer configured."""
-    path.parent.mkdir(parents=True, exist_ok=True)
     allowed_ids = _configured_ids(configured_group_ids) or set()
-    with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        data = _load_locked(handle)
+    with locked_json(path, runtime_owner=True) as data:
         groups = data.get("nws_groups") if isinstance(data.get("nws_groups"), dict) else {}
         data["nws_configured_group_ids"] = sorted(allowed_ids)
         data["nws_groups"] = {
@@ -625,16 +492,18 @@ def reconcile_status(path: Path, configured_group_ids: Iterable[Any]) -> None:
             if normalize_group_id(key) in allowed_ids and isinstance(value, dict)
         }
         _derive_legacy_fields(data, delivery_touched=False)
-        _write_locked(handle, data)
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    os.chmod(path, 0o640)
 
 
 def _json_env(name: str, fallback: Any) -> Any:
-    try:
-        return json.loads(os.environ.get(name, ""))
-    except (TypeError, ValueError):
+    raw = os.environ.get(name)
+    if raw is None:
         return fallback
+    if len(raw.encode('utf-8')) > 32768:
+        raise ValueError('NWS status input exceeds 32 KiB')
+    value = json.loads(raw, object_pairs_hook=_object,
+                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError('nonfinite status input')))
+    json.dumps(value, allow_nan=False)
+    return value
 
 
 def main() -> int:
@@ -682,14 +551,20 @@ def main() -> int:
     if not str(path) or str(path) == ".":
         print("STATUS_FILE_PATH is required", file=sys.stderr)
         return 2
-    configured = _json_env("NWS_CONFIGURED_GROUP_IDS_JSON", None)
-    if configured is not None and not isinstance(configured, list):
-        print("NWS_CONFIGURED_GROUP_IDS_JSON must be an array", file=sys.stderr)
+    try:
+        configured = _json_env("NWS_CONFIGURED_GROUP_IDS_JSON", None)
+        mutation = _json_env("NWS_STATUS_MUTATION_JSON", None) if sys.argv[1] == 'mutate' else None
+    except (ValueError, RuntimeError, UnicodeError, RecursionError):
+        print('NWS status input is invalid or ambiguous; retained status was not changed.', file=sys.stderr)
+        return 2
+    if ((configured is None and ('NWS_CONFIGURED_GROUP_IDS_JSON' in os.environ or sys.argv[1] == 'reconcile'))
+            or (configured is not None and (not isinstance(configured, list) or len(configured) > MAX_GROUPS
+                or any(not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', value) for value in configured)))):
+        print("NWS_CONFIGURED_GROUP_IDS_JSON must be an explicit bounded array of group identifiers", file=sys.stderr)
         return 2
     if sys.argv[1] == "reconcile":
         reconcile_status(path, configured or [])
         return 0
-    mutation = _json_env("NWS_STATUS_MUTATION_JSON", None)
     if not isinstance(mutation, dict):
         print("NWS_STATUS_MUTATION_JSON must be an object", file=sys.stderr)
         return 2

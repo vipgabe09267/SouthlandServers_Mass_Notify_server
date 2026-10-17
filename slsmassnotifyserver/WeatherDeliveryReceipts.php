@@ -1,6 +1,7 @@
 <?php
 declare(strict_types=1);
 namespace SLS\MassNotify;
+require_once __DIR__ . '/api/sls-mass-notify/security.php';
 
 /** Read-only projection of weather transport evidence; never exposes addresses or URLs. */
 final class WeatherDeliveryReceipts
@@ -28,7 +29,10 @@ final class WeatherDeliveryReceipts
                 throw new \RuntimeException('Phone history exceeds this request memory budget.');
             }
         }
-        $handle = @fopen($path, 'rb');
+        // O_RDWR does not wait for a peer when a FIFO is substituted between
+        // lstat() and open(). Runtime ledgers are service-owned and writable;
+        // fstat below rejects every non-regular descriptor before any I/O.
+        $handle = @fopen($path, 'r+b');
         if (!$handle) { throw new \RuntimeException('Phone delivery record could not be opened.'); }
         try {
             $opened = fstat($handle);
@@ -51,7 +55,7 @@ final class WeatherDeliveryReceipts
             if (!is_string($raw) || strlen($raw) !== $before['size'] || strlen($raw) > 16777216) {
                 throw new \RuntimeException('Phone delivery record is incomplete.');
             }
-            $state = json_decode($raw, true, 32, JSON_THROW_ON_ERROR);
+            $state = ApiSecurity::jsonObject($raw);
             if (!is_array($state) || ($state['schema'] ?? null) !== 1 || !is_array($state['batches'] ?? null)
                 || count($state['batches']) > 2000) {
                 throw new \RuntimeException('Invalid phone delivery record.');
@@ -70,6 +74,10 @@ final class WeatherDeliveryReceipts
     private static function voicemailRows(string $directory, array $parent, array $event, string $provider,
                                           string $identifier, array $groups, int $deadline, array &$result): void
     {
+        if (count($result['rows']) >= 100) {
+            $result['warnings'][] = 'Only the first 100 matching destination results are shown.';
+            return;
+        }
         try { $state = self::phoneState($directory.'/phone-admission.json', $parent['uid'], $parent['gid']); }
         catch (\Throwable $error) {
             $result['warnings'][] = 'Voicemail delivery evidence is unavailable. Review protected phone history and its size.';
@@ -154,13 +162,17 @@ final class WeatherDeliveryReceipts
         }
     }
 
-    private static function read(string $path, int $owner, bool $weather = true): array
+    private static function read(string $path, int $owner, int $group, bool $weather = true): array
     {
         $before = @lstat($path);
         if (!$before || ($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1
-            || ($before['mode'] & 0022) || !in_array($before['uid'], [0, $owner], true) || $before['size'] > 4194304) {
+            || ($before['mode'] & 0137) || !in_array($before['uid'], [0, $owner], true)
+            || $before['gid'] !== $group || $before['size'] > 4194304) {
             throw new \RuntimeException('Unsafe or oversized weather delivery record.');
         }
+        // Keep the open nonblocking for a raced FIFO. A read-only or
+        // incorrectly owned runtime ledger is unavailable until permissions
+        // are repaired; never fall back to a blocking read-only open.
         $handle = @fopen($path, 'r+b');
         if (!$handle) { throw new \RuntimeException('Weather delivery record could not be opened.'); }
         try {
@@ -172,7 +184,7 @@ final class WeatherDeliveryReceipts
             }
             $raw = stream_get_contents($handle, 4194305);
             clearstatcache(true, $path); $after = @lstat($path); $opened = fstat($handle);
-            foreach (['dev', 'ino', 'uid', 'mode', 'nlink', 'size', 'mtime', 'ctime'] as $field) {
+            foreach (['dev', 'ino', 'uid', 'gid', 'mode', 'nlink', 'size', 'mtime', 'ctime'] as $field) {
                 if (!$opened || !$after || $before[$field] !== $opened[$field] || $opened[$field] !== $after[$field]) {
                     throw new \RuntimeException('Weather delivery record changed while reading.');
                 }
@@ -180,7 +192,7 @@ final class WeatherDeliveryReceipts
             if (!is_string($raw) || strlen($raw) !== $before['size'] || strlen($raw) > 4194304) {
                 throw new \RuntimeException('Weather delivery record is incomplete or oversized.');
             }
-            $value = json_decode($raw, true, 32, JSON_THROW_ON_ERROR);
+            $value = ApiSecurity::jsonObject($raw);
             if (!$weather) {
                 if (!is_array($value) || !preg_match('/^job_[a-f0-9]{32}$/D', (string)($value['id']??'')) || !is_array($value['receipts']??[]) || count($value['receipts']??[])>3000) { throw new \RuntimeException('Invalid Weather channel job.'); }
                 return $value;
@@ -234,7 +246,7 @@ final class WeatherDeliveryReceipts
             if (hrtime(true) > $deadline || $bytes > 33554432) {
                 $result['warnings'][] = 'Weather delivery history reached its read limit. Some destinations may be missing.'; break;
             }
-            try { $state = self::read($path, $parent['uid']); $bytes += (int)filesize($path); }
+            try { $state = self::read($path, $parent['uid'], $parent['gid']); $bytes += (int)filesize($path); }
             catch (\Throwable $error) { $result['warnings'][] = 'A weather delivery history file is unreadable. Review protected storage and the maintenance log.'; continue; }
             foreach ($state['deliveries'] as $record) {
                 if (!is_array($record) || ($record['payload']['source'] ?? '') !== $provider
@@ -247,10 +259,16 @@ final class WeatherDeliveryReceipts
                     $jobPath=$directory.'/announcement-jobs/'.$jobId.'.json';
                     try {
                         $jobDirectory=$directory.'/announcement-jobs'; $jobParent=@lstat($jobDirectory);
-                        if (!$jobParent || ($jobParent['mode']&0170000)!==0040000 || ($jobParent['mode']&0022) || $jobParent['uid']!==$parent['uid'] || realpath($jobDirectory)!==$jobDirectory) { throw new \RuntimeException('Unsafe Weather job directory.'); }
-                        $job=self::read($jobPath,$parent['uid'],false);$bytes+=(int)filesize($jobPath);
+                        if (!$jobParent || ($jobParent['mode']&0170000)!==0040000 || ($jobParent['mode']&0022)
+                            || $jobParent['uid']!==$parent['uid'] || $jobParent['gid']!==$parent['gid']
+                            || realpath($jobDirectory)!==$jobDirectory) { throw new \RuntimeException('Unsafe Weather job directory.'); }
+                        $job=self::read($jobPath,$parent['uid'],$parent['gid'],false);$bytes+=(int)filesize($jobPath);
                         if (($job['request']['weather_context']['source_validity']??null)!==$record['source_validity']) { throw new \RuntimeException('Weather channel job identity differs from source.'); }
                         foreach ($job['receipts']??[] as $channelReceipt) {
+                            if (count($result['rows']) >= 100) {
+                                $result['warnings'][] = 'Only the first 100 matching destination results are shown.';
+                                break 3;
+                            }
                             if (!is_array($channelReceipt) || !in_array($channelReceipt['channel']??'', ['sms','external_voice'],true)) { continue; }
                             $channelStatus=$channelReceipt['state']??'not_recorded';
                             if (!is_string($channelStatus) || !preg_match('/^[a-z_]{1,40}$/D',$channelStatus)) { $channelStatus='not_recorded'; }
@@ -264,6 +282,10 @@ final class WeatherDeliveryReceipts
                 if (!empty($record['routing_snapshot']['email_recipients'])) { $keys[] = 'email:email'; }
                 $receipts = $record['destination_receipts'] ?? [];
                 foreach (array_unique(array_merge($keys, array_keys(is_array($receipts) ? $receipts : []))) as $key) {
+                    if (count($result['rows']) >= 100) {
+                        $result['warnings'][] = 'Only the first 100 matching destination results are shown.';
+                        break 3;
+                    }
                     if (!is_string($key) || !preg_match('/^(email|discord|generic|channels):[A-Za-z0-9_-]{1,64}$/D', $key, $match)) { continue; }
                     $receipt = $receipts[$key] ?? [];
                     $status = $receipt['status'] ?? 'not_recorded';

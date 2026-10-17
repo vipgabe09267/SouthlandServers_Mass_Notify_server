@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 namespace FreePBX\modules;
+require_once __DIR__.'/AdminResponse.php';
+require_once __DIR__.'/ImmediateSettings.php';
 require_once __DIR__ . '/OperatorAccess.php';
 require_once __DIR__ . '/OperatorRecoveryService.php';
 use SLS\MassNotify\OperatorAccess;
@@ -68,7 +70,7 @@ trait SlsOperators
     public function enforceOperatorPageAccess(string $page): void
     {
         if ($this->operatorPageAllowed($page)) { return; }
-        while (ob_get_level() > 0) { @ob_end_clean(); }
+        \SLS\MassNotify\AdminResponse::requireClearBuffers();
         http_response_code(403); header('Cache-Control: private, no-store');
         $message = 'Your current SLS role does not allow this page. Use Operations for your assigned sites and audiences.';
         if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
@@ -161,13 +163,29 @@ trait SlsOperators
         return null;
     }
 
+    /** Caller holds the central settings lock. */
+    protected function commitOperatorConfigFiles(array $active, ?array $pending): void
+    {
+        \SLS\MassNotify\ImmediateSettings::commitFiles(
+            self::SETTINGS_JSON,
+            self::PENDING_SETTINGS_JSON,
+            $active,
+            $pending,
+            function (string $path, array $settings, bool $backup): void {
+                $this->writeSettingsFileUnlocked($path, $settings, $backup);
+            }
+        );
+    }
+
     private function writeOperatorConfig(array $active, array $config): void
     {
+        $pending=null;
         if (is_file(self::PENDING_SETTINGS_JSON) || is_link(self::PENDING_SETTINGS_JSON)) {
             $pending=$this->loadSettingsFile(self::PENDING_SETTINGS_JSON); $pending['operator_access']=$config;
-            $this->writeSettingsFileUnlocked(self::PENDING_SETTINGS_JSON,$pending,false);
         }
-        $active['operator_access']=$config; $this->writeSettingsFileUnlocked(self::SETTINGS_JSON,$active,true);
+        $active['operator_access']=$config;
+        [$active,$pending]=\SLS\MassNotify\ImmediateSettings::prepare($active,$pending,['operator_access']);
+        $this->commitOperatorConfigFiles($active, $pending);
     }
 
     public function saveOperatorAccess(array $input): array
@@ -186,7 +204,7 @@ trait SlsOperators
                 if (!is_string($row['password']??'') || !is_bool($row['reset_totp']??false)) { throw new \DomainException('An operator password or authenticator reset has an invalid type.'); }
                 if (($row['password']??'')!=='') { $hashes[$index]=\SLS\MassNotify\OperatorAuth::password($row['password']); }
             }
-            $lock=$this->acquireSettingsLock(true); $active=$this->loadSettingsFile(self::SETTINGS_JSON);
+            $lock=$this->acquireSettingsLock(true); $active=$this->normalizeSettings($this->loadSettingsFile(self::SETTINGS_JSON));
             if (!hash_equals($this->operatorRevision($active),$input['revision'])) { throw new \DomainException('Operator permissions or their directory changed. Reload before saving.'); }
             $previous=array_column(OperatorAccess::normalize($active['operator_access']??[])['accounts'],null,'id'); $rows=[];
             foreach ($input['accounts'] as $index=>$row) {
@@ -360,11 +378,11 @@ trait SlsOperators
     {
         $principal = $this->currentOperator(); $settings = $this->getActiveSettings(); $catalog = $this->locationCatalog($settings);
         $allowed = ApiSecurity::allowedAudience($principal, $settings);
-        $mapping = ['extensions'=>'phones', 'desktop_client_ids'=>'desktops', 'voice_recipient_ids'=>'voice_recipient_ids', 'email_recipient_ids'=>'email_recipient_ids', 'sms_recipient_ids'=>'sms_recipient_ids', 'webhook_ids'=>'webhooks'];
+        $mapping = ['extensions'=>'phones', 'desktop_client_ids'=>'desktops', 'voice_recipient_ids'=>'voice_recipient_ids', 'email_recipient_ids'=>'email_recipient_ids', 'sms_recipient_ids'=>'sms_recipient_ids', 'webhook_ids'=>'webhooks', 'browser_recipient_ids'=>'browser_recipient_ids', 'connector_ids'=>'connector_ids'];
         $choices = [];
         foreach ($mapping as $key=>$target) {
             $field = $key === 'desktop_client_ids' ? 'desktop_clients' : $key; $choices[$field] = [];
-            foreach ($catalog[$key] as $row) {
+            foreach ($catalog[$key] ?? [] as $row) {
                 $id = $key === 'desktop_client_ids' ? ($row['username'] ?? '') : $row['id'];
                 if ($row['available'] && (!empty($principal['audience']['unrestricted']) || in_array($id, $allowed[$target], true))) {
                     $choices[$field][] = ['id'=>$id, 'name'=>$row['label']];
@@ -551,7 +569,7 @@ trait SlsOperators
                 if (array_diff(array_keys($input), ['job_id']) || !is_string($input['job_id'] ?? null) || !preg_match('/^job_[a-f0-9]{32}$/D', $input['job_id'])) { throw new \DomainException('Select an announcement job.'); }
                 $record = (new \SlsAnnouncementJobStore(self::PLUGIN_DATA_DIR.'/announcement-jobs'))->read($input['job_id']);
                 $request = $record['request'] ?? []; $delivery = [];
-                foreach (['extensions'=>'phones','desktop_clients'=>'desktops','voice_recipient_ids'=>'voice_recipient_ids','email_recipient_ids'=>'email_recipient_ids','sms_recipient_ids'=>'sms_recipient_ids','webhook_ids'=>'webhooks'] as $key=>$field) { $delivery[$key] = $request[$field] ?? []; }
+                foreach (['extensions'=>'phones','desktop_clients'=>'desktops','voice_recipient_ids'=>'voice_recipient_ids','email_recipient_ids'=>'email_recipient_ids','sms_recipient_ids'=>'sms_recipient_ids','webhook_ids'=>'webhooks','browser_recipient_ids'=>'browser_recipient_ids','connector_ids'=>'connector_ids'] as $key=>$field) { $delivery[$key] = $request[$field] ?? []; }
                 if (!$record || (empty($principal['audience']['unrestricted']) && (($request['api_credential_id'] ?? '') !== $principal['id'] || !OperatorAccess::delivery($principal,$delivery,$this->getActiveSettings())))) { throw new \DomainException('This announcement is outside your current assignments.'); }
                 return $this->withOperator($principal, fn(): array => $this->getAnnouncementJob($input['job_id']));
             }
@@ -571,6 +589,7 @@ trait SlsOperators
                         'schedule_extensions'=>$delivery['extensions'], 'schedule_desktop_clients'=>$delivery['desktop_clients'],
                         'schedule_voice_recipient_ids'=>$delivery['voice_recipient_ids'], 'schedule_email_recipient_ids'=>$delivery['email_recipient_ids'],
                         'schedule_sms_recipient_ids'=>$delivery['sms_recipient_ids'], 'schedule_webhook_ids'=>$delivery['webhook_ids'],
+                        'schedule_browser_recipient_ids'=>$delivery['browser_recipient_ids'], 'schedule_connector_ids'=>$delivery['connector_ids'],
                         'schedule_colored'=>$delivery['style']==='colored'?'1':'0', 'schedule_background_color'=>$delivery['background_color'],
                     ])); } finally { $this->operatorScheduleOrigin = null; }
                 }
@@ -599,8 +618,9 @@ trait SlsOperators
             if (in_array($action, ['start_incident', 'update_incident'], true)) {
                 if (!OperatorAccess::may($principal, 'send')) { throw new \DomainException('Your current role cannot send incident announcements.'); }
                 if ($action === 'start_incident') {
-                    $state = $this->operatorOperationsState();
-                    if (!in_array($input['template_id'] ?? '', array_column($state['templates'], 'id'), true)) { throw new \DomainException('The incident template exceeds your current audience permissions.'); }
+                    $settings = $this->getActiveSettings();
+                    $templates = $this->operatorPermittedTemplates($principal, $settings);
+                    if (!in_array($input['template_id'] ?? '', array_column($templates, 'id'), true)) { throw new \DomainException('The incident template exceeds your current audience permissions.'); }
                     return $this->withOperator($principal, function () use ($input, $principal): array {
                         $result = $this->startIncident($input);
                         return empty($result['success']) ? $result : ['success'=>true, 'incident'=>$this->operatorIncidentProjection($result, $principal)];
@@ -621,7 +641,11 @@ trait SlsOperators
     }
 
     public function renderOperatorsPage(string $endpoint = 'config.php?display=slsmassnotifyserver_operators', ?string $csrf = null): string
-    { return load_view(__DIR__.'/views/operators.php', ['state'=>$this->operatorAccessState(), 'csrf_token'=>$csrf ?? $this->getCsrfToken(), 'endpoint'=>$endpoint]); }
+    {
+        $state=$this->operatorAccessState();$csrf_token=$csrf ?? $this->getCsrfToken();
+        $identity_settings=isset($GLOBALS['sls_operator_portal_principal'])?'':$this->renderOperatorIdentitySettings($endpoint,$csrf_token);
+        return load_view(__DIR__.'/views/operators.php',compact('state','csrf_token','endpoint','identity_settings'));
+    }
     public function renderOperationsPage(string $cursor = '', string $endpoint = 'config.php?display=slsmassnotifyserver_operations', ?string $csrf = null): string
     { return load_view(__DIR__.'/views/operations.php', ['state'=>$this->operatorOperationsState($cursor), 'csrf_token'=>$csrf ?? $this->getCsrfToken(), 'endpoint'=>$endpoint]); }
 }

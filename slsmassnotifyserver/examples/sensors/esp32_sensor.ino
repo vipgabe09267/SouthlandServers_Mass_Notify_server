@@ -16,7 +16,31 @@ static const int CONTACT_PIN = 27;
 Preferences journal;
 String pending;
 bool candidate = false, stable = false, baseline = false;
-unsigned long changedAt = 0, lastHeartbeat = 0, lastActivation = 0;
+bool storageReady = false;
+unsigned long changedAt = 0, lastHeartbeat = 0, lastActivation = 0, lastRetry = 0;
+unsigned long payloadExpiry(const String &payload) {
+  const String key="\"expires_at\":"; int start=payload.indexOf(key);
+  if(start<0) return 0;
+  start+=key.length(); int end=payload.indexOf(',',start);
+  if(end<0) return 0;
+  String number=payload.substring(start,end);
+  if(number.length()!=10) return 0;
+  for(unsigned int i=0;i<number.length();i++) if(number[i]<'0'||number[i]>'9') return 0;
+  unsigned long value=strtoul(number.c_str(),nullptr,10);
+  return String(value)==number && value>=1700000000UL ? value : 0;
+}
+bool savePending(const String &payload) {
+  if(journal.putString("pending",payload)!=payload.length() || journal.getString("pending","")!=payload) {
+    storageReady=false; Serial.println("Pending persistence failed; preserve the journal for review"); return false;
+  }
+  pending=payload; return true;
+}
+bool clearPending() {
+  if(!journal.remove("pending") || journal.getString("pending","").length()) {
+    storageReady=false; Serial.println("Pending completion failed; preserve the journal for review"); return false;
+  }
+  pending=""; return true;
+}
 String newId() {
   char buffer[33]; uint8_t bytes[16]; esp_fill_random(bytes, sizeof bytes);
   for (int i=0;i<16;i++) sprintf(buffer+i*2,"%02x",bytes[i]); buffer[32]=0; return String(buffer);
@@ -30,7 +54,7 @@ bool post(const String &payload) {
   time_t now=time(nullptr); if (!ENABLE_SEND || now<1700000000 || strlen(SECRET)!=64 || strlen(ROOT_CA)==0) return false;
   String stamp=String((unsigned long)now), bytes=String(RULE)+"."+stamp+"."+payload;
   uint8_t digest[32]; mbedtls_md_context_t ctx; mbedtls_md_init(&ctx);
-  if (mbedtls_md_setup(&ctx,mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),1)!=0) return false;
+  if (mbedtls_md_setup(&ctx,mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),1)!=0) { mbedtls_md_free(&ctx); return false; }
   mbedtls_md_hmac_starts(&ctx,(const unsigned char*)SECRET,strlen(SECRET));
   mbedtls_md_hmac_update(&ctx,(const unsigned char*)bytes.c_str(),bytes.length());
   mbedtls_md_hmac_finish(&ctx,digest); mbedtls_md_free(&ctx);
@@ -51,22 +75,34 @@ bool post(const String &payload) {
 void setup() {
   pinMode(CONTACT_PIN,INPUT_PULLUP); Serial.begin(115200);
   if(!ENABLE_SEND) { Serial.println("Labs example disabled; no network requests"); return; }
-  journal.begin("sls-sensor",false); pending=journal.getString("pending","");
+  if(!journal.begin("sls-sensor",false)) { Serial.println("Private journal unavailable"); return; }
+  pending=journal.getString("pending","");
+  if(pending.length() && payloadExpiry(pending)==0) { Serial.println("Preserve malformed pending journal for review"); return; }
+  storageReady=true;
   WiFi.begin(SSID,WIFI_PASSWORD); configTime(0,0,"pool.ntp.org");
 }
 void loop() {
-  if(!ENABLE_SEND) { delay(100); return; }
+  if(!ENABLE_SEND || !storageReady) { delay(100); return; }
   unsigned long nowMs=millis(); bool input=digitalRead(CONTACT_PIN)==LOW;
+  time_t epoch=time(nullptr);
+  if(pending.length() && epoch>=1700000000 && payloadExpiry(pending)<=(unsigned long)epoch) {
+    if(journal.putString("expired",pending)!=pending.length() || journal.getString("expired","")!=pending) {
+      storageReady=false; Serial.println("Expired evidence could not be retained"); return;
+    }
+    if(!clearPending()) return;
+    Serial.println("Expired activation retained for review; automatic retry stopped");
+  }
   if(input!=candidate) { candidate=input; changedAt=nowMs; }
   if(nowMs-changedAt>=50 && (!baseline || candidate!=stable)) {
     bool was=stable; stable=candidate;
     if(baseline && !was && stable && pending.length()==0 && nowMs-lastActivation>=10000 && time(nullptr)>=1700000000) {
-      pending=body("activate",time(nullptr)); journal.putString("pending",pending); lastActivation=nowMs;
+      if(!savePending(body("activate",epoch))) return;
+      lastActivation=nowMs;
     } baseline=true;
   }
   if(WiFi.status()==WL_CONNECTED && time(nullptr)>=1700000000) {
-    if(pending.length()) { if(post(pending)) { pending=""; journal.remove("pending"); } delay(5000); }
-    else if(nowMs-lastHeartbeat>=60000) { if(post(body("heartbeat",time(nullptr)))) lastHeartbeat=nowMs; }
+    if(pending.length() && nowMs-lastRetry>=5000) { lastRetry=nowMs; if(post(pending) && !clearPending()) return; }
+    if(nowMs-lastHeartbeat>=60000) { lastHeartbeat=nowMs; post(body("heartbeat",time(nullptr))); }
   }
   delay(10);
 }

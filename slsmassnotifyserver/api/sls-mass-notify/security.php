@@ -3,11 +3,96 @@ declare(strict_types=1);
 
 namespace SLS\MassNotify;
 
+if (!class_exists(ApiSecurity::class, false)) {
 /** Shared by the Control and desktop APIs. No framework bootstrap or side effects. */
 final class ApiSecurity
 {
     public const SCOPES = ['read', 'send', 'test', 'config'];
-    public const AUDIENCES = ['extensions', 'desktop_client_ids', 'announcement_group_ids', 'nws_zone_ids', 'voice_recipient_ids', 'webhook_ids', 'email_recipient_ids', 'sms_recipient_ids'];
+    public const AUDIENCES = ['extensions', 'desktop_client_ids', 'announcement_group_ids', 'nws_zone_ids', 'voice_recipient_ids', 'webhook_ids', 'email_recipient_ids', 'sms_recipient_ids', 'browser_recipient_ids', 'connector_ids'];
+
+    public static function jsonObject(string $raw, bool $allowLegacyEmptyList = false, int $maximumDepth = 64): array
+    {
+        if ($maximumDepth < 2 || $maximumDepth > 64) { throw new \InvalidArgumentException('JSON nesting limit is invalid.'); }
+        self::assertUniqueJsonMembers($raw, $maximumDepth);
+        $decoded = json_decode($raw, true, $maximumDepth, JSON_THROW_ON_ERROR);
+        self::assertFiniteJsonNumbers($decoded);
+        $trimmed = ltrim($raw);
+        $object = str_starts_with($trimmed, '{');
+        $legacyEmptyList = $allowLegacyEmptyList && $decoded === []
+            && preg_match('/\A\[\s*\]\z/D', $trimmed) === 1;
+        if (!is_array($decoded) || (!$object && !$legacyEmptyList)) {
+            throw new \InvalidArgumentException('JSON object required.');
+        }
+        return $decoded;
+    }
+
+    private static function assertFiniteJsonNumbers($value): void
+    {
+        if (is_float($value) && !is_finite($value)) {
+            throw new \InvalidArgumentException('JSON numbers must be finite.');
+        }
+        if (!is_array($value)) { return; }
+        foreach ($value as $member) { self::assertFiniteJsonNumbers($member); }
+    }
+
+    /** Reject duplicate object members without retaining a second decoded tree. */
+    private static function assertUniqueJsonMembers(string $raw, int $maximumDepth): void
+    {
+        $length = strlen($raw);
+        $stack = [];
+        for ($index = 0; $index < $length; $index++) {
+            $byte = $raw[$index];
+            if ($byte === '{' || $byte === '[') {
+                if (count($stack) >= $maximumDepth) {
+                    throw new \InvalidArgumentException('JSON nesting limit is invalid.');
+                }
+                $stack[] = ['object' => $byte === '{', 'keys' => []];
+                continue;
+            }
+            if ($byte === '}' || $byte === ']') {
+                $last = count($stack) - 1;
+                if ($last < 0 || ($stack[$last]['object'] !== ($byte === '}'))) {
+                    throw new \InvalidArgumentException('Invalid JSON structure.');
+                }
+                array_pop($stack);
+                continue;
+            }
+            if ($byte !== '"') { continue; }
+
+            $start = $index;
+            $escaped = false;
+            for ($index++; $index < $length; $index++) {
+                if ($raw[$index] === '\\') {
+                    $escaped = true;
+                    if (++$index >= $length) { throw new \InvalidArgumentException('Invalid JSON string.'); }
+                    continue;
+                }
+                if ($raw[$index] === '"') { break; }
+            }
+            if ($index >= $length) { throw new \InvalidArgumentException('Invalid JSON string.'); }
+            $next = $index + 1;
+            while ($next < $length && ($raw[$next] === ' ' || $raw[$next] === "\t"
+                || $raw[$next] === "\r" || $raw[$next] === "\n")) { $next++; }
+            if ($next >= $length || $raw[$next] !== ':') { continue; }
+            $last = count($stack) - 1;
+            if ($last < 0 || !$stack[$last]['object']) {
+                throw new \InvalidArgumentException('Invalid JSON member.');
+            }
+            $literal = substr($raw, $start, $index - $start + 1);
+            if ($escaped) {
+                $key = json_decode($literal, true, 2, JSON_THROW_ON_ERROR);
+                if (!is_string($key)) { throw new \InvalidArgumentException('Invalid JSON key.'); }
+            } else {
+                $key = substr($literal, 1, -1);
+            }
+            $identity = 'k:' . $key;
+            if (isset($stack[$last]['keys'][$identity])) {
+                throw new \InvalidArgumentException('Duplicate JSON members are not supported.');
+            }
+            $stack[$last]['keys'][$identity] = true;
+        }
+        if ($stack) { throw new \InvalidArgumentException('Invalid JSON structure.'); }
+    }
 
     private static function values($value, string $pattern, int $maximum = 1000): array
     {
@@ -32,7 +117,9 @@ final class ApiSecurity
         foreach (self::AUDIENCES as $key) {
             $pattern = $key === 'extensions' ? '/^[0-9]{1,20}$/D'
                 : ($key === 'email_recipient_ids' ? '/^email_[a-f0-9]{24}$/D' : ($key === 'sms_recipient_ids' ? '/^sms_[a-f0-9]{24}$/D' : '/^[A-Za-z0-9_-]{1,64}$/D'));
-            $items = in_array($key, ['email_recipient_ids','sms_recipient_ids'], true) && array_key_exists($key, $value) ? $value[$key] : ($value[$key] ?? []);
+            if ($key==='browser_recipient_ids') { $pattern='/^sub_[a-f0-9]{24}$/D'; }
+            if ($key==='connector_ids') { $pattern='/^conn_[a-f0-9]{24}$/D'; }
+            $items = in_array($key, ['email_recipient_ids','sms_recipient_ids','browser_recipient_ids','connector_ids'], true) && array_key_exists($key, $value) ? $value[$key] : ($value[$key] ?? []);
             $result[$key] = self::values($items, $pattern);
         }
         return $result;
@@ -41,11 +128,12 @@ final class ApiSecurity
     public static function credentials($value): array
     {
         if (!is_array($value) || !array_is_list($value) || count($value) > 100) { throw new \DomainException('Control API supports up to 100 named credentials.'); }
-        $result = []; $ids = [];
+        $result = []; $ids = []; $hashes = [];
         foreach ($value as $row) {
             if (!is_array($row) || array_diff(array_keys($row), ['id', 'name', 'secret_hash', 'scopes', 'audience', 'created_at', 'revoked_at'])
                 || !is_string($row['id'] ?? null) || !preg_match('/^api_[a-f0-9]{24}$/D', $row['id']) || isset($ids[$row['id']])
                 || !is_string($row['secret_hash'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $row['secret_hash'])
+                || isset($hashes[$row['secret_hash']])
                 || !is_string($row['name'] ?? null) || trim($row['name']) === '' || strlen($row['name']) > 80 || preg_match('/[\x00-\x1f\x7f]/', $row['name'])) {
                 throw new \DomainException('A named API credential has invalid metadata.');
             }
@@ -55,11 +143,13 @@ final class ApiSecurity
             if (!$audience['unrestricted'] && in_array('config', $scopes, true)) { throw new \DomainException('Configuration permission requires an unrestricted audience.'); }
             foreach (['created_at', 'revoked_at'] as $field) {
                 if (!is_string($row[$field] ?? null) || ($row[$field] === '' && $field !== 'revoked_at')
-                    || ($row[$field] !== '' && (!preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00$/D', $row[$field]) || strtotime($row[$field]) === false))) {
+                    || ($row[$field] !== '' && (!preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00$/D', $row[$field])
+                        || !($parsed = \DateTimeImmutable::createFromFormat('!Y-m-d\TH:i:sP', $row[$field]))
+                        || $parsed->format('Y-m-d\TH:i:sP') !== $row[$field]))) {
                     throw new \DomainException('An API credential timestamp is invalid.');
                 }
             }
-            $ids[$row['id']] = true;
+            $ids[$row['id']] = true; $hashes[$row['secret_hash']] = true;
             $result[] = ['id' => $row['id'], 'name' => trim($row['name']), 'secret_hash' => $row['secret_hash'],
                 'scopes' => $scopes, 'audience' => $audience, 'created_at' => $row['created_at'], 'revoked_at' => $row['revoked_at']];
         }
@@ -106,6 +196,7 @@ final class ApiSecurity
     {
         if ($id === 'legacy') { return null; } // Legacy jobs keep their existing behavior; never promote a missing named key.
         if (array_key_exists('operator_access', $settings)) {
+            if (!is_array($settings['operator_access'])) { return null; }
             $local = dirname(__DIR__, 2) . '/OperatorAccess.php';
             require_once is_file($local) ? $local : '/var/www/html/admin/modules/slsmassnotifyserver/OperatorAccess.php';
             $operator = OperatorAccess::principal($settings, $id);
@@ -195,6 +286,8 @@ final class ApiSecurity
     public static function allowedAudience(array $principal, array $settings): array
     {
         $audience = self::audience($principal['audience'] ?? []);
+        $labs = self::labsDirectory($settings);
+        $reviewedGroups = [];
         $allowed = ['phones' => $audience['extensions'], 'desktops' => [], 'webhooks' => $audience['webhook_ids'], 'voice_recipient_ids' => $audience['voice_recipient_ids'], 'email_recipient_ids' => $audience['email_recipient_ids'], 'sms_recipient_ids' => $audience['sms_recipient_ids']];
         foreach ($settings['desktop_clients'] ?? [] as $row) {
             if (is_array($row) && !empty($row['enabled']) && in_array($row['client_id'] ?? '', $audience['desktop_client_ids'], true)) {
@@ -203,17 +296,25 @@ final class ApiSecurity
         }
         foreach ($settings['announcement_groups'] ?? [] as $group) {
             if (!is_array($group) || !in_array($group['id'] ?? '', $audience['announcement_group_ids'], true)) { continue; }
-            if (!self::groupDesktopBindingsValid($group, $settings)) { continue; }
+            if (!self::groupDesktopBindingsValid($group, $settings) || !self::groupLabsBindingsValid($group,$settings,$labs)) { continue; }
+            $reviewedGroups[] = $group;
             foreach (['phones' => 'extensions', 'desktops' => 'desktop_clients', 'voice_recipient_ids' => 'voice_recipient_ids', 'email_recipient_ids' => 'email_recipient_ids', 'sms_recipient_ids' => 'sms_recipient_ids', 'webhooks' => 'webhook_ids'] as $key => $field) {
                 foreach ($group[$field] ?? [] as $target) { if (is_string($target) || is_int($target)) { $allowed[$key][] = (string)$target; } }
             }
         }
         $allowed['email_recipient_ids'] = array_values(array_intersect($allowed['email_recipient_ids'], self::enabledEmailRecipientIds($settings)));
         $allowed['sms_recipient_ids'] = array_values(array_intersect($allowed['sms_recipient_ids'], self::enabledSmsRecipientIds($settings)));
+        foreach (['browser_recipient_ids','connector_ids'] as $field) {
+            $selected=$audience[$field];
+            foreach ($reviewedGroups as $group) {
+                $selected=array_merge($selected,$group[$field] ?? []);
+            }
+            $allowed[$field]=array_values(array_filter(array_unique($selected),static fn($id)=>!empty($labs[$field][$id]['available'])));
+        }
         // Apply channel restrictions after expanding saved audiences. A group
         // may contain channels the operator has not been allowed to use.
         if (isset($principal['allowed_channels']) && empty($principal['audience']['unrestricted'])) {
-            foreach (['phones'=>'extensions','desktops'=>'desktop_client_ids','webhooks'=>'webhook_ids','voice_recipient_ids'=>'voice_recipient_ids','email_recipient_ids'=>'email_recipient_ids','sms_recipient_ids'=>'sms_recipient_ids'] as $key=>$channel) {
+            foreach (['phones'=>'extensions','desktops'=>'desktop_client_ids','webhooks'=>'webhook_ids','voice_recipient_ids'=>'voice_recipient_ids','email_recipient_ids'=>'email_recipient_ids','sms_recipient_ids'=>'sms_recipient_ids','browser_recipient_ids'=>'browser_recipient_ids','connector_ids'=>'connector_ids'] as $key=>$channel) {
                 if (!in_array($channel,$principal['allowed_channels'],true)) { $allowed[$key]=[]; }
             }
         }
@@ -230,8 +331,18 @@ final class ApiSecurity
         catch (\DomainException $error) { return false; }
         try { self::values(array_key_exists('sms_recipient_ids', $request) ? $request['sms_recipient_ids'] : [], '/^sms_[a-f0-9]{24}$/D', 50); }
         catch (\DomainException $error) { return false; }
-        if (($principal['audience']['unrestricted'] ?? false) === true) { return true; }
-        if(!empty($request['browser_recipient_ids'])||!empty($request['connector_ids'])){return false;}
+        if (($principal['audience']['unrestricted'] ?? false) === true) {
+            if (!isset($principal['allowed_channels'])) { return true; }
+            if (!is_array($principal['allowed_channels']) || !array_is_list($principal['allowed_channels'])) { return false; }
+            $channelFields = ['phones'=>'extensions', 'desktops'=>'desktop_client_ids', 'webhooks'=>'webhook_ids',
+                'voice_recipient_ids'=>'voice_recipient_ids', 'email_recipient_ids'=>'email_recipient_ids',
+                'sms_recipient_ids'=>'sms_recipient_ids', 'browser_recipient_ids'=>'browser_recipient_ids',
+                'connector_ids'=>'connector_ids'];
+            foreach ($channelFields as $field => $channel) {
+                if (!empty($request[$field]) && !in_array($channel, $principal['allowed_channels'], true)) { return false; }
+            }
+            return true;
+        }
         $allowed = self::allowedAudience($principal, $settings);
         foreach ($allowed as $key => $targets) {
             if (!is_array($request[$key] ?? []) || array_diff(array_map('strval', $request[$key] ?? []), $targets)) { return false; }
@@ -239,6 +350,68 @@ final class ApiSecurity
         // Future delivery channels require an explicit authorization contract.
         foreach (['emails', 'email_recipients', 'sms_recipients', 'mobile_recipients'] as $key) { if (!empty($request[$key])) { return false; } }
         return true;
+    }
+
+    public static function labsDirectory(array $settings): array
+    {
+        $result=['browser_recipient_ids'=>[],'connector_ids'=>[]];
+        $subscribers=$settings['subscriber_browser'] ?? [];
+        foreach ($subscribers['people'] ?? [] as $row) {
+            if (!is_array($row) || !preg_match('/^sub_[a-f0-9]{24}$/D',$row['id'] ?? '')) { continue; }
+            $identity=hash('sha256',json_encode([$row['id'],$row['person_id'] ?? '',$row['name'] ?? '',
+                strtolower($row['email'] ?? ''),$row['version'] ?? '',$row['registered_at'] ?? 0],JSON_THROW_ON_ERROR));
+            $result['browser_recipient_ids'][$row['id']]=['id'=>$row['id'],'label'=>($row['name'] ?? $row['id']).' · Browser (Labs)',
+                'identity'=>$identity,'available'=>($subscribers['enabled'] ?? false)===true && ($subscribers['push']['enabled'] ?? false)===true && ($row['enabled'] ?? false)===true];
+        }
+        $integrations=$settings['enterprise_integrations'] ?? [];
+        foreach ($integrations['connectors']['destinations'] ?? [] as $row) {
+            if (!is_array($row) || !preg_match('/^conn_[a-f0-9]{24}$/D',$row['id'] ?? '')) { continue; }
+            $fields=[];
+            foreach (['id','name','provider','origin','pinned_ipv4','token','topic'] as $key) { $fields[$key]=$row[$key] ?? ''; }
+            $result['connector_ids'][$row['id']]=['id'=>$row['id'],'label'=>($row['name'] ?? $row['id']).' · Connector (Labs)',
+                'identity'=>hash('sha256',json_encode($fields,JSON_THROW_ON_ERROR)),
+                'available'=>($integrations['enabled'] ?? '0')==='1' && ($integrations['connectors']['enabled'] ?? '0')==='1' && ($row['enabled'] ?? '0')==='1'];
+        }
+        return $result;
+    }
+
+    public static function labsBindings(array $members,array $settings,?array $catalog=null): array
+    {
+        $catalog=$catalog??self::labsDirectory($settings);$bindings=[];
+        foreach ($catalog as $field=>$rows) {
+            $pattern=$field==='connector_ids' ? '/^conn_[a-f0-9]{24}$/D' : '/^sub_[a-f0-9]{24}$/D';
+            foreach (self::values($members[$field] ?? [],$pattern,50) as $id) {
+                if (empty($rows[$id]['available'])) { throw new \DomainException('A Labs audience recipient is disabled or missing. Review the saved audience.'); }
+                $bindings[$field][$id]=$rows[$id]['identity'];
+            }
+        }
+        return self::normalizeLabsBindings($bindings);
+    }
+
+    public static function groupLabsBindingsValid(array $group,array $settings,?array $catalog=null): bool
+    {
+        try {
+            $bindings=self::normalizeLabsBindings(self::labsBindings($group,$settings,$catalog));
+            return $bindings===self::normalizeLabsBindings($group['labs_bindings'] ?? []);
+        } catch (\Throwable $error) { return false; }
+    }
+
+    public static function normalizeLabsBindings($value): array
+    {
+        if (!is_array($value) || ($value && array_is_list($value)) || array_diff(array_keys($value),['browser_recipient_ids','connector_ids'])) {
+            throw new \DomainException('Labs audience enrollment bindings are invalid.');
+        }
+        foreach ($value as $field=>&$rows) {
+            if (!is_array($rows) || ($rows && array_is_list($rows)) || count($rows)>50) { throw new \DomainException('Labs audience enrollment bindings exceed their bound.'); }
+            $pattern=$field==='connector_ids' ? '/^conn_[a-f0-9]{24}$/D' : '/^sub_[a-f0-9]{24}$/D';
+            foreach ($rows as $id=>$identity) {
+                if (!is_string($id) || !preg_match($pattern,$id) || !is_string($identity) || !preg_match('/^[a-f0-9]{64}$/D',$identity)) {
+                    throw new \DomainException('A Labs audience has an invalid enrollment fingerprint.');
+                }
+            }
+            ksort($rows,SORT_STRING);
+        }
+        unset($rows);ksort($value,SORT_STRING);return $value;
     }
 
     public static function permitsTest(array $principal, array $body, array $settings): bool
@@ -281,8 +454,10 @@ final class ApiSecurity
     /** Trust only the immediate configured proxy and walk its address chain right-to-left. */
     public static function requestNetwork(array $server, array $settings): array
     {
-        $peer = trim((string)($server['REMOTE_ADDR'] ?? ''));
-        $directHttps = !empty($server['HTTPS']) && strtolower((string)$server['HTTPS']) !== 'off';
+        $peerValue = $server['REMOTE_ADDR'] ?? '';
+        $httpsValue = $server['HTTPS'] ?? '';
+        $peer = is_string($peerValue) ? trim($peerValue) : '';
+        $directHttps = is_string($httpsValue) && $httpsValue !== '' && strtolower($httpsValue) !== 'off';
         $result = ['ip' => $peer, 'peer' => $peer, 'https' => $directHttps, 'loopback' => false, 'proxied' => false, 'error' => ''];
         if (!filter_var($peer, FILTER_VALIDATE_IP)) { $result['error'] = 'invalid_remote_address'; return $result; }
         try { $cidrs = self::network($settings['api_network'] ?? [])['trusted_proxy_cidrs']; }
@@ -292,11 +467,16 @@ final class ApiSecurity
             return false;
         };
         $hasForwarded = false;
-        foreach ($server as $key => $unused) { if ($key === 'HTTP_FORWARDED' || strpos($key, 'HTTP_X_FORWARDED_') === 0) { $hasForwarded = true; break; } }
+        foreach ($server as $key => $unused) {
+            if (is_string($key) && ($key === 'HTTP_FORWARDED' || strpos($key, 'HTTP_X_FORWARDED_') === 0)) { $hasForwarded = true; break; }
+        }
         $peerTrusted = $trusted($peer);
         $result['loopback'] = in_array($peer, ['127.0.0.1', '::1'], true) && !$hasForwarded && !$peerTrusted;
         if (!$peerTrusted) { return $result; }
-        $raw = (string)($server['HTTP_X_FORWARDED_FOR'] ?? ''); $proto = strtolower(trim((string)($server['HTTP_X_FORWARDED_PROTO'] ?? '')));
+        $rawValue = $server['HTTP_X_FORWARDED_FOR'] ?? '';
+        $protoValue = $server['HTTP_X_FORWARDED_PROTO'] ?? '';
+        if (!is_string($rawValue) || !is_string($protoValue)) { $result['error'] = 'invalid_forwarded_headers'; return $result; }
+        $raw = $rawValue; $proto = strtolower(trim($protoValue));
         $chain = array_map('trim', explode(',', $raw));
         if (strlen($raw) > 1024 || count($chain) > 16 || !in_array($proto, ['https', 'http'], true)) { $result['error'] = 'invalid_forwarded_headers'; return $result; }
         foreach ($chain as $ip) { if (!filter_var($ip, FILTER_VALIDATE_IP)) { $result['error'] = 'invalid_forwarded_headers'; return $result; } }
@@ -306,4 +486,5 @@ final class ApiSecurity
         // Proxied addresses never qualify for the local HTTP maintenance exemption.
         return $result;
     }
+}
 }

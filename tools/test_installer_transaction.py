@@ -34,7 +34,7 @@ acquire_maintenance_coordination() { trace maintenance-lock; }
 install_dependencies() { :; }
 preflight_platform() { :; }
 preflight_python() { :; }
-detect_served_php_profiles() { :; }
+detect_served_php_profiles() { SERVED_PHP_PROFILES='8.2:apache2'; }
 verify_served_php_configuration() { :; }
 bootstrap_missing_dashboard() { :; }
 preflight_profile_identity() { :; }

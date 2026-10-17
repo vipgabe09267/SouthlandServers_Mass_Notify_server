@@ -208,7 +208,7 @@ $placeholderHelp = "{{event}}, {{severity}}, {{message_type}}, {{audio}}, {{page
 						}
 					}, 1000);
 					setInterval(function() {
-						fetch('config.php?display=<?php echo htmlspecialchars($settingsDisplay); ?>&slsmassnotifyserver_action=cooldowns', {credentials: 'same-origin'})
+						fetch('config.php?display=<?php echo htmlspecialchars($settingsDisplay); ?>&slsmassnotifyserver_action=cooldowns', {credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(5000)})
 							.then(function(response) { return response.json(); })
 							.then(function(data) {
 								if (data && data.cooldowns && data.cooldowns.test) {
@@ -220,6 +220,7 @@ $placeholderHelp = "{{event}}, {{severity}}, {{message_type}}, {{audio}}, {{page
 					}, 10000);
 					form.addEventListener('submit', function(event) {
 						event.preventDefault();
+						if (requestRunning) return;
 						if (remaining > 0 || !confirm('Run a test through the phone and desktop channels assigned to the selected Weather zone scope?')) {
 							return;
 						}
@@ -228,7 +229,7 @@ $placeholderHelp = "{{event}}, {{severity}}, {{message_type}}, {{audio}}, {{page
 						submit.innerHTML = '<i class="fa fa-circle-o-notch fa-spin" aria-hidden="true"></i> ' + <?php echo json_encode(_('Running Test…')); ?>;
 						renderTestStatus('running', <?php echo json_encode(_('Weather test in progress')); ?>, <?php echo json_encode(_('Submitting the selected phone, audio, SIP NOTIFY, and desktop checks.')); ?>);
 						var body = new FormData(form);
-						fetch(form.action, {method: 'POST', credentials: 'same-origin', body: body})
+						fetch(form.action, {method: 'POST', credentials: 'same-origin', cache: 'no-store', body: body, signal: AbortSignal.timeout(120000)})
 							.then(function(response) { return response.json(); })
 							.then(function(data) {
 								var message = data && data.message ? data.message : 'Test request finished.';
@@ -325,7 +326,10 @@ $placeholderHelp = "{{event}}, {{severity}}, {{message_type}}, {{audio}}, {{page
 				</div>
 				<script type="text/template" id="sls-zone-template"><div class="sls-zone-editor" data-zone-editor><div class="sls-zone-editor-header"><strong data-zone-title><?php echo _('New Weather Zone'); ?></strong><button type="button" class="btn btn-link btn-sm text-danger" data-zone-remove><i class="fa fa-trash"></i> <?php echo _('Remove'); ?></button></div><input type="hidden" data-zone-field="id" value=""><div class="row"><div class="col-md-7"><div class="form-group"><label><?php echo _('Group Name'); ?></label><input class="form-control" data-zone-field="name" maxlength="64" placeholder="<?php echo htmlspecialchars(_('Williamson County')); ?>"></div></div><div class="col-md-5"><div class="form-group"><label><?php echo _('NWS Zone'); ?></label><input class="form-control" data-zone-field="zone" maxlength="6" placeholder="TXZ163"></div></div></div><div class="row"><div class="col-md-6"><label><?php echo _('Recipient Extensions'); ?></label><div class="sls-recipient-grid sls-nws-scroll"><div class="row"><?php foreach ((array)($available_extensions ?? []) as $extension) { ?><div class="col-md-6"><div class="checkbox"><label><input type="checkbox" data-zone-extension value="<?php echo htmlspecialchars($extension['extension']); ?>"> <?php echo htmlspecialchars($extension['extension'] . ($extension['name'] !== '' ? ' - ' . $extension['name'] : '')); ?> <span class="text-muted"><?php echo !empty($extension['registered']) ? _('online') : _('offline'); ?></span></label></div></div><?php } ?></div></div></div><div class="col-md-6"><label><?php echo _('Desktop Clients'); ?></label><div class="sls-recipient-grid sls-nws-scroll"><div class="row"><?php foreach ($desktopClients as $desktopClient) { $username = (string)($desktopClient['username'] ?? ''); $desktopEnabled = !empty($desktopClient['enabled']); ?><div class="col-md-6"><div class="checkbox"><label><input type="checkbox" data-zone-desktop value="<?php echo htmlspecialchars($username); ?>" <?php echo !$desktopEnabled ? 'disabled' : ''; ?>> <?php echo htmlspecialchars($desktopNames[$username] ?? $username); ?> <span class="text-muted"><?php echo $desktopEnabled ? _('enabled') : _('disabled'); ?></span></label></div></div><?php } ?><?php if (empty($desktopClients)) { ?><div class="col-xs-12 text-muted"><?php echo _('No desktop clients are configured in General Settings.'); ?></div><?php } ?></div></div></div></div><div class="form-group" style="margin-top:12px"><label><?php echo _('Email Recipients for This Zone'); ?></label><textarea class="form-control" data-zone-email rows="2" maxlength="4096" placeholder="weather-team@example.com"></textarea><p class="help-block"><?php echo _('Optional. Only live alerts from this zone use these addresses. Up to 50 unique addresses are allowed per zone. Manual tests never send email.'); ?></p></div></div></script>
 				<script type="text/template" id="sls-zone-advanced-template">
-					<div data-zone-advanced><div class="row"><div class="col-md-3"><div class="form-group"><label><?php echo _('Zone Quiet Hours'); ?></label><select class="form-control" data-zone-field="quiet_hours_enabled"><option value="0"><?php echo _('Disabled'); ?></option><option value="1"><?php echo _('Enabled'); ?></option></select></div></div><div class="col-md-3"><div class="form-group"><label><?php echo _('Start'); ?></label><input class="form-control" type="time" data-zone-field="quiet_hours_start" value="21:00"></div></div><div class="col-md-3"><div class="form-group"><label><?php echo _('End'); ?></label><input class="form-control" type="time" data-zone-field="quiet_hours_end" value="06:00"></div></div><div class="col-md-3"><div class="form-group"><label><?php echo _('Critical bypass events'); ?></label><input class="form-control" data-zone-field="quiet_critical_events" value="<?php echo htmlspecialchars(implode(', ', (array)($settings['quiet_critical_events'] ?? []))); ?>"></div></div></div>
+					<div data-zone-advanced>
+                    <?php $weather_site_group=[]; $weather_site_prefix='zone'; include __DIR__.'/weather_site_picker.php'; ?>
+                    <?php $weather_channel_group=[]; $weather_channel_prefix='zone'; include __DIR__.'/weather_channel_picker.php'; ?>
+                    <div class="row"><div class="col-md-3"><div class="form-group"><label><?php echo _('Zone Quiet Hours'); ?></label><select class="form-control" data-zone-field="quiet_hours_enabled"><option value="0"><?php echo _('Disabled'); ?></option><option value="1"><?php echo _('Enabled'); ?></option></select></div></div><div class="col-md-3"><div class="form-group"><label><?php echo _('Start'); ?></label><input class="form-control" type="time" data-zone-field="quiet_hours_start" value="21:00"></div></div><div class="col-md-3"><div class="form-group"><label><?php echo _('End'); ?></label><input class="form-control" type="time" data-zone-field="quiet_hours_end" value="06:00"></div></div><div class="col-md-3"><div class="form-group"><label><?php echo _('Critical bypass events'); ?></label><input class="form-control" data-zone-field="quiet_critical_events" value="<?php echo htmlspecialchars(implode(', ', (array)($settings['quiet_critical_events'] ?? []))); ?>"></div></div></div>
 					<div class="row"><div class="col-md-6"><label><?php echo _('Discord Destinations'); ?></label><?php foreach ($discordDestinations as $destination) { ?><div class="checkbox"><label><input type="checkbox" data-zone-discord value="<?php echo htmlspecialchars((string)$destination['id']); ?>"> <?php echo htmlspecialchars((string)$destination['name']); ?></label></div><?php } ?></div><div class="col-md-6"><label><?php echo _('Generic Webhook Destinations'); ?></label><?php foreach ($genericDestinations as $destination) { ?><div class="checkbox"><label><input type="checkbox" data-zone-generic value="<?php echo htmlspecialchars((string)$destination['id']); ?>"> <?php echo htmlspecialchars((string)$destination['name']); ?></label></div><?php } ?></div></div></div>
 				</script>
 
@@ -338,8 +342,8 @@ $placeholderHelp = "{{event}}, {{severity}}, {{message_type}}, {{audio}}, {{page
 								<option value="" <?php echo ($settings['nws_opening_tone'] ?? '') === '' ? 'selected' : ''; ?>><?php echo _('None'); ?></option>
 								<optgroup label="<?php echo htmlspecialchars(_('Mass Notify tones')); ?>">
 								<?php foreach ((array)($available_tones ?? []) as $toneName) {
-									if (strpos($toneName, 'opening_') !== 0) continue;
-									$displayName = str_replace('_', ' ', substr($toneName, strlen('opening_')));
+									if (strpos($toneName, 'opening_') !== 0 && !preg_match('/^recording_[a-f0-9]{32}$/D', $toneName)) continue;
+									$displayName = str_starts_with($toneName, 'recording_') ? _('Imported recording') . ' · ' . substr($toneName, 10, 8) : str_replace('_', ' ', substr($toneName, strlen('opening_')));
 									if ($toneName === 'opening_NWS_alert') {
 										$displayName = 'NWS alert (' . _('default; bundled as NWS_alert.wav') . ')';
 									}
@@ -363,8 +367,8 @@ $placeholderHelp = "{{event}}, {{severity}}, {{message_type}}, {{audio}}, {{page
 								<option value="" <?php echo ($settings['nws_closing_tone'] ?? '') === '' ? 'selected' : ''; ?>><?php echo _('None'); ?></option>
 								<optgroup label="<?php echo htmlspecialchars(_('Mass Notify tones')); ?>">
 								<?php foreach ((array)($available_tones ?? []) as $toneName) {
-									if (strpos($toneName, 'closing_') !== 0) continue;
-									$displayName = str_replace('_', ' ', substr($toneName, strlen('closing_')));
+									if (strpos($toneName, 'closing_') !== 0 && !preg_match('/^recording_[a-f0-9]{32}$/D', $toneName)) continue;
+									$displayName = str_starts_with($toneName, 'recording_') ? _('Imported recording') . ' · ' . substr($toneName, 10, 8) : str_replace('_', ' ', substr($toneName, strlen('closing_')));
 								?>
 									<option value="<?php echo htmlspecialchars($toneName); ?>" <?php echo ($settings['nws_closing_tone'] ?? '') === $toneName ? 'selected' : ''; ?>>
 										<?php echo htmlspecialchars($displayName); ?>

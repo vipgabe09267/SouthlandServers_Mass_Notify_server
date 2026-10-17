@@ -15,6 +15,7 @@ $report=Readiness::heartbeat('worker','Worker',$snapshot,300,$now);
 check($report['state']==='ok'&&$report['age_seconds']===0,'Fresh heartbeat failed.');
 check(strpos(json_encode($report),'private_extra')===false,'Private snapshot fields were projected.');
 check($before===[hash_file('sha256',$path),fileinode($path),filemtime($path)],'Snapshot reading changed state.');
+chmod($path,0400);check(isset(Readiness::snapshot($path)['data']),'Read-only health evidence was reported unavailable.');chmod($path,0600);
 foreach([['checked_at'=>$now-301],['checked_at'=>$now+61],['checked_at'=>false],['checked_at'=>'2026-01-01 00:00:00']]as $row){
  check(Readiness::heartbeat('worker','Worker',['data'=>$row],300,$now)['state']==='warning','Invalid/stale/future heartbeat passed.');
 }
@@ -22,6 +23,7 @@ check(Readiness::heartbeat('worker','Worker',['data'=>['checked_at'=>gmdate('c',
 $lock=fopen($path,'r+');flock($lock,LOCK_EX);$start=microtime(true);
 check(Readiness::snapshot($path)['error']==='busy'&&microtime(true)-$start<0.5,'Reader blocked behind writer.');fclose($lock);
 file_put_contents($path,'{broken');check(Readiness::snapshot($path)['error']==='invalid','Corrupt JSON accepted.');
+file_put_contents($path,'{"checked_at":1,"checked_at":2}');check(Readiness::snapshot($path)['error']==='invalid','Duplicate-key JSON evidence accepted.');
 file_put_contents($path,str_repeat('x',65537));check(Readiness::snapshot($path)['error']==='unsafe','Oversized snapshot accepted.');
 unlink($path);posix_mkfifo($path,0600);$start=microtime(true);
 check(Readiness::snapshot($path)['error']==='unsafe'&&microtime(true)-$start<0.5,'FIFO blocked the reader.');unlink($path);
@@ -38,18 +40,32 @@ foreach([[31*86400,'ok'],[30*86400,'warning'],[1,'warning'],[-1,'warning']]as [$
 }
 check(Readiness::certificate(['ok'=>true],$now)['state']==='unknown','Missing certificate expiry passed.');
 check(Readiness::certificate(['ok'=>false,'certificate_expires_at'=>$now+90*86400],$now)['state']==='warning','Failed TLS verification passed on expiry alone.');
-check(Readiness::capacity(['schema'=>1,'errors'=>[]])['state']==='ok','Measured capacity rejected.');
+$invalidProbe=Readiness::certificate(['ok'=>false,'message'=>['private'=>'value']],$now);
+check($invalidProbe['state']==='warning'&&is_string($invalidProbe['detail'])&&!str_contains($invalidProbe['detail'],'Array'),
+    'Malformed certificate probe produced a conversion warning or exposed an invalid diagnostic.');
+$measurements=array_fill_keys(['cpu','memory','storage','temporary'],['ok'=>true]);
+check(Readiness::capacity(['schema'=>1,'errors'=>[],'resource_checks'=>$measurements])['state']==='ok','Complete measured capacity rejected.');
+check(Readiness::capacity(['schema'=>1,'errors'=>[]])['state']==='unknown','Missing resource measurements were reported as healthy.');
+set_error_handler(static function(int $severity,string $message): never{throw new ErrorException($message,0,$severity);});
+try {
+ check(Readiness::heartbeat('worker','Worker',['data'=>'damaged'],300,$now)['state']==='warning','Malformed heartbeat data passed.');
+ check(array_column(Readiness::audit(['data'=>'damaged'],true),'state')===['unknown','warning'],'Malformed audit data passed or emitted a PHP warning.');
+ check(Readiness::capacity(['schema'=>1,'errors'=>[],'resource_checks'=>'damaged'])['state']==='unknown','Malformed capacity measurements passed or emitted a PHP warning.');
+} finally { restore_error_handler(); }
+$failed=$measurements;$failed['memory']['ok']=false;check(Readiness::capacity(['schema'=>1,'errors'=>[],'resource_checks'=>$failed])['state']==='warning','A failed metric without an error detail passed.');
+check(Readiness::audit(['data'=>[]],false)[0]['state']==='unknown','Missing audit health measurements were reported as healthy.');
 check(Readiness::capacity([])['state']==='unknown','Missing capacity evidence passed.');
 check(Readiness::capacity(['errors'=>[['message'=>'Measurement unavailable.']]])['state']==='warning','Failed capacity probe passed.');
 check(Readiness::capacity(['schema'=>1,'errors'=>[['message'=>'Need 200 MiB more free space.']]])['detail']==='Need 200 MiB more free space.','Actionable shortage was lost.');
 foreach ([
  [['data'=>['audit_failed_records'=>2]],false,['warning','ok']],
- [['data'=>['audit_failed_records'=>2,'audit_fault_active'=>false]],false,['ok','ok']],
+ [['data'=>['audit_failed_records'=>2,'audit_fault_active'=>false,'audit_at_capacity'=>false]],false,['ok','ok']],
  [['data'=>['audit_at_capacity'=>true]],false,['warning','ok']],
  [['error'=>'busy'],true,['warning','warning']],
- [['data'=>['audit_forwarding_enabled'=>true]],true,['ok','unknown']],
- [['data'=>['audit_forwarding_enabled'=>true,'audit_forwarding_active'=>true]],true,['ok','warning']],
- [['data'=>['audit_forwarding_enabled'=>true,'audit_forwarding_last_success_at'=>$now]],true,['ok','ok']],
+ [['data'=>['audit_failed_records'=>0,'audit_fault_active'=>false,'audit_at_capacity'=>false,'audit_forwarding_enabled'=>true,'audit_forwarding_active'=>false,'audit_forwarding_last_success_at'=>0,'audit_forwarding_failed_records'=>0]],true,['ok','unknown']],
+ [['data'=>['audit_failed_records'=>0,'audit_fault_active'=>false,'audit_at_capacity'=>false,'audit_forwarding_enabled'=>true,'audit_forwarding_active'=>true]],true,['ok','warning']],
+ [['data'=>['audit_failed_records'=>0,'audit_fault_active'=>false,'audit_at_capacity'=>false,'audit_forwarding_enabled'=>true,'audit_forwarding_active'=>false,'audit_forwarding_last_success_at'=>$now,'audit_forwarding_failed_records'=>0]],true,['ok','ok']],
+ [['data'=>['audit_failed_records'=>0,'audit_fault_active'=>false,'audit_at_capacity'=>false,'audit_forwarding_enabled'=>true,'audit_forwarding_active'=>false,'audit_forwarding_last_success_at'=>'invalid','audit_forwarding_failed_records'=>0]],true,['ok','warning']],
 ] as [$snapshot,$enabled,$expected]) {
  check(array_column(Readiness::audit($snapshot,$enabled),'state')===$expected,'Audit recovery or forwarding evidence misreported.');
 }
@@ -73,7 +89,7 @@ eval('namespace FreePBX\\modules;
  class SlsLocalWebProbe{static function mediaAccess($settings){return ["ok"=>true,"message"=>"Private media fixture verified."];}}
  class ReadinessFixture{use SlsSupportDiagnostics; const PLUGIN_DATA_DIR='.var_export($root,true).';const SETTINGS_JSON='.var_export($root.'/active.json',true).';const MODULE_VERSION="0.1.5-beta";
  function getDiagnosticsSummary($devices=true){if($devices!==false)throw new \\RuntimeException("AMI scan requested");return ["checks"=>[["ok"=>true,"label"=>"Runtime","detail"=>"Available"]]];}
- function checkDesktopCapacityResources($desktops,$phones){if($desktops!==25||$phones!==25)throw new \\RuntimeException("Wrong capacity");return ["schema"=>1,"errors"=>[]];}
+ function checkDesktopCapacityResources($desktops,$phones){if($desktops!==25||$phones!==25)throw new \\RuntimeException("Wrong capacity");return ["schema"=>1,"errors"=>[],"resource_checks"=>array_fill_keys(["cpu","memory","storage","temporary"],["ok"=>true])];}
  function automationDependencyChecks($settings){return [];}
  public array $settings=[]; public string $role="administrator";
  function currentOperator(){return ["operator_role"=>$this->role];}
@@ -81,11 +97,11 @@ eval('namespace FreePBX\\modules;
  function getActiveSettings(){return $this->settings;}}
 ');
 mkdir($root.'/announcement-jobs',0700);
-file_put_contents($root.'/storage-summary.json',json_encode(['checked_at'=>time()]));chmod($root.'/storage-summary.json',0600);
+file_put_contents($root.'/storage-summary.json',json_encode(['checked_at'=>time(),'audit_failed_records'=>0,'audit_fault_active'=>false,'audit_at_capacity'=>false]));chmod($root.'/storage-summary.json',0600);
 file_put_contents($root.'/announcement-jobs/worker-probe.json',json_encode(['checked_at'=>gmdate('c')]));chmod($root.'/announcement-jobs/worker-probe.json',0600);
 $module=new \FreePBX\modules\ReadinessFixture();$report=$module->getDeploymentReadiness();
 check($report['operational_ready']===true&&count($report['checks'])===9,'Real report aggregation failed.');
-file_put_contents($root.'/storage-summary.json',json_encode(['checked_at'=>time()-1000]));
+file_put_contents($root.'/storage-summary.json',json_encode(['checked_at'=>time()-1000,'audit_failed_records'=>0,'audit_fault_active'=>false,'audit_at_capacity'=>false]));
 $before=hash_file('sha256',$root.'/storage-summary.json');$report=$module->getDeploymentReadiness();
 check($report['operational_ready']===false&&$report['attention_count']===1,'Stopped maintenance was not detected independently.');
 check($before===hash_file('sha256',$root.'/storage-summary.json'),'Report repaired or rewrote the missing heartbeat.');

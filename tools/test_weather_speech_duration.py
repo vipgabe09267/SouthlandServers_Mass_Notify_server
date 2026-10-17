@@ -16,6 +16,7 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / "slsmassnotifyserver/bin/sls_mass_notify"
 sys.path.insert(0, str(RUNTIME))
+import sls_voicemail as voicemail
 spec = importlib.util.spec_from_file_location("lightning_speech_fixture", RUNTIME / "sls_mass_notify_xweather_poll.py")
 lightning = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(lightning)
@@ -48,16 +49,22 @@ with wave.open(path, "wb") as output:
         "instruction": " ".join(["Keep all instructions."] * 45) + " FINAL INSTRUCTION MUST REMAIN."}}
     payload = base64.b64encode(json.dumps(feature).encode()).decode()
     expected = "Weather alert. Special Weather Statement for Area One; Area Two; Area Three. " + feature["properties"]["instruction"]
-    environment = {**os.environ, "SLS_SPEECH_CAPTURE": str(capture), "SLS_FIXTURE_DURATION": "2"}
+    environment = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                   "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+                   "SLS_SPEECH_CAPTURE": str(capture), "SLS_FIXTURE_DURATION": "2"}
 
     for filename, entry in (("sls_mass_notify_nws_poll.sh", "generate_tts_audio"),
                             ("sls_mass_notify_test.sh", "generate_test_tts_audio")):
         source = (RUNTIME.parent / filename).read_text()
         definitions = function(source, entry)
-        assert 'sls_speech_admission.py' in definitions, 'Weather producer bypasses shared speech admission'
+        admission_command = 'timeout "$((generation_timeout + 65))" /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_speech_admission.py --max-seconds "$PIPER_MAX_SECONDS" --'
+        if definitions.count(admission_command) != 1:
+            raise AssertionError('Weather producer admission command could not be isolated')
         # This fixture measures duration rather than process admission. Separate
         # admission tests exercise the fixed-executable boundary and quotas.
-        definitions = definitions.replace('timeout "$((generation_timeout + 65))" /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_speech_admission.py --max-seconds "$PIPER_MAX_SECONDS" --', 'timeout "$generation_timeout"')
+        definitions = definitions.replace(admission_command, 'timeout "$generation_timeout"')
+        if '/usr/local/bin/sls_mass_notify/sls_speech_admission.py' in definitions:
+            raise AssertionError('Weather duration fixture retained the installed admission helper')
         if entry == "generate_tts_audio":
             definitions = function(source, "build_tts_text") + definitions
         # Permission changes are irrelevant to this media-only fixture.
@@ -79,11 +86,12 @@ with wave.open(path, "wb") as output:
                 output = Path(variables["SLS_TTS_DIR"]) / (result.stdout.strip() + ".wav")
                 with wave.open(str(output)) as generated:
                     assert generated.getnframes() / generated.getframerate() == 2
+                assert output.stat().st_mode & 0o027 == 0, 'Generated Weather speech is incompatible with private voicemail snapshots'
             if entry == "generate_tts_audio":
                 assert capture.read_text().strip() == expected
 
         # Exercise the producer's real shared-admission error classification,
-        # rather than its later duration check, with a transport returning65.
+        # rather than its later duration check, with a transport returning 65.
         for audio in Path(variables['SLS_TTS_DIR']).glob('*.wav'):audio.unlink()
         guarded = subprocess.run(['bash','-c',definitions+'PIPER_MAX_SECONDS=1\n'+entry+arguments],
             env={**environment,'SLS_SYNTHESIS_CODE':'65'},capture_output=True,text=True,timeout=15)
@@ -99,9 +107,9 @@ with wave.open(path, "wb") as output:
             command = command[command.index('--') + 1:]
         return actual_run(command, *args, **kwargs)
     with mock.patch.object(lightning, "PIPER_BIN", piper), \
-         mock.patch.object(lightning, "TTS_DIR", directory / "lightning"), \
+         mock.patch.object(lightning, "TTS_DIR", directory / "sounds/tts"), \
          mock.patch.object(lightning, "safe_tone", return_value=None), \
-         mock.patch.dict(os.environ, environment), \
+         mock.patch.dict(os.environ, environment, clear=True), \
          mock.patch.object(lightning.subprocess, 'run', side_effect=media_run):
         config = {"nws_piper_voice": str(voice), "tts_max_seconds": 1}
         try:
@@ -110,18 +118,23 @@ with wave.open(path, "wb") as output:
             assert "2.00 seconds" in str(error) and "maximum is 1 seconds" in str(error)
         else:
             raise AssertionError("Over-limit Lightning speech was accepted")
-        assert not list((directory / "lightning").glob("*.wav"))
+        assert not list((directory / "sounds/tts").glob("*.wav"))
         config["tts_max_seconds"] = 2
         lightning.generate_audio(config, {}, expected, "boundary")
-        with wave.open(str(directory / "lightning/xweather_tts_boundary.wav")) as generated:
+        assert (directory / 'sounds/tts/xweather_sequence_boundary.wav').stat().st_mode & 0o027 == 0, 'Generated Lightning sequence is incompatible with private voicemail snapshots'
+        with wave.open(str(directory / "sounds/tts/xweather_tts_boundary.wav")) as generated:
             assert generated.getnframes() / generated.getframerate() == 2
+        with mock.patch.object(voicemail, 'reserve_quota'), mock.patch.object(voicemail, 'release_quota'):
+            retained = voicemail.snapshot_audio('a' * 32, 'SLS_Mass_Notifications_Plugin/tts/xweather_sequence_boundary', 3, directory)
+        assert retained == voicemail.canonical_sound('a' * 32)
+        assert voicemail.VoicemailMedia(directory).validate('a' * 32)['duration_seconds'] == 3
         assert capture.read_text().strip() == expected
-        for audio in (directory/'lightning').glob('*.wav'):audio.unlink()
+        for audio in (directory/'sounds/tts').glob('*.wav'):audio.unlink()
         with mock.patch.dict(os.environ, {'SLS_SYNTHESIS_CODE':'65'}):
             try:lightning.generate_audio(config, {}, expected, 'output-bound')
             except RuntimeError as error:
                 assert 'configured maximum of 2 seconds or its reserved output bound' in str(error)
             else:raise AssertionError('Lightning accepted a shared speech output-bound rejection')
-        assert not list((directory/'lightning').glob('*.wav'))
+        assert not list((directory/'sounds/tts').glob('*.wav'))
 
 print("Weather/Lightning complete speech, measured rejection, and duration boundary checks passed.")

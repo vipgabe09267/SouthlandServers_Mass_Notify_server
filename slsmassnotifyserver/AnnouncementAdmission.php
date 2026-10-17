@@ -9,7 +9,7 @@ trait SlsAnnouncementAdmission
     private function announcementAdmissionRecipients(array $request): array
     {
         $keys = [];
-        foreach (['phones', 'desktops', 'webhooks', 'voice_recipient_ids', 'email_recipient_ids', 'sms_recipient_ids'] as $channel) {
+        foreach (['phones', 'desktops', 'webhooks', 'voice_recipient_ids', 'email_recipient_ids', 'sms_recipient_ids', 'browser_recipient_ids', 'connector_ids'] as $channel) {
             foreach ($request[$channel] ?? [] as $recipient) {
                 if (!is_string($recipient) && !is_int($recipient)) { throw new \RuntimeException('Announcement admission recipient is invalid.'); }
                 $keys[hash('sha256', $channel . ':' . (string)$recipient)] = true;
@@ -31,45 +31,39 @@ trait SlsAnnouncementAdmission
             throw new \RuntimeException('Announcement admission initialization marker is corrupt.');
         }
         $path = self::PLUGIN_DATA_DIR . '/announcement-admission.json';
-        clearstatcache(true, $path);
-        $before = @lstat($path);
-        if (!$before) {
+        clearstatcache(true, $path); $present=@lstat($path);
+        if (!$present) {
             if ($marker !== '') { throw new \RuntimeException('Established announcement admission state is missing. Preserve recovery evidence before repair.'); }
             return ['schema' => 1, 'global_stamp' => 0, 'reservations' => []];
         }
-        $owner = @fileowner(self::PLUGIN_DATA_DIR);
-        if (($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1 || $before['uid'] !== $owner
-            || ($before['mode'] & 07022) || $before['size'] < 1 || $before['size'] > 2097152) {
-            throw new \RuntimeException('Announcement admission storage has unsafe ownership, permissions, type or size.');
+        $helper=__DIR__.'/bin/sls_mass_notify/sls_atomic_json.py';
+        $process=proc_open(['/usr/bin/timeout','--kill-after=1','3','/usr/bin/python3','-I',$helper,'--read-announcement-admission',$path],
+            [0=>['file','/dev/null','r'],1=>['pipe','w'],2=>['file','/dev/null','w']],$pipes,null,null,['bypass_shell'=>true]);
+        if(!is_resource($process)){throw new \RuntimeException('Announcement admission storage reader could not start.');}
+        $raw=stream_get_contents($pipes[1],2097153);fclose($pipes[1]);$exit=proc_close($process);
+        if($exit!==0||!is_string($raw)||strlen($raw)>2097152){throw new \RuntimeException('Announcement admission storage has unsafe ownership, permissions, type, size, or content.');}
+        try{$response=json_decode($raw,true,18,JSON_THROW_ON_ERROR);}catch(\Throwable $error){throw new \RuntimeException('Announcement admission storage reader returned invalid data.',0,$error);}
+        if(!is_array($response)||count($response)!==2||($response['ok']??null)!==true||!is_array($response['state']??null)){
+            throw new \RuntimeException('Announcement admission storage reader returned invalid data.');
         }
-        $handle = @fopen($path, 'rb');
-        if (!$handle) { throw new \RuntimeException('Announcement admission storage cannot be read.'); }
-        try {
-            $opened = fstat($handle);
-            if (!$opened || $opened['ino'] !== $before['ino'] || $opened['dev'] !== $before['dev']) {
-                throw new \RuntimeException('Announcement admission storage changed while opening.');
-            }
-            $raw = stream_get_contents($handle, 2097153);
-            if (!is_string($raw) || strlen($raw) !== $opened['size']) { throw new \RuntimeException('Announcement admission storage changed while reading.'); }
-            $state = json_decode($raw, true, 16, JSON_THROW_ON_ERROR);
-            // This new, private journal has one canonical writer. Reject duplicate
-            // object keys or manual/partial rewrites instead of silently merging.
-            if (json_encode($state, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n" !== $raw) {
-                throw new \RuntimeException('Announcement admission state is not a complete canonical journal.');
-            }
-        } finally { fclose($handle); }
+        $state=$response['state'];
         if (!is_array($state) || ($state['schema'] ?? null) !== 1 || !is_int($state['global_stamp'] ?? null)
             || count($state) !== 3 || $state['global_stamp'] < 0 || !is_array($state['reservations'] ?? null) || count($state['reservations']) > 1000) {
             throw new \RuntimeException('Announcement admission storage is corrupt; existing reservations were preserved.');
         }
         foreach ($state['reservations'] as $id => $row) {
+            $legacy=is_array($row)&&count($row)===4;
             if (!is_string($id) || !preg_match('/^[a-f0-9]{64}$/D', $id) || !is_array($row)
-                || count($row) !== 4
+                || (!$legacy&&count($row)!==8)
                 || !is_array($row['recipients'] ?? null) || !array_is_list($row['recipients']) || count($row['recipients']) > 2500
                 || !is_int($row['until'] ?? null) || !is_int($row['retain_until'] ?? null) || !is_int($row['deadline_at'] ?? null)
                 || $row['until'] < 0 || $row['deadline_at'] < 0 || $row['retain_until'] < $row['until']) {
                 throw new \RuntimeException('Announcement recipient reservation is corrupt.');
             }
+            if(!$legacy&&(!is_string($row['job_id']??null)||($row['job_id']!==''&&!\SlsAnnouncementJobStore::validId($row['job_id']))
+                ||!is_string($row['request_fingerprint']??null)||!preg_match('/^[a-f0-9]{64}$/D',$row['request_fingerprint'])
+                ||!is_int($row['reserved_at']??null)||$row['reserved_at']<1||$row['reserved_at']>$row['until']
+                ||!is_bool($row['committed']??null))){throw new \RuntimeException('Announcement recipient reservation commit evidence is corrupt.');}
             foreach ($row['recipients'] as $recipient) {
                 if (!is_string($recipient) || !preg_match('/^[a-f0-9]{64}$/D', $recipient)) {
                     throw new \RuntimeException('Announcement recipient reservation identity is corrupt.');
@@ -81,7 +75,7 @@ trait SlsAnnouncementAdmission
     }
 
     /** Caller owns announcement-send.lock. Persist admission before a job becomes runnable. */
-    private function reserveAnnouncementRecipients(array $request, bool $scheduled): array
+    private function reserveAnnouncementRecipients(array $request, bool $scheduled, string $jobId='', bool $provisional=false): array
     {
         $now = time();
         $deadline = $scheduled ? ($request['schedule_context']['deadline_at'] ?? null) : 0;
@@ -89,7 +83,10 @@ trait SlsAnnouncementAdmission
             return ['success' => false, 'error_code' => 'schedule_deadline_expired', 'message' => 'The maximum start delay elapsed before admission. No channels were submitted.'];
         }
         $recipients = $this->announcementAdmissionRecipients($request);
-        $owner = $scheduled ? hash('sha256', 'scheduled:' . ($request['delivery_id'] ?? '')) : bin2hex(random_bytes(32));
+        if($scheduled){$jobId=\SlsAnnouncementJobStore::scheduledId($request['schedule_context']??[]);}
+        elseif($jobId!==''&&!\SlsAnnouncementJobStore::validId($jobId)){throw new \RuntimeException('Interactive admission requires a valid generated job identity.');}
+        $owner = $scheduled ? hash('sha256', 'scheduled:' . ($request['delivery_id'] ?? ''))
+            :($jobId!==''?hash('sha256','interactive:'.$jobId):bin2hex(random_bytes(32)));
         if ($scheduled && !preg_match('/^announcement-[a-f0-9]{32}$/D', (string)($request['delivery_id'] ?? ''))) {
             throw new \RuntimeException('Scheduled admission requires its original delivery identity.');
         }
@@ -105,7 +102,11 @@ trait SlsAnnouncementAdmission
             if ($original['recipients'] !== $recipients || $original['deadline_at'] !== $deadline) {
                 throw new \RuntimeException('Scheduled admission does not match the original audience or deadline.');
             }
-            return ['success' => true]; // Reconciliation never renews this reservation.
+            if (array_key_exists('request_fingerprint', $original)
+                && !hash_equals($original['request_fingerprint'], \SlsAnnouncementJobStore::requestFingerprint($request))) {
+                throw new \RuntimeException('Scheduled admission does not match the original delivery snapshot.');
+            }
+            return ['success' => true,'reservation_id'=>$owner,'committed'=>(bool)($original['committed']??true)]; // Reconciliation never renews this reservation.
         }
         $cooldown = $this->getAnnouncementCooldownState();
         if (!$scheduled) {
@@ -138,7 +139,9 @@ trait SlsAnnouncementAdmission
         if (count($state['reservations']) >= 1000) { throw new \RuntimeException('Announcement admission history reached its protected capacity. Wait for existing reservations to expire.'); }
         $until = $now + (int)$cooldown['duration'];
         $state['reservations'][$owner] = ['recipients' => $recipients, 'until' => $until,
-            'retain_until' => max($until, $deadline), 'deadline_at' => $deadline];
+            'retain_until' => max($until, $deadline), 'deadline_at' => $deadline,'job_id'=>$jobId,
+            'request_fingerprint'=>\SlsAnnouncementJobStore::requestFingerprint($request),'reserved_at'=>$now,
+            'committed'=>!$provisional];
         $state['global_stamp'] = $now;
         $store = new \SlsAnnouncementJobStore(self::PLUGIN_DATA_DIR);
         $store->atomic('announcement-admission.json', $state);
@@ -151,7 +154,7 @@ trait SlsAnnouncementAdmission
         // Preserve the existing UI/API cooldown file, using the same durable writer.
         // The JSON integer plus newline is also its historical plain-text format.
         $this->writeAnnouncementCooldownTimestamp($now);
-        return ['success' => true];
+        return ['success' => true,'reservation_id'=>$owner,'committed'=>!$provisional];
     }
 
     private function writeAnnouncementCooldownTimestamp(int $timestamp): void
@@ -171,14 +174,54 @@ trait SlsAnnouncementAdmission
         try { return $callback(); } finally { $this->announcementAdmissionLock = null; \SlsAnnouncementJobStore::unlock($lock); }
     }
 
-    private function recordInteractiveAnnouncementAdmission(array $request): void
+    private function restoreAnnouncementAdmissionState(array $state,int $cooldown): void
     {
-        $result = $this->withAnnouncementAdmissionLock(function () use ($request) { return $this->reserveAnnouncementRecipients($request, false); });
-        if (empty($result['success'])) { throw new \RuntimeException($result['message'] ?? 'Announcement admission failed before delivery.'); }
+        $store=new \SlsAnnouncementJobStore(self::PLUGIN_DATA_DIR);$store->atomic('announcement-admission.json',$state);$store->admissionTimestamp($cooldown);
+    }
+
+    private function finalizeAnnouncementAdmission(string $reservationId,string $jobId): void
+    {
+        $state=$this->readAnnouncementAdmissionState();$row=$state['reservations'][$reservationId]??null;
+        if(!is_array($row)||($row['job_id']??null)!==$jobId){throw new \RuntimeException('Announcement reservation changed before its durable job commit could be confirmed.');}
+        if(($row['committed']??null)===true){return;}
+        if(($row['committed']??null)!==false){throw new \RuntimeException('Announcement reservation commit evidence is invalid.');}
+        $row['committed']=true;$state['reservations'][$reservationId]=$row;(new \SlsAnnouncementJobStore(self::PLUGIN_DATA_DIR))->atomic('announcement-admission.json',$state);
+    }
+
+    private function recordInteractiveAnnouncementAdmission(array $request,?callable $commit=null,string $jobId='')
+    {
+        $result=$this->withAnnouncementAdmissionLock(function()use($request,$commit,$jobId){
+            $before=$this->readAnnouncementAdmissionState();$store=new \SlsAnnouncementJobStore(self::PLUGIN_DATA_DIR);$cooldown=$store->admissionCooldown();
+            try{$reservation=$this->reserveAnnouncementRecipients($request,false,$jobId,$commit!==null);}
+            catch(\Throwable $error){$this->restoreAnnouncementAdmissionState($before,$cooldown);throw $error;}
+            if(empty($reservation['success'])){return $reservation;}
+            if($commit===null){return $reservation;}
+            try{$value=$commit();}
+            catch(\Throwable $error){$this->restoreAnnouncementAdmissionState($before,$cooldown);throw $error;}
+            $this->finalizeAnnouncementAdmission($reservation['reservation_id'],$jobId);
+            return ['success'=>true,'value'=>$value];
+        });
+        if(empty($result['success'])){throw new \RuntimeException($result['message']??'Announcement admission failed before delivery.');}
+        return $commit!==null?($result['value']??null):null;
     }
 
     private function admitScheduledAnnouncementRequest(array $request): array
     {
         return $this->withAnnouncementAdmissionLock(function () use ($request) { return $this->reserveAnnouncementRecipients($request, true); });
+    }
+
+    private function commitScheduledAnnouncementAdmission(array $request,callable $commit): array
+    {
+        return $this->withAnnouncementAdmissionLock(function()use($request,$commit):array{
+            $before=$this->readAnnouncementAdmissionState();$store=new \SlsAnnouncementJobStore(self::PLUGIN_DATA_DIR);$cooldown=$store->admissionCooldown();
+            try{$reservation=$this->reserveAnnouncementRecipients($request,true,'',true);}
+            catch(\Throwable $error){$this->restoreAnnouncementAdmissionState($before,$cooldown);throw $error;}
+            if(empty($reservation['success'])){return $reservation;}
+            try{$value=$commit();}
+            catch(\Throwable $error){$this->restoreAnnouncementAdmissionState($before,$cooldown);throw $error;}
+            $jobId=\SlsAnnouncementJobStore::scheduledId($request['schedule_context']);
+            $this->finalizeAnnouncementAdmission($reservation['reservation_id'],$jobId);
+            return ['success'=>true,'value'=>$value];
+        });
     }
 }

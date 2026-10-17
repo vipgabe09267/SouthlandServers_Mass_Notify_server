@@ -30,6 +30,40 @@ class SignerBoundary(unittest.TestCase):
     def run_code(self, marker, args):
         return subprocess.run(['/usr/bin/python3', '-I', '-', *map(str, args)], input=program(marker), text=True, capture_output=True, timeout=3)
 
+    def test_private_signing_home_preserves_keys_and_known_agent_socket(self):
+        keyring=self.base/'private-signing';keyring.mkdir(mode=0o755)
+        inner=keyring/'private-keys-v1.d';inner.mkdir(mode=0o755)
+        key=inner/'fixture.key';key.write_bytes(b'private fixture key bytes');key.chmod(0o644)
+        endpoint=socket.socket(socket.AF_UNIX);self.addCleanup(endpoint.close)
+        path=keyring/'S.gpg-agent';endpoint.bind(str(path));before=path.stat()
+        for unused in range(2):
+            result=self.run_code('PYPRIVATEHOME',[keyring])
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(key.read_bytes(),b'private fixture key bytes')
+            self.assertEqual(key.stat().st_mode&0o777,0o600)
+            self.assertEqual(keyring.stat().st_mode&0o777,0o700)
+            self.assertEqual(path.stat().st_ino,before.st_ino)
+            self.assertEqual(path.stat().st_mode,before.st_mode)
+
+    def test_private_signing_home_never_adopts_service_owned_or_linked_key_inputs(self):
+        for case in ('service-home','service-file','hardlink','symlink','fifo'):
+            with self.subTest(case=case),tempfile.TemporaryDirectory(dir=self.base) as directory:
+                home=Path(directory)/'signing';home.mkdir(mode=0o700)
+                outside=Path(directory)/'unrelated';outside.write_bytes(b'preserve');outside.chmod(0o600)
+                target=home/'fixture.key'
+                if case=='service-home':os.chown(home,self.account.pw_uid,self.account.pw_gid)
+                elif case=='service-file':target.write_bytes(b'unreviewed');target.chmod(0o600);os.chown(target,self.account.pw_uid,self.account.pw_gid)
+                elif case=='hardlink':os.link(outside,target)
+                elif case=='symlink':target.symlink_to(outside)
+                else:os.mkfifo(target,0o600)
+                before=home.stat();outside_before=outside.stat();target_before=target.lstat() if target.exists() else None
+                result=self.run_code('PYPRIVATEHOME',[home])
+                self.assertNotEqual(result.returncode,0)
+                self.assertEqual((home.stat().st_uid,home.stat().st_mode),(before.st_uid,before.st_mode))
+                self.assertEqual((outside.stat().st_uid,outside.stat().st_mode),(outside_before.st_uid,outside_before.st_mode))
+                self.assertEqual(outside.read_bytes(),b'preserve')
+                if target_before:self.assertEqual(target.lstat().st_uid,target_before.st_uid)
+
     def test_account_home_matches_passwd_and_rejects_root_or_forged_metadata(self):
         home = Path(self.account.pw_dir)
         if home.is_dir():

@@ -104,6 +104,20 @@ class Fixture(unittest.TestCase):
         self.assertFalse(any(r.sls_user_job(line) for line in self.user_cron.splitlines()))
         self.assertIn(b'unrelated-job',self.user_cron)
         self.assertFalse(any(marker.encode() in self.cron for marker in r.CRON_MARKERS))
+
+    def test_user_jobs_are_restored_only_after_static_reinventory(self):
+        self.snapshot()
+        self.file(r.RUNTIME+'/worker.py',b'candidate worker\n',0o755)
+        expected=b'old worker\n'
+        original=self.helper.user_cron
+        observed=[]
+        def checked(body=None):
+            if body is not None and any(r.sls_user_job(line) for line in body.splitlines()):
+                observed.append(self.helper.dest(r.RUNTIME+'/worker.py').read_bytes())
+            return original(body)
+        self.helper.user_cron=checked
+        self.helper.restore()
+        self.assertEqual(observed,[expected])
     def test_user_cron_snapshot_tampering_is_refused_before_static_changes(self):
         self.snapshot(); self.file(r.RUNTIME+'/worker.py',b'candidate worker')
         (self.private/'static/asterisk-cron.original').write_bytes(b'unapproved')
@@ -149,6 +163,100 @@ class Fixture(unittest.TestCase):
     def test_runtime_owned_by_service_account_rejected(self):
         runtime=self.helper.dest(r.RUNTIME); os.chown(runtime,self.helper.uid,-1)
         with self.assertRaises(r.RecoveryError): self.snapshot()
+
+    def test_root_cli_and_piper_wrapper_owned_by_service_account_are_rejected(self):
+        for path in ('/usr/local/bin/slsconsole', '/usr/local/bin/piper'):
+            with self.subTest(path=path):
+                fixture=Fixture(methodName='runTest'); fixture.setUp()
+                try:
+                    target=fixture.file(path,b'#!/bin/sh\nexit 0\n',0o755)
+                    os.chown(target,fixture.helper.uid,-1)
+                    with self.assertRaisesRegex(r.RecoveryError,'ownership/mode'):
+                        fixture.snapshot()
+                finally: fixture.tearDown()
+    def test_writable_static_web_file_is_rejected(self):
+        path=self.helper.dest('/var/www/html/api/sipnotify/index.php'); path.chmod(0o664)
+        with self.assertRaisesRegex(r.RecoveryError,'ownership/mode'): self.snapshot()
+
+    def test_freepbx_service_group_modes_roundtrip_without_permission_adoption(self):
+        web=self.helper.dest('/var/www/html/api/sipnotify')
+        source=web/'index.php'
+        config=self.helper.dest('/etc/asterisk/extensions_custom.conf')
+        for path,mode in [(web,0o775),(source,0o664),(config,0o660)]:
+            os.chown(path,self.helper.uid,self.helper.gid);path.chmod(mode)
+        root_web=self.file('/var/www/html/api/sipnotify/root-managed.php',b'root managed web\n',0o664)
+        os.chown(root_web,0,self.helper.gid)
+        before={str(path):(path.stat().st_ino,path.stat().st_uid,path.stat().st_gid,stat.S_IMODE(path.stat().st_mode))
+                for path in (web,source,config,root_web)}
+        self.snapshot()
+        self.assertEqual(before,{str(path):(path.stat().st_ino,path.stat().st_uid,path.stat().st_gid,stat.S_IMODE(path.stat().st_mode))
+                                for path in (web,source,config,root_web)})
+        self.assertEqual(source.read_bytes(),b'old web\n')
+        manifest=self.helper.load()
+        blob=self.private/'static/blobs'/manifest['records']['/var/www/html/api/sipnotify/index.php']['sha256']
+        self.assertEqual((blob.stat().st_uid,stat.S_IMODE(blob.stat().st_mode)),(0,0o600))
+        source.write_bytes(b'candidate web\n');config.write_bytes(b'candidate dialplan\n')
+        self.helper.restore()
+        self.assertEqual(source.read_bytes(),b'old web\n')
+        self.assertEqual(config.read_bytes(),b'original dialplan\n')
+        for path in (web,source,config,root_web):
+            self.assertEqual((path.stat().st_uid,path.stat().st_gid,stat.S_IMODE(path.stat().st_mode)),before[str(path)][1:])
+        self.assertTrue(self.helper.verify()['restored_static_verified'])
+
+    def test_static_inventory_preflight_creates_no_snapshot_or_operational_changes(self):
+        source=self.helper.dest('/var/www/html/api/sipnotify/index.php')
+        before=(source.stat().st_ino,source.read_bytes(),self.cron,self.user_cron)
+        result=self.helper.preflight_inventory()
+        self.assertTrue(result['ok'] and result['read_only'])
+        self.assertGreater(result['static_entries'],len(r.TREES))
+        self.assertGreater(result['static_bytes'],0)
+        self.assertFalse((self.private/'static').exists())
+        self.assertEqual(list(self.private.iterdir()),[])
+        self.assertEqual((source.stat().st_ino,source.read_bytes(),self.cron,self.user_cron),before)
+        self.assertEqual(self.commands,[])
+
+    def test_static_inventory_preflight_rejects_unsafe_modes_without_artifacts(self):
+        source=self.helper.dest('/var/www/html/api/sipnotify/index.php')
+        os.chown(source,self.helper.uid,self.helper.gid);source.chmod(0o666)
+        with self.assertRaisesRegex(r.RecoveryError,'ownership/mode'):self.helper.preflight_inventory()
+        self.assertEqual(list(self.private.iterdir()),[])
+        self.assertEqual(source.read_bytes(),b'old web\n')
+        self.assertEqual(self.commands,[])
+
+    def test_group_writable_service_files_with_an_unrelated_group_are_rejected(self):
+        for directory in (False,True):
+            with self.subTest(directory=directory):
+                fixture=Fixture(methodName='runTest');fixture.setUp()
+                try:
+                    path=fixture.helper.dest('/var/www/html/api/sipnotify'+('' if directory else '/index.php'))
+                    os.chown(path,fixture.helper.uid,0);path.chmod(0o775 if directory else 0o664)
+                    with self.assertRaisesRegex(r.RecoveryError,'ownership/mode'):fixture.snapshot()
+                finally:fixture.tearDown()
+
+    def test_service_group_does_not_allow_world_write_or_writable_root_runtime(self):
+        for path,uid,mode in [('/var/www/html/api/sipnotify',self.helper.uid,0o777),
+                              ('/var/www/html/api/sipnotify/index.php',self.helper.uid,0o666),
+                              (r.RUNTIME,0,0o775),(r.RUNTIME+'/worker.py',0,0o775),
+                              (r.COMPAT,0,0o775)]:
+            with self.subTest(path=path):
+                fixture=Fixture(methodName='runTest');fixture.setUp()
+                try:
+                    target=fixture.helper.dest(path)
+                    if path==r.COMPAT:target.mkdir(parents=True)
+                    os.chown(target,uid,fixture.helper.gid);target.chmod(mode)
+                    with self.assertRaisesRegex(r.RecoveryError,'ownership/mode'):fixture.snapshot()
+                finally:fixture.tearDown()
+
+    def test_recovery_manifest_rejects_unsafe_service_group_modes_before_restore(self):
+        self.snapshot();path=self.private/'static/manifest.json';original=path.read_bytes()
+        for item,changes in [('/var/www/html/api/sipnotify/index.php',{'uid':self.helper.uid,'gid':0,'mode':0o664}),
+                             ('/var/www/html/api/sipnotify',{'uid':self.helper.uid,'gid':self.helper.gid,'mode':0o777}),
+                             (r.RUNTIME+'/worker.py',{'uid':0,'gid':self.helper.gid,'mode':0o775})]:
+            with self.subTest(path=item):
+                manifest=json.loads(original);manifest['records'][item].update(changes)
+                path.write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(r.RecoveryError,'Writable static recovery record'):self.helper.load()
+        path.write_bytes(original)
     def test_web_parent_symlink_rejected_without_following(self):
         api=self.helper.dest('/var/www/html/api/sipnotify'); (api/'index.php').unlink(); api.rmdir()
         outside=self.base/'outside'; outside.mkdir(); (outside/'index.php').write_bytes(b'untouched')
@@ -182,6 +290,79 @@ class Fixture(unittest.TestCase):
         self.snapshot(); (self.private/'alias').symlink_to(self.private/'static',target_is_directory=True)
         unsafe=r.Recovery(self.private/'alias',self.fs,self.helper.cron)
         with self.assertRaises(OSError): unsafe.load()
+    def test_manifest_json_and_scalar_types_are_strict(self):
+        self.snapshot(); path=self.private/'static/manifest.json'; original=path.read_bytes()
+        malformed=(
+            original.replace(b'"schema":1',b'"schema":true',1),
+            original.replace(b'"schema":1',b'"schema":1e309',1),
+            original.replace(b'"schema":1',b'"schema":1,"schema":1',1),
+        )
+        for body in malformed:
+            with self.subTest(body=body[-80:]):
+                path.write_bytes(body)
+                with self.assertRaises(r.RecoveryError): self.helper.load()
+        manifest=json.loads(original)
+        for key,value in (('uid',True),('gid',True),('mode',True),('size',True)):
+            with self.subTest(key=key):
+                changed=json.loads(original); changed['records'][r.RUNTIME+'/worker.py'][key]=value
+                path.write_text(json.dumps(changed))
+                with self.assertRaises(r.RecoveryError): self.helper.load()
+        changed=json.loads(original); changed['records'][r.RUNTIME+'/worker.py']['ignored']='value'
+        path.write_text(json.dumps(changed))
+        with self.assertRaisesRegex(r.RecoveryError,'entry members'): self.helper.load()
+        for key,value in (
+            ('automatic_activation_safe',True),
+            ('cron_sha256','A'*64),
+            ('user_cron_sha256',False),
+            ('unknown_member','unexpected'),
+        ):
+            with self.subTest(key=key):
+                changed=json.loads(original); changed[key]=value
+                path.write_text(json.dumps(changed))
+                with self.assertRaisesRegex(r.RecoveryError,'static manifest'): self.helper.load()
+
+    def test_read_only_static_group_is_preserved_without_group_allowlist(self):
+        worker=self.helper.dest(r.RUNTIME+'/worker.py'); os.chown(worker,-1,12345)
+        self.snapshot()
+        self.assertEqual(self.helper.load()['records'][r.RUNTIME+'/worker.py']['gid'],12345)
+        self.file(r.RUNTIME+'/worker.py',b'candidate',0o755)
+        self.helper.restore()
+        self.assertEqual(worker.stat().st_gid,12345)
+
+    def test_invalid_posix_group_ids_are_rejected(self):
+        self.snapshot(); path=self.private/'static/manifest.json'; original=json.loads(path.read_text())
+        for gid in (-1,r.MAX_POSIX_ID+1,True):
+            with self.subTest(gid=gid):
+                changed=json.loads(json.dumps(original)); changed['records'][r.RUNTIME+'/worker.py']['gid']=gid
+                path.write_text(json.dumps(changed))
+                with self.assertRaisesRegex(r.RecoveryError,'ownership/mode'): self.helper.load()
+
+    def test_descriptor_walk_rejects_relative_paths(self):
+        with self.assertRaisesRegex(r.RecoveryError,'must be absolute'):
+            self.helper.directory('relative/path')
+
+    def test_failed_atomic_write_removes_private_temporary(self):
+        parent=self.helper.directory(self.private)
+        try:
+            with patch.object(r.os,'fchown',side_effect=OSError('fixture ownership failure')):
+                with self.assertRaises(OSError): self.helper.write_at(parent,'result',b'value')
+            self.assertFalse((self.private/'result').exists())
+            self.assertEqual(list(self.private.glob('.sls-recovery-*')),[])
+        finally: os.close(parent)
+
+    def test_non_object_manifest_is_rejected_cleanly(self):
+        self.snapshot(); path=self.private/'static/manifest.json'; path.write_text('[]')
+        with self.assertRaisesRegex(r.RecoveryError,'static manifest'): self.helper.load()
+    def test_activation_approval_rejects_boolean_schema(self):
+        approval={'schema':True,'source':'fresh-install','files':{},'root_jobs':[]}
+        with self.assertRaises(r.RecoveryError): self.helper.validate_activation_approval(approval,{},b'')
+    def test_static_removal_has_an_aggregate_bound(self):
+        path=r.RUNTIME+'/worker.py'; self.helper.removed=r.MAX_FILES
+        with self.assertRaisesRegex(r.RecoveryError,'entry bound'): self.helper.remove(path)
+        self.assertEqual(self.helper.dest(path).read_bytes(),b'old worker\n')
+    def test_inventory_paths_reject_terminal_controls_and_surrogates(self):
+        self.assertFalse(r.allowed(r.RUNTIME+'/bad\x7fname'))
+        self.assertFalse(r.allowed(r.RUNTIME+'/bad\udcffname'))
     def test_short_writes_complete_without_truncation(self):
         original=r.os.write
         def short(fd,body): return original(fd,body[:3])
@@ -206,6 +387,23 @@ class Fixture(unittest.TestCase):
         self.snapshot(); manifest=self.helper.load(); digest=manifest['records'][r.RUNTIME+'/worker.py']['sha256']
         os.link(self.private/'static/blobs'/digest,self.private/'external-link')
         with self.assertRaises(r.RecoveryError): self.helper.restore()
+
+    def test_blob_directory_open_failure_closes_snapshot_descriptor(self):
+        self.snapshot()
+        opened=[]; blob_opens=0; original=r.os.open
+        def fail_second_blob(name,flags,*args,**kwargs):
+            nonlocal blob_opens
+            if name=='blobs' and kwargs.get('dir_fd') is not None:
+                blob_opens+=1
+                if blob_opens==2:
+                    opened.append(kwargs['dir_fd'])
+                    raise OSError('fixture snapshot blob open failure')
+            return original(name,flags,*args,**kwargs)
+        with patch.object(r.os,'open',side_effect=fail_second_blob):
+            with self.assertRaisesRegex(OSError,'blob open failure'): self.helper.restore()
+        self.assertEqual(len(opened),1)
+        with self.assertRaises(OSError): os.fstat(opened[0])
+
     def test_partial_restore_disables_sls_root_jobs_before_file_writes(self):
         self.snapshot()
         original=self.helper.write_at

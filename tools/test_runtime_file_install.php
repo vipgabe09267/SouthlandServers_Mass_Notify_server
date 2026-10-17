@@ -10,7 +10,8 @@ $root = sys_get_temp_dir() . '/sls-runtime-install-' . bin2hex(random_bytes(8));
 if (!mkdir($root, 0700)) { throw new RuntimeException('Cannot create private runtime fixture'); }
 $previousUmask = umask(0027);
 $methods = '';
-foreach (['installRuntimeFiles', 'copyRuntimeFile', 'copyRuntimeDirectory', 'pruneRuntimeDirectory'] as $name) {
+foreach (['installRuntimeFiles', 'copyRuntimeFile', 'copyRuntimeDirectory', 'pruneRuntimeDirectory',
+    'readManagedTextFile', 'writeManagedTextFile'] as $name) {
     $method = $reflection->getMethod($name);
     $methods .= implode('', array_slice($source, $method->getStartLine() - 1, $method->getEndLine() - $method->getStartLine() + 1));
 }
@@ -24,6 +25,7 @@ if (strpos($methods, "'/usr/") !== false || strpos($methods, "'/var/") !== false
     throw new RuntimeException('Runtime fixture encountered an unmapped production destination');
 }
 eval('class RuntimeFileInstallFixture {
+    const PLUGIN_DATA_DIR = ' . var_export($root, true) . ';
     const RUNTIME_DIR = ' . var_export($root . '/runtime', true) . ';
     const SOUNDS_DIR = ' . var_export($root . '/sounds', true) . ';
     public $secured = 0;
@@ -104,6 +106,25 @@ try {
         }
     }
     runtime_install_assert($fixture->secured === 2, 'Runtime ownership-hardening boundary was skipped');
+
+    $firstTarget = $root . '/runtime/sls_mass_notify_nws_poll.sh';
+    $victim = $root . '/runtime-copy-victim';
+    file_put_contents($victim, 'victim bytes must remain unchanged');
+    unlink($firstTarget);
+    symlink($victim, $firstTarget);
+    try { $fixture->install(); throw new RuntimeException('A symbolic-link runtime target was accepted'); }
+    catch (RuntimeException $error) {
+        runtime_install_assert(strpos($error->getMessage(), 'atomically') !== false, 'Wrong symbolic-link rejection reason');
+    }
+    runtime_install_assert(file_get_contents($victim) === 'victim bytes must remain unchanged', 'Runtime symlink rejection changed its victim');
+    unlink($firstTarget);
+    link($victim, $firstTarget);
+    try { $fixture->install(); throw new RuntimeException('A hard-linked runtime target was accepted'); }
+    catch (RuntimeException $error) {
+        runtime_install_assert(strpos($error->getMessage(), 'atomically') !== false, 'Wrong hard-link rejection reason');
+    }
+    runtime_install_assert(file_get_contents($victim) === 'victim bytes must remain unchanged', 'Runtime hard-link rejection changed its victim');
+    runtime_install_assert(glob(dirname($firstTarget) . '/.' . basename($firstTarget) . '.sls.*') === [], 'Rejected runtime target left staging files');
     echo 'Actual fresh/repair runtime copies preserve all ' . count($workers) . " top-level workers, package bytes, execute modes, nested helpers and Piper state.\n";
 } finally {
     runtime_fixture_remove($root);

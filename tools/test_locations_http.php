@@ -14,10 +14,16 @@ register_shutdown_function(static function(){fwrite(STDERR,':STATUS:'.(http_resp
 PHP;
 $fixture .= 'require ' . var_export($root . '/slsmassnotifyserver/page.slsmassnotifyserver_locations.php', true) . ';';
 $invoke = static function (array $request) use ($fixture): array {
-    $process = proc_open([PHP_BINARY, '-n', '-r', $fixture], [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+    $environment=['PATH'=>'/usr/bin:/bin','LANG'=>'C','LC_ALL'=>'C'];
+    $process = proc_open(['/usr/bin/timeout','--signal=TERM','--kill-after=2s','10s','/usr/bin/php', '-n', '-r', $fixture],
+        [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, $environment, ['bypass_shell'=>true]);
     if (!is_resource($process)) { throw new RuntimeException('Unable to start isolated controller fixture.'); }
-    fwrite($pipes[0], json_encode($request, JSON_THROW_ON_ERROR)); fclose($pipes[0]);
-    $out = stream_get_contents($pipes[1]); fclose($pipes[1]); $err = stream_get_contents($pipes[2]); fclose($pipes[2]);
+    $input=json_encode($request, JSON_THROW_ON_ERROR);$written=0;
+    while($written<strlen($input)){$count=fwrite($pipes[0],substr($input,$written));if(!is_int($count)||$count<1){break;}$written+=$count;}
+    $inputClosed=fclose($pipes[0]);
+    locations_http_check($written===strlen($input)&&$inputClosed,'Unable to supply the complete controller request.');
+    $out = stream_get_contents($pipes[1],1048577);$outClosed=fclose($pipes[1]);$err = stream_get_contents($pipes[2],1048577);$errClosed=fclose($pipes[2]);
+    locations_http_check(is_string($out)&&strlen($out)<=1048576&&$outClosed&&is_string($err)&&strlen($err)<=1048576&&$errClosed,'Controller output exceeded its bound or could not be read.');
     locations_http_check(proc_close($process) === 0, 'Controller fixture failed: ' . $err);
     locations_http_check(preg_match('/^:STATUS:([0-9]{3})$/D', $err, $match) === 1, 'Unexpected controller warning or output: ' . $err);
     return [(int)$match[1], json_decode($out, true, 16, JSON_THROW_ON_ERROR)];
@@ -27,11 +33,19 @@ foreach (['save_location' => 'saveLocation', 'delete_location' => 'deleteLocatio
     [$status, $result] = $invoke($input);
     locations_http_check($status === 403 && !$result['success'] && !isset($result['called']), 'CSRF failure reached a location operation.');
     [$status, $result] = $invoke($input + ['slsmassnotifyserver_csrf' => 'fixture-csrf']);
-    locations_http_check($status === 200 && $result['called'] === $method && $result['payload']['revision'] === 'fixture-revision', 'Controller dispatched the wrong method or altered payload.');
+    locations_http_check($status === 200 && ($result['called'] ?? '') === $method && ($result['payload']['revision'] ?? '') === 'fixture-revision',
+        'Controller dispatched the wrong method or altered payload: ' . json_encode([$status, $result], JSON_UNESCAPED_SLASHES));
 }
 foreach (['', '{bad', '[]', 'null', str_repeat('x', 786433), str_repeat('{"a":', 13) . '1' . str_repeat('}', 13), ['not text']] as $payload) {
     [$status, $result] = $invoke(['slsmassnotifyserver_action' => 'save_location', 'slsmassnotifyserver_csrf' => 'fixture-csrf', 'payload' => $payload]);
     locations_http_check($status === 400 && !$result['success'] && !isset($result['called']), 'Invalid request reached a location mutation.');
+}
+foreach ([
+    ['slsmassnotifyserver_action' => 'save_location', 'slsmassnotifyserver_csrf' => [], 'payload' => '{"revision":"fixture"}'],
+    ['slsmassnotifyserver_action' => [], 'slsmassnotifyserver_csrf' => 'fixture-csrf', 'payload' => '{"revision":"fixture"}'],
+] as $request) {
+    [$status, $result] = $invoke($request);
+    locations_http_check(in_array($status, [400, 403], true) && !$result['success'] && !isset($result['called']), 'Malformed controller fields reached a location mutation.');
 }
 [$status, $result] = $invoke(['slsmassnotifyserver_action' => 'send_alert', 'slsmassnotifyserver_csrf' => 'fixture-csrf', 'payload' => '{"revision":"fixture"}']);
 locations_http_check($status === 400 && !isset($result['called']), 'Unsupported action reached a location mutation.');
@@ -42,13 +56,18 @@ $malicious = '</script><img src=x onerror=alert(1)>';
 $state = ['directory' => ['schema' => 1, 'nodes' => [['name' => $malicious]]], 'catalog' => [], 'revision' => 'fixture'];
 $html = load_view($root . '/slsmassnotifyserver/views/locations.php', ['state' => $state, 'csrf_token' => 'token"<bad>', 'hero_image' => 'fixture.png']);
 locations_http_check(!str_contains($html, $malicious) && !str_contains($html, 'token"<bad>'), 'Location bootstrap injected markup.');
-preg_match('/<script type="application\/json" id="sls-location-data">(.*?)<\/script>/s', $html, $match);
+$matched=preg_match('/<script type="application\/json" id="sls-location-data">(.*?)<\/script>/s', $html, $match);
+locations_http_check($matched===1,'Location bootstrap data is missing.');
 $decoded = json_decode($match[1] ?? '', true, 16, JSON_THROW_ON_ERROR);
 locations_http_check($decoded['state'] === $state && $decoded['csrf'] === 'token"<bad>', 'Escaped bootstrap changed values.');
 locations_http_check(str_contains($html, 'role="status"') && str_contains($html, 'aria-labelledby="sls-location-audience-title"'), 'Accessible status/audience controls missing.');
 foreach (['locations.js', 'geographic.js', 'audiences.js'] as $script) {
-    $process = proc_open(['node', '--check', $root . '/slsmassnotifyserver/views/' . $script], [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
-    $out = stream_get_contents($pipes[1]); fclose($pipes[1]); $err = stream_get_contents($pipes[2]); fclose($pipes[2]);
+    $process = proc_open(['/usr/bin/timeout','--signal=TERM','--kill-after=2s','10s','/usr/bin/node', '--check', $root . '/slsmassnotifyserver/views/' . $script],
+        [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null,
+        ['PATH'=>'/usr/bin:/bin','LANG'=>'C','LC_ALL'=>'C'],['bypass_shell'=>true]);
+    locations_http_check(is_resource($process),'Unable to start the bounded location JavaScript checker.');
+    $out = stream_get_contents($pipes[1],262145);$outClosed=fclose($pipes[1]);$err = stream_get_contents($pipes[2],262145);$errClosed=fclose($pipes[2]);
+    locations_http_check(is_string($out)&&strlen($out)<=262144&&$outClosed&&is_string($err)&&strlen($err)<=262144&&$errClosed,'Location JavaScript checker output exceeded its bound.');
     locations_http_check(proc_close($process) === 0, 'Location JavaScript syntax failed: ' . $err);
 }
 echo "Location controller CSRF, request bounds, action routing, escaping and editor syntax: $count checks passed.\n";

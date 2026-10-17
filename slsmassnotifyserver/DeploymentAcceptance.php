@@ -84,21 +84,32 @@ trait SlsDeploymentAcceptance
             }
             $lock = $this->acquireSettingsLock(true);
             $stored = $this->deviceAcceptanceConfiguration(self::SETTINGS_JSON); $active = $stored['settings'];
+            $lockedSettings = $this->getActiveSettings(); $catalog = $this->deviceAcceptanceCatalog($lockedSettings);
+            if (!hash_equals($stored['sha256'], $this->deviceAcceptanceConfiguration(self::SETTINGS_JSON)['sha256'])) {
+                return ['success' => false, 'error_code' => 'configuration_changed', 'message' => 'Settings changed while the device-test record was being confirmed. Reload before recording this observation.'];
+            }
             if (!hash_equals(self::deviceAcceptanceRevision($stored['sha256'], $catalog), $revision)) {
                 return ['success' => false, 'error_code' => 'configuration_changed', 'message' => 'Another request changed SLS settings. Reload before recording this observation.'];
             }
+            $target = array_values(array_filter($catalog, static fn($row) => $row['type'] === $observation['target_type'] && $row['id'] === $observation['target_id']));
+            if (count($target) !== 1) { throw new \DomainException('That destination is no longer configured. Reload the form and select its current saved identity.'); }
             $history = DeviceAcceptance::normalize($active['device_acceptance'] ?? []);
             array_unshift($history['records'], $observation + ['id' => 'dtest_' . bin2hex(random_bytes(12)),
                 'target_label' => $target[0]['label'], 'recorded_at' => gmdate('c'), 'recorded_by' => $principal['username'],
-                'module_version' => self::MODULE_VERSION, 'configuration_fingerprint' => DeviceAcceptance::fingerprint($active, self::MODULE_VERSION)]);
+                'module_version' => self::MODULE_VERSION, 'configuration_fingerprint' => DeviceAcceptance::fingerprint(
+                    $active, self::MODULE_VERSION, $observation['target_type'], $observation['target_id']
+                )]);
             if (count($history['records']) > DeviceAcceptance::MAX_RECORDS) { array_pop($history['records']); $history['retired_records']++; }
             $history = DeviceAcceptance::normalize($history);
+            $pending = null;
             if (is_file(self::PENDING_SETTINGS_JSON) || is_link(self::PENDING_SETTINGS_JSON)) {
                 $pending = $this->deviceAcceptanceConfiguration(self::PENDING_SETTINGS_JSON)['settings']; $pending['device_acceptance'] = $history;
-                $this->writeSettingsFileUnlocked(self::PENDING_SETTINGS_JSON, $pending, false);
             }
             $active['device_acceptance'] = $history;
-            $this->writeSettingsFileUnlocked(self::SETTINGS_JSON, $active, true);
+            \SLS\MassNotify\ImmediateSettings::commitFiles(self::SETTINGS_JSON, self::PENDING_SETTINGS_JSON,
+                $active, $pending, function (string $path, array $settings, bool $backup): void {
+                    $this->writeSettingsFileUnlocked($path, $settings, $backup);
+                });
             return ['success' => true, 'message' => 'Observation recorded. No notification was sent and no Apply Config is needed.',
                 'report' => DeviceAcceptance::report($active, self::MODULE_VERSION)];
         } catch (\Throwable $error) {

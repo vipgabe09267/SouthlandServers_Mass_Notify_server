@@ -14,12 +14,12 @@ import time
 import wave
 
 repo = Path(__file__).resolve().parents[1]
-isolated = ((os.environ.get('SLS_TEST_NAMESPACE') == 'entered'
-             and os.environ.get('SLS_TEST_PARENT_NET_NS') not in (None, os.readlink('/proc/self/ns/net')))
-            or (os.environ.get('SLS_BUILD_STAGE') == 'isolated'
-                and os.environ.get('SLS_BUILD_PARENT_NET') not in (None, os.readlink('/proc/self/ns/net'))))
+isolated = os.environ.get('SLS_TEST_NAMESPACE') == 'entered' and all(
+    os.environ.get('SLS_TEST_PARENT_' + label + '_NS') not in (None, '', os.readlink('/proc/self/ns/' + kind))
+    for label, kind in [('MOUNT', 'mnt'), ('NET', 'net'), ('PID', 'pid')]
+)
 if not isolated or not shutil.which('asterisk'):
-    raise SystemExit('Native voicemail fixture requires the isolated wrapper. No production PBX was contacted.')
+    raise SystemExit('Use the private fixture runner for native voicemail. No production PBX was contacted.')
 data = Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin')
 library = repo / 'slsmassnotifyserver/bin/sls_mass_notify/sls_live_paging.php'
 

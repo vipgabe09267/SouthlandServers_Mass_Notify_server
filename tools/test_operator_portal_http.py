@@ -7,8 +7,8 @@ from urllib.parse import urlencode
 import base64, hashlib, hmac, json, os, re, shutil, signal, socket, struct, subprocess, tempfile, time, unittest
 
 ROOT=Path(__file__).resolve().parents[1]; MODULE=ROOT/'slsmassnotifyserver'
-isolated=((os.environ.get('SLS_TEST_NAMESPACE')=='entered' and os.environ.get('SLS_TEST_PARENT_NET_NS') not in (None,os.readlink('/proc/self/ns/net')))
-    or (os.environ.get('SLS_BUILD_STAGE')=='isolated' and os.environ.get('SLS_BUILD_PARENT_NET') not in (None,os.readlink('/proc/self/ns/net'))))
+isolated=((os.environ.get('SLS_TEST_NAMESPACE')=='entered' and os.environ.get('SLS_TEST_PARENT_NET_NS') not in (None, '', os.readlink('/proc/self/ns/net')))
+    or (os.environ.get('SLS_BUILD_STAGE')=='isolated' and os.environ.get('SLS_BUILD_PARENT_NET') not in (None, '', os.readlink('/proc/self/ns/net'))))
 if not isolated: raise SystemExit('Use the isolated fixture runner; no portal server was started.')
 
 class PortalHttpTests(unittest.TestCase):
@@ -18,6 +18,9 @@ class PortalHttpTests(unittest.TestCase):
         cls.temp=tempfile.TemporaryDirectory(prefix='sls-portal-http-'); cls.root=Path(cls.temp.name)
         (cls.root/'sessions').mkdir(mode=0o700); (cls.root/'mass-notify').mkdir()
         source=(MODULE/'portal/index.php').read_text()
+        # Retain private failure diagnostics; production still returns a generic error.
+        source=source.replace('} catch (Throwable $error) {',
+                              '} catch (Throwable $error) { error_log((string)$error);')
         replacements={
           "'/var/www/html/admin/modules/slsmassnotifyserver/OperatorPortal.php'":json.dumps(str(MODULE/'OperatorPortal.php')),
           "'/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config'":json.dumps(str(cls.root/'settings.json')),
@@ -93,7 +96,10 @@ if(parse_url($_SERVER['REQUEST_URI'],PHP_URL_PATH)!=='/mass-notify/'){http_respo
         (cls.root/'settings.json').write_text(json.dumps(value));(cls.root/'settings.json').chmod(0o640)
     def setUp(self):
         self.write_settings(self.original)
-        for name in ['rate.json','mfa-rate.json','action.json','pending.json','failures.json','recovery-rate.json','reset-rate.json','audit.jsonl','mail.jsonl','audit-failure']:(self.root/name).unlink(missing_ok=True)
+        for name in ['rate.json','mfa-rate.json','action.json','pending.json','failures.json','recovery-rate.json','reset-rate.json','audit.jsonl','mail.jsonl','audit-failure']:
+            (self.root/name).unlink(missing_ok=True)
+            # Each case starts a new private installation with no active requests.
+            (self.root/(name+'.lock')).unlink(missing_ok=True)
     def request(self,method='GET',post=None,cookie='',origin='https://pbx.example.test',query='',host='pbx.example.test'):
         conn=HTTPConnection('127.0.0.1',self.port,timeout=10)
         headers={'Host':host}
@@ -183,13 +189,18 @@ if(parse_url($_SERVER['REQUEST_URI'],PHP_URL_PATH)!=='/mass-notify/'){http_respo
             self.assertEqual(status,200);self.assertTrue(json.loads(answer)['empty_object_accepted'])
             self.assertEqual(self.request('POST',{**request,'slsmassnotifyserver_csrf':'wrong'},owner)[0],403)
             self.assertEqual(self.request('POST',request,'')[0],403)
-            for malformed in ['[]','null','false']:
+            for malformed in ['[]','null','false','{"delivery":{},"delivery":{"extensions":["1000"]}}',
+                              '{"delivery":{"extensions":[],"extensions":["1000"]}}',
+                              '{"delivery":{},"deliv\\u0065ry":{"extensions":["1000"]}}',
+                              '{"maximum":1e400}']:
                 self.assertEqual(self.request('POST',{**request,'payload':malformed},owner)[0],400)
+                self.assertFalse((self.root/'action.json').exists(), 'Ambiguous request reached delivery dispatch')
     def test_parallel_otp_reuse_is_rejected(self):
         a=self.password_login();b=self.password_login();code=self.otp()
-        def submit(binding):return self.request('POST',{'portal_action':'totp','portal_csrf':binding[1],'code':code},binding[0])[0]
-        with ThreadPoolExecutor(max_workers=2) as pool:statuses=list(pool.map(submit,[a,b]))
-        self.assertEqual(sorted(statuses),[303,401])
+        def submit(binding):return self.request('POST',{'portal_action':'totp','portal_csrf':binding[1],'code':code},binding[0])
+        with ThreadPoolExecutor(max_workers=2) as pool:responses=list(pool.map(submit,[a,b]))
+        self.assertEqual(sorted(reply[0] for reply in responses),[303,401],
+                         [(reply[0],reply[2]) for reply in responses]+[('server', (self.root/'server.log').read_text())])
     def test_first_signin_enrollment_and_recovery(self):
         cookie,token,body=self.password_login('newuser');self.assertIn('Set your personal password',body)
         status,_,_=self.request('POST',{'portal_action':'password','portal_csrf':token,'new_password':'personal fixture passphrase 829','confirm_password':'personal fixture passphrase 829'},cookie);self.assertEqual(status,303)

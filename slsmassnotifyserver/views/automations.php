@@ -1,5 +1,5 @@
 <?php
-$revision=substr(hash('sha256',hash_file('sha256',__DIR__.'/automations.js').hash_file('sha256',__DIR__.'/automations.css')),0,16);
+$revision=substr(hash('sha256',hash_file('sha256',__DIR__.'/automations.js').hash_file('sha256',__DIR__.'/automations.css').hash_file('sha256',__DIR__.'/locations.css')),0,16);
 ?>
 <link rel="stylesheet" href="modules/slsmassnotifyserver/views/locations.css?v=<?php echo $revision; ?>">
 <link rel="stylesheet" href="modules/slsmassnotifyserver/views/automations.css?v=<?php echo $revision; ?>">

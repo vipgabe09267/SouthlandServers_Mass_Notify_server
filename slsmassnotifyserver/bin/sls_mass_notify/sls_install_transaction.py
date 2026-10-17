@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -24,7 +25,7 @@ FIELDS = ('RECOVERY_DIR', 'INSTALL_BOOTSTRAP_DIR', 'UPGRADE_TRUST_DIR',
           'MODULE_WAS_ENABLED', 'MODULE_ACTIVATED', 'STATIC_MUTATION_STARTED',
           'ORIGINAL_SYSTEM_TIMEZONE', 'SYSTEM_TIMEZONE_CHANGED')
 TERMINAL = {'committed', 'rolled_back', 'abandoned'}
-PHASES = {'prepared', 'mutating', 'recovering', 'recovery_failed'} | TERMINAL
+PHASES = {'preparing', 'prepared', 'mutating', 'recovering', 'recovery_failed'} | TERMINAL
 STAGES = {'initialization', 'hardware admission', 'platform validation', 'release download and validation',
           'publisher and stock approval', 'FreePBX ownership protection',
           'legacy configuration and runtime permissions', 'authenticated prerequisite validation',
@@ -34,10 +35,43 @@ STAGES = {'initialization', 'hardware admission', 'platform validation', 'releas
           'post-install verification', 'interrupted installation recovery'}
 NAME = re.compile(r'transaction-[0-9a-f]{24}\Z')
 LIMIT = 65536
+BOOTSTRAP_FILES = {
+    'sls_module_trust.py', 'sls_release_trust.py', 'sls_privileged_install.py',
+    'sls_installer_recovery.py', 'sls_install_transaction.py',
+    'sls_install_idle.py', 'sls_install_guard.py', 'sls_audio_state.py',
+    'sls_config_crypto.py', 'sls_upgrade_trust.py',
+    'sls_legacy_permissions.py', 'freepbx-mirror-signing.pub',
+}
 
 
 class TransactionError(RuntimeError):
     pass
+
+
+def decode_json(body):
+    """Decode one unambiguous, finite JSON document from private evidence."""
+    def object_pairs(items):
+        value = {}
+        for key, item in items:
+            if key in value:
+                raise TransactionError('Duplicate installer transaction metadata member')
+            value[key] = item
+        return value
+
+    def finite_float(text):
+        value = float(text)
+        if not math.isfinite(value):
+            raise TransactionError('Nonfinite installer transaction metadata number')
+        return value
+
+    def invalid_constant(_text):
+        raise TransactionError('Nonfinite installer transaction metadata number')
+
+    try:
+        return json.loads(body, object_pairs_hook=object_pairs,
+                          parse_float=finite_float, parse_constant=invalid_constant)
+    except (RecursionError, UnicodeDecodeError) as error:
+        raise TransactionError('Invalid installer transaction metadata encoding') from error
 
 
 def directory(path):
@@ -100,11 +134,28 @@ def atomic(path, value):
 
 def state(path):
     if not NAME.fullmatch(path.name): raise TransactionError('Invalid installer transaction identity')
-    value = json.loads(read(path / 'transaction.json'))
-    if (not isinstance(value, dict) or value.get('schema') != 1 or value.get('phase') not in PHASES
+    try:
+        value = decode_json(read(path / 'transaction.json'))
+    except FileNotFoundError:
+        handle = directory(path)
+        try:
+            info = os.fstat(handle)
+            if stat.S_IMODE(info.st_mode) != 0o700 or os.listdir(handle):
+                raise TransactionError('Missing transaction metadata has nonempty or unsafe evidence; preserve it for review')
+            created = max(0, int(info.st_mtime))
+        finally:
+            os.close(handle)
+        # begin() cannot return to its caller before publishing the first
+        # record. An empty private directory grants no recovery authority.
+        return {'schema': 1, 'directory': str(path), 'phase': 'abandoned',
+                'created_at': created, 'updated_at': created, 'settings': {},
+                'empty_preparation': True}
+    if (not isinstance(value, dict) or type(value.get('schema')) is not int or value.get('schema') != 1
+            or value.get('phase') not in PHASES
             or value.get('directory') != str(path) or not isinstance(value.get('settings'), dict)
-            or set(value['settings']) - set(FIELDS) or not isinstance(value.get('created_at'), int)
-            or not isinstance(value.get('updated_at'), int) or value['created_at'] < 0 or value['updated_at'] < value['created_at']):
+            or set(value['settings']) - set(FIELDS) or type(value.get('created_at')) is not int
+            or type(value.get('updated_at')) is not int or value['created_at'] < 0
+            or value['updated_at'] < value['created_at'] or value['updated_at'] > 2 ** 63 - 1):
         raise TransactionError('Invalid installer transaction metadata')
     for field, item in value['settings'].items():
         if not isinstance(item, str) or len(item) > 4096 or any(ord(c) < 32 or ord(c) == 127 for c in item):
@@ -139,6 +190,11 @@ def clean_completed_evidence(value):
     handle = directory(path)
     try:
         names = os.listdir(handle)
+        if value.get('empty_preparation') and not (path / 'transaction.json').exists():
+            if names:
+                raise TransactionError('Empty preparation evidence changed before archival; preserve it for review')
+            atomic(path / 'transaction.json', value)
+            names = ['transaction.json']
         fixed = {'transaction.json', 'installer.sh', 'package.tgz', 'release-manifest.json',
                  'release-manifest.sig', 'bootstrap', 'approval', 'config.snapshot', 'pending.snapshot'}
         if any(name not in fixed and not re.fullmatch(r'sls-mass-notify-recovery\.[A-Za-z0-9]{6,12}', name) for name in names):
@@ -175,7 +231,7 @@ def begin(root):
     try: os.mkdir(name, 0o700, dir_fd=parent); os.fsync(parent)
     finally: os.close(parent)
     path = root / name
-    atomic(path / 'transaction.json', {'schema': 1, 'directory': str(path), 'phase': 'prepared',
+    atomic(path / 'transaction.json', {'schema': 1, 'directory': str(path), 'phase': 'preparing',
                                       'created_at': int(time.time()), 'updated_at': int(time.time()), 'settings': {}})
     return path
 
@@ -184,8 +240,22 @@ def update(path, phase, settings, stage=None):
     value = state(path)
     if value['phase'] in TERMINAL and phase != value['phase'] and not (value['phase']=='committed' and phase=='recovery_failed'):
         raise TransactionError('A finished transaction cannot return to an unfinished state')
-    if phase not in PHASES or set(settings) - set(FIELDS): raise TransactionError('Invalid installer transition')
-    value['settings'] = {key: str(item) for key, item in settings.items()}
+    if (phase not in PHASES or type(settings) is not dict or set(settings) - set(FIELDS)
+            or any(type(item) is not str for item in settings.values())):
+        raise TransactionError('Invalid installer transition')
+    if value['phase'] == 'preparing' and phase == 'prepared':
+        if set(settings) != set(FIELDS) or settings.get('STATIC_MUTATION_STARTED') != '0' or settings.get('MODULE_ACTIVATED') != '0':
+            raise TransactionError('Complete unmutated preparation settings are required before publishing recovery readiness')
+        for filename, bound in (('installer.sh', 2097152), ('package.tgz', 54525952),
+                                ('release-manifest.json', 16384), ('release-manifest.sig', 64)):
+            if not read(path / filename, bound):
+                raise TransactionError('Preparation artifact is empty: ' + filename)
+        for field, name in (('INSTALL_BOOTSTRAP_DIR', 'bootstrap'), ('UPGRADE_TRUST_DIR', 'approval')):
+            if settings.get(field) != str(path / name):
+                raise TransactionError('Prepared evidence directory does not belong to this transaction')
+            checked_directory = directory(path / name)
+            os.close(checked_directory)
+    value['settings'] = dict(settings)
     value['phase'] = phase; value['updated_at'] = max(int(time.time()),value['created_at'],value['updated_at'])
     if stage is not None:
         if stage not in STAGES:raise TransactionError('Invalid installer stage')
@@ -210,10 +280,27 @@ def authenticate(path):
             raise TransactionError('Saved installer recovery artifact differs from its publisher signature: ' + filename)
     bootstrap = Path(value['settings'].get('INSTALL_BOOTSTRAP_DIR', ''))
     if bootstrap != path / 'bootstrap': raise TransactionError('Recovery bootstrap is outside the durable transaction')
+    bootstrap_fd = directory(bootstrap)
+    try:
+        bootstrap_info = os.fstat(bootstrap_fd)
+        names = set(os.listdir(bootstrap_fd))
+        if bootstrap_info.st_uid != 0 or bootstrap_info.st_gid != 0 or stat.S_IMODE(bootstrap_info.st_mode) != 0o700:
+            raise TransactionError('Recovery bootstrap directory permissions are unsafe')
+        if names != BOOTSTRAP_FILES:
+            raise TransactionError('Recovery bootstrap helper inventory is incomplete or contains unknown files')
+        for name in names:
+            info = os.stat(name, dir_fd=bootstrap_fd, follow_symlinks=False)
+            expected_mode = 0o600 if name == 'freepbx-mirror-signing.pub' else 0o700
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != 0 or info.st_gid != 0
+                    or stat.S_IMODE(info.st_mode) != expected_mode):
+                raise TransactionError('Recovery bootstrap helper metadata is unsafe: ' + name)
+    finally:
+        os.close(bootstrap_fd)
     with tarfile.open(path / 'package.tgz', 'r:gz') as archive:
         members = archive.getmembers()
         if len(members) > 10000: raise TransactionError('Saved recovery package has too many entries')
-        for child in bootstrap.iterdir():
+        for child in sorted(bootstrap.iterdir(), key=lambda item: item.name):
             if child.name == 'freepbx-mirror-signing.pub':
                 name = 'slsmassnotifyserver/bin/sls_mass_notify/freepbx-mirror-signing.pub'
             else:
@@ -245,8 +332,10 @@ def main():
     if args.transaction is None: parser.error('--transaction is required')
     if args.transaction.parent != args.root: raise TransactionError('Transaction must belong to its protected evidence root')
     if args.action == 'update':
-        settings = json.loads(sys.stdin.buffer.read(LIMIT + 1))
-        if not isinstance(settings, dict) or args.phase is None: raise TransactionError('Transition requires a phase and settings object')
+        raw = sys.stdin.buffer.read(LIMIT + 1)
+        if len(raw) > LIMIT: raise TransactionError('Transition input exceeds its size limit')
+        settings = decode_json(raw)
+        if type(settings) is not dict or args.phase is None: raise TransactionError('Transition requires a phase and settings object')
         update(args.transaction, args.phase, settings, args.stage)
     elif args.action == 'stage':
         value=state(args.transaction)
@@ -256,6 +345,8 @@ def main():
         authenticate(args.transaction); print('Saved installer, package and recovery helpers match publisher-authenticated evidence.')
     else:
         value = authenticate(args.transaction)
+        if value['phase'] not in ('prepared', 'mutating', 'recovering', 'recovery_failed'):
+            raise TransactionError('Only an unfinished installation can supply operational recovery settings')
         for field in FIELDS: print(value['settings'].get(field, ''))
     return 0
 

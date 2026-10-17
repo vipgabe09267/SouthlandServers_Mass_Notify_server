@@ -53,7 +53,7 @@ class CronRunnerTests(unittest.TestCase):
 
     def test_fixed_jobs_and_unknown_arguments_never_execute(self):
         self.assertEqual(set(runner.JOBS), {'maintenance', 'update', 'weather', 'scheduling', 'announcement_reconcile'})
-        self.assertEqual([runner.JOBS[name][1] for name in runner.JOBS], [900, 1800, 5500, 1200, 900])
+        self.assertEqual([runner.JOBS[name][1] for name in runner.JOBS], [7200, 1800, 5500, 1200, 900])
         with mock.patch.object(runner.subprocess, 'Popen') as start:
             self.assertEqual(runner.execute('weather; touch /tmp/unsafe', self.data), 64)
             self.assertEqual(runner.execute('weather', self.data), 77)
@@ -88,6 +88,15 @@ class CronRunnerTests(unittest.TestCase):
                 self.assertEqual(path.stat().st_ino, inode); self.assertLessEqual(path.stat().st_size, 256 * 1024)
         self.assertTrue(self.records()[-1]['output'].endswith('RUN7'))
         self.assertLess(len(self.records()), 16)
+
+    def test_final_record_refuses_a_log_made_public_while_the_worker_runs(self):
+        path = self.data / 'cron-diagnostics/maintenance.jsonl'
+        code = 'import os;os.chmod(' + repr(str(path)) + ',0o644);print("must not be appended")'
+        self.assertEqual(self.run_job(code), 1)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+        rows = self.records()
+        self.assertEqual([row['event'] for row in rows], ['started'])
+        self.assertNotIn('must not be appended', path.read_text())
 
     def test_permanent_lock_prevents_overlapping_jobs_without_output(self):
         self.assertEqual(self.run_job('pass'), 0)
@@ -129,11 +138,25 @@ class CronRunnerTests(unittest.TestCase):
         self.assert_child_stopped(marker)
 
     def test_user_jobs_run_as_actual_asterisk_without_root_log_ownership(self):
+        os.chown(self.root,0,self.account.pw_gid);self.root.chmod(0o2775)
         private_source = self.root / 'runner.py'; private_source.write_bytes(SOURCE.read_bytes()); private_source.chmod(0o644)
         script = 'import importlib.util,sys;sys.dont_write_bytecode=True;s=importlib.util.spec_from_file_location("fixture",sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);m.JOBS["weather"]=(False,5,["/usr/bin/python3","-c","import os;print(os.geteuid())"]);raise SystemExit(m.execute("weather",sys.argv[2]))'
         result = subprocess.run(['/usr/sbin/runuser', '-u', 'asterisk', '--', '/usr/bin/python3', '-I', '-c', script, str(private_source), str(self.data)], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr); self.assertEqual(result.stdout, '')
         self.assertEqual(self.records('weather')[-1]['output'].strip(), str(self.account.pw_uid))
+        self.assertEqual(stat.S_IMODE(self.root.stat().st_mode),0o2775)
+
+    def test_trusted_pbx_ancestor_preserved_but_unsafe_groups_stop_before_job(self):
+        os.chown(self.root,0,self.account.pw_gid);self.root.chmod(0o2775)
+        self.assertEqual(self.run_job('print("private qualified ancestor")'),0)
+        path=self.data/'cron-diagnostics/maintenance.jsonl';saved=path.read_bytes()
+        self.data.chmod(0o2770)
+        with mock.patch.object(runner.subprocess,'Popen') as start:
+            self.assertEqual(self.run_job('raise RuntimeError("must not run")'),1);start.assert_not_called()
+        self.data.chmod(0o750);os.chown(self.root,0,65534)
+        with mock.patch.object(runner.subprocess,'Popen') as start:
+            self.assertEqual(self.run_job('raise RuntimeError("must not run")'),1);start.assert_not_called()
+        self.assertEqual(path.read_bytes(),saved);self.assertEqual(stat.S_IMODE(self.root.stat().st_mode),0o2775)
 
     def test_cron_redirection_prevents_mail_when_interpreter_cannot_start_helper(self):
         result = subprocess.run(['/bin/sh', '-c', '/usr/bin/python3 -I /definitely-missing-sls-cron-fixture.py weather >/dev/null 2>&1'], capture_output=True, timeout=5)

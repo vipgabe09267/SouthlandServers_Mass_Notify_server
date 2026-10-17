@@ -78,15 +78,26 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 <?php include __DIR__.'/installation_profile.php'; ?>
 	<?php echo load_view(__DIR__ . '/hero.php', ['hero_image' => $hero_image ?? '']); ?>
 	<h2><i class="fa fa-life-ring text-primary" aria-hidden="true"></i> <?php echo _('Help'); ?></h2>
+	<?php $build=\SLS\MassNotify\DeviceAcceptance::buildIdentity(); if ($build!==null): ?><p class="help-block"><?php echo htmlspecialchars('Signed build: '.$build['module_version'].' · '.$build['inventory_sha256']); ?></p><?php endif; ?>
 	<p class="lead"><?php echo _('Southland Servers Mass Notifications Server by the Southland Servers Group is an AGPL version 3-or-later FreePBX module for SIP NOTIFY alerts, desktop notifications, NWS weather alerts, dashboard announcements, and Piper TTS audio delivery.'); ?></p>
+
+    <details class="sls-help-section"><summary><i class="fa fa-check-square-o" aria-hidden="true"></i> <?php echo _('Qualification and support'); ?></summary><div class="sls-help-section-body">
+    <p><?php echo _('The supported installer profile is Debian 12, FreePBX 17, amd64 and the standard asterisk runtime identity. Isolated fixtures cover protocol behavior and failure handling. They do not certify a public HTTPS route, full fleet, carrier, provider account or physical device.'); ?></p>
+    <ul>
+        <li><?php echo _('Record actual handset, desktop, mailbox and provider observations in device acceptance. Software receipt, physical playback and human response remain different evidence.'); ?></li>
+        <li><?php echo _('Labs integrations begin disabled. Verify the exact provider/API/firmware and enrolled identities before enabling them. BulkVS inbound receipts and STOP callbacks remain unsupported.'); ?></li>
+        <li><?php echo _('Download redacted diagnostics for build identity, retained-state bytes, queue counts and safe fault categories. Configuration, credentials, addresses and message contents are excluded.'); ?></li>
+    </ul>
+    <p><a href="https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/blob/main/docs/QUALIFICATION_MATRIX.md" target="_blank" rel="noopener noreferrer"><?php echo _('Installer and integration qualification matrix'); ?></a></p>
+    </div></details>
 
 	<details class="sls-help-section" open><summary><?php echo _('Project Status'); ?></summary><div class="sls-help-section-body">
 	<ul>
 		<li><?php echo _('This is beta software. Test on a non-critical PBX before relying on it for emergency workflows.'); ?></li>
 		<li><?php echo _('The module is designed to keep deployment settings outside module code in a centralized .config file so updates do not overwrite local configuration.'); ?></li>
-		<li><?php echo _('Custom/local FreePBX module signatures normally show as Unknown. Altered means the module should be signed again on that PBX.'); ?></li>
+		<li><?php echo _('Custom/local FreePBX module signatures normally show as Unknown. Altered means installed files differ from the signed inventory. Review the differences and run verified repair before signing; signing alone does not validate changed files.'); ?></li>
 		<li><?php echo _('General Settings shows the installed package version and whether the known release status is LATEST or an update is available.'); ?></li>
-		<li><?php echo _('Version 0.1.6-beta improves installer resource checks, upgrade recovery and dial-in paging diagnostics. See the changelog for the full list of changes.'); ?></li>
+		<li><?php echo _('Version 0.1.7-beta adds crash recovery, enrollment-bound desktop delivery, collector performance improvements and lightning coverage checks. See the changelog for the full list of changes.'); ?></li>
 		<li><?php echo _('Device capacity checks, shared phone admission and call evidence apply across notification services. External voice remains experimental with restricted routing support. New integrations carry the Labs badge and require site acceptance.'); ?></li>
 		<li><?php echo _('Local signing now uses the web account, module root, and GPG home reported by FreePBX. Install, update, repair, and uninstall share a maintenance lock; each candidate signature must return trusted status 129 before it replaces the previous module.sig.'); ?></li>
 		<li><?php echo _('After a Dashboard or Framework upgrade, Repair Installation restores the managed announcement widget and menu placement, rebuilds the stored Dashboard hook index, and verifies that the announcement controls render. Framework 17.0.30 and earlier Framework 17 menu comparator forms are supported.'); ?></li>
@@ -150,10 +161,10 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 									<tr>
 										<td><?php echo htmlspecialchars(($client['name'] ?? '') . ' (' . ($client['client_id'] ?? '') . ')'); ?></td>
 										<td>
-											<?php $readinessLabels = ['not_reported'=>_('Not reported'), 'stale_report'=>_('Report older than 24 hours'), 'unsupported_protocol'=>_('Unsupported protocol reported'), 'upgrade_required'=>_('Upgrade required'), 'meets_minimum'=>_('Meets minimum version'), 'no_minimum'=>_('No minimum version set')];
+											<?php $readinessLabels = ['not_reported'=>_('Not reported'), 'stale_report'=>_('Report older than 24 hours'), 'protocol_not_reported'=>_('Protocol version not reported'), 'unsupported_protocol'=>_('Unsupported protocol reported'), 'upgrade_required'=>_('Upgrade required'), 'meets_minimum'=>_('Meets minimum version'), 'no_minimum'=>_('No minimum version set')];
 											$readiness = $client['compatibility'] ?? 'not_reported'; ?>
 											<strong><?php echo htmlspecialchars(($client['client_version'] ?? '') ?: _('Unknown version')); ?></strong><br>
-											<span class="<?php echo in_array($readiness, ['upgrade_required', 'unsupported_protocol'], true) ? 'text-warning' : 'text-muted'; ?>"><?php echo htmlspecialchars($readinessLabels[$readiness] ?? _('Not reported')); ?></span>
+											<span class="<?php echo in_array($readiness, ['upgrade_required', 'protocol_not_reported', 'unsupported_protocol'], true) ? 'text-warning' : 'text-muted'; ?>"><?php echo htmlspecialchars($readinessLabels[$readiness] ?? _('Not reported')); ?></span>
 										</td>
 										<td><?php echo htmlspecialchars(($client['last_seen_at'] ?? '') ?: _('Never')); ?> <?php echo !empty($client['last_seen_ip']) ? htmlspecialchars(' from ' . $client['last_seen_ip']) : ''; ?></td>
 										<td>
@@ -340,10 +351,10 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 	<ul>
 		<li><?php echo _('The setup wizard defaults Lightning Alerts to No and does not require credentials, recipients, or a Weather trigger zone unless the administrator opts in. The overall module remains beta software and should be verified with each deployment’s devices and provider plan.'); ?></li>
 		<li><?php echo _('Lightning Alerts uses protected provider credentials. Xweather is the default; Tempest and Meteomatics adapters are Labs and require a provider account and acceptance test. Up to five named trigger areas can independently select cloud-to-ground strikes, cloud-to-cloud strikes, or both; a forecast-aware Weather Alert trigger group; location and radius; phone, desktop, email, SMS and external-call recipients; quiet hours; and an optional all-clear. Credentials, query period, tones, voice, volume, and the enabled shared webhook destinations remain service-wide.'); ?></li>
-		<li><?php echo _('Adaptive protection is enabled by default and requires every enabled Lightning area to select a Weather Alert group. The green shield means an area stays idle until a qualifying current Weather.gov alert or the structured forecast period active at that time indicates thunder, then polls that location every five minutes through the grace period, which defaults to 60 minutes. A future thunder period is remembered but does not spend Xweather tokens before its start. Turning the toggle off changes the card to a red shield and polls every enabled area continuously; Lightning outside a Weather.gov signal can be missed while protection is enabled.'); ?></li>
+		<li><?php echo _('Adaptive protection is enabled by default and requires every enabled Lightning area to select a Weather Alert group. A qualifying current alert or active thunder forecast opens polling through the configured grace period, default 60 minutes. The selected polling period is preserved. Future forecast periods do not start paid queries early. Turning protection off polls enabled areas continuously; unexpected lightning can be missed while adaptive protection is enabled.'); ?></li>
 		<li><?php echo _('Xweather usage is measured in cost tokens. Area state is isolated, but one protected quota governor is shared, so multiple storm-active areas consume tokens faster. The usage card shows the provider’s latest counters and labels an expired period as historical until a successful query refreshes it.'); ?></li>
-		<li><?php echo _('The 5-minute default is the longest gap-free period for standard Xweather access. Periods from 6–10 minutes can miss strikes unless the subscription includes extended lightning history.'); ?></li>
-		<li><?php echo _('A storm creates one entry alert using the nearest strike distance reported by Xweather, rounded to one decimal mile. Repeated strikes do not alert again until two clear queries reset the state; an optional all-clear can be sent. Lightning uses its own quiet-hours toggle and opening/closing tones.'); ?></li>
+		<li><?php echo _('Xweather periods are one through four minutes, default four, to overlap its five-minute observation window. Tempest and Meteomatics allow one through ten minutes with bounded backfill. A coverage gap restarts all-clear observation; an outage cannot establish an all-clear.'); ?></li>
+		<li><?php echo _('A storm creates one entry alert using the nearest reported strike distance, rounded to one decimal mile. Repeated strikes do not alert again until the configured clear observation period completes; an optional all-clear can then be sent. Lightning has separate quiet hours and opening/closing tones.'); ?></li>
 		<li><?php echo _('Alert Audio → Leave voicemail for unanswered extensions is enabled by default for lightning warnings and all-clear calls. Only selected extensions with enabled FreePBX mailboxes qualify when none of their selected handsets answered; native mailbox limits apply. Manual tests do not leave voicemail. Weather Alerts and Dial-in Paging have separate controls, and external-number handling is unchanged.'); ?></li>
 		<li><?php echo _('Regular announcements, Weather Alerts, and Lightning Alerts default to 25% audio volume and retain independent 1–200% controls. Coordinate locations are announced as “this area,” while named locations use the configured city. Every Lightning audio sequence retains one second of leading silence before the pre-tone and speech.'); ?></li>
 		<li><?php echo _('The Lightning system test can select one or more enabled, applied trigger areas and has a dedicated 60-second anti-spam cooldown. It sends only simulated phone, audio, and authorized desktop tests, waits for Asterisk pickup and SIP NOTIFY submission, and does not send email, Discord, or generic webhook notifications.'); ?></li>
@@ -386,7 +397,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 
 	<details class="sls-help-section"><summary><?php echo _('Control API'); ?></summary><div class="sls-help-section-body">
 	<p><?php echo _('Endpoint:'); ?> <code><?php echo htmlspecialchars($controlUrl); ?></code></p>
-	<p><?php echo _('The Control API is disabled by default. Enable it only if remote administration is required. Authentication uses Authorization: Bearer <api-key> or X-API-Key. Recent Control API Use shows requests that supply an API key, including local health probes. Operator authentication and administrator security activity are shown under Operator Access.'); ?></p>
+	<p><?php echo _('The Control API is disabled by default. Authentication uses Authorization: Bearer YOUR_API_KEY or X-API-Key. Recent Control API Use shows requests that supply an API key, including local health probes. Operator authentication and administrator security activity are shown under Operator Access.'); ?></p>
 	<ul>
 		<li><code>GET ?resource=status</code> <?php echo _('returns status JSON.'); ?></li>
 		<li><code>GET ?resource=events&amp;limit=25</code> <?php echo _('returns recent event records.'); ?></li>
@@ -414,7 +425,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 		<li><?php echo _('Volume controls are saved as percentages and applied to the final Asterisk WAV conversion.'); ?></li>
 		<li><?php echo _('Generated Piper speech defaults to 30 seconds and can be capped anywhere from 1 to 600 seconds.'); ?></li>
 		<li><?php echo _('Upload custom audio through FreePBX Admin > System Recordings, then select it globally or per announcement as the opening or closing tone. Either selection may be None. The installer registers uniquely named SLS Mass Notify paging-opening, paging-closing, NWS, and Lightning recordings and refuses a conflicting user-owned recording instead of overwriting it. Selected recordings are validated and converted into managed Asterisk audio.'); ?></li>
-		<li><?php echo _('Generated TTS and combined announcement audio files are automatically removed after 15 minutes.'); ?></li>
+		<li><?php echo _('Generated audio is removed by periodic retention cleanup when it is old enough and no active job, queue or voicemail fallback still references it. Active references can extend retention. Mailbox messages follow FreePBX voicemail retention separately.'); ?></li>
 			<li><?php echo _('Audio delivery uses the private Asterisk context sls-alert-audio, Page/ConfBridge fan-out, and the module-owned vendor-aware sls-alert-autoanswer handler. It does not require a public paging group such as *6767 or FreePBX-generated paging macros.'); ?></li>
 	</ul>
 
@@ -444,7 +455,7 @@ asterisk -rx "manager show users" | grep slsmassnotify
 timeout 15 python3 /usr/local/bin/sls_mass_notify/sls_notify.py --ami-health-json
 bash -n /usr/local/bin/sls_mass_notify/sls_mass_notify_nws_poll.sh
 bash -n /usr/local/bin/sls_mass_notify/sls_mass_notify_test.sh
-python3 -m py_compile /usr/local/bin/sls_mass_notify/sls_notify.py</pre>
+python3 -B -c "import ast,pathlib; ast.parse(pathlib.Path('/usr/local/bin/sls_mass_notify/sls_notify.py').read_text())"</pre>
 
 	</div></details>
 
@@ -455,7 +466,7 @@ python3 -m py_compile /usr/local/bin/sls_mass_notify/sls_notify.py</pre>
 			<li><?php echo _('Audio missing or the phone rings normally: confirm both SLS dialplan contexts exist, Page and ConfBridge are available, the asterisk account can write to /var/spool/asterisk/tmp and outgoing, the two SLS sound links resolve to the protected sounds folder, Piper generated a WAV under the TTS folder, and the handset permits vendor auto-answer.'); ?></li>
 			<li><?php echo _('Red installer or repair fault on Dashboard: read the reported stage and possible solution, then inspect /tmp/slsmassnotifyserver-install.log or the maintenance log. The fault remains until comprehensive integration, signature, runtime, and health verification succeeds.'); ?></li>
 		<li><?php echo _('Asterisk provider repair stops before installation: wait for active calls to finish and rerun the installer. If it reports an unowned module path, unavailable exact package version, noload rule, or autoload-disabled provider, restore or explicitly enable the matching provider from that Asterisk build or repository; the installer intentionally will not mix modules from a different ABI.'); ?></li>
-		<li><?php echo _('Module says Altered: remove generated caches such as __pycache__ if present, run the PBX-local signing helper, confirm verifyModule returns status 129 with no details, then run fwconsole reload.'); ?></li>
+		<li><?php echo _('Module says Altered: preserve the reported differences and run the verified installer or protected repair. Unknown changes require review. Do not sign unreviewed files to hide a verification warning.'); ?></li>
 		<li><?php echo _('Setup wizard appears after update: verify setup.completed remains 1 in the central .config and no pending config reset it.'); ?></li>
 	</ul>
 

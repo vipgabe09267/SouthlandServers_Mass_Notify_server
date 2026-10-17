@@ -15,9 +15,9 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 MODULE = ROOT / 'slsmassnotifyserver'
 isolated = ((os.environ.get('SLS_TEST_NAMESPACE') == 'entered'
-             and os.environ.get('SLS_TEST_PARENT_NET_NS') not in (None, os.readlink('/proc/self/ns/net')))
+             and os.environ.get('SLS_TEST_PARENT_NET_NS') not in (None, '', os.readlink('/proc/self/ns/net')))
             or (os.environ.get('SLS_BUILD_STAGE') == 'isolated'
-                and os.environ.get('SLS_BUILD_PARENT_NET') not in (None, os.readlink('/proc/self/ns/net'))))
+                and os.environ.get('SLS_BUILD_PARENT_NET') not in (None, '', os.readlink('/proc/self/ns/net'))))
 if not isolated:
     raise SystemExit('Use the isolated fixture runner; no administrator HTTP server was started.')
 
@@ -127,6 +127,9 @@ require MODULE.'/page.slsmassnotifyserver_enterprise.php';
             self.assertEqual(status, 403)
             self.assertFalse(json.loads(body)['success'])
         self.assertEqual(self.post('{}', cookie=False)[0], 403)
+        status, _, body = self.request('POST', {'slsmassnotifyserver_csrf[]': 'bad', 'payload': '{}'})
+        self.assertEqual(status, 403)
+        self.assertFalse(json.loads(body)['success'])
 
     def test_structured_request_bounds_and_allowed_actions(self):
         for payload in ['{', '[]', 'null', 'false', '"scalar"']:

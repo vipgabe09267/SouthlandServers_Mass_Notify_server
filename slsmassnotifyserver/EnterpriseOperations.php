@@ -3,7 +3,9 @@ declare(strict_types=1);
 namespace FreePBX\modules;
 require_once __DIR__.'/EnterpriseApprovalService.php';
 require_once __DIR__.'/EnterpriseFloorplanStore.php';
-use SLS\MassNotify\{EnterpriseOperationsConfig,EnterpriseOperationsStore,EnterpriseApprovalService,EnterpriseFloorplanStore,OperatorAccess,ApiSecurity,LocationDirectory,IncidentConfig};
+require_once __DIR__.'/EnterpriseFloorplanAudit.php';
+require_once __DIR__.'/EnterpriseFloorplanReferences.php';
+use SLS\MassNotify\{EnterpriseOperationsConfig,EnterpriseOperationsStore,EnterpriseApprovalService,EnterpriseFloorplanStore,EnterpriseFloorplanRetirementUncertain,EnterpriseFloorplanAudit,EnterpriseFloorplanReferences,OperatorAccess,ApiSecurity,LocationDirectory,IncidentConfig};
 
 trait SlsEnterpriseOperations
 {
@@ -53,11 +55,18 @@ trait SlsEnterpriseOperations
         if(!EnterpriseOperationsConfig::policies($settings,$request)||!empty($request['preview'])){return null;}
         $principal=$GLOBALS['sls_control_principal']??null;
         if(is_array($principal)&&!isset($principal['operator_role'])){
-            $person='control:'.($principal['id']??'');$identity=$person;
-            if(($principal['id']??'')!=='legacy'){$request['api_credential_id']=$principal['id'];}
+            $person=$principal['id']??'';
+            if($person==='legacy'){
+                return ['success'=>false,'delivery_started'=>false,'error_code'=>'named_credential_required',
+                    'message'=>'Two-person review requires a named, revocable Control API credential. No delivery has started.'];
+            }
+            EnterpriseOperationsConfig::actor($person);$identity=$person;$request['api_credential_id']=$person;
         }else{
             try{$p=$this->currentOperator();$person=$this->enterprisePerson($p);$identity=$this->enterprisePersonIdentity($person,$settings);}
-            catch(\Throwable $error){$person='worker:'.($request['sender']??'SLS');$identity=$person;}
+            catch(\Throwable $error){
+                $label=preg_replace('/[^A-Za-z0-9_.@-]/','_',is_string($request['sender']??null)?$request['sender']:'SLS');
+                $label=trim(substr($label,0,80),'_');$person='worker:'.($label!==''?$label:'SLS');$identity=$person;
+            }
         }
         $r=$this->enterpriseApprovalService()->request($settings,$request,$person,$identity);
         return ['success'=>true,'awaiting_approval'=>true,'delivery_started'=>false,'state'=>'awaiting_approval',
@@ -101,7 +110,7 @@ trait SlsEnterpriseOperations
                 $request['force_queue']=true;$this->announcementAdmissionLock=$send;
                 $result=$this->withOperator($p,fn():array=>$this->deliverResolvedAnnouncement($request));
             }
-            $service->finish($id,$result);
+            $result=$service->finish($id,$result);
             $this->recordEnterpriseIncidentApproval($request,$result);
             return $result;
         }catch(\Throwable $error){
@@ -113,14 +122,18 @@ trait SlsEnterpriseOperations
     {
         $context=$request['incident_context']??null;if(!is_array($context)){return;}
         if(method_exists($this,'recordIncidentLanguageApproval')&&$this->recordIncidentLanguageApproval($request,$result)){return;}
-        $this->incidentStore()->transaction($context['incident_id'],static function(array $record)use($context,$request,$result):array{
+        IncidentConfig::context($context);$linked=false;
+        $this->incidentStore()->transaction($context['incident_id'],static function(array $record)use($context,$request,$result,&$linked):array{
             foreach($record['operations'] as &$operation){
-                if(($operation['sequence']??null)!==$context['sequence']||($operation['review_id']??'')!==($request['_enterprise_approval']['id']??'')){continue;}
-                $operation['state']=isset($result['job_id'])?'queued':(($result['delivery_started']??null)===false?'not_submitted':'uncertain');
-                if(isset($result['job_id'])){$operation['job_id']=$result['job_id'];if($record['opened_at']===''&&$operation['kind']==='initial'){$record['opened_at']=gmdate('c');}if($operation['kind']==='all_clear'){$record['state']='closed';$record['closed_at']=gmdate('c');}}
-                $operation['finished_at']=gmdate('c');$record['timeline'][]=['at'=>gmdate('c'),'kind'=>'approval_submission_'.$operation['state'],'actor'=>['identity'=>'Two-person review','source'=>'approval'],'details'=>['review_id'=>$operation['review_id'],'job_id'=>$result['job_id']??'']];$record['updated_at']=gmdate('c');
+                if(($operation['sequence']??null)!==$context['sequence']||($operation['kind']??null)!==$context['kind']||($operation['state']??null)!=='awaiting_approval'||($operation['review_id']??'')!==($request['_enterprise_approval']['id']??'')){continue;}
+                if(count($record['timeline'])+\SLS\MassNotify\IncidentStore::pendingApprovalCount($record)>4000){throw new \RuntimeException('Incident history cannot durably link this reviewed submission. No additional approval may be submitted.');}
+                $job=$result['job_id']??'';$accepted=is_string($job)&&preg_match('/^job_[a-f0-9]{32}$/D',$job);
+                $operation['state']=$accepted?'queued':(($result['delivery_started']??null)===false?'not_submitted':'uncertain');$operation['job_id']=$accepted?$job:'';
+                if($accepted){if($record['opened_at']===''&&$operation['kind']==='initial'){$record['opened_at']=gmdate('c');}if($operation['kind']==='all_clear'){$record['state']='closed';$record['closed_at']=gmdate('c');}}
+                $operation['finished_at']=gmdate('c');$record['timeline'][]=['at'=>gmdate('c'),'kind'=>'approval_submission_'.$operation['state'],'actor'=>['identity'=>'Two-person review','source'=>'approval'],'details'=>['review_id'=>$operation['review_id'],'job_id'=>$operation['job_id']]];$record['updated_at']=gmdate('c');$linked=true;
             }unset($operation);return $record;
         });
+        if(!$linked){throw new \RuntimeException('The reviewed submission no longer matches its incident operation. Inspect both records before retrying.');}
     }
     protected function routeEnterpriseIncidentTemplate(array $template): array
     {
@@ -150,8 +163,9 @@ trait SlsEnterpriseOperations
     {
         $this->assertEnterpriseAdministrator();
         if(($file['error']??null)!==UPLOAD_ERR_OK||!is_string($file['tmp_name']??null)||!is_uploaded_file($file['tmp_name'])){throw new \InvalidArgumentException('A complete PNG/JPEG upload is required.');}
-        if(!is_int($file['size']??null)||$file['size']>EnterpriseFloorplanStore::MAX_BYTES){throw new \InvalidArgumentException('Floor plan upload exceeds 5 MiB.');}
-        $bytes=file_get_contents($file['tmp_name'],false,null,0,EnterpriseFloorplanStore::MAX_BYTES+1);
+        if(!is_int($file['size']??null)||$file['size']<1||$file['size']>EnterpriseFloorplanStore::MAX_BYTES){throw new \InvalidArgumentException('Floor plan upload exceeds 5 MiB or is empty.');}
+        $bytes=@file_get_contents($file['tmp_name'],false,null,0,EnterpriseFloorplanStore::MAX_BYTES+1);
+        if(!is_string($bytes)||strlen($bytes)!==$file['size']){throw new \RuntimeException('The uploaded floor plan could not be read completely. Retry the upload.');}
         return ['success'=>true]+(new EnterpriseFloorplanStore())->put($bytes);
     }
     public function getEnterpriseFloorplanImage(string $id): array
@@ -175,6 +189,52 @@ trait SlsEnterpriseOperations
         foreach($plan['markers'] as &$marker){$values=$statuses[$marker['kind'].':'.$marker['target_id']]??[];$marker['response_counts']=array_count_values($values);$marker['status']=in_array('needs_assistance',$values,true)?'needs_assistance':(in_array('missing',$values,true)?'missing':($values&&!in_array('no_response',$values,true)?'responded':'unconfirmed'));}unset($marker);
         return ['success'=>true,'plan'=>$plan,'incident_id'=>$incidentId,'observed_at'=>gmdate('c'),'meaning'=>'Human responses are shown separately from transport receipts. Unconfirmed markers are never reported as safe.'];
     }
+    private function enterpriseFloorplanReferenceReport(string $id,array $active,?array $pending,bool $backups): array
+    {
+        return EnterpriseFloorplanReferences::report($id,$active,$pending,self::PLUGIN_DATA_DIR.'/config-backups',$backups);
+    }
+    public function retireEnterpriseFloorplan(array $input): array
+    {
+        $principal=$this->assertEnterpriseAdministrator();
+        $input=IncidentConfig::object($input,['image_id','confirmation'],'Floor plan retirement');
+        $id=IncidentConfig::identifier($input['image_id']??'','/^img_[a-f0-9]{64}$/D','Private image');
+        if(($input['confirmation']??null)!=='RETIRE'){throw new \InvalidArgumentException('Enter RETIRE to confirm permanent removal of this unreferenced image.');}
+        $actor='pbx:'.substr(preg_replace('/[^\x20-\x7e]/','_',is_string($principal['username']??null)?$principal['username']:'administrator'),0,150);
+        $activity=$this->acquireAnnouncementActivityLock(true,5);
+        if($activity===null){throw new \DomainException('An announcement or Labs worker is using the configuration. Wait for it to finish before retiring a floor plan.');}
+        $settingsLock=null;$request=null;
+        try{
+            $settingsLock=$this->acquireSettingsLock(false);
+            $active=$this->normalizeSettings($this->loadSettingsFile(self::SETTINGS_JSON));
+            $pending=$this->getPendingSettings();
+            $report=$this->enterpriseFloorplanReferenceReport($id,$active,$pending,true);
+            if($report['blocking_count']>0){
+                $sources=implode(', ',array_values(array_unique(array_column($report['references'],'source'))));
+                throw new \DomainException('This image is still referenced by '.$sources.'. Remove those references, save the settings, and retry.');
+            }
+            $this->enterpriseOperationsStore()->transaction(static fn(array &$state):bool=>true);
+            $audit=new EnterpriseFloorplanAudit();$store=new EnterpriseFloorplanStore();
+            try{
+                $retired=$store->retire($id,function(array $image)use($audit,$actor,$report,&$request):array{
+                    $request=$audit->requested($image,$actor,$report['reference_hash']);
+                    return ['request_id'=>$request['event_id']];
+                });
+            }catch(\Throwable $error){
+                if(is_array($request)){
+                    try{$error instanceof EnterpriseFloorplanRetirementUncertain?$audit->uncertain($request['event_id']):$audit->failed($request['event_id']);}
+                    catch(\Throwable $auditError){throw new \RuntimeException('The floor-plan retirement outcome could not be finalized. Preserve the retirement audit and reload the inventory before retrying.',0,$error);}
+                }
+                throw $error;
+            }
+            try{$outcome=$audit->completed($retired['request_id']);}
+            catch(\Throwable $error){throw new \RuntimeException('The image was retired, but its completion audit could not be finalized. Preserve the retirement audit and reload before another action.',0,$error);}
+            return ['success'=>true,'image_id'=>$id,'audit_event_id'=>$outcome['event_id'],
+                'message'=>'The unreferenced private floor plan was retired. Protected retirement evidence was preserved.'];
+        }finally{
+            if($settingsLock!==null){$this->releaseSettingsLock($settingsLock);}
+            $this->releaseNativeBackupFileLock($activity);
+        }
+    }
     public function enterpriseOperationsState(): array
     {
         $this->assertEnterpriseAdministrator();$settings=$this->getActiveSettings();
@@ -189,10 +249,15 @@ trait SlsEnterpriseOperations
         foreach($this->locationCatalog($settings)['extensions'] as $device){$markers[]=['kind'=>'phone','id'=>$device['id'],'name'=>$device['label']];}
         foreach($settings['desktop_clients']??[] as $device){$markers[]=['kind'=>'desktop','id'=>$device['username'],'name'=>$device['name']];}
         foreach($settings['automations']['rules']??[] as $device){$markers[]=['kind'=>'sensor','id'=>$device['id'],'name'=>$device['name']];}
-        return ['config'=>$cfg,'revision'=>hash('sha256',json_encode($cfg,JSON_THROW_ON_ERROR)),'sites'=>array_values(array_filter(LocationDirectory::effective($settings['location_directory']??[])['nodes'],static fn($n)=>$n['type']==='site')),
+        $pending=$this->getPendingSettings();
+        $floorplanStorage=is_dir(EnterpriseFloorplanStore::DIRECTORY) ? (new EnterpriseFloorplanStore())->usage() : ['image_count'=>0,'image_bytes'=>0,'pending_upload_count'=>0,'pending_upload_bytes'=>0,'maximum_images'=>100,'maximum_bytes'=>33554432,'images'=>[]];
+        foreach($floorplanStorage['images'] as &$image){$image['reference_report']=$this->enterpriseFloorplanReferenceReport($image['image_id'],$settings,$pending,false);}unset($image);
+        $auditDirectory=EnterpriseOperationsStore::DIRECTORY.'/archive';
+        $retirementHistory=(is_dir($auditDirectory)||file_exists(dirname($auditDirectory).'/.'.basename($auditDirectory).'-required'))?(new EnterpriseFloorplanAudit($auditDirectory))->recent():[];
+        return ['config'=>$cfg,'floorplan_storage'=>$floorplanStorage,'revision'=>hash('sha256',json_encode($cfg,JSON_THROW_ON_ERROR)),'sites'=>array_values(array_filter(LocationDirectory::effective($settings['location_directory']??[])['nodes'],static fn($n)=>$n['type']==='site')),
             'incident_choices'=>$incidents,'people'=>$people,'templates'=>array_map(static fn($t)=>['id'=>$t['id'],'name'=>$t['name'],'fields'=>$t['fields']],$this->incidentTemplates()),
             'audiences'=>$this->getAnnouncementGroups(),'marker_choices'=>$markers,'tones'=>$this->getAvailableTones(),'timezone'=>$settings['pbx_timezone']??'','timezones'=>\DateTimeZone::listIdentifiers(),'reviews'=>$this->listEnterpriseApprovals()['reviews'],
-            'drill_report'=>$this->getEnterpriseDrillReport()['assignments']];
+            'drill_report'=>$this->getEnterpriseDrillReport()['assignments'],'floorplan_retirements'=>$retirementHistory];
     }
     private function enterpriseDrillAssignment(string $id): array
     {
@@ -204,7 +269,8 @@ trait SlsEnterpriseOperations
     public function startEnterpriseDrill(array $input): array
     {
         $input=IncidentConfig::object($input,['assignment_id','request_id','fields','planned_at'],'Central drill start');
-        $assignment=$this->enterpriseDrillAssignment($input['assignment_id']??'');$p=$this->currentOperator();$person=$this->enterprisePerson($p);
+        $assignmentId=IncidentConfig::identifier($input['assignment_id']??'','/^drill_[a-f0-9]{24}$/D','Drill assignment');
+        $assignment=$this->enterpriseDrillAssignment($assignmentId);$p=$this->currentOperator();$person=$this->enterprisePerson($p);
         if(($p['operator_role']??'')!=='administrator'&&$assignment['owner_id']!==$person){throw new \DomainException('Only the assigned drill owner or an administrator can launch this drill.');}
         if(!OperatorAccess::may($p,'send')){throw new \DomainException('Your current role cannot launch a drill announcement.');}
         $request=IncidentConfig::identifier($input['request_id']??'','/^[a-f0-9]{32}$/D','Drill request');$run='run_'.hash('sha256',$request);
@@ -222,7 +288,7 @@ trait SlsEnterpriseOperations
             $templates=$this->operatorOperationsState()['templates'];
             if(!in_array($assignment['template_id'],array_column($templates,'id'),true)){throw new \DomainException('This drill template exceeds your current permitted audience.');}
             $result=$this->withOperator($p,fn():array=>$this->startIncident($start));
-        }catch(\Throwable $error){$result=['success'=>false,'message'=>$error instanceof \DomainException?$error->getMessage():'Drill launch did not confirm completion. Review incidents before taking another action.'];}
+        }catch(\Throwable $error){$result=['success'=>false,'delivery_started'=>$error instanceof \DomainException?false:null,'message'=>$error instanceof \DomainException?$error->getMessage():'Drill launch did not confirm completion. Review incidents before taking another action.'];}
         $record=$this->enterpriseOperationsStore()->transaction(static function(array &$state)use($run,$result):array{
             $r=&$state['drills'][$run];$r['state']=self::enterpriseDrillDeliveryState($result);$r['incident_id']=$result['id']??'';$r['result']=array_intersect_key($result,array_flip(['success','message','id','state']));return $r;
         });
@@ -230,7 +296,7 @@ trait SlsEnterpriseOperations
     }
     private static function enterpriseDrillDeliveryState(array $result): string
     {
-        if(empty($result['success'])||!isset($result['id'])){return 'uncertain';}
+        if(empty($result['success'])||!isset($result['id'])){return ($result['delivery_started']??null)===false?'not_submitted':'uncertain';}
         if(($result['state']??'')==='planned'){return 'planned';}
         foreach($result['operations']??[] as $operation){
             if(($operation['kind']??'')==='initial'){
@@ -268,6 +334,11 @@ trait SlsEnterpriseOperations
         foreach($cfg['drills']['assignments'] as $a){
             if(($p['operator_role']??'')!=='administrator'&&$a['owner_id']!==$person&&!in_array($person,$a['reviewer_ids'],true)){continue;}
             $matched=array_values(array_filter($runs,static fn($run)=>$run['assignment']['id']===$a['id']));
+            usort($matched, static function (array $left, array $right): int {
+                $order = (strtotime((string)($left['created_at'] ?? '')) ?: 0)
+                    <=> (strtotime((string)($right['created_at'] ?? '')) ?: 0);
+                return $order ?: strcmp((string)($left['id'] ?? ''), (string)($right['id'] ?? ''));
+            });
             $a['runs']=$matched;
             $latest=$matched?end($matched):null;
             $a['status']=!$a['enabled']?'disabled':(!$latest?(strtotime($a['due_at'])<time()?'overdue':'assigned'):
@@ -281,8 +352,18 @@ trait SlsEnterpriseOperations
         if($action==='operations_archive'){$this->assertEnterpriseAdministrator();$days=$input['retention_days']??30;if(array_diff(array_keys($input),['retention_days'])||!is_int($days)||$days<1||$days>365){throw new \InvalidArgumentException('Retention must be 1–365 days.');}return $this->enterpriseOperationsStore()->maintain(time(),$days*86400);}
         if($action==='operations_save'){return $this->saveEnterpriseOperations($input);}
         if($action==='approval_list'){return $this->listEnterpriseApprovals();}
-        if(in_array($action,['approval_approve','approval_submit','approval_reject'],true)){return $this->actEnterpriseApproval(substr($action,9),$input['review_id']??'');}
-        if($action==='floorplan_overlay'){return $this->getEnterpriseFloorplanOverlay($input['plan_id']??'',$input['incident_id']??'');}
+        if(in_array($action,['approval_approve','approval_submit','approval_reject'],true)){
+            $input=IncidentConfig::object($input,['review_id'],'Approval action');
+            $review=IncidentConfig::identifier($input['review_id']??'','/^review_[a-f0-9]{32}$/D','Approval request');
+            return $this->actEnterpriseApproval(substr($action,9),$review);
+        }
+        if($action==='floorplan_overlay'){
+            $input=IncidentConfig::object($input,['plan_id','incident_id'],'Floor plan overlay');
+            $plan=IncidentConfig::identifier($input['plan_id']??'','/^plan_[a-f0-9]{24}$/D','Floor plan');
+            $incident=IncidentConfig::identifier($input['incident_id']??'','/^inc_[a-f0-9]{32}$/D','Incident');
+            return $this->getEnterpriseFloorplanOverlay($plan,$incident);
+        }
+        if($action==='floorplan_retire'){return $this->retireEnterpriseFloorplan($input);}
         if($action==='drill_start'){return $this->startEnterpriseDrill($input);}
         if($action==='drill_review'){return $this->reviewEnterpriseDrill($input);}
         if($action==='drill_report'){return $this->getEnterpriseDrillReport();}

@@ -362,7 +362,7 @@ class XweatherGroupTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(worker, "read_state", return_value={}))
             stack.enter_context(mock.patch.object(worker, "atomic_json_update"))
             stack.enter_context(mock.patch.object(worker, "fetch_payload", return_value={"success": True}))
-            stack.enter_context(mock.patch.object(worker, "normalize_records", return_value=[{"id": "strike", "distance_miles": 4.1}]))
+            stack.enter_context(mock.patch.object(worker, "normalize_records", return_value=[{"id": "strike", "timestamp": 1_800_000_000, "distance_miles": 4.1}]))
             stack.enter_context(mock.patch.object(worker, "queue_external_delivery", side_effect=queue_external))
             stack.enter_context(mock.patch.object(worker, "external_delivery_recorded", return_value=False))
             stack.enter_context(mock.patch.object(worker, "external_delivery_pending", return_value=False))

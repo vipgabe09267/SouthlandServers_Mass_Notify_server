@@ -13,10 +13,12 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 import pwd
 import re
 import secrets
+import select
 import stat
 import sys
 import time
@@ -38,6 +40,12 @@ MAX_REQUEST_BYTES = 256 * 1024
 MAX_STATE_BYTES = 8 * 1024 * 1024
 MAX_CLAIMS = 10_000
 MAX_CYCLES = 128
+MAX_DESTINATIONS = 3120
+LOCK_WAIT_SECONDS = 0.5
+HISTORY_MARKER = b'SLS_NWS_COORDINATION_V1\n'
+LEGACY_HISTORY_MARKER = b'SLS_NWS_LEGACY_HISTORY_V1\n'
+MAX_LEGACY_HISTORY_BYTES = 2 * 1024 * 1024
+MAX_LEGACY_HISTORY_LINES = 5000
 CLAIM_RETENTION_SECONDS = 30 * 86400
 CYCLE_RETENTION_SECONDS = 2 * 3600
 # A worker may legitimately wait up to 55 minutes for the serialized audio
@@ -50,6 +58,27 @@ KIND_ORDER = ("phone", "desktop", "email", "discord", "generic", "voice", "sms")
 
 class CoordinationError(RuntimeError):
     """Raised when coordination state cannot be used safely."""
+
+
+def _json(raw):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError('duplicate field')
+            result[key] = value
+        return result
+    def constant(value):
+        raise ValueError('nonfinite value')
+    def number(value):
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError('nonfinite number')
+        return result
+    try:
+        return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant, parse_float=number)
+    except (ValueError, UnicodeError, RecursionError) as error:
+        raise CoordinationError('coordination JSON is invalid; preserve its evidence') from error
 
 
 def _account_ids():
@@ -79,12 +108,22 @@ def _open_directory(path: Path) -> int:
         raise
 
 
-def _secure_file_metadata(descriptor: int):
+def _checked_file_metadata(descriptor: int):
     metadata = os.fstat(descriptor)
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-        raise CoordinationError("coordination path is not a regular file")
-    os.fchmod(descriptor, 0o640)
     uid, gid = _account_ids()
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+            or metadata.st_uid not in (0, uid) or metadata.st_gid not in (0, gid)
+            or stat.S_IMODE(metadata.st_mode) not in (0o600, 0o640, 0o644)):
+        raise CoordinationError("coordination file has unsafe ownership or permissions")
+    return metadata, uid, gid
+
+
+def _secure_file_metadata(descriptor: int):
+    metadata, uid, gid = _checked_file_metadata(descriptor)
+    if stat.S_IMODE(metadata.st_mode) != 0o640:
+        os.fchmod(descriptor, 0o640)
+    if (metadata.st_uid, metadata.st_gid) == (uid, gid):
+        return
     try:
         os.fchown(descriptor, uid, gid)
     except PermissionError:
@@ -101,6 +140,56 @@ def _validate_parent_directory(descriptor: int):
         or metadata.st_uid not in {0, asterisk_uid}
     ):
         raise CoordinationError("coordination directory ownership or permissions are unsafe")
+
+
+def hold_worker_lock(path: Path, wait_seconds: int):
+    """Lease an empty worker lock until the shell closes its reading pipe."""
+    if wait_seconds not in (0, 3300):
+        raise CoordinationError('worker lock wait is invalid')
+    if not stat.S_ISFIFO(os.fstat(sys.stdout.fileno()).st_mode):
+        raise CoordinationError('worker lock requires a shell-owned reading pipe')
+    parent = _open_directory(path.parent)
+    descriptor = None
+    try:
+        _validate_parent_directory(parent)
+        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW
+        descriptor = os.open(path.name, flags, 0o640, dir_fd=parent)
+        metadata, _uid, _gid = _checked_file_metadata(descriptor)
+        if metadata.st_size != 0:
+            raise CoordinationError('worker lock contains unexpected data; preserve its evidence')
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    print('busy', flush=True)
+                    return 75
+                time.sleep(0.05)
+        named_parent = _open_directory(path.parent)
+        try:
+            _validate_parent_directory(named_parent)
+            if ((os.fstat(parent).st_dev, os.fstat(parent).st_ino)
+                    != (os.fstat(named_parent).st_dev, os.fstat(named_parent).st_ino)
+                    or _identity(os.stat(path.name, dir_fd=parent, follow_symlinks=False))
+                    != _identity(os.fstat(descriptor))):
+                raise CoordinationError('worker lock changed while acquiring its lease')
+        finally:
+            os.close(named_parent)
+        _secure_file_metadata(descriptor)
+        print('locked', flush=True)
+        # A pipe reports POLLERR when its last reader closes, including after
+        # the shell exits. No lock inode is replaced or truncated on release.
+        pipe = select.poll()
+        pipe.register(sys.stdout.fileno(), select.POLLERR | select.POLLHUP)
+        while not pipe.poll():
+            pass
+        return 0
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent)
 
 
 def _empty_state():
@@ -136,20 +225,30 @@ def _read_state(parent_fd: int, name: str):
     finally:
         os.close(descriptor)
     try:
-        decoded = json.loads(raw.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as exc:
+        decoded = _json(raw.decode("utf-8"))
+    except (UnicodeError, CoordinationError) as exc:
         raise CoordinationError("coordination state is corrupt") from exc
-    if not isinstance(decoded, dict) or decoded.get("version") != 1:
+    if not isinstance(decoded, dict) or type(decoded.get("version")) is not int or decoded['version'] != 1:
         raise CoordinationError("coordination state schema is invalid")
     if not isinstance(decoded.get("claims"), dict) or not isinstance(decoded.get("cycles"), dict):
         raise CoordinationError("coordination state structure is invalid")
+    _validate_state(decoded)
     return decoded
 
 
-def _write_state(parent_fd: int, name: str, state):
-    encoded = (json.dumps(state, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
+def _identity(metadata):
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid, metadata.st_gid,
+            metadata.st_nlink, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+
+def _write_state(parent_fd: int, name: str, state, expected):
+    encoded = (json.dumps(state, separators=(",", ":"), sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
     if len(encoded) > MAX_STATE_BYTES:
         raise CoordinationError("coordination state capacity is exhausted")
+    _write_bytes(parent_fd, name, encoded, expected)
+
+
+def _write_bytes(parent_fd: int, name: str, encoded: bytes, expected, parent_path=None):
     temporary = f".{name}.tmp.{os.getpid()}.{secrets.token_hex(8)}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(temporary, flags, 0o640, dir_fd=parent_fd)
@@ -157,7 +256,10 @@ def _write_state(parent_fd: int, name: str, state):
         _secure_file_metadata(descriptor)
         offset = 0
         while offset < len(encoded):
-            offset += os.write(descriptor, encoded[offset:])
+            written = os.write(descriptor, encoded[offset:])
+            if written <= 0:
+                raise CoordinationError('coordination state write could not complete')
+            offset += written
         os.fsync(descriptor)
     except BaseException:
         try:
@@ -172,8 +274,18 @@ def _write_state(parent_fd: int, name: str, state):
             target = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError:
             target = None
-        if target is not None and (not stat.S_ISREG(target.st_mode) or target.st_nlink != 1):
-            raise CoordinationError("coordination state target is unsafe")
+        if ((target is None) != (expected is None)
+                or (target is not None and _identity(target) != _identity(expected))):
+            raise CoordinationError("coordination state changed before commit; evidence was preserved")
+        if parent_path is not None:
+            named_parent = _open_directory(parent_path)
+            try:
+                _validate_parent_directory(named_parent)
+                if ((os.fstat(parent_fd).st_dev, os.fstat(parent_fd).st_ino)
+                        != (os.fstat(named_parent).st_dev, os.fstat(named_parent).st_ino)):
+                    raise CoordinationError('legacy history parent changed before commit')
+            finally:
+                os.close(named_parent)
         os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         os.fsync(parent_fd)
     finally:
@@ -181,6 +293,118 @@ def _write_state(parent_fd: int, name: str, state):
             os.unlink(temporary, dir_fd=parent_fd)
         except FileNotFoundError:
             pass
+
+
+def legacy_alert_history(path: Path, operation: str, key: str = ''):
+    """Preserve the old line-based history behind a permanent checked lease."""
+    if operation not in {'ensure', 'contains', 'add', 'remove'}:
+        raise CoordinationError('legacy history operation is invalid')
+    if operation != 'ensure' and (not key or len(key.encode('utf-8')) > 4096
+            or re.search(r'[\x00-\x1f\x7f]', key)):
+        raise CoordinationError('legacy history key is invalid')
+    parent = _open_directory(path.parent)
+    lock = None
+    descriptor = None
+    try:
+        _validate_parent_directory(parent)
+        flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        lock_name = path.name + '.lock'
+        lock = os.open(lock_name, flags, 0o640, dir_fd=parent)
+        lock_meta, _uid, _gid = _checked_file_metadata(lock)
+        if lock_meta.st_size > len(LEGACY_HISTORY_MARKER):
+            raise CoordinationError('legacy history lock is unsafe')
+        deadline = time.monotonic() + LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise CoordinationError('legacy history is busy; retry a later poll')
+                time.sleep(0.01)
+        marker = os.pread(lock, len(LEGACY_HISTORY_MARKER) + 1, 0)
+        if marker and not LEGACY_HISTORY_MARKER.startswith(marker):
+            raise CoordinationError('legacy history marker is invalid')
+        try:
+            descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
+        except FileNotFoundError:
+            if marker or operation != 'ensure':
+                raise CoordinationError('established legacy history is missing; restore it before polling')
+            metadata = None
+            encoded = b''
+            lines = []
+        else:
+            metadata, _uid, _gid = _checked_file_metadata(descriptor)
+            if metadata.st_size > MAX_LEGACY_HISTORY_BYTES:
+                raise CoordinationError('legacy history byte capacity is exhausted; preserve it for review')
+            encoded = bytearray()
+            while len(encoded) <= MAX_LEGACY_HISTORY_BYTES:
+                chunk = os.read(descriptor, min(65536, MAX_LEGACY_HISTORY_BYTES + 1 - len(encoded)))
+                if not chunk:
+                    break
+                encoded.extend(chunk)
+            if len(encoded) > MAX_LEGACY_HISTORY_BYTES or _identity(os.fstat(descriptor)) != _identity(metadata):
+                raise CoordinationError('legacy history changed or exceeded its byte capacity')
+            try:
+                text = bytes(encoded).decode('utf-8')
+            except UnicodeError as error:
+                raise CoordinationError('legacy history is not valid UTF-8') from error
+            lines = text.splitlines()
+            if (len(lines) > MAX_LEGACY_HISTORY_LINES
+                    or any(not line or len(line.encode('utf-8')) > 4096
+                           or re.search(r'[\x00-\x1f\x7f]', line) for line in lines)
+                    or re.search(r'[\x00-\x09\x0b-\x1f\x7f]', text)):
+                raise CoordinationError('legacy history structure or capacity is invalid; no records were discarded')
+        named_parent = _open_directory(path.parent)
+        try:
+            _validate_parent_directory(named_parent)
+            if ((os.fstat(parent).st_dev, os.fstat(parent).st_ino)
+                    != (os.fstat(named_parent).st_dev, os.fstat(named_parent).st_ino)
+                    or _identity(os.stat(lock_name, dir_fd=parent, follow_symlinks=False))
+                    != _identity(os.fstat(lock))):
+                raise CoordinationError('legacy history lease changed before use')
+        finally:
+            os.close(named_parent)
+        expected = metadata
+        if descriptor is not None:
+            if _identity(os.stat(path.name, dir_fd=parent, follow_symlinks=False)) != _identity(metadata):
+                raise CoordinationError('legacy history changed before use')
+            _secure_file_metadata(descriptor)
+            expected = os.fstat(descriptor)
+            if ((metadata.st_dev, metadata.st_ino, metadata.st_nlink, metadata.st_size, metadata.st_mtime_ns)
+                    != (expected.st_dev, expected.st_ino, expected.st_nlink, expected.st_size, expected.st_mtime_ns)):
+                raise CoordinationError('legacy history contents changed during permission repair')
+        _secure_file_metadata(lock)
+        found = key in lines
+        if operation == 'contains' and not found and (len(lines) >= MAX_LEGACY_HISTORY_LINES
+                or len(encoded) + len(key.encode('utf-8')) + 1 > MAX_LEGACY_HISTORY_BYTES):
+            raise CoordinationError('legacy history is full; new delivery was not admitted')
+        if operation == 'add' and not found:
+            if len(lines) >= MAX_LEGACY_HISTORY_LINES:
+                raise CoordinationError('legacy history is full; no active records were discarded')
+            lines.append(key)
+        elif operation == 'remove' and found:
+            lines = [line for line in lines if line != key]
+        replacement = ('\n'.join(lines) + ('\n' if lines else '')).encode('utf-8')
+        if len(replacement) > MAX_LEGACY_HISTORY_BYTES:
+            raise CoordinationError('legacy history byte capacity is exhausted')
+        if expected is None or replacement != bytes(encoded):
+            _write_bytes(parent, path.name, replacement, expected, path.parent)
+        if marker != LEGACY_HISTORY_MARKER:
+            offset = len(marker)
+            while offset < len(LEGACY_HISTORY_MARKER):
+                written = os.pwrite(lock, LEGACY_HISTORY_MARKER[offset:], offset)
+                if written <= 0:
+                    raise CoordinationError('legacy history marker write failed')
+                offset += written
+            os.fsync(lock)
+        return found
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if lock is not None:
+            os.close(lock)
+        os.close(parent)
 
 
 class LockedState:
@@ -199,9 +423,27 @@ class LockedState:
             lock_name = self.path.name + ".lock"
             flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
             self.lock_fd = os.open(lock_name, flags, 0o640, dir_fd=self.parent_fd)
+            self._read_lock_marker()
+            deadline = time.monotonic() + LOCK_WAIT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise CoordinationError('coordination state is busy; retry the same request')
+                    time.sleep(0.01)
+            current = os.stat(lock_name, dir_fd=self.parent_fd, follow_symlinks=False)
+            if _identity(os.fstat(self.lock_fd)) != _identity(current):
+                raise CoordinationError('coordination lock changed during acquisition')
+            self.lock_marker = self._read_lock_marker()
             _secure_file_metadata(self.lock_fd)
-            fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
+            self.lock_identity = _identity(os.fstat(self.lock_fd))
+            self.state_identity = self._state_metadata()
+            if self.lock_marker and self.state_identity is None:
+                raise CoordinationError('established coordination history is missing; preserve the lock and restore reviewed evidence')
             self.state = _read_state(self.parent_fd, self.path.name)
+            self._verify_named_storage()
             return self
         except BaseException:
             if self.lock_fd >= 0:
@@ -215,7 +457,55 @@ class LockedState:
     def commit(self):
         if self.state is None:
             raise CoordinationError("coordination state is unavailable")
-        _write_state(self.parent_fd, self.path.name, self.state)
+        _validate_state(self.state)
+        self._verify_named_storage()
+        _write_state(self.parent_fd, self.path.name, self.state, self.state_identity)
+        self.state_identity = self._state_metadata()
+        self._commit_history_marker()
+
+    def _read_lock_marker(self):
+        metadata, _, _ = _checked_file_metadata(self.lock_fd)
+        if metadata.st_size > len(HISTORY_MARKER):
+            raise CoordinationError('coordination lock has unknown contents')
+        raw = os.pread(self.lock_fd, len(HISTORY_MARKER) + 1, 0)
+        if not HISTORY_MARKER.startswith(raw):
+            raise CoordinationError('coordination lock has unknown contents')
+        return raw
+
+    def _commit_history_marker(self):
+        if self.lock_marker == HISTORY_MARKER:
+            return
+        if os.pwrite(self.lock_fd, HISTORY_MARKER, 0) != len(HISTORY_MARKER):
+            raise CoordinationError('coordination history marker commit is uncertain; preserve state and retry the same request')
+        os.ftruncate(self.lock_fd, len(HISTORY_MARKER))
+        os.fsync(self.lock_fd)
+        self.lock_marker = HISTORY_MARKER
+        self.lock_identity = _identity(os.fstat(self.lock_fd))
+        self._verify_named_storage()
+        os.fsync(self.parent_fd)
+
+    def _state_metadata(self):
+        try:
+            return os.stat(self.path.name, dir_fd=self.parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+
+    def _verify_named_storage(self):
+        descriptor = _open_directory(self.path.parent)
+        try:
+            _validate_parent_directory(descriptor)
+            opened, named = os.fstat(self.parent_fd), os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+                raise CoordinationError('coordination directory changed during access')
+        finally:
+            os.close(descriptor)
+        current = os.stat(self.path.name + '.lock', dir_fd=self.parent_fd, follow_symlinks=False)
+        if _identity(current) != self.lock_identity:
+            raise CoordinationError('coordination lock changed during access')
+        current = self._state_metadata()
+        if ((current is None) != (self.state_identity is None)
+                or (current is not None and _identity(current) != _identity(self.state_identity))):
+            raise CoordinationError('coordination state changed during access')
 
     def __exit__(self, exc_type, exc, traceback):
         if self.lock_fd >= 0:
@@ -267,7 +557,7 @@ def _safe_expected_count(value) -> int:
         expected = int(value)
     except (TypeError, ValueError) as exc:
         raise CoordinationError("reservation transition count is invalid") from exc
-    if expected < 0 or expected > 300:
+    if expected < 0 or expected > MAX_DESTINATIONS:
         raise CoordinationError("reservation transition count is invalid")
     return expected
 
@@ -291,66 +581,50 @@ def _normalize_destination(kind: str, value) -> str:
     return ""
 
 
+def _validate_state(state):
+    if (not isinstance(state, dict) or set(state) != {'version', 'claims', 'cycles'}
+            or type(state.get('version')) is not int or state['version'] != 1
+            or not isinstance(state.get('claims'), dict) or not isinstance(state.get('cycles'), dict)):
+        raise CoordinationError('coordination state structure is invalid; preserve its evidence')
+    if len(state['claims']) > MAX_CLAIMS or len(state['cycles']) > MAX_CYCLES:
+        raise CoordinationError('coordination state capacity is exhausted')
+    for key, row in state['claims'].items():
+        if (not isinstance(key, str) or not re.fullmatch(r'[a-f0-9]{64}:[a-f0-9]{64}', key)
+                or not isinstance(row, dict)
+                or set(row) - {'chain', 'destination', 'kind', 'group', 'group_rank', 'claimed_at', 'status', 'owner', 'lease_until'}):
+            raise CoordinationError('coordination claim is invalid; preserve its evidence')
+        chain, destination = key.split(':', 1)
+        if (row.get('chain') != chain or row.get('destination') != destination
+                or not isinstance(row.get('kind'), str) or row['kind'] not in ALLOWED_KINDS
+                or not isinstance(row.get('group'), str) or not re.fullmatch(r'[a-f0-9]{64}', row['group'])
+                or type(row.get('group_rank')) is not int or not 0 <= row['group_rank'] <= 4
+                or type(row.get('claimed_at')) is not int or not 0 <= row['claimed_at'] <= 253402300799
+                or row.get('status', 'committed') not in ('reserved', 'committed')):
+            raise CoordinationError('coordination claim is invalid; preserve its evidence')
+        if row.get('status') == 'reserved' and (
+                not isinstance(row.get('owner'), str) or not re.fullmatch(r'[a-f0-9]{64}', row['owner'])
+                or type(row.get('lease_until')) is not int or not row['claimed_at'] <= row['lease_until'] <= 253402300799):
+            raise CoordinationError('coordination reservation is invalid; preserve its evidence')
+    for key, row in state['cycles'].items():
+        if (not isinstance(key, str) or not re.fullmatch(r'[a-f0-9]{64}', key)
+                or not isinstance(row, dict) or set(row) != {'started_at', 'group_count', 'completed'}
+                or type(row.get('started_at')) is not int or not 0 <= row['started_at'] <= 253402300799
+                or type(row.get('group_count')) is not int or not 1 <= row['group_count'] <= 5
+                or not isinstance(row.get('completed'), list)
+                or any(type(rank) is not int or not 0 <= rank < row['group_count'] for rank in row['completed'])
+                or len(set(row['completed'])) != len(row['completed'])):
+            raise CoordinationError('coordination cycle is invalid or unavailable; preserve its evidence')
+
+
 def _prune(state, now: int):
-    def valid_claim(key, record):
-        if not isinstance(record, dict) or not re.fullmatch(r"[0-9a-f]{64}:[0-9a-f]{64}", str(key)):
-            return False
-        chain_hash, destination_hash = str(key).split(":", 1)
-        rank = record.get("group_rank")
-        if (
-            record.get("chain") != chain_hash
-            or record.get("destination") != destination_hash
-            or record.get("kind") not in ALLOWED_KINDS
-            or not re.fullmatch(r"[0-9a-f]{64}", str(record.get("group", "")))
-            or isinstance(rank, bool)
-            or not isinstance(rank, int)
-            or rank < 0
-            or rank > 4
-            or not isinstance(record.get("claimed_at"), int)
-            or isinstance(record.get("claimed_at"), bool)
-            or record["claimed_at"] < now - CLAIM_RETENTION_SECONDS
-        ):
-            return False
-        if record.get("status", "committed") == "committed":
-            return True
-        return (
-            record.get("status") == "reserved"
-            and isinstance(record.get("lease_until"), int)
-            and not isinstance(record.get("lease_until"), bool)
-            and record["lease_until"] >= now
-            and re.fullmatch(r"[0-9a-f]{64}", str(record.get("owner", ""))) is not None
-        )
-
-    def valid_cycle(key, record):
-        if not isinstance(record, dict) or not re.fullmatch(r"[0-9a-f]{64}", str(key)):
-            return False
-        group_count = record.get("group_count")
-        completed = record.get("completed")
-        return (
-            isinstance(record.get("started_at"), int)
-            and not isinstance(record.get("started_at"), bool)
-            and record["started_at"] >= now - CYCLE_RETENTION_SECONDS
-            and isinstance(group_count, int)
-            and not isinstance(group_count, bool)
-            and 1 <= group_count <= 5
-            and isinstance(completed, list)
-            and all(
-                isinstance(rank, int)
-                and not isinstance(rank, bool)
-                and 0 <= rank < group_count
-                for rank in completed
-            )
-        )
-
-    state["claims"] = {
-        key: record
-        for key, record in state["claims"].items()
-        if valid_claim(key, record)
+    state['claims'] = {
+        key: row for key, row in state['claims'].items()
+        if row['claimed_at'] >= now - CLAIM_RETENTION_SECONDS
+        and (row.get('status', 'committed') != 'reserved' or row['lease_until'] >= now)
     }
-    state["cycles"] = {
-        key: record
-        for key, record in state["cycles"].items()
-        if valid_cycle(key, record)
+    state['cycles'] = {
+        key: row for key, row in state['cycles'].items()
+        if row['started_at'] >= now - CYCLE_RETENTION_SECONDS
     }
 
 
@@ -454,7 +728,7 @@ def claim_destination_sets(
                 kind_originals[item] = str(value).strip()
                 normalized.append(item)
         total += len(normalized)
-        if total > 3120:
+        if total > MAX_DESTINATIONS:
             raise CoordinationError("destination set capacity is exhausted")
         normalized_sets[kind] = normalized
         originals[kind] = kind_originals
@@ -601,8 +875,8 @@ def _request_from_stdin():
     if len(raw) > MAX_REQUEST_BYTES:
         raise CoordinationError("coordination request is too large")
     try:
-        request = json.loads(raw.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as exc:
+        request = _json(raw.decode("utf-8"))
+    except (UnicodeError, CoordinationError) as exc:
         raise CoordinationError("coordination request is invalid") from exc
     if not isinstance(request, dict):
         raise CoordinationError("coordination request must be an object")
@@ -610,6 +884,17 @@ def _request_from_stdin():
 
 
 def main():
+    if len(sys.argv) in (4, 5) and sys.argv[1] == '--legacy-history':
+        found = legacy_alert_history(Path(sys.argv[3]), sys.argv[2], sys.argv[4] if len(sys.argv) == 5 else '')
+        return 0 if sys.argv[2] != 'contains' or found else 1
+    if len(sys.argv) == 4 and sys.argv[1] == '--hold-lock':
+        try:
+            wait_seconds = int(sys.argv[3])
+        except ValueError as error:
+            raise CoordinationError('worker lock wait is invalid') from error
+        return hold_worker_lock(Path(sys.argv[2]), wait_seconds)
+    if len(sys.argv) != 1:
+        raise CoordinationError('coordination arguments are invalid')
     request = _request_from_stdin()
     operation = str(request.get("op") or "")
     path = DEFAULT_STATE_FILE
@@ -664,4 +949,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except (CoordinationError, OSError) as exc:
         print(f"NWS delivery coordination failed: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(2 if sys.argv[1:2] == ['--legacy-history'] else 1)

@@ -30,7 +30,8 @@ import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sls_nws_delivery_claims import _open_directory, _validate_parent_directory, _secure_file_metadata
+from sls_nws_delivery_claims import (_open_directory, _validate_parent_directory, _secure_file_metadata,
+                                     _checked_file_metadata, _account_ids, _identity)
 from sls_nws_status import mutate_status, reconcile_status
 from sls_cluster_guard import runtime_running
 
@@ -48,10 +49,20 @@ DISPATCH_SECONDS = 3300
 DELIVERY_SECONDS = 3200
 DELIVERY_STOP_GRACE = 2
 QUEUE_MAX_AGE = 3600
+HISTORY_MARKER = b'SLS_WEATHER_OUTBOX_V1\n'
 
 
 class WeatherQueueCapacityError(RuntimeError):
     """Capacity failures safe to display without exposing notification bodies."""
+
+
+def strict_json(raw):
+    try:
+        return json.loads(raw, object_pairs_hook=_config_crypto._pairs,
+                          parse_constant=_config_crypto._invalid_constant,
+                          parse_float=_config_crypto._finite_float)
+    except RecursionError as error:
+        raise ValueError('Weather JSON nesting exceeds its limit') from error
 
 
 def compact_terminal_history(data, now):
@@ -132,12 +143,31 @@ def validate_collection(value):
         if not isinstance(feature, dict) or not isinstance(feature.get('properties'), dict):
             raise ValueError('Malformed Weather.gov feature')
         props = feature['properties']
+        for name, limit in [('id', 4096), ('event', 120), ('severity', 32), ('status', 32), ('messageType', 32)]:
+            field = props.get(name)
+            if field is not None and (not isinstance(field, str) or len(field.encode('utf-8')) > limit
+                    or re.search(r'[\x00-\x1f\x7f]', field)):
+                raise ValueError('Weather.gov identity/status field is invalid: ' + name)
+        if props.get('status') == 'Actual' and props.get('messageType') not in {'Alert', 'Update', 'Cancel'}:
+            raise ValueError('Weather.gov actual alert message type is invalid')
+        identifier = feature.get('id')
+        if identifier is not None and (not isinstance(identifier, str) or len(identifier.encode('utf-8')) > 4096
+                or re.search(r'[\x00-\x1f\x7f]', identifier)):
+            raise ValueError('Weather.gov feature identity is invalid')
         if props.get('status') == 'Actual' and props.get('messageType') != 'Cancel':
             if not (feature.get('id') or props.get('id')) or not props.get('event') or not timestamp(props.get('expires')):
                 raise ValueError('Weather.gov alert is missing identity or expiration')
         if not isinstance(props.get('references') or [], list):
             raise ValueError('Weather.gov alert references are malformed')
-        if len(json.dumps(feature)) > 256 * 1024:
+        for reference in props.get('references') or []:
+            if not isinstance(reference, dict):
+                raise ValueError('Weather.gov alert reference is not an object')
+            for name in ['identifier', '@id', 'sent']:
+                field = reference.get(name)
+                if field is not None and (not isinstance(field, str) or len(field.encode('utf-8')) > 4096
+                        or re.search(r'[\x00-\x1f\x7f]', field)):
+                    raise ValueError('Weather.gov alert reference identity is invalid')
+        if len(json.dumps(feature, allow_nan=False)) > 256 * 1024:
             raise ValueError('Weather.gov feature size limit exceeded')
     return value['features']
 
@@ -146,12 +176,18 @@ def read_json_at(directory_fd, name, maximum=MAX_BYTES):
     fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory_fd)
     with os.fdopen(fd, 'r', encoding='utf-8') as handle:
         metadata = os.fstat(handle.fileno())
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > maximum:
+        owner, group = _account_ids()
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > maximum
+                or metadata.st_uid not in (0, owner) or metadata.st_gid not in (0, group)
+                or stat.S_IMODE(metadata.st_mode) not in (0o600, 0o640, 0o644)):
             raise RuntimeError('Weather queue file is unsafe or oversized')
         raw = handle.read(maximum + 1)
         if len(raw.encode()) > maximum:
             raise RuntimeError('Weather queue file exceeds capacity')
-        return _config_crypto.decode_config(raw) if name.endswith(".config") else json.loads(raw)
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if _identity(metadata) != _identity(os.fstat(handle.fileno())) or _identity(metadata) != _identity(named):
+            raise RuntimeError('Weather queue file changed during its bounded read')
+        return _config_crypto.decode_config(raw) if name.endswith(".config") else strict_json(raw)
 
 
 def write_gate(group_id, row, events, now):
@@ -175,6 +211,58 @@ def write_gate(group_id, row, events, now):
         os.close(directory_fd)
 
 
+def state_metadata(parent):
+    try:
+        return os.stat('weather-delivery.json', dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def verify_parent(path, descriptor):
+    named = _open_directory(Path(path))
+    try:
+        _validate_parent_directory(named)
+        opened, current = os.fstat(descriptor), os.fstat(named)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise RuntimeError('Weather queue directory changed during access')
+    finally:
+        os.close(named)
+
+
+def lock_marker(descriptor):
+    metadata, _, _ = _checked_file_metadata(descriptor)
+    if metadata.st_size > len(HISTORY_MARKER):
+        raise RuntimeError('Weather queue lock has unknown contents')
+    raw = os.pread(descriptor, len(HISTORY_MARKER) + 1, 0)
+    if not HISTORY_MARKER.startswith(raw):
+        raise RuntimeError('Weather queue lock has unknown contents')
+    return raw
+
+
+def validate_state(data):
+    if (not isinstance(data, dict) or type(data.get('schema')) is not int or data['schema'] != 1
+            or not isinstance(data.get('jobs'), dict) or not isinstance(data.get('snapshots'), dict)
+            or any(not isinstance(row, dict) for row in data['jobs'].values())
+            or any(not isinstance(row, dict) for row in data['snapshots'].values())):
+        raise RuntimeError('Weather queue state is corrupt; preserve it before repair')
+
+
+def commit_history_marker(directory, parent, descriptor, previous):
+    if previous == HISTORY_MARKER:
+        return
+    if lock_marker(descriptor) != previous:
+        raise RuntimeError('Weather queue history marker changed before commit')
+    if os.pwrite(descriptor, HISTORY_MARKER, 0) != len(HISTORY_MARKER):
+        raise RuntimeError('Weather queue history marker commit is uncertain; retry the same request')
+    os.ftruncate(descriptor, len(HISTORY_MARKER))
+    os.fsync(descriptor)
+    verify_parent(directory, parent)
+    named = os.stat('weather-delivery.lock', dir_fd=parent, follow_symlinks=False)
+    if _identity(os.fstat(descriptor)) != _identity(named):
+        raise RuntimeError('Weather queue history lock changed during marker commit')
+    os.fsync(parent)
+
+
 @contextmanager
 def state_lock(directory=DATA, write=True):
     directory_fd = _open_directory(Path(directory))
@@ -182,7 +270,7 @@ def state_lock(directory=DATA, write=True):
         _validate_parent_directory(directory_fd)
         fd = os.open('weather-delivery.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o640, dir_fd=directory_fd)
         with os.fdopen(fd, 'a+') as handle:
-            _secure_file_metadata(handle.fileno())
+            lock_marker(handle.fileno())
             lock_deadline = time.monotonic() + 2
             while True:
                 try:
@@ -192,15 +280,33 @@ def state_lock(directory=DATA, write=True):
                     if time.monotonic() >= lock_deadline:
                         raise RuntimeError('Weather queue state is busy; retry on the next worker cycle')
                     time.sleep(0.01)
+            named = os.stat('weather-delivery.lock', dir_fd=directory_fd, follow_symlinks=False)
+            if _identity(os.fstat(handle.fileno())) != _identity(named):
+                raise RuntimeError('Weather queue lock changed during acquisition')
+            marker = lock_marker(handle.fileno())
+            _secure_file_metadata(handle.fileno())
+            lock_identity = _identity(os.fstat(handle.fileno()))
+            verify_parent(directory, directory_fd)
+            before = state_metadata(directory_fd)
             try:
                 data = read_json_at(directory_fd, 'weather-delivery.json')
             except FileNotFoundError:
+                if marker:
+                    raise RuntimeError('Established Weather queue history is missing; restore reviewed evidence') from None
                 data = {'schema': 1, 'jobs': {}, 'snapshots': {}}
-            if not isinstance(data, dict) or data.get('schema') != 1 or not isinstance(data.get('jobs'), dict) or not isinstance(data.get('snapshots'), dict):
-                raise RuntimeError('Weather queue state is corrupt')
+            validate_state(data)
+            previous = json.dumps(data, separators=(',', ':'), allow_nan=False).encode()
             yield data
+            verify_parent(directory, directory_fd)
+            named = os.stat('weather-delivery.lock', dir_fd=directory_fd, follow_symlinks=False)
+            current = state_metadata(directory_fd)
+            if (_identity(os.fstat(handle.fileno())) != lock_identity or _identity(named) != lock_identity
+                    or (current is None) != (before is None)
+                    or (current is not None and _identity(current) != _identity(before))):
+                raise RuntimeError('Weather queue storage changed before commit; evidence was preserved')
             if not write:
                 return
+            validate_state(data)
             compact_terminal_history(data, time.time())
             encoded = json.dumps(data, separators=(',', ':'), allow_nan=False).encode()
             if len(encoded) > MAX_BYTES:
@@ -208,14 +314,25 @@ def state_lock(directory=DATA, write=True):
                     f'Weather queue state requires {len(encoded) / 1048576:.2f} MiB; '
                     f'the limit is {MAX_BYTES / 1048576:.0f} MiB. '
                     'This state update was not saved. Review the weather backlog and storage health.')
+            if before is not None and encoded == previous:
+                commit_history_marker(directory, directory_fd, handle.fileno(), marker)
+                return
             name = '.weather-delivery-' + os.urandom(12).hex()
             out = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640, dir_fd=directory_fd)
             try:
                 with os.fdopen(out, 'wb') as target:
                     _secure_file_metadata(target.fileno())
-                    target.write(encoded); target.flush(); os.fsync(target.fileno())
+                    if target.write(encoded) != len(encoded):
+                        raise RuntimeError('Weather queue state write could not complete')
+                    target.flush(); os.fsync(target.fileno())
+                current = state_metadata(directory_fd)
+                if ((current is None) != (before is None)
+                        or (current is not None and _identity(current) != _identity(before))):
+                    raise RuntimeError('Weather queue state changed before replacement')
+                verify_parent(directory, directory_fd)
                 os.rename(name, 'weather-delivery.json', src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
                 os.fsync(directory_fd)
+                commit_history_marker(directory, directory_fd, handle.fileno(), marker)
             finally:
                 try:
                     os.unlink(name, dir_fd=directory_fd)
@@ -256,7 +373,7 @@ def enqueue_lightning(group_id, key, payload, directory=DATA):
 def groups():
     result = subprocess.run([str(RUNTIME / 'sls_mass_notify_weather_poll.sh'), '--groups-json'],
                             capture_output=True, text=True, timeout=15, check=True)
-    records = json.loads(result.stdout)
+    records = strict_json(result.stdout)
     if not isinstance(records, list) or len(records) > 5 or any(not isinstance(row, list) or len(row) != 11 for row in records):
         raise RuntimeError('Invalid configured Weather groups')
     return {row[0]: row for row in records}
@@ -277,7 +394,7 @@ def fetch_zone(zone):
         result = subprocess.run(['/usr/bin/curl', '-fsS', '--connect-timeout', '12', '--max-time', '20',
             '--retry', '1', '--retry-max-time', '45', '--max-filesize', '10485760',
             '-H', 'Accept: application/geo+json', '-H',
-            'User-Agent: SLS-Mass-Notify/0.1.6-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)',
+            'User-Agent: SLS-Mass-Notify/0.1.7-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)',
             'https://api.weather.gov/alerts/active?zone=' + zone + '&status=actual'], capture_output=True, timeout=50, check=False)
     except subprocess.TimeoutExpired:
         raise WeatherPollError('Weather.gov request exceeded its retry deadline; check PBX DNS and connectivity.') from None
@@ -297,18 +414,18 @@ def fetch_zone(zone):
         else:
             message = 'Weather.gov request failed (curl code ' + str(int(result.returncode)) + '); check PBX connectivity.'
         raise WeatherPollError(message)
-    return validate_collection(json.loads(result.stdout))
+    return validate_collection(strict_json(result.stdout))
 
 
-def current_channel_snapshot(provider, group_id):
+def current_configuration():
+    path = Path(os.environ.get('CONFIG_FILE', str(DATA / 'mass-notifications.config')))
+    return _config_crypto.read_config(path)
+
+
+def current_channel_snapshot(provider, group_id, config=None):
     from sls_notification_destinations import _source_group
     from sls_weather_channels import snapshot
-    path = Path(os.environ.get('CONFIG_FILE', str(DATA / 'mass-notifications.config')))
-    descriptor = _open_directory(path.parent)
-    try:
-        config = read_json_at(descriptor, path.name, _config_crypto.MAX_FILE_BYTES)
-    finally:
-        os.close(descriptor)
+    config = current_configuration() if config is None else config
     group = _source_group(config, {'provider': provider, 'group_id': group_id})
     return snapshot(config, group or {})
 
@@ -346,6 +463,12 @@ def observe_nws():
                     by_chain[key] = feature
         active = list(by_chain.values())
         group_capacity_failures = []
+        from sls_weather_channels import desktop_snapshot
+        config = current_configuration()
+        routing = {'phones': row[3].split(','), 'desktops': row[4].split(','),
+                   'desktop_client_ids': desktop_snapshot(config, row[4].split(',')),
+                   'emails': row[5].split(), 'webhooks': row[10].split(','),
+                   'channels': current_channel_snapshot('nws', group_id, config)}
         with state_lock() as data:
             previous = copy.deepcopy(data)
             data['snapshots'] = {k: v for k, v in data['snapshots'].items() if k in configured}
@@ -362,9 +485,7 @@ def observe_nws():
                 try:
                     enqueue_locked(data, 'nws', group_id, alert_key(feature), {
                         'zone': row[2], 'feature': feature,
-                        'routing_snapshot': {'phones': row[3].split(','), 'desktops': row[4].split(','),
-                                             'emails': row[5].split(), 'webhooks': row[10].split(','),
-                                             'channels': current_channel_snapshot('nws', group_id)},
+                        'routing_snapshot': routing,
                     }, now, priority(feature))
                 except WeatherQueueCapacityError as error:
                     if str(error) not in group_capacity_failures:
@@ -486,11 +607,14 @@ def dispatch_nws(job_id, job):
     for index, name, separator in ((3, 'phones', ','), (4, 'desktops', ','), (5, 'emails', ' '), (10, 'webhooks', ',')):
         original = {str(value).lower() for value in snapshot.get(name, []) if value}
         row[index] = separator.join(value for value in row[index].split(separator) if value and value.lower() in original)
+    from sls_weather_channels import authorized_desktops
+    row[4] = ','.join(authorized_desktops(current_configuration(), row[4].split(','), snapshot.get('desktop_client_ids')))
     channels = snapshot.get('channels') or {'voice_recipient_ids':[], 'sms_recipient_ids':[], 'fingerprints':{}}
     if not any(row[index] for index in (3, 4, 5, 10)) and not (channels['voice_recipient_ids'] or channels['sms_recipient_ids']):
         return 'cancelled', 'Original Weather recipients were removed or disabled.'
     cycle_id = 'nws_' + os.urandom(16).hex()
     env = nws_environment(row, cycle_id)
+    env['SLS_DESKTOP_CLIENT_IDS_SNAPSHOT'] = json.dumps(snapshot.get('desktop_client_ids') or {}, separators=(',', ':'))
     env['SLS_WEATHER_CHANNEL_SNAPSHOT'] = json.dumps(channels, separators=(',',':'))
     env['SLS_WORKER_DEADLINE_EPOCH'] = str(int(job.get('deadline_at', time.time() + DELIVERY_SECONDS)))
     subprocess.run([str(RUNTIME / 'sls_nws_delivery_claims.py')], input=json.dumps(
@@ -511,16 +635,25 @@ def dispatch_nws(job_id, job):
 
 @contextmanager
 def singleton(name):
+    if name not in {'weather-observation.lock', 'weather-dispatch-worker.lock', 'weather-external-worker.lock'}:
+        raise ValueError('Invalid Weather worker lock')
     fd = _open_directory(DATA)
     try:
         _validate_parent_directory(fd)
         lock = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o640, dir_fd=fd)
         with os.fdopen(lock, 'a+') as handle:
-            _secure_file_metadata(handle.fileno())
+            metadata, _, _ = _checked_file_metadata(handle.fileno())
+            if metadata.st_size != 0:
+                raise RuntimeError('Weather worker lock has unknown contents')
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 yield False; return
+            named = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if _identity(os.fstat(handle.fileno())) != _identity(named):
+                raise RuntimeError('Weather worker lock changed during acquisition')
+            _secure_file_metadata(handle.fileno())
+            verify_parent(DATA, fd)
             yield True
     finally:
         os.close(fd)
@@ -545,7 +678,7 @@ def retry_pending_external():
                 env=dict(os.environ, SLS_NOTIFICATION_LIVE='1', SLS_NOTIFICATION_TEST='0',
                     SLS_NOTIFICATION_DRY_RUN='0', SLS_DESTINATION_SOURCE=source, SLS_EXTERNAL_RETRY_ONLY='1'),
                 timeout=45, capture_output=True, text=True)
-            outcome = json.loads(result.stdout) if len(result.stdout) <= 256 * 1024 else {}
+            outcome = strict_json(result.stdout) if len(result.stdout) <= 256 * 1024 else {}
             failed = result.returncode not in {0, 1} or not isinstance(outcome, dict) or outcome.get('pending', -1) < 0
             uncertain = int(outcome.get('uncertain', 0)) if isinstance(outcome, dict) else 0
             pending = int(outcome.get('pending', 0)) if isinstance(outcome, dict) else 0
@@ -655,14 +788,9 @@ def webhook_audience_aliases():
     from urllib.parse import urlsplit, urlunsplit
     from sls_notification_destinations import _destination_rows
     path = Path(os.environ.get('CONFIG_FILE', str(DATA / 'mass-notifications.config')))
-    descriptor = _open_directory(path.parent)
-    try:
-        try:
-            config = read_json_at(descriptor, path.name, _config_crypto.MAX_FILE_BYTES)
-        except FileNotFoundError:
-            return {}
-    finally:
-        os.close(descriptor)
+    if not path.exists() and not path.is_symlink():
+        return {}
+    config = _config_crypto.read_config(path)
     aliases = {}
     for row in _destination_rows(config, 'discord') + _destination_rows(config, 'generic'):
         try:
@@ -933,12 +1061,7 @@ def runtime_enabled():
 
 
 def services_enabled():
-    path = Path(os.environ.get('CONFIG_FILE', str(DATA / 'mass-notifications.config')))
-    fd = _open_directory(path.parent)
-    try:
-        config = read_json_at(fd, path.name, _config_crypto.MAX_FILE_BYTES)
-    finally:
-        os.close(fd)
+    config = current_configuration()
     if not isinstance(config, dict) or not isinstance(config.get('xweather', {}), dict):
         raise ValueError('Invalid weather service configuration')
     enabled = lambda value: str(value).lower() in {'1', 'true', 'yes', 'on'}

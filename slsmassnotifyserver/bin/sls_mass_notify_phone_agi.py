@@ -38,18 +38,46 @@ class PhoneAgi:
     def __init__(self, source=sys.stdin, target=sys.stdout):
         self.source = source
         self.target = target
+        self.buffer = bytearray()
         self.environment = {}
+        deadline = time.monotonic() + 5
         for _ in range(128):
-            line = self.source.readline(4097)
-            if len(line) > 4096:
-                raise PhoneAdmissionError('phone_agi_environment_invalid')
-            if not line or line in ('\n', '\r\n'):
+            line = self.line(4096, deadline, 'phone_agi_environment_invalid')
+            if not line:
                 break
             key, separator, value = line.partition(':')
-            if separator:
-                self.environment[key.strip()] = value.strip()
+            key = key.strip()
+            if not separator or not key or key in self.environment:
+                raise PhoneAdmissionError('phone_agi_environment_invalid')
+            self.environment[key] = value.strip()
         else:
             raise PhoneAdmissionError('phone_agi_environment_invalid')
+
+    def line(self, maximum, deadline, invalid):
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PhoneAdmissionError('phone_agi_response_timeout')
+            separator = self.buffer.find(b'\n')
+            if separator >= 0:
+                if separator > maximum:
+                    raise PhoneAdmissionError(invalid)
+                raw = bytes(self.buffer[:separator])
+                del self.buffer[:separator + 1]
+                try:
+                    return raw.decode('utf-8').rstrip('\r')
+                except UnicodeDecodeError:
+                    raise PhoneAdmissionError(invalid) from None
+            if len(self.buffer) > maximum:
+                raise PhoneAdmissionError(invalid)
+            descriptor = self.source.fileno()
+            ready, _, _ = select.select([descriptor], [], [], remaining)
+            if not ready:
+                raise PhoneAdmissionError('phone_agi_response_timeout')
+            chunk = os.read(descriptor, min(4096, maximum + 1 - len(self.buffer)))
+            if not chunk:
+                raise PhoneAdmissionError(invalid)
+            self.buffer.extend(chunk)
 
     @staticmethod
     def quote(value):
@@ -59,12 +87,10 @@ class PhoneAgi:
         return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
     def command(self, value, timeout=2):
+        deadline = time.monotonic() + timeout
         self.target.write(value + '\n'); self.target.flush()
-        ready, _, _ = select.select([self.source], [], [], timeout)
-        if not ready:
-            raise PhoneAdmissionError('phone_agi_response_timeout')
-        result = self.source.readline(131073).rstrip('\r\n')
-        if len(result) > 131072 or not result.startswith('200 result='):
+        result = self.line(131072, deadline, 'phone_agi_response_invalid')
+        if not result.startswith('200 result='):
             raise PhoneAdmissionError('phone_agi_response_invalid')
         return result
 

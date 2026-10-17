@@ -2,10 +2,13 @@
 
 declare(strict_types=1);
 
+require_once dirname(__DIR__) . '/slsmassnotifyserver/ImmediateSettings.php';
+
 // Extract only the production locking/wrapper methods: no FreePBX bootstrap,
 // installed config access, worker launch, or channel delivery is possible here.
-$classPath = $argv[1] ?? dirname(__DIR__) . '/slsmassnotifyserver/Slsmassnotifyserver.class.php';
-$traitPath = $argv[2] ?? dirname(__DIR__) . '/slsmassnotifyserver/AnnouncementDelivery.php';
+$classPath = dirname(__DIR__) . '/slsmassnotifyserver/Slsmassnotifyserver.class.php';
+$traitPath = dirname(__DIR__) . '/slsmassnotifyserver/AnnouncementDelivery.php';
+if ($argc !== 1) { throw new RuntimeException('This regression accepts no source-path arguments.'); }
 $classSource = file_get_contents($classPath);
 $traitSource = file_get_contents($traitPath);
 $extract = static function (string $source, string $method): string {
@@ -28,6 +31,8 @@ $methods .= $extract($traitSource, 'executeResolvedAnnouncement');
 eval('class AnnouncementActivityFixture {
     const ANNOUNCEMENT_ACTIVITY_LOCK_FILE = ' . var_export($directory . '/activity.lock', true) . ';
     const SETTINGS_LOCK = ' . var_export($directory . '/settings.lock', true) . ';
+    const SETTINGS_JSON = ' . var_export($directory . '/active.config', true) . ';
+    const PENDING_SETTINGS_JSON = ' . var_export($directory . '/pending.config', true) . ';
     private $settingsActivityLocks = [];
     public $executions = 0;
     public $failExecution = false;
@@ -46,8 +51,6 @@ require_once dirname(__DIR__).'/slsmassnotifyserver/EnterpriseAdministration.php
 class EnterpriseActivityFixture extends AnnouncementActivityFixture
 {
     use \FreePBX\modules\SlsEnterpriseAdministration;
-    const SETTINGS_JSON = 'inert-active-fixture';
-    const PENDING_SETTINGS_JSON = 'inert-pending-fixture';
     public array $settings=['unrelated'=>'preserved'];
     public int $writes=0;
     protected function assertEnterpriseAdministrator(): array { return ['username'=>'fixture']; }
@@ -55,7 +58,15 @@ class EnterpriseActivityFixture extends AnnouncementActivityFixture
     public function loadSettingsFile($path): array { return $this->settings; }
     public function normalizeSettings(array $settings): array { return $settings; }
     public function configurationPathMetadata($path) { return null; }
-    public function writeSettingsFileUnlocked($path,array $settings,$backup): void { $this->settings=$settings;$this->writes++; }
+    public function writeSettingsFileUnlocked($path,array $settings,$backup): void {
+        $encoded=\FreePBX\modules\SlsConfigCrypto::encode($settings);
+        $temporary=$path.'.fixture-' . bin2hex(random_bytes(8));
+        if(file_put_contents($temporary,$encoded,LOCK_EX)!==strlen($encoded)||!chmod($temporary,0600)||!rename($temporary,$path)){
+            if(is_file($temporary)||is_link($temporary)){@unlink($temporary);}
+            throw new RuntimeException('Unable to persist the isolated settings fixture.');
+        }
+        $this->settings=$settings;$this->writes++;
+    }
     public function rememberSettingsFingerprint($path): void {}
 }
 
@@ -68,6 +79,11 @@ $one = new AnnouncementActivityFixture();
 $two = new AnnouncementActivityFixture();
 $handles = [];
 try {
+    $initial=\FreePBX\modules\SlsConfigCrypto::encode(['unrelated'=>'preserved']);
+    if(file_put_contents(AnnouncementActivityFixture::SETTINGS_JSON,$initial,LOCK_EX)!==strlen($initial)
+        ||!chmod(AnnouncementActivityFixture::SETTINGS_JSON,0600)){
+        throw new RuntimeException('Unable to create the isolated active configuration.');
+    }
     $handles['first'] = $one->acquireAnnouncementActivityLock(false);
     $start = microtime(true);
     $handles['second'] = $two->acquireAnnouncementActivityLock(false);
@@ -159,7 +175,7 @@ try {
     echo 'Announcement activity locking: ' . $checks . " checks passed.\n";
 } finally {
     foreach ($handles as $handle) { if (is_resource($handle)) { flock($handle, LOCK_UN); fclose($handle); } }
-    foreach (['settings.lock', 'activity.lock'] as $name) {
+    foreach (['settings.lock', 'activity.lock', 'active.config', 'pending.config', '.sls-immediate-settings-transaction.json'] as $name) {
         if (file_exists($directory . '/' . $name) || is_link($directory . '/' . $name)) { unlink($directory . '/' . $name); }
     }
     rmdir($directory);

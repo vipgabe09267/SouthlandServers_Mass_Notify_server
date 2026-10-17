@@ -24,6 +24,13 @@ import tempfile
 import time
 import unittest
 
+if os.environ.get('SLS_TEST_NAMESPACE') != 'entered' or any(
+    os.environ.get('SLS_TEST_PARENT_' + label + '_NS') in
+    (None, '', os.readlink('/proc/self/ns/' + kind))
+    for label, kind in [('MOUNT', 'mnt'), ('NET', 'net'), ('PID', 'pid')]
+):
+    raise SystemExit('Use the private fixture runner; no desktop state or web server was changed.')
+
 ROOT = Path(__file__).resolve().parents[1]
 DATA = Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin')
 
@@ -31,9 +38,6 @@ DATA = Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin')
 class DesktopHttpFleetTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        parent = os.environ.get('SLS_TEST_PARENT_NET_NS') or os.environ.get('SLS_BUILD_PARENT_NET')
-        if not parent or parent == os.readlink('/proc/self/ns/net'):
-            raise RuntimeError('Run this HTTP fleet test through tools/run_isolated_tests.sh or the isolated release gate.')
         subprocess.run(['ip','link','set','lo','up'],check=True,timeout=5)
         cls.count=int(os.environ.get('SLS_FLEET_CLIENTS','25'))
         if not 2 <= cls.count <= 1000: raise RuntimeError('Fixture client count must be 2–1000.')
@@ -124,7 +128,7 @@ php_admin_value error_log "{cls.server_root}/php-error.log"
         raw=subprocess.check_output(['php',str(encrypt),str(cls.count),str(cls.port)],timeout=5)
         cls.write_state('mass-notifications.config',raw);cls.events([])
         cls.write_state('phone-endpoint-inventory.json',json.dumps({'schema':1,'display_only':True,
-            'observed_at':dt.datetime.now(dt.timezone.utc).isoformat(),'expires_at':time.time()+90,
+            'observed_at':dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'),'expires_at':time.time()+90,
             'endpoints':{'1000':{'formats':['yealink'],'contacts':[{'format':'yealink'}]}}}).encode())
         cls.context=ssl.create_default_context(cafile=str(cert))
         cls.process=subprocess.Popen(['/usr/sbin/apache2','-f',str(config),'-DFOREGROUND'],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,start_new_session=True)
@@ -160,9 +164,9 @@ php_admin_value error_log "{cls.server_root}/php-error.log"
 
     @classmethod
     def event(cls,name,recipients):
-        return {'id':name,'schema_version':1,'kind':'announcement','is_test':True,'created_at':dt.datetime.now(dt.timezone.utc).isoformat(),
+        return {'id':name,'schema_version':1,'kind':'announcement','is_test':True,'created_at':dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'),
                 'title':'Private synthetic fixture','message':'No production delivery','desktop_enabled':True,'desktop_all':False,
-                'desktop_recipients':recipients,'display_timeout_seconds':30}
+                'desktop_recipients':recipients,'desktop_client_ids':{name:name for name in recipients},'display_timeout_seconds':30}
 
     @classmethod
     def request(cls,client,path='/api/sipnotify/desktop',payload=None,raw=False):

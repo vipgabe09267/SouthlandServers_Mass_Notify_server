@@ -15,6 +15,9 @@ namespace {
     $settings = ['enabled' => '1', 'setup' => ['complete' => '1'],
         'control_api' => ['api_key' => 'fixture-private-credential'],
         'mail_from_domain' => 'fixture.invalid', 'system_notification_emails' => '',
+	    'xweather' => ['enabled' => '1'],
+	    'announcement_sms' => ['enabled' => true],
+	    'outbound_voice' => ['enabled' => '1'],
         'scheduled_announcements' => [['id' => 'fixture', 'enabled' => '1']]];
     $plain = json_encode(['product' => 'Southland Servers Mass Notifications Server',
         'format' => 'sls-mass-notify-config-v1', 'exported_at' => '2026-09-22T00:00:00Z', 'settings' => $settings]);
@@ -25,6 +28,12 @@ namespace {
     check(Crypto::decode($sealed, $password) === json_decode($plain, true), 'Encrypted round trip changed configuration.');
     check(Crypto::decode($plain) === json_decode($plain, true), 'Legacy export compatibility broken.');
     check(Crypto::decode(json_encode($settings)) === $settings, 'Bare central configuration compatibility broken.');
+    foreach (['{"format":"sls-mass-notify-config-v1","settings":{"enabled":"0","enabled":"1"}}',
+        '{"format":"sls-mass-notify-config-v1","settings":{"nested":{"value":1e309}}}'] as $ambiguous) {
+        rejected(fn() => Crypto::decode($ambiguous), 'Ambiguous portable configuration was accepted.');
+        $authenticated = Crypto::encrypt($ambiguous, $password);
+        rejected(fn() => Crypto::decode($authenticated, $password), 'An authenticated tag allowed ambiguous configuration fields.');
+    }
     rejected(fn() => Crypto::decode($sealed, 'incorrect fixture words'), 'Wrong password was accepted.');
     foreach (['salt', 'nonce', 'ciphertext'] as $field) {
         $bad = json_decode($sealed, true);
@@ -81,7 +90,12 @@ namespace {
         check(!$result['success'] && $module->staged === null, 'Failed authentication staged settings.');
         check(strpos(json_encode($module->progress), $password) === false, 'Passphrase retained in progress state.');
         $result = $module->importConfigUpload($upload, $password);
-        $expected = $settings; $expected['scheduled_announcements'][0]['enabled'] = '0';
+	        $expected = $settings;
+	        $expected['enabled'] = '0';
+	        $expected['xweather']['enabled'] = '0';
+	        $expected['announcement_sms']['enabled'] = false;
+	        $expected['outbound_voice']['enabled'] = '0';
+	        $expected['scheduled_announcements'][0]['enabled'] = '0';
         check($result['success'] && $module->staged === $expected, 'Authenticated import lost config or re-enabled schedules.');
         $module->staged = null; file_put_contents($file, $plain); $upload['size'] = strlen($plain);
         check($module->importConfigUpload($upload)['success'] && $module->staged === $expected, 'Legacy import no longer stages safely.');

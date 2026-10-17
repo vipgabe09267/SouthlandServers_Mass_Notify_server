@@ -137,11 +137,11 @@ final class IncidentConfig
     }
     public static function delivery($value): array
     {
-        $row = self::object($value, ['extensions', 'desktop_clients', 'group_ids', 'voice_recipient_ids', 'webhook_ids', 'email_recipient_ids', 'sms_recipient_ids', 'audio_mode', 'opening_tone', 'closing_tone', 'style', 'background_color'], 'Incident delivery');
+        $row = self::object($value, ['extensions', 'desktop_clients', 'group_ids', 'voice_recipient_ids', 'webhook_ids', 'email_recipient_ids', 'sms_recipient_ids', 'browser_recipient_ids', 'connector_ids', 'audio_mode', 'opening_tone', 'closing_tone', 'style', 'background_color'], 'Incident delivery');
         $out = [];
         foreach (['extensions' => '/^[0-9]{1,20}$/D', 'desktop_clients' => '/^[A-Za-z0-9_.@-]{1,80}$/D',
-            'group_ids' => '/^[A-Za-z0-9_-]{1,64}$/D', 'voice_recipient_ids' => '/^voice_[a-f0-9]{24}$/D', 'webhook_ids' => '/^[A-Za-z0-9_-]{1,64}$/D', 'email_recipient_ids' => '/^email_[a-f0-9]{24}$/D', 'sms_recipient_ids' => '/^sms_[a-f0-9]{24}$/D'] as $key => $pattern) {
-            $out[$key] = self::selectors(array_key_exists($key, $row) ? $row[$key] : [], $pattern, in_array($key, ['group_ids', 'webhook_ids', 'email_recipient_ids', 'sms_recipient_ids'], true) ? 50 : 1000, $key);
+            'group_ids' => '/^[A-Za-z0-9_-]{1,64}$/D', 'voice_recipient_ids' => '/^voice_[a-f0-9]{24}$/D', 'webhook_ids' => '/^[A-Za-z0-9_-]{1,64}$/D', 'email_recipient_ids' => '/^email_[a-f0-9]{24}$/D', 'sms_recipient_ids' => '/^sms_[a-f0-9]{24}$/D', 'browser_recipient_ids'=>'/^sub_[a-f0-9]{24}$/D', 'connector_ids'=>'/^conn_[a-f0-9]{24}$/D'] as $key => $pattern) {
+            $out[$key] = self::selectors(array_key_exists($key, $row) ? $row[$key] : [], $pattern, in_array($key, ['group_ids', 'webhook_ids', 'email_recipient_ids', 'sms_recipient_ids','browser_recipient_ids','connector_ids'], true) ? 50 : 1000, $key);
         }
         $out['audio_mode'] = $row['audio_mode'] ?? 'none';
         if (!in_array($out['audio_mode'], ['none', 'tones', 'tts', 'tones_tts'], true)) { throw new \InvalidArgumentException('Choose a supported incident audio mode.'); }
@@ -154,7 +154,7 @@ final class IncidentConfig
     }
     public static function hasAudience(array $delivery): bool
     {
-        foreach (['extensions', 'desktop_clients', 'group_ids', 'voice_recipient_ids', 'webhook_ids', 'email_recipient_ids', 'sms_recipient_ids'] as $field) { if (!empty($delivery[$field])) { return true; } }
+        foreach (['extensions', 'desktop_clients', 'group_ids', 'voice_recipient_ids', 'webhook_ids', 'email_recipient_ids', 'sms_recipient_ids','browser_recipient_ids','connector_ids'] as $field) { if (!empty($delivery[$field])) { return true; } }
         return false;
     }
     public static function resources($value): array
@@ -290,7 +290,8 @@ final class IncidentConfig
     {
         $patterns = ['extensions'=>'/^[0-9]{1,20}$/D', 'desktop_clients'=>'/^[A-Za-z0-9_.@-]{1,80}$/D',
             'voice_recipient_ids'=>'/^voice_[a-f0-9]{24}$/D', 'email_recipient_ids'=>'/^email_[a-f0-9]{24}$/D',
-            'sms_recipient_ids'=>'/^sms_[a-f0-9]{24}$/D', 'webhook_ids'=>'/^[A-Za-z0-9_-]{1,64}$/D'];
+            'sms_recipient_ids'=>'/^sms_[a-f0-9]{24}$/D', 'webhook_ids'=>'/^[A-Za-z0-9_-]{1,64}$/D',
+            'browser_recipient_ids'=>'/^sub_[a-f0-9]{24}$/D', 'connector_ids'=>'/^conn_[a-f0-9]{24}$/D'];
         $out = []; $seen = [];
         foreach (self::listOf($value, 2000, 'Recipient language preferences') as $row) {
             $row = self::object($row, ['channel','recipient_id','locale'], 'Recipient language preference');

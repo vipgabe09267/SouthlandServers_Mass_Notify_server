@@ -182,12 +182,25 @@ incident_check(file_get_contents($target) === 'protected fixture', 'Unsafe state
 // Atomic claim must survive complete short writes; failed claims cannot invoke sender.
 class IncidentShortWriteStore extends IncidentStore { protected function writeBytes($handle, string $bytes) { return fwrite($handle, substr($bytes, 0, 17)); } }
 class IncidentFailedSyncStore extends IncidentStore { protected function syncFile($handle): bool { return false; } }
+class IncidentIdentitySwapStore extends IncidentStore
+{
+    protected function replace(string $source, string $destination): bool
+    {
+        $bytes = file_get_contents($source);
+        if (!is_string($bytes) || !unlink($source) || file_put_contents($destination, $bytes) !== strlen($bytes)) { return false; }
+        chmod($destination, 0600);
+        return true;
+    }
+}
 $latestTemplate = $template; $before = count($sent);
 $short = $make(new IncidentShortWriteStore($root . '/short')); $short->start(array_replace($start, ['request_id' => $request(50)]), $actor);
 incident_check(count($sent) === $before + 1, 'Complete short writes were not handled.');
 $failedStore = $make(new IncidentFailedSyncStore($root . '/failed')); $before = count($sent);
 incident_reject(static fn() => $failedStore->start(array_replace($start, ['request_id' => $request(51)]), $actor), 'Unsynchronized claim accepted.');
 incident_check(count($sent) === $before, 'Failed durable claim still sent.');
+$swappedStore = $make(new IncidentIdentitySwapStore($root . '/identity-swap')); $before = count($sent);
+incident_reject(static fn() => $swappedStore->start(array_replace($start, ['request_id' => $request(52)]), $actor), 'Substituted commit inode was accepted.');
+incident_check(count($sent) === $before, 'Substituted durable claim still sent.');
 // Real lock contention has a total bounded wait and cannot send around the lock.
 $recordPath = $root . '/main/' . $id . '.lock'; $lock = fopen($recordPath, 'c+b'); flock($lock, LOCK_EX);
 $begin = microtime(true); incident_reject(static fn() => $store->transaction($id, static fn(array $r): array => $r), 'Contended record lock bypassed.');

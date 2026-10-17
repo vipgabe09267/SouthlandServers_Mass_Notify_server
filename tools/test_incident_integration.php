@@ -12,7 +12,7 @@ register_shutdown_function(static function () use ($directory): void {
 });
 $reflection = new ReflectionClass(\FreePBX\modules\Slsmassnotifyserver::class);
 $methods = '';
-foreach (['sendSipNotifyAnnouncement', 'resolveAnnouncementRequest', 'buildAnnouncementVisualPushCommand', 'normalizeAnnouncementAudioMode', 'webhookPayloadFormat', 'webhookDestinationFingerprint', 'announcementTone'] as $name) {
+foreach (['sendSipNotifyAnnouncement', 'resolveAnnouncementRequest', 'buildAnnouncementVisualPushCommand', 'normalizeAnnouncementAudioMode', 'webhookPayloadFormat', 'webhookDestinationFingerprint', 'aggregateSavedAudienceTargets', 'validateAggregateSavedAudienceTargets', 'normalizeExtensionSelector', 'announcementTone'] as $name) {
     $method = $reflection->getMethod($name); $source = file($method->getFileName());
     $methods .= implode('', array_slice($source, $method->getStartLine() - 1, $method->getEndLine() - $method->getStartLine() + 1));
 }
@@ -28,6 +28,8 @@ class IncidentIntegratedFixture
     use \FreePBX\modules\SlsAnnouncementEmail; use \FreePBX\modules\SlsAnnouncementSms;
     const INCIDENT_JOB_CONTRACT = 1;
     const MAX_WEBHOOK_DESTINATIONS = 10;
+    const MAX_SAVED_CHANNEL_RECIPIENTS = 50;
+    const MAX_EXTERNAL_VOICE_RECIPIENTS = 1000;
     public array $validModels = [];
     public function getAvailablePiperVoices() { return array_map(fn($path)=>['path'=>$path], array_keys($this->validModels)); }
     private function isValidPiperVoiceFile($path) { return isset($this->validModels[$path]) && is_file($path) && hash_file('sha256', $path) === $this->validModels[$path]; }
@@ -37,7 +39,9 @@ class IncidentIntegratedFixture
     public array $workers = [];
     public array $webhookContexts = [];
     private $announcementAdmissionLock;
-    private function recordInteractiveAnnouncementAdmission(array $request): void {}
+    private function recordInteractiveAnnouncementAdmission(array $request, ?callable $commit = null, string $jobId = '') {
+        return $commit === null ? null : $commit();
+    }
     private function getActiveSettings() { return $this->settings; }
     private function getPendingSettings() { return null; }
     private function isSetupComplete($settings) { return true; }

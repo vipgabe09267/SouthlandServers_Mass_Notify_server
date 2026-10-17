@@ -35,11 +35,41 @@ if [[ "${1:-}" == --build ]]; then
   # Keep only the artifact destination writable after the root bind is read-only.
   mount --bind "$BUILD_OUTPUT" "$BUILD_OUTPUT"
 fi
-mount --bind / /
-mount -o remount,bind,ro /
+mount --rbind / /
+python3 -I - "$BUILD_OUTPUT" <<'SLS_READONLY_MOUNTS'
+import re
+import os
+import subprocess
+import sys
+
+def unescape(value):
+    return re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), value)
+
+with open('/proc/self/mountinfo', encoding='utf-8') as handle:
+    rows = [line.split() for line in handle]
+targets = {unescape(row[4]): {} for row in rows}
+for row in rows:
+    targets[unescape(row[4])][row[0]] = row[row.index('-') + 1]
+for target in sorted(targets, key=lambda value: (value.count('/'), len(value)), reverse=True):
+    if sys.argv[1] and target == sys.argv[1]:
+        continue
+    descriptor = os.open(target, os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        with open(f'/proc/self/fdinfo/{descriptor}', encoding='utf-8') as handle:
+            actual = next(line.split()[1] for line in handle if line.startswith('mnt_id:'))
+    finally:
+        os.close(descriptor)
+    if actual not in targets[target]:
+        continue  # Covered mounts are protected by their visible ancestor.
+    command = ['mount', '-t', 'tmpfs', '-o', 'ro,mode=000,size=4k', 'tmpfs', target] if targets[target][actual] == 'autofs' else ['mount', '-o', 'remount,bind,ro', target]
+    subprocess.run(command, check=True, timeout=15)
+SLS_READONLY_MOUNTS
 mount -t tmpfs -o mode=1777,size=768M tmpfs /tmp
 mount -t tmpfs -o mode=755,size=64M tmpfs /run
 mount -t tmpfs -o mode=700,size=16M tmpfs /root
+if [[ -d /dev/shm && ! -L /dev/shm ]]; then
+  mount -t tmpfs -o mode=1777,size=64M tmpfs /dev/shm
+fi
 # A disposable Asterisk needs its vendor XML documentation to initialize Stasis.
 # Preserve only this public module metadata before hiding all PBX state.
 if [[ -f /var/lib/asterisk/documentation/core-en_US.xml && ! -L /var/lib/asterisk/documentation/core-en_US.xml ]]; then
@@ -67,7 +97,7 @@ cp -a "$ROOT_DIR/slsmassnotifyserver/bin/sls_mass_notify/." /usr/local/bin/sls_m
 cp "$ROOT_DIR"/slsmassnotifyserver/bin/sls_mass_notify_*.{php,sh,py} /usr/local/bin/sls_mass_notify/ 2>/dev/null || true
 chown -R root:root /usr/local/bin/sls_mass_notify
 mkdir -p /var/lib/asterisk/SLS_Mass_Notifications_Plugin
-export PYTHONDONTWRITEBYTECODE=1 TMPDIR=/tmp
+export PYTHONDONTWRITEBYTECODE=1 TMPDIR=/tmp SLS_TEST_READONLY_SOURCE="$ROOT_DIR"
 umask 027
 cd "$ROOT_DIR"
 python3 -I "$ROOT_DIR/slsmassnotifyserver/bin/sls_mass_notify/sls_config_crypto.py" init >/dev/null

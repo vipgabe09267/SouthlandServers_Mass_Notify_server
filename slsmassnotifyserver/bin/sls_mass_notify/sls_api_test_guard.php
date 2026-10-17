@@ -1,6 +1,7 @@
 #!/usr/bin/php
 <?php
 declare(strict_types=1);
+if (PHP_SAPI !== 'cli') { http_response_code(404); exit(64); }
 // Runtime account only. Prints identifiers, never credentials or arbitrary shell code.
 require_once '/var/www/html/admin/modules/slsmassnotifyserver/ApiPermissionGuards.php';
 require_once __DIR__ . '/sls_config_crypto.php';
@@ -18,7 +19,7 @@ try {
     $settings = \FreePBX\modules\SlsConfigCrypto::decode($raw);
     $rawContext = getenv('SLS_API_TEST_CONTEXT');
     if (!is_string($rawContext) || strlen($rawContext) > 131072) { throw new RuntimeException('Invalid API test context size.'); }
-    $context = json_decode($rawContext, true, 16, JSON_THROW_ON_ERROR);
+    $context = \SLS\MassNotify\ApiSecurity::jsonObject($rawContext, false, 16);
     if (!is_array($settings) || !is_array($context)) { throw new RuntimeException('Invalid API test configuration.'); }
     $allowed = \SLS\MassNotify\ApiPermissionGuards::weather($settings, $context);
     echo implode(',', $allowed['phones']) . "\n" . implode(',', $allowed['desktops']) . "\n" . $allowed['removed_count'] . "\n";

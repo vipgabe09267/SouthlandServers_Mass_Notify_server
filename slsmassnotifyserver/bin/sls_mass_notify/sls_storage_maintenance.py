@@ -11,9 +11,7 @@ import secrets
 import socket
 import stat
 import sys
-import tempfile
 import time
-from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -42,11 +40,20 @@ MAX_QUEUE_FILES = 256
 AUDIT_MAX_BYTES = 8 * 1024 * 1024
 SYSLOG_SOCKET = '/dev/log'
 ACTIVE_JOBS = {'queued', 'worker_starting', 'running'}
-TERMINAL_JOBS = {'complete', 'failed', 'partial_or_failed', 'expired'}
+TERMINAL_JOBS = {'complete', 'failed', 'partial_or_failed', 'cancelled', 'expired'}
 AUDIO_NAME = re.compile(r'(?:announcement_(?:tts|sequence|tone)_[A-Za-z0-9_-]+|nws_[A-Za-z0-9_-]+|test_(?:piper_tts|sequence)_[A-Za-z0-9_-]+|xweather_(?:tts|sequence)_[A-Za-z0-9_-]+)\.wav')
 IMPORTED_AUDIO_NAME = re.compile(r'recording_[a-f0-9]{32}\.wav')
 VOICEMAIL_AUDIO_NAME = re.compile(r'[a-f0-9]{32}(?:-(?:receive|mix))?\.wav')
 IMAGE_NAME = re.compile(r'(?:mms_[0-9]{14}_[a-f0-9]{32}\.png|alert_[a-f0-9]{12}(?:_[a-f0-9]{20})?\.png|announcement_[0-9]{14}_[a-f0-9]{6,32}\.png|phone_payload_[a-f0-9]{12}(?:_[a-f0-9]{20})?\.xml)')
+
+def runtime_json(raw):
+    """Unknown or ambiguous evidence cannot authorize retention or a receipt."""
+    try:
+        return json.loads(raw, object_pairs_hook=_config_crypto._pairs,
+                          parse_constant=_config_crypto._invalid_constant,
+                          parse_float=_config_crypto._finite_float)
+    except (ValueError, RecursionError) as error:
+        raise ValueError('Invalid or ambiguous runtime JSON; preserve the original evidence') from error
 
 def open_directory(path):
     """Anchor every path component; root cleanup never traverses a symlink."""
@@ -66,14 +73,23 @@ def open_directory(path):
         raise
 
 def read_at(directory_fd, name, maximum):
-    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                         dir_fd=directory_fd)
     with os.fdopen(descriptor, 'rb') as handle:
         metadata = os.fstat(handle.fileno())
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > maximum:
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > maximum
+                or metadata.st_uid not in (0, os.geteuid()) or metadata.st_mode & 0o022):
             raise RuntimeError('Unsafe or oversized retention reference')
+        fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
         raw = handle.read(maximum + 1)
         if len(raw) > maximum:
             raise RuntimeError('Retention reference exceeds its limit')
+        current = os.fstat(handle.fileno())
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        fields = ('st_dev', 'st_ino', 'st_nlink', 'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_mode')
+        if (any(getattr(metadata, field) != getattr(current, field) for field in fields)
+                or any(getattr(current, field) != getattr(named, field) for field in fields)):
+            raise RuntimeError('Retention reference changed during inspection')
         return raw
 
 def reference_names(value):
@@ -117,7 +133,7 @@ def media_references(directory, spool, now):
                 raise RuntimeError('Required media reference is missing')
             return None
         remaining -= len(raw)
-        value = _config_crypto.decode_config(raw) if name in {"mass-notifications.config", "mass-notifications.pending.config", "mass-notifications-settings.pending.json", "slsmassnotifyserver-settings.pending.json"} else json.loads(raw)
+        value = _config_crypto.decode_config(raw) if name in {"mass-notifications.config", "mass-notifications.pending.config", "mass-notifications-settings.pending.json", "slsmassnotifyserver-settings.pending.json"} else runtime_json(raw)
         if not isinstance(value, dict):
             raise RuntimeError('Invalid media reference object')
         return value
@@ -163,7 +179,7 @@ def media_references(directory, spool, now):
                     if index >= 1000 or len(line) > 262144:
                         raise RuntimeError('Desktop media references exceed their limit')
                     if line.strip():
-                        names.update(reference_names(json.loads(line)))
+                        names.update(reference_names(runtime_json(line)))
                 continue
             with os.scandir(descriptor) as entries:
                 deadline = time.monotonic() + DIRECTORY_SCAN_SECONDS
@@ -261,7 +277,7 @@ def prune_generated_cache(directory, web_dir, protected, now, limit):
             removed[counter] += 1; total -= before.st_size
         finally: os.close(descriptor)
     if total > limit:
-        raise RuntimeError('Generated media still uses %d MiB above its %d MiB cache target. Active/referenced/recent files were preserved. Check queued alerts and free space; bounded cleanup retries on the next maintenance run.'
+        raise RuntimeError('Generated media still uses %d MiB, above its %d MiB cache target. Active/referenced/recent files were preserved. Check queued alerts and free space; bounded cleanup retries on the next maintenance run.'
                            % ((total + 1048575) // 1048576, limit // 1048576))
     return removed
 
@@ -278,12 +294,31 @@ def prune_generated_media(directory=None, web_dir=None, spool=None, now=None):
         # and also prevents configuration replacement during reference reads.
         activity = os.open('announcement-activity.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o640, dir_fd=parent)
         activity_meta = os.fstat(activity)
-        if not stat.S_ISREG(activity_meta.st_mode) or activity_meta.st_nlink != 1:
-            raise RuntimeError('Unsafe announcement activity lock')
-        if os.geteuid() == 0:
-            account = pwd.getpwnam('asterisk')
-            os.fchown(activity, account.pw_uid, account.pw_gid)
+        account = pwd.getpwnam('asterisk')
+        if (not stat.S_ISREG(activity_meta.st_mode) or activity_meta.st_nlink != 1 or activity_meta.st_size != 0
+                or activity_meta.st_uid not in (0, account.pw_uid) or activity_meta.st_gid not in (0, account.pw_gid)
+                or stat.S_IMODE(activity_meta.st_mode) not in (0o600, 0o640, 0o644)):
+            raise RuntimeError('Unsafe announcement activity lock ownership, permissions or contents; cleanup was deferred')
         fcntl.flock(activity, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        current = os.stat('announcement-activity.lock', dir_fd=parent, follow_symlinks=False)
+        if (current.st_dev, current.st_ino, current.st_uid, current.st_gid, current.st_mode, current.st_size, current.st_nlink) != (
+                activity_meta.st_dev, activity_meta.st_ino, activity_meta.st_uid, activity_meta.st_gid, activity_meta.st_mode, 0, 1):
+            raise RuntimeError('Announcement activity lock changed before cleanup; no permissions were changed')
+        if os.geteuid() == 0:
+            os.fchown(activity, account.pw_uid, account.pw_gid)
+        os.fchmod(activity, 0o640)
+        repaired = os.fstat(activity)
+        named = os.stat('announcement-activity.lock', dir_fd=parent, follow_symlinks=False)
+        expected_owner = account.pw_uid if os.geteuid() == 0 else repaired.st_uid
+        expected_group = account.pw_gid if os.geteuid() == 0 else repaired.st_gid
+        if (not stat.S_ISREG(repaired.st_mode) or repaired.st_nlink != 1 or repaired.st_size != 0
+                or repaired.st_uid != expected_owner or repaired.st_gid != expected_group
+                or stat.S_IMODE(repaired.st_mode) != 0o640
+                or (repaired.st_dev, repaired.st_ino, repaired.st_uid, repaired.st_gid,
+                    repaired.st_mode, repaired.st_size, repaired.st_nlink)
+                != (named.st_dev, named.st_ino, named.st_uid, named.st_gid,
+                    named.st_mode, named.st_size, named.st_nlink)):
+            raise RuntimeError('Announcement activity lock changed after permission repair; cleanup was deferred')
         # The permanent shared lock spans reference inspection and deletion.
         # Atomic JSON replacement cannot strand this reader on an old inode.
         with _audio_state.read_audio_state(directory, nonblocking=True) as state:
@@ -385,11 +420,14 @@ def prune_announcement_jobs(directory, now=None):
                             if current_lock.st_mtime_ns != metadata.st_mtime_ns:
                                 continue
                         else:
-                            job = json.loads(read_at(descriptor, job_name, 2 * 1024 * 1024))
+                            job = runtime_json(read_at(descriptor, job_name, 2 * 1024 * 1024))
                             if not isinstance(job, dict) or job.get('id') != job_name[:-5] or job.get('state') not in TERMINAL_JOBS:
                                 continue
                             current = os.stat(job_name, dir_fd=descriptor, follow_symlinks=False)
-                            if (current.st_dev, current.st_ino, current.st_mtime_ns) != (metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns):
+                            if (current.st_dev, current.st_ino, current.st_nlink, current.st_size,
+                                    current.st_mtime_ns, current.st_ctime_ns, current.st_mode) != (
+                                    metadata.st_dev, metadata.st_ino, 1, metadata.st_size,
+                                    metadata.st_mtime_ns, metadata.st_ctime_ns, metadata.st_mode):
                                 continue
                             os.unlink(job_name, dir_fd=descriptor)
                             removed += 1
@@ -488,7 +526,7 @@ def prune_event_log(path, retention_days=90, now=None, maximum_bytes=64 * 1024 *
                 else:
                     kept = stream
             removed = invalid = scanned = 0
-            retained = deque() if maximum_records is not None else None
+            retained = [] if maximum_records is not None else None
             deadline = time.monotonic() + scan_seconds
             while True:
                 if time.monotonic() > deadline:
@@ -502,27 +540,34 @@ def prune_event_log(path, retention_days=90, now=None, maximum_bytes=64 * 1024 *
                 if original.write(line) != len(line):
                     raise OSError('event_log_retention_backup_failed')
                 expired = False
+                invalid_record = False
                 try:
-                    value = json.loads(line)
+                    value = runtime_json(line)
                     if not isinstance(value, dict):
                         raise ValueError('Invalid log record')
                     timestamp = value.get('logged_at', value.get('created_at'))
-                    parsed = datetime.fromisoformat(str(timestamp).replace('Z', '+00:00')).timestamp()
+                    parsed_time = datetime.fromisoformat(str(timestamp).replace('Z', '+00:00'))
+                    if parsed_time.tzinfo is None or parsed_time.utcoffset() is None:
+                        raise ValueError('Timezone-naive log timestamp')
+                    parsed = parsed_time.timestamp()
                     expired = math.isfinite(parsed) and parsed < cutoff
                 except (ValueError, TypeError, OverflowError):
                     invalid += 1
+                    invalid_record = True
                     expired = discard_invalid
                 if expired:
                     removed += 1
                 elif retained is not None:
-                    retained.append(line)
-                    if len(retained) > maximum_records:
-                        retained.popleft()
-                        removed += 1
+                    retained.append((line, invalid_record))
                 elif kept.write(line) != len(line):
                     raise OSError('event_log_retention_output_failed')
             if retained is not None:
-                for line in retained:
+                valid_to_remove = max(0, sum(not forensic for _, forensic in retained) - max(0, int(maximum_records)))
+                for line, forensic in retained:
+                    if not forensic and valid_to_remove:
+                        valid_to_remove -= 1
+                        removed += 1
+                        continue
                     if kept.write(line) != len(line):
                         raise OSError('event_log_retention_output_failed')
             if removed:
@@ -589,19 +634,22 @@ def prune_configured_event_logs(directory=None, paths=None):
             print('Event retention preserved %d record(s) with malformed or unknown timestamps.' % result['preserved_invalid'])
 
 def read_locked_object(path, limit=4 * 1024 * 1024):
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd, 'rb') as handle:
-        fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        metadata = os.fstat(handle.fileno())
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > limit:
-            raise ValueError('Invalid state file type or size')
-        raw = handle.read(limit + 1)
-        if len(raw) > limit:
-            raise ValueError('State file exceeds its size limit')
-        value = json.loads(raw)
-        if not isinstance(value, dict):
-            raise ValueError('Invalid state object')
-        return value
+    parent = open_directory(Path(path).parent)
+    try:
+        return read_locked_object_at(parent, Path(path).name, limit)
+    finally:
+        os.close(parent)
+
+
+def read_locked_object_at(parent, name, limit=4 * 1024 * 1024):
+    try:
+        raw = read_at(parent, name, limit)
+    except RuntimeError as error:
+        raise ValueError('Invalid state file type, identity, ownership, or size') from error
+    value = runtime_json(raw)
+    if not isinstance(value, dict):
+        raise ValueError('Invalid state object')
+    return value
 
 def audit_regular(parent, name, create=False):
     """Open without following links or blocking on substituted special files."""
@@ -625,7 +673,7 @@ def audit_identity(parent, name, descriptor):
     opened = os.fstat(descriptor)
     current = os.stat(name, dir_fd=parent, follow_symlinks=False)
     if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
-            or opened.st_uid not in (0, os.geteuid()) or opened.st_mode & 0o002
+            or opened.st_uid not in (0, os.geteuid()) or opened.st_mode & 0o022
             or (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_nlink)
             != (current.st_dev, current.st_ino, current.st_mode, current.st_nlink)):
         raise RuntimeError('audit_storage_unsafe')
@@ -661,7 +709,7 @@ def record_audit_health(directory, error_code='', forwarding=False, security=Fal
             with os.fdopen(descriptor, 'rb') as handle:
                 if os.fstat(handle.fileno()).st_size > 4096:
                     raise RuntimeError('audit_fault_state_oversized')
-                value = json.loads(handle.read(4097))
+                value = runtime_json(handle.read(4097))
                 if not isinstance(value, dict):
                     raise RuntimeError('audit_fault_state_invalid')
         except FileNotFoundError:
@@ -787,15 +835,6 @@ def forward_security_audit(record, directory=DATA):
     return forward_audit(record, directory, security=True)
 
 
-def reject_duplicate_json(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError('Duplicate JSON member')
-        result[key] = value
-    return result
-
-
 def validate_audit_separation(value, complete=True):
     names = {'audit-separation-original.jsonl', 'audit-separation-security-before.jsonl',
              'audit-separation-control-after.jsonl', 'audit-separation-security-after.jsonl'}
@@ -839,7 +878,7 @@ def audit_separation_ready(parent):
             if raw != b'SLS_AUDIT_SEPARATION_V1\n':
                 raise RuntimeError('audit_separation_recovery_required')
         else:
-            value = json.loads(raw, object_pairs_hook=reject_duplicate_json)
+            value = runtime_json(raw)
             validate_audit_separation(value)
             for required in ('control-api-audit.jsonl','security-audit.jsonl'):
                 existing,_=audit_regular(parent,required)
@@ -925,7 +964,7 @@ def append_control_audit_stdin(forwarding=False, security=False):
         raw = sys.stdin.buffer.read(4097)
         if len(raw) > 4096:
             raise ValueError('Oversized audit input')
-        record = json.loads(raw)
+        record = runtime_json(raw)
         (encode_security_audit(record) if security else encode_control_audit(record))
         result = append_security_audit(record) if security else append_control_audit(record)
         if forwarding:
@@ -939,7 +978,68 @@ def append_control_audit_stdin(forwarding=False, security=False):
     print(json.dumps(result, separators=(',', ':')))
     return 0 if result['ok'] else 1
 
+def retained_usage(directory):
+    """Bounded metadata-only accounting; no symlink traversal or state writes."""
+    names=('configuration','configuration_backups','announcement_jobs','desktop_journal','phone_evidence',
+           'weather_evidence','incident_evidence','sms_evidence','enterprise_evidence','floorplan_images','other_state')
+    result={name:{'bytes':0,'files':0,'complete':True} for name in names}
+    def component(path):
+        head=path.split('/',1)[0]
+        if head.startswith('mass-notifications.') and '.config' in head:return 'configuration'
+        if head=='config-backups':return 'configuration_backups'
+        if head=='announcement-jobs':return 'announcement_jobs'
+        if head=='sipnotify' or head.startswith('desktop-'):return 'desktop_journal'
+        if head.startswith('phone-') or head.startswith('voicemail-'):return 'phone_evidence'
+        if head.startswith(('weather-','nws-','xweather-','seen-alerts','processed-alerts','event-cooldowns','external-deliveries','audio-delivered')):return 'weather_evidence'
+        if head=='incidents':return 'incident_evidence'
+        if head.startswith('sms'):return 'sms_evidence'
+        if head=='enterprise-floorplans':return 'floorplan_images'
+        if head.startswith(('enterprise-','control-idempotency','automations')):return 'enterprise_evidence'
+        return 'other_state'
+    deadline=time.monotonic()+1
+    inspected=0
+    descriptor=open_directory(directory)
+    try:
+        pending=[((), '')]
+        try:
+            while pending:
+                components,prefix=pending.pop()
+                current=os.dup(descriptor)
+                try:
+                    for name in components:
+                        child=os.open(name,os.O_DIRECTORY|os.O_RDONLY|os.O_NOFOLLOW,dir_fd=current)
+                        os.close(current);current=child
+                    with os.scandir(current) as entries:
+                        for entry in entries:
+                            inspected+=1
+                            if inspected>MAX_SCAN or time.monotonic()>deadline:
+                                raise RuntimeError('Retained-state measurement reached its bound')
+                            info=entry.stat(follow_symlinks=False)
+                            relative=prefix+entry.name
+                            if stat.S_ISDIR(info.st_mode):
+                                pending.append((components+(entry.name,),relative+'/'))
+                            elif stat.S_ISREG(info.st_mode):
+                                row=result[component(relative)];row['bytes']+=info.st_size;row['files']+=1
+                            else:raise RuntimeError('Retained-state measurement found a special file or link')
+                finally:
+                    os.close(current)
+        except (OSError,RuntimeError):
+            for row in result.values():row['complete']=False
+    finally:os.close(descriptor)
+    return result
+
 def storage_summary(directory=DATA, now=None):
+    destination = open_directory(directory)
+    try:
+        account = pwd.getpwnam('asterisk'); metadata = os.fstat(destination)
+        if (metadata.st_uid not in (0, account.pw_uid) or metadata.st_gid not in (0, account.pw_gid)
+                or metadata.st_mode & 0o022):
+            raise RuntimeError('Storage summary directory ownership or permissions are unsafe')
+        return collect_storage_summary(directory, now, destination)
+    finally:
+        os.close(destination)
+
+def collect_storage_summary(directory, now, destination):
     now = time.time() if now is None else now
     filesystem = os.statvfs(directory)
     free = filesystem.f_bavail * filesystem.f_frsize
@@ -947,6 +1047,7 @@ def storage_summary(directory=DATA, now=None):
     summary = {'checked_at': int(now), 'free_bytes': free, 'total_bytes': total,
                'pending_external': 0, 'expired_external': 0, 'recent_expired_external': 0, 'oldest_pending_at': 0, 'queue_errors': 0,
                'queue_scan_incomplete': False, 'queue_files_scanned': 0, 'queue_files_seen': 0}
+    summary['retained_components']=retained_usage(directory)
     deadline = time.monotonic() + DIRECTORY_SCAN_SECONDS
     remaining = MAX_REFERENCE_BYTES
     parent = open_directory(directory)
@@ -971,7 +1072,7 @@ def storage_summary(directory=DATA, now=None):
                         summary['queue_scan_incomplete'] = True
                         break
                     remaining -= max(0, size)
-                    records = read_locked_object(Path('/proc/self/fd') / str(parent) / name).get('deliveries', {})
+                    records = read_locked_object_at(parent, name).get('deliveries', {})
                     if not isinstance(records, dict):
                         raise ValueError('Invalid delivery queue')
                     for record in records.values():
@@ -1025,7 +1126,13 @@ def storage_summary(directory=DATA, now=None):
         pass
     except (OSError, ValueError, TypeError, AttributeError, OverflowError):
         summary['queue_errors'] += 1
-    summary['audit_at_capacity'] = audit.is_file() and audit.stat().st_size >= 8 * 1024 * 1024 - 4096
+    try:
+        audit_info = os.stat(audit.name, dir_fd=destination, follow_symlinks=False)
+        if not stat.S_ISREG(audit_info.st_mode) or audit_info.st_nlink != 1:
+            raise RuntimeError('Control API audit path is unsafe')
+        summary['audit_at_capacity'] = audit_info.st_size >= AUDIT_MAX_BYTES - 4096
+    except FileNotFoundError:
+        summary['audit_at_capacity'] = False
     summary.update(audit_failed_records=0, audit_last_failure_at=0, audit_failure_code='', audit_fault_active=False)
     try:
         fault = read_locked_object(directory / 'control-api-audit-fault.json', limit=4096)
@@ -1084,8 +1191,14 @@ def storage_summary(directory=DATA, now=None):
         except (OSError, ValueError, TypeError):
             summary['audit_forwarding_active'] = True
             summary['audit_forwarding_error'] = 'audit_forwarding_health_unavailable'
-    security = directory / 'security-audit.jsonl'
-    summary.update(security_audit_at_capacity=security.is_file() and security.stat().st_size >= AUDIT_MAX_BYTES - 4096,
+    try:
+        security_info = os.stat('security-audit.jsonl', dir_fd=destination, follow_symlinks=False)
+        if not stat.S_ISREG(security_info.st_mode) or security_info.st_nlink != 1:
+            raise RuntimeError('Security audit path is unsafe')
+        security_at_capacity = security_info.st_size >= AUDIT_MAX_BYTES - 4096
+    except FileNotFoundError:
+        security_at_capacity = False
+    summary.update(security_audit_at_capacity=security_at_capacity,
                    security_audit_failed_records=0, security_audit_last_failure_at=0,
                    security_audit_failure_code='', security_audit_fault_active=False,
                    security_audit_forwarding_enabled=summary['audit_forwarding_enabled'],
@@ -1118,7 +1231,17 @@ def storage_summary(directory=DATA, now=None):
         summary['audit_separation_recovery_required'] = True
     finally:
         os.close(parent)
-    fd, temporary = tempfile.mkstemp(prefix='.storage-summary-', dir=directory)
+    # Bind the derived status write to the originally inspected directory.
+    current = open_directory(directory)
+    try:
+        before, named = os.fstat(destination), os.fstat(current)
+        if (before.st_dev, before.st_ino) != (named.st_dev, named.st_ino):
+            raise RuntimeError('Storage summary directory changed; no summary was replaced')
+    finally:
+        os.close(current)
+    temporary = '.storage-summary-' + secrets.token_hex(16)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                 0o640, dir_fd=destination)
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as handle:
             os.fchmod(handle.fileno(), 0o640)
@@ -1126,10 +1249,16 @@ def storage_summary(directory=DATA, now=None):
                 account = pwd.getpwnam('asterisk')
                 os.fchown(handle.fileno(), account.pw_uid, account.pw_gid)
             json.dump(summary, handle, separators=(',', ':'))
-        os.replace(temporary, directory / 'storage-summary.json')
+            handle.flush(); os.fsync(handle.fileno())
+        os.replace(temporary, 'storage-summary.json', src_dir_fd=destination, dst_dir_fd=destination)
+        temporary = None
+        os.fsync(destination)
     finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+        if temporary is not None:
+            try:
+                os.unlink(temporary, dir_fd=destination)
+                os.fsync(destination)
+            except FileNotFoundError: pass
     return summary
 
 def prune_audit(path, now=None):
@@ -1141,7 +1270,7 @@ def prune_audit(path, now=None):
         audit_identity(parent, '.audit-separation.lock', separation_lock)
         audit_separation_ready(parent)
         result = prune_event_log(path, retention_days=30, now=now, maximum_bytes=AUDIT_MAX_BYTES,
-                                 maximum_records=10000, discard_invalid=True)
+                                 maximum_records=10000, discard_invalid=False)
         if result.get('busy'):
             raise BlockingIOError('Audit retention deferred while an appender holds the log')
         return result

@@ -144,7 +144,8 @@ entries binds a destination's saved identity to a locale:
 ```
 
 Supported channels are `extensions`, `desktop_clients`, `voice_recipient_ids`,
-`email_recipient_ids`, `sms_recipient_ids` and `webhook_ids`. Choose saved destination
+`email_recipient_ids`, `sms_recipient_ids`, `webhook_ids`, `browser_recipient_ids`
+and `connector_ids`. Browser and connector choices retain their Labs labels. Choose saved destination
 IDs, not raw telephone numbers, email addresses or webhook URLs. A preference
 never expands an audience or grants access. Saved groups resolve first; their
 members then use individual preferences. Only reviewed template variants are
@@ -203,7 +204,7 @@ request ID and batch index rather than replacing an entire operation.
 General announcement email is included in `0.1.6-beta`.
 Validation uses isolated sender and browser fixtures; no real external mail or
 inbox receipt has been verified. Enable
-**General Settings > Announcement Email**, save named recipients, configure the
+**General Settings > Delivery providers > Announcement email**, save named recipients, configure the
 existing sender identity and Apply Config. The channel is disabled by default and
 supports at most 50 saved recipients. All settings remain in the protected central
 `.config`; mail submission uses the PBX's existing local mail service, without new
@@ -318,7 +319,7 @@ Use the existing `/api/sls-mass-notify/` route and authentication headers. GET u
 | GET | `incident` | `read` | `incident_id` |
 | GET | `incident_report` | `read` | `incident_id`, optional `job_offset` and `revision` |
 | POST | `start_incident` | `send` | `template_id`, `request_id`, `fields`, boolean `is_test`, optional drill `planned_at`, optional `language_variant` |
-| POST | `update_incident` | `send` | `incident_id`, `request_id`, `kind` (`update` or `all_clear`), `message` |
+| POST | `update_incident` | `send` | `incident_id`, `request_id`, `kind` (`update` or `all_clear`), `message`, optional reviewed `language_messages` |
 | POST | `incident_roll_call` | `config` | `incident_id`, `request_id`, `person_id`, `response`, optional `note` |
 | POST | `incident_checklist` | `config` | `incident_id`, `request_id`, integer `item` (0–24), boolean `complete`, optional `note` |
 

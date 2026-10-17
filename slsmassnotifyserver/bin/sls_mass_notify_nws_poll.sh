@@ -84,6 +84,8 @@ LIGHTNING_GATE_FILE="${LIGHTNING_GATE_FILE:-/var/lib/asterisk/SLS_Mass_Notificat
 NWS_AUDIO_DELIVERY_LOCK="${NWS_AUDIO_DELIVERY_LOCK:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/nws-audio-delivery.lock}"
 NWS_WEBHOOK_DESTINATION_KEYS_OVERRIDE="${NWS_WEBHOOK_DESTINATION_KEYS_OVERRIDE:-}"
 NWS_CROSS_ZONE_CLAIM_HELPER="${NWS_CROSS_ZONE_CLAIM_HELPER:-/usr/local/bin/sls_mass_notify/sls_nws_delivery_claims.py}"
+NWS_SOURCE_HELPER="${NWS_SOURCE_HELPER:-/usr/local/bin/sls_mass_notify/sls_weather_queue.py}"
+export NWS_SOURCE_HELPER
 NWS_CROSS_ZONE_CLAIM_STATE="${NWS_CROSS_ZONE_CLAIM_STATE:-/var/lib/asterisk/SLS_Mass_Notifications_Plugin/nws-cross-zone-delivery-claims.json}"
 NWS_DISPATCH_CYCLE_ID="${NWS_DISPATCH_CYCLE_ID:-}"
 NWS_DISPATCH_GROUP_RANK="${NWS_DISPATCH_GROUP_RANK:-0}"
@@ -94,6 +96,8 @@ NWS_CLAIMED_DESKTOP_COUNT=0
 NWS_CLAIMED_EMAIL_COUNT=0
 NWS_CLAIMED_DISCORD_COUNT=0
 NWS_CLAIMED_GENERIC_COUNT=0
+NWS_CLAIMED_VOICE_COUNT=0
+NWS_CLAIMED_SMS_COUNT=0
 NWS_LAST_PAGE_HOLD_SECONDS=0
 NWS_AUDIO_LOCK_FD=""
 MAIL_TO=""
@@ -191,6 +195,8 @@ claim_cross_zone_destinations() {
   NWS_CLAIMED_EMAIL_COUNT=0
   NWS_CLAIMED_DISCORD_COUNT=0
   NWS_CLAIMED_GENERIC_COUNT=0
+  NWS_CLAIMED_VOICE_COUNT=0
+  NWS_CLAIMED_SMS_COUNT=0
 
   # Standalone/manual workers retain their configured targets. Scheduled
   # multi-zone workers always receive a cycle ID from the weather wrapper.
@@ -325,7 +331,8 @@ print(f"reserved\t{reserved_count}")
         claimed_webhooks+=("generic:$value")
         NWS_CLAIMED_GENERIC_COUNT=$((NWS_CLAIMED_GENERIC_COUNT + 1))
         ;;
-      voice|sms) ;;
+      voice) NWS_CLAIMED_VOICE_COUNT=$((NWS_CLAIMED_VOICE_COUNT + 1)) ;;
+      sms) NWS_CLAIMED_SMS_COUNT=$((NWS_CLAIMED_SMS_COUNT + 1)) ;;
       meta) duplicate_count="$value" ;;
       reserved) reserved_count="$value" ;;
       *) return 1 ;;
@@ -383,6 +390,8 @@ finalize_cross_zone_destinations() {
       email) expected_count=$((expected_count + NWS_CLAIMED_EMAIL_COUNT)) ;;
       discord) expected_count=$((expected_count + NWS_CLAIMED_DISCORD_COUNT)) ;;
       generic) expected_count=$((expected_count + NWS_CLAIMED_GENERIC_COUNT)) ;;
+      voice) expected_count=$((expected_count + NWS_CLAIMED_VOICE_COUNT)) ;;
+      sms) expected_count=$((expected_count + NWS_CLAIMED_SMS_COUNT)) ;;
       *) return 1 ;;
     esac
   done
@@ -427,6 +436,8 @@ PY
       email) NWS_CLAIMED_EMAIL_COUNT=0 ;;
       discord) NWS_CLAIMED_DISCORD_COUNT=0 ;;
       generic) NWS_CLAIMED_GENERIC_COUNT=0 ;;
+      voice) NWS_CLAIMED_VOICE_COUNT=0 ;;
+      sms) NWS_CLAIMED_SMS_COUNT=0 ;;
     esac
   done
 }
@@ -448,10 +459,6 @@ run_status_mutation() {
   NWS_STATUS_MUTATION_JSON="$mutation_json" \
     /usr/bin/python3 "$NWS_STATUS_HELPER" mutate
   local result=$?
-  if [ "$result" -eq 0 ]; then
-    chmod 0640 "$STATUS_FILE" 2>/dev/null || true
-    chown asterisk:asterisk "$STATUS_FILE" 2>/dev/null || true
-  fi
   return "$result"
 }
 
@@ -472,15 +479,35 @@ PY
   run_status_mutation "$mutation_json"
 }
 
-exec 9>"$LOCK_FILE"
-chmod 0640 "$LOCK_FILE" 2>/dev/null || true
-chown asterisk:asterisk "$LOCK_FILE" 2>/dev/null || true
-if ! flock -n 9; then
+start_nws_lock() {
+  local lock_path="$1" wait_seconds="$2" descriptor_name="$3"
+  local descriptor readiness
+  exec {descriptor}< <(/usr/bin/python3 -I "$NWS_CROSS_ZONE_CLAIM_HELPER" --hold-lock "$lock_path" "$wait_seconds")
+  if ! IFS= read -r readiness <&"$descriptor"; then
+    exec {descriptor}<&-
+    return 1
+  fi
+  if [ "$readiness" != "locked" ]; then
+    exec {descriptor}<&-
+    [ "$readiness" != "busy" ] || return 75
+    return 1
+  fi
+  printf -v "$descriptor_name" '%s' "$descriptor"
+}
+
+NWS_POLL_LOCK_FD=""
+start_nws_lock "$LOCK_FILE" 0 NWS_POLL_LOCK_FD
+POLL_LOCK_STATUS=$?
+if [ "$POLL_LOCK_STATUS" -eq 75 ]; then
   echo "$(date): Another NWS alert poll is already running; skipping this cycle" >> "$LOG"
   update_status "$(printf '{"last_poll_at":%s,"last_poll_status":"already_running","last_poll_message":"Previous NWS poll is still running; this cycle was skipped."}' \
     "$(python3 -c 'import json; from datetime import datetime,timezone; print(json.dumps(datetime.now(timezone.utc).astimezone().isoformat()))')")" \
     >/dev/null 2>&1 || true
   exit 0
+fi
+if [ "$POLL_LOCK_STATUS" -ne 0 ]; then
+  printf '%s\n' 'NWS worker lock is unsafe or unavailable; no alert delivery was attempted.' >&2
+  exit 1
 fi
 
 timestamp_now() {
@@ -576,24 +603,30 @@ append_event_log() {
   EVENT_AUDIO="$sound_file" \
   EVENT_AUDIO_SEQUENCE="$audio_sequence" \
   EVENT_ALERT_ID="$alert_id" \
-  EVENT_SUBJECT="$subject" \
-  EVENT_BODY="$body" \
   EVENT_STATUS="$status" \
   NWS_RECIPIENTS="$DELIVERY_TARGETS" \
   SOURCE_EXTENSION="$SOURCE_EXTENSION" \
   SOURCE_NAME="$SOURCE_NAME" \
   NWS_ZONE="$NWS_ZONE" \
   EVENTS_LOG_PATH="$EVENTS_LOG" \
-  python3 - <<'PY'
-import fcntl
+  python3 - 3< <(printf '%s' "$body") 4< <(printf '%s' "$subject") <<'PY'
 import json
 import os
 from datetime import datetime, timezone
+import sys
+
+def template_text(descriptor):
+    with os.fdopen(descriptor,'rb') as stream:
+        raw=stream.read(262145)
+    if len(raw)>262144:
+        raise RuntimeError('Weather audit text exceeds256KiB; delivery may already have occurred')
+    return raw.decode('utf-8')
 
 payload = {
     "event_id": os.environ["EVENT_ID"],
     "logged_at": datetime.now(timezone.utc).astimezone().isoformat(),
     "type": "nws",
+    "is_test": False,
     "status": os.environ.get("EVENT_STATUS", "triggered"),
     "system_name": os.environ.get("SOURCE_NAME", ""),
     "source_extension": os.environ.get("SOURCE_EXTENSION", ""),
@@ -607,17 +640,17 @@ payload = {
     "audio_sequence": [part for part in os.environ.get("EVENT_AUDIO_SEQUENCE", "").split("&") if part],
     "alert_id": os.environ.get("EVENT_ALERT_ID", ""),
     "zone": os.environ.get("NWS_ZONE", ""),
-    "mail_subject": os.environ.get("EVENT_SUBJECT", ""),
-    "mail_body": os.environ.get("EVENT_BODY", ""),
+    "mail_subject": template_text(4),
+    "mail_body": template_text(3),
 }
 
-with open(os.environ["EVENTS_LOG_PATH"], "a", encoding="utf-8") as handle:
-    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-    handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
-    handle.flush()
-    os.fsync(handle.fileno())
-    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-os.chmod(os.environ["EVENTS_LOG_PATH"], 0o640)
+sys.path.insert(0, '/usr/local/bin/sls_mass_notify')
+from sls_atomic_json import append_json_line
+try:
+    append_json_line(os.environ["EVENTS_LOG_PATH"], payload)
+except (OSError, RuntimeError, ValueError, TypeError) as error:
+    print(f"ERROR: Weather audit evidence could not be saved: {error}. Delivery may already have occurred; do not replay it solely to repair this log.", file=sys.stderr)
+    raise SystemExit(1)
 PY
 }
 
@@ -787,9 +820,8 @@ time_to_minutes() {
   local value="$1"
   local hour="${value%%:*}"
   local minute="${value##*:}"
-  if ! [[ "$hour" =~ ^[0-9]{2}$ && "$minute" =~ ^[0-9]{2}$ ]]; then
-    echo 0
-    return
+  if ! [[ "$value" =~ ^[0-9]{2}:[0-9]{2}$ ]] || [ "$((10#$hour))" -gt 23 ] || [ "$((10#$minute))" -gt 59 ]; then
+    return 1
   fi
   echo $((10#$hour * 60 + 10#$minute))
 }
@@ -802,9 +834,9 @@ quiet_hours_active() {
 
   [ "${QUIET_HOURS_ENABLED:-0}" = "1" ] || return 1
 
-  now_minutes="$(time_to_minutes "$now_value")"
-  start_minutes="$(time_to_minutes "${QUIET_HOURS_START:-21:00}")"
-  end_minutes="$(time_to_minutes "${QUIET_HOURS_END:-06:00}")"
+  now_minutes="$(time_to_minutes "$now_value")" || return 0
+  start_minutes="$(time_to_minutes "${QUIET_HOURS_START:-21:00}")" || return 0
+  end_minutes="$(time_to_minutes "${QUIET_HOURS_END:-06:00}")" || return 0
 
   if [ "$start_minutes" -eq "$end_minutes" ]; then
     return 1
@@ -828,35 +860,27 @@ quiet_hours_allows_event() {
   return 1
 }
 
-mark_processed_alert() {
-  local alert_key="$1"
-
-  [ -n "$alert_key" ] || return 0
-  if ! grep -qFx "$alert_key" "$PROCESSED_ALERTS" 2>/dev/null; then
-    printf '%s\n' "$alert_key" >> "$PROCESSED_ALERTS"
-  fi
-	if ! grep -qFx "$alert_key" "$SEEN_ALERTS" 2>/dev/null; then
-    printf '%s\n' "$alert_key" >> "$SEEN_ALERTS"
-  fi
+legacy_alert_history() {
+  /usr/bin/python3 -I "$NWS_CROSS_ZONE_CLAIM_HELPER" --legacy-history "$@"
 }
 
-mark_audio_delivered() {
+prepare_alert_history() {
+  local history_file
+  for history_file in "$SEEN_ALERTS" "$PROCESSED_ALERTS" "$AUDIO_DELIVERED_ALERTS"; do
+    legacy_alert_history ensure "$history_file" || return 1
+  done
+}
+
+mark_processed_alert() {
   local alert_key="$1"
   [ -n "$alert_key" ] || return 0
-  grep -qFx "$alert_key" "$AUDIO_DELIVERED_ALERTS" 2>/dev/null || printf '%s\n' "$alert_key" >> "$AUDIO_DELIVERED_ALERTS"
-  chmod 0640 "$AUDIO_DELIVERED_ALERTS" 2>/dev/null || true
-  chown asterisk:asterisk "$AUDIO_DELIVERED_ALERTS" 2>/dev/null || true
+  legacy_alert_history add "$PROCESSED_ALERTS" "$alert_key" || return 1
+  legacy_alert_history add "$SEEN_ALERTS" "$alert_key"
 }
 
 clear_audio_delivered() {
-  local alert_key="$1"
-  local tmp_file
-  [ -n "$alert_key" ] || return 0
-  tmp_file="${AUDIO_DELIVERED_ALERTS}.tmp.$$"
-  grep -vFx "$alert_key" "$AUDIO_DELIVERED_ALERTS" 2>/dev/null > "$tmp_file" || true
-  chown asterisk:asterisk "$tmp_file" 2>/dev/null || true
-  chmod 0640 "$tmp_file" 2>/dev/null || true
-  mv -f "$tmp_file" "$AUDIO_DELIVERED_ALERTS"
+  [ -n "$1" ] || return 0
+  legacy_alert_history remove "$AUDIO_DELIVERED_ALERTS" "$1"
 }
 
 local_dispatch_intent_recorded() {
@@ -885,10 +909,6 @@ queue_local_dispatch_intent() {
     /usr/bin/timeout --signal=TERM --kill-after=1 10 \
       /usr/bin/python3 "$NWS_STATUS_HELPER" local-intent >> "$LOG" 2>&1
   result=$?
-  if [ "$result" -eq 0 ] || [ "$result" -eq 10 ]; then
-    chmod 0640 "$LOCAL_DISPATCH_STATE" "${LOCAL_DISPATCH_STATE}.lock" 2>/dev/null || true
-    chown asterisk:asterisk "$LOCAL_DISPATCH_STATE" "${LOCAL_DISPATCH_STATE}.lock" 2>/dev/null || true
-  fi
   return "$result"
 }
 
@@ -901,18 +921,13 @@ cancel_local_dispatch_intent() {
     /usr/bin/timeout --signal=TERM --kill-after=1 10 \
       /usr/bin/python3 "$NWS_STATUS_HELPER" local-cancel >> "$LOG" 2>&1
   result=$?
-  if [ "$result" -eq 0 ]; then
-    chmod 0640 "$LOCAL_DISPATCH_STATE" "${LOCAL_DISPATCH_STATE}.lock" 2>/dev/null || true
-    chown asterisk:asterisk "$LOCAL_DISPATCH_STATE" "${LOCAL_DISPATCH_STATE}.lock" 2>/dev/null || true
-  fi
   return "$result"
 }
 
 complete_weather_email_body() {
   local alert_b64="$1" template_body="$2" spoken
   spoken="$(build_tts_text "$alert_b64")" || return 1
-  SLS_MAIL_FEATURE="$alert_b64" SLS_MAIL_TEMPLATE="$template_body" SLS_MAIL_SPOKEN="$spoken" \
-  SLS_MAIL_HELPER="$BRANDED_EMAIL_SCRIPT" python3 - <<'PY'
+  SLS_MAIL_HELPER="$BRANDED_EMAIL_SCRIPT" python3 - 3<<<"$alert_b64" 4<<<"$template_body" 5<<<"$spoken" <<'PY'
 import base64
 import importlib.util
 import json
@@ -923,8 +938,16 @@ try:
     spec = importlib.util.spec_from_file_location("sls_weather_mail", os.environ["SLS_MAIL_HELPER"])
     helper = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(helper)
-    feature = json.loads(base64.b64decode(os.environ["SLS_MAIL_FEATURE"], validate=True))
-    print(helper.weather_body(os.environ["SLS_MAIL_TEMPLATE"], feature, os.environ["SLS_MAIL_SPOKEN"]))
+    def input_text(descriptor, maximum):
+        with os.fdopen(descriptor, 'rb') as source:
+            raw = source.read(maximum + 2)
+        if raw.endswith(b'\n'):
+            raw = raw[:-1]
+        if len(raw) > maximum:
+            raise ValueError('Weather handoff exceeds its size limit')
+        return raw.decode('utf-8')
+    feature = json.loads(base64.b64decode(input_text(3, 349528), validate=True))
+    print(helper.weather_body(input_text(4, 30000), feature, input_text(5, 512000)))
 except Exception:
     print("Weather email details could not be prepared completely; no external submission was made.", file=sys.stderr)
     raise SystemExit(1)
@@ -934,9 +957,8 @@ PY
 build_tts_text() {
   local alert_b64="$1"
 
-  ALERT_B64="$alert_b64" \
   PIPER_MAX_SECONDS="${PIPER_MAX_SECONDS:-30}" \
-  python3 - <<'PY'
+  python3 - 3<<<"$alert_b64" <<'PY'
 import base64
 import json
 import os
@@ -947,9 +969,15 @@ def clean(value):
     return re.sub(r"\s+", " ", value).strip()
 
 try:
-    feature = json.loads(base64.b64decode(os.environ["ALERT_B64"]).decode("utf-8"))
+    with os.fdopen(3, 'rb') as source:
+        encoded = source.read(349530).strip()
+    if len(encoded) > 349528:
+        raise ValueError('Weather handoff exceeds its size limit')
+    feature = json.loads(base64.b64decode(encoded, validate=True).decode('utf-8'))
 except Exception:
-    feature = {}
+    raise SystemExit('Weather speech payload is invalid or exceeds its size limit; no speech was prepared.')
+if not isinstance(feature, dict) or not isinstance(feature.get('properties'), dict):
+    raise SystemExit('Weather speech requires a complete alert feature; no speech was prepared.')
 
 props = feature.get("properties", {}) if isinstance(feature, dict) else {}
 event = clean(props.get("event")) or "weather alert"
@@ -960,7 +988,9 @@ description = clean(props.get("description"))
 instruction = clean(props.get("instruction"))
 
 event_lower = event.lower()
-if "tornado" in event_lower and ("warning" in event_lower or "emergency" in event_lower):
+if instruction:
+    action = instruction
+elif "tornado" in event_lower and ("warning" in event_lower or "emergency" in event_lower):
     action = "Take shelter now in an interior room on the lowest floor."
 elif "flash flood" in event_lower or "flood" in event_lower:
     action = "Avoid flooded roads and move to higher ground if needed."
@@ -1007,7 +1037,7 @@ generate_tts_audio() {
   chown asterisk:asterisk "$SLS_TTS_DIR" 2>/dev/null || true
   chmod 755 "$SLS_TTS_DIR" 2>/dev/null || true
 
-  text="$(build_tts_text "$alert_b64")"
+  text="$(build_tts_text "$alert_b64")" || return 1
   if [ -z "$text" ]; then
     echo "$(date): ERROR — Unable to build Piper TTS text for $event" >> "$LOG"
     return 1
@@ -1064,7 +1094,7 @@ generate_tts_audio() {
   fi
 
   chown asterisk:asterisk "$output_file" 2>/dev/null || true
-  chmod 644 "$output_file"
+  chmod 640 "$output_file"
   echo "$(date): Generated Piper TTS for $event — ${base_name}.wav — ${text}" >> "$LOG"
   printf '%s\n' "$base_name"
 }
@@ -1107,7 +1137,7 @@ build_audio_sequence() {
       && timeout --kill-after=2 30 sox "$silence_file" "${files[@]}" -r 8000 -c 1 -b 16 "$combined_file" >> "$LOG" 2>&1; then
       rm -f "$silence_file"
       chown asterisk:asterisk "$combined_file" 2>/dev/null || true
-      chmod 644 "$combined_file"
+      chmod 640 "$combined_file"
       printf '%s' "${SLS_TTS_SOUND_PREFIX}/${combined_base}"
       return 0
     fi
@@ -1159,7 +1189,7 @@ trigger_visual_alert() {
 	if [ -n "$desktop_targets" ]; then
 		echo "$(date): Publishing visual live alert to the targeted desktop journal for $event — Alert ID: $alert_id" >> "$LOG"
 		notify_args=(--api-only --desktop-targets "$desktop_targets" --no-retry)
-		if ! /usr/bin/timeout 45 /usr/bin/python3 "$visual_script" --alert-json-b64 "$alert_b64" "${notify_args[@]}" >> "$LOG" 2>&1; then
+		if ! printf '%s' "$alert_b64" | /usr/bin/timeout 45 /usr/bin/python3 "$visual_script" --alert-json-b64-stdin "${notify_args[@]}" >> "$LOG" 2>&1; then
       echo "$(date): ERROR — Targeted Desktop journal publication failed for $event" >> "$LOG"
       submission_failed=1
     else
@@ -1176,7 +1206,7 @@ trigger_visual_alert() {
 		fi
 		echo "$(date): Submitting visual live alert to Asterisk for $event — Alert ID: $alert_id" >> "$LOG"
 		notify_args=(--targets "$targets" --no-api --no-retry)
-		if ! /usr/bin/timeout 45 /usr/bin/python3 "$visual_script" --alert-json-b64 "$alert_b64" "${notify_args[@]}" >> "$LOG" 2>&1; then
+		if ! printf '%s' "$alert_b64" | /usr/bin/timeout 45 /usr/bin/python3 "$visual_script" --alert-json-b64-stdin "${notify_args[@]}" >> "$LOG" 2>&1; then
       echo "$(date): ERROR — Phone visual alert submission to Asterisk failed for $event" >> "$LOG"
       submission_failed=1
     fi
@@ -1248,10 +1278,10 @@ queue_audio_to_recipients() {
   local -a admitted_recipients=()
   if ! admission_request="$(SLS_VM_RECIPIENTS="$reservation_recipients" SLS_VM_SOUND="$sound_sequence" \
       SLS_VM_DURATION="$page_hold_seconds" SLS_VM_ENABLED="${NWS_VOICEMAIL_ENABLED:-1}" \
-      SLS_VM_SCOPE="${NWS_ZONE_GROUP_ID_OVERRIDE:-}" SLS_VM_FEATURE="$ALERT_B64" \
+      SLS_VM_SCOPE="${NWS_ZONE_GROUP_ID_OVERRIDE:-}" \
       SLS_VM_CHAIN="$ALERT_KEY" SLS_VM_EVENT="$event" SLS_VM_SEVERITY="${SEVERITY:-}" SLS_VM_EVENT_ID="$alert_id" \
       SLS_VM_ZONE="${NWS_ZONE_OVERRIDE:-${NWS_ZONE:-}}" \
-      /usr/bin/python3 -I - "$CONFIG_JSON_FILE" <<'PY'
+      /usr/bin/python3 -I - "$CONFIG_JSON_FILE" 3<<<"$ALERT_B64" <<'PY'
 import base64, hashlib, json, os, re, sys
 sys.path.insert(0, '/usr/local/bin/sls_mass_notify')
 voicemail = os.environ['SLS_VM_ENABLED'] == '1'
@@ -1270,7 +1300,11 @@ if voicemail and not scope:
 context = None
 if voicemail:
     from sls_notification_destinations import weather_source_validity
-    feature = json.loads(base64.b64decode(os.environ['SLS_VM_FEATURE'], validate=True))
+    with os.fdopen(3, 'rb') as source:
+        encoded = source.read(349530).strip()
+    if len(encoded) > 349528:
+        raise ValueError('Weather admission feature exceeds its size limit')
+    feature = json.loads(base64.b64decode(encoded, validate=True))
     context = {'event': os.environ['SLS_VM_EVENT'], 'severity': os.environ['SLS_VM_SEVERITY'],
         'source_validity': weather_source_validity('nws', scope, feature=feature,
             chain_key=os.environ['SLS_VM_CHAIN'], zone=zone)}
@@ -1362,21 +1396,12 @@ CALL
 }
 
 acquire_audio_delivery_slot() {
-  mkdir -p "$(dirname "$NWS_AUDIO_DELIVERY_LOCK")"
-  exec {NWS_AUDIO_LOCK_FD}>"$NWS_AUDIO_DELIVERY_LOCK" || return 1
-  chmod 0640 "$NWS_AUDIO_DELIVERY_LOCK" 2>/dev/null || true
-  chown asterisk:asterisk "$NWS_AUDIO_DELIVERY_LOCK" 2>/dev/null || true
-  if ! /usr/bin/flock -w 3300 "$NWS_AUDIO_LOCK_FD"; then
-    exec {NWS_AUDIO_LOCK_FD}>&-
-    NWS_AUDIO_LOCK_FD=""
-    return 1
-  fi
+  start_nws_lock "$NWS_AUDIO_DELIVERY_LOCK" 3300 NWS_AUDIO_LOCK_FD
 }
 
 release_audio_delivery_slot() {
   if [ -n "$NWS_AUDIO_LOCK_FD" ]; then
-    /usr/bin/flock -u "$NWS_AUDIO_LOCK_FD" 2>/dev/null || true
-    exec {NWS_AUDIO_LOCK_FD}>&-
+    exec {NWS_AUDIO_LOCK_FD}<&-
     NWS_AUDIO_LOCK_FD=""
   fi
 }
@@ -1458,7 +1483,6 @@ queue_external_destinations() {
   SLS_NOTIFICATION_TEST="0" \
   SLS_NOTIFICATION_DRY_RUN="0" \
   SLS_DESTINATION_SOURCE="nws" \
-  SLS_SOURCE_ALERT_B64="$ALERT_B64" \
   SLS_SOURCE_GROUP_ID="${NWS_ZONE_GROUP_ID_OVERRIDE:-}" \
   SLS_SOURCE_CHAIN_KEY="$correlation_key" \
   SLS_DESTINATION_SUBJECT="$subject" \
@@ -1480,7 +1504,7 @@ queue_external_destinations() {
   SLS_EXTERNAL_PREPARATION_ERROR="${EXTERNAL_PREPARATION_ERROR:-}" \
   SLS_WEBHOOK_DESTINATION_KEYS="$NWS_WEBHOOK_DESTINATION_KEYS_OVERRIDE" \
     /usr/bin/timeout --signal=TERM --kill-after=1 "$command_timeout" \
-      /usr/bin/python3 - "$NOTIFICATION_DESTINATION_SCRIPT" "$CONFIG_JSON_FILE" "$EXTERNAL_DELIVERY_STATE" >> "$LOG" 2>&1 <<'PY'
+      /usr/bin/python3 - "$NOTIFICATION_DESTINATION_SCRIPT" "$CONFIG_JSON_FILE" "$EXTERNAL_DELIVERY_STATE" >> "$LOG" 2>&1 3<<<"$ALERT_B64" <<'PY'
 import importlib.util
 import base64
 import hashlib
@@ -1499,6 +1523,11 @@ module = importlib.util.module_from_spec(spec)
 try:
     spec.loader.exec_module(module)
     config = module._config_crypto.read_config(config_path)
+    with os.fdopen(3, 'rb') as source:
+        encoded = source.read(349530).strip()
+    if len(encoded) > 349528:
+        raise ValueError('Weather external feature exceeds its size limit')
+    source_feature = json.loads(base64.b64decode(encoded, validate=True))
     fields = [
         (name, os.environ.get("SLS_DESTINATION_" + name.upper(), ""))
         for name in ("Type", "Event", "Severity", "Zone", "Recipients", "Audio", "Trigger")
@@ -1539,7 +1568,7 @@ try:
         [value for value in os.environ.get("SLS_WEBHOOK_DESTINATION_KEYS", "").split(",") if value],
         source_validity=module.weather_source_validity(
             "nws", group_id,
-            feature=json.loads(base64.b64decode(os.environ["SLS_SOURCE_ALERT_B64"], validate=True)),
+            feature=source_feature,
             chain_key=os.environ.get("SLS_SOURCE_CHAIN_KEY", ""),
             zone=os.environ.get("SLS_DESTINATION_ZONE", ""),
         ),
@@ -1558,37 +1587,10 @@ PY
   case "$result" in 0|1) return "$result" ;; *) return 75 ;; esac
 }
 
-touch "$SEEN_ALERTS" "$PROCESSED_ALERTS" "$AUDIO_DELIVERED_ALERTS"
-chmod 0640 "$SEEN_ALERTS" "$PROCESSED_ALERTS" "$AUDIO_DELIVERED_ALERTS" 2>/dev/null || true
-chown asterisk:asterisk "$SEEN_ALERTS" "$PROCESSED_ALERTS" "$AUDIO_DELIVERED_ALERTS" 2>/dev/null || true
-
-# v0.0.7 recorded unsupported Heat Advisory chains as fully processed. Remove
-# those stale records once when upgrading so an active advisory can be
-# delivered now that it is a supported event.
-DEDUP_MIGRATION_FILE="${PROCESSED_ALERTS}.v008-migrated"
-if [ ! -f "$DEDUP_MIGRATION_FILE" ]; then
-  for dedup_file in "$SEEN_ALERTS" "$PROCESSED_ALERTS"; do
-    migration_tmp="${dedup_file}.migration.$$"
-    grep -v '^Heat Advisory|' "$dedup_file" > "$migration_tmp" 2>/dev/null || true
-    chown asterisk:asterisk "$migration_tmp" 2>/dev/null || true
-    chmod 0640 "$migration_tmp" 2>/dev/null || true
-    mv -f "$migration_tmp" "$dedup_file"
-  done
-  printf '%s\n' "Heat Advisory support migration completed $(timestamp_now)" > "$DEDUP_MIGRATION_FILE"
-  chown asterisk:asterisk "$DEDUP_MIGRATION_FILE" 2>/dev/null || true
-  chmod 0640 "$DEDUP_MIGRATION_FILE" 2>/dev/null || true
-fi
-
-# Keep dedup state bounded without erasing active alert-chain history.
-for dedup_file in "$SEEN_ALERTS" "$PROCESSED_ALERTS" "$AUDIO_DELIVERED_ALERTS"; do
-  if [ "$(wc -l < "$dedup_file" 2>/dev/null || echo 0)" -gt 5000 ]; then
-    dedup_tmp="${dedup_file}.tmp.$$"
-    tail -n 5000 "$dedup_file" > "$dedup_tmp"
-    chown asterisk:asterisk "$dedup_tmp" 2>/dev/null || true
-    chmod 0640 "$dedup_tmp" 2>/dev/null || true
-    mv -f "$dedup_tmp" "$dedup_file"
-  fi
-done
+prepare_alert_history || {
+  printf '%s\n' 'NWS alert history is unsafe, missing or full; preserve it and restore reviewed history before retrying.' >&2
+  exit 1
+}
 
 echo "$(date): Checking NWS alerts for zone $NWS_ZONE" >> "$LOG"
 
@@ -1611,13 +1613,13 @@ if [ -n "$INPUT_PAYLOAD" ]; then
 else
 	ALERTS=$(curl -fsS --retry 3 --retry-all-errors --retry-connrefused --connect-timeout 10 --max-time 30 --max-filesize 10485760 \
     -H "Accept: application/geo+json" \
-    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.6-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
+    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.7-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
     "${NWS_API_BASE_URL%/}/alerts/active?zone=${NWS_ZONE}&status=actual" 2>>"$LOG") || ALERTS=""
   if [ -z "$ALERTS" ]; then
     echo "$(date): Initial NWS request failed; retrying over IPv4" >> "$LOG"
 	  ALERTS=$(curl -4 -fsS --retry 2 --retry-all-errors --retry-connrefused --connect-timeout 10 --max-time 30 --max-filesize 10485760 \
       -H "Accept: application/geo+json" \
-	    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.6-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
+	    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.7-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
       "${NWS_API_BASE_URL%/}/alerts/active?zone=${NWS_ZONE}&status=actual" 2>>"$LOG") || ALERTS=""
   fi
 fi
@@ -1629,20 +1631,24 @@ if [ -z "$ALERTS" ]; then
 fi
 
 POLL_SUMMARY="$(echo "$ALERTS" | python3 -c "
+import importlib.util
 import json
+import os
 import sys
 from collections import Counter
 
 try:
-    data = json.load(sys.stdin)
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location('sls_weather_source', os.environ['NWS_SOURCE_HELPER'])
+    source = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(source)
+    raw = sys.stdin.buffer.read(10485761)
+    if len(raw) > 10485760:
+        raise ValueError('Weather.gov response exceeds its size limit')
+    features = source.validate_collection(source.strict_json(raw))
 except Exception:
     print('{}')
-    sys.exit(0)
-
-if not isinstance(data, dict) or not isinstance(data.get('features'), list):
-    print('{}')
     sys.exit(3)
-features = data['features']
 events = []
 candidate_events = []
 for feature in features:
@@ -1664,17 +1670,22 @@ print(json.dumps(payload, separators=(',', ':')))
 
 PARSED_ALERTS="$(echo "$ALERTS" | python3 -c "
 import base64
+import importlib.util
+import os
 import sys, json
 from datetime import datetime
 
 try:
-    data = json.load(sys.stdin)
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location('sls_weather_source', os.environ['NWS_SOURCE_HELPER'])
+    source = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(source)
+    raw = sys.stdin.buffer.read(10485761)
+    if len(raw) > 10485760:
+        raise ValueError('Weather.gov response exceeds its size limit')
+    features = source.validate_collection(source.strict_json(raw))
 except Exception:
     sys.exit(2)
-
-if not isinstance(data, dict) or not isinstance(data.get('features'), list):
-    sys.exit(3)
-features = data['features']
 
 if not features:
     sys.exit(0)
@@ -1688,7 +1699,7 @@ for source_index, feature in enumerate(features):
         continue
     alert_id = str(feature.get('id') or props.get('id') or '').strip().split('/')[-1]
     event = str(props.get('event') or '').strip()
-    severity = str(props.get('severity') or '').strip()
+    severity = str(props.get('severity') or 'Unknown').strip() or 'Unknown'
     status = str(props.get('status') or '').strip()
     msg_type = str(props.get('messageType') or '').strip()
     references = props.get('references') or []
@@ -1851,7 +1862,16 @@ printf '%s\n' "$PARSED_ALERTS" | while IFS=$'\t' read -r ALERT_ID EVENT SEVERITY
 
   # Skip already processed alert chains. NWS time-only updates can arrive with
   # a new alert ID, but references keep them tied to the original alert.
-  if [ "$FORCE_REPLAY" != "1" ] && grep -qFx "$ALERT_KEY" "$PROCESSED_ALERTS"; then
+  PROCESSED_HISTORY_STATUS=1
+  if [ "$FORCE_REPLAY" != "1" ]; then
+    legacy_alert_history contains "$PROCESSED_ALERTS" "$ALERT_KEY"
+    PROCESSED_HISTORY_STATUS=$?
+    if [ "$PROCESSED_HISTORY_STATUS" -gt 1 ]; then
+      report_fault "delivery_state" "Processed alert history is unavailable; no new delivery was attempted" "$EVENT" "$ALERT_ID"
+      exit 1
+    fi
+  fi
+  if [ "$PROCESSED_HISTORY_STATUS" -eq 0 ]; then
     echo "$(date): Skipping update for already processed alert — Event: $EVENT | Key: $ALERT_KEY" >> "$LOG"
     update_status "$(printf '{"last_delivery_at":%s,"last_delivery_status":"skipped_duplicate","last_delivery_source":"nws","last_delivery_event":%s,"last_delivery_message":%s,"last_delivery_alert_id":%s}' \
       "$(json_string "$(timestamp_now)")" \
@@ -1902,7 +1922,7 @@ printf '%s\n' "$PARSED_ALERTS" | while IFS=$'\t' read -r ALERT_ID EVENT SEVERITY
         "$(json_string "$EVENT")" \
         "$(json_string "Skipped ${EVENT}; every destination was already durably claimed by an earlier configured Weather zone.")" \
         "$(json_string "$ALERT_ID")")"
-      [ "$FORCE_REPLAY" = "1" ] || mark_processed_alert "$ALERT_KEY"
+      if [ "$FORCE_REPLAY" != "1" ]; then mark_processed_alert "$ALERT_KEY" || exit 1; fi
       continue
       ;;
     *)
@@ -2014,7 +2034,7 @@ ${QUIET_NOTE}"
         "$(json_string "$ALERT_ID")")"
       append_event_log "$EVENT" "$SEVERITY" "$MSG_TYPE" "$QUIET_AUDIO" "$ALERT_ID" "$MAIL_SUBJECT" "$MAIL_BODY" "$QUIET_EVENT_STATUS"
 	      if [ "$QUIET_STATE_PERSISTED" = "1" ] && [ "$CROSS_ZONE_FINALIZE_OK" = "1" ]; then
-	        [ "$FORCE_REPLAY" = "1" ] || mark_processed_alert "$ALERT_KEY"
+	        if [ "$FORCE_REPLAY" != "1" ]; then mark_processed_alert "$ALERT_KEY" || exit 1; fi
 	      fi
     fi
     continue
@@ -2027,10 +2047,8 @@ ${QUIET_NOTE}"
   LOCAL_STATE_OK=1
   LOCAL_PREP_OK=1
   LOCAL_INTENT_COMMITTED=0
-  LOCAL_INTENT_NEW=0
   LOCAL_SUBMISSION_OK=1
   LOCAL_AUDIO_QUEUE_FAILED=0
-  VISUAL_DELIVERY_OK=1
   [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ] && LOCAL_PHONE_REQUESTED=1
   if [ "${#NWS_ALERT_RECIPIENTS[@]}" -gt 0 ] || [ "${#NWS_DESKTOP_RECIPIENTS[@]}" -gt 0 ]; then
     LOCAL_VISUAL_REQUESTED=1
@@ -2058,7 +2076,13 @@ ${QUIET_NOTE}"
     # Migrate the prior post-audio marker into the stronger all-local-channel
     # intent contract. Audio may already have been submitted, so visual must
     # not be replayed while the outcome is uncertain.
-    if [ "$LOCAL_RECOVERY" = "0" ] && grep -qFx "$ALERT_KEY" "$AUDIO_DELIVERED_ALERTS" 2>/dev/null; then
+    AUDIO_HISTORY_STATUS=1
+    if [ "$LOCAL_RECOVERY" = "0" ]; then
+      legacy_alert_history contains "$AUDIO_DELIVERED_ALERTS" "$ALERT_KEY"
+      AUDIO_HISTORY_STATUS=$?
+      [ "$AUDIO_HISTORY_STATUS" -le 1 ] || LOCAL_STATE_OK=0
+    fi
+    if [ "$LOCAL_RECOVERY" = "0" ] && [ "$AUDIO_HISTORY_STATUS" -eq 0 ]; then
       queue_local_dispatch_intent "$ALERT_KEY" "$ALERT_ID" "$EVENT" "$LOCAL_PHONE_REQUESTED" "$LOCAL_VISUAL_REQUESTED"
       LOCAL_MIGRATION_STATUS=$?
       if [ "$LOCAL_MIGRATION_STATUS" -eq 0 ] || [ "$LOCAL_MIGRATION_STATUS" -eq 10 ]; then
@@ -2217,7 +2241,6 @@ ${QUIET_NOTE}"
       LOCAL_INTENT_STATUS=$?
       if [ "$LOCAL_INTENT_STATUS" -eq 0 ]; then
         LOCAL_INTENT_COMMITTED=1
-        LOCAL_INTENT_NEW=1
       elif [ "$LOCAL_INTENT_STATUS" -eq 10 ]; then
         LOCAL_INTENT_COMMITTED=1
         LOCAL_RECOVERY=1
@@ -2265,7 +2288,6 @@ ${QUIET_NOTE}"
       fi
       if [ "$LOCAL_VISUAL_REQUESTED" = "1" ]; then
         if ! trigger_visual_alert "$ALERT_B64" "$EVENT" "$ALERT_ID" 2; then
-          VISUAL_DELIVERY_OK=0
           LOCAL_SUBMISSION_OK=0
           DELIVERY_STATUS="partial_failure"
           DELIVERY_MESSAGE="Phone SIP NOTIFY submission or durable Desktop journal publication returned a failure for ${EVENT}; its outcome may be partial and automatic local replay is suppressed"
@@ -2308,8 +2330,8 @@ ${QUIET_NOTE}"
     && [ "$EXTERNAL_STATE_PERSISTED" = "1" ] \
     && { [ "$LOCAL_INTENT_COMMITTED" = "1" ] || [ "$LOCAL_DELIVERY_REQUESTED" = "0" ]; } \
     && [ "$CROSS_ZONE_FINALIZE_OK" = "1" ]; then
-    [ "$FORCE_REPLAY" = "1" ] || mark_processed_alert "$ALERT_KEY"
-    clear_audio_delivered "$ALERT_KEY"
+    if [ "$FORCE_REPLAY" != "1" ]; then mark_processed_alert "$ALERT_KEY" || exit 1; fi
+    clear_audio_delivered "$ALERT_KEY" || exit 1
   fi
   if [ "$LOCAL_SUBMISSION_OK" = "1" ] \
     && [ "$AUX_DELIVERY_OK" = "1" ] \

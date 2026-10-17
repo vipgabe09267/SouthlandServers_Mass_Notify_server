@@ -17,14 +17,15 @@
             var status=document.getElementById('sls-install-profile-status'),result=document.getElementById('sls-install-profile-result'),report=null;
             check.addEventListener('click',async function(){
                 check.disabled=true;download.disabled=true;status.textContent='Checking the local installation…';
-                var controller=new AbortController(),timer=setTimeout(function(){controller.abort();},15000);
+                var controller=new AbortController(),timer=setTimeout(function(){controller.abort();},15000),failure='The compatibility report is unavailable. Run slsconsole doctor from the CLI.';
                 try{
                     var body=new URLSearchParams({slsmassnotifyserver_action:'installation_profile',slsmassnotifyserver_csrf:<?php echo json_encode($csrf_token ?? '', JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT); ?>});
                     var response=await fetch('config.php?display=slsmassnotifyserver_help',{method:'POST',credentials:'same-origin',cache:'no-store',body:body,signal:controller.signal});
-                    var value=await response.json();if(!response.ok||!value.success)throw new Error(value.message||'The compatibility report is unavailable.');
+                    var value;try{value=await response.json();}catch(parseError){throw new Error('invalid_response');}
+                    if(!response.ok||!value||value.success!==true){if(value&&typeof value.message==='string'&&value.message.length>0&&value.message.length<=500)failure=value.message;throw new Error('request_failed');}
                     report=JSON.stringify(value,null,2)+'\n';result.textContent=report;result.hidden=false;download.disabled=false;
                     status.textContent='Report ready. Review warnings before upgrading. The report excludes configuration values and credentials; review system paths before sharing it.';
-                }catch(error){status.textContent=error.name==='AbortError'?'The check timed out. Run slsconsole doctor from the CLI.':error.message;}
+                }catch(error){status.textContent=error&&error.name==='AbortError'?'The check timed out. Run slsconsole doctor from the CLI.':failure;}
                 finally{clearTimeout(timer);check.disabled=false;}
             });
             download.addEventListener('click',function(){if(!report)return;var url=URL.createObjectURL(new Blob([report],{type:'application/json'})),link=document.createElement('a');link.href=url;link.download='sls-installation-profile.json';document.body.appendChild(link);link.click();link.remove();setTimeout(function(){URL.revokeObjectURL(url);},1000);});

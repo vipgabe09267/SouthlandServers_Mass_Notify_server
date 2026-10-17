@@ -15,10 +15,10 @@ import time
 import wave
 
 repo = Path(__file__).resolve().parents[1]
-isolated = ((os.environ.get('SLS_TEST_NAMESPACE') == 'entered'
-             and os.environ.get('SLS_TEST_PARENT_NET_NS') not in (None, os.readlink('/proc/self/ns/net')))
-            or (os.environ.get('SLS_BUILD_STAGE') == 'isolated'
-                and os.environ.get('SLS_BUILD_PARENT_NET') not in (None, os.readlink('/proc/self/ns/net'))))
+isolated = all(os.environ.get('SLS_TEST_NAMESPACE') == 'entered' and
+               os.environ.get('SLS_TEST_PARENT_' + label + '_NS') not in
+               (None, '', os.readlink('/proc/self/ns/' + kind))
+               for label, kind in [('MOUNT', 'mnt'), ('NET', 'net'), ('PID', 'pid')])
 asterisk = shutil.which('asterisk')
 if not isolated or not asterisk:
     raise SystemExit('This fixture requires Asterisk and tools/run_isolated_tests.sh; no PBX was started.')

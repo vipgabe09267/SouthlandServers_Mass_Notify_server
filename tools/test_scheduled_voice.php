@@ -13,7 +13,9 @@ foreach (['saveScheduledAnnouncement', 'normalizeScheduledAnnouncements', 'getSc
     'processScheduledAnnouncements', 'findLiveScheduledOccurrence', 'scheduleExecutionRecord',
     'validateScheduledAnnouncementRecurrences', 'sanitizeScheduleText', 'normalizeScheduleRecurrenceMode',
     'scheduleRecurrenceIntervalDays', 'buildScheduledOccurrences', 'scheduleRecurrenceMatchesOccurrences',
-    'resolveScheduleLocalDateTime', 'parseScheduleUtcTimestamp', 'normalizeAnnouncementAudioMode', 'normalizeToneName', 'validateAudienceWebhookIds', 'announcementTone'] as $name) {
+	'resolveScheduleLocalDateTime', 'parseScheduleUtcTimestamp', 'normalizeAnnouncementAudioMode', 'normalizeToneName',
+	'validateAudienceWebhookIds', 'announcementTone', 'normalizeExtensionSelector', 'validateExtensionSelectorList', 'validateDesktopSelectorList',
+	'normalizeStoredFlag', 'aggregateSavedAudienceTargets', 'validateAggregateSavedAudienceTargets'] as $name) {
     $method = $reflection->getMethod($name);
     $methods .= implode('', array_slice($source, $method->getStartLine() - 1, $method->getEndLine() - $method->getStartLine() + 1));
 }
@@ -42,6 +44,9 @@ class ScheduledVoiceFixture {
     private function acquireAnnouncementActivityLock(...$args) { return null; }
     private function releaseNativeBackupFileLock($lock) {}
     private function admitScheduledAnnouncementRequest(array $request): array { return ['success'=>true]; }
+    private function commitScheduledAnnouncementAdmission(array $request, callable $commit): array {
+        return ['success'=>true, 'value'=>$commit()];
+    }
     private function startAnnouncementWorker($id) { return true; }
     protected function readAnnouncementPhoneOutcomes($correlation) { return ['available'=>false,'targets'=>[]]; }
     private function loadScheduleExecutionStore($failClosed) { return $this->store; }
@@ -68,7 +73,7 @@ class ScheduledVoiceFixture {
             'voice_recipient_ids'=>$ids, 'email_recipient_ids'=>[], 'audio_mode'=>$options['audio_mode'], 'is_test'=>false]];
     }
 FIXTURE;
-foreach (['MAX_WEBHOOK_DESTINATIONS', 'MAX_SCHEDULES', 'MAX_SCHEDULE_OCCURRENCES', 'MAX_SCHEDULE_YEARS', 'SCHEDULE_GRACE_SECONDS'] as $name) {
+foreach (['MAX_WEBHOOK_DESTINATIONS', 'MAX_SAVED_CHANNEL_RECIPIENTS', 'MAX_EXTERNAL_VOICE_RECIPIENTS', 'MAX_SCHEDULES', 'MAX_SCHEDULE_OCCURRENCES', 'MAX_SCHEDULE_YEARS', 'SCHEDULE_GRACE_SECONDS'] as $name) {
     $fixture .= 'const ' . $name . ' = ' . var_export($reflection->getConstant($name), true) . ';';
 }
 $fixture .= 'const SCHEDULE_LOCK_FILE = ' . var_export($directory . '/schedule.lock', true) . ';'

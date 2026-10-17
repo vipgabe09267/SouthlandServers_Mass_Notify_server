@@ -42,7 +42,11 @@ ladder_check(count($legacy['escalation']['steps']) === 1 && $legacy['escalation'
 $now = 1800000000; $sent = []; $frozen = []; $mode = 'ok';
 $store = new IncidentStore($root . '/records');
 $service = new IncidentService($store, static function ($id) use (&$template) { return $template; },
-    static function ($delivery) use (&$frozen) { $frozen[] = $delivery; return $delivery + ['_identities' => ['fixture' => hash('sha256', json_encode($delivery))]]; },
+    static function ($delivery) use (&$frozen) {
+        $frozen[] = $delivery; $identities = ['desktop_clients' => []];
+        foreach ($delivery['desktop_clients'] as $id) { $identities['desktop_clients'][$id] = hash('sha256', $id); }
+        return $delivery + ['_identities' => $identities];
+    },
     static function ($delivery, $message, $title, $context, $origin) use (&$sent, &$mode) {
         if ($mode === 'uncertain') { throw new RuntimeException('Fixture transport interruption.'); }
         if ($mode === 'denied') { return ['success' => false, 'delivery_started' => false, 'message' => 'Fixture current grant revoked.']; }

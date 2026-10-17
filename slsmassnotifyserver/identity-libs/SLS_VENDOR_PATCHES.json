@@ -1,0 +1,139 @@
+{
+  "packages": {
+    "guzzlehttp/guzzle": {
+      "files": {
+        "src/Handler/CurlFactory.php": "242fd9074dd92480423840064ecb2ae3fec2dd86f1b43f02a52da30921473b8c"
+      },
+      "modifications": "Reject a non-array curl request option before the handler reads nested options.",
+      "source_reference": "93939470950a9b11e2e84204166ef5e048c55fe4"
+    },
+    "guzzlehttp/promises": {
+      "files": {
+        "CHANGELOG.md": "ad3ea7604130eb3fffd09d856e94e0d78a1ef08e622e4010e1e809e5c70de93e",
+        "UPGRADING.md": "6ed54151d8f6123ccea6218004f74f64873b9d163af3a4fb28f7b5d020a7c23c",
+        "src/RejectionException.php": "da1f0df61a17e3aa63dabcccb075563efb1345567ea9d48bdec7332f1a54d058"
+      },
+      "modifications": "Bound and escape rejection diagnostics and contain exceptions raised while formatting untrusted rejection reasons.",
+      "source_reference": "42118e66a53c492effaf92bc357e931985d5c6f9"
+    },
+    "guzzlehttp/psr7": {
+      "files": {
+        "CHANGELOG.md": "5f5bdf252ad28d2b21dc9c53e4e72a903659bf0579af5cbb613b71ead6371e3b",
+        "UPGRADING.md": "a8821bcf0dfb4e40df45cfdd15b609ddf29f2b845f78eb57ca800ed277e628df",
+        "src/DroppingStream.php": "27e88433f444f1c420348b35e5ce320e505f2384270d6a4ad04bf827debcee30"
+      },
+      "modifications": "Fail closed when DroppingStream cannot determine the underlying size needed to enforce its maximum.",
+      "source_reference": "a3059ba1a84c9139c4ae03cf0f45bea276c97c74"
+    },
+    "onelogin/php-saml": {
+      "files": {
+        "src/Saml2/Utils.php": "25163dbb84d60443607ddc5c596b23d9eef39a029b9effca47a5cf9d13c03453"
+      },
+      "modifications": "Do not parse document-supplied KeyInfo when signature verification already has caller-pinned certificates.",
+      "source_reference": "26b3a47349415e5b7aa300ba4ab7fc316c65f19e"
+    },
+    "paragonie/constant_time_encoding": {
+      "files": {
+        "src/RFC4648.php": "56dae1fc2a4694c630f0708c7b195d6406f1aaacc04f89c56959c45cb4ad8f48"
+      },
+      "modifications": "Dispatch the RFC 4648 Base32-Hex facade to the Base32-Hex alphabet for encoding and decoding.",
+      "source_reference": "d5b01a39b3415c2cd581d3bd3a3575c1ebbd8e77"
+    },
+    "phpseclib/phpseclib": {
+      "files": {
+        "phpseclib/Common/Functions/Strings.php": "01d08e733988f6f53ae048a1a1b817a30bc72a307c3078d37a3ad99cb22d002b",
+        "phpseclib/Crypt/ChaCha20.php": "b7c1473211a922de0ab051e71e8dce3ebbd0f58d32fb5d8b5909bbb8255d1548",
+        "phpseclib/Crypt/Common/AsymmetricKey.php": "49e739edcaac018e1f88a58cbe482e68331f53db81b964dcccf035937b04bb6e",
+        "phpseclib/Crypt/Common/Formats/Keys/JWK.php": "81aea0a1e1cf5379b4d9bb7879667f89feee0ef2eda523e2a44a107353713b5a",
+        "phpseclib/Crypt/Common/Formats/Keys/OpenSSH.php": "955a4a07f443e960cdbd860fab41d6aa549627c74ae9b71a075f82b6c8c7924b",
+        "phpseclib/Crypt/Common/Formats/Keys/PKCS1.php": "9066496fd61345f689801249678379da94529f237d7be3b3973b948c9425b94c",
+        "phpseclib/Crypt/Common/Formats/Keys/PKCS8.php": "06f1854c671a6361f68e8c9bb590d3afeb5f0b421c6e3399005e66ed9101dbac",
+        "phpseclib/Crypt/Common/Formats/Keys/PuTTY.php": "693b50f186dc663117dd7784e3e68f74f16de3ffedda3db1cc23b8cd9764f096",
+        "phpseclib/Crypt/Common/SymmetricKey.php": "625b91612103e72994103cfc9c70579ff29046d1e9742fb8de507ae4f73412e3",
+        "phpseclib/Crypt/EC.php": "01d94d2266e2955771e1f65ff0659eae05d0ec4c0b3204bf54c9e3b0b42c4c07",
+        "phpseclib/Crypt/EC/BaseCurves/Base.php": "88670062eb7d4fc746d89200d1396aac3949b2a49e04d6595d83a67eca0ba6b9",
+        "phpseclib/Crypt/EC/BaseCurves/Binary.php": "aa4cb3edf2a7ff6dc96c7cc579641410358624e862500abdc75f8b2bbe9c3d5b",
+        "phpseclib/Crypt/EC/BaseCurves/KoblitzPrime.php": "dd4f17c944f64c43a7e04db7a9cc2b5b7091dcf0cbea761cab0d6ed6e11e9fdb",
+        "phpseclib/Crypt/EC/Curves/Curve25519.php": "56a2f86222c1485ba06952106f79ef3504e84d564438a865e4749373305d4e26",
+        "phpseclib/Crypt/EC/Curves/Curve448.php": "85e330914b8bcce1c94f8ab481d62c08c1bb981d64868fc159e8eb192ce79715",
+        "phpseclib/Crypt/EC/Curves/Ed25519.php": "cc20ac0c98c704d0d8b431b38e9024e86ac25d5cdcc8c52027c65c8a03536839",
+        "phpseclib/Crypt/EC/Curves/Ed448.php": "a2939062494e2125cfceee72ac41bb72d8c838e1c0e098f528c6e0883d633d29",
+        "phpseclib/Crypt/EC/Curves/nistk283.php": "33d0519037b1c2d6680d1d7a7cfb51e67b669d14a276f7345ff89d29b306f171",
+        "phpseclib/Crypt/EC/Curves/sect239k1.php": "c5b52e0acfdcc185087f5f734408d6e17a34ae4071f975ae1a9d26ed79c90274",
+        "phpseclib/Crypt/EC/Curves/sect283k1.php": "3435e6e06b9713531d9d3e5da7e99f715c03e4b404ffdc94684d5e3dca1bb509",
+        "phpseclib/Crypt/EC/Curves/sect283r1.php": "4c1a97a4d5cbdcae02d61b33d3835dff7e40ec038fe459190eeacba41a930927",
+        "phpseclib/Crypt/EC/Curves/sect409k1.php": "c1a440b2ca3c21fb140401fbdf2ecd19a89ddec7da1250eb08a19e6476b67574",
+        "phpseclib/Crypt/EC/Curves/sect409r1.php": "badd599f3a0839b14ec96f4c2f8b3db9bf005d2244b1c4082884859ad1845b64",
+        "phpseclib/Crypt/EC/Curves/sect571k1.php": "53ffca912bddde99cf351f5b5285f3342ad153d92959fc32c5c70498c13f30c8",
+        "phpseclib/Crypt/EC/Curves/sect571r1.php": "1cb88ee8aa5b6833b416b75b133b68d6cc9dfd01b6b7388d825ade24a78c931c",
+        "phpseclib/Crypt/EC/Formats/Keys/Common.php": "1b1594a8dff633d2d731a28e601ef2a813e221f6add79c22d49a9a0a76d10be7",
+        "phpseclib/Crypt/EC/Formats/Keys/JWK.php": "e09b6ea3891ee04ca28a07a6dc4196cd27603445708f4726935266a058866412",
+        "phpseclib/Crypt/EC/Formats/Keys/MontgomeryPrivate.php": "b9b679da3d481a996d40427de6564705d44ca6223679dc51c2bc068f6d787306",
+        "phpseclib/Crypt/EC/Formats/Keys/MontgomeryPublic.php": "f1774933f48cb88cbe37e0ffc318be55dfcc2b5865414f8102786a4699be89dd",
+        "phpseclib/Crypt/EC/Formats/Keys/OpenSSH.php": "9ea8ef0f072ce137fa90c6bd7b1d5f440876875df6cdac8d89ede68f17a2a593",
+        "phpseclib/Crypt/EC/Formats/Keys/PKCS1.php": "fbe0518d9319e8a860a3e312fdec8ce03c1a4237c563e05887618a3c49c8c9b3",
+        "phpseclib/Crypt/EC/Formats/Keys/PKCS8.php": "fd9a684a7afcba533bb6575fb9d61acc7918b705ceb03810543c61321cfb7dc2",
+        "phpseclib/Crypt/EC/Formats/Keys/PuTTY.php": "28c47888e224c2d0971a2e3a7dfc510c548343880e2ee6efbf5f97dfd3e4232d",
+        "phpseclib/Crypt/EC/Formats/Keys/XML.php": "2fbed267a95612ec61a57c1d712101eee9e2713ad089ff5e12fb1d9fa4b0f15c",
+        "phpseclib/Crypt/EC/Formats/Keys/libsodium.php": "23f737b8e5acb2ed456301dddcb70562b1ac79d03616345c11ca28aa3876638e",
+        "phpseclib/Crypt/EC/Formats/Signature/ASN1.php": "680501499b11aa36e12f6df5318170abfdb62db7b6494c77c5b3dfafa14ee945",
+        "phpseclib/Crypt/EC/Formats/Signature/IEEE.php": "36c07e3078550f1102de61a6a964b825f568a56b0a21e49863df2157e46dc0d8",
+        "phpseclib/Crypt/EC/Formats/Signature/SSH2.php": "a841782cd82efc4fd751a257474c686954462e7aa947fb9063f9858159791285",
+        "phpseclib/Crypt/EC/Parameters.php": "a9416676373ff4d904f9001f34ff4195a9decd2af53d50bfd42d02d8fb91d809",
+        "phpseclib/Crypt/EC/PrivateKey.php": "015c0707e8836921bce30cd9e5b88954ee51a2653e78e0396043390b24409ef4",
+        "phpseclib/Crypt/EC/PublicKey.php": "f6434edcbe59fe2d785b9ac04634cc74b2e24a3b119243d60e10a1b562cbd291",
+        "phpseclib/Crypt/Hash.php": "ea4667ae60ee59482fc03415083d2559ed9dbc96c9e95b5aaf5a38b0e39bb697",
+        "phpseclib/Crypt/PublicKeyLoader.php": "369fed61473fd1d511e2ac6068db64f24d612954234d648d0f30a7424646353a",
+        "phpseclib/Crypt/RC2.php": "49136d99330fd5024eb39584227915ec0a5a019c5e28824b9ed861a3b8d0688f",
+        "phpseclib/Crypt/RC4.php": "741b16eda1ebef15f57e86930786cda3b30684d38510e9eeee0d495562246033",
+        "phpseclib/Crypt/RSA.php": "8411533759be799a1afb66b22b9408d69e265fe46b4f5180c8d8f341c929c5cd",
+        "phpseclib/Crypt/RSA/Formats/Keys/JWK.php": "f0761ea3df43e9a0b60156641e42cc33ef1dfc41e55aaa51de9c85a50d65f16d",
+        "phpseclib/Crypt/RSA/Formats/Keys/MSBLOB.php": "22816ae1b78b442854ddb74607f45fd8726425509ee7e7accc0b2e2622712428",
+        "phpseclib/Crypt/RSA/Formats/Keys/OpenSSH.php": "334bcafe409959d7d74a63a2f823ca46bc1d68b77f5571fc645c992ad249cd93",
+        "phpseclib/Crypt/RSA/Formats/Keys/PKCS1.php": "dc4afd98f5934103e38f2ca8dcecfc861f6bb60670a74afd3f15955175f6f44e",
+        "phpseclib/Crypt/RSA/Formats/Keys/PKCS8.php": "98eeb03b2926e7d9e7f7ec6a4166e28308a9165cc96d89d005015333aa5e50e4",
+        "phpseclib/Crypt/RSA/Formats/Keys/PSS.php": "03da4e0599781b696e018736d9986433c47a262d1fc7a22a19e39f7d4b8d5f50",
+        "phpseclib/Crypt/RSA/Formats/Keys/PuTTY.php": "6f3a8daef59e527f8dce8fceaf7e29a4592235f1d2a0051f1efdd18ea42296b6",
+        "phpseclib/Crypt/RSA/Formats/Keys/Raw.php": "d34571ff6b00964338c073049c6399e11da85e66b966ef0878c599986881e4b3",
+        "phpseclib/Crypt/RSA/Formats/Keys/XML.php": "eadfacb7344ea6678b0b7ab97328fca8948bc336ea9db46a5295515062a61140",
+        "phpseclib/Crypt/RSA/PrivateKey.php": "357d5962943116bd9c21f2bed651052eb61766fe04d70bad86a2afd0ece184ee",
+        "phpseclib/Crypt/RSA/PublicKey.php": "84bdb58827ce7f4f50d5e79fda137900d0c8e3b2c230f2621a008944ea5ce9fa",
+        "phpseclib/Crypt/Random.php": "c610a4aa63c13b30d355287a8612761ece1a4a0837a99bb68e10f88247749e9d",
+        "phpseclib/Crypt/Salsa20.php": "56bf994563285f65580c50a74406464cba62e6f4e62c31ed7d0cc7799f1bac82",
+        "phpseclib/File/ANSI.php": "c11daeb5f117b6085dc8016b54b72c403f9c352ff330d0a65ace3c425123c9d1",
+        "phpseclib/File/ASN1.php": "a18deaa742fd23e7331a400a24ba254b6dffeee78991cc4704058e00af3fe4d0",
+        "phpseclib/File/X509.php": "dc07e722dd16cb72c38c58a5c7f1aabe12e03236e5a0b09d2592482d170a918a",
+        "phpseclib/Math/BigInteger/Engines/BCMath/Reductions/EvalBarrett.php": "9d59cda8d4524fa1a97146ae301928bd31826b8f2c9c3dc8ed778a3e4e8be749",
+        "phpseclib/Math/BigInteger/Engines/Engine.php": "ee09a6932ee68e20fbcdd4f654cb0eaa03cb2c4abdec9853e3c3f9bf86b6d8be",
+        "phpseclib/Math/BigInteger/Engines/PHP.php": "5fa4d73581140df982eea2126a726659446078059dca612a1e6739384647ca4b",
+        "phpseclib/Math/BigInteger/Engines/PHP/Reductions/Montgomery.php": "e832f37eb7d1bb60ca5803466cb27d4ddbd1f19ed1fa3340b47f2c6cc42a6cb2",
+        "phpseclib/Math/BinaryField/Integer.php": "40d35be519a452d428c7f97ef26826ca327cb4d37564cc4aa5ceb70ceba81aa9",
+        "phpseclib/Net/SFTP.php": "cca93a2280824c9632dcd2c560f00a95a4319f25275dfe756737ca8b1862e011",
+        "phpseclib/Net/SFTP/Stream.php": "485554992946572d7d53d36c2cccfa4b6cbf33bdee54dfc934fe8dcf770f3790",
+        "phpseclib/Net/SSH2.php": "cdc4933124559bfac54ca4d2880d01ab81c8cc479661f11eb1d17fa7ab84275a",
+        "phpseclib/System/SSH/Common/Traits/ReadBytes.php": "c77a721f4c60b375843bca9d843061055b3c17ce09536cd3ccc51a8c55a6caf8"
+      },
+      "modifications": "Harden untrusted cryptographic input and key serialization across EC, RSA, ASN.1, X.509, SSH and SFTP; validate curves, points, domains, RSA/CRT math, aliases, padding, lengths, XML structure, packets and trailing data; bound terminal, network and stream processing; fail closed on entropy and arithmetic edge cases; repair cipher/hash state, RC2/RC4, Poly1305 and 32-bit decoding; preserve registered formats and exact password semantics.",
+      "source_reference": "d17e0ddaeaf6f22f7e007cbb437d78792fe2a0e4"
+    },
+    "robrichards/xmlseclibs": {
+      "files": {
+        "CHANGELOG.txt": "ec79b583264bc8dda6fdc4e3de74ddf9aba2dae635ddb68c33f201af01b24010",
+        "README.md": "9c0031b22dbf63cbbcb05c0c19fa3f8a9de8703850909cc33503db7e8d8d3bc7",
+        "src/XMLSecEnc.php": "87860a43be1ef7d8609688f174b826fafd2691fef9d23722103d785411e89be0",
+        "src/XMLSecurityDSig.php": "63efccfa1fa89581694710b3ccdcb1159b09f1c29fd1b4f4db2a52d13659aea9",
+        "src/XMLSecurityKey.php": "3a9c4850a41695357805f0576a1c37a909d0feb2a7c6827e44342d8b173a94e5"
+      },
+      "modifications": "Reject lossy or ambiguous XML security references, duplicate identifiers and transform containers, oversized encoded values, unsafe external resources, unsupported algorithms and malformed key material; clear partially validated state after failures; contain verification exceptions; document the forked safe defaults and migration boundaries; and normalize vendored changelog whitespace.",
+      "source_reference": "b06a4bf7b537610eae85788bfa51e0f3ed3eb267"
+    },
+    "symfony/polyfill-php82": {
+      "files": {
+        "Random/Engine/Secure.php": "0b954ca972fdb6e94f4ce4d8afd26fcb13c2d05d74f087f12c8fa1c3ec7b9f88"
+      },
+      "modifications": "Retain the actual entropy-source exception as the previous exception when raising RandomException.",
+      "source_reference": "843bbe8b2a7934307b749751eede0f111f5d1cfc"
+    }
+  },
+  "schema": 1
+}

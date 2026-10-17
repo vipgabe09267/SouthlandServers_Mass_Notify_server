@@ -3,6 +3,8 @@
 import fcntl
 import json
 import os
+import pwd
+import stat
 from pathlib import Path
 import sys
 import tempfile
@@ -159,6 +161,51 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(victim.read_text(), 'unchanged')
         self.assertTrue(path.exists())
 
+    def test_ambiguous_runtime_references_defer_all_media_deletion(self):
+        for kind in ('weather', 'job', 'desktop', 'nonfinite'):
+            with self.subTest(kind=kind):
+                audio = self.stale(self.audio, 'announcement_tts_ambiguous.wav')
+                image = self.stale(self.web, 'alert_'+'e'*12+'.png')
+                if kind in ('weather', 'nonfinite'):
+                    reference = self.data/'weather-delivery.json'
+                    raw = ('{"jobs":{"one":{"state":"queued","state":"complete","sound":"'+audio.name+'"}}}' if kind=='weather' else '{"jobs":{},"unused":1e309}')
+                elif kind == 'job':
+                    jobs = self.data/'announcement-jobs'; jobs.mkdir(exist_ok=True)
+                    job_id = 'job_'+'a'*32; reference = jobs/(job_id+'.json')
+                    (jobs/('pending_'+job_id+'.mark')).touch()
+                    raw = '{"id":"'+job_id+'","state":"queued","state":"complete","sound":"'+audio.name+'"}'
+                else:
+                    journal = self.data/'sipnotify'; journal.mkdir(exist_ok=True)
+                    reference = journal/'sipnotify_events.jsonl'
+                    raw = '{"image_url":"https://fixture/'+image.name+'","image_url":"https://fixture/other.png"}\n'
+                reference.write_text(raw); before=reference.stat().st_ino
+                try:
+                    with self.assertRaises(ValueError): self.clean()
+                    self.assertTrue(audio.exists() and image.exists())
+                    self.assertEqual((reference.stat().st_ino, reference.read_text()), (before, raw))
+                finally: reference.unlink()
+
+    def test_ambiguous_terminal_jobs_and_event_timestamps_are_preserved(self):
+        jobs=self.data/'announcement-jobs';jobs.mkdir();job_id='job_'+'b'*32
+        job=jobs/(job_id+'.json');raw='{"id":"'+job_id+'","state":"queued","state":"complete"}'
+        job.write_text(raw);os.utime(job,(self.now-31*86400,self.now-31*86400));(jobs/(job.name+'.lock')).touch()
+        self.assertEqual(storage.prune_announcement_jobs(jobs,self.now),0)
+        self.assertEqual(job.read_text(),raw)
+        log=self.data/'events.jsonl';entry=b'{"created_at":"2099-01-01T00:00:00Z","created_at":"2000-01-01T00:00:00Z"}\n';log.write_bytes(entry)
+        result=storage.prune_event_log(log,now=self.now)
+        self.assertEqual((result['removed'],result['preserved_invalid']),(0,1))
+        self.assertEqual(log.read_bytes(),entry)
+
+    def test_summary_does_not_follow_a_replaced_parent_during_commit(self):
+        victim=self.root/'outside';victim.mkdir();sentinel=victim/'storage-summary.json';sentinel.write_text('outside remains unchanged')
+        moved=self.root/'original-data';real_check=storage.audit_separation_ready
+        def replace_parent(parent):
+            real_check(parent);self.data.rename(moved);self.data.symlink_to(victim,target_is_directory=True)
+        with mock.patch.object(storage,'WEB',self.web), mock.patch.object(storage,'audit_separation_ready',side_effect=replace_parent):
+            with self.assertRaises((OSError,RuntimeError)): storage.storage_summary(self.data,self.now)
+        self.assertEqual(sentinel.read_text(),'outside remains unchanged')
+        self.assertEqual(sorted(p.name for p in victim.iterdir()),['storage-summary.json'])
+
     def test_links_and_unrelated_files_are_never_removed(self):
         victim = self.stale(self.root, 'victim')
         hard = self.audio / 'announcement_tts_hard.wav'; os.link(victim, hard)
@@ -184,10 +231,58 @@ class RetentionTests(unittest.TestCase):
             self.assertEqual(self.clean()['audio_removed'], 2)
             self.assertEqual(self.clean()['audio_removed'], 1)
 
+    def test_cleanup_preserves_unrecognized_activity_lock_metadata(self):
+        lock=self.data/'announcement-activity.lock';orphan=self.stale(self.audio,'announcement_tts_keep.wav')
+        for case in ('owner','group','mode','contents'):
+            with self.subTest(case=case):
+                lock.unlink(missing_ok=True);lock.write_bytes(b'unknown' if case=='contents' else b'');lock.chmod(0o777 if case=='mode' else 0o640)
+                if case=='owner':os.chown(lock,65000,0)
+                elif case=='group':os.chown(lock,0,65000)
+                before=lock.stat();raw=lock.read_bytes()
+                with self.assertRaises(RuntimeError):self.clean()
+                after=lock.stat()
+                self.assertEqual((after.st_ino,after.st_uid,after.st_gid,after.st_mode),(before.st_ino,before.st_uid,before.st_gid,before.st_mode))
+                self.assertEqual(lock.read_bytes(),raw);self.assertTrue(orphan.exists())
+        lock.unlink()
+
+    def test_cleanup_repairs_only_known_legacy_lock_without_replacing_it(self):
+        lock=self.data/'announcement-activity.lock';lock.touch();lock.chmod(0o644);before=lock.stat()
+        self.clean();after=lock.stat();account=pwd.getpwnam('asterisk')
+        self.assertEqual((after.st_ino,after.st_uid,after.st_gid,stat.S_IMODE(after.st_mode),after.st_size),(before.st_ino,account.pw_uid,account.pw_gid,0o640,0))
+
+    def test_cleanup_refuses_activity_lock_replacement_before_permission_repair(self):
+        lock=self.data/'announcement-activity.lock';lock.touch();lock.chmod(0o640);before=lock.stat()
+        original=self.data/'original-activity.lock';orphan=self.stale(self.audio,'announcement_tts_preserve_race.wav')
+        real_lock=storage.fcntl.flock;replaced=False
+        def replace_name(descriptor, operation):
+            nonlocal replaced
+            if not replaced:
+                lock.rename(original);lock.touch();lock.chmod(0o640);replaced=True
+            return real_lock(descriptor,operation)
+        with mock.patch.object(storage.fcntl,'flock',side_effect=replace_name):
+            with self.assertRaisesRegex(RuntimeError,'activity lock changed'):self.clean()
+        after=original.stat()
+        self.assertEqual((after.st_ino,after.st_uid,after.st_gid,after.st_mode),(before.st_ino,before.st_uid,before.st_gid,before.st_mode))
+        self.assertTrue(orphan.exists())
+
+    def test_cleanup_refuses_activity_lock_replacement_during_permission_repair(self):
+        lock=self.data/'announcement-activity.lock';lock.touch();lock.chmod(0o644)
+        original=self.data/'original-activity.lock';orphan=self.stale(self.audio,'announcement_tts_preserve_repair_race.wav')
+        real_fchmod=storage.os.fchmod;replaced=False
+        def replace_after_chmod(descriptor,mode):
+            nonlocal replaced
+            result=real_fchmod(descriptor,mode)
+            if not replaced:
+                lock.rename(original);lock.touch();lock.chmod(0o640);replaced=True
+            return result
+        with mock.patch.object(storage.os,'fchmod',side_effect=replace_after_chmod):
+            with self.assertRaisesRegex(RuntimeError,'changed after permission repair'):self.clean()
+        self.assertTrue(replaced and original.exists() and lock.exists() and orphan.exists())
+
     def test_terminal_jobs_require_original_unlocked_inode(self):
         jobs = self.data / 'announcement-jobs'; jobs.mkdir()
         records = {}
-        for index, state in enumerate(('complete', 'worker_starting', 'queued', 'running', 'failed', 'expired')):
+        for index, state in enumerate(('complete', 'cancelled', 'worker_starting', 'queued', 'running', 'failed', 'expired')):
             job_id = 'job_' + format(index, '032x')
             path = jobs / (job_id + '.json')
             path.write_text(json.dumps({'id': job_id, 'state': state}))
@@ -198,9 +293,11 @@ class RetentionTests(unittest.TestCase):
         with records['failed'][1].open('r') as held, \
                 mock.patch.object(storage, 'lock_reclamation_ready', return_value=False):
             fcntl.flock(held, fcntl.LOCK_EX)
-            self.assertEqual(storage.prune_announcement_jobs(jobs, self.now), 1)
+            self.assertEqual(storage.prune_announcement_jobs(jobs, self.now), 2)
         self.assertFalse(records['complete'][0].exists())
+        self.assertFalse(records['cancelled'][0].exists())
         self.assertTrue(records['complete'][1].exists(), 'Cleanup replaced or removed a lock inode')
+        self.assertTrue(records['cancelled'][1].exists(), 'Cleanup replaced or removed a cancelled-job lock inode')
         self.assertTrue(all(records[state][0].exists() for state in ('worker_starting', 'queued', 'running', 'failed', 'expired')))
 
     def test_busy_audit_does_not_block_independent_media_cleanup(self):
@@ -221,10 +318,10 @@ class RetentionTests(unittest.TestCase):
         with self.assertRaises(ValueError): storage.read_locked_object(linked)
         with self.assertRaises(RuntimeError): storage.prune_audit(linked, self.now)
         self.assertEqual(victim.read_text(), '{}')
+        linked.unlink()
         with victim.open('r+') as held:
             fcntl.flock(held, fcntl.LOCK_EX)
             with self.assertRaises(BlockingIOError): storage.read_locked_object(victim)
-        linked.unlink()
         with victim.open('r+') as held:
             fcntl.flock(held, fcntl.LOCK_EX)
             with self.assertRaises(BlockingIOError): storage.prune_audit(victim, self.now)

@@ -4,15 +4,17 @@ $contactSeed=['voice'=>$settings['outbound_voice']['recipients']??[], 'sms'=>$se
     'blocked'=>$announcement_sms_usage['blocked_recipients']??[]];
 ?>
 <style>
-.sls-phone-contacts{margin:18px 0;padding:18px;border:1px solid #dfe5ec;border-radius:8px;background:#fbfcfe}
-.sls-phone-contacts h3{margin:0 0 10px}.sls-phone-contacts .contact-row{border:1px solid #dfe5ec;border-radius:7px;background:white;padding:14px;margin:12px 0}
+.sls-phone-contacts{--contact-surface:var(--sls-surface,#fbfcfe);--contact-raised:var(--sls-raised,#fff);--contact-line:var(--sls-border,#dfe5ec);--contact-text:var(--sls-text,#334155);margin:18px 0;padding:18px;border:1px solid var(--contact-line);border-radius:8px;background:var(--contact-surface);color:var(--contact-text)}
+.sls-phone-contacts h3{margin:0 0 10px}.sls-phone-contacts .contact-row{border:1px solid var(--contact-line);border-radius:7px;background:var(--contact-raised);padding:14px;margin:12px 0}
 .sls-phone-contacts .contact-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}
 .sls-phone-contacts .contact-channels{display:flex;align-items:center;gap:20px;flex-wrap:wrap;margin-top:12px}
 .sls-phone-contacts .contact-channels label{display:flex;gap:7px;align-items:center;margin:0;font-weight:600}
-.sls-phone-contacts .contact-channels button{margin-left:auto}.sls-phone-contacts .contact-consent{margin-top:14px;padding-top:12px;border-top:1px solid #e8edf2}
+.sls-phone-contacts .contact-channels button{margin-left:auto}.sls-phone-contacts .contact-consent{margin-top:14px;padding-top:12px;border-top:1px solid var(--contact-line)}
 .sls-phone-contacts .contact-consent label{display:block;margin-bottom:8px}.sls-phone-contacts label .form-control{margin-top:6px}
 .sls-phone-contacts .contact-footer{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.sls-phone-contacts [hidden]{display:none!important}
 @media(max-width:650px){.sls-phone-contacts .contact-grid{grid-template-columns:1fr}.sls-phone-contacts{padding:14px}}
+@media(prefers-color-scheme:dark){.sls-phone-contacts{--contact-surface:var(--sls-surface,#182334);--contact-raised:var(--sls-raised,#111b2b);--contact-line:var(--sls-border,#40506a);--contact-text:var(--sls-text,#e0e7ef)}}
+[data-theme=dark] .sls-phone-contacts,body.dark .sls-phone-contacts{--contact-surface:var(--sls-surface,#182334);--contact-raised:var(--sls-raised,#111b2b);--contact-line:var(--sls-border,#40506a);--contact-text:var(--sls-text,#e0e7ef)}
 </style>
 <section id="sls-phone-contacts" class="sls-phone-contacts" aria-labelledby="sls-phone-contacts-title">
     <h3 id="sls-phone-contacts-title"><i class="fa fa-phone text-primary" aria-hidden="true"></i> <?php echo _('Phone and SMS contacts'); ?> <?php include __DIR__.'/labs.php'; ?></h3>

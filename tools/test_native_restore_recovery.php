@@ -17,9 +17,22 @@ namespace SlsNativeRecoveryFixture {
         if (!empty($GLOBALS['native_short_write'])) { return \fwrite($handle, substr($body, 0, 3)); }
         return \fwrite($handle, $body);
     }
-    function fsync($handle) { return empty($GLOBALS['native_sync_failure']) && \fsync($handle); }
+	function fsync($handle) {
+		$uri = (string)(stream_get_meta_data($handle)['uri'] ?? '');
+		if (($GLOBALS['native_sync_path'] ?? '') !== '' && $uri === $GLOBALS['native_sync_path']
+			&& ($GLOBALS['native_sync_path_skip'] ?? 0) > 0) {
+			$GLOBALS['native_sync_path_skip']--;
+			return \fsync($handle);
+		}
+		return empty($GLOBALS['native_sync_failure'])
+			&& (($GLOBALS['native_sync_path'] ?? '') === '' || $uri !== $GLOBALS['native_sync_path'])
+			&& \fsync($handle);
+	}
     function rename($from, $to) {
-        if (str_contains($from, '/.freepbx-restore-stage-') && str_ends_with($from, '/freepbx-restore-pending.json')) { return false; }
+		if (str_contains($from, '/.freepbx-restore-stage-')) {
+			$GLOBALS['native_activation_order'][] = basename($to);
+			if (!empty($GLOBALS['native_fail_config_activation']) && str_ends_with($to, '/mass-notifications.config')) { return false; }
+		}
         if (str_contains($from, '.restore-rollback-')) {
             if (($GLOBALS['rollback_fault'] ?? '') === 'rename') { return false; }
             if (($GLOBALS['rollback_fault'] ?? '') === 'corrupt') { file_put_contents($from, 'changed-during-rollback'); }
@@ -41,7 +54,10 @@ namespace {
         'keys' => [$keyId => ['created_at' => time(), 'key' => base64_encode(random_bytes(32))]]];
     $reflection = new ReflectionClass(FreePBX\modules\Slsmassnotifyserver::class);
     $lines = file($reflection->getFileName()); $methods = '';
-    foreach (['commitNativeRestorePayload', 'backupNativeRestoreTargets', 'restoreNativeRestoreTargets', 'writeNativeSnapshotFile', 'readNativeBackupFile', 'removeNativeBackupDirectory'] as $name) {
+	foreach (['commitNativeRestorePayload', 'backupNativeRestoreTargets', 'restoreNativeRestoreTargets',
+		'writeNativeSnapshotFile', 'syncNativeDirectory', 'setNativeFileMetadata', 'nativeRestoreTargetLimit',
+		'activateNativeRestoreFile', 'removeNativeRestoreTarget', 'readNativeBackupFile', 'removeNativeBackupDirectory',
+		'unlinkNamedFileIfIdentity'] as $name) {
         $method = $reflection->getMethod($name);
         $methods .= implode('', array_slice($lines, $method->getStartLine() - 1, $method->getEndLine() - $method->getStartLine() + 1));
     }
@@ -59,14 +75,23 @@ namespace {
             const DEFAULT_ANNOUNCEMENT_CLOSING_TONE="close";
             const DEFAULT_NWS_OPENING_TONE="weather";
             const DEFAULT_LIGHTNING_OPENING_TONE="lightning";
+			const NATIVE_BACKUP_MAX_CONFIG_BYTES=2097152;
+			const NATIVE_BACKUP_MAX_LEDGER_BYTES=10485760;
+			const NATIVE_BACKUP_MAX_TONE_BYTES=20971520;
+			const NATIVE_BACKUP_MAX_TONES_BYTES=209715200;
             public $status=[];
             function snapshotRead($path,$max=1024){return $this->readNativeBackupFile($path,$max,"fixture read refused");}
             function snapshotWrite($path,$body){return $this->writeNativeSnapshotFile($path,$body,0600);}
+			function cleanup($path){return $this->removeNativeBackupDirectory($path);}
             function run(){ $this->commitNativeRestorePayload("{\"enabled\":\"0\"}\n", null, false, [], "fixture", []); }
             function ensurePluginDataDir(){}
             function validateNativeBackupConfig($raw){return json_decode($raw,true,32,JSON_THROW_ON_ERROR);}
             function normalizeNativeBackupTransactionId($id){return $id;}
-            function nativeRestoreMarkerContents($id,$warnings){return "{}\n";}
+			function nativeRestoreMarkerContents($id,$warnings,$state="committed"){return json_encode(["version"=>2,"transaction_id"=>$id,"restored_at"=>gmdate("c"),"commit_state"=>$state])."\n";}
+			function writePrivateAtomicFile($path,$body,$maximum){
+				if(!empty($GLOBALS["native_final_marker_failure"]))throw new \RuntimeException("fixture final marker failure");
+				$tmp=$path.".fixture.".bin2hex(random_bytes(4));file_put_contents($tmp,$body);chmod($tmp,0640);rename($tmp,$path);return true;
+			}
             function acquireNativeBackupFileLock($path,$message){$h=fopen($path,"c+b");flock($h,LOCK_EX);return $h;}
             function acquireSettingsLock($exclusive){return $this->acquireNativeBackupFileLock(self::PLUGIN_DATA_DIR . "/settings.lock", "");}
             function releaseNativeBackupFileLock($h){if(is_resource($h)){flock($h,LOCK_UN);fclose($h);}}
@@ -100,16 +125,34 @@ namespace {
         try { $module->snapshotWrite($file, 'not synchronized'); } catch (RuntimeException $error) { $refused = true; }
         unset($GLOBALS['native_sync_failure']);
         recoveryCheck($refused && !file_exists($file), 'Unsynchronized snapshot was retained as successful.');
-        foreach (['none', 'rename', 'corrupt', 'status'] as $fault) {
+		mkdir($root . '/unapproved', 0700);
+		mkdir($root . '/unapproved/slsmassnotify-backup-outside', 0700);
+		file_put_contents($root . '/unapproved/slsmassnotify-backup-outside/evidence', 'keep');
+		$module->cleanup($root . '/unapproved/slsmassnotify-backup-outside');
+		recoveryCheck(is_file($root . '/unapproved/slsmassnotify-backup-outside/evidence'),
+			'Cleanup escaped its approved immediate parent.');
+		$approvedCleanup = $root . '/slsmassnotify-backup-approved';
+		mkdir($approvedCleanup, 0700); file_put_contents($approvedCleanup . '/evidence', 'remove');
+		$module->cleanup($approvedCleanup);
+		recoveryCheck(!file_exists($approvedCleanup), 'Cleanup did not remove an approved private workspace.');
+		foreach (['none', 'rename', 'corrupt', 'status', 'directory_sync'] as $fault) {
+			$GLOBALS['native_activation_order'] = [];
+			$GLOBALS['native_fail_config_activation'] = true;
+			$GLOBALS['native_final_marker_failure'] = false;
             $GLOBALS['rollback_fault'] = $fault === 'status' ? 'rename' : $fault;
             $GLOBALS['status_fault'] = $fault === 'status';
+			$GLOBALS['native_sync_path'] = $fault === 'directory_sync' ? $root . '/live' : '';
+			$GLOBALS['native_sync_path_skip'] = $fault === 'directory_sync' ? 1 : 0;
             file_put_contents($root . '/live/mass-notifications.config', $original); chmod($root . '/live/mass-notifications.config', 0640);
             $error = null;
             try { $module->run(); } catch (RuntimeException $caught) { $error = $caught; }
             recoveryCheck($error !== null, 'Failed restore reported success.');
+			recoveryCheck(($GLOBALS['native_activation_order'][0] ?? '') === 'freepbx-restore-pending.json',
+				'Restore changed live data before activating its recovery marker (' . $fault . ': '
+				. json_encode($GLOBALS['native_activation_order']) . ').');
             $rollback = glob($root . '/slsmassnotify-rollback-fixture-*');
             $stage = glob($root . '/live/.freepbx-restore-stage-fixture-*');
-            if ($fault === 'none') {
+			if ($fault === 'none') {
                 recoveryCheck(!$rollback && !$stage, 'Verified rollback left obsolete recovery material.');
                 recoveryCheck(file_get_contents($root . '/live/mass-notifications.config') === $original, 'Successful rollback did not recover original bytes.');
             } else {
@@ -123,7 +166,27 @@ namespace {
                 rmdir($directory);
             }
         }
-        echo "Native restore: failed activation, verified rollback, failed rename, undetected copy corruption and status-write faults preserve recovery correctly.\n";
+		$GLOBALS['native_activation_order'] = [];
+		$GLOBALS['native_fail_config_activation'] = false;
+		$GLOBALS['native_final_marker_failure'] = true;
+		$GLOBALS['native_sync_path'] = '';
+		$GLOBALS['rollback_fault'] = '';
+		file_put_contents($root . '/live/mass-notifications.config', $original); chmod($root . '/live/mass-notifications.config', 0640);
+		$error = null;
+		try { $module->run(); } catch (RuntimeException $caught) { $error = $caught; }
+		recoveryCheck($error !== null && file_get_contents($root . '/live/mass-notifications.config') === $original,
+			'Failure to commit the final restore marker did not roll back the activated configuration.');
+		recoveryCheck(!file_exists($root . '/live/freepbx-restore-pending.json'),
+			'Rollback retained a preparing marker that did not exist before restore.');
+		$GLOBALS['native_activation_order'] = [];
+		$GLOBALS['native_final_marker_failure'] = false;
+		$module->run();
+		$committedMarker = json_decode((string)file_get_contents($root . '/live/freepbx-restore-pending.json'), true);
+		recoveryCheck(($GLOBALS['native_activation_order'][0] ?? '') === 'freepbx-restore-pending.json'
+			&& ($committedMarker['commit_state'] ?? '') === 'committed',
+			'A successful restore did not durably transition its first marker from preparing to committed.');
+		unset($GLOBALS['native_sync_path']);
+		echo "Native restore: marker ordering, rollback verification, cleanup containment, corruption, rename, status and directory-sync faults passed.\n";
     } finally {
         $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::CHILD_FIRST);
         foreach ($iterator as $file) { $file->isDir() ? rmdir($file->getPathname()) : unlink($file->getPathname()); }

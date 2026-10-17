@@ -7,6 +7,7 @@ and tools/. No installed worker, installer, config, API, or network is used.
 
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import subprocess
@@ -30,14 +31,18 @@ class UpdaterFailures(unittest.TestCase):
         self.fixture = tempfile.TemporaryDirectory(prefix="sls-update-regression-")
         self.addCleanup(self.fixture.cleanup)
         self.base = Path(self.fixture.name)
+        account=pwd.getpwnam('asterisk');self.base.chmod(0o755)
+        self.data=self.base/'data';self.data.mkdir(mode=0o750);os.chown(self.data,account.pw_uid,account.pw_gid)
+        (self.base/'sls_update_status.py').write_bytes((BIN/'sls_mass_notify/sls_update_status.py').read_bytes());(self.base/'sls_update_status.py').chmod(0o644)
         self.mock_bin = self.base / "bin"
         self.mock_bin.mkdir()
+        self.mock_bin.chmod(0o755)
         self.env = dict(os.environ, MOCK_BIN=str(self.mock_bin), MOCK_FAILURE="",
                         MOCK_SENTINEL=str(self.base / "installer-called"),
                         CONFIG_LOADER=str(self.base / "config-loader.py"),
                         CONFIG_JSON_FILE=str(self.base / "fixture.config"),
-                        STATUS_FILE=str(self.base / "status.json"),
-                        UPDATE_PROGRESS_FILE=str(self.base / "progress.json"),
+                        STATUS_FILE=str(self.data / "update-status.json"),
+                        UPDATE_PROGRESS_FILE=str(self.data / "update-progress.json"),
                         LOG_FILE=str(self.base / "log"), LOCK_FILE=str(self.base / "lock"),
                         SLS_MASS_NOTIFY_MANUAL_UPDATE="1", SLS_MASS_NOTIFY_CHECK_ONLY="0")
         executable(Path(self.env["CONFIG_LOADER"]), "# fixture loader; intercepted by mock Python\n")
@@ -87,7 +92,9 @@ else:
         source = (BIN / "sls_mass_notify_update.sh").read_text()
         source = source.replace('PATH="/usr/local/sbin:', 'PATH="$MOCK_BIN:/usr/local/sbin:')
         source = source.replace("/usr/bin/python3", str(self.mock_bin / "python3"))
+        source = source.replace("/usr/bin/curl", str(self.mock_bin / "curl"))
         source = source.replace("/run/lock/sls-mass-notify-update-status.lock", str(self.base / "status.lock"))
+        source = source.replace('/usr/local/bin/sls_mass_notify/sls_update_status.py',str(self.base/'sls_update_status.py'))
         source = source.replace(SERVICE_ACCOUNT, FIXTURE_ACCOUNT)
         source = source.replace('if [ "${EUID:-$(id -u)}" -ne 0 ]; then', 'if false; then')
         executable(self.base / "update.sh", source)
@@ -97,7 +104,7 @@ else:
         self.env["SLS_MASS_NOTIFY_CHECK_ONLY"] = "1" if check_only else "0"
         result = subprocess.run(["bash", str(self.base / "update.sh")], env=self.env,
                                 capture_output=True, text=True, timeout=10)
-        progress = json.loads((self.base / "progress.json").read_text()) if (self.base / "progress.json").exists() else {}
+        progress = json.loads(Path(self.env["UPDATE_PROGRESS_FILE"]).read_text()) if Path(self.env["UPDATE_PROGRESS_FILE"]).exists() else {}
         return result, progress
 
     def test_failure_codes_categories_and_no_false_completion(self):
@@ -113,10 +120,13 @@ else:
                 (self.base / "installer-called").unlink(missing_ok=True)
                 result, progress = self.run_update(failure)
                 self.assertEqual(result.returncode, code, result.stderr)
+                if failure=="root-admission":
+                    self.assertEqual(progress,{},"Unapproved updater wrote to runtime data before admission.")
+                    continue
                 self.assertEqual(progress.get("state"), "failed")
                 self.assertEqual(progress.get("error_category"), category)
                 self.assertEqual(progress.get("exit_code"), code)
-                status = json.loads((self.base / "status.json").read_text())
+                status = json.loads(Path(self.env["STATUS_FILE"]).read_text())
                 self.assertIs(status.get("ok"), False)
                 self.assertEqual(status.get("error_category"), category)
                 self.assertNotIn("secret-fixture", json.dumps(progress) + json.dumps(status))
@@ -144,7 +154,7 @@ else:
         result, progress = self.run_update('', check_only=True)
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(progress['state'],'complete')
-        self.assertTrue(json.loads((self.base/'status.json').read_text())['update_available'])
+        self.assertTrue(json.loads(Path(self.env['STATUS_FILE']).read_text())['update_available'])
         self.assertFalse((self.base/'installer-called').exists())
 
     def test_specific_feed_failure_survives_shell_status_and_progress(self):
@@ -153,7 +163,7 @@ else:
             result, progress = self.run_update('feed:'+category)
             self.assertEqual(result.returncode,1,result.stderr)
             self.assertEqual(progress['error_category'],category)
-            self.assertEqual(json.loads((self.base/'status.json').read_text())['error_category'],category)
+            self.assertEqual(json.loads(Path(self.env['STATUS_FILE']).read_text())['error_category'],category)
             self.assertNotIn('secret-fixture',json.dumps(progress))
 
     def test_success_and_current_report_complete(self):
@@ -169,7 +179,7 @@ else:
         result, _ = self.run_update('deferred')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.base / 'installer-called').exists())
-        self.assertTrue(json.loads((self.base / 'status.json').read_text())['update_available'])
+        self.assertTrue(json.loads(Path(self.env['STATUS_FILE']).read_text())['update_available'])
         self.env['SLS_MASS_NOTIFY_MANUAL_UPDATE'] = '1'
         result, progress = self.run_update('deferred')
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -201,6 +211,8 @@ class MaintenanceFailures(unittest.TestCase):
                 source = source.replace(old, new)
             source = source.replace(SERVICE_ACCOUNT, FIXTURE_ACCOUNT)
             source = source.replace('[ "${EUID:-$(id -u)}" -eq 0 ] || exit 1', "secure_central_config() { :; }\nadmit_root_runtime() { :; }\n")
+            source = source.replace('open_maintenance_log LOG_FD "$LOG_FILE"',
+                                    'exec {LOG_FD}>>"$LOG_FILE"')
             # Fixture-owned markers are valid even when this test is not root.
             source = source.replace('[ "$owner" != "asterisk" ] && [ "$owner" != "root" ]', "false")
             executable(base / "maintenance.sh", source)

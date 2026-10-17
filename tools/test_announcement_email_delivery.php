@@ -18,7 +18,9 @@ class EmailDeliveryFixture {
     private function announcementEmailTargets($settings) { return !empty($settings['enabled']) ? $settings['targets'] : []; }
     private function announcementEmailFingerprint($target) { return hash('sha256',json_encode([$target['id'],$target['address'],$target['sender']['name'],$target['sender']['address']])); }
     private function setAnnouncementCooldown() {}
-    private function recordInteractiveAnnouncementAdmission(array $request): void {}
+    private function recordInteractiveAnnouncementAdmission(array $request, ?callable $commit = null, string $jobId = '') {
+        return $commit === null ? null : $commit();
+    }
     private function getAnnouncementCooldownState() { return ['remaining'=>0]; }
     private function sanitizeScheduleText($value,$limit,$single) { return $value; }
     private function dispatchAnnouncementWebhooks(...$args) { return ['accepted'=>[],'failed'=>[]]; }

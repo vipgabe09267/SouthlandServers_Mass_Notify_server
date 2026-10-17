@@ -1,10 +1,11 @@
 <?php
 declare(strict_types=1);
-require_once (getenv('SLS_ANNOUNCEMENT_TRAIT') ?: dirname(__DIR__) . '/slsmassnotifyserver/AnnouncementDelivery.php');
+require_once dirname(__DIR__) . '/slsmassnotifyserver/AnnouncementDelivery.php';
 class TestDelivery {
     use \FreePBX\modules\SlsAnnouncementDelivery;
     public $commands = [];
     public $desktopFails = true;
+    public $desktopOutput = [];
     public $audioFails = true;
     public $audioThrows = false;
     public $audioUncertain = false;
@@ -14,6 +15,7 @@ class TestDelivery {
     public $notifyLogs = [];
     public $cooldownRemaining = 0;
     public $currentTargets = ['phones' => ['1000'], 'desktops' => ['gabe'], 'webhooks' => ['hook']];
+    public function getActiveSettings() { return ['desktop_clients'=>[['client_id'=>'device_gabe','username'=>'gabe','enabled'=>true]]]; }
     private function currentAnnouncementDestinationIds() { return $this->currentTargets; }
     private function startAnnouncementWorker($id) {}
     private function acquireAnnouncementActivityLock($exclusive = false, $timeoutSeconds = 30) { return null; }
@@ -26,7 +28,7 @@ class TestDelivery {
     public function run($request) { return $this->executeResolvedAnnouncement($request); }
     private function sanitizeScheduleText($text, $limit, $single) { return substr($text, 0, $limit); }
     private function buildAnnouncementVisualPushCommand($message, $targets, $timeout, $options) { return $options['mode']; }
-    private function executeAnnouncementVisualPushCommand($command) { $this->commands[] = $command; return ['success' => $command !== 'api_only' || !$this->desktopFails]; }
+    private function executeAnnouncementVisualPushCommand($command) { $this->commands[] = $command; return ['success' => $command !== 'api_only' || !$this->desktopFails, 'output'=>$this->desktopOutput]; }
     protected function executeAnnouncementPhoneVisualBatch(array $commands, callable $completed): void {
         foreach ($commands as $target => $command) { $completed((string)$target, array_merge($this->executeAnnouncementVisualPushCommand($command), ['started' => true])); }
     }
@@ -39,11 +41,13 @@ class TestDelivery {
     }
     private function dispatchAnnouncementWebhooks(...$args) { return ['accepted' => $args[0] ? [['id' => 'hook', 'name' => 'Fixture']] : [], 'failed' => []]; }
     private function setAnnouncementCooldown() {}
-    private function recordInteractiveAnnouncementAdmission(array $request): void {}
+    private function recordInteractiveAnnouncementAdmission(array $request, ?callable $commit = null, string $jobId = '') {
+        return $commit === null ? null : $commit();
+    }
     private function getAnnouncementCooldownState() { return ['remaining' => $this->cooldownRemaining]; }
     private function appendAnnouncementNotifyLog(...$args) { $this->notifyLogs[]=$args; }
 }
-$request = ['message' => 'fixture', 'sender' => 'Gabe', 'phones' => ['1000'], 'desktops' => ['gabe'], 'webhooks' => ['hook'], 'audio_mode' => 'tts', 'timeout_mode' => 'none', 'display_timeout' => 0, 'opening_tone' => '', 'closing_tone' => '', 'voice' => 'original-voice', 'volume' => 25, 'trigger_source' => 'fixture', 'image' => false, 'title' => 'Fixture', 'background_color' => '#000000',
+$request = ['message' => 'fixture', 'sender' => 'Gabe', 'phones' => ['1000'], 'desktops' => ['gabe'], 'desktop_client_ids'=>['gabe'=>'device_gabe'], 'webhooks' => ['hook'], 'audio_mode' => 'tts', 'timeout_mode' => 'none', 'display_timeout' => 0, 'opening_tone' => '', 'closing_tone' => '', 'voice' => 'original-voice', 'volume' => 25, 'trigger_source' => 'fixture', 'image' => false, 'title' => 'Fixture', 'background_color' => '#000000',
     'delivery_id' => 'announcement-fixture-original', 'delivery_timestamp' => '2026-09-20T12:00:00+00:00', 'webhook_fingerprints' => ['hook' => hash('sha256', 'https://hooks.example.com/original')]];
 $fixture = new TestDelivery();
 $request['priority'] = 'urgent';
@@ -60,6 +64,24 @@ if (!$uncertainOnly['submission_uncertain'] || !$uncertainOnly['delivery_started
     throw new RuntimeException('All-uncertain delivery was incorrectly reported as no submission.');
 }
 echo "Independent-channel failures, sender and partial receipts checks passed.\n";
+$fixture->desktopFails=false;$fixture->desktopOutput=['SLS_DESKTOP_PUBLICATION "invalid-scalar"'];
+$malformedPublication=$fixture->run(array_replace($request,['phones'=>[],'webhooks'=>[],'audio_mode'=>'none']));
+$malformedRows=array_values(array_filter($malformedPublication['receipts'],static fn($row)=>($row['channel']??'')==='desktop'));
+if(count($malformedRows)!==1||($malformedRows[0]['state']??'')!=='uncertain'||isset($malformedRows[0]['event_id'])
+    ||empty($malformedPublication['submission_uncertain'])||!empty($malformedPublication['success'])){
+    throw new RuntimeException('Malformed desktop helper metadata was trusted as an exact durable publication.');
+}
+$eventPrefix='announcement-20261015000000000000-';
+$fixture->desktopOutput=[
+    'SLS_DESKTOP_PUBLICATION '.json_encode(['event_id'=>$eventPrefix.str_repeat('a',32)],JSON_THROW_ON_ERROR),
+    'SLS_DESKTOP_PUBLICATION '.json_encode(['event_id'=>$eventPrefix.str_repeat('b',32)],JSON_THROW_ON_ERROR),
+];
+$duplicatePublication=$fixture->run(array_replace($request,['phones'=>[],'webhooks'=>[],'audio_mode'=>'none']));
+$duplicateRows=array_values(array_filter($duplicatePublication['receipts'],static fn($row)=>($row['channel']??'')==='desktop'));
+if(count($duplicateRows)!==1||($duplicateRows[0]['state']??'')!=='uncertain'||isset($duplicateRows[0]['event_id'])){
+    throw new RuntimeException('Ambiguous desktop helper publication identities were accepted.');
+}
+$fixture->desktopFails=true;$fixture->desktopOutput=[];
 $unavailableRequest = $request;
 $unavailableRequest['unavailable_phones'] = ['1002'];
 $unavailable = $fixture->run($unavailableRequest);
@@ -77,7 +99,12 @@ try {
     $fixture->processAnnouncementJobs($id);
     $job = $fixture->getAnnouncementJob($id);
     if ($job['state'] !== 'failed' || count($job['receipts']) !== 4 || !$job['submission_uncertain']) { throw new RuntimeException('Durable receipts and uncertainty were not persisted'); }
-    if (!$job['retryable']) { throw new RuntimeException('Known audio failure did not offer retry'); }
+    if ($job['retryable']) { throw new RuntimeException('Unknown audio submission outcome was offered for replay'); }
+    $fixture->audioThrows = false;
+    file_put_contents($path, json_encode(['id'=>$id, 'state'=>'queued', 'created_at'=>gmdate('c'), 'request'=>$request]));
+    $fixture->processAnnouncementJobs($id);
+    $job = $fixture->getAnnouncementJob($id);
+    if (!$job['retryable']) { throw new RuntimeException('Confirmed pre-submission audio failure did not offer retry'); }
     $retry = $fixture->retryFailedAnnouncementJob($id, ['sender'=>'Retry operator']);
     if (empty($retry['queued'])) { throw new RuntimeException('Failed destination retry was not queued'); }
     $retryRequest = json_decode(file_get_contents($directory . '/' . $retry['job_id'] . '.json'), true)['request'];
@@ -101,6 +128,7 @@ try {
     $fixture->processAnnouncementJobs($id);
     if ($fixture->getAnnouncementJob($id)['state'] !== 'expired') { throw new RuntimeException('Stale job was delivered'); }
     $fixture->audioThrows = false; $fixture->audioFails = false; $fixture->desktopFails = false;
+    $fixture->desktopOutput=['SLS_DESKTOP_PUBLICATION '.json_encode(['event_id'=>$eventPrefix.str_repeat('c',32)],JSON_THROW_ON_ERROR)];
     file_put_contents($path, json_encode(['id'=>$id, 'state'=>'queued', 'created_at'=>gmdate('c'), 'request'=>$request]));
     $fixture->processAnnouncementJobs($id);
     $completed = $fixture->getAnnouncementJob($id);
@@ -120,6 +148,9 @@ try {
     file_put_contents($path, json_encode(['id'=>$id, 'state'=>'failed', 'created_at'=>gmdate('c'), 'request'=>$request,
         'receipts'=>[['state'=>'failed', 'channel'=>'webhook', 'target'=>'hook', 'retryable'=>false]]]));
     if ($fixture->getAnnouncementJob($id)['retryable']) { throw new RuntimeException('A route snapshot failure offered an unsafe retry.'); }
+    file_put_contents($path, json_encode(['id'=>$id, 'state'=>'failed', 'created_at'=>gmdate('c'), 'request'=>$request,
+        'receipts'=>[['state'=>'failed', 'channel'=>'webhook', 'target'=>'hook']]]));
+    if ($fixture->getAnnouncementJob($id)['retryable']) { throw new RuntimeException('A failed receipt without explicit replay evidence was offered for retry.'); }
     $fixture->currentTargets = ['phones'=>[], 'desktops'=>[], 'webhooks'=>[]];
     $before = count($fixture->commands);
     $disabled = $fixture->run($request);

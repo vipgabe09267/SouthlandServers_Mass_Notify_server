@@ -26,7 +26,7 @@ class PagingGroupStagingFixtureBase
 $reflection = new ReflectionClass(\FreePBX\modules\Slsmassnotifyserver::class);
 $source = file($reflection->getFileName());
 $methods = '';
-foreach (['saveAnnouncementGroup', 'deleteAnnouncementGroup', 'syncPendingAnnouncementGroups', 'normalizeAnnouncementGroups', 'normalizeAnnouncementGroupsForExtensions', 'validateAudienceWebhookIds'] as $name) {
+foreach (['saveAnnouncementGroup', 'deleteAnnouncementGroup', 'syncPendingAnnouncementGroups', 'normalizeAnnouncementGroups', 'normalizeAnnouncementGroupsForExtensions', 'normalizeExtensionSelector', 'validateAudienceWebhookIds'] as $name) {
     $method = $reflection->getMethod($name);
     $methods .= implode('', array_slice($source, $method->getStartLine() - 1, $method->getEndLine() - $method->getStartLine() + 1));
 }
@@ -111,5 +111,44 @@ foreach ([[$active, null], [$active, $converted], [$converted, $active]] as [$gu
     paging_group_check(!$result['success'] && $fixture->activeWrites === 0 && $fixture->pendingWrites === 0,
         'An active or pending legacy paging reference no longer blocked announcement deletion');
 }
+$guardCases = [
+    'active schedule' => function (array $settings) use ($groupB): array {
+        $settings['scheduled_announcements'] = [['id' => 'schedule', 'targets' => ['groups' => [$groupB]]]];
+        return $settings;
+    },
+    'pending schedule' => function (array $settings) use ($groupB): array {
+        $settings['scheduled_announcements'] = [['id' => 'pending-schedule', 'targets' => ['groups' => [$groupB]]]];
+        return $settings;
+    },
+    'active incident' => function (array $settings) use ($groupB): array {
+        $settings['incident_workflows']['templates'] = [['delivery' => ['group_ids' => [$groupB]]]];
+        return $settings;
+    },
+    'incident escalation' => function (array $settings) use ($groupB): array {
+        $settings['incident_workflows']['templates'] = [['escalation' => ['steps' => [['delivery' => ['group_ids' => [$groupB]]]]]]];
+        return $settings;
+    },
+    'reviewed location' => function (array $settings) use ($groupB): array {
+        foreach ($settings['announcement_groups'] as &$group) {
+            if ($group['id'] === $groupB) { $group['location_snapshot'] = ['site_id' => 'site_default']; }
+        }
+        unset($group);
+        return $settings;
+    },
+];
+foreach ($guardCases as $label => $mutate) {
+    $guarded = $mutate($active);
+    $fixture = new PagingGroupStagingFixture($guarded, $label === 'pending schedule' ? $guarded : null);
+    if ($label === 'pending schedule') { $fixture->active = $active; }
+    $result = $fixture->deleteAnnouncementGroup($groupB);
+    paging_group_check(!$result['success'] && $fixture->activeWrites === 0 && $fixture->pendingWrites === 0,
+        ucfirst($label) . ' reference did not block announcement-group deletion');
+}
+$fixture = new PagingGroupStagingFixture($active);
+foreach (['missing_group', $groupB . '!'] as $invalidId) {
+    $result = $fixture->deleteAnnouncementGroup($invalidId);
+    paging_group_check(!$result['success'] && $fixture->activeWrites === 0,
+        'Invalid or missing group identifier was accepted for deletion');
+}
 echo "Converted paging groups remain independent of same-ID announcement edits/deletion; active and pending legacy references retain their guards.\n";
-echo "Paging group edits stage without active prompt gaps; ordinary save/add/delete preserve pending edits and validate paging references.\n";
+echo "Paging group edits stage without active prompt gaps; deletion preserves referential integrity for paging, schedules, incidents, and reviewed location audiences.\n";

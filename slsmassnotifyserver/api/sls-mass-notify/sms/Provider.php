@@ -4,6 +4,7 @@ namespace SLS\MassNotify\Sms;
 require_once __DIR__.'/Config.php';
 require_once __DIR__.'/vendor/twilio/Values.php';
 require_once __DIR__.'/vendor/twilio/RequestValidator.php';
+require_once dirname(__DIR__).'/security.php';
 
 /** Fixed provider APIs. No arbitrary destinations, redirects or automatic retries. */
 class Provider
@@ -21,18 +22,31 @@ class Provider
     {
         return $this->transport($url, ['Accept: application/json'], '', $basic, false);
     }
+    private static function callbackUrl(string $url): bool
+    {
+        if (strlen($url)>2048) { return false; }
+        $parts=parse_url($url);
+        return is_array($parts) && !array_diff(array_keys($parts),['scheme','host','port','path','query'])
+            && strtolower($parts['scheme']??'')==='https' && Config::host($parts['host']??null)
+            && (($parts['port']??443)>=1 && ($parts['port']??443)<=65535)
+            && ($parts['path']??'')==='/api/sls-mass-notify/sms-callback.php'
+            && (bool)preg_match('/^delivery=smsd_[a-f0-9]{64}$/D',$parts['query']??'');
+    }
     private function transport(string $url, array $headers, string $body, ?string $basic, bool $post): array
     {
+        if(!function_exists('curl_init')){throw new \RuntimeException('SMS provider HTTPS support is unavailable.');}
         $response=''; $curl=curl_init($url);
-        curl_setopt_array($curl,[CURLOPT_HTTPHEADER=>$headers,
+        if($curl===false){throw new \RuntimeException('SMS provider HTTPS request could not be initialized.');}
+        $options=[CURLOPT_HTTPHEADER=>$headers,
             CURLOPT_FOLLOWLOCATION=>false,CURLOPT_MAXREDIRS=>0,CURLOPT_PROTOCOLS=>CURLPROTO_HTTPS,
-            CURLOPT_SSL_VERIFYPEER=>true,CURLOPT_SSL_VERIFYHOST=>2,CURLOPT_CONNECTTIMEOUT_MS=>2500,
-            CURLOPT_TIMEOUT_MS=>8000,CURLOPT_NOSIGNAL=>true,CURLOPT_PROXY=>'',CURLOPT_USERAGENT=>'SLS-Mass-Notify-SMS/1',
+            CURLOPT_SSL_VERIFYPEER=>true,CURLOPT_SSL_VERIFYHOST=>2,CURLOPT_SSLVERSION=>CURL_SSLVERSION_TLSv1_2,CURLOPT_CONNECTTIMEOUT_MS=>2500,
+            CURLOPT_TIMEOUT_MS=>8000,CURLOPT_NOSIGNAL=>true,CURLOPT_PROXY=>'',CURLOPT_NOPROXY=>'*',CURLOPT_USERAGENT=>'SLS-Mass-Notify-SMS/1',
             CURLOPT_WRITEFUNCTION=>static function ($handle,$chunk) use (&$response) {
                 if (strlen($response)+strlen($chunk)>65536) { return 0; } $response.=$chunk; return strlen($chunk);
-            }]);
-        if ($post) { curl_setopt($curl,CURLOPT_POST,true); curl_setopt($curl,CURLOPT_POSTFIELDS,$body); }
-        if ($basic!==null) { curl_setopt($curl,CURLOPT_HTTPAUTH,CURLAUTH_BASIC); curl_setopt($curl,CURLOPT_USERPWD,$basic); }
+            }];
+        if($post){$options[CURLOPT_POST]=true;$options[CURLOPT_POSTFIELDS]=$body;}
+        if($basic!==null){$options[CURLOPT_HTTPAUTH]=CURLAUTH_BASIC;$options[CURLOPT_USERPWD]=$basic;}
+        if(!curl_setopt_array($curl,$options)){curl_close($curl);throw new \RuntimeException('SMS provider HTTPS safeguards could not be configured.');}
         try { $ok=curl_exec($curl); return ['status'=>(int)curl_getinfo($curl,CURLINFO_RESPONSE_CODE),'error'=>$ok===false?curl_errno($curl):0,'body'=>$response]; }
         finally { curl_close($curl); }
     }
@@ -52,11 +66,13 @@ class Provider
             }
             throw new \DomainException('The BulkVS sender check failed (HTTP '.(int)$result['status'].'). Review the saved API credentials, API permissions and PBX internet access. No SMS was sent.');
         }
-        $value=json_decode($result['body'],true,32);
+        try { $value=\SLS\MassNotify\ApiSecurity::jsonObject('{"rows":'.$result['body'].'}',false,32)['rows']??null; }
+        catch (\Throwable $error) { throw new \DomainException('BulkVS returned an unexpected sender record. No SMS was sent.',0,$error); }
         if (!is_array($value) || !array_is_list($value)) { throw new \DomainException('BulkVS returned an unexpected sender record. No SMS was sent.'); }
-        $rows=array_values(array_filter($value,static fn($r)=>is_array($r) && (string)($r['TN']??'')===substr($config['from'],1)));
+        $rows=array_values(array_filter($value,static fn($r)=>is_array($r) && is_scalar($r['TN']??null) && (string)$r['TN']===substr($config['from'],1)));
         if (count($rows)!==1) { throw new \DomainException('The saved sending number was not found in this BulkVS account. Select a number owned by the account. No SMS was sent.'); }
         $messaging=$rows[0]['Messaging']??[];
+        if (!is_array($messaging) || array_is_list($messaging)) { throw new \DomainException('BulkVS returned an unexpected messaging record. No SMS was sent.'); }
         $sms=($messaging['Sms']??null)===true; $mms=($messaging['Mms']??null)===true;
         $campaign=is_string($messaging['Tcr']??null) && trim($messaging['Tcr'])!=='';
         $class=is_string($messaging['Class']??null)?$messaging['Class']:'';
@@ -87,8 +103,7 @@ class Provider
     public function send(array $config, string $number, string $body, string $callback, int $expiresAt, int $now, string $mediaUrl=''): array
     {
         $config=Config::normalize($config);
-        if (!$config['enabled'] || !Config::number($number)
-            || !preg_match('#^https://[a-z0-9.-]+(?::[0-9]{1,5})?/api/sls-mass-notify/sms-callback\.php\?delivery=smsd_[a-f0-9]{64}$#Di',$callback)) {
+        if (!$config['enabled'] || !Config::number($number) || !self::callbackUrl($callback)) {
             throw new \DomainException('sms_submission_settings_invalid');
         }
         $type=$mediaUrl===''?'SMS':'MMS';
@@ -120,14 +135,21 @@ class Provider
         // may already have created a billable message. Never repeat it here.
         $uncertain=['state'=>'uncertain','provider_id'=>'','error_code'=>'sms_submission_unconfirmed','submission_started'=>true];
         if ($result['error']!==0 || $result['status']>=500 || $result['status']<200 || $result['status']>=300 && $result['status']<400) { return $uncertain; }
-        $value=json_decode($result['body'],true,32);
+        try { $value=\SLS\MassNotify\ApiSecurity::jsonObject($result['body'],false,32); }
+        catch (\Throwable $error) {
+            if ($result['status']>=400) { $value=[]; }
+            else { return $uncertain; }
+        }
         if ($result['status']>=400) {
             if ($config['provider']==='bulkvs') {
                 return ['state'=>'failed','provider_id'=>'','error_code'=>'bulkvs_http_'.$result['status'], 'submission_started'=>true,
                     'error_detail'=>self::bulkvsErrorDetail($value,$config,$number,$body)];
             }
-            $code=$config['provider']==='twilio'?($value['code']??''):($value['errors'][0]['code']??'');
-            return ['state'=>'failed','provider_id'=>'','error_code'=>preg_match('/^[0-9]{1,10}$/D',(string)$code)?'provider_'.$code:'provider_http_'.$result['status'],
+            $errors=$value['errors']??null;
+            $first=is_array($errors) && array_is_list($errors) && is_array($errors[0]??null)?$errors[0]:[];
+            $code=$config['provider']==='twilio'?($value['code']??''):($first['code']??'');
+            $code=is_int($code)||is_string($code)?(string)$code:'';
+            return ['state'=>'failed','provider_id'=>'','error_code'=>preg_match('/^[0-9]{1,10}$/D',$code)?'provider_'.$code:'provider_http_'.$result['status'],
                 'submission_started'=>true];
         }
         if ($config['provider']==='bulkvs') {
@@ -140,12 +162,18 @@ class Provider
             }
             return ['state'=>'accepted','provider_id'=>$value['RefId'],'error_code'=>'','submission_started'=>true];
         }
-        $id=$config['provider']==='twilio'?($value['sid']??null):($value['data']['id']??null);
-        $from=$config['provider']==='twilio'?($value['from']??null):($value['data']['from']['phone_number']??null);
-        $to=$config['provider']==='twilio'?($value['to']??null):($value['data']['to'][0]['phone_number']??null);
+        $data=$value['data']??null;
+        if ($config['provider']==='telnyx' && (!is_array($data) || array_is_list($data))) { return $uncertain; }
+        $fromRow=is_array($data)?($data['from']??null):null;
+        $toRows=is_array($data)?($data['to']??null):null;
+        if ($config['provider']==='telnyx' && (!is_array($fromRow) || array_is_list($fromRow) || !is_array($toRows)
+            || !array_is_list($toRows) || count($toRows)!==1 || !is_array($toRows[0]) || array_is_list($toRows[0]))) { return $uncertain; }
+        $id=$config['provider']==='twilio'?($value['sid']??null):$data['id'];
+        $from=$config['provider']==='twilio'?($value['from']??null):($fromRow['phone_number']??null);
+        $to=$config['provider']==='twilio'?($value['to']??null):($toRows[0]['phone_number']??null);
         if (!self::providerId($config['provider'],$id) || $from!==$config['from'] || $to!==$number
             || ($config['provider']==='twilio' && ($value['account_sid']??'')!==$config['twilio_account_sid'])
-            || ($config['provider']==='telnyx' && ($value['data']['messaging_profile_id']??'')!==$config['telnyx_profile_id'])) { return $uncertain; }
+            || ($config['provider']==='telnyx' && ($data['messaging_profile_id']??'')!==$config['telnyx_profile_id'])) { return $uncertain; }
         return ['state'=>'accepted','provider_id'=>$id,'error_code'=>'','submission_started'=>true];
     }
     private static function form(string $raw): array
@@ -165,10 +193,12 @@ class Provider
         if (!in_array($config['provider']??'', ['twilio','telnyx'],true)) { throw new \DomainException('sms_callback_unauthorized'); }
         if (strlen($raw)>65536) { throw new \InvalidArgumentException('sms_callback_too_large'); }
         if ($config['provider']==='twilio') {
-            if ($config['twilio_auth_token']==='' || strtolower(explode(';',$headers['content-type']??'')[0])!=='application/x-www-form-urlencoded') { throw new \DomainException('sms_callback_unauthorized'); }
+            $contentType=$headers['content-type']??'';$signatureHeader=$headers['x-twilio-signature']??'';
+            if ($config['twilio_auth_token']==='' || !is_string($contentType) || !is_string($signatureHeader)
+                || strtolower(trim(explode(';',$contentType,2)[0]))!=='application/x-www-form-urlencoded') { throw new \DomainException('sms_callback_unauthorized'); }
             $payload=self::form($raw);
             $validator=new \SLS\MassNotify\Vendor\Twilio\Security\RequestValidator($config['twilio_auth_token']);
-            if (!$validator->validate($headers['x-twilio-signature']??'',$canonicalUrl,$payload)
+            if (!$validator->validate($signatureHeader,$canonicalUrl,$payload)
                 || ($payload['AccountSid']??'')!==$config['twilio_account_sid']) { throw new \DomainException('sms_callback_unauthorized'); }
             $id=$payload['MessageSid']??'';
             if (!self::providerId('twilio',$id)) { throw new \InvalidArgumentException('sms_callback_invalid_id'); }
@@ -176,35 +206,48 @@ class Provider
             $inbound=$status==='received';
             $state=['accepted'=>'accepted','scheduled'=>'accepted','queued'=>'accepted','sending'=>'accepted','sent'=>'sent',
                 'delivered'=>'delivered','undelivered'=>'failed','failed'=>'failed','canceled'=>'failed'][$status]??null;
-            $optOut=($payload['OptOutType']??'')==='STOP' || in_array(strtoupper(trim($payload['Body']??'')),['STOP','STOPALL','UNSUBSCRIBE','CANCEL','END','QUIT','REVOKE','OPT OUT'],true);
             $code=$payload['ErrorCode']??'';
             $text=$payload['Body']??'';
             if (!is_string($text) || strlen($text)>6400) { throw new \InvalidArgumentException('sms_callback_invalid_body'); }
+            $from=$payload['From']??'';$to=$payload['To']??'';
+            if (!Config::number($from) || !Config::number($to) || ($inbound ? $to!==$config['from'] : $from!==$config['from'])) { throw new \DomainException('sms_callback_identity_mismatch'); }
+            $optOut=($payload['OptOutType']??'')==='STOP' || in_array(strtoupper(trim($text)),['STOP','STOPALL','UNSUBSCRIBE','CANCEL','END','QUIT','REVOKE','OPT OUT'],true);
             return ['provider'=>'twilio','body'=>$inbound?$text:'','provider_id'=>$id,'event_id'=>'twilio_'.$id,'inbound'=>$inbound,'opt_out'=>$inbound&&$optOut,
-                'from'=>$payload['From']??'','to'=>$payload['To']??'','state'=>$state,
+                'from'=>$from,'to'=>$to,'state'=>$state,
                 'error_code'=>$code!==''&&preg_match('/^[0-9]{1,10}$/D',$code)?'provider_'.$code:''];
         }
         $timestamp=$headers['telnyx-timestamp']??'';
-        $signature=base64_decode($headers['telnyx-signature-ed25519']??'',true);
+        $encodedSignature=$headers['telnyx-signature-ed25519']??'';
+        $signature=is_string($encodedSignature)?base64_decode($encodedSignature,true):false;
         $key=base64_decode($config['telnyx_public_key'],true);
-        if (!preg_match('/^[0-9]{10}$/D',$timestamp) || abs($now-(int)$timestamp)>300 || !is_string($signature) || strlen($signature)!==64
-            || !is_string($key) || strlen($key)!==32 || !sodium_crypto_sign_verify_detached($signature,$timestamp.'|'.$raw,$key)) {
+        if (!is_string($timestamp) || !preg_match('/^[0-9]{10}$/D',$timestamp) || abs($now-(int)$timestamp)>300 || !is_string($signature) || strlen($signature)!==64
+            || !is_string($key) || strlen($key)!==32 || !function_exists('sodium_crypto_sign_verify_detached')
+            || !sodium_crypto_sign_verify_detached($signature,$timestamp.'|'.$raw,$key)) {
             throw new \DomainException('sms_callback_unauthorized');
         }
-        $value=json_decode($raw,true,32,JSON_THROW_ON_ERROR); $data=$value['data']??[]; $payload=$data['payload']??[];
+        try { $value=\SLS\MassNotify\ApiSecurity::jsonObject($raw,false,32); }
+        catch (\Throwable $error) { throw new \InvalidArgumentException('sms_callback_invalid_json',0,$error); }
+        $data=$value['data']??[]; $payload=is_array($data)?($data['payload']??[]):[];
+        if (!is_array($data) || array_is_list($data) || !is_array($payload) || array_is_list($payload)) { throw new \DomainException('sms_callback_identity_mismatch'); }
         if (!Config::uuid($data['id']??null) || !self::providerId('telnyx',$payload['id']??null)
             || ($payload['messaging_profile_id']??'')!==$config['telnyx_profile_id']) { throw new \DomainException('sms_callback_identity_mismatch'); }
         $inbound=($data['event_type']??'')==='message.received';
-        $status=$payload['to'][0]['status']??'';
+        $fromRow=$payload['from']??null;$toRows=$payload['to']??null;
+        if (!is_array($fromRow) || array_is_list($fromRow) || !is_array($toRows) || !array_is_list($toRows) || count($toRows)!==1 || !is_array($toRows[0]) || array_is_list($toRows[0])) { throw new \DomainException('sms_callback_identity_mismatch'); }
+        $from=$fromRow['phone_number']??'';$to=$toRows[0]['phone_number']??'';
+        if (!Config::number($from) || !Config::number($to) || ($inbound ? $to!==$config['from'] : $from!==$config['from'])) { throw new \DomainException('sms_callback_identity_mismatch'); }
+        $status=$toRows[0]['status']??'';$status=is_string($status)?$status:'';
         $state=['queued'=>'accepted','sending'=>'accepted','sent'=>'sent','delivered'=>'delivered','sending_failed'=>'failed',
             'delivery_failed'=>'failed','delivery_unconfirmed'=>'uncertain'][$status]??null;
         if (!$inbound && !in_array($data['event_type']??'',['message.sent','message.finalized'],true)) { $state=null; }
-        $optOut=in_array(strtoupper(trim($payload['text']??'')),['STOP','STOPALL','UNSUBSCRIBE','CANCEL','END','QUIT','REVOKE','OPT OUT'],true);
-        $code=$payload['errors'][0]['code']??'';
         $text=$payload['text']??'';
         if (!is_string($text) || strlen($text)>6400) { throw new \InvalidArgumentException('sms_callback_invalid_body'); }
+        $optOut=in_array(strtoupper(trim($text)),['STOP','STOPALL','UNSUBSCRIBE','CANCEL','END','QUIT','REVOKE','OPT OUT'],true);
+        $errors=$payload['errors']??null;
+        $first=is_array($errors) && array_is_list($errors) && is_array($errors[0]??null)?$errors[0]:[];
+        $code=$first['code']??'';$code=is_int($code)||is_string($code)?(string)$code:'';
         return ['provider'=>'telnyx','body'=>$inbound?$text:'','provider_id'=>$payload['id'],'event_id'=>'telnyx_'.$data['id'],'inbound'=>$inbound,'opt_out'=>$inbound&&$optOut,
-            'from'=>$payload['from']['phone_number']??'','to'=>$payload['to'][0]['phone_number']??'','state'=>$state,
-            'error_code'=>preg_match('/^[0-9]{1,10}$/D',(string)$code)?'provider_'.$code:''];
+            'from'=>$from,'to'=>$to,'state'=>$state,
+            'error_code'=>preg_match('/^[0-9]{1,10}$/D',$code)?'provider_'.$code:''];
     }
 }

@@ -145,6 +145,25 @@ def verify_upstream(packages,contents):
             if xml.findtext('rawname')!=module or xml.findtext('version')!=version: raise ValueError('Upstream package identity mismatch: '+package.name)
 
 
+def installer_environment(directory):
+    """Return paths and the package digest from authenticated release metadata."""
+    directory=Path(directory).absolute()
+    manifest=release(directory)
+    values={'SLS_MASS_NOTIFY_TGZ_URL':'',
+            'SLS_MASS_NOTIFY_TGZ':str(directory/manifest['package']),
+            'SLS_MASS_NOTIFY_SHA256':manifest['package_sha256'],
+            'SLS_MASS_NOTIFY_MANIFEST':str(directory/'release-manifest.json'),
+            'SLS_MASS_NOTIFY_MANIFEST_SIGNATURE':str(directory/'release-manifest.sig'),
+            'SLS_MASS_NOTIFY_UPSTREAM_PACKAGES':str(directory/'upstream'),
+            'SLS_MASS_NOTIFY_OFFLINE_ASSETS':str(directory/'assets')}
+    if (directory/'previous').exists():
+        previous=release(directory/'previous')
+        values.update({'SLS_MASS_NOTIFY_PREVIOUS_TGZ':str(directory/'previous'/previous['package']),
+                       'SLS_MASS_NOTIFY_PREVIOUS_MANIFEST':str(directory/'previous/release-manifest.json'),
+                       'SLS_MASS_NOTIFY_PREVIOUS_MANIFEST_SIGNATURE':str(directory/'previous/release-manifest.sig')})
+    return values
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('directory',type=Path)
@@ -152,17 +171,7 @@ def main():
     args=parser.parse_args();directory=args.directory.absolute()
     result=validate(directory)
     if args.print_environment:
-        manifest=release(directory)
-        values={'SLS_MASS_NOTIFY_TGZ':str(directory/manifest['package']),
-                'SLS_MASS_NOTIFY_MANIFEST':str(directory/'release-manifest.json'),
-                'SLS_MASS_NOTIFY_MANIFEST_SIGNATURE':str(directory/'release-manifest.sig'),
-                'SLS_MASS_NOTIFY_UPSTREAM_PACKAGES':str(directory/'upstream'),
-                'SLS_MASS_NOTIFY_OFFLINE_ASSETS':str(directory/'assets')}
-        if (directory/'previous').exists():
-            previous=release(directory/'previous')
-            values.update({'SLS_MASS_NOTIFY_PREVIOUS_TGZ':str(directory/'previous'/previous['package']),
-                           'SLS_MASS_NOTIFY_PREVIOUS_MANIFEST':str(directory/'previous/release-manifest.json'),
-                           'SLS_MASS_NOTIFY_PREVIOUS_MANIFEST_SIGNATURE':str(directory/'previous/release-manifest.sig')})
+        values=installer_environment(directory)
         for key,value in values.items(): print('export '+key+'='+shlex.quote(value))
     else: print(json.dumps(result,indent=2,sort_keys=True))
 

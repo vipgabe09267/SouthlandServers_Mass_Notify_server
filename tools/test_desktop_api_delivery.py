@@ -6,6 +6,7 @@ import re
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 
@@ -43,7 +44,7 @@ class DesktopApiDeliveryTests(unittest.TestCase):
 
     def php(self, statements, endpoint=False):
         harness = self.directory / "harness.php"
-        contents = self.prefix + "\n" + statements
+        contents = self.prefix + "\numask(0027);\n" + statements
         if endpoint:
             contents += "\n$endpoint =" + self.endpoint
         harness.write_text(contents, encoding="utf-8")
@@ -182,7 +183,7 @@ class DesktopApiDeliveryTests(unittest.TestCase):
         result = self.php("""
             $events = [];
             for ($i = 0; $i < 8; $i++) {
-                $events[] = ['id' => 'event-' . $i, 'kind' => 'alert', 'desktop_recipients' => ['alice'], 'expires' => $i % 2 ? '2027-01-16T09:00:00Z' : '2000-01-01T00:00:00Z'];
+                $events[] = ['id' => 'event-' . $i, 'kind' => 'alert', 'desktop_recipients' => ['alice'], 'desktop_client_ids' => ['alice'=>'device-a'], 'expires' => $i % 2 ? '2027-01-16T09:00:00Z' : '2000-01-01T00:00:00Z'];
             }
             $first = desktop_poll_events_after_cursor($events, 'alice', '@sls:empty', 2, 1800000000);
             $second = desktop_poll_events_after_cursor($events, 'alice', $first['last_event_id'], 2, 1800000000);
@@ -196,12 +197,27 @@ class DesktopApiDeliveryTests(unittest.TestCase):
         self.assertFalse(result[1]["has_more"])
         self.assertEqual(result[2]["events"], [])
 
+    def test_event_identifier_boundary_matches_writer_poll_cursor_and_ack(self):
+        result = self.php("""
+            $identifier = str_repeat('a', MAX_EVENT_ID_BYTES);
+            $event = ['id' => $identifier, 'kind' => 'announcement', 'created_at' => '2027-01-15T08:00:00+00:00',
+                'desktop_recipients' => ['alice'], 'desktop_client_ids' => ['alice' => 'device-a']];
+            $batch = desktop_poll_events_after_cursor([$event], 'alice', '@sls:empty', 1, 1800000000, 'device-a');
+            $ack = record_desktop_acknowledgement(['log_retention_days' => 90],
+                ['username' => 'alice', 'client_id' => 'device-a'], $event, 1800000000);
+            echo json_encode(['delivered_length' => strlen($batch['events'][0]['id'] ?? ''), 'cursor' => desktop_event_id_valid($identifier),
+                'too_long' => desktop_event_id_valid($identifier . 'a'), 'control' => desktop_event_id_valid("bad\nvalue"),
+                'padded' => desktop_event_id_valid(' padded'), 'ack' => $ack]);
+        """)
+        self.assertEqual(result, {"delivered_length": 2048, "cursor": True, "too_long": False,
+                                  "control": False, "padded": False, "ack": True})
+
     def test_cursor_polling_preserves_all_250_burst_events_and_snapshot_reports_truncation(self):
         result = self.php("""
             $events = [];
             for ($i = 0; $i < 250; $i++) {
                 $events[] = ['id' => 'event-' . $i, 'kind' => 'announcement',
-                    'created_at' => '2027-01-15T08:00:00+00:00', 'desktop_recipients' => ['alice'],
+                    'created_at' => '2027-01-15T08:00:00+00:00', 'desktop_recipients' => ['alice'], 'desktop_client_ids' => ['alice'=>'device-a'],
                     'display_timeout_seconds' => 300, 'display_expires_at' => '2027-01-15T08:05:00+00:00'];
                 $events[] = ['id' => 'private-' . $i, 'kind' => 'announcement', 'desktop_recipients' => ['bob']];
             }
@@ -228,7 +244,7 @@ class DesktopApiDeliveryTests(unittest.TestCase):
     def test_delivery_expiry_does_not_delete_audit_record(self):
         result = self.php("""
             $event = ['id' => 'expired', 'kind' => 'announcement', 'created_at' => gmdate('c', time() - 60),
-                'desktop_recipients' => ['alice'], 'display_timeout_seconds' => 30,
+                'desktop_recipients' => ['alice'], 'desktop_client_ids' => ['alice'=>'device-a'], 'display_timeout_seconds' => 30,
                 'display_expires_at' => gmdate('c', time() - 30)];
             file_put_contents(EVENTS_FILE, json_encode($event) . "\n");
             $journal = retained_events([]);
@@ -238,6 +254,61 @@ class DesktopApiDeliveryTests(unittest.TestCase):
                 'unchanged' => $saved === $event]);
         """)
         self.assertEqual(result, {"delivered": [], "retained": 1, "unchanged": True})
+
+    def test_fractional_timestamp_contract_accepts_real_dates_and_rejects_ambiguity(self):
+        valid = ['2027-01-15T08:00:00Z', '2027-01-15T08:00:00.1Z',
+                 '2027-01-15T08:00:00.123Z', '2027-01-15T08:00:00.473064-05:00',
+                 '2027-01-15T08:00:00.123456789+14:00', '2027-01-15T08:00:00.000001-13:59']
+        invalid = ['2027-02-30T08:00:00.123456Z', '2027-01-15T08:00:60.123Z',
+                   '2027-01-15T08:00:00.1234567890Z', '2027-01-15T08:00:00.123',
+                   '2027-01-15T08:00:00.Z', '2027-01-15T08:00:00.123+14:01',
+                   '2027-01-15T08:00:00.123-00:00', '2027-01-15T08:00:00.123Z\n']
+        values = json.dumps(json.dumps(valid + invalid))
+        result = self.php('echo json_encode(array_map("desktop_timestamp", json_decode(' + values + ', true)));')
+        self.assertEqual(result, [int(datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp())
+                                  for value in valid] + [None] * len(invalid))
+
+    def test_malformed_expiry_fails_closed_and_impossible_created_at_is_corrupt(self):
+        result = self.php("""
+            $announcement=['kind'=>'announcement','display_timeout_seconds'=>30,
+                'display_expires_at'=>'2027-02-30T08:00:00Z'];
+            $alert=['kind'=>'alert','expires'=>'2027-02-30T08:00:00Z'];
+            file_put_contents(EVENTS_FILE,json_encode(['id'=>'bad-date','created_at'=>'2027-02-30T08:00:00Z'])."\\n");
+            ob_start(); retained_events([]);
+        """)
+        self.assertEqual(result["error"], "journal_corrupt")
+
+        result = self.php("""
+            echo json_encode(['announcement'=>announcement_display_expired(
+                ['kind'=>'announcement','display_timeout_seconds'=>30,'display_expires_at'=>'2027-02-30T08:00:00Z']),
+                'alert'=>desktop_event_display_expired(['kind'=>'alert','expires'=>'2027-02-30T08:00:00Z'])]);
+        """)
+        self.assertEqual(result, {"announcement": True, "alert": True})
+
+    def test_malformed_routing_cannot_expand_or_crash_authorization(self):
+        result = self.php("""
+            $events=[
+                ['id'=>'all-string','kind'=>'announcement','desktop_all'=>'1','desktop_client_ids'=>['alice'=>'device-a']],
+                ['id'=>'bad-bindings','kind'=>'announcement','desktop_all'=>true,'desktop_client_ids'=>'device-a'],
+                ['id'=>'bad-recipients','kind'=>'announcement','desktop_recipients'=>'alice','desktop_client_ids'=>['alice'=>'device-a']],
+                ['id'=>['array-id'],'kind'=>'announcement','desktop_all'=>true,'desktop_client_ids'=>['alice'=>'device-a']],
+            ];
+            echo json_encode(desktop_poll_snapshot($events,'alice',100,null,'device-a'));
+        """)
+        self.assertEqual(result["events"], [])
+        self.assertEqual(result["eligible_count"], 0)
+
+    def test_journal_ack_and_stream_slots_reject_writable_parent(self):
+        self.directory.chmod(0o777)
+        result = self.php("""
+            $atomic=atomic_replace_journal(EVENTS_FILE,"{}\\n");
+            $ack=record_desktop_acknowledgement([],['client_id'=>'device-a','username'=>'alice'],['id'=>'event-a']);
+            echo json_encode(['atomic'=>$atomic,'ack'=>$ack,'events'=>file_exists(EVENTS_FILE),
+                'acks'=>is_dir(DESKTOP_ACK_DIRECTORY)]);
+        """)
+        self.assertEqual(result, {"atomic": False, "ack": False, "events": False, "acks": False})
+        result = self.php("desktop_stream_slot('alice');")
+        self.assertEqual(result["error"], "stream_capacity_unavailable")
 
     def test_stream_capacity_preserves_bound_and_advertises_poll_fallback(self):
         result = self.php("""
@@ -274,13 +345,13 @@ class DesktopApiDeliveryTests(unittest.TestCase):
     def test_legacy_json_endpoint_filters_expiry_without_reordering_history(self):
         result = self.php(self.authenticated_endpoint_setup() + """
             $events = [
-                ['id' => 'old', 'kind' => 'alert', 'expires' => '2000-01-01T00:00:00Z', 'desktop_all' => true],
-                ['id' => 'first', 'kind' => 'announcement', 'desktop_all' => true],
-                ['id' => 'second', 'kind' => 'announcement', 'desktop_recipients' => ['alice']],
+                ['id' => 'old', 'kind' => 'alert', 'expires' => '2000-01-01T00:00:00Z', 'desktop_all' => true, 'desktop_client_ids' => ['alice'=>'device-a']],
+                ['id' => 'first', 'kind' => 'announcement', 'desktop_all' => true, 'desktop_client_ids' => ['alice'=>'device-a']],
+                ['id' => 'second', 'kind' => 'announcement', 'desktop_recipients' => ['alice'], 'desktop_client_ids' => ['alice'=>'device-a']],
                 ['id' => 'private', 'kind' => 'announcement', 'desktop_recipients' => ['bob']],
             ];
             file_put_contents(EVENTS_FILE, implode("\n", array_map('json_encode', $events)) . "\n");
-            $_GET = ['limit' => 1];
+            $_GET = ['limit' => '1'];
         """, endpoint=True)
         self.assertTrue(result["ok"])
         self.assertEqual([item["id"] for item in result["events"]], ["second"])
@@ -294,12 +365,12 @@ class DesktopApiDeliveryTests(unittest.TestCase):
     def test_resumable_json_endpoint_advances_expired_cursor_and_preserves_backlog(self):
         result = self.php(self.authenticated_endpoint_setup() + """
             $events = [
-                ['id' => 'old', 'kind' => 'alert', 'expires' => '2000-01-01T00:00:00Z', 'desktop_all' => true],
-                ['id' => 'first', 'kind' => 'announcement', 'desktop_all' => true],
-                ['id' => 'second', 'kind' => 'announcement', 'desktop_recipients' => ['alice']],
+                ['id' => 'old', 'kind' => 'alert', 'expires' => '2000-01-01T00:00:00Z', 'desktop_all' => true, 'desktop_client_ids' => ['alice'=>'device-a']],
+                ['id' => 'first', 'kind' => 'announcement', 'desktop_all' => true, 'desktop_client_ids' => ['alice'=>'device-a']],
+                ['id' => 'second', 'kind' => 'announcement', 'desktop_recipients' => ['alice'], 'desktop_client_ids' => ['alice'=>'device-a']],
             ];
             file_put_contents(EVENTS_FILE, implode("\n", array_map('json_encode', $events)) . "\n");
-            $_GET = ['limit' => 1, 'last_event_id' => 'old'];
+            $_GET = ['limit' => '1', 'last_event_id' => 'old'];
         """, endpoint=True)
         self.assertEqual([item["id"] for item in result["events"]], ["first"])
         self.assertEqual(result["last_event_id"], "first")
@@ -324,6 +395,18 @@ class DesktopApiDeliveryTests(unittest.TestCase):
         """, endpoint=True)
         self.assertEqual(result["error"], "rate_limited")
         self.assertIn(result["retry_after_seconds"], range(1, 61))
+
+    def test_missing_cursor_rebaselines_without_replaying_missed_events(self):
+        result = self.php("""
+            $events = [
+                ['id'=>'missed-a','kind'=>'announcement','desktop_recipients'=>['alice'],'desktop_client_ids'=>['alice'=>'device-a']],
+                ['id'=>'missed-b','kind'=>'announcement','desktop_recipients'=>['alice'],'desktop_client_ids'=>['alice'=>'device-a']],
+            ];
+            echo json_encode(desktop_poll_events_after_cursor($events,'alice','expired-cursor',100,null,'device-a'));
+        """)
+        self.assertEqual(result["events"], [])
+        self.assertTrue(result["cursor_gap"])
+        self.assertEqual(result["last_event_id"], "missed-b")
 
     def test_ack_is_durable_per_event_client_and_idempotent(self):
         result = self.php("""
@@ -410,7 +493,7 @@ class DesktopApiDeliveryTests(unittest.TestCase):
             "json_encode(['event_id' => 'routed-event'])",
         )
         result = self.php(self.authenticated_endpoint_setup("desktop/ack", "POST") + """
-            file_put_contents(EVENTS_FILE, json_encode(['id' => 'routed-event', 'kind' => 'announcement', 'desktop_recipients' => ['alice'], 'created_at' => gmdate('c')]) . "\n");
+            file_put_contents(EVENTS_FILE, json_encode(['id' => 'routed-event', 'kind' => 'announcement', 'desktop_recipients' => ['alice'], 'desktop_client_ids' => ['alice'=>'device-a'], 'created_at' => gmdate('c')]) . "\n");
         """, endpoint=True)
         self.assertTrue(result["ok"])
         stored = list((self.directory / "acks").glob("*.json"))

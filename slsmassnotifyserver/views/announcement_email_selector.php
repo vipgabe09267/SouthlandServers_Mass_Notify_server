@@ -1,20 +1,23 @@
 <?php
 // IDs only; email addresses remain in the administrator's saved-recipient editor.
-$emailSelectorField = (string)($email_selector_field ?? '');
-if (!in_array($emailSelectorField, ['announcement_email_recipient_ids', 'group_email_recipient_ids', 'schedule_email_recipient_ids'], true)) { throw new DomainException('Unknown email recipient form.'); }
+if (!is_string($email_selector_field ?? null)
+    || !in_array($email_selector_field, ['announcement_email_recipient_ids', 'group_email_recipient_ids', 'schedule_email_recipient_ids'], true)) { throw new DomainException('Unknown email recipient form.'); }
+$emailSelectorField = $email_selector_field;
 $emailSelectorId = 'sls-' . str_replace('_', '-', $emailSelectorField);
 $emailSelectorRows = array_values(array_filter((array)($emailRecipients ?? []), 'is_array'));
 $emailSelectorEscape = static function ($value) { return htmlspecialchars((string)$value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); };
 ?>
 <style>
-.sls-email-selector { border:1px solid #dfe5ec; border-radius:7px; margin-bottom:12px; background:#fff; }
+.sls-email-selector { --selector-surface:var(--sls-raised,#fff);--selector-line:var(--sls-border,#dfe5ec);--selector-muted:var(--sls-muted,#475569);--selector-warning:var(--sls-warning,#92400e);border:1px solid var(--selector-line); border-radius:7px; margin-bottom:12px; background:var(--selector-surface); }
 .sls-email-selector>summary { display:flex; gap:8px; align-items:center; cursor:pointer; padding:10px 12px; font-weight:600; }
 .sls-email-selector .sls-email-selector-body { padding:0 12px 12px; }
-.sls-email-selector .sls-email-selected { margin-left:auto; color:#475569; font-size:12px; font-weight:400; }
+.sls-email-selector .sls-email-selected { margin-left:auto; color:var(--selector-muted); font-size:12px; font-weight:400; }
 .sls-email-selector .sls-email-selector-list { max-height:220px; overflow:auto; margin-top:9px; }
 .sls-email-selector .checkbox { margin:7px 0; overflow-wrap:anywhere; }
-.sls-email-selector .sls-email-unavailable { color:#92400e; }
+.sls-email-selector .sls-email-unavailable { color:var(--selector-warning); }
 .sls-email-selector .help-block { font-size:12px; margin-bottom:0; }
+@media(prefers-color-scheme:dark){.sls-email-selector{--selector-surface:var(--sls-raised,#111b2b);--selector-line:var(--sls-border,#40506a);--selector-muted:var(--sls-muted,#b5c2d4);--selector-warning:var(--sls-warning,#fbbf24)}}
+[data-theme=dark] .sls-email-selector,body.dark .sls-email-selector{--selector-surface:var(--sls-raised,#111b2b);--selector-line:var(--sls-border,#40506a);--selector-muted:var(--sls-muted,#b5c2d4);--selector-warning:var(--sls-warning,#fbbf24)}
 </style>
 <details class="sls-destination-panel sls-email-selector" id="<?php echo $emailSelectorEscape($emailSelectorId); ?>">
     <summary><i class="fa fa-envelope" aria-hidden="true"></i><span><?php echo _('Email'); ?></span><span class="sls-email-selected" data-email-selected aria-live="polite"></span><i class="fa fa-chevron-down" aria-hidden="true"></i></summary>

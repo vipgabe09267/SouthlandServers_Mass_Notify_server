@@ -28,6 +28,7 @@ try {
  switch($input['op']) {
   case 'encode': $result=C::encode($input['settings'],$input['keyring']); break;
   case 'decode': $result=C::decode($input['raw'],$input['keyring'],$input['legacy']??true); break;
+  case 'validate_decode': C::decode($input['raw'],$input['keyring'],$input['legacy']??true); $result=true; break;
   case 'read': $result=C::readFile($input['path'],$input['keyring'],$input['legacy']??true); break;
   case 'backup': $result=C::backupKeyring($input['raw'],$input['keyring']); break;
   case 'restore': $result=C::decodeBackup($input['raw'],$input['backup']); break;
@@ -112,6 +113,34 @@ class ConfigCryptoTest(unittest.TestCase):
         self.assertEqual(crypto.decode_config(raw, self.keyring), expected)
         self.assertEqual(self.php("decode", raw=raw)["result"], expected)
 
+    def test_overflowed_json_numbers_rejected_before_settings_are_returned(self):
+        key_id=self.ring['active']; key=base64.b64decode(self.ring['keys'][key_id]['key'])
+        for plaintext in (b'{"enabled":"0","value":1e309}', b'{"enabled":"0","nested":[{"value":-1e999}]}'):
+            nonce=os.urandom(12)
+            sealed=crypto.AESGCM(key).encrypt(nonce,plaintext,(crypto.FORMAT+'\n'+key_id).encode('ascii'))
+            envelope=json.dumps({'format':crypto.FORMAT,'key_id':key_id,'nonce':base64.b64encode(nonce).decode('ascii'),
+                'ciphertext':base64.b64encode(sealed).decode('ascii')})
+            for raw in (plaintext,envelope):
+                accepted=[]
+                try: crypto.decode_config(raw,self.keyring); accepted.append('python')
+                except crypto.ConfigCryptoError: pass
+                if self.php('validate_decode',raw=raw)['ok']: accepted.append('php')
+                self.assertEqual(accepted,[],'Nonfinite settings escaped validation: '+repr(accepted))
+        raw='{"enabled":"0","nested":[1e20,-1e-20]}'
+        self.assertTrue(self.php('validate_decode',raw=raw)['ok'])
+        self.assertEqual(crypto.decode_config(raw,self.keyring)['nested'],[1e20,-1e-20])
+
+    def test_invalid_unicode_scalars_rejected_in_both_runtimes(self):
+        for raw in (b'{"value":"\\ud800"}', b'{"\\udfff":1}', b'{"nested":["valid",{"value":"\\ud800"}]}'):
+            with self.subTest(raw=raw):
+                with self.assertRaises(crypto.ConfigCryptoError):
+                    crypto.decode_config(raw, self.keyring)
+                self.assertFalse(self.php("validate_decode", raw=raw)["ok"])
+        with self.assertRaises(crypto.ConfigCryptoError):
+            crypto.decode_config('{"value":"\ud800"}', self.keyring)
+        with self.assertRaises(crypto.ConfigCryptoError):
+            crypto.encode_config({"value": "\ud800"}, self.keyring)
+
     def test_random_nonces_and_no_cleartext(self):
         values = {crypto.encode_config(self.settings, self.keyring) for _ in range(100)}
         self.assertEqual(len(values), 100)
@@ -172,11 +201,15 @@ class ConfigCryptoTest(unittest.TestCase):
         path = self.private_file("mass-notifications.config", self.sealed)
         self.assertEqual(crypto.read_config(path, self.keyring), self.settings)
         self.assertTrue(self.php("read", path=str(path))["ok"])
-        for mode in (0o644, 0o660, 0o666):
+        for mode in (0o610, 0o644, 0o650, 0o660, 0o700, 0o750, 0o755, 0o666):
             path.chmod(mode)
             with self.assertRaises(crypto.ConfigCryptoError):
                 crypto.read_config(path, self.keyring)
             self.assertFalse(self.php("read", path=str(path))["ok"])
+        path.chmod(0o640)
+        path.chmod(0o600)
+        self.assertEqual(crypto.read_config(path, self.keyring), self.settings)
+        self.assertTrue(self.php("read", path=str(path))["ok"])
         path.chmod(0o640)
         os.link(path, self.data / "second-link")
         with self.assertRaises(crypto.ConfigCryptoError):

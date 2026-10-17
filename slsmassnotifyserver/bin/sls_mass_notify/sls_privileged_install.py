@@ -648,10 +648,7 @@ class PrivilegedInstall:
     def retention(self):
         try: raw = self.files.read(CONFIG, 3 * 1024 * 1024)
         except FileNotFoundError: return 90
-        data = json.loads(raw)
-        if not isinstance(data, dict): raise InstallError('central configuration must be an object')
-        if any(key in data for key in ('format', 'ciphertext', 'key_id', 'nonce')):
-            data = self.crypto.decode_config(raw)
+        data = self.crypto.decode_config(raw)
         if not isinstance(data, dict): raise InstallError('protected configuration root is invalid')
         value = data.get('log_retention_days', 90)
         if isinstance(value, bool) or not isinstance(value, (str, int)) or not re.fullmatch(r'[0-9]{1,4}', str(value)):
@@ -810,6 +807,10 @@ class PrivilegedInstall:
         for args in (['is-enabled', '--quiet', SERVICE], ['is-active', '--quiet', SERVICE]):
             self.run(['/usr/bin/systemctl', *args])
         self.run(['/usr/sbin/apache2ctl', 'configtest'])
+        self.files.write('/etc/sls-mass-notify/build-identity.json', json.dumps({
+            'schema': 1, 'module_version': self.data['version'], 'generation': self.source.parent.name,
+            'inventory_sha256': hashlib.sha256(self.trust.read(self.source.parent / 'inventory.json', self.trust.MAX_MANIFEST, protected=True)).hexdigest(),
+        }, separators=(',', ':')).encode(), 0o644)
         return True
 
     def plan(self):

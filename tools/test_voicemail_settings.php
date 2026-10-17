@@ -19,6 +19,9 @@ $module = (new ReflectionClass(VoicemailSettingsModuleFixture::class))->newInsta
 $invoke = static function (string $name, ...$arguments) use ($reflection, $module) {
     return $reflection->getMethod($name)->invokeArgs($module, $arguments);
 };
+$invokeArgs = static function (string $name, array &$arguments) use ($reflection, $module) {
+    return $reflection->getMethod($name)->invokeArgs($module, $arguments);
+};
 $checks = 0;
 $check = static function (bool $condition, string $message) use (&$checks): void {
     ++$checks;
@@ -91,7 +94,7 @@ foreach (array_unique($constantNames[1]) as $name) {
 eval('class VoicemailSettingsSaveFixture {
     use \FreePBX\modules\SlsLivePaging;
     ' . $constants . '
-    public $active; public $pending; public $writes = 0; public $invoke;
+	    public $active; public $pending; public $writes = 0; public $invoke; public $invokeArgs;
     private function getActiveSettings() { return $this->active; }
     private function getPendingSettings() { return $this->pending; }
     private function isSetupComplete($settings) { return true; }
@@ -101,11 +104,16 @@ eval('class VoicemailSettingsSaveFixture {
     public function getAvailablePiperVoices() { return [["path"=>\FreePBX\modules\Slsmassnotifyserver::PIPER_AMY_VOICE], ["path"=>\FreePBX\modules\Slsmassnotifyserver::PIPER_VOICE]]; }
     public function getDesktopClients($settings) { return []; }
     private function importSystemSoundAsTone($selection, $prefix, &$errors) { throw new RuntimeException("Unexpected recording import"); }
+	    private function resolvePiperVoiceInput(array $input, string $field, $current, string $fallback, array $known, array $ready, array &$errors, string $label): string {
+	        $arguments = [$input, $field, $current, $fallback, $known, $ready, &$errors, $label];
+	        return ($this->invokeArgs)("resolvePiperVoiceInput", $arguments);
+	    }
     public function __call($name, $arguments) { return ($this->invoke)($name, ...$arguments); }
     ' . $methods . '
 }');
 $fixture = new VoicemailSettingsSaveFixture();
 $fixture->invoke = $invoke;
+$fixture->invokeArgs = $invokeArgs;
 $fixture->active = $defaults;
 $fixture->active['public_pbx_host'] = 'active.example.test';
 $fixture->pending = $saved;

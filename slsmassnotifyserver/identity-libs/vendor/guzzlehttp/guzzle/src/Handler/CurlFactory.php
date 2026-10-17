@@ -287,6 +287,10 @@ final class CurlFactory implements CurlFactoryInterface
             throw new RequestException(sprintf('HTTP/%s is not supported by the cURL handler.', $protocolVersion), $request);
         }
 
+        if (\array_key_exists('curl', $options) && !\is_array($options['curl'])) {
+            throw new InvalidArgumentException('The "curl" request option must be an array.');
+        }
+
         if (isset($options['curl']['body_as_string'])) {
             $options['_body_as_string'] = $options['curl']['body_as_string'];
             unset($options['curl']['body_as_string']);

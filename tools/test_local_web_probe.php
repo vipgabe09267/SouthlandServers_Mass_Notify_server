@@ -65,12 +65,30 @@ namespace {
 	check($options['ssl']['peer_name'] === 'pbx.example.test' && $options['ssl']['SNI_enabled'], 'Configured SNI was lost');
 	check($options['http']['follow_location'] === 0 && $options['http']['max_redirects'] === 0, 'Redirects could disclose credentials');
 	check($options['http']['timeout'] <= 8 && $length === 262144, 'Probe response bounds changed');
+	$GLOBALS['probe_requests'] = [];
+	iterator_to_array(SlsLocalWebProbe::responses('pbx.example.test', '/api/test', ['Authorization: Bearer fixture'], 1, $GLOBALS['vhost_fixture']));
+	check(count($GLOBALS['probe_requests'])>0,'Matched credential probe produced no requests.');
+	foreach ($GLOBALS['probe_requests'] as [$requestUrl,$requestOptions]) {
+		check(parse_url($requestUrl,PHP_URL_PORT)===8443&&str_starts_with($requestOptions['http']['header'],"Host: pbx.example.test:8443\r\n"),'Credential reached an unrelated local virtual host.');
+	}
+	$GLOBALS['probe_requests'] = [];
+	iterator_to_array(SlsLocalWebProbe::responses('pbx.example.test', '/api/test', ['Authorization: Bearer fixture'], 1, "*:9090 fixture\n"));
+	check(count($GLOBALS['probe_requests'])>0,'Credential fallback produced no standard-port requests.');
+	foreach ($GLOBALS['probe_requests'] as [$requestUrl,$requestOptions]) {
+		check(in_array(parse_url($requestUrl,PHP_URL_PORT),[80,443],true)&&str_starts_with($requestOptions['http']['header'],"Host: pbx.example.test"),'Credential fallback reached a discovered unrelated listener or default host.');
+	}
 	foreach ([['https://external.invalid', ['Accept: text/plain']], ['/api/test', ["Authorization: test\r\nInjected: value"]]] as $invalid) {
 		$rejected = false;
 		try { iterator_to_array(SlsLocalWebProbe::responses('pbx.example.test', $invalid[0], $invalid[1], 8, '')); }
 		catch (\RuntimeException $exception) { $rejected = true; }
 		check($rejected, 'Invalid request input was accepted');
 	}
+	foreach ([[ '/api/test', ['MalformedHeader'], 8 ], [ '/api/test', array_fill(0, 33, 'Accept: text/plain'), 8 ], [ '/api/test', ['Accept: text/plain'], 0 ]] as [$badPath,$badHeaders,$badTimeout]) {
+		$rejected=false;try{iterator_to_array(SlsLocalWebProbe::responses('pbx.example.test',$badPath,$badHeaders,$badTimeout,''));}catch(\RuntimeException $exception){$rejected=true;}
+		check($rejected,'Malformed header count, syntax or timeout was accepted');
+	}
+	$rejected=false;try{SlsLocalWebProbe::targets('pbx.example.test',[]);}catch(\InvalidArgumentException $exception){$rejected=true;}
+	check($rejected,'Non-text Apache inventory was accepted');
 	// Execute the installer's actual enabled-Control-API PHP with private files
 	// and an inert HTTP helper, so wrong credential variables cannot pass lint.
 	$fixture = sys_get_temp_dir() . '/sls-web-probe-' . bin2hex(random_bytes(8));
@@ -100,8 +118,12 @@ namespace {
 		check($result['ok'], 'Healthy media gate was not recognized.');
 	}
 	check(!SlsLocalWebProbe::mediaAccess([], [['status'=>404,'headers'=>[], 'body'=>'Not found']])['ok'], 'Static Apache 404 falsely proved media policy enforcement.');
+	check(!SlsLocalWebProbe::mediaAccess([], [['status'=>404,'headers'=>['X-SLS-Media-Policy: 1'], 'body'=>'{"error":"other","error":"media_not_found"}']])['ok'], 'Ambiguous duplicate-key media response proved policy enforcement.');
 	$result = SlsLocalWebProbe::mediaAccess([], [['status'=>503,'headers'=>['X-SLS-Media-Policy: 1'], 'body'=>'{"error":"media_access_configuration_unavailable"}']]);
 	check(!$result['ok'] && str_contains($result['message'], 'protected configuration'), 'Policy read error was not actionable.');
 	check(!SlsLocalWebProbe::mediaAccess(['media_access'=>null], [])['ok'], 'Malformed policy passed readiness.');
+	foreach ([null,['status'=>[],'headers'=>['X-SLS-Media-Policy: 1'],'body'=>'{}'],['status'=>404,'headers'=>[['X-SLS-Media-Policy: 1']],'body'=>'{}']] as $observation) {
+		check(!SlsLocalWebProbe::mediaAccess([],[$observation])['ok'],'Malformed media observation was accepted or escaped bounded failure.');
+	}
 	echo "Local Apache discovery, custom-port authentication, loopback pinning, Host/SNI, request bounds, media policy and invalid-input fixtures passed.\n";
 }

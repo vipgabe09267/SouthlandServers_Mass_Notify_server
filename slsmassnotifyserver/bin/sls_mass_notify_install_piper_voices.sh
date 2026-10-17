@@ -2,20 +2,80 @@
 set -euo pipefail
 
 umask 027
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
 
 VOICE_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices"
 PIPER_DIR="/usr/local/bin/sls_mass_notify/piper"
 PIPER_BIN="$PIPER_DIR/venv/bin/piper"
 PIPER_PY="$PIPER_DIR/venv/bin/python"
-LOG_FILE="/var/log/sls_mass_notify.log"
+LOG_FILE="${LOG_FILE:-/var/log/sls_mass_notify.log}"
+LOG_FD=""
 PIPER_ARTIFACTS_CHANGED=0
 PIPER_DEPENDENCY_CHECK="/usr/local/bin/sls_mass_notify/sls_piper_dependencies.py"
 PIPER_REQUIREMENTS="/usr/local/bin/sls_mass_notify/piper-requirements.txt"
 PIPER_WHEELHOUSE=""
 PIPER_VOICE_CACHE=""
 
+open_append_log() {
+  local output_variable="$1" protected_path="$2"
+  local protected_identity opened_identity protected_fd
+  protected_identity="$(/usr/bin/python3 -I - "$protected_path" <<'PYLOG'
+import os
+import pwd
+import stat
+import sys
+path = sys.argv[1]
+parts = path.split('/')[1:]
+if not path.startswith('/') or not parts or any(part in ('', '.', '..') for part in parts):
+    raise SystemExit(1)
+account = pwd.getpwnam('asterisk')
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+parent = os.open('/', flags); descriptor = -1
+try:
+    for component in parts[:-1]:
+        child = os.open(component, flags, dir_fd=parent)
+        os.close(parent); parent = child
+        info = os.fstat(parent)
+        if info.st_uid != 0 or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX):
+            raise RuntimeError('unsafe log parent')
+    open_flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        descriptor = os.open(parts[-1], open_flags | os.O_CREAT | os.O_EXCL,
+                             0o640, dir_fd=parent)
+        os.fchown(descriptor, account.pw_uid, account.pw_gid)
+        os.fchmod(descriptor, 0o640); os.fsync(parent)
+    except FileExistsError:
+        descriptor = os.open(parts[-1], open_flags, dir_fd=parent)
+    opened = os.fstat(descriptor)
+    named = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+    if ((opened.st_uid, opened.st_gid) not in
+            ((account.pw_uid, account.pw_gid), (0, account.pw_gid), (0, 0))
+            or not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+            or opened.st_mode & 0o022
+            or (opened.st_dev, opened.st_ino, opened.st_uid, opened.st_gid,
+                opened.st_mode, opened.st_nlink)
+            != (named.st_dev, named.st_ino, named.st_uid, named.st_gid,
+                named.st_mode, named.st_nlink)):
+        raise RuntimeError('unsafe Piper log')
+    print(f'{opened.st_dev}:{opened.st_ino}')
+finally:
+    if descriptor >= 0: os.close(descriptor)
+    os.close(parent)
+PYLOG
+)" || return 1
+  exec {protected_fd}>>"$protected_path" || return 1
+  opened_identity="$(stat -Lc '%d:%i' "/proc/${BASHPID}/fd/$protected_fd" 2>/dev/null)" || opened_identity=""
+  if [ "$opened_identity" != "$protected_identity" ]; then
+    exec {protected_fd}>&-
+    return 1
+  fi
+  printf -v "$output_variable" '%s' "$protected_fd"
+}
+
 log() {
-  printf '%s: %s\n' "$(date)" "$*" >> "$LOG_FILE" 2>/dev/null || true
+  [ -n "${LOG_FD:-}" ] || return 0
+  printf '%s: %s\n' "$(date)" "$*" >&"$LOG_FD" || true
 }
 
 declare -A voice_bytes=(
@@ -38,6 +98,8 @@ declare -A voice_bytes=(
 )
 
 SLS_VOICE_DOWNLOAD_TMP=""
+# Invoked indirectly by the EXIT trap.
+# shellcheck disable=SC2317
 cleanup_voice_download() { [ -z "$SLS_VOICE_DOWNLOAD_TMP" ] || rm -f -- "$SLS_VOICE_DOWNLOAD_TMP"; }
 trap cleanup_voice_download EXIT
 trap 'exit 130' INT
@@ -48,13 +110,81 @@ bounded_voice_stream() {
   /usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_bounded_stream.py "$1" "$2"
 }
 
+voice_file_is_current() {
+  local target="$1" expected_sha="$2" expected_bytes="$3"
+  SLS_PIPER_VOICE_TARGET="$target" SLS_PIPER_VOICE_SHA256="$expected_sha" \
+    SLS_PIPER_VOICE_BYTES="$expected_bytes" /usr/bin/python3 -I - 2>/dev/null <<'PYVOICEEXISTS'
+import hashlib
+import os
+import pwd
+import re
+import stat
+
+target = os.environ['SLS_PIPER_VOICE_TARGET']
+expected_sha = os.environ['SLS_PIPER_VOICE_SHA256']
+expected_bytes = int(os.environ['SLS_PIPER_VOICE_BYTES'])
+name = os.path.basename(target)
+expected_prefix = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices/'
+if (target != expected_prefix + name
+        or not re.fullmatch(r'[a-z]{2}_[A-Z]{2}-[A-Za-z0-9_-]+\.onnx(?:\.json)?', name)
+        or not re.fullmatch(r'[a-f0-9]{64}', expected_sha)
+        or not 1 <= expected_bytes <= 128 * 1024 * 1024):
+    raise SystemExit(2)
+account = pwd.getpwnam('asterisk')
+directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+parent = os.open('/', directory_flags)
+descriptor = -1
+try:
+    for component in ('var', 'lib', 'asterisk', 'SLS_Mass_Notifications_Plugin', 'piper', 'voices'):
+        child = os.open(component, directory_flags, dir_fd=parent)
+        os.close(parent)
+        parent = child
+        info = os.fstat(parent)
+        if (info.st_uid not in (0, account.pw_uid) or info.st_mode & 0o002
+                or info.st_mode & 0o020 and info.st_gid not in (0, account.pw_gid)):
+            raise RuntimeError('unsafe Piper voice directory')
+    try:
+        before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        raise SystemExit(1)
+    descriptor = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=parent)
+    opened = os.fstat(descriptor)
+    if ((opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+            or opened.st_uid not in (0, account.pw_uid) or opened.st_mode & 0o022
+            or opened.st_size != expected_bytes):
+        raise RuntimeError('unsafe or stale Piper voice file')
+    digest = hashlib.sha256()
+    remaining = expected_bytes
+    while remaining:
+        block = os.read(descriptor, min(1024 * 1024, remaining))
+        if not block:
+            raise RuntimeError('Piper voice file was truncated')
+        digest.update(block)
+        remaining -= len(block)
+    after = os.fstat(descriptor)
+    current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if (os.read(descriptor, 1)
+            or (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+               != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            or (after.st_dev, after.st_ino) != (current.st_dev, current.st_ino)
+            or digest.hexdigest() != expected_sha):
+        raise RuntimeError('Piper voice file changed or failed checksum validation')
+finally:
+    if descriptor >= 0:
+        os.close(descriptor)
+    os.close(parent)
+PYVOICEEXISTS
+}
+
 download_file() {
   local url="$1"
   local target="$2"
   local expected_sha="$3"
   local expected_bytes="${voice_bytes[$(basename "$target")]:-0}"
   [ "$expected_bytes" -gt 0 ] || return 1
-  local tmp attempt downloaded=0
+  local tmp downloaded=0 attempt
 
   tmp="$(mktemp "${TMPDIR:-/tmp}/sls-piper-voice.XXXXXXXX")" || return 1
   SLS_VOICE_DOWNLOAD_TMP="$tmp"
@@ -62,13 +192,16 @@ download_file() {
     /usr/bin/python3 -I - "$PIPER_VOICE_CACHE/$(basename "$target")" "$tmp" "$expected_bytes" <<'PYVOICECACHE' || { rm -f -- "$tmp"; return 1; }
 import os, pathlib, stat, sys
 source,target,bound=sys.argv[1],sys.argv[2],int(sys.argv[3])
+source_path=pathlib.Path(source)
+if not source_path.is_absolute() or '..' in source_path.parts:
+    raise RuntimeError('Voice cache path must be absolute and canonical')
 parent=os.open('/',os.O_RDONLY|os.O_DIRECTORY)
 try:
-    for part in pathlib.Path(source).parts[1:-1]:
+    for part in source_path.parts[1:-1]:
         child=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
         os.close(parent);parent=child;info=os.fstat(parent)
         if info.st_uid!=0 or info.st_mode&0o022 and not info.st_mode&stat.S_ISVTX: raise RuntimeError('Voice cache must have protected root-owned parents')
-    fd=os.open(pathlib.Path(source).name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=parent)
+    fd=os.open(source_path.name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=parent)
     with os.fdopen(fd,'rb') as incoming:
         info=os.fstat(incoming.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or info.st_uid!=0 or info.st_mode&0o022 or info.st_size!=bound: raise RuntimeError('Pinned offline voice is missing or unsafe')
@@ -82,11 +215,11 @@ try:
             output.flush();os.fsync(output.fileno())
 finally:os.close(parent)
 PYVOICECACHE
-  elif command -v curl >/dev/null 2>&1; then
-    for attempt in 1 2; do
-      if /usr/bin/timeout --signal=TERM --kill-after=5 95 curl -fL --proto '=https' --proto-redir '=https' \
+  elif [ -x /usr/bin/curl ]; then
+    for ((attempt = 0; attempt < 2; attempt++)); do
+      if /usr/bin/timeout --signal=TERM --kill-after=5 95 /usr/bin/curl -fL --proto '=https' --proto-redir '=https' \
         --max-filesize "$expected_bytes" --connect-timeout 20 --max-time 90 \
-        -A "SouthlandServers-Mass-Notifications-Server/0.1.6-beta" \
+        -A "SouthlandServers-Mass-Notifications-Server/0.1.7-beta" \
         -o - "$url" | bounded_voice_stream "$tmp" "$expected_bytes"; then
         downloaded=1
         break
@@ -107,31 +240,38 @@ PYVOICECACHE
     rm -f "$tmp"
     return 1
   fi
-  if ! printf '%s  %s\n' "$expected_sha" "$tmp" | sha256sum -c - >/dev/null 2>&1; then
+  if ! printf '%s  %s\n' "$expected_sha" "$tmp" | /usr/bin/sha256sum -c - >/dev/null 2>&1; then
     log "Piper voice checksum verification failed for $(basename "$target")"
     rm -f "$tmp"
     return 1
   fi
 
   if [[ "$target" == *.onnx ]]; then
-    [ -s "$tmp" ] && [ "$(stat -c%s "$tmp" 2>/dev/null || echo 0)" -gt 1000000 ] || {
+    if [ ! -s "$tmp" ] || [ "$(stat -c%s "$tmp" 2>/dev/null || echo 0)" -le 1000000 ]; then
       rm -f "$tmp"
       return 1
-    }
+    fi
   elif [[ "$target" == *.json ]]; then
-    python3 -I -m json.tool "$tmp" >/dev/null 2>&1 || {
+    /usr/bin/python3 -I -m json.tool "$tmp" >/dev/null 2>&1 || {
       rm -f "$tmp"
       return 1
     }
   fi
 
-  SLS_PIPER_VOICE_SOURCE="$tmp" SLS_PIPER_VOICE_TARGET="$target" /usr/bin/python3 -I - <<'PY' || {
+  SLS_PIPER_VOICE_SOURCE="$tmp" SLS_PIPER_VOICE_TARGET="$target" SLS_PIPER_VOICE_SHA256="$expected_sha" SLS_PIPER_VOICE_BYTES="$expected_bytes" /usr/bin/python3 -I - <<'PY' || {
 import os
 import pwd
 import secrets
 import stat
 
+import hashlib
+import pathlib
 source = os.environ["SLS_PIPER_VOICE_SOURCE"]
+expected_bytes = int(os.environ["SLS_PIPER_VOICE_BYTES"])
+expected_sha = os.environ["SLS_PIPER_VOICE_SHA256"]
+account = pwd.getpwnam("asterisk")
+if account.pw_uid<=0 or not 1<=expected_bytes<=128*1024*1024 or not __import__("re").fullmatch(r"[a-f0-9]{64}",expected_sha):
+    raise RuntimeError("Invalid pinned voice promotion metadata")
 target = os.environ["SLS_PIPER_VOICE_TARGET"]
 name = os.path.basename(target)
 if target != "/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices/" + name \
@@ -158,16 +298,38 @@ try:
         dir_fd=voices_fd,
     )
     try:
-        with open(source, "rb") as input_handle, os.fdopen(output_fd, "wb") as output_handle:
+        source_parent=os.open("/",directory_flags)
+        try:
+            source_path=pathlib.Path(source)
+            if not source_path.is_absolute() or ".." in source_path.parts:
+                raise RuntimeError("Voice staging path must be absolute and canonical")
+            for part in source_path.parts[1:-1]:
+                child=os.open(part,directory_flags,dir_fd=source_parent)
+                os.close(source_parent);source_parent=child
+                info=os.fstat(child)
+                if info.st_uid!=0 or info.st_mode&0o022 and not info.st_mode&stat.S_ISVTX:
+                    raise RuntimeError("Voice staging parents must be root-owned and protected")
+            source_fd=os.open(source_path.name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC,dir_fd=source_parent)
+        finally:
+            os.close(source_parent)
+        with os.fdopen(source_fd,"rb") as input_handle, os.fdopen(output_fd,"wb") as output_handle:
             output_fd = -1
-            while True:
-                chunk = input_handle.read(1024 * 1024)
+            before=os.fstat(input_handle.fileno())
+            if (not stat.S_ISREG(before.st_mode) or before.st_nlink!=1 or before.st_uid!=0
+                    or before.st_mode&0o7077 or before.st_size!=expected_bytes):
+                raise RuntimeError("Voice staging input must remain one private root-owned regular file")
+            remaining=expected_bytes;checksum=hashlib.sha256()
+            while remaining:
+                chunk=input_handle.read(min(1024*1024,remaining))
                 if not chunk:
-                    break
-                output_handle.write(chunk)
+                    raise RuntimeError("Pinned voice staging input was truncated")
+                checksum.update(chunk);output_handle.write(chunk);remaining-=len(chunk)
+            after=os.fstat(input_handle.fileno())
+            if (input_handle.read(1) or checksum.hexdigest()!=expected_sha
+                    or (before.st_size,before.st_mtime_ns,before.st_ctime_ns)!=(after.st_size,after.st_mtime_ns,after.st_ctime_ns)):
+                raise RuntimeError("Pinned voice staging input changed before promotion")
             output_handle.flush()
             os.fsync(output_handle.fileno())
-            account = pwd.getpwnam("asterisk")
             os.fchown(output_handle.fileno(), account.pw_uid, account.pw_gid)
             os.fchmod(output_handle.fileno(), 0o644)
         existing = None
@@ -201,81 +363,6 @@ PY
   return 0
 }
 
-reset_managed_piper_venv() {
-  PIPER_RESET_ROOT="$PIPER_DIR" /usr/bin/python3 -I - <<'PY'
-import os
-import shutil
-import stat
-import time
-
-root = os.environ["PIPER_RESET_ROOT"]
-if root != "/usr/local/bin/sls_mass_notify/piper":
-    raise SystemExit("Piper repair refused: runtime path is not the SLS-managed path")
-flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
-deadline = time.monotonic() + 10
-entries = 0
-
-def trusted(metadata, label):
-    if metadata.st_uid != 0 or (not stat.S_ISLNK(metadata.st_mode) and metadata.st_mode & 0o022):
-        raise RuntimeError("Piper repair refused: " + label + " is not root-owned and protected from writes")
-
-def inspect_tree(descriptor, device):
-    global entries
-    trusted(os.fstat(descriptor), "runtime directory")
-    for name in os.listdir(descriptor):
-        entries += 1
-        if entries > 50000 or time.monotonic() > deadline:
-            raise RuntimeError("Piper repair refused: runtime inspection exceeded its bounded safety limit")
-        metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-        trusted(metadata, "runtime entry")
-        if metadata.st_dev != device:
-            raise RuntimeError("Piper repair refused: runtime contains another mounted filesystem")
-        if stat.S_ISDIR(metadata.st_mode):
-            child = os.open(name, flags, dir_fd=descriptor)
-            try:
-                inspect_tree(child, device)
-            finally:
-                os.close(child)
-        elif stat.S_ISREG(metadata.st_mode):
-            if metadata.st_nlink != 1:
-                raise RuntimeError("Piper repair refused: runtime contains a hard-linked file")
-        elif not stat.S_ISLNK(metadata.st_mode):
-            raise RuntimeError("Piper repair refused: runtime contains an unsupported file type")
-        # Standard venv interpreter/lib64 symlinks are unlinked, never traversed.
-
-descriptor = os.open("/", flags)
-try:
-    trusted(os.fstat(descriptor), "root directory")
-    for component in root.strip("/").split("/"):
-        child = os.open(component, flags, dir_fd=descriptor)
-        os.close(descriptor)
-        descriptor = child
-        trusted(os.fstat(descriptor), "runtime ancestor")
-    try:
-        metadata = os.stat("venv", dir_fd=descriptor, follow_symlinks=False)
-    except FileNotFoundError:
-        metadata = None
-    if metadata is not None:
-        if not stat.S_ISDIR(metadata.st_mode):
-            raise RuntimeError("Piper repair refused: managed venv is not a real directory")
-        venv = os.open("venv", flags, dir_fd=descriptor)
-        try:
-            if os.fstat(venv).st_dev != os.fstat(descriptor).st_dev:
-                raise RuntimeError("Piper repair refused: managed venv is a mounted filesystem")
-            inspect_tree(venv, metadata.st_dev)
-            current = os.stat("venv", dir_fd=descriptor, follow_symlinks=False)
-            if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
-                raise RuntimeError("Piper repair refused: managed venv changed during inspection")
-            if not shutil.rmtree.avoids_symlink_attacks:
-                raise RuntimeError("Piper repair refused: safe directory removal is unavailable")
-            shutil.rmtree("venv", dir_fd=descriptor)
-        finally:
-            os.close(venv)
-finally:
-    os.close(descriptor)
-PY
-}
-
 piper_venv_usable() {
   [ -x "$PIPER_PY" ] \
     && /usr/bin/timeout 20 "$PIPER_PY" -I -c \
@@ -286,7 +373,7 @@ piper_venv_usable() {
 
 ensure_piper_runtime() {
   validate_piper_runtime_tree || { log "Piper executable tree failed ownership/link validation; no existing interpreter was executed"; return 1; }
-  if ! python3 --version >/dev/null 2>&1; then
+  if ! /usr/bin/python3 --version >/dev/null 2>&1; then
     log "Piper install failed: python3 is installed but not executable or broken"
     return 1
   fi
@@ -297,9 +384,9 @@ ensure_piper_runtime() {
   fi
   if [ -x "$PIPER_PY" ]; then
     # Only package names and version mismatches are emitted by this checker.
-    /usr/bin/timeout 20 "$PIPER_PY" -I "$PIPER_DEPENDENCY_CHECK" --requirements "$PIPER_REQUIREMENTS" >> "$LOG_FILE" 2>&1 || true
+    /usr/bin/timeout 20 "$PIPER_PY" -I "$PIPER_DEPENDENCY_CHECK" --requirements "$PIPER_REQUIREMENTS" >&"$LOG_FD" 2>&1 || true
   fi
-  if ! command -v python3 >/dev/null 2>&1; then
+  if [ ! -x /usr/bin/python3 ]; then
     log "Piper install failed: python3 missing"
     return 1
   fi
@@ -309,19 +396,19 @@ ensure_piper_runtime() {
   [ -r "$environment_helper" ] || { log "The signed Piper replacement helper is missing; no active packages were changed."; return 1; }
   [ "${PIPER_WORKERS_PAUSED:-0}" != 1 ] || replacement_args+=(--workers-paused)
   [ -z "$PIPER_WHEELHOUSE" ] || replacement_args+=(--wheelhouse "$PIPER_WHEELHOUSE")
-  /usr/bin/python3 -I "$environment_helper" "${replacement_args[@]}" >> "$LOG_FILE" 2>&1 || {
+  /usr/bin/python3 -I "$environment_helper" "${replacement_args[@]}" >&"$LOG_FD" 2>&1 || {
     log "Piper replacement did not complete. Review the specific namespace, dependency, activation or recovery error above. No in-place package upgrade was attempted."
     return 1
   }
   PIPER_ARTIFACTS_CHANGED=1
   piper_venv_usable && /usr/bin/timeout 20 "$PIPER_PY" -I -m piper -h >/dev/null 2>&1 \
-    && /usr/bin/timeout 20 "$PIPER_PY" -I "$PIPER_DEPENDENCY_CHECK" --requirements "$PIPER_REQUIREMENTS" >> "$LOG_FILE" 2>&1 \
+    && /usr/bin/timeout 20 "$PIPER_PY" -I "$PIPER_DEPENDENCY_CHECK" --requirements "$PIPER_REQUIREMENTS" >&"$LOG_FD" 2>&1 \
     && /usr/bin/timeout 20 "$PIPER_PY" -I -m pip check >/dev/null 2>&1
 
 }
 
 install_piper_wrapper() {
-  local expected current wrapper_tmp
+  local expected expected_hash current wrapper_hash wrapper_mode wrapper_permissions wrapper_tmp
   expected="$(cat <<'EOF'
 #!/bin/sh
 PIPER_BIN="/usr/local/bin/sls_mass_notify/piper/venv/bin/piper"
@@ -339,15 +426,35 @@ echo "Piper TTS binary is not installed or not executable: $PIPER_BIN" >&2
 exit 126
 EOF
 )"
+  expected_hash="$(printf '%s\n' "$expected" | /usr/bin/sha256sum)"
+  expected_hash="${expected_hash%% *}"
   if [ -e /usr/local/bin/piper ] || [ -L /usr/local/bin/piper ]; then
     if [ -L /usr/local/bin/piper ]; then
       case "$(readlink /usr/local/bin/piper 2>/dev/null || true)" in
         /usr/local/bin/sls_mass_notify/piper/venv/bin/piper|/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/venv/bin/piper) ;;
         *) printf '%s\n' '/usr/local/bin/piper belongs to another application; refusing to overwrite it.' >&2; return 1 ;;
       esac
-    elif ! grep -Eq 'sls_mass_notify/piper|SLS_Mass_Notifications_Plugin/piper' /usr/local/bin/piper 2>/dev/null; then
-      printf '%s\n' '/usr/local/bin/piper belongs to another application; refusing to overwrite it.' >&2
-      return 1
+    else
+      if [ ! -f /usr/local/bin/piper ] \
+        || [ "$(stat -c '%h' /usr/local/bin/piper 2>/dev/null || true)" != 1 ] \
+        || [ "$(stat -c '%u:%g' /usr/local/bin/piper 2>/dev/null || true)" != "0:0" ] \
+        || [ "$(stat -c '%s' /usr/local/bin/piper 2>/dev/null || printf '16385')" -gt 16384 ]; then
+        printf '%s\n' '/usr/local/bin/piper belongs to another application; refusing to overwrite it.' >&2
+        return 1
+      fi
+      wrapper_mode="$(stat -c '%a' /usr/local/bin/piper 2>/dev/null || true)"
+      [[ "$wrapper_mode" =~ ^[0-7]{3,4}$ ]] || return 1
+      wrapper_permissions=$((8#$wrapper_mode))
+      if (( (wrapper_permissions & 07022) != 0 )); then
+        printf '%s\n' '/usr/local/bin/piper has unsafe permissions; refusing to overwrite it.' >&2
+        return 1
+      fi
+      wrapper_hash="$(/usr/bin/sha256sum /usr/local/bin/piper 2>/dev/null || true)"
+      wrapper_hash="${wrapper_hash%% *}"
+      case "$wrapper_hash" in
+        "$expected_hash"|97792a8e4ca9f3f48be0be0c24202921008807da030ac85438b58034f21130e4|4c6c0dfe69c1b59b8650c0c5a9d38adf5a9c6cbe311c283a929a7fc5580015c0) ;;
+        *) printf '%s\n' '/usr/local/bin/piper is not a recognized SLS wrapper; refusing to overwrite it.' >&2; return 1 ;;
+      esac
     fi
   fi
   if [ -f /usr/local/bin/piper ] && [ ! -L /usr/local/bin/piper ] \
@@ -369,6 +476,78 @@ EOF
   PIPER_ARTIFACTS_CHANGED=1
 }
 
+ensure_piper_install_directories() {
+  /usr/bin/python3 -I - <<'PYDIRECTORIES'
+import os
+import pwd
+import stat
+
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+account = pwd.getpwnam('asterisk')
+
+def descend(parent, name):
+    return os.open(name, flags, dir_fd=parent)
+
+def validate(info, owners, groups, allow_group_write=False):
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in owners
+            or info.st_gid not in groups or info.st_mode & 0o002
+            or (info.st_mode & 0o020 and not allow_group_write)):
+        raise RuntimeError('unsafe Piper installation directory')
+
+root = os.open('/', flags)
+current = root
+try:
+    for component in ('usr', 'local', 'bin', 'sls_mass_notify'):
+        child = descend(current, component)
+        if current != root: os.close(current)
+        current = child
+        validate(os.fstat(current), (0,), (0,))
+    try:
+        os.mkdir('piper', 0o755, dir_fd=current)
+        os.fsync(current)
+    except FileExistsError:
+        pass
+    runtime = descend(current, 'piper')
+    try:
+        validate(os.fstat(runtime), (0,), (0,))
+        os.fchown(runtime, 0, 0); os.fchmod(runtime, 0o755)
+    finally:
+        os.close(runtime)
+finally:
+    if current != root: os.close(current)
+    os.close(root)
+
+root = os.open('/', flags)
+current = root
+try:
+    for component in ('var', 'lib', 'asterisk'):
+        child = descend(current, component)
+        if current != root: os.close(current)
+        current = child
+        info = os.fstat(current)
+        if component == 'asterisk':
+            validate(info, (0, account.pw_uid), (0, account.pw_gid), True)
+        else:
+            validate(info, (0,), (0,))
+    for component in ('SLS_Mass_Notifications_Plugin', 'piper', 'voices'):
+        try:
+            os.mkdir(component, 0o755, dir_fd=current)
+            created = descend(current, component)
+            os.fchown(created, account.pw_uid, account.pw_gid)
+            os.fchmod(created, 0o755)
+            os.fsync(current)
+        except FileExistsError:
+            created = descend(current, component)
+        info = os.fstat(created)
+        validate(info, (0, account.pw_uid), (0, account.pw_gid), True)
+        if current != root: os.close(current)
+        current = created
+finally:
+    if current != root: os.close(current)
+    os.close(root)
+PYDIRECTORIES
+}
+
 install_piper_compatibility_path() {
   local result
   result="$(
@@ -388,6 +567,15 @@ temporary = ""
 def descend(parent_fd, component):
     return os.open(component, directory_flags, dir_fd=parent_fd)
 
+def bounded_entries(descriptor, limit):
+    names = set()
+    with os.scandir(descriptor) as entries:
+        for entry in entries:
+            if len(names) >= limit:
+                raise RuntimeError("Piper compatibility path exceeds its entry limit")
+            names.add(entry.name)
+    return names
+
 try:
     current = root_fd
     for component in ("var", "lib", "asterisk", "SLS_Mass_Notifications_Plugin", "piper"):
@@ -396,13 +584,13 @@ try:
             os.close(current)
         current = next_fd
     piper_fd = current
-    entries = set(os.listdir(piper_fd))
+    entries = bounded_entries(piper_fd, 128)
     if "venv" not in entries:
         os.mkdir("venv", 0o755, dir_fd=piper_fd)
         changed = True
     venv_fd = descend(piper_fd, "venv")
     try:
-        entries = set(os.listdir(venv_fd))
+        entries = bounded_entries(venv_fd, 4)
         if entries - {"bin"}:
             raise RuntimeError("Piper compatibility path contains an unexpected entry")
         if "bin" not in entries:
@@ -410,13 +598,16 @@ try:
             changed = True
         bin_fd = descend(venv_fd, "bin")
         try:
-            entries = set(os.listdir(bin_fd))
+            entries = bounded_entries(bin_fd, 4)
             if entries - {"piper"}:
                 raise RuntimeError("Piper compatibility path contains an unexpected entry")
             if "piper" in entries:
                 metadata = os.stat("piper", dir_fd=bin_fd, follow_symlinks=False)
-                if not stat.S_ISLNK(metadata.st_mode) or os.readlink("piper", dir_fd=bin_fd) != "/usr/local/bin/piper":
+                if (not stat.S_ISLNK(metadata.st_mode) or metadata.st_nlink != 1
+                        or os.readlink("piper", dir_fd=bin_fd) != "/usr/local/bin/piper"):
                     raise RuntimeError("Piper compatibility path contains an untrusted layout")
+                if metadata.st_uid != 0 or metadata.st_gid != 0:
+                    changed = True
             else:
                 temporary = ".piper." + secrets.token_hex(8)
                 os.symlink("/usr/local/bin/piper", temporary, dir_fd=bin_fd)
@@ -430,6 +621,9 @@ try:
                 os.fchown(descriptor, 0, 0)
                 os.fchmod(descriptor, 0o755)
             os.chown("piper", 0, 0, dir_fd=bin_fd, follow_symlinks=False)
+            os.fsync(bin_fd)
+            os.fsync(venv_fd)
+            os.fsync(piper_fd)
         finally:
             if temporary and bin_fd >= 0:
                 try:
@@ -470,8 +664,7 @@ count = 0
 deadline = time.monotonic() + 15
 
 def protected(info, label):
-    sticky_ancestor = label == 'runtime ancestor' and info.st_mode & stat.S_ISVTX
-    if info.st_uid != 0 or (not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022 and not sticky_ancestor):
+    if info.st_uid != 0 or (not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022):
         raise RuntimeError('Piper runtime is not root-owned and protected: ' + label)
 
 def system_python(path):
@@ -497,34 +690,36 @@ def system_python(path):
 def visit(fd, relative=''):
     global count
     protected(os.fstat(fd), relative or 'runtime directory')
-    for name in os.listdir(fd):
-        count += 1
-        if count > 50000 or time.monotonic() > deadline:
-            raise RuntimeError('Piper runtime inspection exceeded safety limits')
-        rel = relative + '/' + name if relative else name
-        link_rel = re.sub(r'^\.replacement-[a-f0-9]{24}/', '', rel)
-        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
-        protected(info, rel)
-        if stat.S_ISDIR(info.st_mode):
-            child = os.open(name, flags, dir_fd=fd)
-            try:
-                current = os.fstat(child)
-                if (current.st_dev,current.st_ino) != (info.st_dev,info.st_ino):
-                    raise RuntimeError('Piper runtime directory changed')
-                visit(child,rel)
-            finally: os.close(child)
-        elif stat.S_ISREG(info.st_mode):
-            if info.st_nlink != 1:
-                raise RuntimeError('Piper runtime contains a hard-linked file: ' + rel)
-        elif stat.S_ISLNK(info.st_mode):
-            target = os.readlink(name, dir_fd=fd)
-            if link_rel == 'venv/lib64' and target == 'lib': continue
-            if re.fullmatch(r'venv/bin/python(?:3(?:\.[0-9]+)?)?',link_rel):
-                if target == 'python3' and link_rel != 'venv/bin/python3': continue
-                system_python(target)
-                continue
-            raise RuntimeError('Piper runtime contains an unexpected symbolic link: ' + rel)
-        else: raise RuntimeError('Piper runtime contains an unsupported entry: ' + rel)
+    with os.scandir(fd) as entries:
+        for entry in entries:
+            name = entry.name
+            count += 1
+            if count > 50000 or time.monotonic() > deadline:
+                raise RuntimeError('Piper runtime inspection exceeded safety limits')
+            rel = relative + '/' + name if relative else name
+            link_rel = re.sub(r'^\.replacement-[a-f0-9]{24}/', '', rel)
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            protected(info, rel)
+            if stat.S_ISDIR(info.st_mode):
+                child = os.open(name, flags, dir_fd=fd)
+                try:
+                    current = os.fstat(child)
+                    if (current.st_dev,current.st_ino) != (info.st_dev,info.st_ino):
+                        raise RuntimeError('Piper runtime directory changed')
+                    visit(child,rel)
+                finally: os.close(child)
+            elif stat.S_ISREG(info.st_mode):
+                if info.st_nlink != 1:
+                    raise RuntimeError('Piper runtime contains a hard-linked file: ' + rel)
+            elif stat.S_ISLNK(info.st_mode):
+                target = os.readlink(name, dir_fd=fd)
+                if link_rel == 'venv/lib64' and target == 'lib': continue
+                if re.fullmatch(r'venv/bin/python(?:3(?:\.[0-9]+)?)?',link_rel):
+                    if target == 'python3' and link_rel != 'venv/bin/python3': continue
+                    system_python(target)
+                    continue
+                raise RuntimeError('Piper runtime contains an unexpected symbolic link: ' + rel)
+            else: raise RuntimeError('Piper runtime contains an unsupported entry: ' + rel)
 
 fd = os.open('/',flags)
 try:
@@ -582,39 +777,56 @@ import stat
 
 root = os.environ["PIPER_VOICE_PERMISSION_ROOT"]
 flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
-root_fd = os.open(root, flags)
 account = pwd.getpwnam("asterisk")
+if account.pw_uid<=0 or root!="/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices":
+    raise RuntimeError("Unexpected Piper voice repair path or owner")
+root_fd=os.open("/",flags)
+children=[]
 try:
-    os.fchown(root_fd, account.pw_uid, account.pw_gid)
-    os.fchmod(root_fd, 0o755)
-    for name in os.listdir(root_fd):
-        metadata = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            raise RuntimeError(f"unsupported Piper voice entry: {name}")
-        child_fd = os.open(
-            name,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW,
-            dir_fd=root_fd,
-        )
-        try:
-            opened = os.fstat(child_fd)
-            current = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
-            if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
-                    or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
-                    or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)):
-                raise RuntimeError('unsafe Piper voice permission target')
-            os.fchown(child_fd, account.pw_uid, account.pw_gid)
-            os.fchmod(child_fd, 0o644)
-        finally:
-            os.close(child_fd)
+    for part in root.strip("/").split("/"):
+        child=os.open(part,flags,dir_fd=root_fd)
+        os.close(root_fd);root_fd=child
+        info=os.fstat(root_fd)
+        if (info.st_uid not in (0,account.pw_uid) or info.st_mode&0o002
+                or info.st_mode&0o020 and info.st_gid not in (0,account.pw_gid)):
+            raise RuntimeError("Unsafe Piper voice repair ancestor")
+    names=[]
+    with os.scandir(root_fd) as entries:
+        for entry in entries:
+            if len(names)>=128:
+                raise RuntimeError("Piper voice tree exceeds its reviewed file-count bound")
+            names.append(entry.name)
+    for name in names:
+        before=os.stat(name,dir_fd=root_fd,follow_symlinks=False)
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink!=1
+                or before.st_uid not in (0,account.pw_uid) or before.st_size>128*1024*1024):
+            raise RuntimeError("Unsupported Piper voice repair entry")
+        child=os.open(name,os.O_RDONLY|os.O_CLOEXEC|os.O_NONBLOCK|os.O_NOFOLLOW,dir_fd=root_fd)
+        children.append((name,child,before))
+        opened=os.fstat(child)
+        if (opened.st_dev,opened.st_ino,opened.st_nlink)!=(before.st_dev,before.st_ino,1):
+            raise RuntimeError("Piper voice entry changed during repair")
+    for name,child,before in children:
+        current=os.stat(name,dir_fd=root_fd,follow_symlinks=False)
+        opened=os.fstat(child)
+        if ((opened.st_dev,opened.st_ino,opened.st_nlink)!=(current.st_dev,current.st_ino,1)
+                or not stat.S_ISREG(opened.st_mode) or opened.st_uid not in (0,account.pw_uid)
+                or opened.st_size>128*1024*1024):
+            raise RuntimeError("Piper voice entry changed before permission repair")
+        os.fchown(child,account.pw_uid,account.pw_gid)
+        os.fchmod(child,0o644)
+    os.fchown(root_fd,account.pw_uid,account.pw_gid)
+    os.fchmod(root_fd,0o755)
 finally:
+    for unused,child,unused_info in children:os.close(child)
     os.close(root_fd)
 PY
 }
 
 repair_piper_permissions_only() {
-  [ -d "$PIPER_DIR" ] && [ ! -L "$PIPER_DIR" ] && [ -x "$PIPER_BIN" ] || return 1
+  [ -d "$PIPER_DIR" ] && [ ! -L "$PIPER_DIR" ] || return 1
   secure_piper_runtime_tree
+  [ -x "$PIPER_BIN" ] || return 1
   if [ -d "$VOICE_DIR" ]; then
     [ ! -L /var/lib/asterisk/SLS_Mass_Notifications_Plugin ] \
       && [ ! -L /var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper ] \
@@ -627,6 +839,14 @@ repair_piper_permissions_only() {
 
 PIPER_ACTION="all"
 PIPER_WORKERS_PAUSED=0
+[ "${EUID:-$(id -u)}" -eq 0 ] || {
+  printf '%s\n' 'Piper installation must run as root.' >&2
+  exit 1
+}
+open_append_log LOG_FD "$LOG_FILE" || {
+  printf '%s\n' 'Piper installation refused an unsafe log file.' >&2
+  exit 1
+}
 while [ "$#" -gt 0 ]; do
   option="$1"; shift
   case "$option" in
@@ -646,15 +866,10 @@ if [ "$PIPER_ACTION" = repair-permissions-only ]; then
   exit $?
 fi
 
-if [ -L "$PIPER_DIR" ] \
-  || [ -L /var/lib/asterisk/SLS_Mass_Notifications_Plugin ] \
-  || [ -L /var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper ] \
-  || [ -L "$VOICE_DIR" ]; then
-  printf '%s\n' 'Piper installation path must not contain a symbolic-link directory.' >&2
+ensure_piper_install_directories || {
+  printf '%s\n' 'Piper installation directories are missing or unsafe.' >&2
   exit 1
-fi
-mkdir -p "$PIPER_DIR"
-mkdir -p "$VOICE_DIR"
+}
 
 if ! ensure_piper_runtime; then
   printf 'Piper TTS runtime could not be installed. Check %s for details.\n' "$LOG_FILE" >&2
@@ -723,7 +938,7 @@ for file in \
   pt_BR-faber-medium.onnx.json
 do
   target="$VOICE_DIR/$file"
-  if [ -f "$target" ] && printf '%s  %s\n' "${hashes[$file]}" "$target" | sha256sum -c - >/dev/null 2>&1; then
+  if voice_file_is_current "$target" "${hashes[$file]}" "${voice_bytes[$file]}"; then
     continue
   fi
   log "Downloading Piper voice file $file"

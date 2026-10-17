@@ -14,6 +14,11 @@ import threading
 import time
 import unittest
 
+if os.environ.get('SLS_TEST_NAMESPACE') != 'entered' or os.environ.get(
+    'SLS_TEST_PARENT_NET_NS'
+) in (None, '', os.readlink('/proc/self/ns/net')):
+    raise SystemExit('Use the private fixture runner; monitor network isolation verification failed.')
+
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location('monitor', ROOT / 'slsmassnotifyserver/bin/sls_mass_notify/sls_external_monitor.py')
 monitor = importlib.util.module_from_spec(SPEC); SPEC.loader.exec_module(monitor)
@@ -62,9 +67,7 @@ class ExternalMonitorTests(unittest.TestCase):
         with self.assertRaises(OSError): monitor.credential(str(self.root/'linked'))
 
     def test_real_https_authentication_date_cache_and_no_redirect(self):
-        parent = os.environ.get('SLS_TEST_PARENT_NET_NS') or os.environ.get('SLS_BUILD_PARENT_NET')
-        if parent and parent != os.readlink('/proc/self/ns/net'):
-            subprocess.run(['ip','link','set','lo','up'],check=True,timeout=5,stdout=subprocess.DEVNULL)
+        subprocess.run(['ip','link','set','lo','up'],check=True,timeout=5,stdout=subprocess.DEVNULL)
         key=self.root/'key.pem'; cert=self.root/'cert.pem'
         subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-keyout',str(key),'-out',str(cert),
                         '-days','1','-subj','/CN=localhost','-addext','subjectAltName=DNS:localhost'],

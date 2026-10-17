@@ -81,6 +81,7 @@
             const count = Object.values(members).reduce((sum, values) => sum + values.length, 0);
             review.append(node('p', count + ' recipient(s) in the selected types.'));
             const unsupported = [];
+            if ((source.members.browser_recipient_ids || []).length || (source.members.connector_ids || []).length) unsupported.push('browser and connector recipients (select the saved audience, or use the Labs composer)');
             if (paging && source.members.voice_recipient_ids.length) unsupported.push('external voice');
             if (paging && source.members.sms_recipient_ids.length) unsupported.push('SMS');
             if (paging && (source.members.desktop_client_ids.length || source.members.email_recipient_ids.length || source.members.webhook_ids.length)) unsupported.push('desktop, email and webhook destinations');

@@ -24,7 +24,9 @@ $restricted = ControlContract::capabilities($principal);
 $check(!in_array('events', $restricted['resources'], true), 'Restricted discovery offered unrestricted audit history.');
 $check(!in_array('start_incident', array_column($restricted['actions'], 'action'), true), 'Restricted discovery offered incident mutation.');
 $principal['audience']['unrestricted'] = true;
+$check(!in_array('recordings', ControlContract::capabilities($principal)['resources'], true), 'Read-only discovery offered the config-protected recording catalogue.');
 $principal['scopes'][] = 'config';
+$check(in_array('recordings', ControlContract::capabilities($principal)['resources'], true), 'Read-and-config discovery omitted the recording catalogue.');
 $check(in_array('start_incident', array_column(ControlContract::capabilities($principal)['actions'], 'action'), true), 'Named unrestricted incident sender is missing discovery.');
 $principal['id'] = 'legacy';
 $check(!in_array('start_incident', array_column(ControlContract::capabilities($principal)['actions'], 'action'), true), 'Discovery offered incident mutation to a legacy key.');
@@ -36,7 +38,10 @@ $input = ControlContract::announcementInput(['action' => 'send_announcement', 'm
 $check($input['options']['_is_test'] === false, 'Top-level explicit false did not take precedence over an option.');
 foreach ([['options' => ['_test_channels' => ['sms']]], ['options' => ['_is_test' => true]], ['is_test' => 'true'],
     ['preview' => 1], ['webhook_ids' => [false]], ['webhook_ids' => array_fill(0, 11, 'hook')],
-    ['tts_volume' => 0], ['tts_volume' => 201], ['tts_volume' => '100'], ['piper_voice' => []], ['undocumented' => true]] as $invalid) {
+    ['tts_volume' => 0], ['tts_volume' => 201], ['tts_volume' => '100'], ['piper_voice' => []],
+    ['style' => 'bogus'], ['audio_mode' => 'bogus'], ['background_color' => 'red'],
+    ['options' => ['style' => 'bogus']], ['options' => ['audio_mode' => 'bogus']],
+    ['options' => ['background_color' => '#12345g']], ['undocumented' => true]] as $invalid) {
     try { ControlContract::announcementInput(['action' => 'send_announcement', 'message' => 'Fixture'] + $invalid); }
     catch (InvalidArgumentException $expected) { $checks++; continue; }
     throw new RuntimeException('An internal option or malformed announcement field was accepted.');

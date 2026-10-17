@@ -209,7 +209,7 @@ $buttonPosition = strpos($dashboard, 'dashboard-sls-mass-notify-announcement-sub
 $inlineStatusPosition = strpos($dashboard, 'dashboard-sls-mass-notify-announcement-result', $buttonPosition === false ? 0 : $buttonPosition);
 $formSubmitPosition = strpos($dashboard, "form.addEventListener('submit'");
 $progressPosition = strpos($dashboard, "setAnnouncementStatus('info'", $formSubmitPosition === false ? 0 : $formSubmitPosition);
-$fetchPosition = strpos($dashboard, 'fetch(form.action', $progressPosition === false ? 0 : $progressPosition);
+$fetchPosition = strpos($dashboard, 'widgetRequest(form.action', $progressPosition === false ? 0 : $progressPosition);
 if ($buttonPosition === false || $inlineStatusPosition === false || $formSubmitPosition === false
 	|| $progressPosition === false || $fetchPosition === false
 	|| $inlineStatusPosition < $buttonPosition || $progressPosition > $fetchPosition) {

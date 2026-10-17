@@ -8,6 +8,7 @@ function calendar_check($condition, string $message): void { ++$GLOBALS['checks'
 function calendar_reject(callable $call, string $message): void { try { $call(); } catch (DomainException $e) { calendar_check($e->getMessage() !== '', $message); return; } throw new RuntimeException($message); }
 $reflection = new ReflectionClass(\FreePBX\modules\Slsmassnotifyserver::class);
 $module = $reflection->newInstanceWithoutConstructor(); $zone = new DateTimeZone('America/Chicago');
+$reflection->getProperty('extensionNameMapCache')->setValue($module,[]);
 $build = $reflection->getMethod('buildScheduledOccurrences');
 $plan = static function (string $start, array $calendar, array $existing = [], int $minimum = 0) use ($build, $module, $zone): array {
     return $build->invoke($module, 'sched_calendar', [$start], 'calendar', $zone, $existing, $minimum, PHP_INT_MAX, $calendar);
@@ -54,6 +55,21 @@ $schedule=['id'=>'sched_calendar','name'=>'Calendar fixture','message'=>'Full me
     'recurrence'=>$result['recurrence'],'occurrences'=>$result['occurrences'],'targets'=>[], 'delivery'=>['audio_mode'=>'none']];
 $validate=$reflection->getMethod('validateScheduledAnnouncementRecurrences');
 calendar_check(!$validate->invoke($module,[$schedule]), 'Valid protected calendar rejected.');
+$types=$reflection->getMethod('validateConfigValueTypes');
+calendar_check(!$types->invoke($module,['scheduled_announcements'=>[$schedule]]),
+    'The central configuration schema rejects its own calendar snapshot.');
+$badCalendar=$schedule; $badCalendar['recurrence']['calendar']='invalid';
+calendar_check($types->invoke($module,['scheduled_announcements'=>[$badCalendar]]),
+    'A calendar snapshot accepted a non-object calendar.');
+$unexpected=$schedule; $unexpected['recurrence']['mode']='none';
+calendar_check($types->invoke($module,['scheduled_announcements'=>[$unexpected]]),
+    'A non-calendar recurrence accepted calendar-only fields.');
+$importable=['enabled'=>'0','setup'=>[],'ami'=>[],'control_api'=>[],'sipnotify'=>[],
+    'scheduled_announcements'=>[$schedule]];
+calendar_check(!$reflection->getMethod('validateConfigSchema')->invoke($module,$importable),
+    'A valid calendar configuration cannot pass import validation.');
+calendar_check($reflection->getMethod('validateNativeBackupConfig')->invoke($module,json_encode($importable))===$importable,
+    'A valid calendar configuration cannot pass native backup validation.');
 $reordered=$schedule;foreach($reordered['occurrences']as &$row){ksort($row);}unset($row);
 calendar_check(!$validate->invoke($module,[$reordered]), 'JSON key order changed calendar validity.');
 foreach (['id','run_at_utc','local_datetime'] as $field) {

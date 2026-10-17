@@ -1,7 +1,9 @@
 <?php
 declare(strict_types=1);
 namespace SLS\MassNotify;
+require_once __DIR__ . '/security.php';
 
+if (!class_exists(EventLog::class, false)) {
 /** Bounded, newest-first JSONL pages. A cursor refers to one frozen file prefix. */
 final class EventLog
 {
@@ -53,7 +55,8 @@ final class EventLog
             if ($position !== null) { throw new \RuntimeException('event_log_changed'); }
             return ['events'=>[], 'next_cursor'=>null, 'has_more'=>false, 'scan_limited'=>false];
         }
-        if (($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1) {
+        if (($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1
+            || ($before['mode'] & 0137) || !in_array($before['uid'], [0, posix_geteuid()], true)) {
             throw new \RuntimeException('event_log_unsafe');
         }
         // Opening read/write cannot wait indefinitely on a substituted FIFO.
@@ -66,6 +69,7 @@ final class EventLog
             $current = @lstat($path);
             if (!is_array($metadata) || !is_array($current)
                 || ($metadata['mode'] & 0170000) !== 0100000 || $metadata['nlink'] !== 1
+                || ($metadata['mode'] & 0137) || !in_array($metadata['uid'], [0, posix_geteuid()], true)
                 || $metadata['dev'] !== $before['dev'] || $metadata['ino'] !== $before['ino']
                 || $current['dev'] !== $metadata['dev'] || $current['ino'] !== $metadata['ino']) {
                 throw new \RuntimeException('event_log_changed');
@@ -97,7 +101,8 @@ final class EventLog
                 $prior = strrpos(substr($data, $begin, $finish - $begin - 1), "\n");
                 $lineStart = $prior === false ? $begin : $begin + $prior + 1;
                 $line = substr($data, $lineStart, $finish - $lineStart - 1);
-                $decoded = strlen($line) <= 65536 ? json_decode($line, true, 32) : null;
+                try { $decoded = strlen($line) <= 65536 ? ApiSecurity::jsonObject($line) : null; }
+                catch (\Throwable $error) { $decoded = null; }
                 if (is_array($decoded)) { $events[] = $decoded; }
                 $next = $start + $lineStart;
                 $finish = $lineStart;
@@ -115,4 +120,5 @@ final class EventLog
             return ['events'=>$events, 'next_cursor'=>$token, 'has_more'=>$token !== null, 'scan_limited'=>$limited];
         } finally { fclose($handle); }
     }
+}
 }

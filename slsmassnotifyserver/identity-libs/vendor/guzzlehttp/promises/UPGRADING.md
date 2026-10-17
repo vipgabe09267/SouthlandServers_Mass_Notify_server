@@ -159,6 +159,11 @@ Cancelled promises now inspect with a `CancellationException` reason. If you
 need the string reason from a `RejectionException` or subclass, call
 `getReason()` on the exception.
 
+`RejectionException` messages now escape non-ASCII and control bytes, truncate
+rendered reasons after 1024 input bytes, and describe throwing string or JSON
+formatters as unprintable. The original value returned by `getReason()` is not
+changed.
+
 `Utils::inspect()` still reports wait-function failures as rejection reasons
 when the wait function does not settle the promise. If the wait function
 settles the promise and then throws, `inspect()` reports the settled

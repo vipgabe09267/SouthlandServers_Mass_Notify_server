@@ -81,6 +81,8 @@ foreach (['1000', '+123&Local/911@from-internal', '+123,argument', "+123\r\n", '
     $invalid = $config; $invalid['recipients'][0]['number'] = $number;
     voice_assert((bool)$fixture->validate($invalid), 'Unsafe or malformed telephone number accepted');
 }
+$invalidName = $config; $invalidName['recipients'][0]['name'] = "Invalid \xFF name";
+voice_assert((bool)$fixture->validate($invalidName), 'Invalid UTF-8 external recipient name was accepted.');
 foreach (['enabled', 'route_mode', 'trunk_id', 'caller_id', 'piper_voice', 'recipients'] as $field) {
     voice_assert((bool)$fixture->validate(array_replace($config, [$field=>null])), 'Explicit null bypassed config validation for ' . $field);
 }

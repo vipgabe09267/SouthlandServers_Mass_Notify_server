@@ -1,5 +1,14 @@
 # Triggers and actions — Labs
 
+Trigger replay history is durable. `automations/worker-state.json` and its private
+`.automations-required` parent marker must be kept together. Missing established
+history blocks activation; restoring an empty file is not a repair. Valid older
+journals are enrolled before effects without changing their saved events or mutex
+inode. Interrupted first initialization resumes only from its exact empty intent.
+Native backups preserve passive trigger evidence and the loss marker; they do not
+restart archived events. Review retained recovery evidence before recommissioning
+a lost journal.
+
 **Mass Notify → Triggers and Actions** connects an explicitly enrolled source to
 a saved incident template and/or a reviewed device/script action. Configuration,
 enrollment secrets, routing and script approvals live in the central `.config`.
@@ -71,6 +80,12 @@ a real emergency-call test.
 ## CAP feeds
 
 Configure a trusted public HTTPS URL, exact CAP sender and exact event name.
+Select a language tag such as `en`, `en-US` or `es`. Matching source text includes
+the headline, description, instructions and affected areas. SLS does not
+translate it. Complete context is limited to 3,000 characters and rejects
+oversized text rather than truncating it. A reviewed incident template still
+enforces its title, field and 500-character message bounds; long descriptions
+need a suitable reviewed template or source action.
 The parser accepts CAP 1.2 XML or an Atom feed with inline CAP records, at most
 50 alerts and 1 MiB. Linked-only entries require a direct CAP URL. External
 entities, document types, redirects, private destinations, mismatched sender,

@@ -107,6 +107,20 @@ namespace {
 
 	$moduleReflection = new \ReflectionClass(\FreePBX\modules\Slsmassnotifyserver::class);
 	$module = $moduleReflection->newInstanceWithoutConstructor();
+	$pcm = pack('vvVVvv', 1, 1, 8000, 16000, 2, 16);
+	$waveBody = 'WAVEfmt ' . pack('V', 16) . $pcm . 'data' . pack('V', 2) . "\0\0";
+	$validWave = 'RIFF' . pack('V', strlen($waveBody)) . $waveBody;
+	slsInvoke($module, 'validateNativeWaveContents', [$validWave, 'fixture']);
+	foreach ([
+		$validWave . "\0",
+		'RIFF' . pack('V', strlen($waveBody)) . substr($waveBody, 0, 12) . pack('V', 44100) . substr($waveBody, 16),
+		'RIFF' . pack('V', strlen($waveBody) - 1) . $waveBody,
+	] as $invalidWave) {
+		$rejected = false;
+		try { slsInvoke($module, 'validateNativeWaveContents', [$invalidWave, 'fixture']); }
+		catch (\RuntimeException $error) { $rejected = true; }
+		slsAssert($rejected, 'A malformed or incompatible restored WAV was accepted.');
+	}
 
 	$ledgerRaw = json_encode([
 		'version' => 1,
@@ -122,6 +136,25 @@ namespace {
 	$ledger = slsInvoke($module, 'validateNativeScheduleLedger', [$ledgerRaw]);
 	slsAssert(($ledger['occurrences']['occ_past']['state'] ?? '') === 'pending', 'Valid schedule journal was rejected.');
 
+	$ambiguousLedger = '{"version":1,"occurrences":{"completed":{"state":"success"}},"occurrences":{}}';
+	$rejected = false;
+	try { slsInvoke($module, 'validateNativeScheduleLedger', [$ambiguousLedger]); }
+	catch (\Throwable $error) { $rejected = true; }
+	slsAssert($rejected, 'Duplicate schedule fields silently discarded completed delivery history.');
+	$optionalRoot=sys_get_temp_dir().'/sls-optional-backup-'.bin2hex(random_bytes(8)); mkdir($optionalRoot,0700);
+	try {
+		$path=$optionalRoot.'/journal';
+		slsAssert(slsInvoke($module,'readOptionalNativeBackupFile',[$path,4096,'unsafe evidence'])===null,
+			'An absent optional journal was fabricated.');
+		symlink($optionalRoot.'/missing-target',$path); $rejected=false;
+		try { slsInvoke($module,'readOptionalNativeBackupFile',[$path,4096,'unsafe evidence']); }
+		catch (\RuntimeException $error) { $rejected=$error->getMessage()==='unsafe evidence'; }
+		slsAssert($rejected && is_link($path),'A broken journal link was omitted or modified instead of rejected.');
+		unlink($path); file_put_contents($path,$ledgerRaw);
+		slsAssert(slsInvoke($module,'readOptionalNativeBackupFile',[$path,4096,'unsafe evidence'])===$ledgerRaw,
+			'A valid optional journal was lost.');
+	} finally { @unlink($optionalRoot.'/journal'); rmdir($optionalRoot); }
+
 	$settings = [
 		'enabled' => '0',
 		'setup' => ['completed' => '1'],
@@ -134,6 +167,7 @@ namespace {
 			'id' => 'sched_one',
 			'name' => 'Restore safety test',
 			'enabled' => '1',
+			'targets' => ['extensions' => ['1000']],
 			'occurrences' => [
 				['id' => 'occ_past', 'run_at_utc' => '2026-01-01T12:00:00Z'],
 				['id' => 'occ_future', 'run_at_utc' => '2030-01-01T12:00:00Z'],
@@ -235,9 +269,18 @@ namespace {
 	slsAssert(mkdir($restoreFiles, 0700, true), 'Unable to create test restore directory.');
 	$restoreConfig = $restoreFiles . '/protected-config.json';
 	slsAssert(file_put_contents($restoreConfig, $configRaw, LOCK_EX) === strlen($configRaw), 'Unable to create test restore config.');
+	$restoreTone = $restoreFiles . '/tone--fixture.wav';
+	slsAssert(file_put_contents($restoreTone, $validWave, LOCK_EX) === strlen($validWave), 'Unable to create test restore tone.');
 	$payloadManifest = $manifest;
 	$payloadManifest['files']['config']['bytes'] = strlen($configRaw);
 	$payloadManifest['files']['config']['sha256'] = hash('sha256', $configRaw);
+	$payloadManifest['files']['tones'][] = [
+		'type' => 'slsmassnotify-tone',
+		'archive_name' => 'tone--fixture.wav',
+		'restore_name' => 'fixture.wav',
+		'bytes' => strlen($validWave),
+		'sha256' => hash('sha256', $validWave),
+	];
 	$payloadManifest = slsInvoke($module, 'validateNativeBackupManifest', [$payloadManifest]);
 	$restoreFileObject = new class($restoreConfig) {
 		private $path;
@@ -258,12 +301,21 @@ namespace {
 			return $this->path;
 		}
 	};
-	$loadedPayload = slsInvoke($module, 'loadNativeRestorePayload', [$payloadManifest, [$restoreFileObject], $restoreRoot]);
+	$restoreToneObject = new class($restoreTone) {
+		private $path;
+		public function __construct($path) { $this->path = $path; }
+		public function getType() { return 'slsmassnotify-tone'; }
+		public function getFilename() { return 'tone--fixture.wav'; }
+		public function getPathname() { return $this->path; }
+	};
+	$loadedPayload = slsInvoke($module, 'loadNativeRestorePayload', [$payloadManifest, [$restoreFileObject, $restoreToneObject], $restoreRoot]);
 	slsAssert(($loadedPayload['config']['raw'] ?? '') === $configRaw, 'Verified extracted config was not loaded byte-for-byte.');
+	slsAssert(count($loadedPayload['tones'] ?? []) === 1 && ($loadedPayload['tones'][0]['name'] ?? '') === 'fixture',
+		'A complete custom tone larger than its WAV header was rejected during native restore loading.');
 	file_put_contents($restoreConfig, $configRaw . " ", LOCK_EX);
 	$tamperRejected = false;
 	try {
-		slsInvoke($module, 'loadNativeRestorePayload', [$payloadManifest, [$restoreFileObject], $restoreRoot]);
+		slsInvoke($module, 'loadNativeRestorePayload', [$payloadManifest, [$restoreFileObject, $restoreToneObject], $restoreRoot]);
 	} catch (\RuntimeException $e) {
 		$tamperRejected = true;
 	}
@@ -314,6 +366,7 @@ namespace {
 	slsAssert($wrongKeyRejected, 'Wrong native backup recovery key was accepted.');
 	unlink($restoreKey);
 	unlink($restoreConfig);
+	unlink($restoreTone);
 	rmdir($restoreFiles);
 	rmdir(dirname($restoreFiles));
 	rmdir($restoreRoot);

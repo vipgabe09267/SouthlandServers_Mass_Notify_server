@@ -2,7 +2,7 @@
 
 Open **Mass Notify → Locations and Audiences** after completing setup. Create a site, then buildings, floors, and rooms beneath it. Names must be distinct within the same parent and type. Up to 500 locations are supported, within a 512 KiB directory allocation and the central configuration's existing total size limit.
 
-Assign configured phone extensions, desktop clients, and saved external voice, email, or SMS recipients. Each recipient can have one directory assignment. Remove its old assignment before moving it. Disabled or deleted recipients remain visible so an operator can resolve the problem. Desktop assignments use the stable client ID; reusing a username does not move an assignment to the new account.
+Assign configured phone extensions, desktop clients, and saved external voice, email, SMS or webhook recipients. Phones, desktops, voice, email and SMS recipients can have one directory assignment; remove the old assignment before moving one. A saved webhook may be assigned to more than one location, and recipient snapshots deduplicate it before delivery. Disabled or deleted recipients remain visible so an operator can resolve the problem. Desktop assignments use the stable client ID; reusing a username does not move an assignment to the new account.
 
 Save the location. Changes are staged in the protected `.config` workflow; Apply Config activates them. Saving a directory never sends an announcement or enables an external provider.
 
@@ -42,4 +42,4 @@ Configured locations describe administrator-entered assignments, not presence, G
 
 The editor rejects duplicate assignments, invalid parents, unsupported fields, oversized input, stale browser revisions and storage failures. Review the saved state after an interrupted response before repeating a mutation. Deleting a parent requires moving or removing its children first. Existing announcement groups and historical delivery records remain intact when locations are removed.
 
-Validation uses private fixture data: hierarchy and isolation tests, actual announcement/scheduler/incident resolution, group-scoped API checks, HTTP/CSRF and escaping tests, and browser interactions with 1,000 fixture desktops at 1440- and 390-pixel widths. No provider, phone, or desktop notification is needed to configure or validate the directory editor.
+Validation uses fixture data for hierarchy and isolation, actual announcement/scheduler/incident resolution, group-scoped API checks, HTTP/CSRF handling, escaping, and large desktop catalogs. Responsive location-map behavior remains an explicit browser acceptance check before release. No provider, phone, or desktop notification is needed to configure or validate the directory editor.

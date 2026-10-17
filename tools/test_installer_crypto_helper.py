@@ -19,7 +19,7 @@ INSTALLER = Path(os.environ.get("SLS_INSTALLER_UNDER_TEST", ROOT / "tools/instal
 SOURCE = INSTALLER.read_text(encoding="utf-8")
 CANONICAL = ROOT / "slsmassnotifyserver/api/sls-mass-notify/config-crypto.php"
 RUNTIME_PATH = "/usr/local/bin/sls_mass_notify/sls_config_crypto.php"
-UNPRIVILEGED = ("local_web_probe", "verify_desktop_sse_handshake", "verify_media_access",
+UNPRIVILEGED = ("local_web_probe", "verify_desktop_transport", "verify_media_access",
                 "verify_control_api_authentication", "verify_fresh_install_defaults")
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location("sls_installer_crypto_fixture", ROOT / "slsmassnotifyserver/bin/sls_mass_notify/sls_config_crypto.py")

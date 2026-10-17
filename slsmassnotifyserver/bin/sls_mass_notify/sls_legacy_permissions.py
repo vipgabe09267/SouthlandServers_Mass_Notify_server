@@ -26,8 +26,10 @@ sys.dont_write_bytecode = True
 MAX_STATE = 16 * 1024 * 1024
 CONFIG_NAMES = ('mass-notifications.config', 'mass-notifications.pending.config')
 CONFIG_LOCK = 'mass-notifications.config.lock'
+PHONE_HISTORY_MARKER_NAME = '.phone-admission-required'
+PHONE_HISTORY_MARKER = b'SLS_PHONE_ADMISSION_V1\n'
 NAMES = ('enterprise-worker.lock', 'announcement-activity.lock', 'mass-notifications.config.lock',
-         'phone-admission.lock', 'phone-admission.json', *CONFIG_NAMES)
+         'phone-admission.lock', PHONE_HISTORY_MARKER_NAME, 'phone-admission.json', *CONFIG_NAMES)
 CONFIG_KEYRING = Path('/etc/sls-mass-notify/config-keys.json')
 DATA = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin'
 MAX_CHOWN = 512 * 1024
@@ -92,8 +94,13 @@ def decoded(raw):
         return output
     def constant(_):
         raise ValueError('nonfinite number')
+    def finite_float(value):
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError('nonfinite number')
+        return number
     try:
-        return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+        return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant, parse_float=finite_float)
     except (ValueError, UnicodeError, RecursionError):
         raise PermissionRecoveryError('Legacy permission recovery JSON is malformed') from None
 
@@ -152,12 +159,12 @@ def checked_phone_state(raw):
         for recipient, row in batch['targets'].items():
             if (not re.fullmatch(r'(?:[0-9]{1,20}|voice_[a-f0-9]{24})', recipient) or not isinstance(row, dict)
                     or not isinstance(row.get('dials'), list) or len(row['dials']) > 1000
-                    or any(not isinstance(dial, str) or len(dial) > 4096 or re.search(r'[\x00-\x20\x7f]', dial) for dial in row['dials'])):
+                    or any(not valid_utf8_text(dial, 4096, forbid_space=True) for dial in row['dials'])):
                 raise PermissionRecoveryError('Legacy phone admission target record is malformed')
         for uid, row in batch['channels'].items():
             if (not re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', uid) or not isinstance(row, dict)
                     or row.get('kind') not in {'origin', 'contact'} or row.get('recipient') not in batch['targets']
-                    or not isinstance(row.get('channel'), str) or len(row['channel']) > 4096):
+                    or not valid_utf8_text(row.get('channel'), 4096)):
                 raise PermissionRecoveryError('Legacy phone admission channel record is malformed')
 
 
@@ -166,6 +173,18 @@ def finite_nonnegative(value):
         return type(value) in (int, float) and math.isfinite(value) and value >= 0
     except OverflowError:
         return False
+
+
+def valid_utf8_text(value, maximum, *, forbid_space=False):
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        encoded = value.encode('utf-8')
+    except UnicodeError:
+        return False
+    if len(encoded) > maximum:
+        return False
+    return not forbid_space or re.search(r'[\x00-\x20\x7f]', value) is None
 
 
 def checked_configuration(raw):
@@ -287,6 +306,12 @@ def repair(data, approval, *, timeout=120):
                         if time.monotonic() >= deadline:
                             raise PermissionRecoveryError('Legacy SLS lock is active; stop the verified worker before repair: ' + name) from None
                         time.sleep(.05)
+            elif name == PHONE_HISTORY_MARKER_NAME:
+                if not any(entry[0] == 'phone-admission.lock' for entry in files):
+                    raise PermissionRecoveryError('Existing phone history marker is missing its permanent lock; preserve it for reviewed recovery')
+                marker = read(fd, len(PHONE_HISTORY_MARKER))
+                if not PHONE_HISTORY_MARKER.startswith(marker):
+                    raise PermissionRecoveryError('Legacy phone history marker is malformed')
             elif name == 'phone-admission.json':
                 if not any(entry[0] == 'phone-admission.lock' for entry in files):
                     raise PermissionRecoveryError('Existing phone admission journal is missing its permanent lock; preserve it for reviewed recovery')

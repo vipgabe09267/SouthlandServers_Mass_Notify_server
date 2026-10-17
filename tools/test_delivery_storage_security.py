@@ -55,8 +55,8 @@ with tempfile.TemporaryDirectory() as temporary, mock.patch.object(storage.os, '
         storage.main()
     assert (audio / 'announcement_tts_leased.wav').exists() and not (audio / 'announcement_tts_orphan.wav').exists()
     audit = root / 'audit.jsonl'; audit.write_text('{bad\n' + json.dumps({'created_at': '2026-09-04T00:00:00+00:00'}) + '\n')
-    storage.prune_audit(audit, now=1788480000)
-    assert '{bad' not in audit.read_text()
+    result = storage.prune_audit(audit, now=1788480000)
+    assert '{bad' in audit.read_text() and result['preserved_invalid'] == 1
 
 with tempfile.TemporaryDirectory() as temporary:
     root = Path(temporary)

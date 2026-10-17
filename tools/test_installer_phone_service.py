@@ -110,8 +110,8 @@ esac
         self.assertLess(service.index('systemctl stop'), service.index('inspect_uninstall_idle'))
         self.assertLess(service.index('inspect_uninstall_idle'), service.index('systemctl disable'))
         self.assertLess(service.index('systemctl disable'), service.index('rm -- "$unit"'))
-        self.assertIn('/usr/bin/timeout --kill-after=2 20 systemctl stop', service)
-        self.assertIn('/usr/bin/timeout --kill-after=2 20 systemctl disable', service)
+        self.assertIn('/usr/bin/timeout --kill-after=2 20 /usr/bin/systemctl stop', service)
+        self.assertIn('/usr/bin/timeout --kill-after=2 20 /usr/bin/systemctl disable', service)
 
     def previous_collector(self, mode='modern', enabled='enabled', active='active', overrides=False, healthy=True):
         approval={'source':'fresh-install','files':{}} if mode=='fresh' else {

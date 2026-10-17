@@ -1,20 +1,23 @@
 <?php
 // Project destination names and IDs only; webhook URLs and credentials stay out of this selector.
-$webhookSelectorField = (string)($webhook_selector_field ?? '');
-if (!in_array($webhookSelectorField, ['group_webhook_ids', 'schedule_webhook_ids'], true)) { throw new DomainException('Unknown Webhook recipient form.'); }
+if (!is_string($webhook_selector_field ?? null)
+    || !in_array($webhook_selector_field, ['group_webhook_ids', 'schedule_webhook_ids'], true)) { throw new DomainException('Unknown Webhook recipient form.'); }
+$webhookSelectorField = $webhook_selector_field;
 $webhookSelectorId = 'sls-' . str_replace('_', '-', $webhookSelectorField);
 $webhookSelectorRows = array_values(array_filter((array)($announcementWebhooks ?? []), 'is_array'));
 $webhookSelectorEscape = static function ($value) { return htmlspecialchars((string)$value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); };
 ?>
 <style>
-.sls-webhook-selector { border:1px solid #dfe5ec; border-radius:7px; margin-bottom:12px; background:#fff; }
+.sls-webhook-selector { --selector-surface:var(--sls-raised,#fff);--selector-line:var(--sls-border,#dfe5ec);--selector-muted:var(--sls-muted,#475569);--selector-warning:var(--sls-warning,#92400e);border:1px solid var(--selector-line); border-radius:7px; margin-bottom:12px; background:var(--selector-surface); }
 .sls-webhook-selector>summary { display:flex; gap:8px; align-items:center; cursor:pointer; padding:10px 12px; font-weight:600; }
 .sls-webhook-selector .sls-webhook-selector-body { padding:0 12px 12px; }
-.sls-webhook-selector .sls-webhook-selected { margin-left:auto; color:#475569; font-size:12px; font-weight:400; }
+.sls-webhook-selector .sls-webhook-selected { margin-left:auto; color:var(--selector-muted); font-size:12px; font-weight:400; }
 .sls-webhook-selector .sls-webhook-selector-list { max-height:220px; overflow:auto; margin-top:9px; }
 .sls-webhook-selector .checkbox { margin:7px 0; overflow-wrap:anywhere; }
-.sls-webhook-selector .sls-webhook-unavailable { color:#92400e; }
+.sls-webhook-selector .sls-webhook-unavailable { color:var(--selector-warning); }
 .sls-webhook-selector .help-block { font-size:12px; margin-bottom:0; }
+@media(prefers-color-scheme:dark){.sls-webhook-selector{--selector-surface:var(--sls-raised,#111b2b);--selector-line:var(--sls-border,#40506a);--selector-muted:var(--sls-muted,#b5c2d4);--selector-warning:var(--sls-warning,#fbbf24)}}
+[data-theme=dark] .sls-webhook-selector,body.dark .sls-webhook-selector{--selector-surface:var(--sls-raised,#111b2b);--selector-line:var(--sls-border,#40506a);--selector-muted:var(--sls-muted,#b5c2d4);--selector-warning:var(--sls-warning,#fbbf24)}
 </style>
 <details class="sls-destination-panel sls-webhook-selector" id="<?php echo $webhookSelectorEscape($webhookSelectorId); ?>">
     <summary><i class="fa fa-link" aria-hidden="true"></i><span><?php echo _('Webhook'); ?></span><span class="sls-webhook-selected" data-webhook-selected aria-live="polite"></span><i class="fa fa-chevron-down" aria-hidden="true"></i></summary>

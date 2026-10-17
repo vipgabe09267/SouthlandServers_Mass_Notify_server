@@ -68,6 +68,7 @@ class HealthSnapshots(unittest.TestCase):
         (self.base/'sls_config_crypto.py').write_bytes((RUNTIME/'sls_config_crypto.py').read_bytes())
         (self.base/'sls_cluster_guard.py').write_bytes((RUNTIME/'sls_cluster_guard.py').read_bytes())
         (self.base/'sls_mail_admission.py').write_bytes((RUNTIME/'sls_mail_admission.py').read_bytes())
+        (self.base/'sls_atomic_json.py').write_bytes((RUNTIME/'sls_atomic_json.py').read_bytes())
         env=dict(os.environ);env.pop('PYTHONDONTWRITEBYTECODE',None)
         result=subprocess.run(['/usr/bin/python3','-I',str(entry)],env=env,capture_output=True,text=True,timeout=3)
         self.assertEqual(result.returncode,37,result.stderr)
@@ -308,7 +309,7 @@ class HealthEmailPolicy(unittest.TestCase):
 
     def test_preserved_status_cannot_grow_state_above_existing_bound(self):
         self.state.write_text(json.dumps({"version": 1, "active": {"lightning_" + str(i): "a" * 64
-                              for i in range(MODULE.MAX_ACTIVE_FAULTS + 1)}}))
+                              for i in range(MODULE.MAX_ACTIVE_FAULTS + 1)}, "attempts": {}, "history": {}}))
         before = self.state.read_bytes()
         with self.assertRaisesRegex(RuntimeError, "exceeds its limit"):
             self.process({}, preserve_status_faults=True)

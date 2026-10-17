@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'if [[ $- == *e* ]]; then printf "Installer config-safety assertion failed at line %s.\n" "$LINENO" >&2; fi' ERR
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${ROOT_DIR}/tools/install_release.sh"
@@ -142,7 +143,8 @@ grep -Fq 'Slsmassnotifyserver->installUnprivilegedPhase()' "$maintenance_script"
 piper_installer="${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_install_piper_voices.sh"
 grep -Fq -- '--repair-permissions-only' "$piper_installer"
 grep -Fq 'if [ "$PIPER_ARTIFACTS_CHANGED" -eq 1 ]' "$piper_installer"
-grep -Fq "[ -L /var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper ]" "$piper_installer"
+grep -Fq 'ensure_piper_install_directories' "$piper_installer"
+grep -Fq "flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW" "$piper_installer"
 grep -Fq 'dir_fd=bin_fd, follow_symlinks=False' "$piper_installer"
 grep -Fq 'os.open(component, directory_flags, dir_fd=parent_fd)' "$piper_installer"
 if grep -Eq 'chown root:root "\$compatibility"|chmod 0755 "\$compatibility"' "$piper_installer"; then
@@ -170,12 +172,23 @@ if grep -Fq 'python3 --version >> "$LOG_FILE"' "$piper_installer"; then
   printf 'No-op Piper verification still appends Python version noise.\n' >&2
   exit 1
 fi
+updater="${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_update.sh"
+grep -Fq 'open_append_log LOG_FD "$LOG_FILE"' "$updater"
+grep -Fq 'open_append_log LOG_FD "$LOG_FILE"' "$piper_installer"
+if grep -Eq '(>{1,2}|2>{1,2})[[:space:]]*"?\$LOG_FILE' "$updater" "$piper_installer"; then
+  printf 'A privileged runtime script still opens the shared log by pathname.\n' >&2
+  exit 1
+fi
+if grep -Eq '/usr/bin/python3[[:space:]]+-([[:space:]]|$)|(^|[[:space:]])python3[[:space:]]+-' "$updater"; then
+  printf 'The root updater still invokes a non-isolated Python stdin program.\n' >&2
+  exit 1
+fi
 grep -Fq "getattr(os, 'O_NOFOLLOW', 0)" "${ROOT_DIR}/slsmassnotifyserver/Slsmassnotifyserver.class.php"
 if grep -Fq "'/bin/chown -R root:root ' . escapeshellarg(self::RUNTIME_DIR)" "${ROOT_DIR}/slsmassnotifyserver/Slsmassnotifyserver.class.php"; then
   printf 'Module executable-runtime repair reverted to recursive pathname ownership changes.\n' >&2
   exit 1
 fi
-grep -Fq 'getattr(os, "O_NOFOLLOW", 0)' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_maintenance.sh"
+grep -Fq 'os.O_NOFOLLOW' "${ROOT_DIR}/slsmassnotifyserver/bin/sls_mass_notify_maintenance.sh"
 declare -f repair_runtime_permissions | grep -Fq 'protected_install_phase prepare --apply'
 declare -f ensure_local_signer | grep -Fq 'protected_install_phase admit'
 declare -f runtime_install_postconditions_available | grep -Fq '"sls_mass_notify_announcement_worker.php",'
@@ -184,7 +197,7 @@ grep -Fq "'sls_weather_queue.py'," "${ROOT_DIR}/slsmassnotifyserver/Slsmassnotif
 grep -Fq 'if temporary and bin_fd >= 0:' "$piper_installer"
 grep -Fq 'mktemp /usr/local/bin/.sls-piper.XXXXXX' "$piper_installer"
 grep -Fq 'close_inherited_maintenance_lock' "${ROOT_DIR}/slsmassnotifyserver/bin/sign_sls_mass_notify_local_sig.sh"
-grep -Fq 'run_without_maintenance_lock /usr/sbin/runuser -u asterisk -- /usr/bin/timeout 300 /usr/bin/php' "$maintenance_script"
+grep -Fq '/usr/bin/timeout --signal=TERM --kill-after=10 300 /usr/bin/php' "$maintenance_script"
 grep -Fq 'run_without_install_maintenance_lock /usr/bin/timeout --signal=TERM 360' "${ROOT_DIR}/tools/install_release.sh"
 if grep -Fq 'chown -R root:root /usr/local/bin/sls_mass_notify' "${ROOT_DIR}/tools/install_release.sh" \
   || grep -Fq 'chown -R root:root "$RUNTIME_DIR"' "$maintenance_script"; then

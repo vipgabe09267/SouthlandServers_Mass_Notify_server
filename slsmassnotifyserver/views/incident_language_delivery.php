@@ -8,7 +8,7 @@
         if ($count) { $counts[]=str_replace('_',' ',$channel).': '.$count; }
     }
     echo $e(implode(' · ',$counts));
-?></td><td><?php echo $e(str_replace('_',' ',$batch['state'])); ?><?php if (!empty($batch['error'])): ?><p class="sls-inc-muted"><?php echo $e($batch['error']); ?></p><?php endif; ?></td><td><?php echo $e($batch['job_id'] ?: ($batch['review_id'] ?? '—')); ?></td></tr>
+    ?></td><td><?php echo $e(str_replace('_',' ',$batch['state'])); ?><?php if (!empty($batch['error'])): ?><p class="sls-inc-muted"><?php echo $e($batch['error']); ?></p><?php endif; ?></td><td><?php echo $e(($batch['job_id'] ?? '') ?: ($batch['review_id'] ?? '—')); ?></td></tr>
 <?php if (isset($batch['delivery_result'])): ?>
 <tr><td colspan="4"><table><thead><tr><th>Channel</th><th>Destination</th><th>Result</th><th>Evidence</th></tr></thead><tbody>
 <?php foreach ($batch['delivery_result']['receipts'] ?? [] as $receipt): ?><tr><td><?php echo $e($receipt['channel'] ?? ''); ?></td><td><?php echo $e($receipt['target'] ?? ''); ?></td><td><?php echo $e($receipt['state'] ?? 'unknown'); ?></td><td><?php echo $e($receipt['detail'] ?? ''); ?></td></tr><?php endforeach; ?>

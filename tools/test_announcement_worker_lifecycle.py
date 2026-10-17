@@ -39,18 +39,25 @@ class WorkerLifecycleTests(unittest.TestCase):
         self.assertEqual(replaced, 1, "Fixture must replace the production DATA path")
         self.helper = self.folder / "sls_announcement_jobs.php"
         self.helper.write_text(helper)
+        (self.folder / 'sls_atomic_json.php').write_bytes(helper_path.with_name('sls_atomic_json.php').read_bytes())
         worker = worker_path.read_text()
         self.assertIn("require '/etc/freepbx.conf';", worker)
         worker = worker.replace("require '/etc/freepbx.conf';", "require " + self.php_string(str(self.bootstrap)) + ";")
         self.assertNotIn("/etc/freepbx.conf", worker)
-        # Keep the isolated fixture files owned by this test's account. Production
-        # privilege dropping is not exercised, and no runtime override is added.
-        drop_condition = "if (function_exists('posix_geteuid') && posix_geteuid() === 0) {"
-        self.assertEqual(worker.count(drop_condition), 1)
-        worker = worker.replace(drop_condition, "if (false) {", 1)
+        # Keep isolated fixture files owned by this test's account. Production
+        # account enforcement is asserted from source, then its single call is
+        # removed from this private copy; no runtime override is added.
+        self.assertIn("if($uid!==$account['uid'])", worker)
+        guard_call = 'slsAnnouncementRequireRuntimeAccount($arguments);'
+        self.assertEqual(worker.count(guard_call), 1)
+        worker = worker.replace(guard_call, '// Isolated fixture account boundary.', 1)
         self.worker = self.folder / "sls_mass_notify_announcement_worker.php"
         self.worker.write_text(worker)
         self.bootstrap.write_text("<?php\n")
+        self.authority = self.folder / "sls_mass_notify_cluster_effect.php"
+        self.authority.write_text(
+            '<?php if(stream_get_contents(STDIN)!==\'{"action":"authority"}\'){exit(2);} echo \'{"ok":true,"enabled":false,"claim":null}\';'
+        )
 
     @staticmethod
     def php_string(value):
@@ -74,10 +81,10 @@ class WorkerLifecycleTests(unittest.TestCase):
     def read(self, job_id=JOB_ID):
         return json.loads((self.data / (job_id + ".json")).read_text())
 
-    def run_worker(self, *arguments):
+    def run_worker(self, *arguments, env=None):
         return subprocess.run(
             ["php", "-d", "display_errors=0", str(self.worker), *arguments],
-            cwd=self.folder, capture_output=True, text=True, timeout=8, check=False,
+            cwd=self.folder, capture_output=True, text=True, timeout=8, check=False, env=env,
         )
 
     def module(self, action="complete", module_action="normal"):
@@ -115,6 +122,9 @@ class FixtureAnnouncementModule {
             "exit_zero": "fwrite(STDERR, " + self.php_string(SECRET) + "); exit(0);",
             "exit_nonzero": "fwrite(STDERR, " + self.php_string(SECRET) + "); exit(9);",
             "return_false": "return false;", "return_true_without_finish": "return true;",
+            "cancel": "$job['state']='cancelled';$job['failure_category']='weather_source_cancelled';"
+                      "$job['finished_at']=gmdate('c');$job['message']='Source cancelled fixture.';"
+                      "$store->write($job);SlsAnnouncementJobStore::unlock($lock);return true;",
             "hang": "while (true) { usleep(10000); }",
         }
         self.bootstrap.write_text(source.replace("MODULE_ACTION", module_actions[module_action]).replace("PROCESS_ACTION", actions[action]))
@@ -203,6 +213,25 @@ class FixtureAnnouncementModule {
         self.assertEqual(job["receipts"][0]["state"], "submitted_to_asterisk")
         self.assertFalse((self.data / ("pending_" + JOB_ID + ".mark")).exists())
 
+    def test_supervised_child_does_not_inherit_caller_secrets(self):
+        self.seed(); self.module()
+        source = self.bootstrap.read_text()
+        self.bootstrap.write_text(source.replace('<?php\n',
+            '<?php\nif(getenv("SLS_PARENT_SECRET")!==false){throw new RuntimeException("ambient environment leaked");}\n', 1))
+        environment = {**os.environ, 'SLS_PARENT_SECRET': SECRET}
+        result = self.run_worker('--supervise', JOB_ID, env=environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.read()['state'], 'complete')
+
+    def test_source_cancellation_is_terminal_without_worker_fault(self):
+        self.seed(); self.module("cancel")
+        result = self.run_worker("--supervise", JOB_ID)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        job = self.read()
+        self.assertEqual(job["state"], "cancelled")
+        self.assertEqual(job["failure_category"], "weather_source_cancelled")
+        self.assertFalse((self.data / ("pending_" + JOB_ID + ".mark")).exists())
+
     def test_standby_authority_denial_preserves_queue_and_reconciliation(self):
         self.seed("worker_starting", age=1200); self.module()
         authority = self.folder / "sls_mass_notify_cluster_effect.php"
@@ -212,10 +241,23 @@ class FixtureAnnouncementModule {
             self.assertNotEqual(self.run_worker(*arguments).returncode, 0)
             self.assertEqual((self.data / (JOB_ID + ".json")).read_bytes(), original)
 
+    def test_missing_authority_helper_preserves_queue_before_bootstrap(self):
+        self.seed("worker_starting", age=1200)
+        self.authority.unlink()
+        self.bootstrap.write_text('<?php file_put_contents(__DIR__."/bootstrap-ran","unexpected");exit(9);')
+        original = (self.data / (JOB_ID + ".json")).read_bytes()
+        for arguments in ((JOB_ID,), ("--supervise", JOB_ID), ("--reconcile",)):
+            with self.subTest(arguments=arguments):
+                result = self.run_worker(*arguments)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('cluster_authority_unavailable', result.stderr)
+                self.assertEqual((self.data / (JOB_ID + ".json")).read_bytes(), original)
+                self.assertFalse((self.folder / 'bootstrap-ran').exists())
+
     def test_supervisor_lost_authority_preserves_pending_child_result(self):
         self.seed(); self.module("return_true_without_finish")
         authority = self.folder / "sls_mass_notify_cluster_effect.php"
-        authority.write_text('<?php $n=(int)@file_get_contents(__DIR__."/authority-count");file_put_contents(__DIR__."/authority-count",$n+1);if($n<2){echo \'{"ok":true}\';exit(0);}echo \'{"ok":false}\';exit(1);')
+        authority.write_text('<?php $n=(int)@file_get_contents(__DIR__."/authority-count");file_put_contents(__DIR__."/authority-count",$n+1);if($n<2){echo \'{"ok":true,"enabled":false,"claim":null}\';exit(0);}echo \'{"ok":false}\';exit(1);')
         self.assertNotEqual(self.run_worker("--supervise", JOB_ID).returncode, 0)
         self.assertEqual(self.read()["state"], "running")
         self.assertNotIn("failure_category", self.read())
@@ -319,6 +361,7 @@ class FixtureAnnouncementModule {
         # Model deployment: runtime worker and packaged module contain separate
         # paths to the same helper class. require_once alone cannot deduplicate it.
         packaged_helper.write_text(self.helper.read_text())
+        (packaged_helper.parent / 'sls_atomic_json.php').write_bytes((self.folder / 'sls_atomic_json.php').read_bytes())
         (packaged_helper.parent / 'sls_runtime_state.php').write_bytes((CANDIDATE / 'bin/sls_mass_notify/sls_runtime_state.php').read_bytes())
         packaged_trait = packaged / "AnnouncementDelivery.php"
         packaged_trait.write_text((CANDIDATE / "AnnouncementDelivery.php").read_text())

@@ -59,6 +59,38 @@ class VoicemailRuntimeTests(unittest.TestCase):
     def snapshot(self, duration=3):
         return vm.snapshot_audio(self.token, 'SLS_Mass_Notifications_Plugin/tts/fixture', duration, self.root)
 
+    def test_ambiguous_lease_is_preserved_and_rejected(self):
+        self.snapshot()
+        path = self.media.path / (self.token + '.json')
+        original = path.read_text()
+        variants = [original.replace('"schema":1', '"schema":false,"schema":1', 1),
+                    original.replace('"schema":1', '"schema":true', 1)]
+        for raw in variants:
+            with self.subTest(raw=raw):
+                path.write_text(raw)
+                before = path.stat()
+                with self.assertRaises(vm.PhoneAdmissionError):
+                    self.media.validate(self.token)
+                self.assertEqual(path.read_text(), raw)
+                self.assertEqual(path.stat().st_ino, before.st_ino)
+
+    def test_missing_marked_phone_history_preserves_expired_voicemail_evidence(self):
+        self.snapshot()
+        lease = self.media.path / (self.token + '.json')
+        value = json.loads(lease.read_text())
+        value['expires_at'] = time.time() - 1
+        lease.write_text(json.dumps(value))
+        store = vm.PhoneAdmissionStore(self.root)
+        with store.locked():
+            pass
+        (self.root / 'phone-admission.json').unlink()
+        before = {path: (path.read_bytes(), path.stat().st_ino)
+                  for path in (lease, self.media.path / (self.token + '.wav'), self.root / '.phone-admission-required')}
+        with self.assertRaises(vm.PhoneAdmissionError):
+            vm.cleanup_media(self.root)
+        for path, evidence in before.items():
+            self.assertEqual((path.read_bytes(), path.stat().st_ino), evidence)
+
     def policy(self, body):
         directory = self.root / 'etc'; directory.mkdir(exist_ok=True)
         path = directory / 'voicemail.conf'; path.write_text(body); path.chmod(0o644)

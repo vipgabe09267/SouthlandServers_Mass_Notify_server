@@ -4,6 +4,7 @@ import importlib.metadata
 import importlib.util
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -17,13 +18,45 @@ DEPENDENCIES = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(DEPENDENCIES)
 PINS = DEPENDENCIES.load_pins(REQUIREMENTS)
 VOICE_INSTALLER = (ROOT / 'slsmassnotifyserver/bin/sls_mass_notify_install_piper_voices.sh').read_text()
-ENSURE_RUNTIME = 'reset_managed_piper_venv() {' + VOICE_INSTALLER.split('reset_managed_piper_venv() {', 1)[1].split('\ninstall_piper_wrapper() {', 1)[0]
-RESET_RUNTIME = ENSURE_RUNTIME.split('\npiper_venv_usable() {', 1)[0]
+MODULE_SOURCE = (ROOT / 'slsmassnotifyserver/Slsmassnotifyserver.class.php').read_text()
+ENSURE_RUNTIME = 'piper_venv_usable() {' + VOICE_INSTALLER.split('piper_venv_usable() {', 1)[1].split('\ninstall_piper_wrapper() {', 1)[0]
 VALIDATE_RUNTIME = 'validate_piper_runtime_tree() {' + VOICE_INSTALLER.split('validate_piper_runtime_tree() {', 1)[1].split('\nsecure_piper_runtime_tree() {', 1)[0]
 ENSURE_RUNTIME = VALIDATE_RUNTIME + '\n' + ENSURE_RUNTIME
+SECURE_RUNTIME = 'secure_piper_runtime_tree() {' + VOICE_INSTALLER.split('secure_piper_runtime_tree() {', 1)[1].split('\nsecure_piper_voice_tree() {', 1)[0]
+REPAIR_PERMISSIONS = 'repair_piper_permissions_only() {' + VOICE_INSTALLER.split('repair_piper_permissions_only() {', 1)[1].split('\nPIPER_ACTION=', 1)[0]
 
 
 class PiperDependencyTests(unittest.TestCase):
+    def test_wrapper_admission_uses_exact_historical_hashes(self):
+        block = VOICE_INSTALLER.split('install_piper_wrapper() {', 1)[1].split('\nensure_piper_install_directories() {', 1)[0]
+        self.assertNotIn("grep -Eq 'sls_mass_notify/piper|SLS_Mass_Notifications_Plugin/piper'", block)
+        self.assertIn('wrapper_permissions & 07022', block)
+        self.assertIn('97792a8e4ca9f3f48be0be0c24202921008807da030ac85438b58034f21130e4', block)
+        self.assertIn('4c6c0dfe69c1b59b8650c0c5a9d38adf5a9c6cbe311c283a929a7fc5580015c0', block)
+
+    @unittest.skipUnless(os.geteuid() == 0, 'Permission repair requires a root-owned fixture')
+    def test_permission_repair_restores_a_missing_executable_bit(self):
+        with tempfile.TemporaryDirectory(prefix='sls-piper-mode-',dir='/root') as directory:
+            root=Path(directory);binary=root/'venv/bin/piper';binary.parent.mkdir(parents=True)
+            binary.write_text('#!/bin/sh\nexit 0\n');binary.chmod(0o644)
+            script=(VALIDATE_RUNTIME+'\n'+SECURE_RUNTIME+'\n'+REPAIR_PERMISSIONS+r'''
+PIPER_DIR="$1"
+PIPER_BIN="$1/venv/bin/piper"
+VOICE_DIR="$1/missing-voices"
+install_piper_wrapper() { :; }
+install_piper_compatibility_path() { :; }
+repair_piper_permissions_only
+''')
+            result=subprocess.run(['/bin/bash','-c',script,'fixture',str(root)],capture_output=True,text=True,timeout=5)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(binary.stat().st_mode&0o777,0o755)
+
+    def test_post_restore_verifies_every_supported_voice_artifact(self):
+        names = set(re.findall(r'\["([^"\n]+\.onnx(?:\.json)?)"\]', VOICE_INSTALLER))
+        block = MODULE_SOURCE.split('$hashes = [', 1)[1].split('];', 1)[0]
+        self.assertTrue(names)
+        self.assertEqual([name for name in sorted(names) if repr(name) not in block], [])
+
     def test_exact_versions_and_equivalent_release_spelling(self):
         installed = dict(PINS)
         installed['pip'] = PINS['pip'] + '.0'
@@ -137,6 +170,7 @@ PIPER_DEPENDENCY_CHECK="$2"
 PIPER_REQUIREMENTS="$3"
 PIPER_ARTIFACTS_CHANGED=0
 LOG_FILE="$1/log"
+exec {LOG_FD}>>"$LOG_FILE"
 log() { printf '%s\n' "$*" >>"$LOG_FILE"; }
 ensure_piper_runtime
 '''
@@ -155,7 +189,7 @@ ensure_piper_runtime
     def test_untrusted_venv_descendants_are_rejected_before_interpreter_execution(self):
         import pwd
         account = pwd.getpwnam('asterisk')
-        for kind in ('foreign-owner','writable','hardlink','fifo','external-link'):
+        for kind in ('foreign-owner','writable','writable-root','hardlink','fifo','external-link'):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory(prefix='sls-piper-admission-',dir='/root') as directory:
                 base=Path(directory); (base/'venv/bin').mkdir(parents=True)
                 interpreter=base/'venv/bin/python'
@@ -165,6 +199,7 @@ ensure_piper_runtime
                 victim=base/'outside'; victim.write_text('preserved'); victim.chmod(0o600)
                 if kind=='foreign-owner': os.chown(entry,account.pw_uid,account.pw_gid)
                 elif kind=='writable': entry.chmod(0o666)
+                elif kind=='writable-root': base.chmod(0o777)
                 elif kind=='hardlink': entry.unlink(); os.link(victim,entry)
                 elif kind=='fifo': entry.unlink(); os.mkfifo(entry)
                 else: interpreter.unlink(); interpreter.symlink_to(victim)
@@ -222,62 +257,6 @@ ensure_piper_runtime
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue(rebuilt)
                 self.assertEqual(len(installs), 2)
-
-    @unittest.skipUnless(os.geteuid() == 0, 'Managed runtime repair requires root ownership')
-    def test_reset_rejects_unsafe_paths_before_removing_files(self):
-        for mode in ('wrong-path', 'parent-link', 'venv-link', 'hard-link', 'writable', 'foreign-owner', 'fifo'):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory(prefix='sls-piper-reset-', dir='/root') as name:
-                fixture = Path(name)
-                root = fixture / 'runtime'
-                venv = root / 'venv'
-                venv.mkdir(parents=True)
-                sentinel = fixture / 'sentinel'
-                sentinel.write_text('preserve')
-                marker = venv / 'old-runtime-marker'
-                marker.write_text('preserve old tree on refusal')
-                target = root
-                if mode == 'parent-link':
-                    (fixture / 'alias').symlink_to(root, target_is_directory=True)
-                    target = fixture / 'alias'
-                elif mode == 'venv-link':
-                    venv.rename(fixture / 'outside-venv')
-                    venv.symlink_to(fixture / 'outside-venv', target_is_directory=True)
-                elif mode == 'hard-link':
-                    os.link(sentinel, venv / 'linked-file')
-                elif mode == 'writable':
-                    marker.chmod(0o666)
-                elif mode == 'foreign-owner':
-                    os.chown(marker, 65534, 65534)
-                elif mode == 'fifo':
-                    os.mkfifo(venv / 'pipe')
-                source = RESET_RUNTIME
-                if mode != 'wrong-path':
-                    source = source.replace('"/usr/local/bin/sls_mass_notify/piper"', repr(str(target)))
-                result = subprocess.run(['bash', '-c', source + '\nPIPER_DIR="$1"\nreset_managed_piper_venv', '_', str(target)],
-                                        capture_output=True, text=True, timeout=15)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(sentinel.read_text(), 'preserve')
-                self.assertEqual(marker.read_text(), 'preserve old tree on refusal')
-
-    @unittest.skipUnless(os.geteuid() == 0, 'Managed runtime repair requires root ownership')
-    def test_reset_unlinks_standard_venv_links_without_following_them(self):
-        with tempfile.TemporaryDirectory(prefix='sls-piper-reset-', dir='/root') as name:
-            fixture = Path(name)
-            venv = fixture / 'venv'
-            (venv / 'bin').mkdir(parents=True)
-            (venv / 'lib').mkdir()
-            sentinel = fixture / 'sentinel'
-            sentinel.write_text('preserve')
-            (venv / 'lib64').symlink_to('lib', target_is_directory=True)
-            (venv / 'bin/python').symlink_to('/usr/bin/python3')
-            (venv / 'outside-link').symlink_to(sentinel)
-            source = RESET_RUNTIME.replace('"/usr/local/bin/sls_mass_notify/piper"', repr(str(fixture)))
-            result = subprocess.run(['bash', '-c', source + '\nPIPER_DIR="$1"\nreset_managed_piper_venv', '_', str(fixture)],
-                                    capture_output=True, text=True, timeout=15)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertFalse(venv.exists())
-            self.assertEqual(sentinel.read_text(), 'preserve')
-
 
 if __name__ == '__main__':
     unittest.main()

@@ -179,4 +179,35 @@ ob_start(); include dirname(__DIR__) . '/slsmassnotifyserver/views/help.php'; $h
 foreach ([$main, $detail, $help] as $view) {
     log_check(strpos($view, '&lt;script&gt;fixture notice&lt;/script&gt;') !== false && strpos($view, '<script>fixture notice</script>') === false, 'A log view omitted or failed to escape read notices');
 }
-echo "UI log bounds passed: order/filter/detail/retention, 16 MiB I/O, 256 KiB records, 2 MiB responses, locks, unsafe paths, and escaped notices.\n";
+$methodSource = file($reflection->getFileName());
+$logReaderMethod = $reflection->getMethod('readUiLogLines');
+$logReaderSource = implode('', array_slice(
+	$methodSource,
+	$logReaderMethod->getStartLine() - 1,
+	$logReaderMethod->getEndLine() - $logReaderMethod->getStartLine() + 1
+));
+log_check(strpos($logReaderSource, "\$position = (int)\$opened['size'];") !== false
+	&& strpos($logReaderSource, "(int)fstat(\$handle)['size']") === false,
+	'Log reader discarded validated descriptor metadata and performed an unchecked second stat');
+$racedFixture = '<?php namespace RacedLog; function fopen($path, $mode) {'
+    . ' if (isset($GLOBALS["swap"])) { unset($GLOBALS["swap"]); unlink($path); posix_mkfifo($path,0600); }'
+    . ' return \\fopen($path,$mode); } class Reader { private $uiLogNotices=[];';
+foreach (['UI_LOG_SCAN_BYTES', 'UI_LOG_LINE_BYTES', 'UI_LOG_SCAN_LINES'] as $name) {
+    $racedFixture .= 'const '.$name.' = '.(int)$reflection->getConstant($name).';';
+}
+foreach (['readUiLogLines', 'noteUiLogRead', 'getUiLogNotices'] as $name) {
+    $method=$reflection->getMethod($name);
+    $racedFixture .= implode('',array_slice($methodSource,$method->getStartLine()-1,$method->getEndLine()-$method->getStartLine()+1));
+}
+$racedFixture .= 'public function read($path) { return [iterator_to_array($this->readUiLogLines($path,"events"),false),$this->getUiLogNotices("events")]; }}'
+    . ' $GLOBALS["swap"]=true; echo json_encode((new Reader)->read($argv[1]));';
+$child=$root.'/raced-reader.php';file_put_contents($child,$racedFixture);
+file_put_contents($eventPath,"{\"event_id\":\"before-replacement\"}\n");
+$process=proc_open(['/usr/bin/timeout','--kill-after=1','2',PHP_BINARY,$child,$eventPath],
+    [0=>['file','/dev/null','r'],1=>['pipe','w'],2=>['pipe','w']],$pipes);
+log_check(is_resource($process),'Private raced-log process did not start');
+$output=stream_get_contents($pipes[1]);$error=stream_get_contents($pipes[2]);fclose($pipes[1]);fclose($pipes[2]);
+log_check(proc_close($process)===0&&$error==='', 'A FIFO substituted after lstat blocked the log reader');
+$rejected=json_decode($output,true);
+log_check($rejected[0]===[]&&count($rejected[1])===1,'A substituted FIFO was not rejected with a notice');
+echo "UI log bounds passed: order/filter/detail/retention, 16 MiB I/O, 256 KiB records, 2 MiB responses, locks, unsafe and raced paths, and escaped notices.\n";

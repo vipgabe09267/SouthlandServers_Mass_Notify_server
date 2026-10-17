@@ -1,7 +1,9 @@
 <?php
+require_once __DIR__.'/AdminResponse.php';
 
 $slsmassnotifyserver = \FreePBX::create()->Slsmassnotifyserver;
 $slsmassnotifyserver->enforceOperatorPageAccess('slsmassnotifyserver');
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') { \SLS\MassNotify\AdminResponse::requireClearBuffers(); }
 $view = isset($_REQUEST['view']) ? $_REQUEST['view'] : 'main';
 $saveResult = null;
 $setupResult = $_SESSION['slsmassnotifyserver_setup_result'] ?? null;
@@ -9,9 +11,7 @@ unset($_SESSION['slsmassnotifyserver_setup_result']);
 
 function slsmassnotifyserver_json_response(array $payload, $status = 200)
 {
-	while (ob_get_level() > 0) {
-		@ob_end_clean();
-	}
+	\SLS\MassNotify\AdminResponse::requireClearBuffers();
 	http_response_code((int)$status);
 	header('Content-Type: application/json');
 	header('Cache-Control: no-store');
@@ -74,7 +74,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action
 	} catch (\Throwable $error) {
 		slsmassnotifyserver_json_response(['success' => false, 'message' => _('The diagnostic report could not be generated. No configuration was exported.')], 503);
 	}
-	while (ob_get_level() > 0) { @ob_end_clean(); }
+	\SLS\MassNotify\AdminResponse::requireClearBuffers();
 	header('Content-Type: application/json; charset=utf-8');
 	header('Content-Disposition: attachment; filename="sls-diagnostics-' . gmdate('Ymd\\THis\\Z') . '.json"');
 	header('Cache-Control: private, no-store');

@@ -10,6 +10,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / 'slsmassnotifyserver/bin/sls_mass_notify_maintenance.sh').read_text()
 REPAIR = SOURCE[SOURCE.index('repair_ok=1\n'):]
+PRIVILEGED_HELPER = '/usr/local/bin/sls_mass_notify/sls_privileged_install.py'
 
 class ProtectedMaintenance(unittest.TestCase):
     def run_repair(self, failure=''):
@@ -19,6 +20,7 @@ class ProtectedMaintenance(unittest.TestCase):
             for module in ('slsmassnotifyserver','dashboard','framework'): (modules/module).mkdir(parents=True)
             script='''set -euo pipefail
 LOG_FILE="$1/log"
+exec {LOG_FD}>>"$LOG_FILE"
 PRIVILEGED_HELPER=/usr/local/bin/sls_mass_notify/sls_privileged_install.py
 SIGNER=/usr/local/sbin/sign_sls_mass_notify_local_sig.sh
 run_without_maintenance_lock() {
@@ -31,7 +33,10 @@ if failure and any(failure == item or failure in item for item in args): raise S
 if '/usr/sbin/fwconsole' in args:
     # Execute the real env prefix with an inert child in place of fwconsole.
     # This proves the flag reaches the child, without invoking a PBX command.
-    command=args[4:]
+    boundary=args.index('/usr/sbin/runuser')
+    # Keep the real credential scrub; replace only the account transition
+    # with an inert child because the fixture must not run PBX commands.
+    command=args[:boundary]+args[boundary+4:]
     index=command.index('/usr/sbin/fwconsole')
     command[index:]=[sys.executable, '-c', "import os; print('RELOAD_PENDING=' + os.environ.get('SLS_MASS_NOTIFY_PRESERVE_PENDING', 'missing'))"]
     subprocess.run(command, check=True)
@@ -84,14 +89,45 @@ fail_maintenance() { log "$*"; exit "$3"; }
         self.assertIn('RELOAD_PENDING=1',log)
         reload_calls=[args for args in calls if '/usr/sbin/fwconsole' in args]
         self.assertEqual(len(reload_calls),1)
-        self.assertEqual(reload_calls[0][4:],['/usr/bin/env','SLS_MASS_NOTIFY_PRESERVE_PENDING=1','/usr/sbin/fwconsole','reload'])
+        scrub=['/usr/bin/env','-u','GITHUB_TOKEN','-u','GH_TOKEN','-u','SLS_MASS_NOTIFY_GITHUB_TOKEN']
+        transition=['/usr/sbin/runuser','-u','asterisk','--']
+        bounded=['/usr/bin/timeout','--signal=TERM','--kill-after=10','600']
+        self.assertEqual(reload_calls[0],scrub+transition+bounded+['/usr/bin/env','SLS_MASS_NOTIFY_PRESERVE_PENDING=1','/usr/sbin/fwconsole','reload'])
         for args in calls:
             if '/usr/bin/php' in args or '/usr/sbin/fwconsole' in args:
-                self.assertEqual(args[:4],['/usr/sbin/runuser','-u','asterisk','--'])
-        root_ops=[args for args in calls if args[0]=='/usr/bin/python3']
-        self.assertEqual([args[3] for args in root_ops],['prepare','dependencies','activate','verify'])
+                self.assertEqual(args[:11],scrub+transition)
+        root_ops=[args for args in calls if '/usr/bin/python3' in args and PRIVILEGED_HELPER in args]
+        self.assertEqual([args[args.index(PRIVILEGED_HELPER)+1] for args in root_ops],
+                         ['prepare','dependencies','activate','verify'])
         self.assertFalse(any('chown' in args for args in calls))
         self.assertTrue(any('finalizeVerifiedUnprivilegedRestore' in arg for args in calls for arg in args))
+
+    def test_guard_release_closes_original_coprocess_writer(self):
+        definitions=SOURCE[:SOURCE.index('[ "${EUID:-$(id -u)}" -eq 0 ] || exit 1')]
+        self.assertIn('read -r -t 125 status', definitions)
+        with tempfile.TemporaryDirectory(prefix='sls-guard-release-') as name:
+            base=Path(name);runtime=base/'runtime';runtime.mkdir()
+            sentinel=base/'released'
+            (runtime/'sls_install_guard.py').write_text('''import os,sys
+print("ready",flush=True)
+message=sys.stdin.readline()
+with open(os.environ["GUARD_SENTINEL"],"w",encoding="utf-8") as output: output.write(message)
+''')
+            (runtime/'sls_install_idle.py').write_text('print("{}")\n')
+            script=definitions.replace('/run/sls-maintenance-idle.XXXXXXXX',str(base/'idle.XXXXXXXX'))+'''\n
+RUNTIME_DIR="$1/runtime"
+CONFIG_FILE="$1/mass-notifications.config"
+LOG_FILE="$1/log"
+mutation_config_fingerprint() { printf '{}'; }
+acquire_mutation_coordination
+MUTATION_VERIFIED=1
+release_mutation_coordination
+test "$(cat "$GUARD_SENTINEL")" = release
+'''
+            result=subprocess.run(['/bin/bash','-c',script,'_',str(base)],
+                                  env={**os.environ,'GUARD_SENTINEL':str(sentinel)},
+                                  capture_output=True,text=True,timeout=5)
+            self.assertEqual(result.returncode,0,result.stderr)
     def test_every_required_stage_failure_preserves_failure_and_stops_following_stages(self):
         for stage in ('prepare','dependencies','installUnprivilegedPhase','/usr/sbin/fwconsole','activate','sign_sls_mass_notify_local_sig.sh','verify','verifyUnprivilegedIntegration'):
             with self.subTest(stage=stage):

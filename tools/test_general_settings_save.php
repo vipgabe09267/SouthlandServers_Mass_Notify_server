@@ -24,20 +24,22 @@ class GeneralReflectionFixture extends \FreePBX\modules\Slsmassnotifyserver {
 $reflection=new ReflectionClass(\FreePBX\modules\Slsmassnotifyserver::class);
 $module=(new ReflectionClass(GeneralReflectionFixture::class))->newInstanceWithoutConstructor();
 $invoke=static function($name,...$args)use($reflection,$module){$method=$reflection->getMethod($name);$method->setAccessible(true);return $method->invoke($module,...$args);};
+$invokeArgs=static function($name,array &$args)use($reflection,$module){$method=$reflection->getMethod($name);$method->setAccessible(true);return $method->invokeArgs($module,$args);};
 $method=$reflection->getMethod('saveOtherSettings');$lines=file($method->getFileName());
 $body=implode('',array_slice($lines,$method->getStartLine()-1,$method->getEndLine()-$method->getStartLine()+1));
 $constants='';foreach($reflection->getConstants() as $name=>$value){$constants.='const '.$name.'='.var_export($value,true).';';}
 eval('namespace FreePBX\\modules; class GeneralSaveFixture {
- public $settings; public $pending=null; public $call; public $writes=0;
+ public $settings; public $pending=null; public $call; public $callArgs; public $writes=0;
  private function getActiveSettings(){return $this->settings;}
  private function getPendingSettings(){return $this->pending;}
  private function isSetupComplete($settings){return true;}
  private function persistPendingSettings($settings){$this->pending=$settings;++$this->writes;}
  public function getAvailableTones(){return [];}
  public function getAvailablePiperVoices(){return [];}
+ private function resolvePiperVoiceInput(array $input,string $field,$current,string $fallback,array $known,array $ready,array &$errors,string $label):string{$args=[$input,$field,$current,$fallback,$known,$ready,&$errors,$label];return ($this->callArgs)("resolvePiperVoiceInput",$args);}
  public function __call($name,$args){return ($this->call)($name,...$args);}
  '.$constants.$body.'}');
-$fixture=new \FreePBX\modules\GeneralSaveFixture();$fixture->call=$invoke;
+$fixture=new \FreePBX\modules\GeneralSaveFixture();$fixture->call=$invoke;$fixture->callArgs=$invokeArgs;
 $settings=$invoke('getDefaultSettings');$settings['desktop_clients']=[];
 $settings['public_pbx_host']='old.example.test';$settings['sipnotify']['pbx_host']='old.example.test';
 $settings['sipnotify']['base_url']='https://old.example.test:8443/api/sipnotify';

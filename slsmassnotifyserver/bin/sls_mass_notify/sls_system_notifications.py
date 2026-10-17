@@ -12,7 +12,6 @@ import os
 import pwd
 import re
 import stat
-import tempfile
 import time
 import sys
 from datetime import datetime, timezone
@@ -32,6 +31,9 @@ _email_module = importlib.util.module_from_spec(_email_spec)
 _email_spec.loader.exec_module(_email_module)
 send_branded_email = _email_module.send_branded_email
 valid_recipient = _email_module.valid_recipient
+_atomic_spec = importlib.util.spec_from_file_location('sls_system_atomic_json', Path(__file__).with_name('sls_atomic_json.py'))
+_atomic_module = importlib.util.module_from_spec(_atomic_spec)
+_atomic_spec.loader.exec_module(_atomic_module)
 
 
 DATA_DIR = Path("/var/lib/asterisk/SLS_Mass_Notifications_Plugin")
@@ -52,21 +54,39 @@ RETENTION_SECONDS = 90 * 86400
 MAX_XWEATHER_GROUP_FAULTS = 5
 MAX_ACTIVE_FAULTS = 24
 MAX_HISTORY_RECORDS = 512
+STATE_REQUIRED_MARKER = b"SLS_SYSTEM_NOTIFICATIONS_V1\n"
 
 
 def _read_json(path: Path, *, required: bool = False, tolerate_corrupt: bool = False):
     if Path(path) == CONFIG_FILE:
         return _config_crypto.read_config(path)
+    path = Path(path)
+    if not path.is_absolute() or ".." in path.parts:
+        if tolerate_corrupt:
+            return None
+        raise RuntimeError("JSON path is unsafe")
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    parent = os.open("/", directory_flags)
+    descriptor = -1
     try:
-        descriptor = os.open(path, flags)
-    except FileNotFoundError:
-        if required:
-            raise RuntimeError(f"required JSON file is missing: {path.name}")
-        return None if tolerate_corrupt else {}
-    try:
+        try:
+            for component in path.parts[1:-1]:
+                child = os.open(component, directory_flags, dir_fd=parent)
+                os.close(parent)
+                parent = child
+            descriptor = os.open(path.name, flags, dir_fd=parent)
+        except FileNotFoundError:
+            if required:
+                raise RuntimeError(f"required JSON file is missing: {path.name}")
+            return None if tolerate_corrupt else {}
         metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > MAX_JSON_BYTES:
+        account = pwd.getpwnam("asterisk")
+        current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > MAX_JSON_BYTES
+                or metadata.st_uid not in (0, os.geteuid(), account.pw_uid) or metadata.st_mode & 0o022
+                or (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_nlink)
+                != (current.st_dev, current.st_ino, current.st_mode, current.st_nlink)):
             if tolerate_corrupt:
                 return None
             raise RuntimeError(f"unsafe JSON file: {path.name}")
@@ -87,23 +107,33 @@ def _read_json(path: Path, *, required: bool = False, tolerate_corrupt: bool = F
                 if tolerate_corrupt:
                     return None
                 raise RuntimeError(f"JSON file is corrupt: {path.name}") from exc
-        if len(raw) > MAX_JSON_BYTES:
-            if tolerate_corrupt:
-                return None
-            raise RuntimeError(f"JSON file exceeds its size limit: {path.name}")
+            if len(raw) > MAX_JSON_BYTES:
+                if tolerate_corrupt:
+                    return None
+                raise RuntimeError(f"JSON file exceeds its size limit: {path.name}")
+            after = os.fstat(handle.fileno())
+            named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            identity_fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+            if (any(getattr(metadata, key) != getattr(after, key) for key in identity_fields)
+                    or any(getattr(after, key) != getattr(named, key) for key in identity_fields)):
+                if tolerate_corrupt:
+                    return None
+                raise RuntimeError(f"JSON file changed during inspection: {path.name}")
         if not raw.strip():
             if tolerate_corrupt:
                 return None
             raise RuntimeError(f"JSON file is empty: {path.name}")
         try:
-            decoded = json.loads(raw)
-        except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+            decoded = json.loads(raw, object_pairs_hook=_config_crypto._pairs,
+                parse_constant=_config_crypto._invalid_constant, parse_float=_config_crypto._finite_float)
+        except (UnicodeError, ValueError, RecursionError) as exc:
             if tolerate_corrupt:
                 return None
             raise RuntimeError(f"JSON file is corrupt: {path.name}") from exc
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+        os.close(parent)
     if not isinstance(decoded, dict):
         if tolerate_corrupt:
             return None
@@ -128,8 +158,11 @@ def _read_health_snapshot(path: Path) -> tuple[dict | None, str]:
         descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
         metadata = os.fstat(descriptor)
         current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        account = pwd.getpwnam("asterisk")
         if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
                 or metadata.st_size > MAX_HEALTH_BYTES
+                or metadata.st_uid not in (0, os.geteuid(), account.pw_uid)
+                or metadata.st_mode & 0o022
                 or (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_nlink)
                 != (current.st_dev, current.st_ino, current.st_mode, current.st_nlink)):
             return None, "unsafe"
@@ -137,9 +170,16 @@ def _read_health_snapshot(path: Path) -> tuple[dict | None, str]:
         with os.fdopen(descriptor, "rb") as handle:
             descriptor = -1
             raw = handle.read(MAX_HEALTH_BYTES + 1)
-        if len(raw) > MAX_HEALTH_BYTES:
-            return None, "oversized"
-        data = json.loads(raw)
+            if len(raw) > MAX_HEALTH_BYTES:
+                return None, "oversized"
+            after = os.fstat(handle.fileno())
+            named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+            if (any(getattr(metadata, key) != getattr(after, key) for key in fields)
+                    or any(getattr(after, key) != getattr(named, key) for key in fields)):
+                return None, "changed"
+        data = json.loads(raw, object_pairs_hook=_config_crypto._pairs,
+            parse_constant=_config_crypto._invalid_constant, parse_float=_config_crypto._finite_float)
         return (data, "") if isinstance(data, dict) else (None, "invalid")
     except FileNotFoundError:
         return None, "missing"
@@ -207,12 +247,14 @@ def collect_health_faults(worker: dict | None, storage: dict | None, *,
         storage_issues.append("Storage and delivery-queue health is stale. Check scheduled maintenance before relying on its counts.")
     else:
         counters = ("free_bytes", "queue_errors", "expired_external", "failed_weather", "uncertain_weather",
-                    "expired_weather", "weather_deadline_misses", "audit_failed_records",
+                    "expired_weather", "weather_deadline_misses", "audit_failed_records", "security_audit_failed_records",
                     "recent_expired_external", "recent_failed_weather", "recent_uncertain_weather",
                     "recent_expired_weather", "recent_weather_deadline_misses")
         if any(type(storage.get(key, 0)) is not int or storage.get(key, 0) < 0 for key in counters):
             storage_issues.append("Storage health contains invalid counters. Check the maintenance log and regenerate diagnostics.")
-        elif any(type(storage.get(key, False)) is not bool for key in ("queue_scan_incomplete", "audit_at_capacity", "audit_fault_active", "audit_forwarding_active", "media_scan_incomplete", "media_over_budget", "media_near_budget", "free_below_media_reserve")):
+        elif any(type(storage.get(key, False)) is not bool for key in ("queue_scan_incomplete", "audit_at_capacity", "audit_fault_active", "audit_forwarding_active",
+                                                                        "security_audit_at_capacity", "security_audit_fault_active", "security_audit_forwarding_active",
+                                                                        "media_scan_incomplete", "media_over_budget", "media_near_budget", "free_below_media_reserve")):
             storage_issues.append("Storage health contains invalid status flags. Check the maintenance log and regenerate diagnostics.")
         else:
             if "free_bytes" not in storage:
@@ -225,10 +267,12 @@ def collect_health_faults(worker: dict | None, storage: dict | None, *,
                 storage_issues.append("External deliveries expired without acceptance. Review delivery results and current recipient authorization.")
             if any(storage.get("recent_" + key, storage.get(key)) for key in ("failed_weather", "uncertain_weather", "expired_weather", "weather_deadline_misses")):
                 storage_issues.append("Weather or Lightning deliveries failed, expired or have an uncertain outcome. Review delivery evidence; do not blindly replay them.")
-            if storage.get("audit_at_capacity") or storage.get("audit_fault_active", bool(storage.get("audit_failed_records") or storage.get("audit_failure_code"))):
-                storage_issues.append("Control API audit storage reached capacity or could not confirm records. Review audit fault and recovery evidence; do not resend accepted actions to repair history.")
-            if storage.get("audit_forwarding_active"):
-                storage_issues.append("Control API audit forwarding cannot confirm local system-logger acceptance. Check /dev/log and logger health, then verify the separate collector. Do not replay accepted API actions.")
+            if (storage.get("audit_at_capacity") or storage.get("security_audit_at_capacity")
+                    or storage.get("audit_fault_active", bool(storage.get("audit_failed_records") or storage.get("audit_failure_code")))
+                    or storage.get("security_audit_fault_active", bool(storage.get("security_audit_failed_records") or storage.get("security_audit_failure_code")))):
+                storage_issues.append("API or operator security audit storage reached capacity or could not confirm records. Review audit fault and recovery evidence; do not resend accepted actions to repair history.")
+            if storage.get("audit_forwarding_active") or storage.get("security_audit_forwarding_active"):
+                storage_issues.append("Audit forwarding cannot confirm local system-logger acceptance. Check /dev/log and logger health, then verify the separate collector. Do not replay accepted actions.")
             if storage.get("media_scan_incomplete"):
                 storage_issues.append("Generated-media storage could not be fully inspected. Check the storage maintenance log; cleanup preserves files when inspection fails.")
             if storage.get("media_over_budget"):
@@ -302,25 +346,35 @@ def project_status(status: dict, config: dict, now: int) -> dict:
     def recent(value):
         return epoch(value) > 0 and epoch(value) >= now - 900
     nws = config.get('enabled') == '1'
-    lightning_config = config.get('xweather') or {}
+    lightning_config = config.get('xweather')
+    lightning_config = lightning_config if isinstance(lightning_config, dict) else {}
     lightning = lightning_config.get('enabled') not in (None, False, 0, '', '0')
-    nws_ids = {row.get('id') for row in config.get('nws_zones', []) if isinstance(row, dict)}
-    lightning_ids = {row.get('id') for row in lightning_config.get('groups', [])
-                     if isinstance(row, dict) and row.get('enabled') == '1'}
-    source = str(status.get('last_fault_source', '')).lower()
-    group_id = str(status.get('last_fault_group_id', ''))
-    stage = str(status.get('last_fault_stage', '')).lower()
+    nws_rows = config.get('nws_zones')
+    nws_rows = nws_rows if isinstance(nws_rows, list) else []
+    lightning_rows = lightning_config.get('groups')
+    lightning_rows = lightning_rows if isinstance(lightning_rows, list) else []
+    nws_ids = {row.get('id') for row in nws_rows
+               if isinstance(row, dict) and isinstance(row.get('id'), str)}
+    lightning_ids = {row.get('id') for row in lightning_rows
+                     if isinstance(row, dict) and isinstance(row.get('id'), str)
+                     and row.get('enabled') == '1'}
+    text = lambda value: value if isinstance(value, str) else ''
+    source = text(status.get('last_fault_source', '')).lower()
+    group_id = text(status.get('last_fault_group_id', ''))
+    stage = text(status.get('last_fault_stage', '')).lower()
     at = epoch(status.get('last_fault_at'))
     applicable = source not in {'test', 'manual_test', 'dry_run'}
     group = status
     if source in {'nws', 'weather', 'weather.gov'}:
         applicable = nws and (not group_id or group_id in nws_ids)
         if group_id:
-            group = (status.get('nws_groups') or {}).get(group_id, {})
+            groups = status.get('nws_groups')
+            group = (groups if isinstance(groups, dict) else {}).get(group_id, {})
     elif source in {'xweather', 'lightning'}:
         applicable = lightning and (not group_id or group_id in lightning_ids)
         if group_id:
-            group = (status.get('xweather_groups') or {}).get(group_id, {})
+            groups = status.get('xweather_groups')
+            group = (groups if isinstance(groups, dict) else {}).get(group_id, {})
     group = group if isinstance(group, dict) else {}
     recovered = (stage == 'api' and group.get('last_poll_status') == 'ok'
                  and epoch(group.get('last_poll_ok_at')) > at)
@@ -330,8 +384,8 @@ def project_status(status: dict, config: dict, now: int) -> dict:
     ongoing = stage in {'api', 'external', 'dependencies', 'piper_voice_download'}
     if not applicable or recovered or (not ongoing and not recent(status.get('last_fault_at'))):
         status['last_fault_at'] = ''
-    delivery_source = str(status.get('last_delivery_source', '')).lower()
-    delivery_group = str(status.get('last_delivery_group_id', ''))
+    delivery_source = text(status.get('last_delivery_source', '')).lower()
+    delivery_group = text(status.get('last_delivery_group_id', ''))
     if (not recent(status.get('last_delivery_at')) or
             (delivery_source in {'nws', 'weather', 'weather.gov'} and
              (not nws or (delivery_group and delivery_group not in nws_ids)))):
@@ -416,9 +470,9 @@ def collect_faults(status: dict, install_failure: dict, update_progress: dict, m
     for group_id, group in sorted(xweather_groups.items(), key=lambda item: str(item[0])):
         if not isinstance(group, dict):
             continue
-        safe_id = re.sub(r"[^A-Za-z0-9_-]", "", str(group_id))[:64]
-        if not safe_id:
-            continue
+        if not isinstance(group_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", group_id) is None:
+            raise RuntimeError("Lightning fault status contains an invalid stable group ID")
+        safe_id = group_id
         area_name = _text(group.get("group_name") or safe_id, 64)
         for fault_kind, status_key, message_key, time_key in (
             ("poll", "last_xweather_poll_status", "last_xweather_poll_message", "last_xweather_poll_at"),
@@ -462,99 +516,150 @@ def collect_faults(status: dict, install_failure: dict, update_progress: dict, m
 
 
 def _write_state(path: Path, state: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".system-email-state.", dir=path.parent)
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(state, handle, sort_keys=True, separators=(",", ":"))
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary, 0o640)
+    """Commit the notification fence through a validated, held directory."""
+    raw = (json.dumps(state, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+    if len(raw) > MAX_JSON_BYTES:
+        raise RuntimeError("system notification state exceeds its storage limit")
+    account = pwd.getpwnam("asterisk")
+    with _config_crypto._parent(path) as (parent, name):
+        original_parent = os.fstat(parent)
+        if (original_parent.st_uid not in (0, account.pw_uid)
+                or original_parent.st_gid not in (0, account.pw_gid)
+                or original_parent.st_mode & 0o022):
+            raise RuntimeError("system notification state directory is unsafe")
         try:
-            account = pwd.getpwnam("asterisk")
-            os.chown(temporary, account.pw_uid, account.pw_gid)
-        except (KeyError, PermissionError):
-            pass
-        if path.is_symlink():
-            raise RuntimeError("system notification state path is a symbolic link")
-        os.replace(temporary, path)
-        directory_descriptor = os.open(
-            path.parent,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
-        )
+            previous = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            previous = None
+        if previous is not None and (not stat.S_ISREG(previous.st_mode) or previous.st_nlink != 1
+                or previous.st_uid not in (0, account.pw_uid) or previous.st_gid not in (0, account.pw_gid)
+                or stat.S_IMODE(previous.st_mode) not in (0o600, 0o640, 0o644)
+                or previous.st_size > MAX_JSON_BYTES):
+            raise RuntimeError("system notification state destination is unsafe")
+        temporary = ".system-email-state." + os.urandom(16).hex()
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                             0o640, dir_fd=parent)
         try:
-            os.fsync(directory_descriptor)
+            if os.geteuid() == 0:
+                os.fchown(descriptor, account.pw_uid, account.pw_gid)
+            os.fchmod(descriptor, 0o640)
+            with os.fdopen(os.dup(descriptor), "wb") as handle:
+                if handle.write(raw) != len(raw):
+                    raise OSError("Incomplete system notification state write")
+                handle.flush()
+                os.fsync(handle.fileno())
+            with _config_crypto._parent(path) as (named_parent, _):
+                current_parent = os.fstat(named_parent)
+                if (original_parent.st_dev, original_parent.st_ino) != (current_parent.st_dev, current_parent.st_ino):
+                    raise RuntimeError("system notification state directory changed")
+            try:
+                current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                current = None
+            fields = ("st_dev", "st_ino", "st_uid", "st_gid", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+            if ((previous is None) != (current is None)
+                    or previous is not None and any(getattr(previous, key) != getattr(current, key) for key in fields)):
+                raise RuntimeError("system notification state changed before commit")
+            opened = os.fstat(descriptor)
+            named = os.stat(temporary, dir_fd=parent, follow_symlinks=False)
+            if (opened.st_dev, opened.st_ino, opened.st_nlink) != (named.st_dev, named.st_ino, 1):
+                raise RuntimeError("system notification staging file changed")
+            os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+            temporary = None
+            os.fsync(parent)
         finally:
-            os.close(directory_descriptor)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+            os.close(descriptor)
+            if temporary is not None:
+                try:
+                    os.unlink(temporary, dir_fd=parent)
+                    os.fsync(parent)
+                except FileNotFoundError:
+                    pass
 
 
 def _mark_weather_fault_email_sent(path: Path, fault: dict, sent_at: str) -> None:
-    flags = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except FileNotFoundError:
+    if not path.exists() and not path.is_symlink():
         return
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_JSON_BYTES:
-            raise RuntimeError("unsafe Weather status file")
-        with os.fdopen(descriptor, "r+", encoding="utf-8") as handle:
-            descriptor = -1
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                status = json.load(handle)
-            except (TypeError, ValueError):
-                status = {}
-            if not isinstance(status, dict):
-                raise RuntimeError("Weather status file is not an object")
-            if _text(status.get("last_fault_stage"), 80) != _text(fault.get("stage"), 80):
-                return
-            occurred_at = _text(fault.get("occurred_at"), 80)
-            if occurred_at and _text(status.get("last_fault_at"), 80) != occurred_at:
-                return
-            status["fault_email_sent_at"] = sent_at
-            group_id = _text(fault.get("group_id"), 64)
-            groups = status.get("nws_groups") if isinstance(status.get("nws_groups"), dict) else {}
-            group = groups.get(group_id) if group_id else None
-            if isinstance(group, dict):
-                stage_key = re.sub(r"[^a-z0-9_-]", "", _text(fault.get("stage"), 48).lower())
-                group_faults = group.get("faults") if isinstance(group.get("faults"), dict) else {}
-                group_fault = group_faults.get(stage_key)
-                if isinstance(group_fault, dict):
-                    group_fault["email_sent_at"] = sent_at
-                    group_faults[stage_key] = group_fault
-                    group["faults"] = group_faults
-                if _text(group.get("last_fault_stage"), 48).lower() == stage_key:
-                    group["fault_email_sent_at"] = sent_at
-                groups[group_id] = group
-                status["nws_groups"] = groups
-            handle.seek(0)
-            handle.truncate(0)
-            json.dump(status, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-            os.fchmod(handle.fileno(), 0o640)
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+    with _atomic_module.locked_json(path, maximum=MAX_JSON_BYTES, runtime_owner=True) as status:
+        if _text(status.get("last_fault_stage"), 80) != _text(fault.get("stage"), 80):
+            return
+        occurred_at = _text(fault.get("occurred_at"), 80)
+        if occurred_at and _text(status.get("last_fault_at"), 80) != occurred_at:
+            return
+        status["fault_email_sent_at"] = sent_at
+        group_id = _text(fault.get("group_id"), 64)
+        groups = status.get("nws_groups") if isinstance(status.get("nws_groups"), dict) else {}
+        group = groups.get(group_id) if group_id else None
+        if isinstance(group, dict):
+            stage_key = re.sub(r"[^a-z0-9_-]", "", _text(fault.get("stage"), 48).lower())
+            group_faults = group.get("faults") if isinstance(group.get("faults"), dict) else {}
+            group_fault = group_faults.get(stage_key)
+            if isinstance(group_fault, dict):
+                group_fault["email_sent_at"] = sent_at
+                group_faults[stage_key] = group_fault
+                group["faults"] = group_faults
+            if _text(group.get("last_fault_stage"), 48).lower() == stage_key:
+                group["fault_email_sent_at"] = sent_at
+            groups[group_id] = group
+            status["nws_groups"] = groups
 
 
 def process_faults(config: dict, faults: dict[str, dict], state_path: Path, *, sender=send_branded_email, on_sent=None,
-                   now: int | None = None, preserve_status_faults: bool = False) -> dict:
+                   now: int | None = None, preserve_status_faults: bool = False,
+                   journal_lock: int | None = None) -> dict:
     current = int(time.time() if now is None else now)
     if len(faults) > MAX_ACTIVE_FAULTS:
         raise RuntimeError("system fault inventory exceeds the protected limit")
 
+    marker = None
+    if journal_lock is not None:
+        opened = os.fstat(journal_lock)
+        named = LOCK_FILE.lstat()
+        if state_path != STATE_FILE or (opened.st_dev, opened.st_ino, opened.st_nlink) != (named.st_dev, named.st_ino, 1):
+            raise RuntimeError("system notification journal lease does not match its configured paths")
+        marker = os.pread(journal_lock, len(STATE_REQUIRED_MARKER) + 1, 0)
+        if not STATE_REQUIRED_MARKER.startswith(marker):
+            raise RuntimeError("system notification history marker is invalid; preserve it before repair")
+        if marker and not state_path.exists():
+            raise RuntimeError("established system notification history is missing; preserve its lock and restore reviewed evidence")
     state = _read_json(state_path)
-    if state and _integer(state.get("version")) != 1:
-        raise RuntimeError("unsupported system notification state version")
+    if state or state_path.exists() or state_path.is_symlink():
+        if (type(state.get("version")) is not int or state["version"] != 1
+                or set(state) - {"version", "active", "attempts", "history"}
+                or any(not isinstance(state.get(key), dict) for key in ("active", "attempts"))
+                or not isinstance(state.get("history", {}), dict)):
+            raise RuntimeError("system notification suppression state is invalid; preserve it before repair")
+        for channel, fingerprint in state["active"].items():
+            if (not isinstance(channel, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", channel)
+                    or not isinstance(fingerprint, str) or not re.fullmatch(r"[a-f0-9]{64}", fingerprint)):
+                raise RuntimeError("system notification active state is invalid; preserve it before repair")
+        for channel, attempt in state["attempts"].items():
+            if (not isinstance(channel, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", channel)
+                    or not isinstance(attempt, dict) or set(attempt) - {"fingerprint", "at", "submission_started"}
+                    or not isinstance(attempt.get("fingerprint"), str) or not re.fullmatch(r"[a-f0-9]{64}", attempt["fingerprint"])
+                    or type(attempt.get("at")) is not int or not 0 <= attempt["at"] <= 253402300799
+                    or ("submission_started" in attempt and type(attempt["submission_started"]) is not bool)):
+                raise RuntimeError("system notification attempt state is invalid; preserve it before repair")
+        for fingerprint, sent_at in state.get("history", {}).items():
+            if (not isinstance(fingerprint, str) or not re.fullmatch(r"[a-f0-9]{64}", fingerprint)
+                    or type(sent_at) is not int or not 0 <= sent_at <= 253402300799):
+                raise RuntimeError("system notification history is invalid; preserve it before repair")
+    if marker is not None and marker != STATE_REQUIRED_MARKER:
+        if not state:
+            state = {"version": 1, "active": {}, "attempts": {}, "history": {}}
+        # Commit valid state before the required marker and before any mail.
+        # A crash in this gap retains legacy-readable state without submission.
+        _write_state(state_path, state)
+        if os.pwrite(journal_lock, STATE_REQUIRED_MARKER, 0) != len(STATE_REQUIRED_MARKER):
+            raise OSError("Incomplete system notification history marker write")
+        os.ftruncate(journal_lock, len(STATE_REQUIRED_MARKER))
+        os.fsync(journal_lock)
+        with _config_crypto._parent(LOCK_FILE) as (parent, name):
+            lock_named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            opened = os.fstat(journal_lock)
+            if (opened.st_dev, opened.st_ino, opened.st_nlink) != (lock_named.st_dev, lock_named.st_ino, 1):
+                raise RuntimeError("system notification history lock changed during initialization")
+            os.fsync(parent)
     raw_active = state.get("active") if isinstance(state.get("active"), dict) else {}
     raw_attempts = state.get("attempts") if isinstance(state.get("attempts"), dict) else {}
     raw_history = state.get("history") if isinstance(state.get("history"), dict) else {}
@@ -680,6 +785,8 @@ def _open_notification_lock(path: Path) -> int:
         current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
         if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
                 or metadata.st_uid not in (0, account.pw_uid)
+                or metadata.st_gid not in (0,account.pw_gid) or metadata.st_size>len(STATE_REQUIRED_MARKER)
+                or stat.S_IMODE(metadata.st_mode) not in (0o600,0o640,0o644)
                 or (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_nlink)
                 != (current.st_dev, current.st_ino, current.st_mode, current.st_nlink)):
             raise RuntimeError("system notification lock is unsafe or changed during open")
@@ -687,6 +794,12 @@ def _open_notification_lock(path: Path) -> int:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise RuntimeError("another system notification check is running") from exc
+        current=os.stat(path.name,dir_fd=parent,follow_symlinks=False)
+        if (metadata.st_dev,metadata.st_ino,metadata.st_uid,metadata.st_gid,metadata.st_mode,metadata.st_size,metadata.st_nlink)!=(
+                current.st_dev,current.st_ino,current.st_uid,current.st_gid,current.st_mode,current.st_size,current.st_nlink):
+            raise RuntimeError("system notification lock changed before permission repair")
+        if not STATE_REQUIRED_MARKER.startswith(os.pread(descriptor,len(STATE_REQUIRED_MARKER)+1,0)):
+            raise RuntimeError("system notification lock contains unknown history evidence")
         os.fchmod(descriptor, 0o640)
         if os.geteuid() == 0:
             os.fchown(descriptor, account.pw_uid, account.pw_gid)
@@ -727,7 +840,8 @@ def main() -> int:
             sent_at = datetime.fromtimestamp(sent_epoch, tz=timezone.utc).isoformat()
             _mark_weather_fault_email_sent(STATUS_FILE, fault, sent_at)
 
-        process_faults(config, faults, STATE_FILE, on_sent=record_sent, preserve_status_faults=status is None)
+        process_faults(config, faults, STATE_FILE, on_sent=record_sent,
+                       preserve_status_faults=status is None, journal_lock=descriptor)
     finally:
         os.close(descriptor)
     return 0

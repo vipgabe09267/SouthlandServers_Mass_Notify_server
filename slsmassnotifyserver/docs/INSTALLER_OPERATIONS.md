@@ -1,5 +1,11 @@
 # Installer diagnostics, recovery and qualification
 
+Activation reloads Apache and each independently qualified PHP-FPM version. This
+refreshes their separate opcode caches without changing PHP settings or restarting
+Asterisk. Rollback refreshes FPM after restoring the approved files. The local,
+read-only API probe reports its compiled SLS version; installation fails clearly
+if the serving handler still runs a previous release or its reload fails.
+
 The supported profile is FreePBX 17 on Debian 12, amd64, CPython 3.11 and
 Apache, using the standard FreePBX paths and the `asterisk` service account.
 Versioned local PHP-FPM sockets are inspected separately from CLI PHP. The
@@ -18,6 +24,11 @@ new service. Weather/Lightning and live paging default to voicemail fallback onl
 for eligible internal mailboxes. Review the independent controls and the existing
 mailbox length/capacity policy during acceptance. Installer and manual alert probes
 do not leave voicemail.
+
+Native legacy cron cleanup requires a complete successful read. A timeout,
+permission error or partial read leaves existing entries untouched and stops
+installation with a specific message. Only the exact current-user “no crontab”
+result is treated as an empty initial configuration.
 
 ## Read-only diagnostics
 
@@ -74,6 +85,13 @@ independent stock/previous-release approvals and recovery snapshots across a
 reboot. Public module recovery remains on the module filesystem for atomic
 renames; the journal records that location.
 
+Discovery and recovery acquire the existing installation locks before examining
+unfinished work. A named, empty, root-owned mode 0700 transaction directory left
+before its first journal write is safely recorded as abandoned on the next run.
+Unknown contents, unsafe ownership/modes and existing incomplete signed evidence
+remain preserved for review. Completed transactions cannot start recovery again,
+even when their saved installer is from an older release.
+
 TERM, INT and HUP cause an explicit abort. The installer terminates its own
 child work while keeping the worker guard until restoration finishes. Recovery
 copies are removed only after a recorded commit, verified rollback or a
@@ -94,8 +112,8 @@ The journal does not approve live file hashes. It does not restore operational
 delivery history over newer records. Failed restoration or newer activity that
 prevents safe verification requires administrator review.
 
-The corrected `0.1.6-beta` installer accepts all ownership, permission, collector
-and coordination stage names. Earlier copies can exit with code 2 while their
+An earlier `0.1.6-beta` installer omitted ownership, permission, collector and
+coordination stage names from its transaction allowlist. Those copies can exit with code 2 while their
 journal remains in `prepared` phase. Recover that retained transaction with
 the command above, then rerun the normal corrected installer. A prepared
 transaction is not disposable: its signed evidence and any native-permission
@@ -191,7 +209,7 @@ SLS_DISPOSABLE_QUALIFICATION_ONLY
 
 Each scenario uses a new overlay. Guest outbound networking is disabled; SSH
 is forwarded only to the controller's loopback interface. The harness checks
-the declared fresh/0.1.4-beta/0.1.5-beta baseline, protected settings, installer
+the declared fresh/0.1.4-beta/0.1.5-beta/0.1.6-beta baseline, protected settings, installer
 completion, reload and doctor results. Scenarios cover installation, inactive
 cron, absent Dashboard, TERM/INT/HUP and an abrupt VM power interruption followed
 by authenticated recovery and retry. Power interruption tests require a VM;
@@ -205,9 +223,9 @@ actual qualification results before expanding the supported deployment matrix.
 
 ## Recognized legacy permission recovery
 
-An older FreePBX chown/startup run can leave `enterprise-worker.lock`, `phone-admission.lock` or `phone-admission.json` publicly readable at mode0644. The installer authenticates the previous release before recovering recognized files to0640. The same bounded pass checks the active/pending central configuration and its permanent locks when native chown changed their modes. Configuration is decoded with the authenticated crypto helper before any permission changes; ciphertext, keys and saved settings are not rewritten. It validates the directory and open file descriptors, rejects symbolic/hard links, unexpected ownership, oversized or malformed state, and preserves journal bytes and lock inodes. It does not erase admission history or delete locks.
+An older FreePBX chown/startup run can leave `enterprise-worker.lock`, `phone-admission.lock` or `phone-admission.json` publicly readable at mode `0644`. The installer authenticates the previous release before recovering recognized files to `0640`. The same bounded pass checks the active/pending central configuration and its permanent locks when native chown changed their modes. Configuration is decoded with the authenticated crypto helper before any permission changes; ciphertext, keys and saved settings are not rewritten. It validates the directory and open file descriptors, rejects symbolic/hard links, unexpected ownership, oversized or malformed state, and preserves journal bytes and lock inodes. It does not erase admission history or delete locks.
 
-Copied or restored central settings may be owned by root rather than Asterisk, or may lack `mass-notifications.config.lock`. The installer accepts only known root/Asterisk UID and GID combinations at modes0600,0640 or0644 for the active/pending settings and empty mutex. It authenticates and decodes every present settings file before creating an absent mutex, then normalizes recognized ownership in place. This also permits a signed fresh-install retry containing valid settings. Other runtime files retain their stricter ownership and previous-release approval checks. A new empty private mutex is retained if a later prerequisite fails, so retry uses the same inode. Existing mutexes, configuration bytes and encryption keys are never replaced by this repair.
+Copied or restored central settings may be owned by root rather than Asterisk, or may lack `mass-notifications.config.lock`. The installer accepts only known root/Asterisk UID and GID combinations at modes `0600`, `0640` or `0644` for the active/pending settings and empty mutex. It authenticates and decodes every present settings file before creating an absent mutex, then normalizes recognized ownership in place. This also permits a signed fresh-install retry containing valid settings. Other runtime files retain their stricter ownership and previous-release approval checks. A new empty private mutex is retained if a later prerequisite fails, so retry uses the same inode. Existing mutexes, configuration bytes and encryption keys are never replaced by this repair.
 
 The authenticated worker keeper holds the configuration mutex until completion or recovery; it validates the current directory and mutex before and after acquisition. Unsafe files are rejected without blocking on FIFOs or adopting hard links. Active editors have a bounded wait. Failure markers identify publisher approval, legacy permission recovery, previous collector recovery or worker/configuration coordination separately. Review the first specific error in the protected installer log. Successful final verification clears the installation marker; manual permission changes alone do not establish a successful installation.
 
@@ -221,11 +239,17 @@ An older collector may have a voicemail fallback pending in a closed phone batch
 
 Earlier installers can stop with `Previous runtime changed after preflight; no additional files were approved` immediately after reporting `quarantined_caches: 1` or more. They remove recognized legacy Python caches during permission preparation, then incorrectly require those same caches during the next runtime verification.
 
-The corrected `0.1.6-beta` recognizes completed or partially completed quarantine only when the protected `runtime-cache-recovery/inventory.json` matches the original approval and the saved cache bytes match their recorded hashes. Each check still verifies authenticated source files and rejects unknown runtime files, unsafe recovery entries and changed caches. Quarantined bytecode never receives execution or rollback approval. Completed quarantine evidence is left intact.
+Current installers recognize completed or partially completed quarantine only when the protected `runtime-cache-recovery/inventory.json` matches the original approval and the saved cache bytes match their recorded hashes. Each check still verifies authenticated source files and rejects unknown runtime files, unsafe recovery entries and changed caches. Quarantined bytecode never receives execution or rollback approval. Completed quarantine evidence is left intact.
 
-Download the current matching installer and package, then rerun the normal installation command. If it reports an unfinished transaction, use the authenticated recovery command in [Interrupted installations](#interrupted-installations) before retrying. Preserve the transaction and installer log; missing or changed quarantine evidence requires review rather than manual cache deletion or new live-file approvals.
+Use the publisher-authenticated installer and package from the exact release generation recorded in the retained transaction. Do not substitute either an older or newer installer merely because it is currently published. After that transaction is recovered, use the intended target release for a new upgrade attempt. If the installer reports an unfinished transaction, use the authenticated recovery command in [Interrupted installations](#interrupted-installations) before retrying. Preserve the transaction and installer log; missing or changed quarantine evidence requires review rather than manual cache deletion or new live-file approvals.
 
 ## Included offline removal
+
+Removal records its preparation, teardown and verification stages in a private
+transaction under `/var/lib/sls-mass-notify-uninstaller`. Failed attempts retain
+authenticated local retry helpers and configuration recovery locations. Completion
+is recorded after teardown postconditions, not merely after deleting the runtime.
+Only recorded workspaces are cleaned; unrelated `/tmp` files remain untouched.
 
 Run `sudo slsconsole uninstall` or the included `/usr/local/bin/sls_mass_notify/sls_mass_notify_uninstall.sh`. Removal does not download packages or require the installed `sls_privileged_install.py`, speech engine or collector to be healthy. It authenticates fixed teardown helpers against the retained publisher generation and checks independently approved Framework/Dashboard inventories. It drains notification workers under private leases before changing services or removing files, and refuses active phone delivery. It preserves configuration, media, history, logs and recovery keys by default. Purging data is a separate destructive option.
 

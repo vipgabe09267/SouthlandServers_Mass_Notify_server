@@ -53,6 +53,22 @@ with tempfile.TemporaryDirectory() as temporary:
     assert queue.claim_ticket(ticket, directory=root, now=1715)
 
 with tempfile.TemporaryDirectory() as temporary:
+    root=Path(temporary); original=queue.ticket_state
+    with original(root) as state: state['recipients']['1000']=999999
+    clock=[0.0]; sleeps=[0]
+    def advance(seconds):
+        sleeps[0]+=1; clock[0]+=150
+        if sleeps[0]>3: raise AssertionError('A nonadvancing wall clock bypassed the paging wait budget')
+    with mock.patch.object(queue,'ticket_state',side_effect=lambda *args,**kwargs:original(root)), \
+         mock.patch.object(queue.time,'time',return_value=1000), \
+         mock.patch.object(queue.time,'monotonic',side_effect=lambda:clock[0]), \
+         mock.patch.object(queue.time,'sleep',side_effect=advance):
+        try: queue.wait_for_slot(['1000'],1,sound)
+        except RuntimeError as error: assert 'wait expired' in str(error),str(error)
+        else: raise AssertionError('Paging remained waiting beyond its monotonic budget')
+    assert json.loads((root/'audio-reservations.json').read_text())['waiting']=={},'An expired waiter retained its ticket'
+
+with tempfile.TemporaryDirectory() as temporary:
     root = Path(temporary); audio = root / 'sounds/tts'; audio.mkdir(parents=True)
     config = root / 'mass-notifications.config'
     config.write_text('{"enabled":"1"}')

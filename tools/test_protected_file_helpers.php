@@ -71,6 +71,38 @@ try {
         try { $work(); } catch (Throwable $expected) { $failed = true; }
         $assert($failed && microtime(true) - $start < $seconds, $message);
     };
+	$namedRace = $root . '/named-race';
+	file_put_contents($namedRace, 'intended inode');
+	chmod($namedRace, 0600);
+	$expectedRaceIdentity = lstat($namedRace);
+	rename($namedRace, $root . '/held-race');
+	file_put_contents($namedRace, 'replacement inode');
+	chmod($namedRace, 0600);
+	$replacementBefore = lstat($namedRace);
+	$reject(fn() => $call('setPrivateOwnership', $namedRace, $expectedRaceIdentity),
+		'Private ownership changed a replacement inode selected through a stale name.');
+	clearstatcache(true, $namedRace);
+	$replacementAfter = lstat($namedRace);
+	$assert($replacementAfter['ino'] === $replacementBefore['ino']
+		&& $replacementAfter['uid'] === $replacementBefore['uid']
+		&& $replacementAfter['mode'] === $replacementBefore['mode']
+		&& file_get_contents($namedRace) === 'replacement inode',
+		'Rejected stale-name ownership changed the replacement file.');
+	mkdir($root . '/path-component', 0700);
+	$reject(fn() => $call('setPrivateOwnership', $root . '/path-component/../protected'),
+		'Private ownership accepted a parent-directory path component.');
+	$reject(fn() => $call('ensurePrivateFile', $root . '/path-component/../created'),
+		'Private file creation accepted a parent-directory path component.');
+	$reject(fn() => $call('ensureOwnedDirectory', $root . '/path-component/../directory', 0750),
+		'Owned directory handling accepted a parent-directory path component.');
+	$reject(fn() => $call('secureManagedRuntimeTree', $root . '/path-component/../data', 'data'),
+		'Runtime-tree hardening accepted a parent-directory path component.');
+	$reject(fn() => $call('ensureAsteriskSoundLink', $root . '/path-component/../sound-link'),
+		'Asterisk sound-link creation accepted a parent-directory path component.');
+	$reject(fn() => $call('setNativeFileMetadata', $root . '/path-component/../protected', 0640),
+		'Native restore metadata handling accepted a parent-directory path component.');
+	$assert(file_get_contents($target) === 'fixture contents' && !file_exists($root . '/sound-link'),
+		'Rejected parent-directory paths changed protected data or created a link.');
     $lockPath = $root . '/backup.lock';
     $held = $call('acquireNativeBackupFileLock', $lockPath, 'Fixture lock rejected', 1);
     $assert(is_resource($held), 'A safe backup lock was rejected.');
@@ -108,28 +140,34 @@ try {
     $method = $reflection->getMethod('updateStatusData');
     $sourceLines = file($reflection->getFileName());
     $statusMethod = implode('', array_slice($sourceLines, $method->getStartLine() - 1, $method->getEndLine() - $method->getStartLine() + 1));
+    $assert(strpos($statusMethod, 'while ($written<strlen($body))') !== false
+        && strpos($statusMethod, "'PATH'=>'/usr/sbin:/usr/bin:/sbin:/bin'") !== false
+        && strpos($statusMethod, 'proc_open($command') !== false,
+        'The root status writer does not use complete pipe writes and a minimal child environment.');
     $statusMethod = preg_replace('/private function updateStatusData/', 'public function updateStatusData', $statusMethod, 1, $replaced);
     $assert($replaced === 1, 'Actual status method could not be isolated.');
     $statusPath = $root . '/status.json';
-    eval('class ProtectedStatusFixture { const STATUS_JSON=' . var_export($statusPath, true) . ';'
+		eval('class ProtectedStatusFixture { const STATUS_JSON=' . var_export($statusPath, true) . ';'
         . 'public function __construct(private $ownership) {} private function ensurePluginDataDir() {}'
-        . 'private function setPrivateOwnership($path) { ($this->ownership)($path); }' . $statusMethod . '}');
-    $status = new ProtectedStatusFixture(static fn($path) => $call('setPrivateOwnership', $path));
+		    . 'private function setPrivateOwnership($path, $identity=null) { ($this->ownership)($path, $identity); }' . $statusMethod . '}');
+		$status = new ProtectedStatusFixture(static fn($path, $identity=null) => $call('setPrivateOwnership', $path, $identity));
     $status->updateStatusData(['old_evidence' => 'preserved', 'counter' => 1]);
-    clearstatcache(); $statusInode = fileinode($statusPath);
+    clearstatcache(); $statusInode = fileinode($statusPath);$statusLockInode=fileinode($statusPath.'.lock');
     $status->updateStatusData(['counter' => 2]);
     $assert(json_decode(file_get_contents($statusPath), true) === ['old_evidence' => 'preserved', 'counter' => 2]
-        && fileinode($statusPath) === $statusInode, 'Status merge lost evidence or changed the shared writer inode.');
+        && fileinode($statusPath) !== $statusInode && fileinode($statusPath.'.lock')===$statusLockInode, 'Atomic status merge lost evidence or replaced the permanent lock inode.');
     $before = file_get_contents($statusPath);
-    $reject(fn() => $status->updateStatusData(['oversized' => str_repeat('x', 1048576)]), 'Oversized status output was accepted.');
+    $reject(fn() => $status->updateStatusData(['oversized' => str_repeat('x', 2097152)]), 'Oversized status output was accepted.');
     $assert(file_get_contents($statusPath) === $before, 'Rejected status output erased evidence.');
-    $held = fopen($statusPath, 'r+b'); flock($held, LOCK_EX);
+    $held = fopen($statusPath.'.lock', 'r+b'); flock($held, LOCK_EX);
     $reject(fn() => $status->updateStatusData(['counter' => 3]), 'Status contention did not have a bounded deadline.', 2.5);
+    fclose($held);
+    $held = fopen($statusPath,'r+b');flock($held,LOCK_EX);
     $start = microtime(true); $loaded = $call('loadJsonFile', $statusPath);
     $assert($loaded === [] && microtime(true) - $start < 0.5, 'A busy dashboard JSON reader blocked.');
     fclose($held);
     $assert($call('loadJsonFile', $statusPath)['counter'] === 2, 'Safe dashboard status reading failed.');
-    foreach (['', '{broken', '[]', 'null', str_repeat('x', 1048577)] as $raw) {
+    foreach (['', '{broken', '[]', 'null', str_repeat('x', 2097153)] as $raw) {
         file_put_contents($statusPath, $raw);
         $reject(fn() => $status->updateStatusData(['counter' => 4]), 'Incomplete, non-object or oversized status input was reset.');
         $assert(file_get_contents($statusPath) === $raw, 'Invalid status evidence was overwritten.');
@@ -153,7 +191,26 @@ try {
     file_put_contents($statusPath, str_repeat('x', 8 * 1024 * 1024 + 1)); chmod($statusPath, 0600);
     $assert($call('loadJsonFile', $statusPath) === [], 'Dashboard reader exceeded its input limit.');
     $assert(file_get_contents($target) === 'fixture contents', 'Rejected storage changed a linked target.');
-    echo "Protected helpers reject unsafe paths, preserve evidence, bound input and lock waits, keep shared writer inodes and ignore untrusted Python imports.\n";
+
+    // Voice presence checks run before hashing. Oversized sparse files must be
+    // rejected without reading their apparent contents into memory.
+    $model = $root . '/en_US-lessac-low.onnx';
+    $metadata = $root . '/en_US-lessac-low.onnx.json';
+    $modelHandle = fopen($model, 'x+b');
+    $metadataHandle = fopen($metadata, 'x+b');
+    $assert(is_resource($modelHandle) && is_resource($metadataHandle), 'Voice size fixtures could not be created.');
+    $assert(ftruncate($modelHandle, 1000001) && ftruncate($metadataHandle, 2), 'Voice size fixtures could not be populated.');
+    fclose($modelHandle); fclose($metadataHandle);
+    $assert($call('isPresentPiperVoiceFile', $model) && $call('isPresentPiperVoiceFile', $metadata),
+        'Bounded voice presence checks rejected valid file sizes.');
+    $modelHandle = fopen($model, 'r+b'); $metadataHandle = fopen($metadata, 'r+b');
+    $assert(is_resource($modelHandle) && is_resource($metadataHandle)
+        && ftruncate($modelHandle, 100000001) && ftruncate($metadataHandle, 1048577),
+        'Oversized voice fixtures could not be prepared.');
+    fclose($modelHandle); fclose($metadataHandle);
+    $assert(!$call('isPresentPiperVoiceFile', $model) && !$call('isPresentPiperVoiceFile', $metadata),
+        'Oversized Piper model or metadata passed the pre-hash size boundary.');
+    echo "Protected helpers reject unsafe paths, preserve evidence, bound status and voice input, bound lock waits, keep shared writer inodes and ignore untrusted Python imports.\n";
 } finally {
     chdir($oldCwd);
     putenv($oldPythonPath === false ? 'PYTHONPATH' : 'PYTHONPATH=' . $oldPythonPath);

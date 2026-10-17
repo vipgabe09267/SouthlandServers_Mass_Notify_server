@@ -4,6 +4,7 @@ namespace SLS\MassNotify;
 require_once __DIR__.'/OperatorAccess.php';
 require_once __DIR__.'/EnterpriseIdentity.php';
 require_once __DIR__.'/OperatorLoginRate.php';
+if (!class_exists('SlsAtomicJson', false)) { require_once __DIR__.'/bin/sls_mass_notify/sls_atomic_json.php'; }
 require_once __DIR__.'/bin/sls_mass_notify/sls_live_paging.php';
 
 /** Separate web sessions, operator passwords, TOTP, and current SLS permissions. */
@@ -26,11 +27,14 @@ final class OperatorPortal
             || !hash_equals($session['portal_csrf'], $token)) { return false; }
         if (in_array($server['HTTP_SEC_FETCH_SITE'] ?? '', ['cross-site'], true)) { return false; }
         if (isset($server['HTTP_ORIGIN'])) {
-            $origin = parse_url($server['HTTP_ORIGIN']); $host = parse_url('https://'.($server['HTTP_HOST'] ?? ''));
+            if (!is_string($server['HTTP_ORIGIN']) || !is_string($server['HTTP_HOST'] ?? null)) { return false; }
+            $origin = parse_url($server['HTTP_ORIGIN']); $host = parse_url('https://'.$server['HTTP_HOST']);
             if (!is_array($origin) || !is_array($host) || ($origin['scheme'] ?? '') !== 'https'
                 || strtolower($origin['host'] ?? '') !== strtolower($host['host'] ?? '')
                 || ($origin['port'] ?? 443) !== ($host['port'] ?? 443)
                 || isset($origin['user']) || isset($origin['pass']) || isset($origin['query']) || isset($origin['fragment'])
+                || isset($host['user']) || isset($host['pass']) || isset($host['query']) || isset($host['fragment'])
+                || !in_array($host['path'] ?? '', ['', '/'], true)
                 || !in_array($origin['path'] ?? '', ['', '/'], true)) { return false; }
         }
         return true;
@@ -60,12 +64,17 @@ final class OperatorPortal
     public static function passwordWork(string $prefix, callable $work)
     {
         $parent=@lstat(dirname($prefix));
-        if (!$parent || realpath(dirname($prefix))!==dirname($prefix) || ($parent['mode']&0022)) { throw new \RuntimeException('portal_password_storage_unsafe'); }
+        if (!$parent || ($parent['mode']&0170000)!==0040000 || !in_array($parent['uid'],[0,posix_geteuid()],true)
+            || realpath(dirname($prefix))!==dirname($prefix) || ($parent['mode']&0022)) { throw new \RuntimeException('portal_password_storage_unsafe'); }
+        $safe=static fn(array $meta):bool=>($meta['mode']&0170000)===0100000&&!($meta['mode']&07027)
+            &&$meta['uid']===posix_geteuid()&&$meta['nlink']===1&&$meta['size']===0;
         for ($slot=0;$slot<2;$slot++) {
-            $path=$prefix.'-'.$slot.'.lock'; clearstatcache(true,$path); $before=@lstat($path); $mask=umask(0037);
+            $path=$prefix.'-'.$slot.'.lock'; clearstatcache(true,$path); $before=@lstat($path);
+            if($before&&(!$safe($before)||is_link($path))){throw new \RuntimeException('portal_password_storage_unsafe');}
+            $mask=umask(0037);
             try {
                 $handle=@fopen($path,$before===false?'x+b':'r+b');
-                if (!$handle && $before===false) { clearstatcache(true,$path); $before=@lstat($path); if ($before) { $handle=@fopen($path,'r+b'); } }
+                if (!$handle && $before===false) { clearstatcache(true,$path); $before=@lstat($path); if ($before) { if(!$safe($before)||is_link($path)){throw new \RuntimeException('portal_password_storage_unsafe');}$handle=@fopen($path,'r+b'); } }
             } finally { umask($mask); }
             if (!$handle) { throw new \RuntimeException('portal_password_storage_unavailable'); }
             try {
@@ -73,7 +82,17 @@ final class OperatorPortal
                 if (!$open || !$named || ($open['mode']&0170000)!==0100000 || ($open['mode']&0027) || $open['nlink']!==1
                     || $open['uid']!==posix_geteuid() || $open['size']!==0 || $open['dev']!==$named['dev'] || $open['ino']!==$named['ino']
                     || is_link($path) || ($before && ($open['dev']!==$before['dev'] || $open['ino']!==$before['ino']))) { throw new \RuntimeException('portal_password_storage_unsafe'); }
-                if (flock($handle,LOCK_EX|LOCK_NB)) { return $work(); }
+                if (flock($handle,LOCK_EX|LOCK_NB)) {
+                    clearstatcache(true,$path);$named=@lstat($path);$held=fstat($handle);
+                    clearstatcache(true,dirname($prefix));$currentParent=@lstat(dirname($prefix));
+                    if(!$named||!$held||!$safe($held)||!$safe($named)||is_link($path)
+                        ||$held['dev']!==$named['dev']||$held['ino']!==$named['ino']
+                        ||!$currentParent||$currentParent['dev']!==$parent['dev']||$currentParent['ino']!==$parent['ino']
+                        ||($currentParent['mode']&0022)||realpath(dirname($prefix))!==dirname($prefix)){
+                        throw new \RuntimeException('portal_password_storage_unsafe');
+                    }
+                    return $work();
+                }
             } finally { fclose($handle); }
         }
         header('Retry-After: 1'); http_response_code(429);
@@ -94,42 +113,23 @@ final class OperatorPortal
 
     private static function loginBudget(string $path, string $ip, string $username, int $now, bool $clear): int
     {
-        clearstatcache(true, $path); $before = @lstat($path);
-        $mask=umask(0037);
-        try {
-            $handle = @fopen($path, $before === false ? 'x+b' : 'r+b');
-            // Two first sign-ins can create the same ledger concurrently.
-            // Open the winning inode, then perform all ownership/link checks.
-            if (!is_resource($handle) && $before===false) {
-                clearstatcache(true,$path); $before=@lstat($path);
-                if ($before!==false) { $handle=@fopen($path,'r+b'); }
-            }
-        } finally { umask($mask); }
-        if (!is_resource($handle)) { throw new \RuntimeException('portal_login_storage_unavailable'); }
-        try {
-            if ($before === false) { chmod($path, 0640); }
-            $meta = fstat($handle); clearstatcache(true, $path); $current = @lstat($path);
-            if (!$meta || !$current || ($meta['mode'] & 0170000) !== 0100000 || ($meta['mode'] & 0027)
-                || $meta['nlink'] !== 1 || $meta['uid'] !== posix_geteuid() || $meta['size'] > 65536
-                || $meta['dev'] !== $current['dev'] || $meta['ino'] !== $current['ino'] || is_link($path)
-                || (is_array($before) && ($meta['dev'] !== $before['dev'] || $meta['ino'] !== $before['ino']))) {
-                throw new \RuntimeException('portal_login_storage_unsafe');
-            }
-            $deadline = microtime(true)+2;
-            while (!flock($handle, LOCK_EX | LOCK_NB)) {
-                if (microtime(true) >= $deadline) { throw new \RuntimeException('portal_login_storage_busy'); }
-                usleep(10000);
-            }
-            $raw = stream_get_contents($handle, 65537);
-            $rows = $raw === '' ? [] : json_decode($raw, true, 4, JSON_THROW_ON_ERROR);
-            if (!is_array($rows) || count($rows)>512) { throw new \RuntimeException('portal_login_storage_invalid'); }
+        $packed=@inet_pton($ip);$canonical=$packed===false?false:@inet_ntop($packed);
+        if ($now<0 || $now>253402300799 || !is_string($canonical) || strlen($username)>256
+            || preg_match('/[\x00-\x1f\x7f]/',$username)) { throw new \InvalidArgumentException('portal_login_input_invalid'); }
+        $ip=$canonical;
+        return \SlsAtomicJson::transaction($path, [], static function (array $rows) use ($ip, $username, $now, $clear): array {
+            if (count($rows)>512) { throw new \RuntimeException('portal_login_storage_invalid'); }
             foreach ($rows as $key=>$row) {
                 if (!preg_match('/^(?:global|[iu]_[a-f0-9]{64})$/D', (string)$key) || !is_array($row)
-                    || !is_int($row['start'] ?? null) || !is_int($row['count'] ?? null) || $row['count']<0
+                    || array_diff(array_keys($row),['start','count']) || !is_int($row['start'] ?? null) || $row['start']<0
+                    || !is_int($row['count'] ?? null) || $row['count']<0 || $row['count']>100000
                     || $row['start']>$now+30) { throw new \RuntimeException('portal_login_storage_invalid'); }
                 if ($now-$row['start']>=300) { unset($rows[$key]); }
             }
-            $keys=['i_'.hash('sha256', $ip)=>50, 'u_'.hash('sha256', strtolower($username))=>10, 'global'=>300];
+            $keys=['i_'.hash('sha256', $ip)=>50, 'global'=>300];
+            // Provider handshakes have no authenticated account yet. An IP
+            // must not also consume the smaller per-account budget.
+            if($username!==''){$keys['u_'.hash('sha256',strtolower($username))]=10;}
             if ($clear) {
                 unset($rows['i_'.hash('sha256',$ip)],$rows['u_'.hash('sha256',strtolower($username))]);
                 $keys=[];
@@ -139,17 +139,13 @@ final class OperatorPortal
                 $row=$rows[$key] ?? ['start'=>$now, 'count'=>0];
                 if ($row['count'] >= $limit) { $retry=max($retry, max(1, 300-($now-$row['start']))); }
             }
-            if ($retry) { return $retry; }
+            if ($retry) { return [$rows, $retry, false]; }
             if (count(array_unique(array_merge(array_keys($rows), array_keys($keys))))>512) {
                 throw new \RuntimeException('portal_login_capacity_reached');
             }
             foreach ($keys as $key=>$limit) { $rows[$key] ??= ['start'=>$now,'count'=>0]; $rows[$key]['count']++; }
-            $bytes=json_encode((object)$rows, JSON_THROW_ON_ERROR); rewind($handle);
-            if (!ftruncate($handle,0) || fwrite($handle,$bytes)!==strlen($bytes) || !fflush($handle) || !fsync($handle)) {
-                throw new \RuntimeException('portal_login_storage_write_failed');
-            }
-            return 0;
-        } finally { fclose($handle); }
+            return [$rows, 0, true];
+        }, 65536, true, true);
     }
 
     public static function headers(string $nonce): void
@@ -158,7 +154,7 @@ final class OperatorPortal
         // HTML form navigation uses an opaque Origin under no-referrer in
         // Chromium. Keep the same-origin Origin intact for the CSRF check.
         header('Referrer-Policy: same-origin'); header('X-Frame-Options: DENY');
-        header("Content-Security-Policy: default-src 'none'; script-src 'nonce-$nonce'; style-src 'self' 'nonce-$nonce'; img-src 'self' data:; font-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+        header("Content-Security-Policy: default-src 'none'; script-src 'nonce-$nonce'; worker-src 'self'; style-src 'self' 'nonce-$nonce'; img-src 'self' data:; font-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
     }
 
     public static function document(string $content, string $nonce, array $principal, string $csrf, string $view): string
@@ -173,16 +169,21 @@ final class OperatorPortal
             }
             $navigation.='</nav><div class="portal-session"><span>'.$e($principal['name'] ?? $principal['username']).'</span><form method="post" action="'.self::BASE.'"><input type="hidden" name="portal_action" value="logout"><input type="hidden" name="portal_csrf" value="'.$e($csrf).'"><button type="submit" class="btn btn-default">Sign out</button></form></div>';
         }
-        $css=file_get_contents(__DIR__.'/views/portal.css');
+        $css=@file_get_contents(__DIR__.'/views/portal.css');if(!is_string($css)){throw new \RuntimeException('Operator portal stylesheet is unavailable.');}
         $branding=''; $mark='<span class="portal-mark" aria-hidden="true"><i class="fa fa-bullhorn"></i></span>';
         try {
             if (class_exists('FreePBX',false)) {
                 $theme=\FreePBX::Config()->get('BRAND_CSS_CUSTOM'); $logo=\FreePBX::Config()->get('BRAND_IMAGE_TANGO_LEFT');
-                if (is_string($theme) && preg_match('#^/(?!.*\.\.)[A-Za-z0-9_./-]+\.css$#D',$theme)) { $branding='<link rel="stylesheet" href="'.$e($theme).'">'; }
-                if (is_string($logo) && preg_match('#^/(?!.*\.\.)[A-Za-z0-9_./-]+\.(?:png|svg|jpe?g)$#Di',$logo)) { $mark='<img class="portal-logo" src="'.$e($logo).'" alt="">'; }
+                if (is_string($theme) && preg_match('#^/(?!/)(?!.*\.\.)[A-Za-z0-9_./-]+\.css$#D',$theme)) { $branding='<link rel="stylesheet" href="'.$e($theme).'">'; }
+                if (is_string($logo) && preg_match('#^/(?!/)(?!.*\.\.)[A-Za-z0-9_./-]+\.(?:png|svg|jpe?g)$#Di',$logo)) { $mark='<img class="portal-logo" src="'.$e($logo).'" alt="">'; }
             }
         } catch (\Throwable $ignored) { }
         $body='<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>SLS Mass Notify · '.($authenticated?'Operations':'Sign in').'</title><link rel="stylesheet" href="/admin/assets/css/font-awesome.min-4.7.0.css"><style>'.$css.'</style>'.$branding.'</head><body><header class="portal-header"><a class="portal-brand" href="'.self::BASE.'">'.$mark.'<span>SLS Mass Notify<small>Operator portal</small></span></a>'.$navigation.'</header><main class="portal-main">'.$content.'</main><footer class="portal-footer">Southland Servers · Mass Notifications</footer></body></html>';
-        return preg_replace('/<(script|style)(?=[\s>])/i', '<$1 nonce="'.$e($nonce).'"', $body);
+        $document=preg_replace_callback('/<(script|style)(?=[\s>])([^>]*)>/i', static function (array $tag) use ($e,$nonce): string {
+            $attributes=preg_replace('/\s+nonce(?=\s|=|$)(?:\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s]+))?/i','',$tag[2]);
+            return '<'.$tag[1].' nonce="'.$e($nonce).'"'.$attributes.'>';
+        }, $body);
+        if(!is_string($document)){throw new \RuntimeException('Operator portal document could not be rendered.');}
+        return $document;
     }
 }

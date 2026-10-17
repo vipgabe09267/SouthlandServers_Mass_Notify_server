@@ -22,14 +22,23 @@ trait SlsAnnouncementDelivery
             || !$before || ($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1
             || ($before['mode'] & 0022) || !in_array($before['uid'], [0, $parent['uid']], true)
             || $before['size'] > 1048576) { return []; }
-        $handle = @fopen($path, 'rb');
+        // O_RDWR is non-truncating and does not wait for a FIFO peer. Descriptor
+        // validation below rejects anything except the original regular file.
+        $handle = @fopen($path, 'r+b');
         if (!$handle) { return []; }
         try {
             $opened = fstat($handle);
             if (!$opened || $opened['dev'] !== $before['dev'] || $opened['ino'] !== $before['ino']
-                || ($opened['mode'] & 0170000) !== 0100000 || $opened['nlink'] !== 1 || $opened['size'] > 1048576) { return []; }
+                || ($opened['mode'] & 0170000) !== 0100000 || $opened['nlink'] !== 1 || ($opened['mode'] & 0022)
+                || !in_array($opened['uid'], [0, $parent['uid']], true) || $opened['size'] > 1048576) { return []; }
             $raw = stream_get_contents($handle, 1048577);
-            $value = is_string($raw) && strlen($raw) <= 1048576 ? json_decode($raw, true, 16) : null;
+            clearstatcache(true, $path); $after = fstat($handle); $named = @lstat($path);
+            if (!is_string($raw) || strlen($raw) !== $opened['size'] || !$after || !$named
+                || $after['dev'] !== $opened['dev'] || $after['ino'] !== $opened['ino']
+                || $after['size'] !== $opened['size'] || $after['mtime'] !== $opened['mtime'] || $after['ctime'] !== $opened['ctime']
+                || $named['dev'] !== $opened['dev'] || $named['ino'] !== $opened['ino']) { return []; }
+            try { $value = is_string($raw) && strlen($raw) <= 1048576 ? \SLS\MassNotify\ApiSecurity::jsonObject($raw) : null; }
+            catch (\Throwable $error) { return []; }
             return is_array($value) && count($value) <= 1000 ? $value : [];
         } finally { fclose($handle); }
     }
@@ -38,15 +47,23 @@ trait SlsAnnouncementDelivery
     protected function refreshAnnouncementDesktopReceipts(array $result, $createdAt = '')
     {
         unset($result['receipt_status_error']);
-        $rows = is_array($result['receipts'] ?? null) ? $result['receipts'] : [];
+        $savedRows = is_array($result['receipts'] ?? null) ? $result['receipts'] : [];
+        $rows = array_values(array_filter($savedRows, 'is_array'));
+        if (count($rows) !== count($savedRows)) {
+            $result['receipt_status_error'] = 'One or more saved delivery receipt entries are invalid and could not be displayed.';
+        }
         $ledgers = []; $bytes = 0; $deadline = microtime(true) + 2;
         foreach ($rows as &$row) {
             if (($row['channel'] ?? '') !== 'desktop' || ($row['state'] ?? '') !== 'published'
                 || !is_string($row['event_id'] ?? null) || $row['event_id'] === '') { continue; }
-            $username = (string)($row['target'] ?? '');
             // Missing IDs in old jobs must never be guessed from last-seen state.
             if (!array_key_exists('client_id', $row)) { continue; }
-            $clientId = (string)$row['client_id'];
+            $username = $row['target'] ?? null; $clientId = $row['client_id'];
+            if (!is_string($username) || !preg_match('/^[A-Za-z0-9_.@-]{1,80}$/D', $username)
+                || !is_string($clientId) || !preg_match('/^[A-Za-z0-9_-]{0,80}$/D', $clientId)) {
+                $result['receipt_status_error'] = 'One or more saved desktop receipt identities are invalid and could not be checked.';
+                continue;
+            }
             $identity = hash('sha256', $clientId !== '' ? 'id:' . $clientId : 'user:' . $username);
             try {
                 if (!array_key_exists($identity, $ledgers)) {
@@ -55,24 +72,37 @@ trait SlsAnnouncementDelivery
                     $path = $directory . '/' . $identity . '.json';
                     clearstatcache(true, $path);
                     if (!file_exists($path) && !is_link($path)) { $ledgers[$identity] = null; continue; }
-                    $directoryMeta = @lstat($directory); $before = @lstat($path);
-                    if (!$directoryMeta || realpath($directory) !== $directory || ($directoryMeta['mode'] & 0022)
+                    $dataMeta = @lstat(self::PLUGIN_DATA_DIR); $directoryMeta = @lstat($directory); $before = @lstat($path);
+                    if (!$dataMeta || !$directoryMeta || ($directoryMeta['mode'] & 0170000) !== 0040000
+                        || realpath($directory) !== $directory || ($directoryMeta['mode'] & 0022)
+                        || !in_array($directoryMeta['uid'], [0, $dataMeta['uid']], true)
                         || !$before || ($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1
-                        || ($before['mode'] & 0022) || $before['size'] > 2097152) {
+                        || ($before['mode'] & 0022) || !in_array($before['uid'], [0, $directoryMeta['uid'], $dataMeta['uid']], true)
+                        || $before['size'] > 2097152) {
                         throw new \RuntimeException('Unsafe receipt storage.');
                     }
-                    $handle = @fopen($path, 'rb');
+                    // O_RDWR avoids a blocking FIFO open if the name is raced;
+                    // the descriptor must still match the original regular file.
+                    $handle = @fopen($path, 'r+b');
                     if (!$handle) { throw new \RuntimeException('Receipt storage unreadable.'); }
                     try {
                         $opened = fstat($handle);
                         if (!$opened || $opened['ino'] !== $before['ino'] || $opened['dev'] !== $before['dev']
                             || ($opened['mode'] & 0170000) !== 0100000 || $opened['nlink'] !== 1
+                            || ($opened['mode'] & 0022) || !in_array($opened['uid'], [0, $directoryMeta['uid'], $dataMeta['uid']], true)
                             || $opened['size'] > 2097152 || $bytes + $opened['size'] > 33554432) {
                             throw new \RuntimeException('Receipt storage changed or exceeded its read budget.');
                         }
                         $raw = stream_get_contents($handle, 2097153); $bytes += strlen((string)$raw);
+                        clearstatcache(true, $path); $after = fstat($handle); $named = @lstat($path);
+                        if (!is_string($raw) || strlen($raw) !== $opened['size'] || !$after || !$named
+                            || $after['dev'] !== $opened['dev'] || $after['ino'] !== $opened['ino']
+                            || $after['size'] !== $opened['size'] || $after['mtime'] !== $opened['mtime'] || $after['ctime'] !== $opened['ctime']
+                            || $named['dev'] !== $opened['dev'] || $named['ino'] !== $opened['ino']) {
+                            throw new \RuntimeException('Receipt storage changed during its bounded read.');
+                        }
                     } finally { fclose($handle); }
-                    $ledger = is_string($raw) && strlen($raw) <= 2097152 ? json_decode($raw, true, 16) : null;
+                    $ledger = is_string($raw) && strlen($raw) <= 2097152 ? \SLS\MassNotify\ApiSecurity::jsonObject($raw) : null;
                     if (!is_array($ledger) || ($ledger['schema'] ?? null) !== 1
                         || !is_array($ledger['acknowledgements'] ?? null) || count($ledger['acknowledgements']) > 1000) {
                         throw new \RuntimeException('Receipt storage is invalid.');
@@ -82,7 +112,9 @@ trait SlsAnnouncementDelivery
                 $ledger = $ledgers[$identity];
                 if (!is_array($ledger)) { continue; }
                 $entry = $ledger['acknowledgements'][hash('sha256', $row['event_id'])] ?? null;
-                $at = is_array($entry) ? strtotime((string)($entry['ack_at'] ?? '')) : false;
+                $ackAt = is_array($entry) ? ($entry['ack_at'] ?? null) : null;
+                $at = is_string($ackAt) && preg_match('/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\+00:00$/D', $ackAt)
+                    ? strtotime($ackAt) : false;
                 if (!is_array($entry) || ($entry['event_id'] ?? null) !== $row['event_id']
                     || ($entry['username'] ?? $ledger['username'] ?? null) !== $username
                     || ($entry['client_id'] ?? $ledger['client_id'] ?? null) !== $clientId
@@ -100,7 +132,9 @@ trait SlsAnnouncementDelivery
         }) ? $this->announcementDesktopPresence() : [];
         foreach ($rows as &$row) {
             if (($row['channel'] ?? '') !== 'desktop' || ($row['state'] ?? '') !== 'published' || empty($row['client_id'])) { continue; }
-            $seen = $presence[(string)($row['target'] ?? '')] ?? null;
+            if (!is_string($row['target'] ?? null) || !preg_match('/^[A-Za-z0-9_.@-]{1,80}$/D', $row['target'])
+                || !is_string($row['client_id']) || !preg_match('/^[A-Za-z0-9_-]{1,80}$/D', $row['client_id'])) { continue; }
+            $seen = $presence[$row['target']] ?? null;
             if (!is_array($seen) || ($seen['client_id'] ?? '') !== $row['client_id'] || !is_string($seen['seen_at'] ?? null)
                 || !preg_match('/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:Z|[+-][0-9]{2}:[0-9]{2})$/D', $seen['seen_at'])) { continue; }
             $at = strtotime($seen['seen_at']);
@@ -128,15 +162,25 @@ trait SlsAnnouncementDelivery
             'targets' => [], 'truncated' => false, 'playback_confirmed' => false];
         if (!is_string($correlation) || !preg_match('/^[A-Za-z0-9_.:-]{1,128}$/D', $correlation)) { return $unavailable; }
         $helper = self::RUNTIME_DIR . '/sls_phone_outcomes.py';
-        if (!is_file($helper)) { return $unavailable; }
+        if (!function_exists('proc_open') || !is_executable('/usr/bin/timeout')
+            || !is_executable('/usr/bin/python3') || !is_file($helper) || !is_readable($helper)) {
+            return $unavailable;
+        }
         $pipes = [];
-        $process = proc_open(['/usr/bin/timeout', '--kill-after=1', '2', '/usr/bin/python3', '-I', $helper, $correlation],
-            [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']], $pipes, null, null, ['bypass_shell' => true]);
+        try {
+            $process = proc_open(['/usr/bin/timeout', '--kill-after=1', '2', '/usr/bin/python3', '-I', $helper, $correlation],
+                [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']], $pipes, '/',
+                ['PATH' => '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG' => 'C.UTF-8', 'LC_ALL' => 'C.UTF-8',
+                    'HOME' => '/var/lib/asterisk'], ['bypass_shell' => true]);
+        } catch (\Throwable $error) {
+            return $unavailable;
+        }
         if (!is_resource($process)) { return $unavailable; }
         $raw = stream_get_contents($pipes[1], 524289); fclose($pipes[1]);
         if (!is_string($raw) || strlen($raw) > 524288) { proc_terminate($process); }
         $exit = proc_close($process);
-        $value = is_string($raw) && strlen($raw) <= 524288 ? json_decode($raw, true) : null;
+        try { $value = is_string($raw) && strlen($raw) <= 524288 ? \SLS\MassNotify\ApiSecurity::jsonObject($raw) : null; }
+        catch (\Throwable $error) { $value = null; }
         if ($exit !== 0 || !is_array($value) || ($value['ok'] ?? null) !== true
             || !is_array($value['targets'] ?? null) || count($value['targets']) > 1000) { return $unavailable; }
         foreach (['available', 'active', 'uncertain', 'truncated'] as $key) {
@@ -174,7 +218,8 @@ trait SlsAnnouncementDelivery
         }
         $request['email_recipient_ids'] = $ids;
         $smsIds = $request['sms_recipient_ids'] ?? [];
-        if ($smsIds && $this->validateSmsRecipientIds($smsIds)) { throw new \DomainException('Select at most 50 distinct saved SMS recipients.'); }
+        $smsErrors = $smsIds ? $this->validateSmsRecipientIds($smsIds) : [];
+        if ($smsErrors) { throw new \DomainException(implode(' ', $smsErrors)); }
         $request['sms_media'] = $smsIds ? $this->prepareMmsImage($request,$settings) : [];
         $request['sms_targets'] = $smsIds ? \SLS\MassNotify\Sms\Service::snapshot($settings, $smsIds, $request['title'], $request['message'], ($request['is_test'] ?? false) === true,
             array_diff_key($request['sms_media'],['data'=>true])) : [];
@@ -215,7 +260,9 @@ trait SlsAnnouncementDelivery
         if (method_exists($this, 'snapshotEnterpriseIntegrationResponses')) {
             $request = $this->snapshotEnterpriseIntegrationResponses($request, $settings);
         }
-        if(method_exists($this,'snapshotEnterpriseAnnouncementChannels')){$request=$this->snapshotEnterpriseAnnouncementChannels($request,$settings);}
+        if (method_exists($this, 'snapshotEnterpriseAnnouncementChannels')) {
+            $request = $this->snapshotEnterpriseAnnouncementChannels($request, $settings);
+        }
         return $request;
     }
 
@@ -250,6 +297,12 @@ trait SlsAnnouncementDelivery
             throw new \RuntimeException('Announcement job storage is unavailable.');
         }
         return $directory;
+    }
+
+    /** All announcement producers share this one gate, outside the job directory. */
+    protected function announcementAdmissionDirectory(): string
+    {
+        return self::PLUGIN_DATA_DIR;
     }
 
     /** Pure construction; caller must durably link preparing intent before persistence. */
@@ -295,8 +348,12 @@ trait SlsAnnouncementDelivery
                 }
                 return $existing;
             }
-            if (count($store->pendingIds()) >= 25) { throw new \RuntimeException('Announcement queue capacity is reached.'); }
-            $this->writeAnnouncementJob($job);
+            $queueGate = (new \SlsAnnouncementJobStore($this->announcementAdmissionDirectory()))->admissionLock();
+            if (!$queueGate) { throw new \RuntimeException('Scheduled announcement preparation is waiting for the shared queue gate.'); }
+            try {
+                if (count($store->pendingIds()) >= 25) { throw new \RuntimeException('Announcement queue capacity is reached.'); }
+                $this->writeAnnouncementJob($job);
+            } finally { \SlsAnnouncementJobStore::unlock($queueGate); }
             return $job;
         } finally { \SlsAnnouncementJobStore::unlock($lock); }
     }
@@ -335,8 +392,11 @@ trait SlsAnnouncementDelivery
 
     private function activateScheduledAnnouncementJob(array $record): array
     {
-        if (!$this->announcementClusterAuthorityAvailable()) { return ['success'=>false,'deferred'=>true,'state'=>'prepared','job_id'=>$record['job_id'],'message'=>'Cluster exclusive authority is unavailable; this node did not change pending delivery.']; }
         $context = $this->scheduledAnnouncementRecordContext($record);
+        if (!$this->announcementClusterAuthorityAvailable()) {
+            return ['success' => false, 'deferred' => true, 'state' => 'prepared', 'job_id' => $record['job_id'],
+                'message' => 'Cluster exclusive authority is unavailable; this node did not change pending delivery.'];
+        }
         $store = new \SlsAnnouncementJobStore($this->announcementJobDirectory());
         $lock = $store->lock($record['job_id']);
         if (!$lock) { return ['success' => false, 'deferred' => true, 'state' => 'prepared', 'job_id' => $record['job_id'], 'message' => 'Scheduled delivery is busy.']; }
@@ -350,18 +410,25 @@ trait SlsAnnouncementDelivery
             if (($job['state'] ?? '') === 'prepared') {
                 if (time() >= $context['deadline_at']) { $store->failure($job, 'job_expired'); }
                 else {
-                    $admission = $this->admitScheduledAnnouncementRequest($job['request']);
+                    try {
+                        $admission = $this->commitScheduledAnnouncementAdmission($job['request'], function () use (&$job, $context): bool {
+                            if (time() >= $context['deadline_at']) { throw new \OutOfBoundsException('schedule_deadline_expired'); }
+                            $job['state'] = 'queued';
+                            $job['activated_at'] = gmdate('c');
+                            $job['startup_attempted_at'] = $job['activated_at'];
+                            $job['message'] = 'Scheduled announcement admitted; awaiting worker startup.';
+                            $this->writeAnnouncementJob($job);
+                            return true;
+                        });
+                    } catch (\OutOfBoundsException $error) {
+                        $store->failure($job, 'job_expired');
+                        $admission = ['success' => false, 'error_code' => 'schedule_deadline_expired'];
+                    }
                     if (empty($admission['success'])) {
+                        if (($admission['error_code'] ?? '') === 'schedule_deadline_expired') { return $this->getAnnouncementJob($job['id']); }
                         return array_merge($admission, ['job_id' => $job['id'], 'state' => 'prepared']);
                     }
-                    // A slow durable admission must not move the original deadline.
-                    if (time() >= $context['deadline_at']) { $store->failure($job, 'job_expired'); }
-                    else {
-                        $job['state'] = 'queued'; $job['activated_at'] = gmdate('c');
-                        $job['startup_attempted_at'] = $job['activated_at'];
-                        $job['message'] = 'Scheduled announcement admitted; awaiting worker startup.';
-                        $this->writeAnnouncementJob($job); $start = true;
-                    }
+                    $start = true;
                 }
             }
         } finally { \SlsAnnouncementJobStore::unlock($lock); }
@@ -391,17 +458,40 @@ trait SlsAnnouncementDelivery
         }
     }
 
+    private function announcementJobReceiptRows(array $job): array
+    {
+        $rows = array_values(array_filter(is_array($job['receipts'] ?? null) ? $job['receipts'] : [], 'is_array'));
+        if ($rows) { return $rows; }
+        // Releases before the top-level receipt journal stored final receipts
+        // only inside result. Retain that bounded migration fallback only when
+        // no authoritative top-level rows exist; current writers never duplicate
+        // the receipt array in result.
+        $legacy = $job['result']['receipts'] ?? null;
+        return is_array($legacy) && array_is_list($legacy) && count($legacy) <= 5000
+            && count(array_filter($legacy, 'is_array')) === count($legacy) ? $legacy : [];
+    }
+
+    /** Retry only exact failed destinations understood by the current dispatcher. */
+    private function announcementRetryReceiptRows(array $job): array
+    {
+        $channels = ['audio', 'sip_notify', 'desktop', 'webhook', 'external_voice',
+            'email', 'sms', 'browser_push', 'connector'];
+        return array_values(array_filter($this->announcementJobReceiptRows($job), static function ($row) use ($channels): bool {
+            $channel = $row['channel'] ?? null; $target = $row['target'] ?? null;
+            return ($row['state'] ?? null) === 'failed' && ($row['retryable'] ?? null) === true
+                && is_string($channel) && in_array($channel, $channels, true)
+                && is_string($target) && $target !== '' && strlen($target) <= 160
+                && !preg_match('/[\x00-\x1F\x7F]/', $target);
+        }));
+    }
+
     public function getAnnouncementJob($id)
     {
-        if (!is_string($id) || !preg_match('/^job_[a-f0-9]{32}$/', $id)) {
+        if (!is_string($id) || !preg_match('/^job_[a-f0-9]{32}$/D', $id)) {
             return ['success' => false, 'state' => 'missing', 'message' => 'Unknown announcement job.'];
         }
         try {
             $store = new \SlsAnnouncementJobStore($this->announcementJobDirectory());
-            // Polling a standby is read-only. It must not renew a witness lease
-            // or retire a pending job as a side effect of reading its status.
-            $clusterEnabled=method_exists($this,'getActiveSettings') && \SLS\MassNotify\EnterpriseClusterConfig::enabled($this->getActiveSettings());
-            if (!$clusterEnabled && function_exists('posix_geteuid') && posix_geteuid() === fileowner($store->directory())) { $store->reconcile($id); }
             $job = $store->read($id);
         } catch (\Throwable $error) {
             return ['success' => false, 'state' => 'missing', 'message' => 'Announcement job is unavailable.'];
@@ -409,22 +499,65 @@ trait SlsAnnouncementDelivery
         if (!is_array($job)) {
             return ['success' => false, 'state' => 'failed', 'message' => 'Announcement job is unreadable.'];
         }
+        if (!is_array($job['request'] ?? null)) {
+            return ['success' => false, 'state' => 'failed', 'message' => 'Announcement job is invalid.'];
+        }
+        $job['receipts'] = $this->announcementJobReceiptRows($job);
         $principal = $GLOBALS['sls_control_principal'] ?? null;
         if (is_array($principal) && ($principal['audience']['unrestricted'] ?? false) !== true
             && ($job['request']['api_credential_id'] ?? '') !== ($principal['id'] ?? '')) {
             return ['success' => false, 'error_code' => 'permission_denied', 'message' => 'This credential cannot access that announcement.'];
         }
+        try {
+            // Authorization precedes reconciliation so a restricted credential
+            // cannot mutate another credential's job merely by learning its ID.
+            // Polling a cluster standby also remains read-only.
+            $clusterEnabled = method_exists($this, 'getActiveSettings')
+                && \SLS\MassNotify\EnterpriseClusterConfig::enabled($this->getActiveSettings());
+            if (!$clusterEnabled && function_exists('posix_geteuid')
+                && posix_geteuid() === fileowner($store->directory())) {
+                $store->reconcile($id);
+                $job = $store->read($id);
+                if (!is_array($job) || !is_array($job['request'] ?? null)) {
+                    return ['success' => false, 'state' => 'failed', 'message' => 'Announcement job is unavailable after reconciliation.'];
+                }
+                $job['receipts'] = $this->announcementJobReceiptRows($job);
+                if (is_array($principal) && ($principal['audience']['unrestricted'] ?? false) !== true
+                    && ($job['request']['api_credential_id'] ?? '') !== ($principal['id'] ?? '')) {
+                    return ['success' => false, 'error_code' => 'permission_denied', 'message' => 'This credential cannot access that announcement.'];
+                }
+            }
+        } catch (\Throwable $error) {
+            return ['success' => false, 'state' => 'failed', 'message' => 'Announcement job is unavailable during reconciliation.'];
+        }
         $retryable = in_array($job['state'] ?? '', ['failed', 'partial_or_failed'], true)
             && empty($job['submission_uncertain']) && empty($job['retry_job_id'])
             && (empty($job['request']['email_recipient_ids']) || (is_int($job['request']['email_expires_at'] ?? null) && time() < $job['request']['email_expires_at']))
+            && (empty($job['request']['sms_recipient_ids']) || (is_int($job['request']['sms_expires_at'] ?? null) && time() < $job['request']['sms_expires_at']))
             && (!isset($job['request']['schedule_context']) || time() < $this->scheduledAnnouncementDeadline($job['request']))
             && time() - (strtotime($job['created_at'] ?? '') ?: 0) <= 900
-            && count(array_filter($job['receipts'] ?? [], static function ($row) { return ($row['state'] ?? '') === 'failed' && ($row['retryable'] ?? true); })) > 0;
+            && count($this->announcementRetryReceiptRows($job)) > 0;
         // The stored job flag marks a lost worker, whose unrecorded submissions
         // must never be replayed. Explicit uncertain receipts are also exposed
         // publicly, while other confirmed failures may still be retried alone.
         $submissionUncertain = !empty($job['submission_uncertain'])
             || count(array_filter($job['receipts'] ?? [], static function ($row) { return ($row['state'] ?? '') === 'uncertain'; })) > 0;
+        $storedResult = is_array($job['result'] ?? null) ? $job['result'] : [];
+        // A channel result is evidence, not authority over the durable job.
+        // Retain only typed display metadata; identity, state, receipts,
+        // timestamps, retry policy and sender always come from the job record.
+        $storedProjection = [];
+        foreach (['schedule_expired', 'partial_delivery', 'delivery_started', 'desktop_published'] as $key) {
+            if (is_bool($storedResult[$key] ?? null)) { $storedProjection[$key] = $storedResult[$key]; }
+        }
+        if (is_int($storedResult['display_timeout_seconds'] ?? null)
+            && $storedResult['display_timeout_seconds'] >= 0 && $storedResult['display_timeout_seconds'] <= 86400) {
+            $storedProjection['display_timeout_seconds'] = $storedResult['display_timeout_seconds'];
+        }
+        if (is_int($storedResult['cooldown_remaining'] ?? null)
+            && $storedResult['cooldown_remaining'] >= 0 && $storedResult['cooldown_remaining'] <= 86400) {
+            $storedProjection['cooldown_remaining'] = $storedResult['cooldown_remaining'];
+        }
         $public = array_merge([
             'success' => in_array($job['state'] ?? '', ['prepared', 'queued', 'worker_starting', 'running', 'complete'], true),
             'job_id' => $id, 'state' => $job['state'] ?? 'failed',
@@ -440,7 +573,15 @@ trait SlsAnnouncementDelivery
             'submission_uncertain' => $submissionUncertain,
             'retry_operator' => $job['request']['retry_operator'] ?? '',
             'retryable' => $retryable,
-        ], $job['result'] ?? []);
+        ], $storedProjection);
+        foreach (['job_id' => $id, 'state' => $job['state'] ?? 'failed',
+            'api_credential_id' => (string)($job['request']['api_credential_id'] ?? ''),
+            'created_at' => $job['created_at'] ?? '', 'failure_category' => $job['failure_category'] ?? '',
+            'startup_attempted_at' => $job['startup_attempted_at'] ?? '', 'started_at' => $job['started_at'] ?? '',
+            'finished_at' => $job['finished_at'] ?? '', 'retry_operator' => $job['request']['retry_operator'] ?? '',
+            'retryable' => $retryable] as $key => $value) {
+            $public[$key] = $value;
+        }
         $public['submission_uncertain'] = $submissionUncertain;
         if (in_array($public['failure_category'] ?? '', ['channel_submission_failed', 'audio_submission_failed', 'sip_notify_submission_failed'], true)) {
             $public['message'] = \SlsAnnouncementJobStore::failureReason($public['failure_category'], $public['receipts'] ?? []);
@@ -463,10 +604,6 @@ trait SlsAnnouncementDelivery
         if ($this->getAnnouncementCooldownState()['remaining'] > 0) {
             return ['success' => false, 'message' => 'Wait for the announcement cooldown before retrying.'];
         }
-        if (count(glob($this->announcementJobDirectory() . '/pending_job_*.mark') ?: []) >= 25) {
-            return ['success' => false, 'message' => 'The announcement queue is full. Wait for pending deliveries.'];
-        }
-        $path = $this->announcementJobDirectory() . '/' . $id . '.json';
         $store = new \SlsAnnouncementJobStore($this->announcementJobDirectory());
         $lock = $store->lock($id);
         if (!$lock) {
@@ -487,10 +624,13 @@ trait SlsAnnouncementDelivery
                 if (($principal['id'] ?? '') !== 'legacy') { $request['api_credential_id'] = $principal['id']; }
             }
             $request['only_channels'] = [];
-            foreach ($job['receipts'] ?? [] as $row) {
-                if (($row['state'] ?? '') === 'failed' && ($row['retryable'] ?? true)) {
-                    $request['only_channels'][$row['channel']][] = (string)$row['target'];
-                }
+            // Older releases stored the final receipt journal only inside
+            // result. Use the same bounded compatibility projection as the
+            // public job view so a legacy retry cannot claim its parent while
+            // creating an empty child request.
+            $job['receipts'] = $this->announcementJobReceiptRows($job);
+            foreach ($this->announcementRetryReceiptRows($job) as $row) {
+                $request['only_channels'][$row['channel']][] = $row['target'];
             }
             $request['retry_operator'] = $this->announcementSender($options);
             $request['retry_of'] = $id;
@@ -503,9 +643,17 @@ trait SlsAnnouncementDelivery
             // Record the retry claim first. A crash can require operator review,
             // but two clicks cannot create duplicate retry deliveries.
             $job['retry_job_id'] = $child['id'];
-            $this->writeAnnouncementJob($job);
-            $this->recordInteractiveAnnouncementAdmission($request);
-            $this->writeAnnouncementJob($child);
+            try {
+                $this->recordInteractiveAnnouncementAdmission($request, function () use ($store, $job, $child): bool {
+                    if (count($store->pendingIds()) >= 25) { throw new \OverflowException('announcement_queue_full'); }
+                    $this->writeAnnouncementJob($job);
+                    $this->writeAnnouncementJob($child);
+                    return true;
+                }, $child['id']);
+            } catch (\OverflowException $error) {
+                return ['success' => false, 'message' => 'The announcement queue is full. Wait for pending deliveries.',
+                    'error_code' => 'delivery_busy'];
+            }
             if ($this->startAnnouncementWorker($child['id']) === false) { return $this->getAnnouncementJob($child['id']); }
             return ['success' => true, 'queued' => true, 'state' => 'worker_starting', 'job_id' => $child['id'],
                 'message' => 'Starting announcement worker.'];
@@ -526,14 +674,16 @@ trait SlsAnnouncementDelivery
             $job['state'] = 'worker_starting'; $job['startup_attempted_at'] = gmdate('c');
             $job['message'] = 'Starting announcement worker.'; $this->writeAnnouncementJob($job);
             $worker = self::RUNTIME_DIR . '/sls_mass_notify_announcement_worker.php';
-            foreach (['/usr/bin/nohup', '/usr/bin/timeout', '/usr/bin/php', $worker] as $required) {
+            foreach (['/usr/bin/nohup', '/usr/bin/env', '/usr/bin/timeout', '/usr/bin/php', $worker] as $required) {
                 if (!is_executable($required)) { $store->failure($job, 'worker_start_failed'); return false; }
             }
             if (!is_readable(self::RUNTIME_DIR . '/sls_announcement_jobs.php') || !is_callable('exec')) {
                 $store->failure($job, 'worker_start_failed'); return false;
             }
             $output = []; $exit = 1;
-            exec('/usr/bin/nohup /usr/bin/timeout --kill-after=5s 930 /usr/bin/php '
+            exec('/usr/bin/nohup /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin '
+                . 'LANG=C.UTF-8 LC_ALL=C.UTF-8 HOME=/var/lib/asterisk '
+                . '/usr/bin/timeout --kill-after=5s 930 /usr/bin/php '
                 . escapeshellarg($worker) . ' --supervise ' . escapeshellarg($id)
                 . ' </dev/null >/dev/null 2>&1 & echo $!', $output, $exit);
             if ($exit !== 0 || !preg_match('/^[1-9][0-9]*$/D', trim(implode('', $output)))) {
@@ -578,7 +728,9 @@ trait SlsAnnouncementDelivery
         $request['delivery_id'] = 'announcement-' . bin2hex(random_bytes(16));
         $request['delivery_timestamp'] = gmdate('c');
         if (!empty($request['sms_recipient_ids'])) { $request['force_queue']=true; $request['sms_expires_at']=time()+900; }
-        if(!empty($request['browser_targets'])||!empty($request['connector_fingerprints'])){$request['force_queue']=true;}
+        if (!empty($request['browser_targets']) || !empty($request['connector_fingerprints'])) {
+            $request['force_queue'] = true;
+        }
         if (!empty($request['email_recipient_ids'])) {
             $request['force_queue'] = true;
             $request['email_expires_at'] = time() + 900;
@@ -588,24 +740,28 @@ trait SlsAnnouncementDelivery
             }
             unset($target);
         }
-        $this->recordInteractiveAnnouncementAdmission($request);
         if (PHP_SAPI !== 'cli' || !empty($request['force_queue'])) {
             $this->reconcileAnnouncementJobs();
-            // Admission only reads the small pending index, never a month's
-            // completed delivery history on an interactive request.
-            $pending = count(glob($this->announcementJobDirectory() . '/pending_job_*.mark') ?: []);
-            if ($pending >= 25) {
-                return ['success' => false, 'message' => 'The announcement queue is full. Wait for pending deliveries.', 'error_code' => 'delivery_busy'];
-            }
             $job = ['id' => 'job_' . bin2hex(random_bytes(16)), 'state' => 'queued',
                 'created_at' => gmdate('c'), 'request' => $request, 'receipts' => [], 'message' => 'Announcement queued.'];
-            $this->writeAnnouncementJob($job);
+            $store = new \SlsAnnouncementJobStore($this->announcementJobDirectory());
+            try {
+                $this->recordInteractiveAnnouncementAdmission($request, function () use ($store, $job): bool {
+                    if (count($store->pendingIds()) >= 25) { throw new \OverflowException('announcement_queue_full'); }
+                    $this->writeAnnouncementJob($job);
+                    return true;
+                }, $job['id']);
+            } catch (\OverflowException $error) {
+                return ['success' => false, 'message' => 'The announcement queue is full. Wait for pending deliveries.',
+                    'error_code' => 'delivery_busy'];
+            }
             // Only a generated identifier enters this fixed command. No message,
             // destination, credential, or supplied executable enters a shell.
             if ($this->startAnnouncementWorker($job['id']) === false) { return $this->getAnnouncementJob($job['id']); }
             return ['success' => true, 'queued' => true, 'state' => 'worker_starting', 'job_id' => $job['id'],
                 'message' => 'Announcement queued. Waiting for delivery results.', 'sender' => $request['sender']];
         }
+        $this->recordInteractiveAnnouncementAdmission($request);
         // The public CLI facade may own admission. Durable reservation is
         // complete; do not hold the send mutex through TTS or transport waits.
         if (isset($this->announcementAdmissionLock) && is_resource($this->announcementAdmissionLock)) {
@@ -618,7 +774,7 @@ trait SlsAnnouncementDelivery
     public function processAnnouncementJobs($requestedId = '')
     {
         if (PHP_SAPI !== 'cli') { throw new \RuntimeException('Announcement workers require CLI execution.'); }
-        if ($requestedId !== '' && !preg_match('/^job_[a-f0-9]{32}$/', $requestedId)) { return false; }
+        if ($requestedId !== '' && !preg_match('/^job_[a-f0-9]{32}$/D', $requestedId)) { return false; }
         if (!$this->announcementClusterAuthorityAvailable()) { return false; }
         $store = new \SlsAnnouncementJobStore($this->announcementJobDirectory());
         $ids = $requestedId !== '' ? [$requestedId] : $store->pendingIds(); sort($ids);
@@ -641,14 +797,15 @@ trait SlsAnnouncementDelivery
                 }
                 if (!in_array($job['state'] ?? '', ['queued', 'worker_starting'], true)) { continue; }
                 if (!empty($job['request']['weather_context'])) {
-                    if (time() >= ($job['request']['weather_context']['deadline_at'] ?? 0) || time() - (strtotime($job['created_at'] ?? '') ?: 0) > 900) { $store->failure($job,'job_expired'); $finished=true; continue; }
+                    if (time() >= ($job['request']['weather_context']['deadline_at'] ?? 0) || time() - (strtotime($job['created_at'] ?? '') ?: 0) > 900) { $store->failure($job,'job_expired'); $allSucceeded=false; $finished=true; continue; }
                     try { $weather=$this->weatherChannelAuthorization($job['request']['weather_context']); }
                     catch (\Throwable $error) { $weather=['status'=>'deferred']; }
-                    if ($weather['status']==='deferred') {
+                    $weatherStatus=is_array($weather)&&in_array($weather['status']??null,['eligible','deferred','cancelled'],true)?$weather['status']:'deferred';
+                    if ($weatherStatus==='deferred') {
                         $job['state']='queued'; $job['message']='Waiting for a current Weather observation and permitted quiet-hours policy.';
                         $this->writeAnnouncementJob($job); $finished=true; continue;
                     }
-                    if ($weather['status']==='cancelled') { $store->failure($job,'weather_source_cancelled'); $finished=true; continue; }
+                    if ($weatherStatus==='cancelled') { $store->failure($job,'weather_source_cancelled'); $finished=true; continue; }
                 }
                 $deadline = $this->scheduledAnnouncementDeadline($job['request']);
                 if (($deadline !== null && time() >= $deadline) || time() - (strtotime($job['created_at'] ?? '') ?: 0) > 900) {
@@ -659,7 +816,7 @@ trait SlsAnnouncementDelivery
                 // Derive one from their durable identity before any submission.
                 $executionRequest = $job['request'];
                 if (empty($executionRequest['delivery_id'])) {
-                    $executionRequest['delivery_id'] = 'announcement-' . $job['id'];
+                    $executionRequest['delivery_id'] = 'announcement-' . substr($job['id'], 4);
                 }
                 if (empty($executionRequest['delivery_timestamp'])) {
                     $executionRequest['delivery_timestamp'] = $job['created_at'] ?? '';
@@ -676,7 +833,9 @@ trait SlsAnnouncementDelivery
                 try {
                     $result = $this->executeResolvedAnnouncement($executionRequest, $progress);
                     $job['state'] = !empty($result['success']) ? 'complete' : ((!empty($result['schedule_expired']) && empty($result['delivery_started'])) ? 'expired' : 'failed');
-                    $job['result'] = $result; $job['message'] = $result['message'];
+                    $job['result'] = array_intersect_key($result, array_flip(['success', 'schedule_expired', 'partial_delivery',
+                        'delivery_started', 'submission_uncertain', 'desktop_published', 'cooldown_remaining', 'display_timeout_seconds']));
+                    $job['message'] = $result['message'];
                     $job['receipts'] = $result['receipts'];
                     if (in_array($job['state'], ['failed', 'expired'], true)) {
                         $allSucceeded = false;
@@ -752,7 +911,7 @@ trait SlsAnnouncementDelivery
                 'worker_probe_stale'=>'The announcement-worker health report is older than ten minutes. Check the SLS root maintenance cron, its lock and maintenance log. The last completed job is historical.'
             ];
             $result['health_reason'] = $healthReasons[$result['health_failure_code']] ?? '';
-            $result['latest_state'] = in_array($state['state'] ?? '', ['prepared', 'queued', 'worker_starting', 'running', 'complete', 'failed', 'expired'], true) ? $state['state'] : 'idle';
+            $result['latest_state'] = in_array($state['state'] ?? '', ['prepared', 'queued', 'worker_starting', 'running', 'complete', 'failed', 'cancelled', 'expired'], true) ? $state['state'] : 'idle';
             $result['active_delivery_failure'] = SlsStatusHealth::announcementFailure($state, $probe, time());
             $category = !$result['bootstrap_ok'] ? ($probe['failure_category'] ?? '') : ($state['failure_category'] ?? '');
             if (isset(\SlsAnnouncementJobStore::REASONS[$category])) {
@@ -816,7 +975,7 @@ trait SlsAnnouncementDelivery
 
     protected function startAnnouncementPhoneVisualProcess(string $command, float $seconds)
     {
-        if (!function_exists('proc_open') || !is_executable('/usr/bin/timeout')) { return false; }
+        if (!function_exists('proc_open') || !is_executable('/usr/bin/timeout') || !is_executable('/bin/sh')) { return false; }
         $pipes = [];
         // The command is built only by our escaped visual command builder.
         // timeout owns the process group. The builder's managed_deadline option
@@ -825,7 +984,8 @@ trait SlsAnnouncementDelivery
         return @proc_open(['/usr/bin/timeout', '--signal=TERM', '--kill-after=1', (string)$seconds,
             '/bin/sh', '-c', 'exec ' . $command],
             [0 => ['file', '/dev/null', 'r'], 1 => ['file', '/dev/null', 'w'], 2 => ['file', '/dev/null', 'w']],
-            $pipes, null, null, ['bypass_shell' => true]);
+            $pipes, '/', ['PATH' => '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG' => 'C.UTF-8', 'LC_ALL' => 'C.UTF-8',
+                'HOME' => '/var/lib/asterisk'], ['bypass_shell' => true]);
     }
 
     private function stopAnnouncementPhoneVisualProcesses(array &$running): void
@@ -905,8 +1065,34 @@ trait SlsAnnouncementDelivery
                         $pending = []; break;
                     }
                     $target = array_key_first($pending); $command = $pending[$target]; unset($pending[$target]);
-                    if ($authorized !== null && !$authorized((string)$target)) {
-                        $completed((string)$target,['success'=>false,'started'=>false,'reason'=>'permission_changed']); continue;
+                    if ($authorized !== null) {
+                        try { $permitted = $authorized((string)$target) === true; }
+                        catch (\Throwable $error) { $permitted = false; }
+                        if (!$permitted) {
+                            $completed((string)$target, ['success' => false, 'started' => false, 'reason' => 'permission_changed']);
+                            continue;
+                        }
+                    }
+                    // Authorization may consult protected state. Recheck both
+                    // clocks after it returns so a slow check cannot launch a
+                    // sender beyond either delivery boundary.
+                    $remaining = $deadline - hrtime(true) / 1000000000;
+                    if ($latestStart !== null && (time() >= $submissionDeadlineAt
+                        || hrtime(true) / 1000000000 >= $latestStart)) {
+                        $completed((string)$target, ['success' => false, 'started' => false, 'reason' => 'schedule_deadline']);
+                        foreach (array_keys($pending) as $pendingTarget) {
+                            $completed((string)$pendingTarget, ['success' => false, 'started' => false, 'reason' => 'schedule_deadline']);
+                        }
+                        $pending = [];
+                        break;
+                    }
+                    if ($remaining <= 0) {
+                        $completed((string)$target, ['success' => false, 'started' => false, 'reason' => 'phase_timeout']);
+                        foreach (array_keys($pending) as $pendingTarget) {
+                            $completed((string)$pendingTarget, ['success' => false, 'started' => false, 'reason' => 'phase_timeout']);
+                        }
+                        $pending = [];
+                        break;
                     }
                     try { $process = is_string($command) && $command !== ''
                         ? $this->startAnnouncementPhoneVisualProcess($command, min($childSeconds, $remaining)) : false; }
@@ -945,8 +1131,8 @@ trait SlsAnnouncementDelivery
         $request['webhooks'] = $channelTargets('webhook', $request['webhooks']);
         $receipts = [];
         $record = function ($channel, $target, $state, $detail = '', $retryable = true, array $metadata = []) use (&$receipts, $progress) {
-            $receipts[] = array_merge(['channel' => $channel, 'target' => (string)$target, 'state' => $state, 'detail' => $detail,
-                'retryable' => $state === 'failed' && $retryable], $metadata);
+            $receipts[] = array_merge($metadata, ['channel' => $channel, 'target' => (string)$target, 'state' => $state, 'detail' => $detail,
+                'retryable' => $state === 'failed' && $retryable]);
             if ($progress) { $progress($receipts, 'Delivering announcement…'); }
         };
         $scheduleDeadline = $this->scheduledAnnouncementDeadline($request);
@@ -961,10 +1147,16 @@ trait SlsAnnouncementDelivery
             return [];
         };
         $filterCredentialTargets = function (string $channel, string $key, array $targets) use ($request, $record): array {
+            if (!$targets) { return []; }
             if (!empty($request['weather_context'])) {
                 try { $allowed = $this->weatherChannelAuthorization($request['weather_context']); }
                 catch (\Throwable $error) { $allowed = ['status'=>'deferred']; }
-                $eligible = $allowed['status'] === 'eligible' ? ($allowed[$key === 'voice_recipient_ids' ? 'voice_recipient_ids' : 'sms_recipient_ids'] ?? []) : [];
+                $status=is_array($allowed)&&in_array($allowed['status']??null,['eligible','deferred','cancelled'],true)?$allowed['status']:'deferred';
+                if ($status !== 'eligible') {
+                    foreach ($targets as $target) { $record($channel, $target, 'cancelled', 'Weather source or current quiet-hours policy no longer permits this delivery.', false); }
+                    return [];
+                }
+                $eligible = $allowed[$key === 'voice_recipient_ids' ? 'voice_recipient_ids' : 'sms_recipient_ids'] ?? [];
                 if (in_array($key, ['voice_recipient_ids', 'sms_recipient_ids'], true)) {
                     foreach (array_diff($targets, $eligible) as $target) { $record($channel, $target, 'cancelled', 'Weather source, current quiet hours or original recipient authorization no longer permits this delivery.', false); }
                     $targets = array_values(array_intersect($targets, $eligible));
@@ -973,6 +1165,19 @@ trait SlsAnnouncementDelivery
             if (!empty($request['automation_context']) && !$this->automationContextPermitted($request['automation_context'])) {
                 foreach ($targets as $target) { $record($channel,$target,'cancelled','Trigger expired, was revoked, changed or superseded before this destination.',false); }
                 return [];
+            }
+            if ($key === 'desktops' && $targets) {
+                $currentIds = [];
+                foreach ($this->getActiveSettings()['desktop_clients'] ?? [] as $client) {
+                    if (is_array($client) && !empty($client['enabled'])) { $currentIds[(string)($client['username'] ?? '')] = (string)($client['client_id'] ?? ''); }
+                }
+                $retained = [];
+                foreach ($targets as $username) {
+                    if (isset($request['desktop_client_ids'][$username], $currentIds[$username])
+                        && hash_equals((string)$request['desktop_client_ids'][$username], $currentIds[$username])) { $retained[] = $username; }
+                    else { $record($channel, $username, 'cancelled', 'The original desktop enrollment was disabled, removed, or replaced.', false); }
+                }
+                $targets = $retained;
             }
             if (!isset($request['api_credential_id']) || !$targets) { return $targets; }
             $settings = $this->getActiveSettings();
@@ -1078,6 +1283,7 @@ trait SlsAnnouncementDelivery
             if (empty($request['desktops'])) { return; }
             $command = $this->buildAnnouncementVisualPushCommand($visualMessage, [], $displayTimeout, [
                 'mode' => 'api_only', 'desktop_clients' => $request['desktops'],
+                'desktop_client_ids' => $request['desktop_client_ids'] ?? [],
                 'schedule_deadline_at' => $scheduleDeadline,
                 'incident_context' => $request['incident_context'] ?? null,
                 'is_test' => ($request['is_test'] ?? false) === true,
@@ -1086,27 +1292,37 @@ trait SlsAnnouncementDelivery
             $command = \SLS\MassNotify\EnterpriseClusterIntegration::command($request, $command, method_exists($this,'getActiveSettings') ? $this->getActiveSettings() : []);
             try { $result = $this->executeAnnouncementVisualPushCommand($command); }
             catch (\Throwable $error) { $result = ['success' => false]; }
-            $desktopPublished = !empty($result['success']);
-            $expiredBeforePublication = !$desktopPublished && ($result['exit_code'] ?? null) === 78
-                && in_array('SLS_SUBMISSION_REJECTED schedule_deadline_expired', $result['output'] ?? [], true);
-            $eventId = '';
-            foreach (($result['output'] ?? []) as $line) {
+            $helperSucceeded = ($result['success'] ?? null) === true;
+            $output = is_array($result['output'] ?? null) ? $result['output'] : [];
+            $expiredBeforePublication = !$helperSucceeded && ($result['exit_code'] ?? null) === 78
+                && in_array('SLS_SUBMISSION_REJECTED schedule_deadline_expired', $output, true);
+            $publicationRows = 0;
+            $publicationIds = [];
+            foreach ($output as $line) {
                 if (strpos((string)$line, 'SLS_DESKTOP_PUBLICATION ') !== 0) { continue; }
-                $publication = json_decode(substr($line, strlen('SLS_DESKTOP_PUBLICATION ')), true);
-                if (is_string($publication['event_id'] ?? null)
-                    && preg_match('/^announcement-[0-9]{20}-[a-f0-9]{32}$/D', $publication['event_id'])) { $eventId = $publication['event_id']; }
+                $publicationRows++;
+                try { $publication = \SLS\MassNotify\ApiSecurity::jsonObject(substr($line, strlen('SLS_DESKTOP_PUBLICATION '))); }
+                catch (\Throwable $error) { continue; }
+                if (is_array($publication) && is_string($publication['event_id'] ?? null)
+                    && preg_match('/^announcement-[0-9]{20}-[a-f0-9]{32}$/D', $publication['event_id'])) {
+                    $publicationIds[] = $publication['event_id'];
+                }
             }
+            $eventId = $publicationRows === 1 && count($publicationIds) === 1 ? $publicationIds[0] : '';
+            $desktopPublished = $helperSucceeded && $eventId !== '';
             foreach ($request['desktops'] as $target) {
                 if ($expiredBeforePublication) {
                     $record('desktop', $target, 'failed', 'The scheduled start deadline elapsed before the desktop event was published. No event was submitted.', false,
                         ['submission_started' => false, 'failure_category' => 'schedule_deadline']);
                     continue;
                 }
-                $metadata = $desktopPublished && $eventId !== '' ? ['event_id' => $eventId] : [];
+                $metadata = $desktopPublished ? ['event_id' => $eventId] : [];
                 if (array_key_exists($target, $request['desktop_client_ids'] ?? [])) { $metadata['client_id'] = $request['desktop_client_ids'][$target]; }
                 $record('desktop', $target, $desktopPublished ? 'published' : 'uncertain',
-                    $desktopPublished ? ($eventId !== '' ? 'Awaiting desktop application receipt.' : 'Published; exact receipt tracking is unavailable for this event.')
-                        : 'Desktop journal publication could not be confirmed.', false, $metadata);
+                    $desktopPublished ? 'Awaiting desktop application receipt.'
+                        : ($helperSucceeded
+                            ? 'The desktop sender did not return one exact durable event identity. Delivery is uncertain and will not be replayed automatically.'
+                            : 'Desktop journal publication could not be confirmed.'), false, $metadata);
             }
         };
         $needsDuration = $request['timeout_mode'] === 'audio' && $request['audio_mode'] !== 'none';
@@ -1135,7 +1351,8 @@ trait SlsAnnouncementDelivery
                     'automation_context' => $request['automation_context'] ?? null,
                     'outbound_targets' => $batch['outbound'], 'correlation' => $request['delivery_id'] ?? '',
                     'schedule_deadline_at' => $scheduleDeadline,
-                ]); } catch (\Throwable $error) { $audio = ['success' => false, 'message' => 'Audio preparation or queueing failed.']; }
+                ]); } catch (\Throwable $error) { $audio = ['success' => false, 'message' => 'Audio preparation or queueing stopped without a durable result.',
+                    'submission_uncertain' => true, 'delivery_started' => true, 'retryable' => false]; }
                 $audioDuration = max($audioDuration, (int)ceil($audio['audio_duration_seconds'] ?? 0));
                 $audioQueued = $audioQueued || !empty($audio['delivery_started']);
                 if ($batch['phones']) { $phoneAudio = $audio; }
@@ -1148,7 +1365,7 @@ trait SlsAnnouncementDelivery
                     continue;
                 }
                 $accepted = !empty($this->lastAudioQueueResults[(string)$target]);
-                $uncertain = $accepted && !empty($audio['submission_uncertain']);
+                $uncertain = !empty($audio['submission_uncertain']);
                 $record('audio', $target, $uncertain ? 'uncertain' : ($accepted ? 'queued' : 'failed'),
                     $uncertain ? 'A call file was submitted, but durable spool confirmation failed. Review the outcome before resubmitting.'
                         : ($accepted ? 'Queued for Asterisk; handset answer and playback are unverified.' : (string)($audio['message'] ?? 'Audio queue failed.')),
@@ -1239,6 +1456,12 @@ trait SlsAnnouncementDelivery
                 $record('sip_notify', $target, 'failed', 'Phone visual preparation failed before a sender was started.');
             }
         }
+        // filterCredentialTargets just confirmed Weather eligibility. Refresh
+        // that decision periodically during a long phone-display phase without
+        // spawning one authorization helper for every handset.
+        $visualWeatherCheckedAt = hrtime(true) / 1000000000;
+        $visualWeatherEligible = true;
+        $visualAutomationEligible = true;
         $this->executeAnnouncementPhoneVisualBatch($visualCommands, static function (string $target, array $result) use ($record): void {
             $accepted = !empty($result['success']);
             $started = !empty($result['started']);
@@ -1248,22 +1471,44 @@ trait SlsAnnouncementDelivery
                     : (($result['reason'] ?? '') === 'phase_timeout'
                         ? 'The phone visual time budget ended before this sender started. No submission was attempted.'
                         : 'The phone visual sender could not be started. No submission was attempted.'));
-            if (($result['reason'] ?? '')==='permission_changed') {
-                $record('sip_notify',$target,'cancelled','Authorization changed before this phone visual request. No request was submitted.',false); return;
+            if (($result['reason'] ?? '') === 'permission_changed') {
+                $record('sip_notify', $target, 'cancelled', 'Authorization or source eligibility changed before this phone visual request. No request was submitted.', false);
+                return;
             }
             $record('sip_notify', $target, $state, ($result['reason'] ?? '') === 'schedule_deadline' ? 'The scheduled deadline passed before this visual sender started. No submission was attempted.' : $detail, !$started && ($result['reason'] ?? '') !== 'schedule_deadline',
                 ['submission_started' => $started, 'failure_category' => $accepted ? '' : ($result['reason'] ?? 'sender_failed')]);
-        }, $scheduleDeadline, function(string $target) use($request): bool {
-            if (!empty($request['automation_context']) && !$this->automationContextPermitted($request['automation_context'])) { return false; }
+        }, $scheduleDeadline, function (string $target) use ($request, &$visualWeatherCheckedAt, &$visualWeatherEligible, &$visualAutomationEligible): bool {
+            if (!$visualAutomationEligible) { return false; }
+            if (!empty($request['automation_context']) && !$this->automationContextPermitted($request['automation_context'])) {
+                $visualAutomationEligible = false;
+                return false;
+            }
+            if (!empty($request['weather_context'])) {
+                if (!$visualWeatherEligible) { return false; }
+                $now = hrtime(true) / 1000000000;
+                if ($visualWeatherCheckedAt === 0.0 || $now - $visualWeatherCheckedAt >= 15.0) {
+                    $visualWeatherCheckedAt = $now;
+                    try { $weather = $this->weatherChannelAuthorization($request['weather_context']); }
+                    catch (\Throwable $error) { $weather = null; }
+                    $visualWeatherEligible = is_array($weather) && ($weather['status'] ?? null) === 'eligible';
+                }
+                if (!$visualWeatherEligible) { return false; }
+            }
             if (isset($request['api_credential_id'])) {
-                $settings=$this->getActiveSettings(); $principal=\SLS\MassNotify\ApiSecurity::currentCredential($settings,$request['api_credential_id']);
-                return $principal && \SLS\MassNotify\ApiSecurity::permits($principal,'send') && (($principal['audience']['unrestricted'] ?? false)===true || in_array($target,\SLS\MassNotify\ApiSecurity::allowedAudience($principal,$settings)['phones'],true));
+                $settings = $this->getActiveSettings();
+                $principal = \SLS\MassNotify\ApiSecurity::currentCredential($settings, $request['api_credential_id']);
+                $phones = is_array($principal) ? (\SLS\MassNotify\ApiSecurity::allowedAudience($principal, $settings)['phones'] ?? []) : [];
+                return is_array($principal) && \SLS\MassNotify\ApiSecurity::permits($principal, 'send')
+                    && (($principal['audience']['unrestricted'] ?? false) === true
+                        || (is_array($phones) && in_array($target, $phones, true)));
             }
             return true;
         });
         if (!empty($request['email_recipient_ids'])) { $this->deliverAnnouncementEmailTargets($request, $receipts, $progress); }
         if (!empty($request['sms_recipient_ids'])) { $this->deliverAnnouncementSmsTargets($request, $receipts, $progress); }
-        if(method_exists($this,'deliverEnterpriseAnnouncementChannels')){$this->deliverEnterpriseAnnouncementChannels($request,$record,$scheduleDeadline);}
+        if (method_exists($this, 'deliverEnterpriseAnnouncementChannels')) {
+            $this->deliverEnterpriseAnnouncementChannels($request, $record, $scheduleDeadline);
+        }
         $receiptResult = $this->refreshAnnouncementDesktopReceipts(['receipts' => $receipts], $request['delivery_timestamp'] ?? '');
         $receipts = $receiptResult['receipts'];
         $failed = array_filter($receipts, [\SlsAnnouncementJobStore::class, 'receiptNeedsAttention']);
@@ -1272,6 +1517,7 @@ trait SlsAnnouncementDelivery
         $accepted = count($receipts) - count($failed) - $unconfirmedWebhooks;
         $deadlineExpired = count(array_filter($receipts, static function ($row) { return ($row['failure_category'] ?? '') === 'schedule_deadline'; })) > 0;
         $this->appendAnnouncementNotifyLog($request['message'], [
+            'is_test' => ($request['is_test'] ?? false) === true,
             'status' => $failed ? 'partial_failure' : 'submitted', 'trigger_source' => $request['trigger_source'],
             'sender' => $sender, 'phones' => $request['phones'], 'desktop_clients' => $request['desktops'],
             'retry_operator' => $request['retry_operator'] ?? '',
@@ -1364,10 +1610,14 @@ trait SlsAnnouncementDelivery
     protected function startAnnouncementEmailProcess(&$pipes)
     {
         $pipes = [];
-        if (!function_exists('proc_open') || !is_executable('/usr/bin/timeout')) { return false; }
+        $helper = self::RUNTIME_DIR . '/sls_announcement_email.py';
+        if (!function_exists('proc_open') || !is_executable('/usr/bin/timeout')
+            || !is_executable('/usr/bin/python3') || !is_file($helper) || !is_readable($helper)) {
+            return false;
+        }
         return @proc_open(['/usr/bin/timeout', '--signal=TERM', '--kill-after=1', '10', '/usr/bin/python3', '-I',
-            self::RUNTIME_DIR . '/sls_announcement_email.py'],
-            [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']], $pipes, null,
+            $helper],
+            [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']], $pipes, '/',
             ['PATH' => '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG' => 'C.UTF-8'], ['bypass_shell' => true]);
     }
 
@@ -1403,6 +1653,11 @@ trait SlsAnnouncementDelivery
                         || in_array($id, \SLS\MassNotify\ApiSecurity::allowedAudience($principal, $settings)['email_recipient_ids'] ?? [], true));
             }
             if ($allowed && !empty($request['automation_context'])) { $allowed=$this->automationContextPermitted($request['automation_context']); }
+            if ($allowed && !empty($request['weather_context'])) {
+                try { $weather=$this->weatherChannelAuthorization($request['weather_context']); }
+                catch (\Throwable $error) { $weather=['status'=>'deferred']; }
+                $allowed=is_array($weather)&&($weather['status']??null)==='eligible';
+            }
             if (!$allowed) { $row['detail'] = 'Email destination, sender, channel availability or API permission changed after Send. No email was submitted.'; }
             elseif ($scheduleDeadline !== null && time() >= $scheduleDeadline) {
                 $row['state'] = 'failed'; $row['failure_category'] = 'schedule_deadline';

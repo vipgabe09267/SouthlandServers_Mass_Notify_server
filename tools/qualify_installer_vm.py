@@ -15,11 +15,12 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import tempfile
 import time
 
-SCENARIOS=('install','inactive-cron','missing-dashboard','term','int','hup','power-loss')
+SCENARIOS=('install','repair','uninstall','purge','inactive-cron','missing-dashboard','term','int','hup','power-loss','preparation-power-loss')
 
 
 def run(args,timeout=120,**kwargs):
@@ -78,7 +79,7 @@ def installation_command():
     return 'source /root/sls-qualification-environment; bash /root/sls-qualification-bundle/install_release.sh'
 
 
-def scenario(guest,bundle,name,baseline):
+def scenario(guest,bundle,name,baseline,environment):
     guest.start();guest.copy(bundle)
     # The prepared image must include Debian dependencies and a sanitized local
     # PBX. No carrier, provider, mail or production network is reachable here.
@@ -87,11 +88,9 @@ def scenario(guest,bundle,name,baseline):
     # Bundle path names are fixed and shell-quoted. No credentials are copied.
     packages=list(bundle.glob('slsmassnotifyserver-*.tgz'))
     if len(packages)!=1:raise RuntimeError('Provide exactly one signed candidate package.')
-    values={'SLS_MASS_NOTIFY_TGZ':'/root/sls-qualification-bundle/'+packages[0].name,
-        'SLS_MASS_NOTIFY_MANIFEST':'/root/sls-qualification-bundle/release-manifest.json',
-        'SLS_MASS_NOTIFY_MANIFEST_SIGNATURE':'/root/sls-qualification-bundle/release-manifest.sig',
-        'SLS_MASS_NOTIFY_UPSTREAM_PACKAGES':'/root/sls-qualification-bundle/upstream',
-        'SLS_MASS_NOTIFY_OFFLINE_ASSETS':'/root/sls-qualification-bundle/assets'}
+    values={key:(value.replace(str(bundle),'/root/sls-qualification-bundle',1)
+                 if value.startswith(str(bundle)+'/') else value)
+            for key,value in environment.items()}
     dashboards=list((bundle/'upstream').glob('dashboard-*.tgz.gpg'))
     if dashboards:
         versions=[path.name[len('dashboard-'):-8] for path in dashboards]
@@ -110,16 +109,20 @@ def scenario(guest,bundle,name,baseline):
     if name=='missing-dashboard':
         if baseline!='fresh':raise RuntimeError('Absent Dashboard scenario needs a fresh sanitized FreePBX image.')
         guest.ssh('mv /var/www/html/admin/modules/dashboard /root/dashboard-before-fixture')
-    if name in ('term','int','hup','power-loss'):
+    if name in ('term','int','hup','power-loss','preparation-power-loss'):
         start="import os,pathlib,subprocess\noutput=open('/root/sls-test-install.log','wb')\np=subprocess.Popen(['/usr/bin/bash','/root/sls-qualification-bundle/install_release.sh'],env={**os.environ,**"+repr(values)+"},stdin=subprocess.DEVNULL,stdout=output,stderr=subprocess.STDOUT,start_new_session=True)\npathlib.Path('/root/sls-test-install.pid').write_text(str(p.pid))\n"
         guest.ssh('python3 -c '+shlex.quote(start))
-        guest.ssh("timeout 900 bash -c 'until python3 -c '\"'\"'import json,pathlib,sys;sys.exit(0 if any(json.loads(p.read_text()).get(\"phase\")==\"mutating\" for p in pathlib.Path(\"/var/lib/sls-mass-notify-installer\").glob(\"transaction-*/transaction.json\")) else 1)'\"'\"'; do sleep .2; done'",timeout=910)
-        if name=='power-loss':
+        phase='preparing' if name=='preparation-power-loss' else 'mutating'
+        probe='import json,pathlib,sys;sys.exit(0 if any(json.loads(p.read_text()).get("phase")=='+repr(phase)+' for p in pathlib.Path("/var/lib/sls-mass-notify-installer").glob("transaction-*/transaction.json")) else 1)'
+        wait='until python3 -c '+shlex.quote(probe)+'; do sleep .05; done'
+        guest.ssh('timeout 900 bash -c '+shlex.quote(wait),timeout=910)
+        if name in ('power-loss','preparation-power-loss'):
             guest.stop(abrupt=True);guest.start()
-            blocked=guest.ssh(installation_command(),timeout=300,check=False)
-            if blocked.returncode!=3:raise RuntimeError('A power-interrupted transaction was not blocked before mutation.')
-            directory=guest.ssh("python3 -c 'import json,pathlib;print(next(str(p.parent) for p in pathlib.Path(\"/var/lib/sls-mass-notify-installer\").glob(\"transaction-*/transaction.json\") if json.loads(p.read_text())[\"phase\"] not in (\"committed\",\"rolled_back\",\"abandoned\")))'").stdout.strip()
-            guest.ssh('bash /root/sls-qualification-bundle/install_release.sh --recover '+shlex.quote(directory),timeout=1800)
+            if name=='power-loss':
+                blocked=guest.ssh(installation_command(),timeout=300,check=False)
+                if blocked.returncode!=3:raise RuntimeError('A power-interrupted transaction was not blocked before mutation.')
+                directory=guest.ssh("python3 -c 'import json,pathlib;print(next(str(p.parent) for p in pathlib.Path(\"/var/lib/sls-mass-notify-installer\").glob(\"transaction-*/transaction.json\") if json.loads(p.read_text())[\"phase\"] not in (\"committed\",\"rolled_back\",\"abandoned\")))'").stdout.strip()
+                guest.ssh('bash /root/sls-qualification-bundle/install_release.sh --recover '+shlex.quote(directory),timeout=1800)
         else:
             guest.ssh('kill -'+name.upper()+' "$(cat /root/sls-test-install.pid)"')
             guest.ssh("timeout 900 bash -c 'while kill -0 \"$(cat /root/sls-test-install.pid)\" 2>/dev/null; do sleep 1; done'",timeout=910)
@@ -128,33 +131,110 @@ def scenario(guest,bundle,name,baseline):
     guest.ssh('fwconsole reload',timeout=180)
     guest.ssh("python3 - <<'PY'\nimport hashlib,json,pathlib\np=pathlib.Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin')\nfor name,digest in json.loads(pathlib.Path('/root/sls-config-before.json').read_text()).items():\n assert hashlib.sha256((p/name).read_bytes()).hexdigest()==digest,'Protected settings changed: '+name\nPY")
     doctor=guest.ssh('/usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_install_doctor.py --json',timeout=60)
+    if name=='repair':
+        repaired=guest.ssh(installation_command(),timeout=3600,check=False)
+        if repaired.returncode: raise RuntimeError('The installed signed candidate could not be repaired.')
+        guest.ssh('fwconsole reload',timeout=180)
+    if name in ('uninstall','purge'):
+        removed=guest.ssh('bash /usr/local/bin/sls_mass_notify/sls_mass_notify_uninstall.sh'+(' --purge' if name=='purge' else ''),timeout=1800,check=False)
+        if removed.returncode: raise RuntimeError('The included local uninstaller failed.')
+        guest.ssh('test ! -e /var/www/html/admin/modules/slsmassnotifyserver; test ! -e /usr/local/bin/sls_mass_notify')
+        guest.ssh('fwconsole reload',timeout=180)
+        if name=='uninstall':
+            guest.ssh("python3 - <<'PY'\nimport hashlib,json,pathlib\np=pathlib.Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin')\nfor name,digest in json.loads(pathlib.Path('/root/sls-config-before.json').read_text()).items():\n assert hashlib.sha256((p/name).read_bytes()).hexdigest()==digest\nPY")
+        else: guest.ssh('test ! -e /var/lib/asterisk/SLS_Mass_Notifications_Plugin')
     return {'scenario':name,'baseline':baseline,'ok':True,'doctor':json.loads(doctor.stdout)}
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--image',type=Path,required=True);parser.add_argument('--image-sha256',required=True)
-    parser.add_argument('--bundle',type=Path,required=True);parser.add_argument('--baseline',choices=('fresh','0.1.4-beta','0.1.5-beta'),required=True)
+    parser.add_argument('--bundle',type=Path,required=True);parser.add_argument('--baseline',choices=('fresh','0.1.4-beta','0.1.5-beta','0.1.6-beta'),required=True)
     parser.add_argument('--scenarios',nargs='+',choices=SCENARIOS,default=list(SCENARIOS))
     parser.add_argument('--report',type=Path,required=True)
     parser.add_argument('--allow-disposable-vm',action='store_true')
     args=parser.parse_args()
     if not args.allow_disposable_vm:parser.error('Explicit --allow-disposable-vm is required; this tool is never a production PBX test.')
     if not re.fullmatch(r'[a-f0-9]{64}',args.image_sha256):parser.error('Use an independently reviewed SHA-256 for the sanitized qcow2 image.')
-    with args.image.open('rb') as stream:
-        if hashlib.file_digest(stream,'sha256').hexdigest()!=args.image_sha256:raise SystemExit('VM image digest differs from reviewed evidence.')
-    for utility in ('qemu-img','qemu-system-x86_64','virt-customize','ssh','scp','ssh-keygen'):
-        if shutil.which(utility) is None:raise SystemExit('Disposable VM controller requires '+utility)
-    import importlib.util
-    spec=importlib.util.spec_from_file_location('offline_validation',Path(__file__).with_name('prepare_offline_install.py'))
-    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);module.validate(args.bundle.absolute())
     results=[]
+    args.report=args.report.absolute()
+    evidence=args.report.parent/(args.report.stem+'-evidence')
+    parent=args.report.parent.lstat()
+    if (not stat.S_ISDIR(parent.st_mode) or args.report.parent.resolve()!=args.report.parent
+            or parent.st_uid not in {0,os.geteuid()}
+            or (parent.st_mode&0o022 and not (parent.st_uid==0 and parent.st_mode&stat.S_ISVTX))):
+        raise SystemExit('Qualification report needs a trusted canonical parent directory.')
+    evidence.mkdir(mode=0o700,exist_ok=True)
+    info=evidence.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or evidence.resolve()!=evidence
+            or info.st_uid!=os.geteuid() or info.st_mode&0o077):
+        raise SystemExit('Qualification evidence directory is unsafe; existing files were not adopted.')
+    def save():
+        record={'schema':1,'profile':'FreePBX17/Debian12/amd64/2vCPU/4096MiB','results':results,'evidence_directory':str(evidence)}
+        try:
+            before=args.report.lstat()
+        except FileNotFoundError: before=None
+        if before is not None and (not stat.S_ISREG(before.st_mode) or before.st_nlink!=1
+                or before.st_uid!=os.geteuid() or before.st_mode&0o077 or before.st_size>2097152):
+            raise RuntimeError('Existing qualification report is unsafe; no replacement was made.')
+        descriptor,temporary=tempfile.mkstemp(prefix='.'+args.report.name+'.',dir=args.report.parent)
+        try:
+            with os.fdopen(descriptor,'w') as output:
+                output.write(json.dumps(record,indent=2)+'\n');output.flush();os.fsync(output.fileno())
+            current=args.report.lstat() if args.report.exists() or args.report.is_symlink() else None
+            if ((before is None)!=(current is None) or (before is not None
+                    and (before.st_dev,before.st_ino)!=(current.st_dev,current.st_ino))):
+                raise RuntimeError('Qualification report changed during replacement.')
+            os.replace(temporary,args.report)
+            directory=os.open(args.report.parent,os.O_DIRECTORY|os.O_NOFOLLOW|os.O_RDONLY)
+            try:os.fsync(directory)
+            finally:os.close(directory)
+        finally:
+            try:os.unlink(temporary)
+            except FileNotFoundError:pass
+    save()
+    try:
+        with args.image.open('rb') as stream:
+            if hashlib.file_digest(stream,'sha256').hexdigest()!=args.image_sha256:
+                raise RuntimeError('VM image digest differs from reviewed evidence.')
+        for utility in ('qemu-img','qemu-system-x86_64','virt-customize','ssh','scp','ssh-keygen'):
+            if shutil.which(utility) is None:raise RuntimeError('Disposable VM controller requires '+utility)
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('offline_validation',Path(__file__).with_name('prepare_offline_install.py'))
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);module.validate(args.bundle.absolute())
+        environment=module.installer_environment(args.bundle.absolute())
+    except Exception as error:
+        results.append({'scenario':'prerequisites','baseline':args.baseline,'ok':False,'error_type':type(error).__name__,
+                        'detail':'Qualification prerequisites failed; no VM scenario was run.'})
+        save();raise SystemExit(1)
     for name in args.scenarios:
         with tempfile.TemporaryDirectory(prefix='sls-freepbx-vm-') as temporary:
-            guest=Guest(args.image.absolute(),Path(temporary),4096)
-            try:results.append(scenario(guest,args.bundle.absolute(),name,args.baseline))
-            finally:guest.stop()
-    args.report.write_text(json.dumps({'schema':1,'profile':'FreePBX17/Debian12/amd64/2vCPU/4096MiB','results':results},indent=2)+'\n')
+            guest=None
+            try:
+                guest=Guest(args.image.absolute(),Path(temporary),4096)
+                results.append(scenario(guest,args.bundle.absolute(),name,args.baseline,environment))
+            except Exception as error:
+                results.append({'scenario':name,'baseline':args.baseline,'ok':False,'error_type':type(error).__name__,
+                                'detail':'Qualification failed. Review the retained sanitized guest logs; no passing result was inferred.'})
+            finally:
+                if guest is not None:
+                    if guest.process is not None and guest.process.poll() is None:
+                        try:
+                            output=guest.ssh('tail -c 1048576 /tmp/slsmassnotifyserver-install.log /root/sls-test-install.log 2>/dev/null',timeout=15,check=False)
+                            target=evidence/(name+'-installer.log');target.write_text(output.stdout);target.chmod(0o600)
+                        except Exception: pass
+                    try:guest.stop()
+                    except Exception as error:
+                        results.append({'scenario':name+'-cleanup','baseline':args.baseline,'ok':False,
+                                        'error_type':type(error).__name__,'detail':'The disposable guest could not be stopped cleanly.'})
+                serial=Path(temporary)/'serial.log'
+                if serial.is_file():
+                    with serial.open('rb') as source:
+                        source.seek(max(0,serial.stat().st_size-1048576))
+                        target=evidence/(name+'-serial.log');target.write_bytes(source.read(1048576));target.chmod(0o600)
+                save()
+    if any(not row['ok'] for row in results): raise SystemExit(1)
+
 
 
 if __name__=='__main__':main()

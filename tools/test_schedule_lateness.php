@@ -42,6 +42,16 @@ $snapshot['scheduled_announcements'][0]['targets']['phones_all']='1';
 late_check(Presentation::conflicts($snapshot,$now)['rows'][0]['dynamic_audience'], 'All-phone overlap omitted');
 $snapshot['scheduled_announcements'][1]['enabled']='0';
 late_check(Presentation::conflicts($snapshot,$now)['rows'] === [], 'Disabled future schedule included');
+foreach (['browser_recipient_ids'=>'sub_'.str_repeat('a',24), 'connector_ids'=>'conn_'.str_repeat('b',24)] as $field=>$recipient) {
+    $labSnapshot=['scheduled_announcements'=>[
+        array_replace($base,['targets'=>[$field=>[$recipient]]]),
+        array_replace($other,['targets'=>['groups'=>['staff']]]),
+    ],'announcement_groups'=>[['id'=>'staff',$field=>[$recipient]]],'announcement_cooldown_seconds'=>60];
+    $labReport=Presentation::conflicts($labSnapshot,$now);
+    late_check(count($labReport['rows'])===1&&$labReport['rows'][0]['shared_recipients']===1,'Labs channel overlap omitted: '.$field);
+    $labSnapshot['announcement_groups'][0][$field]=[$recipient.'other'];
+    late_check(Presentation::conflicts($labSnapshot,$now)['rows']===[],'Disjoint Labs recipients falsely conflicted: '.$field);
+}
 $snapshot['scheduled_announcements']=[];
 for($i=0;$i<100;$i++) {
     $schedule=array_replace($base,['id'=>'sched_'.$i,'occurrences'=>array_fill(0,366,$base['occurrences'][0])]);

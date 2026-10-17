@@ -24,15 +24,26 @@ import ssl
 import stat
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
+# ``python -I`` removes the script directory from sys.path. Restore only this
+# authenticated runtime directory after standard-library imports have resolved;
+# sibling application modules must never come from cwd or an ambient PYTHONPATH.
+_RUNTIME_DIRECTORY = str(Path(__file__).resolve().parent)
+if _RUNTIME_DIRECTORY not in sys.path:
+    sys.path.insert(0, _RUNTIME_DIRECTORY)
+
 import sys as _config_sys
 _config_sys.dont_write_bytecode = True
+_journal_spec = importlib.util.spec_from_file_location('sls_external_journal', Path(__file__).resolve().with_name('sls_atomic_json.py'))
+_journal_module = importlib.util.module_from_spec(_journal_spec)
+_journal_spec.loader.exec_module(_journal_module)
+_journal_directory = _journal_module.open_directory
+_journal_read = _journal_module.read_json
 _config_crypto_spec = importlib.util.spec_from_file_location("sls_config_crypto", Path(__file__).resolve().with_name("sls_config_crypto.py"))
 _config_crypto = importlib.util.module_from_spec(_config_crypto_spec)
 _config_crypto_spec.loader.exec_module(_config_crypto)
@@ -43,6 +54,7 @@ from urllib.parse import urlsplit
 
 DEFAULT_CONFIG = Path("/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config")
 MAX_DESTINATIONS = 10
+MAX_EXTERNAL_RECEIPTS = MAX_DESTINATIONS * 2 + 2
 MAX_PAYLOAD_BYTES = 64 * 1024
 DEFAULT_TIMEOUT = 2.0
 DEFAULT_DELIVERY_BUDGET = 8.0
@@ -51,10 +63,20 @@ MAX_RETRY_DELAY = 0.5
 WORKER_EXIT_SAFETY_SECONDS = 2.0
 MAX_RETRY_DELIVERIES = 500
 MAX_RETRY_STATE_BYTES = 4 * 1024 * 1024
+RETRY_MARKER = b'SLS_JSON_V1\n'
+_retry_context = threading.local()
 MAX_RETRY_RECORDS_PER_RUN = 3
 COMPLETED_RETRY_RETENTION_SECONDS = 7 * 86400
 PENDING_RETRY_MAX_AGE_SECONDS = 3600
-USER_AGENT = "SouthlandServers-Mass-Notifications-Server/0.1.6-beta"
+RETRYABLE_PRE_SUBMISSION_ERRORS = {
+    "cluster_authority_unavailable",
+    "delivery_budget_exhausted",
+    "dns_failure",
+    "network_failure",
+    "request_timeout",
+    "tls_failure",
+}
+USER_AGENT = "SouthlandServers-Mass-Notifications-Server/0.1.7-beta"
 DISCORD_HOSTS = {"discord.com", "discordapp.com", "canary.discord.com", "ptb.discord.com"}
 DISCORD_PATH = re.compile(r"^/api/webhooks/[0-9]+/[A-Za-z0-9._~-]+$")
 # Downloaded and bundled artwork; providers retrieve it from this PBX, not
@@ -92,6 +114,15 @@ class DeliveryBudgetExceeded(RuntimeError):
 
 class RetryStateError(RuntimeError):
     """Raised when durable external-delivery state cannot be trusted."""
+
+
+def _strict_json(raw):
+    try:
+        return json.loads(raw, object_pairs_hook=_config_crypto._pairs,
+                          parse_constant=_config_crypto._invalid_constant,
+                          parse_float=_config_crypto._finite_float)
+    except RecursionError as error:
+        raise ValueError('External delivery JSON nesting exceeds its limit') from error
 
 
 def _default_email_sender(*args, **kwargs):
@@ -313,26 +344,53 @@ def public_logo_url(config):
     return origin + DISCORD_EMBED_IMAGE_PATH
 
 
-def _compact_description(body, subject):
-    lines = [_text(line, 400) for line in str(body).splitlines()]
-    lines = [line for line in lines if line]
-    return ("\n".join(lines[:4]) if lines else _text(subject, 900))[:900]
+def _discord_length(value):
+    # Conservative UTF-16 units also reserve space for astral characters.
+    return len(value.encode('utf-16-le')) // 2
+
+
+def _validate_discord_payload(payload):
+    # https://docs.discord.com/developers/resources/message#embed-limits
+    total = 0
+    for embed in payload['embeds']:
+        values = [(embed['title'], 256), (embed['description'], 4096),
+                  (embed['author']['name'], 256), (embed['footer']['text'], 2048)]
+        if len(embed['fields']) > 25:
+            raise DestinationError('payload_too_large', submission_possible=False)
+        for field in embed['fields']:
+            values.extend([(field['name'], 256), (field['value'], 1024)])
+        for value, maximum in values:
+            length = _discord_length(value)
+            if length > maximum:
+                raise DestinationError('payload_too_large', submission_possible=False)
+            total += length
+    if total > 6000:
+        raise DestinationError('payload_too_large', submission_possible=False)
+    return payload
 
 
 def build_discord_payload(config, subject, body, event="", severity="", fields=None, timestamp=""):
     color, icon, urgency = alert_profile(subject, body, event, severity)
     avatar_url = public_logo_url(config)
     embed_fields = []
-    for name, value in fields or []:
-        normalized = _text(value, 320)
+    if fields is not None and not isinstance(fields, (list, tuple)):
+        raise DestinationError('invalid_webhook_fields', submission_possible=False)
+    if len(fields or []) > 25:
+        raise DestinationError('payload_too_large', submission_possible=False)
+    for item in fields or []:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise DestinationError('invalid_webhook_fields', submission_possible=False)
+        name, value = item
+        normalized = _integration_text(value)
         if normalized:
-            embed_fields.append({"name": _text(name, 256), "value": normalized, "inline": len(normalized) <= 42})
-        if len(embed_fields) >= 6:
-            break
+            name = _integration_text(name)
+            if not name:
+                raise DestinationError('invalid_webhook_fields', submission_possible=False)
+            embed_fields.append({"name": name, "value": normalized, "inline": len(normalized) <= 42})
     embed = {
         "author": {"name": "Southland Servers Group • SLS Mass Notification System"},
-        "title": f"{icon} {_text(subject, 245)}"[:256],
-        "description": _compact_description(body, subject),
+        "title": f"{icon} {_integration_text(subject)}",
+        "description": _integration_text(body) or _integration_text(subject),
         "color": color,
         "fields": embed_fields,
         "footer": {
@@ -348,12 +406,12 @@ def build_discord_payload(config, subject, body, event="", severity="", fields=N
     }
     if avatar_url:
         payload["avatar_url"] = avatar_url
-    return payload
+    return _validate_discord_payload(payload)
 
 
 def build_announcement_discord_payload(config, title, body, background_color="#6d28d9", fields=None, timestamp=""):
     """Build the bounded Discord-compatible card used by Dashboard announcements."""
-    normalized_title = _text(title, 220) or "Announcement"
+    normalized_title = _integration_text(title) or "Announcement"
     payload = build_discord_payload(
         config,
         normalized_title,
@@ -367,7 +425,7 @@ def build_announcement_discord_payload(config, title, body, background_color="#6
     if re.fullmatch(r"#[0-9A-Fa-f]{6}", color):
         payload["embeds"][0]["color"] = int(color[1:], 16)
     payload["embeds"][0]["footer"]["text"] = "DASHBOARD ANNOUNCEMENT • SLS Mass Notification System"
-    return payload
+    return _validate_discord_payload(payload)
 
 
 def _bounded_details(details):
@@ -404,7 +462,7 @@ def build_generic_payload(subject, body, event="", severity="", source="", event
         "alert": {
             "kind": "lightning" if "xweather" in str(source).lower() or "lightning" in str(event).lower() else "weather",
             "title": _text(subject, 256),
-            "message": _text(body, 2000),
+            "message": _integration_text(body),
             "event": _text(event, 160),
             "severity": _text(severity, 80),
             "state": _text((details or {}).get("storm_state") if isinstance(details, dict) else "", 80),
@@ -460,12 +518,30 @@ def incident_operator_link(config, incident_id):
 def collaboration_incident_context(value):
     if value is None:
         return None
-    if (not isinstance(value, dict) or set(value) != {'schema', 'incident_id', 'sequence', 'kind', 'severity', 'is_test'}
+    core = {'schema', 'incident_id', 'sequence', 'kind', 'severity', 'is_test'}
+    extended = {'operation_request_id', 'language_variant', 'language_batch', 'language_batches', 'expires_at'}
+    if (not isinstance(value, dict) or not core <= set(value) or set(value) - core - extended
             or type(value['schema']) is not int or value['schema'] != 1
             or not isinstance(value['incident_id'], str) or not re.fullmatch(r'inc_[a-f0-9]{32}', value['incident_id'])
             or type(value['sequence']) is not int or not 1 <= value['sequence'] <= 250
             or value['kind'] not in ('initial', 'update', 'all_clear', 'escalation')
             or value['severity'] not in ('information', 'warning', 'critical') or type(value['is_test']) is not bool):
+        raise DestinationError('invalid_incident_context', submission_possible=False)
+    if 'operation_request_id' in value:
+        if (not (extended - {'language_variant'}) <= set(value) or not isinstance(value['operation_request_id'], str)
+                or not re.fullmatch(r'[a-f0-9]{32}', value['operation_request_id'])
+                or not isinstance(value.get('language_variant', ''), str)
+                or not re.fullmatch(r'(?:[a-z]{2,3}(?:-[a-z0-9]{2,8}){0,3})?', value.get('language_variant', ''))
+                or type(value['language_batch']) is not int or type(value['language_batches']) is not int
+                or not 1 <= value['language_batch'] <= value['language_batches'] <= 7
+                or not isinstance(value['expires_at'], str)
+                or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00', value['expires_at'])):
+            raise DestinationError('invalid_incident_context', submission_possible=False)
+        try:
+            datetime.strptime(value['expires_at'], '%Y-%m-%dT%H:%M:%S+00:00')
+        except ValueError as error:
+            raise DestinationError('invalid_incident_context', submission_possible=False) from error
+    elif set(value) & extended:
         raise DestinationError('invalid_incident_context', submission_possible=False)
     return dict(value)
 
@@ -483,8 +559,19 @@ def build_collaboration_payload(adapter, title, body, event="", severity="", fie
         incident_id = incident_context['incident_id']
         event = {'initial':'Incident', 'update':'Incident update', 'all_clear':'Incident all-clear', 'escalation':'Incident escalation'}[incident_context['kind']]
         severity = incident_context['severity'].capitalize()
+    if fields is not None and not isinstance(fields, (list, tuple)):
+        raise DestinationError("invalid_webhook_fields", submission_possible=False)
+    normalized_fields = []
+    for item in list(fields or [])[:6]:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise DestinationError("invalid_webhook_fields", submission_possible=False)
+        name, value = (_integration_text(item[0]), _integration_text(item[1]))
+        if value and not name:
+            raise DestinationError("invalid_webhook_fields", submission_possible=False)
+        if value:
+            normalized_fields.append((name, value))
     metadata = [("Event", event), ("Severity", severity), ("Source", source)]
-    metadata.extend(list(fields or [])[:6])
+    metadata.extend(normalized_fields)
     metadata.extend([("Event ID", event_id), ("Time", timestamp)])
     incident_url = ""
     if incident_id != "":
@@ -583,7 +670,10 @@ def _current_authorization(context):
         result = subprocess.run(['/usr/bin/php', '/usr/local/bin/sls_mass_notify/sls_mass_notify_delivery_authorization.php'],
                                 input=encoded, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                 timeout=1, check=False, env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'})
-        return result.returncode == 0 and len(result.stdout) < 256 and json.loads(result.stdout) == {'allowed': True}
+        if result.returncode != 0 or len(result.stdout) >= 256:
+            return False
+        reply = _strict_json(result.stdout)
+        return isinstance(reply, dict) and reply == {'allowed': True} and type(reply['allowed']) is bool
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return False
 
@@ -755,6 +845,7 @@ def _budget_failure(row, attempts=0):
         "attempts": max(0, int(attempts)),
         "http_status": None,
         "error": "delivery_budget_exhausted",
+        "retryable": True,
     }
 
 
@@ -771,6 +862,7 @@ def _uncertain_delivery(row, attempts=1, reason="transport_failure", http_status
         "status": "uncertain", "attempts": max(0, int(attempts)),
         "http_status": http_status, "error": "delivery_unconfirmed",
         "failure_reason": reason if reason in safe_reasons else "transport_failure",
+        "retryable": False,
     }
 
 
@@ -806,12 +898,13 @@ def _deliver(row, payload, event_id, transport, resolver, sleep, deadline, clock
                 if delay > 0:
                     sleep(delay)
                 continue
-            return {**safe, "status": "cancelled" if exc.code == 'authorization_changed' else "failed", "attempts": attempt, "http_status": None, "error": exc.code,
-                    **({'retryable': False} if exc.code in {'schedule_deadline_expired', 'authorization_changed'} else {})}
+            return {**safe, "status": "cancelled" if exc.code == 'authorization_changed' else "failed", "attempts": attempt,
+                    "http_status": None, "error": exc.code,
+                    "retryable": exc.code in RETRYABLE_PRE_SUBMISSION_ERRORS}
         except Exception:
             return _uncertain_delivery(row, attempt)
         if 200 <= status < 300:
-            return {**safe, "status": "accepted", "attempts": attempt, "http_status": status, "error": ""}
+            return {**safe, "status": "accepted", "attempts": attempt, "http_status": status, "error": "", "retryable": False}
         # An HTTP timeout/server error can follow successful side effects.  An
         # Idempotency-Key header alone is not a receiver deduplication contract.
         if status == 408 or 500 <= status <= 599:
@@ -825,9 +918,13 @@ def _deliver(row, payload, event_id, transport, resolver, sleep, deadline, clock
                 if delay > 0:
                     sleep(delay)
                 continue
+            return {**safe, "status": "failed", "attempts": attempt, "http_status": status,
+                    "error": "http_failure", "retryable": True}
         error = "redirect_blocked" if 300 <= status <= 399 else "http_failure"
-        return {**safe, "status": "failed", "attempts": attempt, "http_status": status, "error": error}
-    return {**safe, "status": "failed", "attempts": MAX_ATTEMPTS, "http_status": None, "error": "transport_failure"}
+        return {**safe, "status": "failed", "attempts": attempt, "http_status": status,
+                "error": error, "retryable": False}
+    return {**safe, "status": "failed", "attempts": MAX_ATTEMPTS, "http_status": None,
+            "error": "transport_failure", "retryable": True}
 
 
 def dispatch_webhook_destinations(
@@ -861,8 +958,6 @@ def dispatch_webhook_destinations(
     budget = _effective_delivery_budget(budget_seconds, wall_clock)
     normalized_timestamp = _normalize_timestamp(timestamp)
     normalized_event_id = _normalized_event_id(event_id, normalized_source, subject, event, normalized_timestamp)
-    discord_payload = build_discord_payload(config, subject, body, event, severity, fields, normalized_timestamp)
-    generic_payload = build_generic_payload(subject, body, event, severity, normalized_source, normalized_event_id, normalized_timestamp, details)
     rows = _destination_rows(config, "discord") + _destination_rows(config, "generic")
     if destination_keys is not None:
         selected = {str(value) for value in destination_keys}
@@ -885,7 +980,12 @@ def dispatch_webhook_destinations(
         row_budget = remaining / rows_left
         row_deadline = clock() + row_budget
         try:
-            payload = _row_payload(row, discord_payload if row["kind"] == "discord" else generic_payload,
+            native_payload = None
+            if row.get('payload_format', 'native') == 'native':
+                native_payload = (build_discord_payload(config, subject, body, event, severity, fields, normalized_timestamp)
+                    if row['kind'] == 'discord' else build_generic_payload(subject, body, event, severity,
+                        normalized_source, normalized_event_id, normalized_timestamp, details))
+            payload = _row_payload(row, native_payload,
                                    subject, body, event, severity, fields, normalized_timestamp, normalized_source, normalized_event_id)
         except DestinationError as exc:
             results.append(_payload_failure(row, exc.code))
@@ -986,20 +1086,6 @@ def dispatch_announcement_webhooks(
         "announcement",
         normalized_timestamp,
     )
-    native_payload = build_announcement_discord_payload(
-        config,
-        title,
-        body,
-        background_color,
-        fields,
-        normalized_timestamp,
-    )
-    if len(json.dumps(native_payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")) > MAX_PAYLOAD_BYTES:
-        return results + [
-            {**{key: row[key] for key in ("kind", "id", "name")}, "status": "failed", "attempts": 0,
-             "http_status": None, "error": "payload_too_large"}
-            for row in rows
-        ]
     if budget <= 0:
         return results + [_budget_failure(row) for row in rows]
     deadline = clock() + budget
@@ -1020,6 +1106,11 @@ def dispatch_announcement_webhooks(
         row_budget = remaining / rows_left
         row_deadline = clock() + row_budget
         try:
+            native_payload = None
+            if row.get('payload_format', 'native') == 'native':
+                native_payload = build_announcement_discord_payload(config, title, body, background_color, fields, normalized_timestamp)
+                if len(json.dumps(native_payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")) > MAX_PAYLOAD_BYTES:
+                    raise DestinationError('payload_too_large', submission_possible=False)
             payload = _row_payload(row, native_payload, title, body, "Announcement", "Information", fields,
                                    normalized_timestamp, "dashboard", normalized_event_id,
                                    incident_id=incident_id, config=config, incident_context=incident_context)
@@ -1058,60 +1149,140 @@ def _retry_delivery_key(source, correlation_key):
 @contextmanager
 def _locked_retry_state(path):
     state_path = Path(path)
-    parent = state_path.parent
-    if not parent.is_dir():
-        raise RetryStateError("retry_state_directory_unavailable")
-    lock_path = Path(str(state_path) + ".lock")
-    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    contexts = getattr(_retry_context, 'leases', None)
+    if contexts is None:
+        contexts = _retry_context.leases = {}
+    key = str(state_path)
+    if key in contexts:
+        raise RetryStateError('retry_state_nested_lock')
+    account = pwd.getpwnam('asterisk')
     try:
-        descriptor = os.open(lock_path, flags, 0o640)
-    except OSError as exc:
-        raise RetryStateError("retry_state_lock_unavailable") from exc
+        parent = _journal_directory(state_path.parent, account.pw_uid)
+    except (OSError, RuntimeError) as error:
+        raise RetryStateError('retry_state_directory_unavailable') from error
+    lock_name = state_path.name + '.lock'
+    flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    descriptor = -1
     try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise RetryStateError("retry_state_lock_invalid")
-        os.fchmod(descriptor, 0o640)
-        if os.geteuid() == 0:
-            account = pwd.getpwnam("asterisk")
-            os.fchown(descriptor, account.pw_uid, account.pw_gid)
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield state_path
-    finally:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
+            descriptor = os.open(lock_name, flags | os.O_CREAT | os.O_EXCL, 0o640, dir_fd=parent)
+            if os.geteuid() == 0:
+                os.fchown(descriptor, account.pw_uid, account.pw_gid)
+            os.fsync(descriptor); os.fsync(parent)
+        except FileExistsError:
+            descriptor = os.open(lock_name, flags, dir_fd=parent)
+        def checked():
+            info = os.fstat(descriptor)
+            named = os.stat(lock_name, dir_fd=parent, follow_symlinks=False)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > len(RETRY_MARKER)
+                    or info.st_uid not in (0, account.pw_uid) or info.st_gid not in (0, account.pw_gid)
+                    or info.st_mode & 0o7027 or (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino)):
+                raise RetryStateError('retry_state_lock_invalid')
+        checked()
+        deadline = time.monotonic() + 1
+        while True:
+            try: fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB); break
+            except BlockingIOError:
+                if time.monotonic() >= deadline: raise RetryStateError('retry_state_lock_busy') from None
+                time.sleep(.01)
+        checked()
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        marker = os.read(descriptor, len(RETRY_MARKER) + 1)
+        if not RETRY_MARKER.startswith(marker):
+            raise RetryStateError('retry_state_marker_invalid')
+        contexts[key] = (parent, descriptor, checked)
+        if marker:
+            _load_retry_state(state_path)
+            if marker != RETRY_MARKER:
+                _mark_retry_state(state_path)
+        else:
+            try:
+                existing = os.open(state_path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
+            except FileNotFoundError:
+                existing = -1
+            if existing >= 0:
+                try:
+                    _load_retry_state(state_path)
+                    os.fsync(existing)
+                finally:
+                    os.close(existing)
+                os.fsync(parent)
+                _mark_retry_state(state_path)
+        yield state_path
+    except OSError as error:
+        raise RetryStateError('retry_state_lock_unavailable') from error
+    finally:
+        contexts.pop(key, None)
+        if descriptor >= 0: os.close(descriptor)
+        os.close(parent)
+
+
+def _mark_retry_state(path):
+    lease = getattr(_retry_context, 'leases', {}).get(str(Path(path)))
+    if lease is None:
+        raise RetryStateError('retry_state_lock_required')
+    parent, descriptor, checked = lease
+    checked()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    marker = os.read(descriptor, len(RETRY_MARKER) + 1)
+    if not RETRY_MARKER.startswith(marker):
+        raise RetryStateError('retry_state_marker_invalid')
+    if marker == RETRY_MARKER:
+        return
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    if os.write(descriptor, RETRY_MARKER) != len(RETRY_MARKER):
+        raise RetryStateError('retry_state_commit_uncertain')
+    os.fsync(descriptor); os.fsync(parent)
 
 
 def _load_retry_state(path):
-    state_path = Path(path)
-    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(state_path, flags)
+        state = _journal_read(path, maximum=MAX_RETRY_STATE_BYTES, missing_ok=False, runtime_owner=True)
     except FileNotFoundError:
-        return {"version": 1, "attempt_sequence": 0, "deliveries": {}}
-    except OSError as exc:
-        raise RetryStateError("retry_state_unreadable") from exc
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_RETRY_STATE_BYTES:
-            raise RetryStateError("retry_state_invalid")
-        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
-            descriptor = -1
-            state = json.load(handle)
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        try:
+            state = _journal_read(path, maximum=MAX_RETRY_STATE_BYTES, missing_ok=True, runtime_owner=True)
+        except (OSError, RuntimeError, ValueError, RecursionError) as error:
+            raise RetryStateError('retry_state_missing') from error
+        if not state:
+            return {"version": 1, "attempt_sequence": 0, "deliveries": {}}
+    except (OSError, RuntimeError, ValueError, RecursionError) as exc:
         raise RetryStateError("retry_state_corrupt") from exc
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    if not isinstance(state, dict) or not isinstance(state.get("deliveries"), dict):
+    if (not isinstance(state, dict) or type(state.get('version')) is not int or state['version'] != 1
+            or set(state) - {'version', 'attempt_sequence', 'deliveries'}
+            or not isinstance(state.get("deliveries"), dict)):
         raise RetryStateError("retry_state_corrupt")
-    try:
-        attempt_sequence = int(state.get("attempt_sequence", 0) or 0)
-    except (TypeError, ValueError) as exc:
-        raise RetryStateError("retry_state_corrupt") from exc
-    if attempt_sequence < 0:
+    attempt_sequence = state.get('attempt_sequence', 0)
+    if type(attempt_sequence) is not int or attempt_sequence < 0:
         raise RetryStateError("retry_state_corrupt")
+    for record in state['deliveries'].values():
+        if not isinstance(record, dict):
+            raise RetryStateError('retry_state_corrupt')
+        for field in ('created_at', 'expires_at', 'completed_at', 'last_attempt_at', 'last_attempt_sequence'):
+            _retry_record_integer(record, field)
+        for field in ('email_pending', 'email_inflight', 'channels_pending'):
+            if field in record and type(record[field]) is not bool:
+                raise RetryStateError('retry_state_corrupt')
+        for field in ('webhook_pending', 'webhook_inflight'):
+            values = record.get(field, [])
+            if (not isinstance(values, list) or len(values) > MAX_DESTINATIONS * 2
+                    or any(not isinstance(value, str) or not re.fullmatch(
+                        r'(?:discord|generic):[A-Za-z0-9_-]{1,64}', value) for value in values)):
+                raise RetryStateError('retry_state_corrupt')
+        payload = record.get('payload', {})
+        if not isinstance(payload, dict):
+            raise RetryStateError('retry_state_corrupt')
+        recipients = record.get('email_recipients', '')
+        if not isinstance(recipients, str) or len(recipients) > 16384:
+            raise RetryStateError('retry_state_corrupt')
+        for field in ('routing_snapshot', 'channels', 'webhook_uncertain', 'destination_receipts',
+                      'email_uncertain', 'channels_uncertain'):
+            if field in record and not isinstance(record[field], dict):
+                raise RetryStateError('retry_state_corrupt')
+        if (len(record.get('webhook_uncertain', {})) > MAX_DESTINATIONS * 2
+                or len(record.get('destination_receipts', {})) > MAX_EXTERNAL_RECEIPTS):
+            raise RetryStateError('retry_state_corrupt')
+        if record.get('channels_pending') and 'channels' not in record:
+            raise RetryStateError('retry_state_corrupt')
     return {
         "version": 1,
         "attempt_sequence": attempt_sequence,
@@ -1121,34 +1292,70 @@ def _load_retry_state(path):
 
 def _write_retry_state(path, state):
     state_path = Path(path)
-    encoded = (json.dumps(state, separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8")
+    lease = getattr(_retry_context, 'leases', {}).get(str(state_path))
+    if lease is None: raise RetryStateError('retry_state_lock_required')
+    lease[2]()
+    encoded = (json.dumps(state, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode("utf-8")
     if len(encoded) > MAX_RETRY_STATE_BYTES:
         raise RetryStateError("retry_state_too_large")
     temporary_descriptor = -1
     temporary_name = ""
+    temporary_identity = None
+    temporary_commit_identity = None
+    account = pwd.getpwnam('asterisk')
     try:
-        temporary_descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{state_path.name}.", suffix=".tmp", dir=str(state_path.parent)
-        )
-        os.fchmod(temporary_descriptor, 0o640)
+        parent = _journal_directory(state_path.parent, account.pw_uid)
+    except (OSError, RuntimeError) as error:
+        raise RetryStateError('retry_state_directory_unavailable') from error
+    try:
+        opened = os.fstat(parent); leased = os.fstat(lease[0])
+        if (opened.st_dev, opened.st_ino) != (leased.st_dev, leased.st_ino):
+            raise RetryStateError('retry_state_directory_changed')
+        try: before = os.stat(state_path.name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError: before = None
+        if before is not None and (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or before.st_uid not in (0, account.pw_uid) or before.st_mode & 0o7027):
+            raise RetryStateError('retry_state_invalid')
+        temporary_name = '.' + state_path.name + '.' + os.urandom(16).hex() + '.tmp'
+        temporary_descriptor = os.open(temporary_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                       0o640, dir_fd=parent)
         if os.geteuid() == 0:
-            account = pwd.getpwnam("asterisk")
             os.fchown(temporary_descriptor, account.pw_uid, account.pw_gid)
+        temporary_info = os.fstat(temporary_descriptor)
+        temporary_identity = (temporary_info.st_dev, temporary_info.st_ino)
+        if (not stat.S_ISREG(temporary_info.st_mode) or temporary_info.st_nlink != 1
+                or temporary_info.st_uid != account.pw_uid or temporary_info.st_gid != account.pw_gid
+                or temporary_info.st_mode & 0o7027):
+            raise RetryStateError('retry_state_temporary_invalid')
         with os.fdopen(temporary_descriptor, "wb") as handle:
             temporary_descriptor = -1
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary_name, state_path)
-        temporary_name = ""
-        directory_descriptor = os.open(
-            state_path.parent,
-            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
-        )
+            committed = os.fstat(handle.fileno())
+            temporary_commit_identity = (committed.st_dev, committed.st_ino, committed.st_size,
+                                         committed.st_mtime_ns, committed.st_ctime_ns, committed.st_nlink,
+                                         stat.S_IMODE(committed.st_mode), committed.st_uid, committed.st_gid)
+        named_temporary = os.stat(temporary_name, dir_fd=parent, follow_symlinks=False)
+        named_commit_identity = (named_temporary.st_dev, named_temporary.st_ino, named_temporary.st_size,
+                                 named_temporary.st_mtime_ns, named_temporary.st_ctime_ns, named_temporary.st_nlink,
+                                 stat.S_IMODE(named_temporary.st_mode), named_temporary.st_uid, named_temporary.st_gid)
+        if temporary_commit_identity != named_commit_identity:
+            raise RetryStateError('retry_state_temporary_changed')
+        try: current = os.stat(state_path.name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError: current = None
+        identity = lambda info: None if info is None else (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
+        if identity(before) != identity(current): raise RetryStateError('retry_state_changed')
+        live = _journal_directory(state_path.parent, account.pw_uid)
         try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
+            named = os.fstat(live); original = os.fstat(parent)
+            if (named.st_dev, named.st_ino) != (original.st_dev, original.st_ino):
+                raise RetryStateError('retry_state_directory_changed')
+        finally: os.close(live)
+        os.replace(temporary_name, state_path.name, src_dir_fd=parent, dst_dir_fd=parent)
+        temporary_name = ""
+        os.fsync(parent)
+        _mark_retry_state(state_path)
     except OSError as exc:
         raise RetryStateError("retry_state_write_failed") from exc
     finally:
@@ -1156,9 +1363,12 @@ def _write_retry_state(path, state):
             os.close(temporary_descriptor)
         if temporary_name:
             try:
-                os.unlink(temporary_name)
-            except FileNotFoundError:
+                named = os.stat(temporary_name, dir_fd=parent, follow_symlinks=False)
+                if temporary_identity == (named.st_dev, named.st_ino):
+                    os.unlink(temporary_name, dir_fd=parent)
+            except OSError:
                 pass
+        os.close(parent)
 
 
 def _prune_retry_state(state, now=None):
@@ -1167,11 +1377,13 @@ def _prune_retry_state(state, now=None):
     for key, record in list(deliveries.items()):
         if not isinstance(record, dict):
             raise RetryStateError("retry_state_corrupt")
-        completed_at = int(record.get("completed_at", 0) or 0)
+        completed_at = _retry_record_integer(record, 'completed_at')
         created_at = _retry_record_integer(record, 'created_at')
         expires_at = _retry_record_integer(record, 'expires_at') or created_at + PENDING_RETRY_MAX_AGE_SECONDS
         if not completed_at and current >= expires_at:
-            record['expired_channels'] = list(record.get('webhook_pending') or []) + (['email'] if record.get('email_pending') else [])
+            record['expired_channels'] = (list(record.get('webhook_pending') or [])
+                                          + (['email'] if record.get('email_pending') else [])
+                                          + (['channels'] if record.get('channels_pending') else []))
             record.update(completed_at=current, terminal_status='expired', email_pending=False, webhook_pending=[], channels_pending=False)
             completed_at = current
         if completed_at and completed_at < current - COMPLETED_RETRY_RETENTION_SECONDS:
@@ -1194,11 +1406,8 @@ def _prune_retry_state(state, now=None):
 
 
 def _retry_record_integer(record, field):
-    try:
-        value = int(record.get(field, 0) or 0)
-    except (TypeError, ValueError) as exc:
-        raise RetryStateError("retry_state_corrupt") from exc
-    if value < 0:
+    value = record.get(field, 0)
+    if type(value) is not int or value < 0:
         raise RetryStateError("retry_state_corrupt")
     return value
 
@@ -1241,10 +1450,10 @@ def _retry_payload(
 ):
     return {
         "subject": _text(subject, 512),
-        "body": str(body or "").replace("\x00", "")[:32768],
+        "body": _integration_text(body),
         "event": _text(event, 160),
         "severity": _text(severity, 80),
-        "fields": [[_text(name, 80), _text(value, 320)] for name, value in list(fields or [])[:10]],
+        "fields": [[_integration_text(name), _integration_text(value)] for name, value in fields or []],
         "timestamp": _normalize_timestamp(timestamp),
         "source": str(source or "").strip().lower(),
         "event_id": _normalized_event_id(event_id, source, subject, event, timestamp),
@@ -1261,9 +1470,11 @@ def _record_external_receipt(record, result):
     if status not in {"accepted", "failed", "uncertain", "cancelled", "queued", "deferred"}:
         raise RetryStateError("external_receipt_invalid")
     receipts = record.setdefault("destination_receipts", {})
-    if not isinstance(receipts, dict) or len(receipts) > MAX_DESTINATIONS * 2 + 1:
+    if not isinstance(receipts, dict) or len(receipts) > MAX_EXTERNAL_RECEIPTS:
         raise RetryStateError("external_receipt_capacity")
     key = kind + ":" + identifier
+    if key not in receipts and len(receipts) >= MAX_EXTERNAL_RECEIPTS:
+        raise RetryStateError('external_receipt_capacity')
     error = result.get("error", "")
     safe_error = error if isinstance(error, str) and re.fullmatch(r"(?:[a-z0-9_]{1,80})?", error) else "transport_failure"
     http_status = result.get("http_status")
@@ -1285,7 +1496,15 @@ def weather_source_validity(provider, group_id, *, feature=None, chain_key="", z
     """Create only bounded source identity; no paths or credentials are persisted."""
     if provider not in {"nws", "xweather"} or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(group_id)):
         raise RetryStateError("invalid_source_identity")
-    current = int(time.time() if observed_at is None else observed_at)
+    raw_observed = time.time() if observed_at is None else observed_at
+    if isinstance(raw_observed, bool):
+        raise RetryStateError("invalid_source_identity")
+    try:
+        current = int(raw_observed)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise RetryStateError("invalid_source_identity") from error
+    if not 0 < current <= 253402300799:
+        raise RetryStateError("invalid_source_identity")
     result = {"version": 1, "provider": provider, "group_id": group_id, "observed_at": current}
     if provider == "nws":
         properties = feature.get("properties", {}) if isinstance(feature, dict) else {}
@@ -1295,29 +1514,20 @@ def weather_source_validity(provider, group_id, *, feature=None, chain_key="", z
             raise RetryStateError("invalid_source_identity")
         result.update(provider_event_id=identifier, chain_key=chain_key, expires_at=expires, zone=zone)
     else:
-        if event_kind not in {"entry", "clear"} or int(cluster_started) <= 0 or not re.fullmatch(r"[a-f0-9]{64}", configuration_identity):
+        if (event_kind not in {"entry", "clear"} or type(cluster_started) is not int or cluster_started <= 0
+                or not re.fullmatch(r"[a-f0-9]{64}", configuration_identity)):
             raise RetryStateError("invalid_source_identity")
-        result.update(event_kind=event_kind, cluster_started=int(cluster_started),
+        result.update(event_kind=event_kind, cluster_started=cluster_started,
                       configuration_identity=configuration_identity,
                       expires_at=current + PENDING_RETRY_MAX_AGE_SECONDS)
     return result
 
 
 def _read_weather_observation(path, maximum=16 * 1024 * 1024):
-    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
     try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > maximum:
-            raise ValueError("invalid_observation")
-        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
-            descriptor = -1
-            value = json.load(handle)
-        if not isinstance(value, dict):
-            raise ValueError("invalid_observation")
-        return value
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+        return _journal_read(path, maximum=maximum, missing_ok=False, runtime_owner=True)
+    except (RuntimeError, ValueError, RecursionError) as error:
+        raise ValueError('invalid_observation') from error
 
 
 def _source_group(config, validity):
@@ -1367,7 +1577,7 @@ def validate_external_weather(record, config, directory, now=None):
     validity = record.get("source_validity")
     # Old records cannot prove source freshness or audience ownership. Never
     # guess a group or send an old alert using a newly configured recipient set.
-    if not isinstance(validity, dict) or validity.get("version") != 1:
+    if not isinstance(validity, dict) or type(validity.get('version')) is not int or validity['version'] != 1:
         return "cancelled", "source_identity_unavailable", None
     if validity.get("provider") not in {"nws", "xweather"} or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(validity.get("group_id", ""))):
         return "cancelled", "source_identity_invalid", None
@@ -1502,7 +1712,7 @@ def queue_external_delivery(
             channels = snapshot(config, group)
         override = os.environ.get('SLS_WEATHER_CHANNEL_SNAPSHOT', '')
         if channel_snapshot is not None or override:
-            channels = channel_snapshot if channel_snapshot is not None else json.loads(override)
+            channels = channel_snapshot if channel_snapshot is not None else _strict_json(override)
             if not isinstance(channels, dict) or set(channels) != {'voice_recipient_ids','sms_recipient_ids','fingerprints'}:
                 raise RetryStateError('invalid_original_weather_channels')
         channels_pending = bool(channels['voice_recipient_ids'] or channels['sms_recipient_ids'])
@@ -1564,6 +1774,7 @@ def external_delivery_uncertain(state_path, source, correlation_key):
         return isinstance(record, dict) and bool(
             record.get("webhook_uncertain") or record.get("webhook_inflight")
             or record.get("email_uncertain") or record.get("email_inflight")
+            or record.get("channels_uncertain")
         )
 
 
@@ -1573,7 +1784,9 @@ def external_delivery_status(state_path, source, correlation_key):
         record = _load_retry_state(locked_path)["deliveries"].get(delivery_key)
         if not isinstance(record, dict):
             return "unknown"
-        if record.get("webhook_uncertain") or record.get("webhook_inflight") or record.get("email_uncertain") or record.get("email_inflight"):
+        if (record.get("webhook_uncertain") or record.get("webhook_inflight")
+                or record.get("email_uncertain") or record.get("email_inflight")
+                or record.get("channels_uncertain")):
             return "uncertain"
         if not record.get("completed_at"):
             return "pending"
@@ -1600,6 +1813,7 @@ def _recover_webhook_inflight(state):
                 reason="interrupted_submission",
             )
             uncertain[key] = receipt
+            _record_external_receipt(record, receipt)
             results.append({"delivery": delivery_key, **receipt})
         if inflight:
             record["webhook_inflight"] = []
@@ -1624,6 +1838,18 @@ def _recover_email_inflight(state):
         if not record.get('webhook_pending') and not record.get('channels_pending'):
             record.update(completed_at=int(time.time()), terminal_status='uncertain')
     return results
+
+
+def _webhook_result_retryable(result):
+    explicit = result.get('retryable')
+    if type(explicit) is bool:
+        return explicit
+    if result.get('status') != 'failed':
+        return False
+    http_status = result.get('http_status')
+    if type(http_status) is int and http_status in {425, 429}:
+        return True
+    return http_status is None and result.get('error') in RETRYABLE_PRE_SUBMISSION_ERRORS
 
 
 def retry_external_deliveries(
@@ -1717,15 +1943,25 @@ def retry_external_deliveries(
                 envelope = {'key':delivery_key, 'context':context, 'title':payload.get('subject','Weather alert'), 'body':payload.get('body','')}
                 try:
                     process = subprocess.run(['/usr/bin/timeout','40','/usr/bin/php','/usr/local/bin/sls_mass_notify/sls_mass_notify_weather_channels.php'],
-                        input=json.dumps(envelope,separators=(',',':')),capture_output=True,text=True,timeout=45,check=False)
-                    reply=json.loads(process.stdout) if len(process.stdout)<16384 else {}
+                        input=json.dumps(envelope,separators=(',',':')),capture_output=True,text=True,timeout=45,check=False,
+                        env={'PATH':'/usr/bin:/bin','LANG':'C.UTF-8','LC_ALL':'C.UTF-8'})
+                    reply=_strict_json(process.stdout) if len(process.stdout)<16384 else {}
+                    if (not isinstance(reply, dict) or type(reply.get('success')) is not bool
+                            or not isinstance(reply.get('status'), str)
+                            or reply['status'] not in {'accepted', 'queued', 'deferred', 'failed', 'cancelled', 'uncertain'}
+                            or not isinstance(reply.get('message', ''), str) or len(reply.get('message', '')) > 400
+                            or not isinstance(reply.get('job_id', ''), str)
+                            or (reply.get('job_id', '') and not re.fullmatch(r'job_[a-f0-9]{32}', reply['job_id']))):
+                        raise ValueError('Invalid Weather channel reply')
                 except Exception:
                     reply={'success':False,'status':'deferred','message':'weather_channel_submission_unavailable'}
                 status=reply.get('status','deferred')
-                if reply.get('success') is True or status in {'failed','cancelled'}:
+                if status in {'accepted','queued','failed','cancelled','uncertain'}:
                     record['channels_pending']=False
                     record['channel_job_id']=reply.get('job_id','')
                 receipt={'type':'channels','id':'sms_external_voice','status':status,'error':str(reply.get('message',''))[:400]}
+                if status == 'uncertain':
+                    record['channels_uncertain'] = dict(receipt)
                 safe_results.append({'delivery':delivery_key,**receipt});_record_external_receipt(record,receipt)
                 _write_retry_state(locked_path,state)
             if record.get("email_pending"):
@@ -1743,8 +1979,12 @@ def retry_external_deliveries(
                     )
                 except Exception as error:
                     sent = False
-                    from sls_branded_email import _mail_admission
-                    if isinstance(error, _mail_admission.MailAdmissionBlocked):
+                    try:
+                        from sls_branded_email import _mail_admission
+                        admission_blocked = isinstance(error, _mail_admission.MailAdmissionBlocked)
+                    except (ImportError, AttributeError):
+                        admission_blocked = False
+                    if admission_blocked:
                         error_code = error.code
                     else:
                         uncertain_email = True; error_code = 'submission_unconfirmed'
@@ -1832,7 +2072,7 @@ def retry_external_deliveries(
                         result = _uncertain_delivery(row, reason="dispatcher_failed")
                     if result.get("status") == "uncertain":
                         uncertain[key] = result
-                    elif result.get("status") == "failed":
+                    elif result.get("status") == "failed" and _webhook_result_retryable(result):
                         retryable.add(key)
                     safe_results.append({"delivery": delivery_key, **result})
                     _record_external_receipt(record, result)
@@ -1843,7 +2083,8 @@ def retry_external_deliveries(
 
             if not record.get("email_pending") and not record.get("webhook_pending") and not record.get("channels_pending"):
                 record["completed_at"] = int(time.time())
-                record["terminal_status"] = ("uncertain" if record.get("webhook_uncertain") or record.get('email_uncertain') else
+                record["terminal_status"] = ("uncertain" if record.get("webhook_uncertain") or record.get('email_uncertain') or record.get('channels_uncertain') else
+                                             "failed" if any(receipt.get('status') == 'failed' for receipt in record.get('destination_receipts', {}).values()) else
                                              "partial_cancelled" if record.get("routing_restricted_at") else "complete")
                 _write_retry_state(locked_path, state)
         pending = sum(
@@ -1855,7 +2096,8 @@ def retry_external_deliveries(
         )
         uncertain = sum(
             1 for record in state["deliveries"].values()
-            if isinstance(record, dict) and (record.get("webhook_uncertain") or record.get('email_uncertain'))
+            if isinstance(record, dict) and (record.get("webhook_uncertain") or record.get('email_uncertain')
+                                             or record.get('channels_uncertain'))
             and str((record.get("payload") or {}).get("source") or "").lower() == normalized_source
         )
         _write_retry_state(locked_path, state)
@@ -1961,7 +2203,7 @@ def main():
         ]
         fields = []
         try:
-            raw_fields = json.loads(os.environ.get("SLS_DESTINATION_FIELDS_JSON", "[]"))
+            raw_fields = _strict_json(os.environ.get("SLS_DESTINATION_FIELDS_JSON", "[]"))
             if isinstance(raw_fields, list):
                 fields = [
                     (str(entry[0]), str(entry[1]))
@@ -1971,18 +2213,18 @@ def main():
         except (TypeError, ValueError, json.JSONDecodeError):
             fields = []
         try:
-            expected_fingerprints = json.loads(os.environ.get("SLS_DESTINATION_FINGERPRINTS_JSON", "{}"))
+            expected_fingerprints = _strict_json(os.environ.get("SLS_DESTINATION_FINGERPRINTS_JSON", "{}"))
         except (TypeError, ValueError, json.JSONDecodeError):
             expected_fingerprints = {}
         raw_start = os.environ.get('SLS_DESTINATION_LATEST_START', '')
-        if raw_start and not re.fullmatch(r'[1-9][0-9]{0,11}', raw_start):
+        if raw_start and (not re.fullmatch(r'[1-9][0-9]{0,11}', raw_start) or int(raw_start) > 253402300799):
             print('{"results":[],"error":"invalid_schedule_deadline"}')
             return 1
         try:
             raw_incident = os.environ.get('SLS_DESTINATION_INCIDENT_JSON', '')
             if len(raw_incident) > 1024:
                 raise ValueError('oversize incident context')
-            incident_context = collaboration_incident_context(json.loads(raw_incident) if raw_incident else None)
+            incident_context = collaboration_incident_context(_strict_json(raw_incident) if raw_incident else None)
         except (ValueError, DestinationError):
             print('{"results":[],"error":"invalid_incident_context"}')
             return 1
@@ -1990,7 +2232,7 @@ def main():
         try:
             if len(raw_authorization) > 16384:
                 raise ValueError('oversize authorization context')
-            authorization = json.loads(raw_authorization) if raw_authorization else None
+            authorization = _strict_json(raw_authorization) if raw_authorization else None
             if authorization is not None and (not isinstance(authorization, dict) or
                     set(authorization) - {'api_credential_id', 'automation_context', 'webhook_ids'}):
                 raise ValueError('invalid authorization context')

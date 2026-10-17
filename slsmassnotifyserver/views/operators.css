@@ -9,6 +9,6 @@
 .sls-ops .ops-dialog details{border-bottom:1px solid var(--sls-border,#dbe3ec);padding-bottom:8px}
 .sls-ops .ops-dialog .ops-actions{position:sticky;bottom:-22px;background:var(--sls-surface,#fff);padding:16px 0;border-top:1px solid var(--sls-border,#dbe3ec);margin-top:18px}
 
-.sls-ops .ops-audit-scroll{max-width:100%;overflow-x:auto}.sls-ops .ops-audit-scroll table{margin:14px 0 0}.sls-ops .ops-audit-scroll td{vertical-align:top;overflow-wrap:anywhere}
+.sls-ops .ops-audit-scroll{max-width:100%;overflow-x:auto}.sls-ops .ops-audit-scroll table{margin:14px 0 0;min-width:820px}.sls-ops .ops-audit-scroll th{white-space:nowrap}.sls-ops .ops-audit-scroll td{vertical-align:top;overflow-wrap:anywhere;min-width:90px}.sls-ops .ops-audit-scroll td:first-child{min-width:145px;white-space:nowrap}
 
 .sls-operator-container{max-width:100vw}.sls-ops{min-width:0;max-width:100%}

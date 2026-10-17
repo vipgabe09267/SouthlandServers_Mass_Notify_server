@@ -9,6 +9,7 @@ function expiryCheck(bool $ok, string $message): void { global $checks; $checks+
 function expiryReject(callable $work): void { try { $work(); } catch (DomainException $expected) { expiryCheck(true, 'Rejected'); return; } throw new RuntimeException('Invalid expiry accepted'); }
 $root = sys_get_temp_dir().'/sls-operator-expiry-'.bin2hex(random_bytes(8)); mkdir($root,0700); define('SLS_EXPIRY_FIXTURE',$root);
 class ExpiryFixture {
+    private function normalizeSettings(array $settings): array { return $settings; }
     use \FreePBX\modules\SlsOperators;
     const SETTINGS_JSON = SLS_EXPIRY_FIXTURE.'/settings.config';
     const PENDING_SETTINGS_JSON = SLS_EXPIRY_FIXTURE.'/pending.config';
@@ -22,6 +23,7 @@ class ExpiryFixture {
     private function releaseSettingsLock($lock): void {}
     private function loadSettingsFile($path): array { return $this->settings; }
     private function writeSettingsFileUnlocked($path,$settings,$active): void { $this->settings=$settings; }
+    protected function commitOperatorConfigFiles(array $active, ?array $pending): void { $this->writeSettingsFileUnlocked(self::SETTINGS_JSON,$active,true); }
     private function resolveScheduleLocalDateTime($value, DateTimeZone $zone): array {
         $class=new ReflectionClass(\FreePBX\modules\Slsmassnotifyserver::class);
         return $class->getMethod('resolveScheduleLocalDateTime')->invoke($class->newInstanceWithoutConstructor(),$value,$zone);
@@ -31,7 +33,9 @@ class ExpiryFixture {
     }
 }
 try {
-    $settings=['enabled'=>'1','desktop_auth_key'=>base64_encode(str_repeat('k',32))];
+    $settings=['enabled'=>'1','desktop_auth_key'=>base64_encode(str_repeat('k',32)),
+        'public_pbx_host'=>'pbx.example.test','sipnotify'=>['base_url'=>'https://pbx.example.test/api/sipnotify'],
+        'control_api'=>['base_url'=>'https://pbx.example.test/api/sls-mass-notify']];
     $id='api_'.str_repeat('a',24);$secret='GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
     $auth=Auth::create('dedicated fixture password 248');$auth['force_password_change']=false;
     $auth['totp_secret_enc']=Auth::seal($secret,$id,$settings);

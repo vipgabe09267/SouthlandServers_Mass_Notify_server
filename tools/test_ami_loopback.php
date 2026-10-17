@@ -15,8 +15,11 @@ namespace {
     final class AmiManagerFixture {
         public $added = [];
         public $fail = false;
-        public function isExist_manager(...$arguments) { return false; }
-        public function del_manager(...$arguments) { throw new RuntimeException('Unexpected deletion.'); }
+        public $existing = [];
+        public $deleted = [];
+        public function isExist_manager($name, ...$arguments) { return isset($this->existing[$name]); }
+        public function get_manager($name, ...$arguments) { return $this->existing[$name]; }
+        public function del_manager($name, ...$arguments) { $this->deleted[] = $name; unset($this->existing[$name]); }
         public function add_manager(...$arguments) {
             if ($this->fail) { throw new RuntimeException('Synthetic Manager database failure.'); }
             $this->added[] = $arguments;
@@ -93,7 +96,7 @@ namespace {
     foreach (['ensureAmiUser', 'normalizeAmiHost', 'detectAmiHost', 'getFreePbxConfigValue', 'normalizeEndpointUsername', 'normalizeEndpointPassword'] as $name) {
         $start = strpos($source, "\tprivate function {$name}(");
         $end = strpos($source, "\n\tprivate function ", $start + 1);
-        $methods .= str_replace('private function', 'public function', substr($source, $start, $end - $start)) . "\n";
+        $methods .= str_replace(['private function', '__DIR__'], ['public function', var_export(dirname(__DIR__).'/slsmassnotifyserver', true)], substr($source, $start, $end - $start)) . "\n";
     }
     eval('class AmiIntegrationFixture {' . $methods . '
         public $settings = []; public $blocks = []; public $commands = []; public $removed = [];
@@ -125,6 +128,29 @@ namespace {
     }
     $assert(count(array_unique($fixture->commands)) === 1 && strpos($fixture->commands[0], 'manager reload') !== false,
         'Unexpected integration command would run.');
+    $unrelated = ['name'=>$settings['ami']['username'], 'secret'=>'different-account-credential',
+        'deny'=>'0.0.0.0/0.0.0.0&::/0', 'permit'=>'127.0.0.1/255.255.255.255&::1/128',
+        'read'=>'system,call,originate,reporting', 'write'=>'system,call,originate,reporting', 'writetimeout'=>1000];
+    FreePBX::$manager = new AmiManagerFixture();
+    FreePBX::$manager->existing[$unrelated['name']] = $unrelated;
+    $rejected = false;
+    try { $fixture->ensureAmiUser(); } catch (RuntimeException $error) { $rejected = true; }
+    $assert($rejected && FreePBX::$manager->deleted === [] && FreePBX::$manager->added === [], 'Repair overwrote an unrelated AMI account.');
+    FreePBX::$manager = new AmiManagerFixture();
+    $legacy = $unrelated; $legacy['name'] = 'sls_mass_notify';
+    FreePBX::$manager->existing['sls_mass_notify'] = $legacy;
+    $fixture->ensureAmiUser();
+    $assert(FreePBX::$manager->deleted === [], 'Repair removed an unrelated historical username.');
+    FreePBX::$manager = new AmiManagerFixture();
+    $owned = $unrelated; $owned['secret'] = $settings['ami']['password'];
+    FreePBX::$manager->existing[$owned['name']] = $owned;
+    $fixture->ensureAmiUser();
+    $assert(FreePBX::$manager->deleted === [$owned['name']], 'Recognized dedicated SLS credential could not be refreshed.');
+    FreePBX::$values['AMPMGRUSER'] = $settings['ami']['username'];
+    $before = count($fixture->commands); $rejected = false;
+    try { $fixture->ensureAmiUser(); } catch (RuntimeException $error) { $rejected = true; }
+    $assert($rejected && count($fixture->commands) === $before, 'Repair accepted the PBX administrative AMI identity.');
+    FreePBX::$values['AMPMGRUSER'] = 'admin';
     $before = count($fixture->commands);
     FreePBX::$values['ASTMANAGERHOST'] = '192.0.2.1';
     $rejected = false;

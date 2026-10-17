@@ -70,6 +70,23 @@ class GuardTests(unittest.TestCase):
             for name in ('schedule-runner.lock','announcement-activity.lock','mass-notifications.config.lock'):
                 self.assertFalse((self.data/name).exists(),name)
         finally:os.close(fd)
+
+    def test_group_writable_runtime_or_slot_directory_is_rejected(self):
+        for target in ('runtime','slots'):
+            with self.subTest(target=target):
+                self.data.chmod(0o700)
+                slots=self.data/'live-paging-slots'
+                if slots.exists():
+                    slots.chmod(0o750)
+                if target == 'runtime':
+                    self.data.chmod(0o770)
+                else:
+                    slots.mkdir(mode=0o770,exist_ok=True)
+                    slots.chmod(0o770)
+                child=self.start();out,err=child.communicate(timeout=5)
+                self.assertNotEqual(child.returncode,0);self.assertNotIn(b'ready',out)
+                self.assertIn(b'unsafe',err)
+        self.data.chmod(0o700)
     def test_parent_pipe_eof_releases_locks(self):
         (self.data/'audio-reservations.json').write_text('{"recipients":{},"media":{}}')
         (self.data/'audio-reservations.json').chmod(0o640)

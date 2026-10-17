@@ -1,6 +1,7 @@
 <?php
 declare(strict_types=1);
 namespace FreePBX\modules;
+require_once __DIR__.'/ImmediateSettings.php';
 require_once __DIR__ . '/api/sls-mass-notify/security.php';
 
 /** Administrator-only methods; the existing FreePBX controller enforces CSRF. */
@@ -23,7 +24,11 @@ trait SlsApiCredentialManagement
                 if (!is_string($input['credential_json'] ?? null) || strlen($input['credential_json']) > 131072) {
                     throw new \DomainException('The credential permission form is missing or too large. Reload and try again.');
                 }
-                $definition = json_decode($input['credential_json'], true, 16);
+                try {
+                    $definition = \SLS\MassNotify\ApiSecurity::jsonObject($input['credential_json'], false, 16);
+                } catch (\JsonException | \InvalidArgumentException $error) {
+                    throw new \DomainException('The credential permission form is invalid.');
+                }
                 if (!is_array($definition) || array_diff(array_keys($definition), ['name', 'scopes', 'audience'])) {
                     throw new \DomainException('The credential permission form is invalid.');
                 }
@@ -42,17 +47,18 @@ trait SlsApiCredentialManagement
                 $rows[] = $issued['credential'];
                 $rows = \SLS\MassNotify\ApiSecurity::credentials($rows);
             } else { $rows = \SLS\MassNotify\ApiSecurity::revoke($rows, $input['credential_id']); }
-            // Write the pending copy first. If its write fails, active keys have
-            // not changed. If the active write then fails, a later Apply cannot
-            // accidentally resurrect a successfully staged revocation.
+            $pending=null;
             if (is_file(self::PENDING_SETTINGS_JSON) || is_link(self::PENDING_SETTINGS_JSON)) {
                 $pending = $this->loadSettingsFile(self::PENDING_SETTINGS_JSON);
                 if (!is_array($pending['control_api'] ?? null)) { throw new \DomainException('Staged Control API settings are invalid. Resolve them before changing credentials.'); }
                 $pending['control_api']['credentials'] = $rows;
-                $this->writeSettingsFileUnlocked(self::PENDING_SETTINGS_JSON, $pending, false);
             }
             $active['control_api']['credentials'] = $rows;
-            $this->writeSettingsFileUnlocked(self::SETTINGS_JSON, $active, true);
+            [$active,$pending]=\SLS\MassNotify\ImmediateSettings::prepare($active,$pending,['control_api']);
+            \SLS\MassNotify\ImmediateSettings::commitFiles(self::SETTINGS_JSON, self::PENDING_SETTINGS_JSON,
+                $active, $pending, function (string $path, array $settings, bool $backup): void {
+                    $this->writeSettingsFileUnlocked($path, $settings, $backup);
+                });
             foreach ($rows as &$row) { unset($row['secret_hash']); } unset($row);
             $result = ['success' => true, 'credentials' => $rows,
                 'message' => $action === 'create' ? 'Credential created. Copy its secret now; it will not be displayed again.' : 'Credential revoked immediately. Applying staged settings will not restore it.'];

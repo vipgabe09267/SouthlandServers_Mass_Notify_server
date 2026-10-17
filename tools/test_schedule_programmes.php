@@ -42,5 +42,9 @@ foreach([['timezone'=>'bad'],['day_types'=>['a']],['cycle_mode'=>'unknown'],['cy
 reject(static fn()=>Programmes::normalize(['enabled'=>true,'calendars'=>[$row,$row]]));
 $escape=$snapshot;$escape['programme']['selected_types']=['missing'];reject(static fn()=>Calendar::validate($escape));
 $ui=file_get_contents(dirname(__DIR__).'/slsmassnotifyserver/views/schedule_programmes.js');
-verify(str_contains($ui,'textContent')&&!str_contains($ui,'innerHTML'),'Calendar editor uses unsafe markup.');
+verify(is_string($ui),'Calendar editor source could not be read.');
+$unsafe='/\b(?:innerHTML|outerHTML|insertAdjacentHTML|document\.write(?:ln)?|eval|Function)\b|(?:\$|jQuery)\s*\([^)]*\)\s*\.html\s*\(/';
+verify(preg_match($unsafe,$ui)===0,'Calendar editor contains an unsafe DOM or code-generation sink.');
+verify(preg_match('/\b(?:import|require)\s*\(/',$ui)===0,'Calendar editor introduced an unreviewed rendering helper.');
+verify(substr_count($ui,'textContent')>=2 && str_contains($ui,'document.createTextNode'),'Calendar editor stopped using inert text nodes for supplied labels.');
 echo "Shared calendar programmes: {$checks} cycle, holiday, DST, snapshot and validation checks passed.\n";

@@ -17,9 +17,11 @@ import wave
 
 sys.dont_write_bytecode = True
 asterisk = shutil.which('asterisk')
-isolated = ((os.environ.get('SLS_TEST_NAMESPACE') == 'entered' and os.environ.get('SLS_TEST_PARENT_NET_NS') != os.readlink('/proc/self/ns/net'))
-            or (os.environ.get('SLS_BUILD_STAGE') == 'isolated' and os.environ.get('SLS_BUILD_PARENT_NET') != os.readlink('/proc/self/ns/net')))
-if not asterisk or not isolated:
+isolated = ((os.environ.get('SLS_TEST_NAMESPACE') == 'entered' and os.environ.get('SLS_TEST_PARENT_NET_NS') not in (None, '', os.readlink('/proc/self/ns/net')))
+            or (os.environ.get('SLS_BUILD_STAGE') == 'isolated' and os.environ.get('SLS_BUILD_PARENT_NET') not in (None, '', os.readlink('/proc/self/ns/net'))))
+if not isolated:
+    raise SystemExit('Use the isolated test wrapper; no Asterisk was started.')
+if not asterisk:
     print('SKIP: real Asterisk playback fixture requires Asterisk and the isolated test/build wrapper.')
     raise SystemExit(0)
 repo = Path(__file__).resolve().parents[1]

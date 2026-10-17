@@ -17,7 +17,7 @@ final class EnterpriseOperationsStore
         $directory=rtrim($directory,'/');$this->directory=$directory;$this->parentMarker=dirname($directory).'/.'.basename($directory).'-required';
         $required=$this->parentRequired();
         if($required&&(!is_dir($directory)||is_link($directory))){throw new \RuntimeException('Established Enterprise operations storage is missing. Restore its replay history; do not recreate it.');}
-        if(!$required&&(@lstat($directory.'/worker-state.json')||is_link($directory.'/worker-state.json'))){throw new \RuntimeException('Enterprise operations lost its parent initialization marker. Preserve the journal for recovery.');}
+        if(!$required&&InitializationJournal::read($directory.'/initialization.pending')===null&&(@lstat($directory.'/worker-state.json')||is_link($directory.'/worker-state.json'))){throw new \RuntimeException('Enterprise operations lost its parent initialization marker. Preserve the journal for recovery.');}
         $this->files=new \SlsAnnouncementJobStore($directory);
     }
     private function parentRequired(): bool
@@ -31,37 +31,47 @@ final class EnterpriseOperationsStore
             if(!$safe($opened)||!$safe($after)||$opened['dev']!==$before['dev']||$opened['ino']!==$before['ino']||$opened['dev']!==$after['dev']||$opened['ino']!==$after['ino']||stream_get_contents($h,65)!==self::MARKER){throw new \RuntimeException('Enterprise operations parent marker changed or is damaged.');}
         }finally{fclose($h);}return true;
     }
-    private function establishParent(): void
+    private static function bounded($value,int $depth,int &$nodes): void
     {
-        $mask=umask(0077);try{$h=@fopen($this->parentMarker,'x+b');}finally{umask($mask);}
-        if(!$h){throw new \RuntimeException('Enterprise operations parent marker could not be established.');}
-        try{if(fwrite($h,self::MARKER)!==strlen(self::MARKER)||!fflush($h)||!fsync($h)){throw new \RuntimeException('Enterprise operations parent marker could not be synchronized.');}}finally{fclose($h);}
-        $h=@fopen(dirname($this->parentMarker),'r');try{if(!$h||!fsync($h)){throw new \RuntimeException('Enterprise operations parent directory could not be synchronized.');}}finally{if($h){fclose($h);}}
-        $this->parentRequired();
+        if($depth>24||++$nodes>30000){throw new \RuntimeException('Enterprise operations history exceeds its structural bound. Preserve it for recovery.');}
+        if(is_string($value)){if(strlen($value)>1100000||preg_match('//u',$value)!==1){throw new \RuntimeException('Enterprise operations history contains invalid or oversized text. Preserve it for recovery.');}return;}
+        if(is_int($value)||is_bool($value)||$value===null||(is_float($value)&&is_finite($value))){return;}
+        if(!is_array($value)){throw new \RuntimeException('Enterprise operations history contains an unsupported value. Preserve it for recovery.');}
+        foreach($value as $key=>$child){if(is_string($key)&&(strlen($key)>128||preg_match('/[\x00-\x1f\x7f]/',$key))){throw new \RuntimeException('Enterprise operations history contains an invalid field. Preserve it for recovery.');}self::bounded($child,$depth+1,$nodes);}
+    }
+    private static function validateState(array $state): void
+    {
+        if(array_diff(array_keys($state),['schema','clock','approvals','drills'])||count($state)!==4||($state['schema']??null)!==1
+            ||!is_int($state['clock']??null)||$state['clock']<0||!is_array($state['approvals']??null)||!is_array($state['drills']??null)
+            ||count($state['approvals'])>200||count($state['drills'])>500){throw new \RuntimeException('Enterprise operations history is invalid or full. Export it and review retention.');}
+        $nodes=0;self::bounded($state,0,$nodes);
+        if(!class_exists(EnterpriseApprovalService::class,false)){require_once __DIR__.'/EnterpriseApprovalService.php';}
+        foreach($state['approvals'] as $id=>$row){
+            if(!is_string($id)||!preg_match('/^review_[a-f0-9]{32}$/D',$id)||!is_array($row)||($row['id']??null)!==$id){throw new \RuntimeException('Enterprise approval history is damaged. Preserve it for recovery.');}
+            EnterpriseApprovalService::validateRecord($row);
+        }
+        foreach($state['drills'] as $id=>$row){
+            if(!is_string($id)||!preg_match('/^run_[a-f0-9]{64}$/D',$id)||!is_array($row)||($row['id']??null)!==$id
+                ||!is_array($row['assignment']??null)||!is_array($row['reviews']??null)||!array_is_list($row['reviews'])||count($row['reviews'])>100
+                ||!in_array($row['state']??null,['submitting','planned','awaiting_approval','queued','submitted','not_submitted','uncertain'],true)
+                ||(isset($row['fingerprint'])&&(!is_string($row['fingerprint'])||!preg_match('/^[a-f0-9]{64}$/D',$row['fingerprint'])))
+                ||(isset($row['incident_id'])&&$row['incident_id']!==''&&(!is_string($row['incident_id'])||!preg_match('/^inc_[a-f0-9]{32}$/D',$row['incident_id'])))
+                ||(isset($row['result'])&&!is_array($row['result']))){throw new \RuntimeException('Enterprise drill history is damaged. Preserve it for recovery.');}
+        }
     }
     public function transaction(callable $work)
     {
         $lock=$this->files->admissionLock();
         if (!$lock) { throw new \DomainException('Enterprise operations history is busy. Retry the same request.'); }
         try {
-            rewind($lock);$marker=stream_get_contents($lock,65);$state=$this->files->state();
-            if (!in_array($marker,['',self::MARKER],true) || ($marker!=='' && !$state) || ($marker==='' && $state)) { throw new \RuntimeException('Enterprise operations history lost its initialization marker or journal. Preserve it for recovery.'); }
-            $required=$this->parentRequired();
-            if($required&&!$state){throw new \RuntimeException('Established Enterprise operations journal is missing. Preserve replay protection for recovery.');}
-            if(!$required&&$state){throw new \RuntimeException('Enterprise operations parent marker is missing. Preserve replay protection for recovery.');}
-            if (!$state) {
-                $state=['schema'=>1,'clock'=>0,'approvals'=>[],'drills'=>[]];
-                $this->files->atomic('worker-state.json',$state);
-                rewind($lock);if(fwrite($lock,self::MARKER)!==strlen(self::MARKER)||!fflush($lock)||!fsync($lock)){throw new \RuntimeException('Enterprise operations initialization could not be synchronized.');}
-                $this->establishParent();$marker=self::MARKER;
-            }
-            if (array_diff(array_keys($state),['schema','clock','approvals','drills']) || ($state['schema']??null)!==1
-                || !is_int($state['clock']??null) || $state['clock']<0 || !is_array($state['approvals']??null) || !is_array($state['drills']??null)
-                || count($state['approvals'])>200 || count($state['drills'])>500) { throw new \RuntimeException('Enterprise operations history is invalid or full. Export it and review retention.'); }
+            $state=InitializationJournal::initializeStore($this->files, 'enterprise-operations',
+                ['schema'=>1,'clock'=>0,'approvals'=>[],'drills'=>[]], $this->parentMarker, self::MARKER, $lock);
+            self::validateState($state);
+            $original=$state;
             $result=$work($state);
             if (count($state['approvals'])>200 || count($state['drills'])>500 || strlen(json_encode($state,JSON_THROW_ON_ERROR))>1800000) { throw new \DomainException('Enterprise operations history reached its allocation. Export its permanent history before admitting more records.'); }
-            $this->files->atomic('worker-state.json',$state);
-            if ($marker==='') { rewind($lock);if(fwrite($lock,self::MARKER)!==strlen(self::MARKER)||!fflush($lock)||!fsync($lock)){throw new \RuntimeException('Enterprise operations initialization could not be synchronized.');} }
+            self::validateState($state);
+            if($state!==$original) { $this->files->atomic('worker-state.json',$state); }
             return $result;
         } finally { \SlsAnnouncementJobStore::unlock($lock); }
     }

@@ -15,7 +15,8 @@ function slsTriggerResponse(int $status,array $body): void
 if (($_SERVER['REQUEST_METHOD'] ?? '')!=='POST') { header('Allow: POST'); slsTriggerResponse(405,['ok'=>false,'error'=>'method_not_allowed']); }
 $id=$_GET['rule_id'] ?? '';
 if (!is_string($id) || !preg_match('/^trg_[a-f0-9]{24}$/D',$id) || array_diff(array_keys($_GET),['rule_id'])) { slsTriggerResponse(400,['ok'=>false,'error'=>'invalid_trigger_identity']); }
-if (strtolower(trim(explode(';',$_SERVER['CONTENT_TYPE'] ?? '')[0]))!=='application/json') { slsTriggerResponse(415,['ok'=>false,'error'=>'json_required']); }
+$contentType=$_SERVER['CONTENT_TYPE'] ?? '';
+if (!is_string($contentType) || strtolower(trim(explode(';',$contentType,2)[0]))!=='application/json') { slsTriggerResponse(415,['ok'=>false,'error'=>'json_required']); }
 $raw=file_get_contents('php://input',false,null,0,16385);
 if (!is_string($raw) || strlen($raw)>16384) { slsTriggerResponse(413,['ok'=>false,'error'=>'trigger_request_too_large']); }
 try {
@@ -29,8 +30,8 @@ try {
         ['timestamp'=>$_SERVER['HTTP_X_SLS_TIMESTAMP'] ?? '', 'signature'=>$_SERVER['HTTP_X_SLS_SIGNATURE'] ?? ''],time())) {
         slsTriggerResponse(403,['ok'=>false,'error'=>'trigger_authentication_failed']);
     }
-    $input=json_decode($raw,true,12,JSON_THROW_ON_ERROR);
-    if (!is_array($input) || array_is_list($input)) { slsTriggerResponse(400,['ok'=>false,'error'=>'trigger_request_must_be_an_object']); }
+    if (!str_starts_with(ltrim($raw),'{')) { slsTriggerResponse(400,['ok'=>false,'error'=>'trigger_request_must_be_an_object']); }
+    $input=ApiSecurity::jsonObject($raw,false,12);
     $bootstrap_settings=['freepbx_auth'=>false,'skip_astman'=>true]; require '/etc/freepbx.conf';
     $module=\FreePBX::create()->Slsmassnotifyserver;
     slsTriggerResponse(200,($input['operation'] ?? '')==='heartbeat'

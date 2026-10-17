@@ -1,29 +1,34 @@
 <p align="center">
-  <a href="https://southlandservers.xyz"><img src="https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/main/slsmassnotifyserver/assets/SLS_Mass_Notif_Plugin.png" width="112" alt="Southland Servers"></a>
+  <a href="https://southlandservers.xyz"><img src="https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/main/slsmassnotifyserver/assets/SLS_Mass_Notif_Email.png" width="112" alt="Southland Servers"></a>
 </p>
 
 # SLS Mass Notifications Server
 
-Phone, desktop, weather, lightning and scheduled notifications for FreePBX 17 on Debian 12. Version `0.1.6-beta` · AGPL-3.0-or-later.
+Phone, desktop, weather, lightning and scheduled notifications for FreePBX 17 on Debian 12. `0.1.7-beta` prerelease candidate · AGPL-3.0-or-later. Publication is pending.
 
-> **Beta software for noncritical testing. Do not rely on SLS for critical or urgent notifications.** Each FreePBX administrator must accept the warning after setup or upgrade; confirmation requires five visible seconds.
+> **Beta software for noncritical testing. Do not rely on SLS for critical or urgent notifications.** Each FreePBX administrator accepts the warning once; their acknowledgment survives upgrades. Confirmation requires five visible seconds.
 
 [Install/update](#install-or-update) · [Uninstall](#uninstall) · [Service commands](#service-commands) · [Repair/recovery](#repair-and-recovery) · [Requirements](#requirements) · [Documentation](#documentation)
 
 ## Install or update
 
-Run as **root** on the PBX:
+The candidate is not published yet. Once released, run as **root** on the PBX.
+For a first installation, use [publisher verification](docs/FIRST_INSTALL_VERIFICATION.md)
+before executing downloaded code. If you already have an independently verified
+installer hash, the short workflow is:
 
 ```bash
-cd /tmp
+SLS_INSTALL_DIR="$(mktemp -d /tmp/sls-verified-install.XXXXXXXX)"
+cd "$SLS_INSTALL_DIR"
 curl -fsSL -o sls-install.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.6-beta/tools/install_release.sh
-chmod +x sls-install.sh
-SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.6-beta/slsmassnotifyserver-0.1.6-beta.tgz' \
-./sls-install.sh
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.7-beta/tools/install_release.sh
+SLS_INSTALLER_SHA256='REPLACE_WITH_THE_INDEPENDENTLY_VERIFIED_INSTALLER_SHA256'
+printf '%s  sls-install.sh\n' "$SLS_INSTALLER_SHA256" | sha256sum --check || exit 1
+SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.7-beta/slsmassnotifyserver-0.1.7-beta.tgz' \
+bash ./sls-install.sh
 ```
 
-This command installs or upgrades using the publisher-signed package. **Already running an earlier `0.1.6-beta`? Rerun it manually:** automatic updates skip equal versions. Existing settings and credentials are preserved.
+This command installs or upgrades using the publisher-signed package. Each release version identifies one signed package. Existing settings and credentials are preserved.
 
 Open **Mass Notify** in FreePBX, complete the setup wizard, review the timezone and use **Apply Config** when prompted. Forwarded ports are optional installation settings; shared defaults remain HTTPS 443 and HTTP 80. See [installation requirements, offline packages and supported layouts](INSTALL.md).
 
@@ -64,7 +69,7 @@ To inspect before installation, use the downloaded matching installer:
 
 ```bash
 bash ./sls-install.sh --inspect \
-  'https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.6-beta/slsmassnotifyserver-0.1.6-beta.tgz'
+  'https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.7-beta/slsmassnotifyserver-0.1.7-beta.tgz'
 ```
 
 If an attempt reports an unfinished transaction, preserve its directory and substitute the **exact path printed in the installer log**:
@@ -73,7 +78,7 @@ If an attempt reports an unfinished transaction, preserve its directory and subs
 bash ./sls-install.sh --recover '/var/lib/sls-mass-notify-installer/transaction-<id>'
 ```
 
-Then rerun the normal installer. The corrected `0.1.6-beta` also fixes repeat verification after legacy Python-cache cleanup. Do not delete recovery evidence or change live hashes to force approval. Keep `/tmp/slsmassnotifyserver-install.log`; see [troubleshooting](INSTALL.md#installer-log-and-runtime-errors), [legacy permission recovery](docs/INSTALLER_OPERATIONS.md#recognized-legacy-permission-recovery) and [interrupted installation recovery](docs/INSTALLER_OPERATIONS.md#interrupted-installations).
+Then rerun the verified installer. Do not delete recovery evidence or change live hashes to force approval. Keep `/tmp/slsmassnotifyserver-install.log`; see [troubleshooting](INSTALL.md#installer-log-and-runtime-errors), [legacy permission recovery](docs/INSTALLER_OPERATIONS.md#recognized-legacy-permission-recovery) and [interrupted installation recovery](docs/INSTALLER_OPERATIONS.md#interrupted-installations).
 
 ## Requirements
 
@@ -107,7 +112,9 @@ Optional channels and Labs features start disabled. Phone/SMS contacts share one
 
 - **Phones:** audio and visual delivery require appropriate handset provisioning. Multiple registrations are handled per contact where safe routing is supported. If HTTPS does not work, try HTTP for legacy phones. See [phone formats](PHONE_FORMATS.md).
 - **Voicemail:** actual Weather, Lightning and recorded live pages can leave one message per unanswered internal extension with an eligible FreePBX mailbox. Independent controls start enabled. Ordinary Dashboard TTS, manual alert tests and external-number calls are unchanged.
-- **Desktops:** the [separate desktop app](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app) receives live alerts. It skips messages missed while disconnected and applies a ten-minute maximum lifetime. `Received by desktop app` confirms software receipt, not human reading. Schema 1 and SSE protocol 2 remain compatible.
+- **Weather:** speech retains the alert's official instructions. Invalid enabled quiet hours suppress noncritical delivery; missing, unsafe or full deduplication history blocks new alerts and preserves records for review.
+- **Alert settings:** new Weather groups include site, SMS and external-call selections. Imported Weather recordings remain selected on reopening. Lightning preserves the chosen polling period and offers the selected provider’s supported range.
+- **Desktops:** the [separate desktop app](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app) receives live alerts. It skips messages missed while disconnected and applies a ten-minute maximum lifetime. `Received by desktop app` confirms software receipt, not human reading. Schema 1 and SSE protocol 2 remain compatible. PHP-FPM uses cursor-based polling so desktop connections do not hold shared PBX workers.
 - **Email:** disabled on fresh installs. Configure local Postfix and recipients, then enable announcement email under **General Settings > Delivery**. Queue backpressure and shared quotas prevent unlimited SLS mail submission; mail-service acceptance does not confirm inbox delivery.
 - **SMS/MMS · Labs:** Twilio, Telnyx and BulkVS adapters require provider setup and consented recipients. BulkVS currently reports API acceptance; authenticated inbound delivery and STOP callbacks are unsupported. See [SMS setup and limits](docs/SMS.md).
 - **Webhooks:** native JSON, Discord, Slack and Teams Workflows. Accepted or unconfirmed one-way delivery does not require a human receipt; explicit HTTP failures still need attention.
@@ -128,6 +135,10 @@ Active, pending and retained settings use **AES-256-GCM**. The protected keyring
 **General Settings > Config Backup** exports a portable encrypted configuration using a separate passphrase of at least 12 characters. It excludes recordings and delivery history. Keep the passphrase separately; there is no recovery for a lost export passphrase. The UI reminds admins to export after 90 days. Plain legacy exports contain reusable credentials.
 
 Native FreePBX module backups include configuration, recovery keys, custom tones and bounded operational evidence. **Protect or encrypt the whole archive.** Install SLS before restoring its module backup; restored automation requires review and old work is not replayed. See [backup and recovery](docs/RECOVERY.md).
+
+## Operator single sign-on · Labs
+
+Configure SAML or OIDC providers under **Operator Access** in the FreePBX admin panel. SSO signs users into `/mass-notify/` only. Saved operator permissions, account expiry and local authenticator verification still apply. Account permissions and SSO settings apply when saved; no FreePBX Apply Config is required. FreePBX and UCP sign-in are unchanged. Providers start disabled and require deployment testing; see [operator SSO and directory setup](docs/ENTERPRISE_IDENTITY.md).
 
 ## Enterprise Labs
 
@@ -150,6 +161,6 @@ Offline delivery still needs a working local PBX, network and power. Cloud chann
 | [Updates](docs/UPDATE_POLICY.md) / [Release trust](docs/RELEASE_TRUST.md) | Release policy, publisher signatures and recovery. |
 | [Changelog](CHANGELOG.md) / [Security policy](SECURITY.md) | Release changes, known limits and vulnerability reporting. |
 
-For development, see [validation](docs/VALIDATION.md) and [dependency inventory](docs/DEPENDENCIES.md). On a PBX, run checks through `bash tools/run_isolated_tests.sh --build` in private namespaces. Release signing uses `python3 tools/sign_release.py` with the publisher key stored outside the repository; publish the TGZ and both signed-manifest assets together.
+For development, see [validation](docs/VALIDATION.md), [qualification boundaries](docs/QUALIFICATION_MATRIX.md) and the [dependency inventory](docs/DEPENDENCIES.md). On a PBX, run checks through `bash tools/run_isolated_tests.sh --build` in private namespaces. Release signing uses `python3 tools/sign_release.py` with the publisher key stored outside the repository; publish the TGZ and both signed-manifest assets together.
 
 [Southland Servers](https://southlandservers.xyz) · [Discord](https://southlandservers.xyz/discord) · [Report an issue](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/issues)

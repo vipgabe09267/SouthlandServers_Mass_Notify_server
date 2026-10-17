@@ -662,6 +662,7 @@ foreach ($desktopClients as $desktopClient) {
 		intervals: [],
 		timeouts: [],
 		events: [],
+		requests: new Set(),
 		resizeObserver: null,
 		resizeHandler: null,
 		dispose: function() {
@@ -669,6 +670,8 @@ foreach ($desktopClients as $desktopClient) {
 				return;
 			}
 			this.disposed = true;
+			this.requests.forEach(function(controller) { controller.abort(); });
+			this.requests.clear();
 			this.intervals.forEach(function(timer) { window.clearInterval(timer); });
 			this.timeouts.forEach(function(timer) { window.clearTimeout(timer); });
 			this.intervals = [];
@@ -696,6 +699,22 @@ foreach ($desktopClients as $desktopClient) {
 			return false;
 		}
 		return true;
+	}
+	async function widgetRequest(url, options, maximum) {
+		var controller = new AbortController(), timer = window.setTimeout(function() { controller.abort(); }, maximum);
+		lifecycle.requests.add(controller);
+		try {
+			var response = await fetch(url, Object.assign({}, options, {signal: controller.signal, cache: 'no-store'}));
+			var data = await parseJsonResponse(response);
+			if (!response.ok) { throw new Error(typeof data.message === 'string' ? data.message : 'The PBX returned HTTP ' + response.status + '.'); }
+			if (!data || typeof data !== 'object' || Array.isArray(data)) { throw new Error('Invalid PBX response.'); }
+			return data;
+		} catch (failure) {
+			if (controller.signal.aborted) { throw new Error('No complete PBX response within ' + maximum / 1000 + ' seconds, or the widget closed. Check saved settings or delivery details before retrying.'); }
+			throw failure;
+		} finally {
+			window.clearTimeout(timer); lifecycle.requests.delete(controller);
+		}
 	}
 	root.setAttribute('data-ready', '1');
 	var form = document.getElementById('dashboard-sls-mass-notify-announcement-form');
@@ -848,12 +867,11 @@ foreach ($desktopClients as $desktopClient) {
 			previewStatus.textContent = 'Preparing preview…';
 			previewButtons.forEach(function (item) { item.disabled = true; });
 			scheduleDashboardLayout();
-			fetch(form.action, {method:'POST', credentials:'same-origin', cache:'no-store', body:body})
-				.then(function (response) { return response.json(); })
+			widgetRequest(form.action, {method:'POST', credentials:'same-origin', body:body}, 120000)
 				.then(function (data) {
 					if (!instanceActive()) return;
 					if (snapshot !== JSON.stringify(previewInputs())) { previewStatus.textContent = 'The message changed. Prepare a new preview.'; return; }
-					if (!data.success) { previewStatus.textContent = data.message || 'The preview failed. Check installation diagnostics.'; return; }
+					if (data.success !== true) { previewStatus.textContent = data.message || 'The preview failed. Check installation diagnostics.'; return; }
                     if (data.kind === 'sms') {
                         if (!Number.isInteger(data.segments) || data.segments < 1 || typeof data.text !== 'string' || typeof data.currency !== 'string') { throw new Error('Invalid SMS preview'); }
                         previewStatus.textContent = data.segments + ' segment(s) per recipient · ' + data.encoding + ' · budgeted ' + (data.budgeted_cost_micros / 1000000).toFixed(4) + ' ' + data.currency + ' per recipient.' + (data.within_limit ? '' : ' Exceeds the configured maximum of ' + data.max_segments + ' segments; sending will be rejected.');
@@ -1024,10 +1042,25 @@ foreach ($desktopClients as $desktopClient) {
 		});
 		groupModal.modal('show');
 	}
+	var groupRequestBusy = false;
+	function lockGroupControls() {
+		var controls = Array.prototype.slice.call(root.querySelectorAll('button,input,select,textarea'));
+		var disabled = controls.map(function(control) { return control.disabled; });
+		var released = false;
+		controls.forEach(function(control) { control.disabled = true; });
+		groupRequestBusy = true; groupForm.setAttribute('aria-busy', 'true');
+		return function() {
+			if (released) { return; } released = true;
+			controls.forEach(function(control, index) { control.disabled = disabled[index]; });
+			groupRequestBusy = false; groupForm.removeAttribute('aria-busy'); renderCooldown();
+		};
+	}
+	groupModal.on('hide.bs.modal', function(event) { if (groupRequestBusy) event.preventDefault(); });
 	function deleteGroup(id) {
 		if (!instanceActive()) {
 			return;
 		}
+		if (groupRequestBusy || requestInFlight || activeJob) { return; }
 		if (!id || !confirm('Delete this announcement group?')) {
 			return;
 		}
@@ -1035,16 +1068,16 @@ foreach ($desktopClients as $desktopClient) {
 		body.append('slsmassnotifyserver_action', 'delete_announcement_group');
 		body.append('slsmassnotifyserver_csrf', <?php echo json_encode($csrfToken); ?>);
 		body.append('group_id', id);
-			fetch(form.action, {method: 'POST', credentials: 'same-origin', body: body})
-				.then(parseJsonResponse)
+		var unlock = lockGroupControls();
+			widgetRequest(form.action, {method: 'POST', credentials: 'same-origin', body: body}, 30000)
 			.then(function(data) {
 				if (!instanceActive()) {
 					return;
 				}
 				groupResult.style.display = 'block';
-				groupResult.className = 'alert alert-' + (data && data.success ? 'success' : 'warning');
+				groupResult.className = 'alert alert-' + (data && data.success === true ? 'success' : 'warning');
 				groupResult.textContent = data && data.message ? data.message : 'Group request finished.';
-				if (data && Array.isArray(data.groups)) {
+				if (data && data.success === true && Array.isArray(data.groups)) {
 					groups = data.groups;
 					renderGroups();
 				}
@@ -1056,7 +1089,7 @@ foreach ($desktopClients as $desktopClient) {
 					groupResult.style.display = 'block';
 					groupResult.className = 'alert alert-danger';
 					groupResult.textContent = 'Group request failed: ' + (error && error.message ? error.message : 'unknown error');
-				});
+				}).finally(unlock);
 	}
 		function selectedGroupOfflineExtensions() {
 		var offline = {};
@@ -1094,20 +1127,22 @@ foreach ($desktopClients as $desktopClient) {
 			if (!instanceActive()) {
 				return;
 			}
-				fetch(form.action, {method: 'POST', credentials: 'same-origin', body: new FormData(groupForm)})
-					.then(parseJsonResponse)
+			if (groupRequestBusy || requestInFlight || activeJob) { return; }
+			var groupBody = new FormData(groupForm), unlock = lockGroupControls();
+				widgetRequest(form.action, {method: 'POST', credentials: 'same-origin', body: groupBody}, 30000)
 				.then(function(data) {
 					if (!instanceActive()) {
 						return;
 					}
 					groupResult.style.display = 'block';
-					groupResult.className = 'alert alert-' + (data && data.success ? 'success' : 'warning');
+					groupResult.className = 'alert alert-' + (data && data.success === true ? 'success' : 'warning');
 					groupResult.textContent = data && data.message ? data.message : 'Group request finished.';
-					if (data && Array.isArray(data.groups)) {
+					if (data && data.success === true && Array.isArray(data.groups)) {
 						groups = data.groups;
 						renderGroups();
 					}
-					if (data && data.success) {
+					if (data && data.success === true) {
+						unlock();
 						groupModal.modal('hide');
 					}
 				})
@@ -1118,7 +1153,7 @@ foreach ($desktopClients as $desktopClient) {
 						groupResult.style.display = 'block';
 						groupResult.className = 'alert alert-danger';
 						groupResult.textContent = 'Group request failed: ' + (error && error.message ? error.message : 'unknown error');
-					});
+					}).finally(unlock);
 		});
 	}
 	var remaining = parseInt(cooldown.getAttribute('data-remaining') || '0', 10) || 0;
@@ -1207,8 +1242,8 @@ foreach ($desktopClients as $desktopClient) {
 		var requestedJob = activeJob || receiptJob || (manual === true ? viewedJob : '');
 		if (!requestedJob || jobPollBusy || !instanceActive() || (document.hidden && manual !== true) || (requestInFlight && !activeJob)) return;
 		jobPollBusy = true;
-		fetch('config.php?display=slsmassnotifyserver&slsmassnotifyserver_action=announcement_job&job_id=' + encodeURIComponent(requestedJob), {credentials:'same-origin', cache:'no-store'})
-			.then(parseJsonResponse).then(function(data) {
+		widgetRequest('config.php?display=slsmassnotifyserver&slsmassnotifyserver_action=announcement_job&job_id=' + encodeURIComponent(requestedJob), {credentials:'same-origin'}, 10000)
+			.then(function(data) {
 				if (!instanceActive() || requestedJob !== viewedJob) return;
 				var pending = ['queued', 'worker_starting', 'running'].indexOf(data.state) >= 0;
 				renderDeliveryStatus(data);
@@ -1247,6 +1282,7 @@ foreach ($desktopClients as $desktopClient) {
 		cooldown.appendChild(document.createTextNode(' ' + message));
 	}
 	function renderCooldown() {
+		if (groupRequestBusy) { submit.disabled = true; return; }
 		if (requestInFlight) {
 			submit.disabled = true;
 			setCooldownText('', '');
@@ -1279,8 +1315,7 @@ foreach ($desktopClients as $desktopClient) {
 		if (!instanceActive() || document.hidden || cooldownPollBusy
 			|| (force !== true && Date.now() - lastCooldownRefresh < 10000)) return;
 		cooldownPollBusy = true; lastCooldownRefresh = Date.now();
-		fetch('config.php?display=slsmassnotifyserver&slsmassnotifyserver_action=cooldowns', {credentials: 'same-origin', cache: 'no-store'})
-				.then(parseJsonResponse)
+		widgetRequest('config.php?display=slsmassnotifyserver&slsmassnotifyserver_action=cooldowns', {credentials: 'same-origin'}, 10000)
 			.then(function(data) {
 				if (!instanceActive()) {
 					return;
@@ -1307,7 +1342,7 @@ foreach ($desktopClients as $desktopClient) {
 		if (!instanceActive()) {
 			return;
 		}
-		if (remaining > 0 || requestInFlight || deliveryOutcomeUnknown || activeJob) {
+		if (remaining > 0 || requestInFlight || deliveryOutcomeUnknown || activeJob || groupRequestBusy) {
 			return;
 		}
 		if (root.getAttribute('data-quiet-hours-active') === '1') {
@@ -1328,8 +1363,7 @@ foreach ($desktopClients as $desktopClient) {
 		setAnnouncementStatus('info', 'Queueing announcement…', true);
 		deliveryOutcomeUnknown = false;
 		var body = new FormData(form);
-			fetch(form.action, {method: 'POST', credentials: 'same-origin', body: body})
-				.then(parseJsonResponse)
+			widgetRequest(form.action, {method: 'POST', credentials: 'same-origin', body: body}, 30000)
 			.then(function(data) {
 				if (!instanceActive()) {
 					return;

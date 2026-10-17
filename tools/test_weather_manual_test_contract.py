@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Exercise the manual Weather test's channel-aware delivery contract."""
 
+import base64
+import importlib.util
 import json
 import os
 import pathlib
+import signal
 import shlex
 import subprocess
 import tempfile
@@ -12,6 +15,14 @@ import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORKER = ROOT / "slsmassnotifyserver/bin/sls_mass_notify_test.sh"
+RUNTIME = ROOT / "slsmassnotifyserver/bin/sls_mass_notify"
+CRYPTO_SPEC = importlib.util.spec_from_file_location(
+    "manual_weather_config_crypto", RUNTIME / "sls_config_crypto.py"
+)
+CRYPTO = importlib.util.module_from_spec(CRYPTO_SPEC)
+if CRYPTO_SPEC.loader is None:
+    raise RuntimeError("The candidate config crypto helper is unavailable.")
+CRYPTO_SPEC.loader.exec_module(CRYPTO)
 
 
 def fail(message):
@@ -62,7 +73,10 @@ def run_case(
             fail('manual Weather fixture could not isolate the reservation helper')
         phone_helper = scratch / 'phone-fixture.py'
         phone_helper.write_text("import sys\nprint('a' * 32)\nprint(sys.argv[sys.argv.index('--recipients') + 1].replace(',', '\\n'))\n")
-        worker_source = worker_source.replace('/usr/local/bin/sls_mass_notify/sls_phone_admission.py', shlex.quote(str(phone_helper)))
+        phone_admission_path = '/usr/local/bin/sls_mass_notify/sls_phone_admission.py'
+        if worker_source.count(phone_admission_path) != 1:
+            fail('manual Weather fixture could not isolate phone admission')
+        worker_source = worker_source.replace(phone_admission_path, shlex.quote(str(phone_helper)))
         # This fixture tests channel routing with an inert Piper transport.
         # test_speech_admission.py exercises real queue, quota and executable checks.
         speech_helper = scratch / 'speech-fixture.py'
@@ -80,16 +94,50 @@ def run_case(
             fail('manual Weather fixture could not isolate cluster policy')
         cluster_helper.write_text(cluster_source.replace(cluster_marker,
             f"CONFIG = Path({str(scratch / 'mass-notifications.config')!r})"), encoding='utf-8')
-        (scratch / 'sls_config_crypto.py').write_bytes((ROOT / 'slsmassnotifyserver/bin/sls_mass_notify/sls_config_crypto.py').read_bytes())
+        crypto_source = (RUNTIME / 'sls_config_crypto.py').read_text(encoding='utf-8')
+        keyring = scratch / 'keys/config-keys.json'
+        keyring_marker = 'KEYRING_PATH = Path("/etc/sls-mass-notify/config-keys.json")'
+        if crypto_source.count(keyring_marker) != 1:
+            fail('manual Weather fixture could not isolate the config keyring')
+        (scratch / 'sls_config_crypto.py').write_text(
+            crypto_source.replace(keyring_marker, f'KEYRING_PATH = Path({str(keyring)!r})'),
+            encoding='utf-8',
+        )
+        for candidate_helper in RUNTIME.iterdir():
+            fixture_helper = scratch / candidate_helper.name
+            if candidate_helper.is_file() and not fixture_helper.exists():
+                fixture_helper.write_bytes(candidate_helper.read_bytes())
         guard_marker = 'CLUSTER_GUARD="/usr/local/bin/sls_mass_notify/sls_cluster_guard.py"'
         if worker_source.count(guard_marker) != 1:
             fail('manual Weather fixture could not isolate the cluster guard')
         worker_source = worker_source.replace(guard_marker, 'CLUSTER_GUARD=' + shlex.quote(str(cluster_helper)))
-        fixture_worker.write_text(worker_source.replace(worker_marker,
-            'AUDIO_QUEUE_HELPER=' + shlex.quote(str(queue_helper))), encoding='utf-8')
+        worker_source = worker_source.replace(worker_marker,
+            'AUDIO_QUEUE_HELPER=' + shlex.quote(str(queue_helper)))
+        installed_runtime = '/usr/local/bin/sls_mass_notify'
+        if installed_runtime not in worker_source:
+            fail('manual Weather fixture found no installed runtime references to isolate')
+        worker_source = worker_source.replace(installed_runtime, str(scratch))
+        if installed_runtime in worker_source:
+            fail('manual Weather fixture retained an installed runtime reference')
+        fixture_worker.write_text(worker_source, encoding='utf-8')
 
+        keyring.parent.mkdir(mode=0o750)
+        key_id = 'a' * 32
+        ring = {
+            'format': CRYPTO.KEYRING_FORMAT,
+            'active': key_id,
+            'keys': {key_id: {
+                'created_at': 1_800_000_000,
+                'key': base64.b64encode(b'\x5a' * 32).decode('ascii'),
+            }},
+        }
+        keyring.write_text(json.dumps(ring, separators=(',', ':')) + '\n', encoding='ascii')
+        keyring.chmod(0o640)
         config = scratch / "mass-notifications.config"
-        config.write_text(json.dumps({'runtime_enabled': runtime_enabled, 'enterprise_cluster': cluster or {'enabled': False}}) + '\n', encoding='utf-8')
+        config.write_bytes(CRYPTO.encode_with_keyring(
+            {'runtime_enabled': runtime_enabled, 'enterprise_cluster': cluster or {'enabled': False}},
+            ring,
+        ))
         config.chmod(0o640)
         model = scratch / "voice.onnx"
         model.write_bytes(b"test-model")
@@ -116,9 +164,11 @@ with wave.open(str(output), "wb") as handle:
 pathlib.Path(os.environ["PIPER_MARKER"]).write_text("ran\\n", encoding="utf-8")
 if os.environ.get("CLUSTER_AFTER_TTS"):
     config = pathlib.Path(os.environ["CONFIG_JSON_FILE"])
-    settings = json.loads(config.read_text())
+    sys.path.insert(0, str(config.parent))
+    import sls_config_crypto
+    settings = sls_config_crypto.read_config(config, allow_legacy=False)
     settings['enterprise_cluster'] = json.loads(os.environ['CLUSTER_AFTER_TTS'])
-    config.write_text(json.dumps(settings))
+    config.write_bytes(sls_config_crypto.encode_config(settings))
 """,
         )
 
@@ -219,41 +269,62 @@ print(os.environ.get("MOCK_ASTERISK_CHANNELS", ""))
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            start_new_session=True,
         )
-        captured_calls = []
-        captured_paths = set()
-        deadline = time.monotonic() + 20
-        while process.poll() is None and time.monotonic() < deadline:
-            for call_file in spool.glob("sls_test_*.call"):
-                if str(call_file) not in captured_paths:
-                    captured_calls.append(call_file.read_text(encoding="utf-8"))
-                    captured_paths.add(str(call_file))
-                if pick_up:
-                    call_file.unlink()
-            time.sleep(0.02)
-        if process.poll() is None:
-            process.kill()
-            fail("manual Weather test contract case timed out")
-        stdout, stderr = process.communicate(timeout=2)
-        status = json.loads((scratch / "status.json").read_text(encoding="utf-8"))
-        calls = (
-            [json.loads(line) for line in visual_args.read_text(encoding="utf-8").splitlines()]
-            if visual_args.exists()
-            else []
-        )
-        return {
-            "returncode": process.returncode,
-            "stdout": stdout,
-            "stderr": stderr,
-            "status": status,
-            "visual_args": [argument for call in calls for argument in call],
-            "visual_calls": calls,
-            "piper_ran": piper_marker.exists(),
-            "calls": captured_calls,
-            "cooldown_lock_exists": pathlib.Path(str(cooldown_file) + ".lock").exists(),
-            "reservation": json.loads((scratch / 'audio-reservations.json').read_text(encoding='utf-8'))
-                if (scratch / 'audio-reservations.json').exists() else None,
-        }
+        try:
+            captured_calls = []
+            captured_paths = set()
+            deadline = time.monotonic() + 20
+            while process.poll() is None and time.monotonic() < deadline:
+                for call_file in spool.glob("sls_test_*.call"):
+                    if str(call_file) not in captured_paths:
+                        captured_calls.append(call_file.read_text(encoding="utf-8"))
+                        captured_paths.add(str(call_file))
+                    if pick_up:
+                        call_file.unlink()
+                time.sleep(0.02)
+            if process.poll() is None:
+                fail("manual Weather test contract case timed out")
+            stdout, stderr = process.communicate(timeout=2)
+            status_path = scratch / "status.json"
+            if not status_path.is_file():
+                fail(
+                    "manual Weather worker did not create status evidence "
+                    f"(exit {process.returncode}; stdout={stdout!r}; stderr={stderr!r})"
+                )
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            calls = (
+                [json.loads(line) for line in visual_args.read_text(encoding="utf-8").splitlines()]
+                if visual_args.exists()
+                else []
+            )
+            return {
+                "returncode": process.returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+                "status": status,
+                "visual_args": [argument for call in calls for argument in call],
+                "visual_calls": calls,
+                "piper_ran": piper_marker.exists(),
+                "calls": captured_calls,
+                "cooldown_lock_exists": pathlib.Path(str(cooldown_file) + ".lock").exists(),
+                "reservation": json.loads((scratch / 'audio-reservations.json').read_text(encoding='utf-8'))
+                    if (scratch / 'audio-reservations.json').exists() else None,
+            }
+        finally:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=2)
 
 
 desktop = run_case([], ["desk_ops"])

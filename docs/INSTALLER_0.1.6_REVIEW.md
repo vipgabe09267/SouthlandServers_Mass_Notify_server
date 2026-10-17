@@ -1,5 +1,10 @@
 # 0.1.6-beta installer review
 
+> **Historical evidence:** This October 2026 review is retained for the
+> `0.1.6-beta` release and is superseded. It does not state the readiness of the
+> `0.1.7-beta` candidate. See [Qualification matrix](QUALIFICATION_MATRIX.md) for
+> current requirements and record current results separately.
+
 This tracks the installer and paging findings from the October 6 audit. Changes are validated in disposable mount, network and process namespaces; production configuration and services are not test fixtures.
 
 | Area | Required behavior |
@@ -27,7 +32,7 @@ Unsupported operating systems or relocated runtime layouts require a qualified a
 
 ## Validation
 
-The earlier October 8 candidate passed 244 isolated release fixture suites. The expanded October 9 source adds interruption recovery, early served-PHP checks, private-ledger permission preservation and operator expiry. Its final verification and remaining deployment limits are tracked in [the current readiness review](READINESS_REVIEW_0.1.6.md). Earlier package hashes and signatures do not authenticate the changed candidate; it requires a newly verified manifest before installation or publication.
+The earlier October 8 candidate passed 244 isolated release fixture suites. The expanded October 9 source added interruption recovery, early served-PHP checks, private-ledger permission preservation and operator expiry. Its final verification and remaining deployment limits were tracked in the [historical 0.1.6 readiness review](READINESS_REVIEW_0.1.6.md). Earlier package hashes and signatures did not authenticate the changed candidate; it required a newly verified manifest before installation or publication.
 
 | Check | Evidence |
 | --- | --- |
@@ -48,6 +53,6 @@ The source-validation pass compared active/pending configuration, encryption key
 
 ## October 10 withdrawal and replacement
 
-The first prerelease was withdrawn after an upgrade on another PBX exposed mode0644 on the enterprise worker lock and phone-admission journal. No candidate activation occurred on that PBX. FreePBX recursive chown/startup was identified as the recurring permission-changing path. The replacement adds authenticated descriptor-based legacy recovery, native chown exclusion and collector readiness before worker pause. Configuration, journal contents and existing lock inodes must remain intact.
+The first prerelease was withdrawn after an upgrade on another PBX exposed mode `0644` on the enterprise worker lock and phone-admission journal. No candidate activation occurred on that PBX. FreePBX recursive chown/startup was identified as the recurring permission-changing path. The replacement adds authenticated descriptor-based legacy recovery, native chown exclusion and collector readiness before worker pause. Configuration, journal contents and existing lock inodes must remain intact.
 
 Both hosted CI runs passed 272 of 274 suites. The failures were a resource fixture dependent on installed Framework metadata and a missing native voicemail package in the CI image. The resource fixture now supplies private metadata without bypassing platform validation; the workflow pins the matching voicemail package. Replacement qualification must include link/ownership/size refusals, real native chown handling, collector failure, rollback/retry and complete isolated release checks. Hosted CI cannot be confirmed until the corrected source is pushed with owner approval.

@@ -68,8 +68,9 @@ trait SlsOutboundVoice
                 $ids[$id] = true;
             }
             $name = $row['name'] ?? '';
-            if (!is_string($name) || trim($name) === '' || strlen($name) > 240 || preg_match('/[\x00-\x1f\x7f]/', $name)) {
-                $errors[] = $prefix . _('enter a name without control characters (maximum 240 bytes).');
+            if (!is_string($name) || trim($name) === '' || strlen($name) > 240 || !preg_match('//u', $name)
+                || preg_match('/[\x00-\x1f\x7f]/', $name)) {
+                $errors[] = $prefix . _('enter a UTF-8 name without control characters (maximum 240 bytes).');
             }
             $number = $row['number'] ?? '';
             if (!is_string($number) || !preg_match('/^\+[1-9][0-9]{1,14}$/D', $number)) {
@@ -157,10 +158,12 @@ trait SlsOutboundVoice
         if (!is_array($value) || !array_is_list($value) || count($value) > 1000) {
             return [_('External voice recipients must be a list of at most 1000 saved recipient IDs.')];
         }
+        $seen = [];
         foreach ($value as $id) {
-            if (!is_string($id) || !preg_match('/^voice_[a-f0-9]{24}$/D', $id)) {
-                return [_('An external voice recipient ID is invalid. Select saved recipients from General Settings.')];
+            if (!is_string($id) || !preg_match('/^voice_[a-f0-9]{24}$/D', $id) || isset($seen[$id])) {
+                return [_('External voice recipient IDs must be valid and distinct. Select saved recipients from General Settings.')];
             }
+            $seen[$id] = true;
         }
         return [];
     }

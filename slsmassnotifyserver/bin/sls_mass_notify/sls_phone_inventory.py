@@ -20,7 +20,8 @@ MAX_BYTES = 4 * 1024 * 1024
 
 def refresh(directory=DATA, *, settings_reader=None, ami_factory=None):
     from sls_phone_admission import PhoneAmi, PhoneAdmissionError, read_settings
-    from sls_notify import get_registered_endpoint_info, saved_phone_format_overrides, ami_response_is_empty_contact_inventory
+    from sls_notify import (ami_response_is_empty_contact_inventory, endpoint_format_summary,
+                            get_registered_endpoint_info, saved_phone_format_overrides)
     class InventoryAmi(PhoneAmi):
         def action(self, fields, complete_event=None):
             if fields.get('Action') != 'PJSIPShowContacts':
@@ -47,7 +48,14 @@ def refresh(directory=DATA, *, settings_reader=None, ami_factory=None):
     settings = (settings_reader or (lambda: read_settings(directory)))()
     with (ami_factory or InventoryAmi)(settings) as ami:
         endpoints = get_registered_endpoint_info(ami, format_overrides=saved_phone_format_overrides(settings), resolve_contact_uris=True)
-    publish(endpoints, directory)
+    display = endpoint_format_summary(endpoints)
+    for row in display.values():
+        row['contacts'] = []
+        for device in row.pop('devices', []):
+            device = dict(device)
+            device['device_key'] = device.pop('key', '')
+            row['contacts'].append(device)
+    publish(display, directory)
 
 
 def start_refresh_worker(directory=DATA, *, refresher=None):
@@ -82,17 +90,31 @@ def publish(endpoints, directory=DATA, now=None):
         raise ValueError('Phone display inventory exceeds its byte limit')
     directory_fd = open_directory(directory)
     temporary = '.phone-inventory-' + secrets.token_hex(12)
+    temporary_identity = None
     try:
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640, dir_fd=directory_fd)
+        temporary_identity = os.fstat(fd)
         with os.fdopen(fd, 'wb') as handle:
             handle.write(raw)
             handle.flush()
             os.fsync(handle.fileno())
+        staged = os.stat(temporary, dir_fd=directory_fd, follow_symlinks=False)
+        if (staged.st_dev, staged.st_ino, staged.st_nlink, stat.S_IMODE(staged.st_mode), staged.st_size) != (
+                temporary_identity.st_dev, temporary_identity.st_ino, 1, 0o640, len(raw)) or not stat.S_ISREG(staged.st_mode):
+            raise ValueError('Phone display inventory staging changed')
         os.replace(temporary, NAME, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        committed = os.stat(NAME, dir_fd=directory_fd, follow_symlinks=False)
+        if (committed.st_dev, committed.st_ino, committed.st_nlink) != (temporary_identity.st_dev, temporary_identity.st_ino, 1):
+            raise ValueError('Phone display inventory commit changed')
         os.fsync(directory_fd)
     finally:
-        try: os.unlink(temporary, dir_fd=directory_fd)
-        except FileNotFoundError: pass
+        try:
+            current = os.stat(temporary, dir_fd=directory_fd, follow_symlinks=False)
+            if temporary_identity is not None and stat.S_ISREG(current.st_mode) and current.st_nlink == 1 \
+                    and (current.st_dev, current.st_ino) == (temporary_identity.st_dev, temporary_identity.st_ino):
+                os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
         os.close(directory_fd)
 
 
@@ -103,9 +125,16 @@ def read(directory=DATA, now=None):
         fd = os.open(NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
         with os.fdopen(fd, 'rb') as handle:
             meta = os.fstat(handle.fileno())
-            if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1 or meta.st_size > MAX_BYTES or meta.st_mode & 0o007:
+            if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1 or meta.st_size > MAX_BYTES or meta.st_mode & 0o027:
                 raise ValueError('Unsafe phone display inventory')
-            value = json.loads(handle.read(MAX_BYTES + 1))
+            raw = handle.read(MAX_BYTES + 1)
+            after = os.fstat(handle.fileno())
+            named = os.stat(NAME, dir_fd=directory_fd, follow_symlinks=False)
+            fields = lambda item: (item.st_dev, item.st_ino, item.st_mode, item.st_uid, item.st_gid,
+                                   item.st_nlink, item.st_size, item.st_mtime_ns, item.st_ctime_ns)
+            if len(raw) != meta.st_size or fields(meta) != fields(after) or fields(after) != fields(named):
+                raise ValueError('Phone display inventory changed while it was read')
+            value = json.loads(raw)
         if not isinstance(value, dict) or value.get('schema') != 1 or value.get('display_only') is not True or not isinstance(value.get('endpoints'), dict) or type(value.get('expires_at')) not in (int, float):
             raise ValueError('Invalid phone display inventory')
         if not now < value['expires_at'] <= now + 100:

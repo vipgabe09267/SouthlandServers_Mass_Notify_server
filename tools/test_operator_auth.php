@@ -34,7 +34,9 @@ $settings=['desktop_auth_key'=>base64_encode(random_bytes(32))]; $id='api_'.str_
 $sealed=Auth::seal($secret,$id,$settings);
 authCheck(Auth::open($sealed,$id,$settings)===$secret&&!str_contains($sealed,$secret),'Authenticated seed encryption failed.');
 authReject(fn()=>Auth::open($sealed,'api_'.str_repeat('b',24),$settings));
-authReject(fn()=>Auth::open(substr($sealed,0,-1).'A',$id,$settings));
+$tampered=base64_decode(substr($sealed,4),true);
+$tampered[strlen($tampered)-1]=chr(ord($tampered[strlen($tampered)-1])^1);
+authReject(fn()=>Auth::open('op1:'.base64_encode($tampered),$id,$settings));
 authReject(fn()=>Auth::open($sealed,$id,['desktop_auth_key'=>base64_encode(random_bytes(32))]));
 $auth=Auth::create('initial fixture passphrase 752');
 $account=['id'=>$id,'username'=>'tester','source'=>'portal','name'=>'Tester','role'=>'sender','enabled'=>true,

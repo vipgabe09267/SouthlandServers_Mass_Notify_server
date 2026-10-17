@@ -53,7 +53,10 @@ and red X indicators. Previewing does not save settings.
 
 ## Desktop transport
 
-The server allows 32 simultaneous SSE connections, with two per desktop username.
+Under Apache module PHP, the server allows 32 simultaneous SSE connections, with
+two per desktop username. PHP-FPM does not hold streaming workers: it returns
+`stream_capacity_reached` with `reason: php_fpm_worker_pool` and a 300-second
+`Retry-After`, and clients use authenticated cursor-aware JSON polling.
 The reviewed app falls back to authenticated five-second JSON polling after a
 stalled or throttled stream. Normal polling, acknowledgments and stream requests
 share a 120-request-per-minute budget per username. Failed-login protection is

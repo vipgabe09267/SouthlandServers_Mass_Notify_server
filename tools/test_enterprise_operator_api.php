@@ -42,6 +42,7 @@ class EnterpriseOperatorApiFixture
     protected function submitIncidentAnnouncement(array $delivery,string $message,string $title,array $context,array $actor):array
     {$this->submissions[]=['delivery'=>$delivery,'actor'=>$actor,'principal'=>$GLOBALS['sls_control_principal']??null];if($this->reviewSubmissions){return $this->enterpriseReviewAnnouncement(['message'=>$message,'title'=>$title,'phones'=>$delivery['extensions'],
         'is_test'=>$context['is_test'],'incident_context'=>$context])??['success'=>false,'delivery_started'=>false];}return ['success'=>true,'job_id'=>'job_'.str_repeat('a',32)];}
+    public function reviewForTest(array $request):?array{return $this->enterpriseReviewAnnouncement($request);}
 }
 try{
     $fixture=new EnterpriseOperatorApiFixture();
@@ -117,7 +118,16 @@ try{
     $pending=$fixture->startEnterpriseControlTemplate(['template_id'=>$template['id'],'request_id'=>str_repeat('5',32),'fields'=>['place'=>'Pending review'],'is_test'=>true],$principal);
     $pendingOperation=array_values($pending['operations'])[0];
     checkEnterpriseOperator($pendingOperation['state']==='awaiting_approval'&&isset($pendingOperation['review_id'])&&(!isset($pendingOperation['job_id'])||$pendingOperation['job_id']===''),'API launch lost pending approval state.');
+    $GLOBALS['sls_control_principal']=['id'=>'legacy','scopes'=>['send'],'audience'=>['unrestricted'=>true]];
+    $legacyReview=$fixture->reviewForTest(['message'=>'Legacy review','title'=>'Fixture','phones'=>['1000'],'is_test'=>true]);
+    checkEnterpriseOperator($legacyReview['success']===false&&$legacyReview['delivery_started']===false&&$legacyReview['error_code']==='named_credential_required','Legacy API key entered two-person review without a named requester identity.');
     unset($GLOBALS['sls_control_principal']);
+    $human=$fixture->human;$fixture->human=null;
+    $workerReview=$fixture->reviewForTest(['message'=>'Worker review','title'=>'Fixture','phones'=>['1000'],'is_test'=>true,'sender'=>"Weather worker\n"]);
+    $fixture->human=$human;
+    $workerRows=$service->listing();$workerRow=array_values(array_filter($workerRows,static fn(array $row):bool=>$row['id']===$workerReview['review_id']))[0]??[];
+    checkEnterpriseOperator($workerReview['awaiting_approval']===true&&$workerRow['requested_by']==='worker:Weather_worker','Background submission could not enter attributable two-person review.');
+    checkEnterpriseOperator($fixture->operatorAction('approval_reject',['review_id'=>$workerReview['review_id']])['success'],'Assigned human could not reject a worker-origin review.');
     $update=['incident_id'=>$pending['id'],'request_id'=>str_repeat('6',32),'kind'=>'update','message'=>'Isolated follow-up'];
     checkEnterpriseOperator(!$fixture->operatorAction('update_incident',$update)['success'],'Pending review permitted another incident update.');
     checkEnterpriseOperator($fixture->operatorAction('approval_reject',['review_id'=>$pendingOperation['review_id']])['success'],'Assigned human could not reject an unsubmitted API-origin review.');

@@ -27,6 +27,17 @@ class WeatherChannels(unittest.TestCase):
 
     def authorize(self): return channels.authorize(self.config,self.context,now=1000)
 
+    def test_desktop_enrollment_is_frozen_not_just_its_username(self):
+        self.config['desktop_clients'] = [{'username':'alice', 'client_id':'original', 'enabled':'1'}]
+        frozen = channels.desktop_snapshot(self.config, ['ALICE', 'unavailable'])
+        self.assertEqual(channels.authorized_desktops(self.config, ['alice'], frozen), ['alice'])
+        self.config['desktop_clients'][0]['client_id'] = 'replacement'
+        self.assertEqual(channels.authorized_desktops(self.config, ['alice'], frozen), [])
+        self.assertEqual(channels.authorized_desktops(self.config, ['alice'], None), [])
+        frozen = channels.desktop_snapshot(self.config, ['alice'])
+        self.config['desktop_clients'][0]['enabled'] = '0'
+        self.assertEqual(channels.authorized_desktops(self.config, ['alice'], frozen), [])
+
     def test_original_recipients_remain_eligible(self):
         result=self.authorize();self.assertEqual(result['status'],'eligible')
         self.assertEqual(result['voice_recipient_ids'],[self.voice]);self.assertEqual(result['sms_recipient_ids'],[self.sms])

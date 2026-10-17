@@ -1,10 +1,22 @@
 # SLS Mass Notifications Control API
 
-This document describes the `0.1.6-beta` candidate API. Its changes are additive
+This document describes the unpublished `0.1.7-beta` candidate API. Its changes are additive
 to the existing routes and authentication. Notification payload schema **1** and
 desktop SSE protocol **2** are retained. Features marked **Labs** in the module
 need acceptance with the actual devices, providers and desktop client before
 operational use.
+
+The candidate adds bounded pre-authentication admission and sampled rejection
+auditing. Successful and attributable authenticated operations retain individual
+audit records. Anonymous rejection bursts cannot launch one audit process per
+request; busy admission returns a retryable response.
+
+Desktop authorization now checks username and original enrollment ID. The
+binding is internal; it does not change the public payload schema. Replacement
+desktops cannot poll, stream or acknowledge an earlier enrollment's events.
+Queued announcements, Weather and Lightning preserve original enrollments.
+IDs, timestamps, absolute expiry and ACK response fields remain stable, and
+polling responses remain uncached.
 
 ## Architecture
 
@@ -38,7 +50,7 @@ The APIs have separate authentication boundaries:
 | Operator portal | `/mass-notify/` | Separate operator login, password and TOTP; administrator-configured permissions |
 
 An API credential is not an operator login or desktop password. Provider callbacks
-do not accept Control API credentials. No API request can choose an executable,
+do not accept Control API credentials. Notification requests cannot choose an executable,
 an arbitrary SMS number, a mail sender identity or a new outbound route.
 
 ## Enable access and create a credential
@@ -69,7 +81,7 @@ GET configuration reads require both `read` and `config`. The POST `get_config`
 action requires `config`. Configuration and incident operations require an
 unrestricted audience. Restricted announcement senders can address only their
 explicit extensions, desktop IDs, saved group membership, external voice IDs,
-saved mail/SMS IDs and webhook IDs. Restricted delivery reads/retries are limited
+saved mail/SMS IDs, webhook IDs, browser subscriber IDs and connector IDs. Restricted delivery reads/retries are limited
 to that credential's own jobs.
 
 Send the secret in either header:
@@ -124,6 +136,7 @@ them with saved IDs from your own PBX.
 | `incidents` | Optional `limit`, `cursor`, `archived=0` or `1` | Unrestricted `read`; incident list, with separate archived view |
 | `incident` | `incident_id` | Unrestricted `read`; incident record, timeline and response state |
 | `incident_report` | `incident_id`, optional `job_offset`, `revision` | Unrestricted `read`; paginated report with live job evidence |
+| `recordings` | Optional `query`, `offset`, `limit` | Unrestricted `config`; bounded System Recording catalogue and scan-completeness evidence |
 | `enterprise_capabilities` | None | Named `read`; enabled Labs capability booleans and supported contracts; no credentials or integration configuration |
 | `incident_templates` | None | Named `read`; templates whose primary, shifted and escalation audiences all fit this credential |
 
@@ -168,6 +181,8 @@ not prove audio synthesis, provider availability or physical delivery.
 | `email_recipient_ids` | Distinct enabled saved mail IDs, at most 50; raw mail addresses are not accepted |
 | `sms_recipient_ids` | Distinct enabled saved SMS IDs with recorded consent, at most 50; raw numbers are not accepted |
 | `webhook_ids` | At most ten enabled saved announcement webhook IDs |
+| `browser_recipient_ids` | At most 50 enabled browser subscriber IDs; Labs enrollment and current recipient authorization are required |
+| `connector_ids` | At most 20 enabled notification connector IDs; Labs configuration and current recipient authorization are required |
 | `title` | String; announcement heading, limited to 80 characters by the delivery resolver |
 | `style` | `standard` or `colored`; existing `image` and `nws` style aliases select the colored image |
 | `image` | Boolean; request generated colored-announcement rendering |
@@ -184,7 +199,7 @@ not prove audio synthesis, provider availability or physical delivery.
 The `options` object accepts `style`, `image`, `title`, `background_color`,
 `audio_mode`, `opening_tone`, `closing_tone`, `priority`, `desktop_all`,
 `phones_all`, `desktop_clients`, `voice_recipient_ids`, `email_recipient_ids`,
-`sms_recipient_ids`, `webhook_ids`, `piper_voice`, `tts_volume`, `preview` and
+`sms_recipient_ids`, `webhook_ids`, `browser_recipient_ids`, `connector_ids`, `piper_voice`, `tts_volume`, `preview` and
 `is_test`. Keep `message`, phone/group selectors and compatibility aliases at the
 top level. Top-level fields take precedence when supplied. Internal option names
 such as `_test_channels`, `_is_test` and `incident_context` are rejected. The
@@ -195,6 +210,10 @@ Saved group recipients expand when admitted, then the worker retains only
 originally selected identities still authorized at dispatch. New group members
 do not receive a queued old announcement. Audio beyond the configured speech
 duration limit is rejected with a clear error rather than silently cut short.
+
+Prefer saved group IDs for integrations. Exact IDs take precedence over group
+names; legacy name aliases must be unique. A removed or ambiguous group rejects
+the complete request before delivery instead of silently selecting a subset.
 External voice calls play their tone/speech only after their own call is answered.
 
 ### Discover and preview using curl
@@ -253,9 +272,10 @@ An accepted HTTP request ordinarily returns:
 
 Read `resource=delivery&job_id=<returned-id>` while the job runs. Receipts identify
 each channel and target independently. Preserve the original response and job ID.
-An HTTP timeout after submission does **not** authorize a new send. Ordinary
-announcements have no caller idempotency key; check existing delivery evidence
-before deciding whether a deliberate new announcement is necessary.
+An HTTP timeout after submission does **not** authorize a new send. Supply an
+`Idempotency-Key` for ordinary announcements and retain that same key and exact
+request when retrieving an existing submission result. An uncertain claim still
+requires delivery review; see [submission idempotency](#submission-idempotency).
 
 | Evidence | Meaning |
 | --- | --- |
@@ -407,9 +427,11 @@ determines recipients and approved actions; the caller cannot change them.
 See [TRIGGERS.md](TRIGGERS.md) for exact bodies, freshness, cooldown and approved
 script constraints.
 
-Twilio and Telnyx callbacks authenticate the original provider body/signature
-against the configured advertised HTTPS callback URL. Delivery callbacks must
-also match the exact local delivery, provider identity and recipient route.
+Twilio validates its provider signature against the original body and the
+configured advertised HTTPS callback URL. Telnyx verifies its Ed25519 signature
+over the provider timestamp and raw body; its signature does not include the
+callback URL. Delivery callbacks must also match the exact local delivery,
+provider identity and recipient route.
 Authenticated inbound STOP messages persist suppression, even when new SMS
 sending is disabled. Replayed STOP identities do not renew suppression after
 new consent. Callback failure to persist evidence returns retryable 503.
@@ -425,6 +447,10 @@ SSE heartbeat activity is sent approximately every 15 seconds, and disconnected
 stream slots are released. Fleet capacity can exceed the bounded simultaneous
 SSE worker allocation; a capacity response supplies five-second JSON polling
 fallback information and `Retry-After`.
+PHP-FPM responds with the same polling fallback before opening a long stream,
+keeping shared PHP workers available for the PBX dashboard and acknowledgements.
+Other supported PHP handlers retain SSE; stream duration, heartbeat intervals and
+credential rechecks use monotonic time. Event timestamps remain UTC wall-clock values.
 
 Resumable polling uses `last_event_id`, `has_more` and the returned cursor. Drain
 full pages with the returned cursor so bursts are not skipped. A fresh empty
@@ -542,7 +568,7 @@ This prevents duplicate submission; it does not retry a provider send.
 
 ```bash
 curl --fail-with-body 'https://pbx.example.org/api/sls-mass-notify/' \
-  -H "Authorization: Bearer $SLS_API_KEY" \
+  -H "Authorization: Bearer $SLS_KEY" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: building-test-2026-10-09-001' \
   --data '{"action":"send_announcement","message":"Scheduled test announcement","targets":["1000"],"is_test":true}'
@@ -563,10 +589,13 @@ presenting the page as a complete inventory. Filenames use the existing
 Ordinary announcements accept `browser_recipient_ids` and `connector_ids` at the
 top level or inside `options`. `browser_recipient_ids` accepts at most 50 distinct
 `sub_<24 hex>` IDs; `connector_ids` accepts at most 20 distinct `conn_<24 hex>` IDs.
-Both require an unrestricted named sender and
-explicitly enabled configuration. `resource=audiences` provides only the
-available authorized IDs. Legacy credentials and restricted credentials cannot
-use these channels.
+Both require a named sender with permitted recipients and explicitly enabled
+configuration. `resource=audiences` exposes only available authorized IDs.
+Restricted senders need explicit recipient or saved-audience permission; existing
+operator accounts retain their previous channel grants. Legacy credentials cannot
+use these channels. Saved audiences bind browser enrollments and connector
+configuration; changing either requires an administrator to review and save the
+audience again. Schedules and incidents use the same checks.
 
 Browser delivery freezes exact enrolled subscription identities and encryption
 keys. Connector delivery freezes its configuration fingerprint. Changes or
@@ -576,8 +605,7 @@ confirmed display. Uncertain sends are not automatically repeated. All browser
 cohorts use the same absolute expiry, limited to ten minutes.
 
 Applicable two-person approval policies are also enforced before these channel
-effects. Approval does not bypass current authorization or permit a restricted
-credential to select them. Enrollment, VAPID key management, directory imports,
+effects. Approval does not bypass current authorization or expand a credential’s audience. Enrollment, VAPID key management, directory imports,
 provider renewal/revocation and journal archival are authenticated FreePBX
 administrator actions; these announcement selectors do not expose those controls
 as public API actions. See [Enterprise identity](ENTERPRISE_IDENTITY.md) and

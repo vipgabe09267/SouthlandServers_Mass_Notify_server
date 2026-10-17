@@ -17,7 +17,7 @@ $lines = file($reflection->getFileName()); $methods = '';
 foreach (['processScheduledAnnouncements', 'scheduleExecutionRecord', 'sanitizeScheduleText', 'parseScheduleUtcTimestamp',
     'normalizeAnnouncementAudioMode', 'loadScheduleExecutionStore', 'writeScheduleExecutionStore',
     'acquireAnnouncementActivityLock', 'acquireNativeBackupFileLock', 'releaseNativeBackupFileLock',
-    'getScheduleExecutionState', 'validateNativeScheduleLedger'] as $name) {
+	'getScheduleExecutionState', 'validateNativeScheduleLedger', 'readNativeBackupFile', 'writePrivateAtomicFile'] as $name) {
     $method = $reflection->getMethod($name);
     $body = implode('', array_slice($lines, $method->getStartLine()-1, $method->getEndLine()-$method->getStartLine()+1));
     if ($name === 'writeScheduleExecutionStore') { $body = str_replace('function writeScheduleExecutionStore(', 'function commitFixtureLedger(', $body); }
@@ -29,11 +29,23 @@ class ScheduledDeliveryFixture {
     use \FreePBX\modules\SlsAnnouncementDelivery { persistPreparedScheduledAnnouncementJob as actualPersist; }
     public $settings = [], $fault = '', $started = [], $statuses = [], $resolved = [], $admit = true;
     private function ensurePluginDataDir() {}
-    private function setPrivateOwnership($path) { chmod($path, 0600); }
+	private function setPrivateOwnership($path) {
+		$account = posix_getpwnam('asterisk');
+		if (!is_array($account) || !chmod($path, 0640) || !chown($path, $account['uid']) || !chgrp($path, $account['gid'])) {
+			throw new RuntimeException('Fixture could not secure a private file.');
+		}
+	}
+	private function unlinkNamedFileIfIdentity($path, $identity) {
+		$current = lstat($path);
+		if (is_array($identity) && is_array($current) && $identity['dev'] === $current['dev'] && $identity['ino'] === $current['ino']) {
+			unlink($path);
+		}
+	}
     public function getActiveSettings() { return $this->settings; }
     private function updateStatusData($value) { $this->statuses[] = $value; }
-    private function writeScheduleExecutionStore(array $store) {
-        $this->commitFixtureLedger($store);
+    private function writeScheduleExecutionStore(array $store, string $changedOccurrenceId='') {
+        if ($changedOccurrenceId==='') { $changedOccurrenceId=(string)array_key_last($store['occurrences']); }
+        $this->commitFixtureLedger($store,$changedOccurrenceId);
         $last = end($store['occurrences']);
         if ($this->fault === 'after_intent' && ($last['state'] ?? '') === 'preparing') { throw new RuntimeException('fixture interruption after intent'); }
         if ($this->fault === 'after_link' && ($last['state'] ?? '') === 'queued') { throw new RuntimeException('fixture interruption after link'); }
@@ -50,6 +62,10 @@ class ScheduledDeliveryFixture {
             'voice'=>'', 'is_test'=>false]];
     }
     private function admitScheduledAnnouncementRequest(array $request): array { return ['success'=>$this->admit, 'deferred'=>!$this->admit]; }
+    private function commitScheduledAnnouncementAdmission(array $request, callable $commit): array {
+        if (!$this->admit) { return ['success'=>false, 'deferred'=>true]; }
+        return ['success'=>true, 'value'=>$commit()];
+    }
     private function startAnnouncementWorker($id) {
         // Exact durable startup boundary, without processes, PBX or channels.
         $ledger = $this->ledger(); $row = end($ledger['occurrences']);
@@ -62,12 +78,13 @@ class ScheduledDeliveryFixture {
     }
     private function refreshAnnouncementDesktopReceipts(array $value, $created='') { return $value; }
     public function ledger() { return $this->loadScheduleExecutionStore(true); }
-    public function saveLedger($store) { $this->commitFixtureLedger($store); }
+    public function saveLedger($store) { $this->commitFixtureLedger($store,(string)array_key_last($store['occurrences'])); }
     public function validateLedger($value) { return $this->validateNativeScheduleLedger(json_encode($value)); }
 }
 PHP;
 $constants = 'const PLUGIN_DATA_DIR=' . var_export($root,true) . '; const SCHEDULE_LOCK_FILE=self::PLUGIN_DATA_DIR."/schedule-worker.lock";'
     . 'const SCHEDULE_STATE_JSON=self::PLUGIN_DATA_DIR."/schedule-state.json"; const ANNOUNCEMENT_ACTIVITY_LOCK_FILE=self::PLUGIN_DATA_DIR."/announcement-activity.lock";'
+	. 'const MAINTENANCE_PROGRESS_FILE=self::PLUGIN_DATA_DIR."/maintenance-progress.json";'
     . 'const NATIVE_BACKUP_MAX_LEDGER_BYTES=4194304; const MAX_SCHEDULES=100; const MAX_SCHEDULE_OCCURRENCES=1000;';
 eval(str_replace("\n}\n", "\n".$constants."\n".$methods."\n}\n", $class."\n"));
 $count = 0;
@@ -129,6 +146,12 @@ try {
     $f->admit=true;$f->processScheduledAnnouncements();check(count($f->started)===1,'deferred job not admitted once');
     $store=new SlsAnnouncementJobStore($root.'/announcement-jobs');$job=$store->read($record['job_id']);$job['state']='complete';$job['message']='Submitted';$store->write($job);
     $f->processScheduledAnnouncements();check(end($f->ledger()['occurrences'])['state']==='success','durable completion not projected');
+    $f=fixture();$f->processScheduledAnnouncements();$record=end($f->ledger()['occurrences']);
+    $store=new SlsAnnouncementJobStore($root.'/announcement-jobs');$job=$store->read($record['job_id']);
+    $job['state']='cancelled';$job['message']='Authorization changed before submission.';$job['finished_at']=gmdate('c');$store->write($job);
+    $f->processScheduledAnnouncements();$cancelled=end($f->ledger()['occurrences']);
+    check($cancelled['state']==='failed'&&$cancelled['job_state']==='cancelled','Known cancelled job state was reported as unsupported uncertainty');
+    check($cancelled['message']==='Authorization changed before submission.','Cancelled job explanation was discarded');
     $valid=$f->ledger();$f->validateLedger($valid);check(true,'valid additive ledger accepted');
     $bad=$valid;$key=array_key_first($bad['occurrences']);$bad['occurrences'][$key]['deadline_at']='900';
     try{$f->validateLedger($bad);throw new LogicException('invalid deadline accepted');}catch(RuntimeException $e){check(true,'invalid deadline rejected');}
@@ -136,5 +159,19 @@ try {
     $f->saveLedger(['version'=>1,'occurrences'=>[$occ['id']=>['schedule_id'=>$row['id'],'schedule_name'=>'Fixture','occurrence_id'=>$occ['id'],
         'run_at_utc'=>$occ['run_at_utc'],'state'=>'claimed','claimed_at'=>gmdate('c',time()-400)]]]);
     $f->processScheduledAnnouncements();check(end($f->ledger()['occurrences'])['state']==='uncertain'&&$f->started===[],'legacy claim replayed');
+    $f=fixture();$row=$f->settings['scheduled_announcements'][0];$oldId=$row['occurrences'][0]['id'];
+    $newRun=gmdate('Y-m-d\TH:i:s\Z',time()+3600);$newId='occ_'.substr(hash('sha256',$row['id'].'|'.$newRun),0,20);
+    $f->settings['scheduled_announcements'][0]['occurrences'][]=['id'=>$newId,'run_at_utc'=>$newRun];
+    $oldAt=gmdate('c',time()-3600);$newAt=gmdate('c',time()-30);
+    $f->saveLedger(['version'=>1,'occurrences'=>[
+        $oldId=>['schedule_id'=>$row['id'],'schedule_name'=>'Fixture','occurrence_id'=>$oldId,'run_at_utc'=>$row['occurrences'][0]['run_at_utc'],
+            'state'=>'failed','message'=>'Old failure','updated_at'=>$oldAt,'completed_at'=>$oldAt],
+        $newId=>['schedule_id'=>$row['id'],'schedule_name'=>'Fixture','occurrence_id'=>$newId,'run_at_utc'=>$newRun,
+            'state'=>'success','message'=>'New success','updated_at'=>$newAt,'completed_at'=>$newAt],
+    ]]);
+    $projection=$f->getScheduleExecutionState();
+    check(($projection[$row['id']]['state']??'')==='success'&&empty($projection[$row['id']]['attention']),'Older failure replaced newer successful schedule status');
+    $result=$f->processScheduledAnnouncements();
+    check(($result['attention']??-1)===0,'Expired schedule failure remained in current worker health');
     echo "$count durable scheduler checks passed; no PBX or outbound actions.\n";
 } finally {cleanDirectory($root);rmdir($root);}

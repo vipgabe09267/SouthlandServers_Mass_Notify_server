@@ -1,20 +1,28 @@
 <?php
+declare(strict_types=1);
+require_once __DIR__.'/AdminResponse.php';
 $slsmassnotifyserver = \FreePBX::create()->Slsmassnotifyserver;
 $slsmassnotifyserver->enforceOperatorPageAccess('slsmassnotifyserver_paging');
+header('Cache-Control: private, no-store');
+$requestMethod = $_SERVER['REQUEST_METHOD'] ?? '';
+if (!is_string($requestMethod)) { $requestMethod = ''; }
+if (!in_array($requestMethod, ['GET', 'POST'], true)) { header('Allow: GET, POST'); http_response_code(405); return; }
 $saveResult = $_SESSION['slsmassnotifyserver_paging_result'] ?? null;
 unset($_SESSION['slsmassnotifyserver_paging_result']);
 
-if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
-    $validToken = $slsmassnotifyserver->validateCsrfToken($_POST['slsmassnotifyserver_csrf'] ?? '');
-    $action = (string)($_POST['slsmassnotifyserver_action'] ?? '');
+if ($requestMethod === 'POST') {
+    $csrf = $_POST['slsmassnotifyserver_csrf'] ?? null;
+    $validToken = is_string($csrf) && $slsmassnotifyserver->validateCsrfToken($csrf);
+    $submittedAction = $_POST['slsmassnotifyserver_action'] ?? null;
+    $action = is_string($submittedAction) ? $submittedAction : '';
     if ($action === 'generate_paging_pin') {
-        while (ob_get_level() > 0) { @ob_end_clean(); }
-        header('Content-Type: application/json');
+        \SLS\MassNotify\AdminResponse::requireClearBuffers();
+        header('Content-Type: application/json; charset=utf-8');
         header('Cache-Control: private, no-store');
         header('X-Content-Type-Options: nosniff');
         if (!$validToken) { http_response_code(403); }
         echo json_encode($validToken ? $slsmassnotifyserver->generateLivePagingPin($_POST['pin_length'] ?? 4)
-            : ['success' => false, 'message' => _('The security token expired. Reload the page.')]);
+            : ['success' => false, 'message' => _('The security token expired. Reload the page.')], JSON_INVALID_UTF8_SUBSTITUTE);
         exit;
     }
     if (!$validToken) {
@@ -30,12 +38,12 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         $result = ['success' => false, 'message' => _('Unsupported live paging action.'), 'errors' => []];
     }
     if (($_POST['ajax'] ?? '') === '1') {
-        while (ob_get_level() > 0) { @ob_end_clean(); }
+        \SLS\MassNotify\AdminResponse::requireClearBuffers();
         header('Content-Type: application/json; charset=utf-8');
         header('Cache-Control: private, no-store'); header('X-Content-Type-Options: nosniff');
         if (!$validToken) { http_response_code(403); }
         if (!empty($result['success'])) { $_SESSION['slsmassnotifyserver_paging_result'] = $result; }
-        echo json_encode($result); exit;
+        echo json_encode($result, JSON_INVALID_UTF8_SUBSTITUTE); exit;
     }
     $_SESSION['slsmassnotifyserver_paging_result'] = $result;
     header('Location: config.php?display=slsmassnotifyserver_paging');

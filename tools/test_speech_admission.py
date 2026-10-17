@@ -10,8 +10,10 @@ import time
 import sys
 import tempfile
 import unittest
+import threading
 from contextlib import redirect_stderr
 import io
+from unittest import mock
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'slsmassnotifyserver/bin/sls_mass_notify'))
@@ -41,6 +43,28 @@ class SpeechTests(unittest.TestCase):
         third = self.admission().acquire()
         self.assertIsNotNone(third.active)
 
+    def test_regular_control_contention_waits_for_the_current_writer(self):
+        holder=self.admission()
+        descriptor=holder.file('speech-admission.lock')
+        holder.lock_control(descriptor)
+        errors=[]
+        completed=threading.Event()
+        other=self.admission()
+        def work():
+            try:
+                other.acquire()
+                completed.set()
+            except BaseException as error:
+                errors.append(error)
+        thread=threading.Thread(target=work)
+        thread.start()
+        time.sleep(.15)
+        fcntl.flock(descriptor,fcntl.LOCK_UN)
+        thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors,[])
+        self.assertTrue(completed.is_set())
+
     def test_configured_parallel_limit_and_bounded_queue(self):
         config = {'speech_queue_wait_seconds': 0, 'speech_synthesis_limit': 2, 'speech_queue_limit': 2}
         self.admission(config).acquire(); self.admission(config).acquire()
@@ -67,6 +91,41 @@ class SpeechTests(unittest.TestCase):
         records = [row for file in self.root.glob('speech-slot-*.json') for row in json.loads(file.read_text() or '[]')]
         self.assertEqual(sum(row['bytes'] for row in records), first.bytes + speech.MIB)
 
+    def test_reservation_reads_and_writes_reject_replaced_names(self):
+        admission = self.admission()
+        control = admission.file('speech-admission.lock');self.assertTrue(admission.available(control))
+        slot = admission.file('speech-slot-00.lock');self.assertTrue(admission.available(slot))
+        state = self.root/'speech-slot-00.json';state.write_text('[]');state.chmod(0o640)
+        displaced = self.root/'displaced.json';real_stat = speech.os.stat;replaced = False
+        def replace_read(name, *args, **kwargs):
+            nonlocal replaced
+            if name == state.name and kwargs.get('dir_fd') == admission.fd and not replaced:
+                state.rename(displaced);state.write_text('[]');state.chmod(0o640);replaced = True
+            return real_stat(name, *args, **kwargs)
+        with mock.patch.object(speech.os, 'stat', side_effect=replace_read):
+            with self.assertRaisesRegex(speech.SpeechAdmissionError, 'changed while being read'):
+                admission.record(slot)
+        state.unlink();displaced.rename(state);replaced = False
+        staged = self.root/'staged-original'
+        def replace_write(name, *args, **kwargs):
+            nonlocal replaced
+            if isinstance(name, str) and name.startswith('.speech-budget-') and kwargs.get('dir_fd') == admission.fd and not replaced:
+                (self.root/name).rename(staged);(self.root/name).write_text('[]');(self.root/name).chmod(0o640);replaced = True
+            return real_stat(name, *args, **kwargs)
+        with mock.patch.object(speech.os, 'stat', side_effect=replace_write):
+            with self.assertRaisesRegex(speech.SpeechAdmissionError, 'staging changed'):
+                admission.write(slot, [])
+        self.assertTrue(staged.exists())
+        altered = False
+        def alter_write(name, *args, **kwargs):
+            nonlocal altered
+            if isinstance(name, str) and name.startswith('.speech-budget-') and kwargs.get('dir_fd') == admission.fd and not altered:
+                (self.root/name).chmod(0o666);altered = True
+            return real_stat(name, *args, **kwargs)
+        with mock.patch.object(speech.os, 'stat', side_effect=alter_write):
+            with self.assertRaisesRegex(speech.SpeechAdmissionError, 'staging changed'):
+                admission.write(slot, [])
+
     def test_unsafe_lock_and_invalid_config_rejected(self):
         os.symlink(self.root/'outside', self.root/'speech-admission.lock')
         with self.assertRaises(OSError): self.admission().acquire()
@@ -78,6 +137,11 @@ class SpeechTests(unittest.TestCase):
         command = [sys.executable, '-c', 'import time,pathlib;time.sleep(3);pathlib.Path('+repr(str(marker))+').write_text("bad")']
         self.assertEqual(speech.launch(command, .1), 124)
         self.assertFalse(marker.exists())
+
+    def test_child_receives_only_the_bounded_runtime_environment(self):
+        command = [sys.executable, '-c', 'import os,sys;sys.exit(9 if os.getenv("SLS_PRIVATE_PARENT_TOKEN") else 0)']
+        with mock.patch.dict(os.environ, {'SLS_PRIVATE_PARENT_TOKEN': 'must-not-leak'}):
+            self.assertEqual(speech.launch(command, 2), 0)
 
     def test_cli_cannot_execute_arbitrary_programs(self):
         result = subprocess.run([sys.executable, '-I', speech.__file__, '--max-seconds', '30', '--', '/bin/true'], capture_output=True)
@@ -140,6 +204,9 @@ if NOISY:sys.stderr.write('diagnostic\\n'*20000)
         with self.assertRaisesRegex(speech.SpeechAdmissionError,'empty private'):
             speech.speech_output(command,1)
         self.assertEqual(path.read_bytes(),b'previous audio')
+        path.write_bytes(b'');path.chmod(0o644)
+        with self.assertRaisesRegex(speech.SpeechAdmissionError,'empty private'):
+            speech.speech_output(command,1)
         path.unlink();os.symlink(self.root/'outside',path)
         with self.assertRaises(OSError):speech.speech_output(command,1)
         path.unlink()
@@ -150,6 +217,25 @@ if NOISY:sys.stderr.write('diagnostic\\n'*20000)
             metadata.write_text(value)
             with self.assertRaisesRegex(speech.SpeechAdmissionError,'voice metadata is invalid'):
                 speech.speech_output(command,1)
+
+    def test_success_requires_the_original_private_output_path(self):
+        command = self.synthesis_command()
+        original = self.root/'speech.wav'
+        displaced = self.root/'displaced.wav'
+        def replace_output(_command, _timeout, _slot, descriptor, _limit):
+            with os.fdopen(os.dup(descriptor), 'wb') as raw:
+                import wave
+                with wave.open(raw, 'wb') as output:
+                    output.setnchannels(1);output.setsampwidth(2);output.setframerate(16000)
+                    output.writeframes(b'\0\0' * 16000)
+            original.rename(displaced)
+            original.write_bytes(b'replacement')
+            original.chmod(0o600)
+            return 0
+        with mock.patch.object(speech, 'launch', side_effect=replace_output):
+            self.assertEqual(speech.synthesize(command, 1, 3), 74)
+        self.assertEqual(original.read_bytes(), b'replacement')
+        self.assertTrue(displaced.exists())
 
     def test_killed_supervisor_cannot_leave_synthesis_running(self):
         child_pid = self.root/'child.pid'
@@ -175,4 +261,10 @@ if NOISY:sys.stderr.write('diagnostic\\n'*20000)
             if supervisor.poll() is None:supervisor.kill();supervisor.wait(timeout=2)
 
 
-if __name__ == '__main__': unittest.main()
+if __name__ == '__main__':
+    if os.environ.get('SLS_ORDINARY_SPEECH_ONLY')=='1':
+        names=['test_shared_limit_queue_and_immediate_reuse','test_non_speech_reserves_without_using_synthesis_slot',
+               'test_regular_control_contention_waits_for_the_current_writer','test_exact_duration_and_catalog_rates_fit_reserved_workspace']
+        result=unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(SpeechTests(name) for name in names))
+        raise SystemExit(0 if result.wasSuccessful() else 1)
+    unittest.main()

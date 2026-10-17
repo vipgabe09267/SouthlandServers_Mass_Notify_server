@@ -75,7 +75,7 @@ CURRENT_GROUP_ID = ""
 CURRENT_GROUP_NAME = ""
 CURRENT_GROUP_INDEX = 0
 CURRENT_GROUP_LEGACY = False
-NWS_USER_AGENT = "SouthlandServers-Mass-Notifications-Server/0.1.6-beta (https://southlandservers.xyz)"
+NWS_USER_AGENT = "SouthlandServers-Mass-Notifications-Server/0.1.7-beta (https://southlandservers.xyz)"
 NWS_FORECAST_CACHE_SECONDS = 10 * 60
 NWS_FORECAST_STALE_SECONDS = 30 * 60
 NWS_POINT_CACHE_SECONDS = 24 * 60 * 60
@@ -96,88 +96,35 @@ class _RejectRedirects(urllib.request.HTTPRedirectHandler):
 XWEATHER_OPENER = urllib.request.build_opener(_RejectRedirects())
 
 
+def _strict_json(raw):
+    try:
+        return json.loads(raw, object_pairs_hook=_config_crypto._pairs,
+                          parse_constant=_config_crypto._invalid_constant,
+                          parse_float=_config_crypto._finite_float)
+    except RecursionError as error:
+        raise ValueError('Lightning JSON nesting exceeds its limit') from error
+
+
 def log(message):
     with LOG_FILE.open("a", encoding="utf-8") as handle:
         handle.write(f"{datetime.now().astimezone().isoformat()}: Xweather: {message}\n")
 
 
+from sls_atomic_json import locked_json, append_json_line, read_json
+
+
 def _read_json_file(path, missing_ok=True):
-    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(path, flags)
-    except FileNotFoundError:
-        if missing_ok:
-            return {}
-        raise
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 4 * 1024 * 1024:
-            raise RuntimeError(f"invalid JSON state file: {path}")
-        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
-            descriptor = -1
-            data = json.load(handle)
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"corrupt JSON state file: {path}") from exc
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    if not isinstance(data, dict):
-        raise RuntimeError(f"JSON state is not an object: {path}")
-    return data
+        return read_json(path, maximum=4 * 1024 * 1024, missing_ok=missing_ok, runtime_owner=True)
+    except (ValueError, RecursionError) as error:
+        raise RuntimeError('Lightning JSON state is corrupt; existing evidence was preserved.') from error
 
 
 def _atomic_state_update(path, patch, *, replace=False):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = Path(str(path) + ".lock")
-    lock_flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-    lock_descriptor = os.open(lock_path, lock_flags, 0o640)
-    temporary_descriptor = -1
-    temporary_name = ""
-    try:
-        if not stat.S_ISREG(os.fstat(lock_descriptor).st_mode):
-            raise RuntimeError("Xweather state lock is not a regular file")
-        os.fchmod(lock_descriptor, 0o640)
-        if os.geteuid() == 0:
-            account = pwd.getpwnam("asterisk")
-            os.fchown(lock_descriptor, account.pw_uid, account.pw_gid)
-        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
-        data = {} if replace else _read_json_file(path)
+    with locked_json(path, maximum=4 * 1024 * 1024, require_existing=True, runtime_owner=True) as data:
+        if replace:
+            data.clear()
         data.update(patch)
-        temporary_descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
-        )
-        os.fchmod(temporary_descriptor, 0o640)
-        if os.geteuid() == 0:
-            account = pwd.getpwnam("asterisk")
-            os.fchown(temporary_descriptor, account.pw_uid, account.pw_gid)
-        with os.fdopen(temporary_descriptor, "w", encoding="utf-8") as handle:
-            temporary_descriptor = -1
-            json.dump(data, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_name, path)
-        temporary_name = ""
-        directory_descriptor = os.open(
-            path.parent,
-            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
-    finally:
-        if temporary_descriptor >= 0:
-            os.close(temporary_descriptor)
-        if temporary_name:
-            try:
-                os.unlink(temporary_name)
-            except FileNotFoundError:
-                pass
-        try:
-            fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(lock_descriptor)
 
 
 def atomic_json_update(path, patch):
@@ -185,65 +132,32 @@ def atomic_json_update(path, patch):
     if path == STATE_FILE:
         _atomic_state_update(path, patch)
         return
-    # NWS workers also update the shared status file and currently coordinate by
-    # locking that inode. Keep the shared locking protocol here; state critical
-    # to Lightning dedup uses the atomic replacement path above.
-    path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags, 0o640)
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise RuntimeError("status path is not a regular file")
-        with os.fdopen(descriptor, "r+", encoding="utf-8") as handle:
-            descriptor = -1
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            handle.seek(0)
-            raw = handle.read()
-            if raw.strip():
-                try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    raise RuntimeError("shared status file is corrupt") from exc
-                if not isinstance(data, dict):
-                    raise RuntimeError("shared status file is not an object")
-            else:
-                data = {}
-            data.update(patch)
-            if path == STATUS_FILE and CURRENT_GROUP_ID:
-                group_statuses = data.get("xweather_groups")
-                if not isinstance(group_statuses, dict):
-                    group_statuses = {}
-                group_status = group_statuses.get(CURRENT_GROUP_ID)
-                if not isinstance(group_status, dict):
-                    group_status = {}
-                group_status.update({
-                    key: value for key, value in patch.items()
-                    if key.startswith("last_xweather_") or key.startswith("xweather_adaptive_") or key.startswith("xweather_gate_") or key.startswith("xweather_fallback_") or key == "xweather_last_observation_age_seconds"
-                })
-                group_status["group_id"] = CURRENT_GROUP_ID
-                group_status["group_name"] = CURRENT_GROUP_NAME
-                group_statuses[CURRENT_GROUP_ID] = group_status
-                data["xweather_groups"] = group_statuses
-            handle.seek(0)
-            handle.truncate(0)
-            json.dump(data, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    os.chmod(path, 0o640)
+    with locked_json(path, runtime_owner=True) as data:
+        data.update(patch)
+        if path == STATUS_FILE and CURRENT_GROUP_ID:
+            group_statuses = data.get("xweather_groups")
+            if not isinstance(group_statuses, dict):
+                group_statuses = {}
+            group_status = group_statuses.get(CURRENT_GROUP_ID)
+            if not isinstance(group_status, dict):
+                group_status = {}
+            group_status.update({
+                key: value for key, value in patch.items()
+                if key.startswith("last_xweather_") or key.startswith("xweather_adaptive_") or key.startswith("xweather_gate_") or key.startswith("xweather_fallback_") or key == "xweather_last_observation_age_seconds"
+            })
+            group_status["group_id"] = CURRENT_GROUP_ID
+            group_status["group_name"] = CURRENT_GROUP_NAME
+            group_statuses[CURRENT_GROUP_ID] = group_status
+            data["xweather_groups"] = group_statuses
 
 
 def append_event(payload):
-    with EVENTS_LOG.open("a", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        handle.write(json.dumps(payload, separators=(",", ":"), ensure_ascii=True) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    os.chmod(EVENTS_LOG, 0o640)
+    try:
+        append_json_line(EVENTS_LOG, payload)
+        return True
+    except (OSError, RuntimeError, ValueError, TypeError) as error:
+        log(f"ERROR: Lightning audit evidence could not be saved: {error}. Delivery may already have occurred; do not replay it solely to repair this log.")
+        return False
 
 
 def _merge_email_recipients(configured, legacy):
@@ -387,7 +301,7 @@ def fetch_payload(xweather):
         fixture_path = Path(fixture)
         if not fixture_path.is_file() or fixture_path.stat().st_size > 10 * 1024 * 1024:
             raise ValueError("test payload is unavailable or too large")
-        return json.loads(fixture_path.read_text(encoding="utf-8"))
+        return _strict_json(fixture_path.read_text(encoding="utf-8"))
     if xweather.get("provider", "xweather") != "xweather":
         from sls_lightning_providers import fetch
         return fetch(xweather)
@@ -404,7 +318,7 @@ def fetch_payload(xweather):
         "client_secret": xweather["client_secret"],
     }
     url = "https://data.api.xweather.com/lightning/closest?" + urllib.parse.urlencode(params)
-    request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "SouthlandServers-Mass-Notifications-Server/0.1.6-beta"})
+    request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "SouthlandServers-Mass-Notifications-Server/0.1.7-beta"})
     last_error = None
     maximum_attempts = 1 if xweather.get("_bounded_gate_fallback") else 3
     for attempt in range(maximum_attempts):
@@ -423,7 +337,10 @@ def fetch_payload(xweather):
                     except (TypeError, ValueError):
                         pass
                 LAST_RATE_LIMIT["reset_at"] = str(response.headers.get("X-Ratelimit-Reset-Period", ""))[:100]
-                return json.loads(response.read(10 * 1024 * 1024 + 1).decode("utf-8"))
+                raw = response.read(10 * 1024 * 1024 + 1)
+                if len(raw) > 10 * 1024 * 1024:
+                    raise RuntimeError('Lightning response is too large')
+                return _strict_json(raw.decode("utf-8"))
         except Exception as exc:
             last_error = exc
             if attempt + 1 < maximum_attempts:
@@ -532,9 +449,10 @@ def read_state():
 
 
 def read_json_object(path):
+    if Path(path) == QUOTA_STATE_FILE:
+        return _read_json_file(path)
     try:
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else {}
+        return _read_json_file(path)
     except Exception:
         return {}
 
@@ -563,7 +481,7 @@ def _nws_json(url, maximum_bytes=5 * 1024 * 1024):
                 payload = response.read(maximum_bytes + 1)
                 if len(payload) > maximum_bytes:
                     raise RuntimeError("Weather.gov response is too large")
-                decoded = json.loads(payload.decode("utf-8"))
+                decoded = _strict_json(payload.decode("utf-8"))
                 if not isinstance(decoded, dict):
                     raise RuntimeError("Weather.gov response is not an object")
                 return decoded
@@ -743,7 +661,11 @@ def forecast_storm_gate(config, xweather, now, grace_minutes):
     cache_path = DATA_DIR / f"nws-forecast-gate-{cache_id}.json"
     cache = read_json_object(cache_path)
     identity = lightning_area_identity(config, xweather)
-    if cache.get("configuration_identity") != identity or cache.get("coverage_schema") != 2:
+    if (cache.get("configuration_identity") != identity or type(cache.get('coverage_schema')) is not int
+            or cache['coverage_schema'] != 2 or type(cache.get('active')) is not bool):
+        cache = {}
+    transition = int(cache.get('next_transition_at', 0) or 0)
+    if transition > 0 and now >= transition:
         cache = {}
     checked_at = int(cache.get("checked_at", 0) or 0)
     cache_expires_at = int(cache.get("expires_at", 0) or 0)
@@ -756,7 +678,7 @@ def forecast_storm_gate(config, xweather, now, grace_minutes):
             fixture_path = Path(forecast_fixture)
             if not fixture_path.is_file() or fixture_path.stat().st_size > 5 * 1024 * 1024:
                 raise RuntimeError("Weather.gov forecast fixture is unavailable")
-            forecast = json.loads(fixture_path.read_text(encoding="utf-8"))
+            forecast = _strict_json(fixture_path.read_text(encoding="utf-8"))
             grid_url = "fixture"
             coordinates = _coordinate_pair(xweather.get("location")) or (0.0, 0.0)
         else:
@@ -951,6 +873,7 @@ def quota_governor(state, now):
             updated = int(state.get("quota_bucket_updated") or now)
         except (TypeError, ValueError):
             bucket, updated = initial_bucket, now
+        now = max(now, updated)
         refill = max(0, now - updated) * refill_allowance / (30 * 86400)
         bucket = min(bucket_cap, bucket + refill)
     state["quota_bucket_tokens"] = round(bucket, 4)
@@ -966,24 +889,23 @@ def quota_governor(state, now):
 
 
 def reserve_shared_quota(now):
-    quota_state = read_json_object(QUOTA_STATE_FILE)
-    allowed, reserved_cost, message = quota_governor(quota_state, now)
-    _atomic_state_update(QUOTA_STATE_FILE, quota_state)
-    return allowed, reserved_cost, message
+    with locked_json(QUOTA_STATE_FILE, maximum=4 * 1024 * 1024,
+                     require_existing=True, runtime_owner=True) as quota_state:
+        return quota_governor(quota_state, now)
 
 
 def adjust_shared_quota(actual_cost, reserved_cost):
     adjustment = int(actual_cost) - int(reserved_cost)
     if not adjustment:
         return
-    quota_state = read_json_object(QUOTA_STATE_FILE)
-    try:
-        bucket = float(quota_state.get("quota_bucket_tokens") or 0)
-    except (TypeError, ValueError):
-        bucket = 0.0
-    quota_state["quota_bucket_tokens"] = round(max(0.0, bucket - adjustment), 4)
-    quota_state["quota_bucket_updated"] = int(time.time())
-    _atomic_state_update(QUOTA_STATE_FILE, quota_state)
+    with locked_json(QUOTA_STATE_FILE, maximum=4 * 1024 * 1024,
+                     require_existing=True, runtime_owner=True) as quota_state:
+        try:
+            bucket = float(quota_state.get("quota_bucket_tokens") or 0)
+        except (TypeError, ValueError):
+            bucket = 0.0
+        quota_state["quota_bucket_tokens"] = round(max(0.0, bucket - adjustment), 4)
+        quota_state["quota_bucket_updated"] = max(int(quota_state.get('quota_bucket_updated', 0) or 0), int(time.time()))
 
 
 def safe_tone(name):
@@ -1078,7 +1000,17 @@ def generate_audio(config, xweather, message, alert_id):
         subprocess.run(["/usr/bin/sox", str(silence), *map(str, sources), "-r", "8000", "-c", "1", "-b", "16", str(target)], check=True, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     finally:
         silence.unlink(missing_ok=True)
-    os.chmod(target, 0o644)
+    from sls_nws_delivery_claims import _open_directory, _validate_parent_directory, _secure_file_metadata
+    parent = _open_directory(TTS_DIR)
+    try:
+        _validate_parent_directory(parent)
+        descriptor = os.open(target.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        try:
+            _secure_file_metadata(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent)
     return f"{SOUND_PREFIX}/{target.stem}"
 
 
@@ -1212,7 +1144,7 @@ def record_xweather_outcome(is_test, status, message):
     })
 
 
-def send_visual(recipients, desktop_clients, message, is_test=False, phone_delay_seconds=0):
+def send_visual(recipients, desktop_clients, message, is_test=False, phone_delay_seconds=0, desktop_bindings=None):
     # ImageScreen is reliable on the legacy Yealink T48G where a long
     # TextScreen can produce a phone-side "Layout Error". Other vendors still
     # receive the normal safe text fallback from sls_notify.py.
@@ -1232,11 +1164,14 @@ def send_visual(recipients, desktop_clients, message, is_test=False, phone_delay
     if desktop_clients:
         command = [*base_command, "--api-only", "--desktop-targets", ",".join(desktop_clients), "--no-retry"]
         try:
-            publication = subprocess.run(command, check=True, timeout=30, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            environment = dict(os.environ)
+            if desktop_bindings is not None:
+                environment['SLS_DESKTOP_CLIENT_IDS_SNAPSHOT'] = json.dumps(desktop_bindings, separators=(',', ':'))
+            publication = subprocess.run(command, check=True, timeout=30, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=environment)
             if is_test and os.environ.get('SLS_TEST_DELIVERY_ID'):
                 for line in publication.stdout.splitlines():
                     if line.startswith('SLS_DESKTOP_PUBLICATION '):
-                        receipt = json.loads(line[len('SLS_DESKTOP_PUBLICATION '):])
+                        receipt = _strict_json(line[len('SLS_DESKTOP_PUBLICATION '):])
                         print('SLS_TEST_DESKTOP_PUBLICATION ' + json.dumps({'event_id': receipt['event_id'], 'targets': desktop_clients}), flush=True)
         except (OSError, subprocess.SubprocessError) as exc:
             failures.append(f"desktop journal publication failed: {exc}")
@@ -1318,20 +1253,8 @@ def send_webhooks(config, subject, message, event_name, severity, state_label, r
 
 
 def quiet_hours_active(xweather):
-    if str(xweather.get("quiet_hours_enabled", "0")) not in {"1", "true", "True"}:
-        return False
-    try:
-        start_hour, start_minute = map(int, str(xweather.get("quiet_hours_start") or "21:00").split(":", 1))
-        end_hour, end_minute = map(int, str(xweather.get("quiet_hours_end") or "06:00").split(":", 1))
-    except (TypeError, ValueError):
-        return False
-    now = datetime.now().astimezone()
-    minute = now.hour * 60 + now.minute
-    start = start_hour * 60 + start_minute
-    end = end_hour * 60 + end_minute
-    if start == end:
-        return False
-    return start <= minute < end if start < end else minute >= start or minute < end
+    from sls_notification_destinations import _quiet_now
+    return _quiet_now(xweather, time.time())
 
 
 def commit_local_event_state(state, event_kind, now):
@@ -1464,7 +1387,9 @@ def main():
         "location": location,
         "radius_miles": min(62, max(1, int(xweather.get("radius_miles", 25)))),
         "strike_type": str(xweather.get("strike_type") or "cloud_to_ground") if str(xweather.get("strike_type") or "cloud_to_ground") in STRIKE_FILTERS else "cloud_to_ground",
-        "query_interval_minutes": 5 if adaptive else min(10, max(1, int(xweather.get("query_interval_minutes", 5)))),
+        "query_interval_minutes": (4 if adaptive else min(4,max(1,int(xweather.get("query_interval_minutes",4)))))
+            if xweather.get("provider","xweather")=="xweather"
+            else (5 if adaptive else min(10,max(1,int(xweather.get("query_interval_minutes",5))))),
         "client_id": client_id,
         "client_secret": client_secret,
     }
@@ -1553,10 +1478,23 @@ def main():
         atomic_json_update(STATUS_FILE, {"last_xweather_query_at": datetime.now().astimezone().isoformat()})
     if test_event in {"entry", "clear"}:
         records = [{"id": f"manual-{int(time.time())}", "timestamp": int(time.time()), "type": "test"}] if test_event == "entry" else []
+        observation_start=now;observation_end=now
     else:
         try:
             settings["_bounded_gate_fallback"] = adaptive and state.get("adaptive_gate_status") == "fallback"
-            records = normalize_records(fetch_payload(settings), settings["strike_type"])
+            settings["_window_end_at"]=now
+            settings["_lookback_seconds"]=min(3600,max(300,now-int(state.get("last_observed_at",now) or now)+120))
+            payload=fetch_payload(settings)
+            records = normalize_records(payload, settings["strike_type"])
+            window=payload.get("observation_window") if settings.get("provider","xweather")!="xweather" else None
+            if window is None:
+                observation_start=int(os.environ.get("XWEATHER_TEST_NOW") or time.time())-300
+                observation_end=now
+            elif (isinstance(window,dict) and type(window.get("start")) is int and type(window.get("end")) is int
+                  and 0<=window["start"]<=window["end"]<=now):
+                observation_start,observation_end=window["start"],window["end"]
+            else:
+                raise ValueError("Lightning observation coverage could not be verified.")
             if adaptive and settings.get("provider", "xweather") == "xweather":
                 actual_cost = max(1, int(LAST_RATE_LIMIT.get("cost_tokens") or reserved_cost))
                 adjust_shared_quota(actual_cost, reserved_cost)
@@ -1576,8 +1514,12 @@ def main():
             return 1
     last_observed = int(state.get("last_observed_at", 0) or 0)
     clear_seconds = max(5, min(120, int(xweather.get("all_clear_minutes", 10) or 10))) * 60
-    expected_interval = max(1, min(10, int(xweather.get("query_interval_minutes", 5) or 5))) * 60
-    observation_gap = max(0, now - last_observed - expected_interval) if last_observed else 0
+    expected_interval = settings["query_interval_minutes"] * 60
+    observation_gap = max(0, observation_start-last_observed) if last_observed else 0
+    continuous_since=int(state.get("continuous_observation_since",observation_start) or observation_start)
+    if observation_gap or continuous_since>observation_end:
+        continuous_since=observation_start
+    state["continuous_observation_since"]=continuous_since
     if test_event == "":
         atomic_json_update(STATUS_FILE, {
             "last_xweather_observation_at": datetime.now().astimezone().isoformat(),
@@ -1609,14 +1551,16 @@ def main():
             notified = False
         else:
             state["empty_polls"] = 0
-        state["last_strike_observed_at"] = now
+        state["last_strike_observed_at"] = max(int(state.get("last_strike_observed_at",0) or 0),
+                                              max(int(record["timestamp"]) for record in records))
         if not notified:
             event_kind = "entry"
     elif active_before:
         empty_polls += 1
         state["empty_polls"] = empty_polls
         last_strike = int(state.get("last_strike_observed_at", state.get("cluster_started", now)) or now)
-        if empty_polls >= 2 and now - last_strike >= clear_seconds and observation_gap <= 60:
+        if (empty_polls >= 2 and observation_end-last_strike>=clear_seconds and observation_gap==0
+                and observation_end-continuous_since>=clear_seconds):
             event_kind = "clear" if notified and str(xweather.get("all_clear", "none")) == "send" else "reset"
     if external_live:
         recovered_intent_key = str(state.get("local_dispatch_intent") or "")
@@ -1630,7 +1574,7 @@ def main():
             event_kind = intent_match.group("kind")
             recovering_local_intent = True
     state["last_poll"] = now
-    state["last_observed_at"] = now
+    state["last_observed_at"] = observation_end
     if test_event == "" and adaptive:
         atomic_json_update(STATUS_FILE, adaptive_gate_status_patch(state, now))
     state["observation_gap_seconds"] = observation_gap
@@ -1800,7 +1744,7 @@ def main():
             return 0
     if external_live and os.environ.get('SLS_WEATHER_QUEUE_ENABLED') == '1':
         from sls_weather_queue import enqueue_lightning
-        from sls_weather_channels import snapshot as channel_snapshot
+        from sls_weather_channels import snapshot as channel_snapshot, desktop_snapshot
         try:
             enqueue_lightning(CURRENT_GROUP_ID, correlation_key, {
                 'group_id': CURRENT_GROUP_ID, 'configuration_identity': area_identity,
@@ -1809,6 +1753,7 @@ def main():
                 'subject': subject, 'event_name': event_name, 'severity': severity,
                 'state_label': state_label, 'nearest_miles': nearest_miles,
                 'routing_snapshot': {'phones': list(recipients), 'desktops': list(desktop_clients),
+                                     'desktop_client_ids': desktop_snapshot(config, desktop_clients),
                                      'emails': email_recipients.split(),
                                      'webhooks': configured_external_destination_keys(config),
                                      'webhook_fingerprints': external_destination_fingerprints(config),
@@ -1921,7 +1866,7 @@ def main():
             log(f"external delivery remains pending because retry state failed: {exc}")
 
     event_status = "dry_run" if dry_run else ("completed" if is_test else ("partial_failure" if external_failures or local_delivery_outcome == "indeterminate" else "queued"))
-    append_event({"event_id": f"xweather-{alert_id}", "logged_at": datetime.now(timezone.utc).astimezone().isoformat(), "type": "xweather", "status": event_status, "system_name": "SLS Mass Notify System", "source_name": {"xweather":"Xweather","tempest":"Tempest","meteomatics":"Meteomatics"}.get(xweather.get("provider","xweather"),"Lightning") + " Lightning API", "trigger_source": "Manual Lightning Test" if test_event else "Xweather API", "trigger_name": os.environ.get("XWEATHER_TEST_TRIGGER_NAME", "")[:80], "trigger_area_id": CURRENT_GROUP_ID, "trigger_area_name": CURRENT_GROUP_NAME, "page_group": ",".join(recipients), "desktop_targets": desktop_clients, "event": event_name, "severity": severity, "message_type": "Lightning", "audio": "Piper TTS" if sound else "None", "audio_sequence": [sound] if sound else [], "body": message, "radius_miles": settings["radius_miles"], "nearest_strike_miles": round(nearest_miles, 1) if nearest_miles is not None else None, "storm_state": state_label, "local_delivery_outcome": local_delivery_outcome, "local_delivery_error": local_delivery_error[:240], "external_destination_failures": external_failures})
+    append_event({"event_id": f"xweather-{alert_id}", "logged_at": datetime.now(timezone.utc).astimezone().isoformat(), "type": "xweather", "is_test": is_test, "status": event_status, "system_name": "SLS Mass Notify System", "source_name": {"xweather":"Xweather","tempest":"Tempest","meteomatics":"Meteomatics"}.get(xweather.get("provider","xweather"),"Lightning") + " Lightning API", "trigger_source": "Manual Lightning Test" if test_event else "Xweather API", "trigger_name": os.environ.get("XWEATHER_TEST_TRIGGER_NAME", "")[:80], "trigger_area_id": CURRENT_GROUP_ID, "trigger_area_name": CURRENT_GROUP_NAME, "page_group": ",".join(recipients), "desktop_targets": desktop_clients, "event": event_name, "severity": severity, "message_type": "Lightning", "audio": "Piper TTS" if sound else "None", "audio_sequence": [sound] if sound else [], "body": message, "radius_miles": settings["radius_miles"], "nearest_strike_miles": round(nearest_miles, 1) if nearest_miles is not None else None, "storm_state": state_label, "local_delivery_outcome": local_delivery_outcome, "local_delivery_error": local_delivery_error[:240], "external_destination_failures": external_failures})
     delivery_state = event_status
     call_label = "completed" if is_test else "queued"
     if local_delivery_outcome == "not_requested":
@@ -1967,10 +1912,10 @@ def deliver_queued_event(record):
         return 'cancelled', 'All-clear superseded by a new cluster or disabled.'
     recipients = [str(value) for value in area.get('recipients', [])
                   if re.fullmatch(r'[0-9]{1,20}', str(value)) and str(value) in snapshot.get('phones', [])]
-    enabled_desktops = {str(client.get('username') or '').lower() for client in config.get('desktop_clients', [])
-        if isinstance(client, dict) and str(client.get('enabled', '0')).lower() in {'1', 'true', 'yes', 'on'}}
-    desktops = [str(value) for value in area.get('desktop_clients', [])
-                if str(value).lower() in enabled_desktops and str(value).lower() in {str(item).lower() for item in snapshot.get('desktops', [])}]
+    from sls_weather_channels import authorized_desktops
+    original_names = {str(item).lower() for item in snapshot.get('desktops', [])}
+    desktops = authorized_desktops(config, [value for value in area.get('desktop_clients', [])
+        if str(value).lower() in original_names], snapshot.get('desktop_client_ids'))
     email_recipients = ' '.join(str(value) for value in area.get('email_recipients', [])
         if valid_recipient(str(value)) and str(value).lower() in {str(item).lower() for item in snapshot.get('emails', [])})
     webhook_keys = set(snapshot.get('webhooks', [])) & set(configured_external_destination_keys(config))
@@ -1983,7 +1928,7 @@ def deliver_queued_event(record):
     # Publish the desktop journal before synthesis and any recipient queue wait.
     if desktops:
         try:
-            send_visual([], desktops, record['message'])
+            send_visual([], desktops, record['message'], desktop_bindings=snapshot.get('desktop_client_ids') or {})
         except Exception as exc:
             errors.append('desktop publication: ' + type(exc).__name__)
     if recipients:
@@ -2024,7 +1969,7 @@ def deliver_queued_event(record):
     status = 'partial_failure' if errors else 'queued'
     detail = '; '.join(errors) if errors else 'Local destinations submitted and external delivery queued; handset acceptance is not confirmed.'
     append_event({'event_id': 'xweather-' + record['alert_id'], 'logged_at': datetime.now(timezone.utc).isoformat(),
-        'type': 'xweather', 'status': status, 'event': record['event_name'], 'severity': record['severity'],
+        'type': 'xweather', 'is_test': False, 'status': status, 'event': record['event_name'], 'severity': record['severity'],
         'body': record['message'], 'trigger_area_id': CURRENT_GROUP_ID, 'trigger_area_name': CURRENT_GROUP_NAME,
         'page_group': ','.join(recipients), 'desktop_targets': desktops, 'audio_sequence': [sound] if sound else [],
         'local_delivery_error': detail if errors else '', 'source_name': {'xweather':'Xweather','tempest':'Tempest','meteomatics':'Meteomatics'}.get(area.get('provider','xweather'),'Lightning')+' Lightning API', 'trigger_source': 'Lightning API'})
@@ -2094,14 +2039,33 @@ def cli(argv=None):
         print(f"Unknown argument: {args[0]}", file=sys.stderr)
         print("Usage: sls_mass_notify_xweather_poll.py", file=sys.stderr)
         return 2
-    WORKER_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with WORKER_LOCK_FILE.open("a+", encoding="utf-8") as lock_handle:
+    from sls_nws_delivery_claims import (_open_directory, _validate_parent_directory,
+                                       _checked_file_metadata, _secure_file_metadata, _identity)
+    parent = _open_directory(WORKER_LOCK_FILE.parent)
+    try:
+        _validate_parent_directory(parent)
+        descriptor = os.open(WORKER_LOCK_FILE.name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o640, dir_fd=parent)
+    finally:
+        os.close(parent)
+    with os.fdopen(descriptor, 'a+') as lock_handle:
+        metadata, _, _ = _checked_file_metadata(lock_handle.fileno())
+        if metadata.st_size != 0:
+            raise RuntimeError('Lightning worker lock has unknown contents')
         try:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             print("Another Xweather poll or manual Lightning test is already active.", file=sys.stderr)
             return 75
         try:
+            parent = _open_directory(WORKER_LOCK_FILE.parent)
+            try:
+                _validate_parent_directory(parent)
+                named = os.stat(WORKER_LOCK_FILE.name, dir_fd=parent, follow_symlinks=False)
+                if _identity(os.fstat(lock_handle.fileno())) != _identity(named):
+                    raise RuntimeError('Lightning worker lock changed during acquisition')
+            finally:
+                os.close(parent)
+            _secure_file_metadata(lock_handle.fileno())
             return run_configured_group_cycle()
         finally:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)

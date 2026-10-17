@@ -21,14 +21,16 @@ final class DesktopFleet
         $at = is_string($seen['seen_at'] ?? null) ? strtotime($seen['seen_at']) : false;
         $reportAt = is_string($report['reported_at'] ?? null) ? strtotime($report['reported_at']) : false;
         $reportFresh = $reportAt !== false && $reportAt <= $now + 60 && $reportAt >= $now - 86400;
+        $connectedUntil = is_int($seen['connected_until'] ?? null) ? $seen['connected_until'] : 0;
         $connection = !$enabled ? 'disabled' : ($at === false ? 'never' : ($at > $now + 60 ? 'clock_error'
-            : ((int)($seen['connected_until'] ?? 0) >= $now && (int)$seen['connected_until'] <= $now + 120 ? 'streaming'
+            : ($connectedUntil >= $now && $connectedUntil <= $now + 120 ? 'streaming'
             : ($at >= $now - 90 ? 'recent' : 'inactive'))));
         $compatibility = 'not_reported';
         if ($reportFresh) {
-            $unsupported = (isset($report['payload_schema']) && $report['payload_schema'] !== 1)
-                || (isset($report['sse_protocol']) && $report['sse_protocol'] !== 2);
-            if ($unsupported) { $compatibility = 'unsupported_protocol'; }
+            $payloadReported = is_int($report['payload_schema'] ?? null);
+            $streamReported = is_int($report['sse_protocol'] ?? null);
+            if (!$payloadReported || !$streamReported) { $compatibility = 'protocol_not_reported'; }
+            elseif ($report['payload_schema'] !== 1 || $report['sse_protocol'] !== 2) { $compatibility = 'unsupported_protocol'; }
             elseif ($version !== '' && self::validMinimum($version) && self::validMinimum($minimum)) {
                 $compatibility = $minimum === '' ? 'no_minimum' : (version_compare($version, $minimum, '<') ? 'upgrade_required' : 'meets_minimum');
             }

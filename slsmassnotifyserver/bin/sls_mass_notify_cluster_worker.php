@@ -35,11 +35,21 @@ function slsClusterWorkerMaintenanceLock(string $path='/var/lib/asterisk/SLS_Mas
         $accepted=true;return $handle;
     } finally { if (!$accepted) { fclose($handle); } }
 }
+function slsClusterWorkerError(Throwable $error): string
+{
+    $message=preg_replace('/[\x00-\x1f\x7f]+/',' ',trim($error->getMessage()));
+    return substr(is_string($message)&&$message!==''?$message:'unspecified protected-state failure',0,240);
+}
 $slsClusterMaintenance=null;
 try {
     if (function_exists('posix_geteuid') && posix_geteuid()===0) {
         $u=posix_getpwnam('asterisk');
-        if (!$u || !posix_initgroups('asterisk',$u['gid']) || !posix_setgid($u['gid']) || !posix_setuid($u['uid'])) { throw new RuntimeException('Runtime account unavailable.'); }
+        if (!$u || $u['uid']<=0 || !function_exists('pcntl_exec')) { throw new RuntimeException('A nonroot asterisk account and PHP CLI PCNTL are required.'); }
+        // Re-exec clears the initial process environment as well as getenv().
+        // A direct UID change leaves root download credentials in memory.
+        pcntl_exec('/usr/bin/env',['-i','PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+            'LANG=C.UTF-8','LC_ALL=C.UTF-8','/usr/sbin/runuser','-u','asterisk','--','/usr/bin/php',__FILE__,...$args]);
+        throw new RuntimeException('Unable to start the clean runtime-account worker.');
     }
     // Installer acquires this exclusive lease before ordinary activity locks.
     // It covers mutable module bootstrap through watch sleep and process exit;
@@ -74,9 +84,11 @@ try {
                 $settings=\FreePBX\modules\SlsConfigCrypto::readFile('/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config');
                 if (!\SLS\MassNotify\EnterpriseClusterConfig::enabled($settings)) { break; }
                 $runtime=new \SLS\MassNotify\EnterpriseClusterRuntime($settings); $connected=false;
+                $deadline=hrtime(true)+8000000000;
                 foreach ($runtime->config()['peers'] as $peer) {
                     if ($peer['role']!=='coordinator') { continue; }
-                    try { $runtime->request($peer['node_id'],'status',[]); $connected=true; break; } catch (Throwable $ignored) {}
+                    if (hrtime(true)>=$deadline) { break; }
+                    try { $runtime->request($peer['node_id'],'status',[],$deadline); $connected=true; break; } catch (Throwable $ignored) {}
                 }
                 $result=['edge_jobs'=>(new \SLS\MassNotify\EnterpriseClusterEdge($runtime))->drain($connected)];
             } else {
@@ -87,9 +99,9 @@ try {
             }
             echo json_encode($result,JSON_THROW_ON_ERROR),"\n";
         } catch (Throwable $error) {
-            fwrite(STDERR,"SLS cluster worker: exclusive authority or protected state unavailable; this cycle was fenced.\n");
+            fwrite(STDERR,"SLS cluster worker: cycle fenced: ".slsClusterWorkerError($error)."\n");
             if (!$watch) { exit(1); }
         }
         if ($watch && $running) { sleep($delay); }
     } while ($watch && $running);
-} catch (Throwable $error) { fwrite(STDERR,"SLS cluster worker: protected state or authority unavailable; dispatch stopped.\n"); exit(1); }
+} catch (Throwable $error) { fwrite(STDERR,"SLS cluster worker: dispatch stopped: ".slsClusterWorkerError($error)."\n"); exit(1); }

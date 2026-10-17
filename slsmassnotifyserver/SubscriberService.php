@@ -22,9 +22,10 @@ final class SubscriberService
         if(!$record||$record['state']!=='open'){throw new \DomainException('Invite links require an open incident.');}$r=self::roster($record,$p);
         $token=bin2hex(random_bytes(32));$expires=$now+$c['link_ttl_seconds'];$proof=['subscriber_id'=>$p['id'],'identity'=>SubscriberConfig::identity($p),'incident_id'=>$incidentId,
             'person_id'=>$p['person_id'],'roster_identity'=>hash('sha256',json_encode($r,JSON_THROW_ON_ERROR)),'created_at'=>$now,'expires_at'=>$expires,'delivery'=>'reserved'];
-        $this->state->transaction('subscriber_tokens',static function(array &$rows)use($token,$proof,$now):void{foreach($rows as $key=>$row){if(($row['expires_at']??0)<=$now){unset($rows[$key]);}}
+        $this->state->transaction('subscriber_tokens',static function(array &$rows)use($token,$proof,$now):void{foreach($rows as $key=>$row){if(max($row['expires_at']??0,($row['created_at']??0)+3600)<=$now){unset($rows[$key]);}}
             $recent=0;foreach($rows as $row){if(($row['subscriber_id']??'')===$proof['subscriber_id']&&$row['created_at']>$now-3600){$recent++;}}
-            if($recent>=3||count($rows)>=2000){throw new \DomainException('Subscriber invitation limit reached. Retry after existing links expire.');}
+            if($recent>=3){throw new \DomainException('This person has reached the three-invitation hourly limit. Retry after the hourly window.');}
+            if(count($rows)>=2000){throw new \DomainException('Subscriber invitation history is full. Retry after retained invitation windows expire.');}
             // Reissuing revokes every unused prior link for this incident/person.
             foreach($rows as &$row){if($row['subscriber_id']===$proof['subscriber_id']&&$row['incident_id']===$proof['incident_id']){$row['revoked']=true;}}unset($row);$rows[hash('sha256',$token)]=$proof;});
         return ['token'=>$token,'token_hash'=>hash('sha256',$token),'url'=>$c['public_base_url'].'#verify='.$token,'expires_at'=>$expires,'person'=>$p,'incident_title'=>$record['title']??$record['template']['title']];
@@ -59,7 +60,7 @@ final class SubscriberService
             $match=null;foreach($record['template']['roster'] as $person){if($person['id']===$binding['person_id']){$match=$person;break;}}
             if(!$match||!hash_equals(hash('sha256',json_encode($match,JSON_THROW_ON_ERROR)),$binding['roster_identity'])){throw new \DomainException('Incident roster binding changed.');}
             if(isset($record['actions'][$request])){if(!hash_equals($record['actions'][$request],$fingerprint)){throw new \DomainException('This request ID belongs to another response.');}return $record;}
-            if(count($record['actions'])>=3500||count($record['timeline'])>=3999){throw new \DomainException('Incident response history is full.');}$at=gmdate('c',$now);$record['actions'][$request]=$fingerprint;
+            if(count($record['actions'])>=3500||count($record['timeline'])+IncidentStore::pendingApprovalCount($record)>=4000){throw new \DomainException('Incident response history is full.');}$at=gmdate('c',$now);$record['actions'][$request]=$fingerprint;
             $record['responses'][$binding['person_id']]=['response'=>$input['response'],'note'=>$note,'at'=>$at,'actor'=>$actor,'source'=>'human_browser_response'];
             $record['timeline'][]=['at'=>$at,'kind'=>'human_response','actor'=>$actor,'details'=>['person_id'=>$binding['person_id'],'response'=>$input['response'],'note'=>$note]];$record['updated_at']=$at;return $record;});
         return $this->current($settings,$binding,$now);
@@ -97,7 +98,7 @@ final class SubscriberService
     {
         $person=SubscriberConfig::person($settings,$subscriberId);$config=SubscriberConfig::normalize($settings['subscriber_browser']);
         if(!$config['push']['enabled']){throw new \DomainException('Browser push is disabled.');}
-        require_once __DIR__.'/BrowserPush.php';$rows=$this->state->read('browser_subscriptions');$results=[];
+        require_once __DIR__.'/BrowserPush.php';BrowserPush::validateEvent($event,$now);$rows=$this->state->read('browser_subscriptions');$results=[];
         foreach($rows as $id=>$row){if(($frozenEndpointIds!==null&&(array_is_list($frozenEndpointIds)?!in_array($id,$frozenEndpointIds,true):!isset($frozenEndpointIds[$id])||!hash_equals($frozenEndpointIds[$id],hash('sha256',json_encode($row['subscription'],JSON_THROW_ON_ERROR)))))||$row['subscriber_id']!==$subscriberId||!$row['enabled']||!hash_equals($row['identity'],SubscriberConfig::identity($person))){continue;}
             $claimId=hash('sha256',$id.'|'.($event['event_id']??''));$fingerprint=hash('sha256',json_encode($event,JSON_THROW_ON_ERROR));
             $claim=$this->state->transaction('browser_push_claims',static function(array &$claims)use($claimId,$fingerprint,$now):array{

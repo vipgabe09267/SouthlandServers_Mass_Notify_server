@@ -1,6 +1,9 @@
 <?php
 declare(strict_types=1);
+if (!interface_exists('BMO')) { interface BMO {} }
+if (!function_exists('_')) { function _($value) { return $value; } }
 require __DIR__.'/../slsmassnotifyserver/bin/sls_mass_notify/sls_announcement_jobs.php';
+require_once __DIR__.'/../slsmassnotifyserver/Slsmassnotifyserver.class.php';
 function webhookCheck(bool $ok, string $message): void { if (!$ok) { throw new RuntimeException($message); } }
 $old = ['state'=>'failed','failure_category'=>'channel_submission_failed','success'=>false,
     'receipts'=>[['channel'=>'webhook','target'=>'hook_one','state'=>'uncertain','retryable'=>false,'detail'=>'Webhook: delivery_unconfirmed']]];
@@ -29,4 +32,25 @@ $workerFailure = array_replace($old,['failure_category'=>'worker_runtime_failed'
 webhookCheck(SlsAnnouncementJobStore::deliveryProjection($workerFailure)['state']==='failed', 'Worker failure was treated as an unconfirmed webhook.');
 $accepted = ['channel'=>'webhook','state'=>'accepted','http_status'=>204];
 webhookCheck(!SlsAnnouncementJobStore::receiptNeedsAttention($accepted), 'Accepted webhook required a human receipt.');
+$module = (new ReflectionClass(FreePBX\modules\Slsmassnotifyserver::class))->newInstanceWithoutConstructor();
+$merge = (new ReflectionClass(FreePBX\modules\Slsmassnotifyserver::class))->getMethod('mergeWebhookDestinationSecrets');
+$merge->setAccessible(true);
+$existing = [[
+    'id'=>'hook_one','name'=>'Hook one','enabled'=>'1','url'=>'https://alerts.example.com/notify',
+    'payload_format'=>'native','bearer_token'=>'old-token','signing_secret'=>'old-secret',
+]];
+$incoming = [[
+    'id'=>'hook_one','name'=>'Hook one','enabled'=>'1','url'=>'https://alerts.example.com/notify',
+    'payload_format'=>'native','bearer_token'=>'0','signing_secret'=>'0',
+]];
+$merged = $merge->invoke($module, $incoming, $existing, 'announcement');
+webhookCheck(($merged[0]['bearer_token']??null)==='0' && ($merged[0]['signing_secret']??null)==='0',
+    'Printable literal-zero webhook secrets were mistaken for blank redacted fields.');
+$retryable = (new ReflectionClass(FreePBX\modules\Slsmassnotifyserver::class))->getMethod('webhookResultRetryable');
+$retryable->setAccessible(true);
+webhookCheck($retryable->invoke($module, ['retryable'=>true]) === true, 'Explicit retryable webhook failure was discarded.');
+webhookCheck($retryable->invoke($module, ['retryable'=>false]) === false, 'Permanent webhook failure became retryable.');
+foreach ([[], ['retryable'=>'true'], ['retryable'=>1], ['retryable'=>null]] as $malformed) {
+    webhookCheck($retryable->invoke($module, $malformed) === false, 'Malformed webhook retry evidence became replayable.');
+}
 echo "Webhook accepted/unconfirmed/HTTP failure projections, channel isolation and immutable history passed.\n";

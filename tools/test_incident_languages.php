@@ -16,7 +16,7 @@ $voice='voice_'.str_repeat('a',24);$email='email_'.str_repeat('b',24);$sms='sms_
 $template=IncidentConfig::template(['id'=>'tpl_'.str_repeat('a',24),'name'=>'Reviewed evacuation','title'=>'Leave {{location}}','message'=>'Leave {{location}} safely.',
     'fields'=>[['key'=>'location','label'=>'Affected location']],'severity'=>'critical',
     'delivery'=>['extensions'=>['1000','1001','1002'],'desktop_clients'=>['english','spanish','japanese'],'voice_recipient_ids'=>[$voice],
-        'email_recipient_ids'=>[$email],'sms_recipient_ids'=>[$sms],'webhook_ids'=>['whole-site'],'audio_mode'=>'tts'],
+        'email_recipient_ids'=>[$email],'sms_recipient_ids'=>[$sms],'webhook_ids'=>['whole-site'],'browser_recipient_ids'=>['sub_'.str_repeat('d',24)],'connector_ids'=>['conn_'.str_repeat('e',24)],'audio_mode'=>'tts'],
     'roster'=>[['id'=>'person_spanish','name'=>'Spanish reader','desktop_username'=>'spanish']],
     'language_variants'=>[
         ['locale'=>'es','label'=>'Spanish','title'=>'Salga de {{location}}','message'=>'Salga de {{location}}.','review_note'=>'Fixture reviewed wording','reviewed'=>true],
@@ -26,10 +26,11 @@ $template=IncidentConfig::template(['id'=>'tpl_'.str_repeat('a',24),'name'=>'Rev
 $preferences=[['channel'=>'extensions','recipient_id'=>'1001','locale'=>'es'],['channel'=>'extensions','recipient_id'=>'1002','locale'=>'fr'],
     ['channel'=>'desktop_clients','recipient_id'=>'spanish','locale'=>'es'],['channel'=>'desktop_clients','recipient_id'=>'japanese','locale'=>'ja'],
     ['channel'=>'voice_recipient_ids','recipient_id'=>$voice,'locale'=>'es'],['channel'=>'email_recipient_ids','recipient_id'=>$email,'locale'=>'es'],
-    ['channel'=>'sms_recipient_ids','recipient_id'=>$sms,'locale'=>'es'],['channel'=>'webhook_ids','recipient_id'=>'whole-site','locale'=>'it']];
+    ['channel'=>'sms_recipient_ids','recipient_id'=>$sms,'locale'=>'es'],['channel'=>'webhook_ids','recipient_id'=>'whole-site','locale'=>'it'],
+    ['channel'=>'browser_recipient_ids','recipient_id'=>'sub_'.str_repeat('d',24),'locale'=>'es'],['channel'=>'connector_ids','recipient_id'=>'conn_'.str_repeat('e',24),'locale'=>'ja']];
 $freeze=static function(array $delivery,string $locale=''):array{
     $delivery['_identities']=[];
-    foreach(IncidentLanguages::CHANNELS as$key){foreach($delivery[$key]as$id)$delivery['_identities'][$key][$id]=hash('sha256',$id);}
+    foreach(['desktop_clients','voice_recipient_ids','email_recipient_ids','sms_recipient_ids','webhook_ids','browser_recipient_ids','connector_ids']as$key){foreach($delivery[$key]as$id)$delivery['_identities'][$key][$id]=hash('sha256',$id);}
     if(in_array($delivery['audio_mode'],['tts','tones_tts'],true))$delivery['_speech']=['locale'=>$locale,'path'=>'fixture:'.($locale ?: 'en'),'external_path'=>'fixture:'.($locale ?: 'en')];
     return $delivery;
 };
@@ -75,6 +76,17 @@ $start=['template_id'=>$template['id'],'request_id'=>$request(1),'fields'=>['loc
 $incident=$service->start($start,$actor);$id=$incident['id'];language_check(count($sent)===4&&$incident['operations'][$request(1)]['state']==='queued','Language cohort jobs were not grouped in one accepted operation.');
 language_check(count(array_unique(array_column(array_column($sent,'context'),'expires_at')))===1,'Language expiry changed between publications.');
 language_check(array_column(array_column($sent,'context'),'sequence')===[1,1,1,1],'Language cohorts became unrelated incident operations.');
+$originalOperation=$store->read($id)['operations'][$request(1)];$gapContext=$sent[2]['context'];
+$gapProof=['delivery'=>$sent[2]['delivery'],'message'=>$sent[2]['message'],'title'=>$sent[2]['title'],'actor'=>$sent[2]['actor']];
+$store->transaction($id,static function(array $record)use($request):array{
+    $operation=&$record['operations'][$request(1)];$operation['state']='submitting';
+    $operation['language_jobs'][0]['state']='queued';$operation['language_jobs'][0]['job_id']='job_'.str_repeat('a',32);
+    $operation['language_jobs'][1]['state']='not_submitted';$operation['language_jobs'][1]['job_id']='';
+    $operation['language_jobs'][2]['state']='submitting';$operation['language_jobs'][2]['job_id']='';
+    return $record;
+});
+language_check(!$fixture->scope($gapContext,$gapProof),'A later language batch bypassed cooldown with an unqueued earlier batch.');
+$store->transaction($id,static function(array $record)use($request,$originalOperation):array{$record['operations'][$request(1)]=$originalOperation;return $record;});
 $service->start($start,$actor);language_check(count($sent)===4,'Duplicate start resent language jobs.');
 $read=$service->get($id);foreach($read['operations'][$request(1)]['language_jobs']as$batch)language_check(isset($batch['delivery_result']),'A language cohort lost its own receipt result.');
 $preferences=[];$template['language_variants'][0]['message']='Changed {{location}}';$now++;
@@ -91,10 +103,21 @@ language_check(count($sent)===$before+2,'Unknown result did not stop later cohor
 $mode='normal';$now++;$complete=$service->update($id,['request_id'=>$request(4),'kind'=>'all_clear','message'=>'All clear.'],$actor);language_check($complete['state']==='closed','All accepted language jobs did not close explicit all-clear.');
 $page=$service->report($id);language_check(!$page['complete']&&$page['next_job_offset']!==null,'Language receipt pagination was not bounded.');$next=$service->report($id,$page['next_job_offset'],$page['revision']);language_check($next['complete'],'Language report lost later child jobs.');
 
+$preferences=[];$mode='approval';$now++;$normalBefore=count($sent);
+$normal=$service->start(array_replace($start,['request_id'=>$request(9)]),$actor);$normalOperation=$normal['operations'][$request(9)];$normalSend=$sent[$normalBefore];
+$normalReview=['incident_context'=>$normalSend['context'],'_enterprise_approval'=>['id'=>$normalOperation['review_id']]];
+language_check($fixture->maySubmit($normalReview),'Current ordinary incident approval was fenced.');
+$store->transaction($normal['id'],static function(array $record)use($request):array{$record['operations'][$request(9)]['state']='not_submitted';return $record;});
+language_check(!$fixture->maySubmit($normalReview),'A stale ordinary incident approval passed the pre-delivery incident check.');
+
 $preferences=[['channel'=>'extensions','recipient_id'=>'1001','locale'=>'es']];$mode='normal';$now++;$other=$service->start(array_replace($start,['request_id'=>$request(10)]),$actor);
 $mode='approval';$now++;$before=count($sent);$approved=$service->update($other['id'],['request_id'=>$request(11),'kind'=>'all_clear','message'=>'Reviewed all-clear.'],$actor);
 language_check($approved['state']==='open'&&$approved['operations'][$request(11)]['state']==='awaiting_approval','Language approvals closed the incident before review.');
 $reviews=array_slice($sent,$before);
+$pendingCount=IncidentStore::pendingApprovalCount($store->read($other['id']));language_check($pendingCount===count($reviews),'Pending approval capacity did not match frozen cohorts.');
+$store->transaction($other['id'],static function(array $record)use($pendingCount):array{$event=end($record['timeline']);$event['kind']='capacity_fixture';while(count($record['timeline'])+$pendingCount<4000){$record['timeline'][]=$event;}return $record;});
+language_reject(fn()=>$service->respond($other['id'],['request_id'=>$request(12),'person_id'=>'person_spanish','response'=>'safe'],$actor));
+language_check(IncidentStore::pendingApprovalCount($store->read($other['id']))===$pendingCount,'Human response consumed reserved approval linkage capacity.');
 foreach($reviews as$index=>$row){$saved=$store->read($other['id'])['operations'][$request(11)]['language_jobs'][$index];$review=['incident_context'=>$row['context'],'_enterprise_approval'=>['id'=>$saved['review_id']]];
     language_check($fixture->maySubmit($review),'Current reviewed language batch was fenced.');
     $expired=$review;$expired['incident_context']['expires_at']='2020-01-01T00:00:00+00:00';language_check(!$fixture->maySubmit($expired),'Expired approval was allowed to extend an incident deadline.');
@@ -112,7 +135,7 @@ class LanguageApprovalController extends LanguageScopeFixture {
     use \FreePBX\modules\SlsEnterpriseOperations;
     public const PLUGIN_DATA_DIR=LANGUAGE_CONTROLLER_DATA;
     public \SLS\MassNotify\EnterpriseApprovalService $reviews;
-    public array $settings=[];public int $deliveries=0;private $announcementAdmissionLock;
+    public array $settings=[];public int $deliveries=0;public array $deliveryResult=['success'=>true,'job_id'=>'job_ffffffffffffffffffffffffffffffff'];private $announcementAdmissionLock;
     public function currentOperator():array{return ['id'=>'recovery_admin','username'=>'alice','operator_role'=>'administrator','audience'=>['unrestricted'=>true]];}
     public function getActiveSettings():array{return $this->settings;}
     protected function enterpriseApprovalService():\SLS\MassNotify\EnterpriseApprovalService{return $this->reviews;}
@@ -120,7 +143,7 @@ class LanguageApprovalController extends LanguageScopeFixture {
     private function acquireAnnouncementActivityLock(...$arguments){return fopen('php://temp','w+b');}
     private function releaseNativeBackupFileLock($handle):void{if(is_resource($handle))fclose($handle);}
     private function withOperator(array $principal,callable $work):array{return $work();}
-    private function deliverResolvedAnnouncement(array $request):array{$this->deliveries++;return ['success'=>true,'job_id'=>'job_'.str_repeat('f',32)];}
+    private function deliverResolvedAnnouncement(array $request):array{$this->deliveries++;return $this->deliveryResult;}
 }
 $mode='approval';$before=count($sent);$pending=$service->start(array_replace($start,['request_id'=>$request(100)]),$actor);$rows=array_slice($sent,$before);
 $controller=new LanguageApprovalController();$controller->store=$store;
@@ -139,4 +162,12 @@ foreach(array_slice($rows,0,2)as$index=>$row){
     language_check($index===0 ? isset($result['job_id']) : ($result['delivery_started']??null)===false,'Review controller did not honor the frozen language deadline.');
 }
 language_check($controller->deliveries===1&&$store->read($pending['id'])['state']==='open','Expired approval reached the delivery adapter or closed an incident.');
+$preferences=[];$mode='approval';$before=count($sent);$generic=$service->start(array_replace($start,['request_id'=>$request(200)]),$actor);$row=$sent[$before];
+$genericRequest=['incident_context'=>$row['context'],'phones'=>$row['delivery']['extensions'],'message'=>$row['message'],'title'=>$row['title']];
+$genericReview=$controller->reviews->request($controller->settings,$genericRequest,'pbx:sender');
+$controller->reviews->approve($genericReview['review_id'],$controller->settings,'pbx:alice',static fn():bool=>true);
+$controller->reviews->approve($genericReview['review_id'],$controller->settings,'pbx:bob',static fn():bool=>true);
+$store->transaction($generic['id'],static function(array $record)use($request,$genericReview):array{$record['operations'][$request(200)]['review_id']=$genericReview['review_id'];return $record;});
+$controller->deliveryResult=['success'=>true,'job_id'=>'job_invalid'];$controller->actEnterpriseApproval('submit',$genericReview['review_id']);
+$genericState=$store->read($generic['id'])['operations'][$request(200)];language_check($genericState['state']==='uncertain'&&$genericState['job_id']==='','Malformed reviewed job identity was accepted as durable delivery.');
 echo "Incident language routing, immutable batches, receipts, scoped cooldown and approval tests passed.\n";

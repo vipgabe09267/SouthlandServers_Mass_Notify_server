@@ -1,5 +1,9 @@
 # 0.1.6-beta readiness review
 
+> **Historical evidence:** This October 2026 record applies only to
+> `0.1.6-beta` and is superseded. It does not qualify the `0.1.7-beta` candidate.
+> See [Qualification matrix](QUALIFICATION_MATRIX.md) for current requirements.
+
 This is the corrected 0.1.6-beta prerelease. Source validation uses disposable
 mount, process and network namespaces;
 production credentials, Asterisk sockets and notification routes are excluded.
@@ -16,7 +20,7 @@ production credentials, Asterisk sockets and notification routes are excluded.
 | Scheduling | Named A/B and weekly programmes, exclusions and date substitutions; timezone validation; saved snapshots; bounded calendar and recording editors. |
 | Labs | Browser push encryption, immutable endpoint consent, scoped ntfy/Gotify sends, reviewed language cohorts, OAuth lifecycle, directory deactivation review, archived journals and replay fences, timed-door checks and local CAP Test/Exercise validation. |
 | UI | Real Chromium checks at desktop/mobile widths, operator sign-in/MFA, safety acknowledgment, directory review, browser key generation and incident-language editing. |
-| Permission recovery | Recognized legacy0644 files and root-owned central settings recovered through root-only no-follow descriptors; missing settings mutex created after configuration validation; ciphertext/key/inode preservation, hostile-link rejection, native FreePBX chown fixtures and actual shell-to-keeper lease checks. Collector readiness is checked before worker guards. |
+| Permission recovery | Recognized legacy mode `0644` files and root-owned central settings recovered through root-only no-follow descriptors; missing settings mutex created after configuration validation; ciphertext/key/inode preservation, hostile-link rejection, native FreePBX chown fixtures and actual shell-to-keeper lease checks. Collector readiness is checked before worker guards. |
 | Mail | Shared durable quotas, bounded local queue admission, pre-submission fault fencing and Weather mail uncertainty protection. Synthetic large-backlog, timeout, corrupt-state and concurrent-reservation tests use no real MTA. |
 | Cron | Fixed authenticated job commands, bounded private diagnostics, process-group cleanup and silent outer cron entries. Exact install/restore/trust checks preserve unrelated jobs. |
 | Uninstall | Included offline command; retained publisher helper authentication without the operational installer dependency, worker drain before teardown, active phone refusal, captured AMI cleanup identity, default history preservation, stopped-PBX handling and exact approved teardown retries. Cron failures cannot erase unrelated jobs. |
@@ -104,6 +108,6 @@ not constitute publication or qualification on other PBXs.
 
 ## Withdrawn first prerelease
 
-The October 10 prerelease was withdrawn after a separate PBX exposed a legacy permission failure before activation. The replacement qualifies authenticated mode0644 recovery, preservation of file contents and lock inodes, native FreePBX chown/startup exclusion, collector health before worker pause, interrupted preflight recovery and rollback/retry in isolated fixtures. The first local install did not cover that legacy state.
+The October 10 prerelease was withdrawn after a separate PBX exposed a legacy permission failure before activation. Its replacement qualified authenticated mode `0644` recovery, preservation of file contents and lock inodes, native FreePBX chown/startup exclusion, collector health before worker pause, interrupted preflight recovery and rollback/retry in isolated fixtures. The first local install did not cover that legacy state.
 
 Two hosted CI fixtures also failed: a hardware test used host Framework metadata, and the image lacked the pinned native voicemail module. The fixtures are corrected locally. The replacement passed 281 isolated release suites and a signed local installation, including 830 deployed-file comparisons, 15 doctor checks and eight live beta-warning page/view checks. Hosted CI is verified separately during publication; local passing fixtures do not establish its result or qualify other PBX environments.

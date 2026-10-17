@@ -91,6 +91,7 @@ final class EnterpriseOperationsConfig
         return $v;
     }
     public static function actor($value): string { return IncidentConfig::identifier($value,'/^(?:pbx:[A-Za-z0-9_.@-]{1,80}|api_[a-f0-9]{24})$/D','Authorized person'); }
+    public static function requester($value): string { return IncidentConfig::identifier($value,'/^(?:pbx:[A-Za-z0-9_.@-]{1,80}|api_[a-f0-9]{24}|worker:[A-Za-z0-9_.@-]{1,80})$/D','Approval requester'); }
     private static function selectors($value,string $pattern,int $limit,string $label): array
     {
         $rows=IncidentConfig::listOf($value,$limit,$label);foreach($rows as $row){IncidentConfig::identifier($row,$pattern,$label);}
@@ -99,8 +100,10 @@ final class EnterpriseOperationsConfig
     private static function actors($value): array { $rows=IncidentConfig::listOf($value,100,'Authorized people');foreach($rows as $row){self::actor($row);}if(count(array_unique($rows))!==count($rows)){throw new \InvalidArgumentException('Authorized people must be unique.');}return $rows; }
     public static function timestamp($value,string $label): string
     {
-        if (!is_string($value) || !preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/D',$value)) { throw new \InvalidArgumentException($label.' requires a timezone-aware timestamp.'); }
-        $date=new \DateTimeImmutable($value);$errors=\DateTimeImmutable::getLastErrors();if($errors && ($errors['warning_count']||$errors['error_count'])){throw new \InvalidArgumentException($label.' is invalid.');}return $date->format('c');
+        if (!is_string($value) || !preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-](?:(?:0[0-9]|1[0-3]):[0-5][0-9]|14:00))$/D',$value)) { throw new \InvalidArgumentException($label.' requires a timezone-aware timestamp.'); }
+        try{$date=new \DateTimeImmutable($value);}
+        catch(\Throwable $error){throw new \InvalidArgumentException($label.' is invalid.',0,$error);}
+        $errors=\DateTimeImmutable::getLastErrors();if($errors && ($errors['warning_count']||$errors['error_count'])){throw new \InvalidArgumentException($label.' is invalid.');}return $date->format('c');
     }
     public static function activeShift(array $settings,string $template,int $now): ?array
     {

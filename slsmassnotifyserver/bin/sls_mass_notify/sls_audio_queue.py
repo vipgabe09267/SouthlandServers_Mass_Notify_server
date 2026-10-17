@@ -110,10 +110,15 @@ def claim_ticket(ticket, directory=DATA, now=None, latest_start_tick=None):
 
 
 def wait_for_slot(recipients, duration, sound, priority='normal', latest_start=None):
+    wait_deadline=time.monotonic()+MAX_WAIT
     latest_start_tick = None if latest_start is None else time.monotonic() + max(0, latest_start - time.time())
     ticket = request_ticket(recipients, duration, sound, priority, latest_start=latest_start)
     try:
-        while not claim_ticket(ticket, latest_start_tick=latest_start_tick):
+        while True:
+            if time.monotonic()>=wait_deadline:
+                raise RuntimeError('Paging queue wait expired; no audio was submitted')
+            if claim_ticket(ticket, latest_start_tick=latest_start_tick):
+                break
             # No lock is held during the wait. Active playback is never displaced.
             time.sleep(0.25)
         return time.time()

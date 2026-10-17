@@ -45,10 +45,10 @@ TTS announcements and external carrier voicemail are unchanged.
 3. Add **Approved external caller numbers**, one per line, including `+` and the
    country code. For example, `+15125550123`. Save a group PIN, even if internal
    callers do not need one. Each group supports up to 100 approved numbers.
-4. Save. Selected IVRs receive the paging code. For a single-key entry, select
-   **SLS external paging · group PIN
-   required** as the desired key destination. Then Apply Config. No existing IVR
-   or inbound route is changed automatically.
+4. Save and Apply Config. SLS adds the exact paging extension to each selected
+   IVR's generated dialplan context; it does not change the IVR database row or
+   create a general inbound-route/from-trunk entry. For a single-key entry, select
+   **SLS external paging · group PIN required** as that key's destination.
 
 The allowlist contains **calling phone numbers**, such as a cell phone, rather
 than the inbound DID that reaches the PBX. An empty list grants no external access.

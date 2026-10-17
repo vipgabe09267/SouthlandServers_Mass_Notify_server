@@ -2,10 +2,10 @@
 	<rawname>slsmassnotifyserver</rawname>
 	<repo>custom</repo>
 	<name>Southland Servers Mass Notifications Server</name>
-	<version>0.1.6-beta</version>
+	<version>0.1.7-beta</version>
 	<publisher>Southland Servers</publisher>
 	<license>AGPLv3+</license>
-	<licenselink>http://www.gnu.org/licenses/agpl-3.0.txt</licenselink>
+	<licenselink>https://www.gnu.org/licenses/agpl-3.0.txt</licenselink>
 	<candisable>yes</candisable>
 	<canuninstall>yes</canuninstall>
 	<category>User Panel Z</category>

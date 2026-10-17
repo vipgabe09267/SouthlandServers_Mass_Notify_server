@@ -52,7 +52,7 @@ if (strpos($updateScript, '[ "$GITHUB_UPDATES_ENABLED" = "1" ] || [ "$MANUAL_UPD
 
 foreach ([
 	'write_update_progress "checking" "Checking the verified release feed."',
-	'SLS_MASS_NOTIFY_MANUAL_UPDATE=1 /usr/bin/timeout 1800',
+		'SLS_MASS_NOTIFY_MANUAL_UPDATE=1 /usr/bin/timeout --signal=TERM --kill-after=30 1800',
 	'write_update_progress "failed"',
 ] as $required) {
 	if (strpos($maintenanceScript, $required) === false) {

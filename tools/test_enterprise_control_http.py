@@ -9,7 +9,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 isolated = (os.environ.get('SLS_TEST_NAMESPACE') == 'entered'
-            and os.environ.get('SLS_TEST_PARENT_NET_NS') not in (None, os.readlink('/proc/self/ns/net')))
+            and os.environ.get('SLS_TEST_PARENT_NET_NS') not in (None, '', os.readlink('/proc/self/ns/net')))
 if not isolated:
     raise SystemExit('Use tools/run_isolated_tests.sh; no HTTP listener was started.')
 spec = importlib.util.spec_from_file_location('enterprise_api_http_helper', ROOT / 'tools/test_api_security.py')

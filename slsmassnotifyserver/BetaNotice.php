@@ -9,7 +9,13 @@ final class BetaNotice
     public const DELAY_SECONDS = 5;
     public const MAX_RECEIPTS = 1024;
 
-    public static function revision(): string { return hash('sha256', '0.1.6-beta\n' . self::TITLE . "\n" . self::BODY); }
+    private const LEGACY_REVISIONS = [
+        'ff40a241032168da33d496200653eced9f5d91b1481ccc0b0127d1854bf0c4da',
+        'eaa61c4dc612b50633cc9c64972a47edb8db2a5f00a1f2653b670e7f6336ba9d',
+    ];
+
+    // Release numbers and wording edits do not reset per-administrator acceptance.
+    public static function revision(): string { return hash('sha256', 'sls-mass-notify-beta-warning-v1'); }
     public static function defaults(): array { return ['schema' => 1, 'receipt' => null, 'receipts' => []]; }
     private static function validActor($actor): bool
     {
@@ -63,14 +69,17 @@ final class BetaNotice
     {
         if (!self::validActor($actor)) { throw new \DomainException('An authenticated FreePBX administrator identity is required.'); }
         $receipt = self::normalize($settings['beta_notice'] ?? [])['receipts'][self::actorKey($actor)] ?? null;
-        return $receipt !== null && hash_equals(self::revision(), $receipt['revision']) && $receipt['accepted_at'] <= time();
+        return $receipt !== null && $receipt['accepted_at'] <= time()
+            && (hash_equals(self::revision(), $receipt['revision']) || in_array($receipt['revision'], self::LEGACY_REVISIONS, true));
     }
     public static function begin(array &$session, string $actor, string $sessionId, ?int $now = null, ?int $monotonic = null): array
     {
         if ($sessionId === '' || !self::validActor($actor)) { throw new \DomainException('An authenticated FreePBX administrator session is required.'); }
+        $now ??= time(); $monotonic ??= hrtime(true);
+        if ($now < 1 || $monotonic < 0) { throw new \DomainException('The warning clock is unavailable. Reload the page before agreeing.'); }
         $nonce = bin2hex(random_bytes(32));
         $session['_sls_beta_notice'] = ['nonce' => $nonce, 'actor' => $actor, 'session' => hash('sha256', $sessionId),
-            'issued_at' => $now ?? time(), 'monotonic' => $monotonic ?? hrtime(true), 'revision' => self::revision()];
+            'issued_at' => $now, 'monotonic' => $monotonic, 'revision' => self::revision()];
         return ['challenge' => $nonce, 'delay_seconds' => self::DELAY_SECONDS];
     }
     public static function accept(array &$session, array $input, string $actor, string $sessionId, ?int $now = null, ?int $monotonic = null): array
@@ -81,7 +90,15 @@ final class BetaNotice
         }
         $now ??= time(); $monotonic ??= hrtime(true);
         $challenge = $session['_sls_beta_notice'] ?? null;
-        if (!is_array($challenge) || $sessionId === '' || !self::validActor($actor) || !hash_equals($challenge['nonce'], $input['challenge'])
+        if (!is_array($challenge) || array_is_list($challenge) || count($challenge) !== 6
+            || array_diff(array_keys($challenge), ['nonce', 'actor', 'session', 'issued_at', 'monotonic', 'revision'])
+            || !is_string($challenge['nonce'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $challenge['nonce'])
+            || !self::validActor($challenge['actor'] ?? null)
+            || !is_string($challenge['session'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $challenge['session'])
+            || !is_int($challenge['issued_at'] ?? null) || $challenge['issued_at'] < 1
+            || !is_int($challenge['monotonic'] ?? null) || $challenge['monotonic'] < 0
+            || !is_string($challenge['revision'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $challenge['revision'])
+            || $now < 1 || $monotonic < 0 || $sessionId === '' || !self::validActor($actor) || !hash_equals($challenge['nonce'], $input['challenge'])
             || !hash_equals($challenge['actor'], $actor) || !hash_equals($challenge['session'], hash('sha256', $sessionId))
             || !hash_equals($challenge['revision'], self::revision()) || $now < $challenge['issued_at']
             || $now - $challenge['issued_at'] > 600 || $monotonic < $challenge['monotonic']) {

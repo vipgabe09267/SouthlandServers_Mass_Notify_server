@@ -4,7 +4,18 @@ require __DIR__.'/../slsmassnotifyserver/EnterpriseIntegrationsProvider.php';
 require __DIR__.'/../slsmassnotifyserver/EnterpriseDeliveryConnector.php';
 use SLS\MassNotify\{EnterpriseIntegrationsConfig as Config,EnterpriseIntegrationsProvider as Provider,EnterpriseDeliveryConnector as Connector};
 function check(bool $ok,string $why):void{if(!$ok)throw new RuntimeException($why);}
-function rejects(callable $call):void{try{$call();}catch(Throwable $expected){return;}throw new RuntimeException('Expected disabled or unsafe provider rejection');}
+function rejects(callable $call):void
+{
+    try {
+        $call();
+    } catch (DomainException | InvalidArgumentException | RuntimeException $expected) {
+        if ($expected->getMessage() !== '') { return; }
+        throw new RuntimeException('Provider rejection did not include a diagnostic.', 0, $expected);
+    } catch (Throwable $unexpected) {
+        throw new RuntimeException('Provider safeguard raised an unexpected exception.', 0, $unexpected);
+    }
+    throw new RuntimeException('Expected disabled or unsafe provider rejection');
+}
 class LifecycleProviderFixture extends Provider
 {
  public array $calls=[];public array $replies=[];
@@ -27,5 +38,10 @@ $access=array_replace($config['access_control'],['enabled'=>'1','origin'=>'https
 $door=['id'=>'door_'.str_repeat('d',24),'token'=>'door-token','allow_access'=>true,'maximum_access_seconds'=>10];
 $provider->replies=[['status'=>200,'error'=>0,'body'=>'{"Door":[{"token":"door-token","AccessTime":"PT7S"}]}'],['status'=>200,'error'=>0,'body'=>'{}']];$before=count($provider->calls);$receipt=$provider->door($access,$door,'access');check($receipt['state']==='accepted'&&count($provider->calls)===$before+2,'Device-timed access rejected valid timer');check(json_decode(end($provider->calls)['body'],true)===['tdc:AccessDoor'=>['Token'=>'door-token']],'Timed access used a delayed PBX unlock task');
 foreach(['{"Door":[{"token":"door-token","AccessTime":"PT11S"}]}','{"Door":[{"token":"other","AccessTime":"PT5S"}]}','{"Door":[{"token":"door-token","AccessTime":"PT5S"},{"token":"door-token","AccessTime":"PT5S"}]}','{"Door":[{"token":"door-token","AccessTime":"PT0S"}]}'] as $body){$provider->replies=[['status'=>200,'error'=>0,'body'=>$body]];$before=count($provider->calls);rejects(fn()=>$provider->door($access,$door,'access'));check(count($provider->calls)===$before+1,'Unsafe timer caused door actuation');}
-foreach(['ntfy','gotify'] as $brand){$destination=['id'=>'conn_'.str_repeat('e',24),'name'=>'Fixture connector','provider'=>$brand,'enabled'=>'1','origin'=>'https://notify.example.test','pinned_ipv4'=>'192.168.1.30','token'=>'fixture-secret','topic'=>$brand==='ntfy'?'fixture-topic':''];$calls=[];$transport=static function($url,$body,$headers,$target)use(&$calls):array{$calls[]=compact('url','body','headers','target');return ['status'=>200,'error'=>0,'body'=>'{"id":42}'];};$receipt=Connector::send($destination,['title'=>'Fixture','message'=>'Read the message','is_test'=>true],$transport);check($receipt['state']==='accepted'&&!str_contains(json_encode($receipt),'fixture-secret'),'Connector acceptance or redaction failed');$call=$calls[0];check(!str_contains($call['url'],'fixture-secret'),'Connector token placed in URL');$body=json_decode($call['body'],true);check($body['title']==='TEST · Fixture','Test status missing');check($brand==='ntfy'?$body['topic']==='fixture-topic'&&in_array('Authorization: Bearer fixture-secret',$call['headers'],true):str_ends_with($call['url'],'/message')&&in_array('X-Gotify-Key: fixture-secret',$call['headers'],true),'Connector provider wire contract incorrect');$destination['pinned_ipv4']='127.0.0.1';rejects(fn()=>Connector::send($destination,['title'=>'Fixture','message'=>'Message','is_test'=>false],$transport));}
+foreach(['ntfy','gotify'] as $brand){$destination=['id'=>'conn_'.str_repeat('e',24),'name'=>'Fixture connector','provider'=>$brand,'enabled'=>'1','origin'=>'https://notify.example.test','pinned_ipv4'=>'192.168.1.30','token'=>'fixture-secret','topic'=>$brand==='ntfy'?'fixture-topic':''];$calls=[];$transport=static function($url,$body,$headers,$target)use(&$calls):array{$calls[]=compact('url','body','headers','target');return ['status'=>200,'error'=>0,'body'=>$target['provider']==='ntfy'?'{"id":"Abc123xyZ9"}':'{"id":42}'];};$receipt=Connector::send($destination,['title'=>'Fixture','message'=>'Read the message','is_test'=>true],$transport);check($receipt['state']==='accepted'&&!str_contains(json_encode($receipt),'fixture-secret'),'Connector acceptance or redaction failed');$call=$calls[0];check(!str_contains($call['url'],'fixture-secret'),'Connector token placed in URL');$body=json_decode($call['body'],true);check($body['title']==='TEST · Fixture','Test status missing');check($brand==='ntfy'?$body['topic']==='fixture-topic'&&in_array('Authorization: Bearer fixture-secret',$call['headers'],true):str_ends_with($call['url'],'/message')&&in_array('X-Gotify-Key: fixture-secret',$call['headers'],true),'Connector provider wire contract incorrect');$destination['pinned_ipv4']='127.0.0.1';rejects(fn()=>Connector::send($destination,['title'=>'Fixture','message'=>'Message','is_test'=>false],$transport));}
+foreach(['ntfy'=>['{"id":""}','{"id":"short"}','{"id":"Abc123xyZ-"}','{"id":42}','{"id":"Abc123xyZ9\\u0001"}'],
+         'gotify'=>['{"id":0}','{"id":-1}','{"id":"42"}','{"id":""}','{"id":"bad\\u0001"}']] as $brand=>$bodies){
+ $destination=['id'=>'conn_'.str_repeat('f',24),'name'=>'Receipt fixture','provider'=>$brand,'enabled'=>'1','origin'=>'https://notify.example.test','pinned_ipv4'=>'192.168.1.31','token'=>'fixture-secret','topic'=>$brand==='ntfy'?'fixture-topic':''];
+ foreach($bodies as $body){$receipt=Connector::send($destination,['title'=>'Fixture','message'=>'Message','is_test'=>false],static fn()=>['status'=>200,'error'=>0,'body'=>$body]);check($receipt['state']==='uncertain','Noncanonical '.$brand.' receipt identity was accepted');}
+}
 echo "Provider lifecycle: three OAuth refresh contracts, rotation, expiry, redaction, disabled state, device relock timers and ntfy/Gotify authenticated publication passed.\n";

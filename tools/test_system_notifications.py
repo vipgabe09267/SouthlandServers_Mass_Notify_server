@@ -121,6 +121,14 @@ group_status = {
 group_faults = MODULE.collect_faults(group_status, {}, {}, {})
 if len(group_faults) != MODULE.MAX_XWEATHER_GROUP_FAULTS:
     fail("the protected Lightning-area fault cap was not enforced")
+try:
+    MODULE.collect_faults({"xweather_groups": {"area_one!": {
+        "last_xweather_poll_status": "fault", "last_xweather_poll_message": "fixture",
+    }}}, {}, {}, {})
+except RuntimeError:
+    pass
+else:
+    fail("a malformed Lightning-area identity was rewritten into a notification channel")
 
 multi_area_faults = MODULE.collect_faults(
     {
@@ -171,6 +179,19 @@ assert set(faults) == {"lightning_group_north_external"}
 external_status["last_xweather_external_status"] = "complete"
 external_status["xweather_groups"]["north"]["last_xweather_external_status"] = "complete"
 assert MODULE.collect_faults(external_status, {}, {}, {}) == {}
+
+security_audit_health = MODULE.collect_health_faults(
+    {"checked_at": "2030-01-15T08:00:00+00:00", "ok": True},
+    {"checked_at": 1894694400, "free_bytes": 1024,
+     "security_audit_at_capacity": True, "security_audit_fault_active": False,
+     "security_audit_forwarding_active": True},
+    now=1894694400,
+)
+if set(security_audit_health) != {"storage"}:
+    fail("security-audit capacity and forwarding failures did not produce a storage-health fault")
+security_message = security_audit_health["storage"]["message"]
+if "operator security audit" not in security_message or "Audit forwarding" not in security_message:
+    fail("security-audit storage fault omitted its actionable capacity or forwarding detail")
 
 with tempfile.TemporaryDirectory(prefix="sls-system-email-status-") as directory:
     status_path = Path(directory) / "status.json"

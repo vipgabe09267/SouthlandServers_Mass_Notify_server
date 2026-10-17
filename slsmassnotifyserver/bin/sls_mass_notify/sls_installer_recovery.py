@@ -57,6 +57,7 @@ MAX_FILES = 100000
 MAX_FILE = 128 * 1024 * 1024
 MAX_TOTAL = 2 * 1024 * 1024 * 1024
 MAX_MANIFEST = 32 * 1024 * 1024
+MAX_POSIX_ID = (1 << 32) - 2
 CRON_MARKERS = ('/usr/local/bin/sls_mass_notify/', '/usr/local/sbin/sign_sls_mass_notify_local_sig.sh',
                 '/var/www/html/admin/modules/slsmassnotifyserver/', 'SLS_Mass_Notifications_Plugin')
 USER_CRON_JOB = re.compile(rb'(?:^|[\s/])(?:sls_mass_notify_(?:weather_poll|nws_poll|schedule_worker|announcement_worker|update|maintenance)\.(?:sh|php)|sls_cron_runner\.py|nws_weather_alert\.sh|nwsalerts_ensure_menu_patch\.sh)(?=$|[\s\"\'])')
@@ -70,7 +71,10 @@ def fingerprint(s):
     return (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_nlink)
 
 def root_file(path):
-    return path.startswith(RUNTIME + '/') or path == RUNTIME or path.startswith(TRUST + '/') or path.startswith('/usr/local/sbin/') or path.startswith('/etc/systemd/') or path.startswith('/etc/apache2/') or path.startswith('/etc/logrotate.')
+    return (path.startswith(RUNTIME + '/') or path == RUNTIME or path.startswith(TRUST + '/')
+            or path in ('/usr/local/bin/slsconsole', '/usr/local/bin/piper')
+            or path.startswith('/usr/local/sbin/') or path.startswith('/etc/systemd/')
+            or path.startswith('/etc/apache2/') or path.startswith('/etc/logrotate.'))
 
 def safe_piper_link(path, target):
     relative=path.removeprefix(RUNTIME+'/piper/')
@@ -78,14 +82,33 @@ def safe_piper_link(path, target):
     return (relative=='venv/lib64' and target=='lib') or (bool(re.fullmatch(r'venv/bin/python(?:3(?:\.[0-9]{1,2})?)?',relative)) and bool(re.fullmatch(r'(?:/usr/bin/)?python3(?:\.[0-9]{1,2})?',target)))
 
 def allowed(path):
-    if not isinstance(path,str) or str(Path(path)) != path or '..' in Path(path).parts or any(ord(c)<32 for c in path): return False
+    if not isinstance(path,str) or str(Path(path)) != path or '..' in Path(path).parts or any(ord(c)<32 or ord(c)==127 for c in path): return False
+    try:
+        if len(path.encode('utf-8', errors='strict')) > 4096: return False
+    except UnicodeEncodeError: return False
     return path in FIXED or path in LINKS or any(path == p or path.startswith(p + '/') for p in TREES)
+
+def strict_json(raw):
+    def pairs(values):
+        result={}
+        for key,value in values:
+            if key in result: raise RecoveryError('Duplicate member in recovery JSON')
+            result[key]=value
+        return result
+    def invalid_number(_value): raise RecoveryError('Non-integer number in recovery JSON')
+    try:
+        text=raw.decode('utf-8',errors='strict') if isinstance(raw,bytes) else raw
+        return json.loads(text,object_pairs_hook=pairs,parse_float=invalid_number,parse_constant=invalid_number)
+    except (json.JSONDecodeError,UnicodeDecodeError,RecursionError) as error:
+        raise RecoveryError('Invalid recovery JSON') from error
 
 class Recovery:
     def __init__(self, snapshot, prefix='/', cron=None, command=None, user_cron=None, approval=None):
         self.snapshot=Path(snapshot)
         self.prefix=Path(prefix)
-        self.uid=pwd.getpwnam('asterisk').pw_uid
+        account=pwd.getpwnam('asterisk')
+        self.uid=account.pw_uid
+        self.gid=account.pw_gid
         self.cron=cron or self.system_cron
         self.user_cron=user_cron or (lambda body=None: self.system_cron(body,user='asterisk'))
         self.command=command or self.system_command
@@ -95,9 +118,12 @@ class Recovery:
 
     @staticmethod
     def directory(path, protected=False, create=False):
+        path = Path(path)
+        if not path.is_absolute():
+            raise RecoveryError('Descriptor walk path must be absolute')
         fd=os.open('/', os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
         try:
-            for part in Path(path).parts[1:]:
+            for part in path.parts[1:]:
                 if create:
                     try: os.mkdir(part, 0o755, dir_fd=fd)
                     except FileExistsError: pass
@@ -112,6 +138,17 @@ class Recovery:
             if fd>=0: os.close(fd)
 
     def dest(self,path): return self.prefix.joinpath(*Path(path).parts[1:])
+
+    def static_mode_allowed(self,path,uid,gid,mode):
+        if mode & 0o002:
+            return False
+        if not mode & 0o020:
+            return True
+        # FreePBX chown uses 0775/0664 for its Asterisk-managed web/config
+        # files. These snapshots never authorize root execution. Root runtime,
+        # signing/trust files and the Piper compatibility tree stay private.
+        return (uid in (0,self.uid) and gid == self.gid and not root_file(path)
+                and path != COMPAT and not path.startswith(COMPAT+'/'))
 
     @staticmethod
     def read_at(parent,name,limit,protected=False):
@@ -135,16 +172,16 @@ class Recovery:
     @staticmethod
     def write_at(parent,name,body,mode=0o600,uid=0,gid=0):
         temp='.sls-recovery-'+uuid.uuid4().hex
-        fd=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600,dir_fd=parent)
         try:
-            view=memoryview(body)
-            while view:
-                n=os.write(fd,view)
-                if n<=0: raise RecoveryError('Short recovery write')
-                view=view[n:]
-            os.fchown(fd,uid,gid); os.fchmod(fd,mode); os.fsync(fd)
-        finally: os.close(fd)
-        try:
+            fd=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600,dir_fd=parent)
+            try:
+                view=memoryview(body)
+                while view:
+                    n=os.write(fd,view)
+                    if n<=0: raise RecoveryError('Short recovery write')
+                    view=view[n:]
+                os.fchown(fd,uid,gid); os.fchmod(fd,mode); os.fsync(fd)
+            finally: os.close(fd)
             os.replace(temp,name,src_dir_fd=parent,dst_dir_fd=parent); os.fsync(parent)
         finally:
             try: os.unlink(temp,dir_fd=parent)
@@ -209,6 +246,11 @@ class Recovery:
                 raise RecoveryError('Collector service has administrator overrides. Review those overrides before installation; rollback cannot safely discard them.')
         return {'ok': True, 'service_state': state, 'rollback_supported': True}
 
+    def preflight_inventory(self):
+        records={};self.total=0
+        for path in (*TREES,*FIXED,*LINKS):self.inspect(path,records=records)
+        return {'ok':True,'read_only':True,'static_entries':len(records),'static_bytes':self.total}
+
     def restore_services(self):
         self.verify()
         state=self.load()['service_state']
@@ -248,8 +290,11 @@ class Recovery:
             except FileNotFoundError:
                 if records is not None: records[path]={'kind':'absent'}
                 return
-            if s.st_uid not in (0,self.uid) or (root_file(path) and (s.st_uid!=0 or (not stat.S_ISLNK(s.st_mode) and s.st_mode&0o022))):
-                raise RecoveryError('Untrusted ownership/mode in static inventory: '+path)
+            if (s.st_uid not in (0,self.uid) or not 0 <= s.st_gid <= MAX_POSIX_ID
+                    or (not stat.S_ISLNK(s.st_mode) and not self.static_mode_allowed(path,s.st_uid,s.st_gid,s.st_mode))
+                    or (root_file(path) and s.st_uid!=0)):
+                raise RecoveryError('Untrusted ownership/mode in static inventory: '+path
+                                    +f' (uid={s.st_uid}, gid={s.st_gid}, mode={stat.S_IMODE(s.st_mode):04o})')
             if path not in TREES and s.st_dev!=os.fstat(parent).st_dev: raise RecoveryError('Mounted child in static inventory: '+path)
             entry={'uid':s.st_uid,'gid':s.st_gid,'mode':stat.S_IMODE(s.st_mode)}
             if s.st_mode&0o7000: raise RecoveryError('Special permissions in static inventory: '+path)
@@ -329,7 +374,7 @@ class Recovery:
                         approval_parent=self.directory(self.approval.parent,protected=True)
                         try: raw,_=self.read_at(approval_parent,self.approval.name,MAX_MANIFEST,True)
                         finally: os.close(approval_parent)
-                        approval=json.loads(raw)
+                        approval=strict_json(raw)
                         self.validate_activation_approval(approval,records,cron)
                         manifest['previous_activation_approval']=approval
                     self.write_at(stagefd,'manifest.json',json.dumps(manifest,sort_keys=True,separators=(',',':')).encode())
@@ -346,10 +391,17 @@ class Recovery:
         try:
             if stat.S_IMODE(os.fstat(fd).st_mode)!=0o700: raise RecoveryError('Snapshot must remain root-only')
             raw,_=self.read_at(fd,'manifest.json',MAX_MANIFEST,True)
-            manifest=json.loads(raw)
+            manifest=strict_json(raw)
+            if not isinstance(manifest,dict): raise RecoveryError('Invalid static manifest')
             records=manifest.get('records')
             self.valid_service_state(manifest.get('service_state'))
-            if manifest.get('schema')!=1 or not isinstance(records,dict) or len(records)>MAX_FILES: raise RecoveryError('Invalid static manifest')
+            expected_manifest={'schema','records','cron_sha256','user_cron_sha256','automatic_activation_safe','service_state'}
+            if 'previous_activation_approval' in manifest: expected_manifest.add('previous_activation_approval')
+            if (set(manifest)!=expected_manifest or type(manifest.get('schema')) is not int or manifest['schema']!=1
+                    or manifest.get('automatic_activation_safe') is not False or not isinstance(records,dict) or len(records)>MAX_FILES
+                    or not re.fullmatch('[a-f0-9]{64}',str(manifest.get('cron_sha256','')))
+                    or not re.fullmatch('[a-f0-9]{64}',str(manifest.get('user_cron_sha256','')))):
+                raise RecoveryError('Invalid static manifest')
             if not all(p in records for p in (*TREES,*FIXED,*LINKS)): raise RecoveryError('Incomplete fixed inventory')
             blobs=os.open('blobs',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd)
             try:
@@ -358,18 +410,27 @@ class Recovery:
                 total=0
                 for path,entry in records.items():
                     if not allowed(path) or not isinstance(entry,dict) or entry.get('kind') not in ('absent','file','dir','link'): raise RecoveryError('Invalid recovery entry')
+                    expected={'absent':{'kind'},'dir':{'kind','uid','gid','mode'},'file':{'kind','uid','gid','mode','sha256','size'},'link':{'kind','uid','gid','mode','target'}}[entry['kind']]
+                    if set(entry)!=expected: raise RecoveryError('Unexpected recovery entry members')
                     if entry['kind']=='absent': continue
-                    if entry.get('uid') not in (0,self.uid) or type(entry.get('gid')) is not int or entry['gid']<0 or type(entry.get('mode')) is not int or entry['mode']&~0o777:
+                    if (type(entry.get('uid')) is not int or entry['uid'] not in (0,self.uid)
+                            or type(entry.get('gid')) is not int or not 0 <= entry['gid'] <= MAX_POSIX_ID
+                            or type(entry.get('mode')) is not int or entry['mode']<0 or entry['mode']&~0o777):
                         raise RecoveryError('Invalid recovery ownership/mode')
-                    if root_file(path) and (entry['uid']!=0 or (entry['kind']!='link' and entry['mode']&0o022)): raise RecoveryError('Unsafe root runtime record')
+                    if entry['kind']!='link' and not self.static_mode_allowed(path,entry['uid'],entry['gid'],entry['mode']):
+                        raise RecoveryError('Writable static recovery record')
+                    if root_file(path) and entry['uid']!=0: raise RecoveryError('Unsafe root runtime record')
                     if entry['kind']=='file':
                         digest=entry.get('sha256','')
-                        if not isinstance(digest,str) or not re.fullmatch('[a-f0-9]{64}',digest): raise RecoveryError('Invalid blob identity')
+                        if (not isinstance(digest,str) or not re.fullmatch('[a-f0-9]{64}',digest)
+                                or type(entry.get('size')) is not int or entry['size']<0 or entry['size']>MAX_FILE): raise RecoveryError('Invalid blob identity')
                         body,_=self.read_at(blobs,digest,MAX_FILE,True); total+=len(body)
                         if total>MAX_TOTAL or len(body)!=entry.get('size') or hashlib.sha256(body).hexdigest()!=digest: raise RecoveryError('Recovery blob verification failed')
                     if entry['kind']=='link':
                         target=entry.get('target')
-                        if not isinstance(target,str) or not target or len(target)>4096 or any(ord(c)<32 for c in target): raise RecoveryError('Invalid recovery link')
+                        try: target_bytes=target.encode('utf-8',errors='strict') if isinstance(target,str) else b''
+                        except UnicodeEncodeError: target_bytes=b''
+                        if not target_bytes or len(target_bytes)>4096 or any(ord(c)<32 or ord(c)==127 for c in target): raise RecoveryError('Invalid recovery link')
                         if path in LINKS:
                             if target!=LINKS[path]: raise RecoveryError('Invalid fixed recovery link')
                         elif path == COMPAT + '/bin/piper' and target == '/usr/local/bin/piper': pass
@@ -387,6 +448,8 @@ class Recovery:
         finally: os.close(fd)
 
     def remove(self,path):
+        self.removed+=1
+        if self.removed>MAX_FILES: raise RecoveryError('Static removal exceeds entry bound')
         target=self.dest(path)
         try: parent=self.directory(target.parent,protected=root_file(path))
         except FileNotFoundError: return
@@ -395,7 +458,9 @@ class Recovery:
             except FileNotFoundError: return
             if stat.S_ISDIR(s.st_mode):
                 child=os.open(target.name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
-                try: names=os.listdir(child)
+                try:
+                    names=os.listdir(child)
+                    if len(names)>MAX_FILES: raise RecoveryError('Static removal directory exceeds entry bound')
                 finally: os.close(child)
                 for name in names: self.remove(path+'/'+name)
                 os.rmdir(target.name,dir_fd=parent)
@@ -413,7 +478,7 @@ class Recovery:
 
     @staticmethod
     def validate_activation_approval(approval, records, cron):
-        if (not isinstance(approval,dict) or approval.get('schema')!=1
+        if (not isinstance(approval,dict) or type(approval.get('schema')) is not int or approval['schema']!=1
                 or approval.get('source') not in ('publisher-verified-previous-release','fresh-install')
                 or not isinstance(approval.get('files'),dict) or not isinstance(approval.get('root_jobs'),list)):
             raise RecoveryError('Missing or invalid prior execution approval; maintenance remains unchanged')
@@ -480,58 +545,71 @@ class Recovery:
         current={}; self.total=0
         for path in (*TREES,*FIXED,*LINKS): self.inspect(path,records=current)
         snapfd=self.directory(self.snapshot,protected=True)
-        blobs=os.open('blobs',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=snapfd)
         try:
-            # Do not revive legacy root PHP/module bootstrap jobs. Preserve current
-            # unrelated jobs, including administrator changes made during upgrade.
-            current_cron=self.cron()
-            safe=b'\n'.join(line for line in current_cron.splitlines() if not any(marker.encode() in line for marker in CRON_MARKERS))
-            safe=(safe+b'\n') if safe else b''
-            if safe!=current_cron: self.cron(safe)
-            try: os.unlink('maintenance-restored.json',dir_fd=snapfd)
-            except FileNotFoundError: pass
-            os.fsync(snapfd)
-            self.restore_user_jobs(disable=True)
-            self.write_at(snapfd,'restore-started.json',b'{"automatic_activation_safe":false,"state":"restoring"}')
-            for path in sorted(current,key=lambda p:(p.count('/'),p),reverse=True):
-                if current[path]['kind']!='absent' and (path not in records or records[path]['kind']=='absent' or records[path]['kind']!=current[path]['kind']): self.remove(path)
-            for path,entry in sorted(records.items(),key=lambda item:(item[0].count('/'),item[0])):
-                kind=entry['kind']
-                if kind=='absent': continue
-                target=self.dest(path); parent=self.directory(target.parent,protected=root_file(path),create=True)
-                try:
-                    if kind=='dir':
-                        try: os.mkdir(target.name,entry['mode'],dir_fd=parent)
-                        except FileExistsError: pass
-                        child=os.open(target.name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
-                        try: os.fchown(child,entry['uid'],entry['gid']); os.fchmod(child,entry['mode']); os.fsync(child)
-                        finally: os.close(child)
-                    elif kind=='file':
-                        body,_=self.read_at(blobs,entry['sha256'],MAX_FILE,True)
-                        if hashlib.sha256(body).hexdigest()!=entry['sha256']: raise RecoveryError('Recovery blob changed')
-                        self.write_at(parent,target.name,body,entry['mode'],entry['uid'],entry['gid'])
-                    else:
-                        try: old=os.stat(target.name,dir_fd=parent,follow_symlinks=False)
-                        except FileNotFoundError: old=None
-                        if old is not None:
-                            if not stat.S_ISLNK(old.st_mode): raise RecoveryError('Link destination changed during restore')
-                            os.unlink(target.name,dir_fd=parent)
-                        os.symlink(entry['target'],target.name,dir_fd=parent)
-                        os.chown(target.name,entry['uid'],entry['gid'],dir_fd=parent,follow_symlinks=False)
-                    os.fsync(parent)
-                finally: os.close(parent)
-            self.restore_user_jobs()
-            self.verify()
-            report={'ok':True,'automatic_activation_safe':False,'sls_root_jobs_disabled':True,
-                    'message':'Static files restored. Admit an authenticated prior release before enabling SLS root jobs or activating its services.'}
-            self.write_at(snapfd,'restore-result.json',json.dumps(report,sort_keys=True).encode())
-            return report
-        finally: os.close(blobs); os.close(snapfd)
+            blobs=os.open('blobs',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=snapfd)
+            try:
+                # Do not revive legacy root PHP/module bootstrap jobs. Preserve current
+                # unrelated jobs, including administrator changes made during upgrade.
+                current_cron=self.cron()
+                safe=b'\n'.join(line for line in current_cron.splitlines() if not any(marker.encode() in line for marker in CRON_MARKERS))
+                safe=(safe+b'\n') if safe else b''
+                if safe!=current_cron: self.cron(safe)
+                try: os.unlink('maintenance-restored.json',dir_fd=snapfd)
+                except FileNotFoundError: pass
+                os.fsync(snapfd)
+                self.restore_user_jobs(disable=True)
+                self.write_at(snapfd,'restore-started.json',b'{"automatic_activation_safe":false,"state":"restoring"}')
+                self.removed=0
+                for path in sorted(current,key=lambda p:(p.count('/'),p),reverse=True):
+                    if current[path]['kind']!='absent' and (path not in records or records[path]['kind']=='absent' or records[path]['kind']!=current[path]['kind']): self.remove(path)
+                for path,entry in sorted(records.items(),key=lambda item:(item[0].count('/'),item[0])):
+                    kind=entry['kind']
+                    if kind=='absent': continue
+                    target=self.dest(path); parent=self.directory(target.parent,protected=root_file(path),create=True)
+                    try:
+                        if kind=='dir':
+                            try: os.mkdir(target.name,entry['mode'],dir_fd=parent)
+                            except FileExistsError: pass
+                            child=os.open(target.name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+                            try: os.fchown(child,entry['uid'],entry['gid']); os.fchmod(child,entry['mode']); os.fsync(child)
+                            finally: os.close(child)
+                        elif kind=='file':
+                            body,_=self.read_at(blobs,entry['sha256'],MAX_FILE,True)
+                            if hashlib.sha256(body).hexdigest()!=entry['sha256']: raise RecoveryError('Recovery blob changed')
+                            self.write_at(parent,target.name,body,entry['mode'],entry['uid'],entry['gid'])
+                        else:
+                            try: old=os.stat(target.name,dir_fd=parent,follow_symlinks=False)
+                            except FileNotFoundError: old=None
+                            if old is not None:
+                                if not stat.S_ISLNK(old.st_mode): raise RecoveryError('Link destination changed during restore')
+                                os.unlink(target.name,dir_fd=parent)
+                            os.symlink(entry['target'],target.name,dir_fd=parent)
+                            os.chown(target.name,entry['uid'],entry['gid'],dir_fd=parent,follow_symlinks=False)
+                        os.fsync(parent)
+                    finally: os.close(parent)
+                # Re-inventory restored code before any scheduled SLS process can
+                # run it. The final verification below also checks the restored
+                # Asterisk schedule after it is enabled.
+                self.verify_static(manifest)
+                self.restore_user_jobs()
+                self.verify()
+                report={'ok':True,'automatic_activation_safe':False,'sls_root_jobs_disabled':True,
+                        'message':'Static files restored. Admit an authenticated prior release before enabling SLS root jobs or activating its services.'}
+                self.write_at(snapfd,'restore-result.json',json.dumps(report,sort_keys=True).encode())
+                return report
+            finally: os.close(blobs)
+        finally: os.close(snapfd)
 
-    def verify(self):
-        manifest=self.load(); current={}; self.total=0
+    def verify_static(self,manifest=None):
+        manifest=self.load() if manifest is None else manifest
+        current={}; self.total=0
         for path in (*TREES,*FIXED,*LINKS): self.inspect(path,records=current)
         if current!=manifest['records']: raise RecoveryError('Restored static inventory differs from original snapshot')
+        return {'ok':True,'restored_static_verified':True}
+
+    def verify(self):
+        manifest=self.load()
+        self.verify_static(manifest)
         if [line for line in self.user_cron().splitlines() if sls_user_job(line)]!=self.original_user_jobs():
             raise RecoveryError('Restored SLS user jobs differ from their original schedule')
         jobs=[line.decode('ascii') for line in self.cron().splitlines() if any(marker.encode() in line for marker in CRON_MARKERS)]
@@ -550,7 +628,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--snapshot',required=True)
     parser.add_argument('--approval',help='root-protected previous execution approval established before mutation')
-    parser.add_argument('action',choices=('snapshot','restore','verify','service-state','restore-services','restore-maintenance','preflight-services'))
+    parser.add_argument('action',choices=('snapshot','restore','verify','service-state','restore-services','restore-maintenance','preflight-services','preflight-inventory'))
     args=parser.parse_args()
     if os.geteuid()!=0: raise RecoveryError('Static recovery requires root')
     # Do not load sibling Python or installed PHP. Installer must authenticate

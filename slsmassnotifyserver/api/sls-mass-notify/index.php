@@ -32,6 +32,7 @@ if (($_GET['sls_installer_runtime'] ?? '') === '1'
     header('Cache-Control: no-store');
     header('X-Content-Type-Options: nosniff');
     echo json_encode(['probe' => 'sls_served_php_v1', 'ok' => !$missing, 'missing' => $missing,
+        'module_version'=>'0.1.7-beta',
         'php_version'=>PHP_VERSION, 'php_sapi'=>PHP_SAPI, 'runtime_account_ok'=>$runtimeAccountOk,
         'extensions'=>$extensions, 'functions'=>$functions]);
     exit;
@@ -77,6 +78,15 @@ const CONTROL_API_MAX_ACTION_BODY_BYTES = 65536;
 
 function respond(int $code, array $payload): void
 {
+    if (isset($GLOBALS['sls_control_audit_context']) && is_array($GLOBALS['sls_control_audit_context'])) {
+        $GLOBALS['sls_control_audit_context']['status'] = $code;
+        $GLOBALS['sls_control_audit_context']['ok'] = ($payload['ok'] ?? false) === true;
+        if (empty($GLOBALS['sls_control_audit_context']['recorded']) && function_exists('audit_control_api')) {
+            audit_control_api((string)($GLOBALS['sls_control_audit_context']['ip'] ?? ''),
+                (string)($GLOBALS['sls_control_audit_context']['action'] ?? 'authenticated_request'),
+                $code, ($payload['ok'] ?? false) === true);
+        }
+    }
     http_response_code($code);
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-store');
@@ -87,6 +97,7 @@ function respond(int $code, array $payload): void
 
 function config(): array
 {
+    if (!isset($GLOBALS['sls_preauth_lease'])) { $GLOBALS['sls_preauth_lease']=control_preauth_admission(); }
     try { return \FreePBX\modules\SlsConfigCrypto::readFile(CONFIG_FILE); }
     catch (Throwable $error) { respond(503, ['ok' => false, 'error' => 'config_unavailable']); }
 }
@@ -95,7 +106,8 @@ function request_header_value(string $name): string
 {
     $serverKey = 'HTTP_' . strtoupper(str_replace('-', '_', $name));
     foreach ([$serverKey, 'REDIRECT_' . $serverKey] as $key) {
-        $value = trim((string)($_SERVER[$key] ?? ''));
+        $raw = $_SERVER[$key] ?? '';
+        $value = is_string($raw) && strlen($raw) <= 8192 ? trim($raw) : '';
         if ($value !== '') {
             return $value;
         }
@@ -109,8 +121,8 @@ function request_header_value(string $name): string
             continue;
         }
         foreach ($headers as $key => $value) {
-            if (strcasecmp((string)$key, $name) === 0) {
-                return trim((string)$value);
+            if (is_string($key) && strcasecmp($key, $name) === 0) {
+                return is_string($value) && strlen($value) <= 8192 ? trim($value) : '';
             }
         }
     }
@@ -126,6 +138,29 @@ function provided_key(): string
     return request_header_value('X-API-Key');
 }
 
+function control_audit_helper_safe(string $path): bool
+{
+    clearstatcache(true, $path);
+    $file = @lstat($path);
+    $resolved = realpath($path);
+    $parentPath = dirname($path);
+    $parent = @lstat($parentPath);
+    $parentResolved = realpath($parentPath);
+    $owners = [0];
+    $temporaryRoot = realpath(sys_get_temp_dir());
+    if (PHP_SAPI === 'cli' && is_string($temporaryRoot) && is_string($resolved)
+        && str_starts_with($resolved, rtrim($temporaryRoot, '/') . '/')) {
+        $owners[] = posix_geteuid();
+    }
+    return is_array($file) && is_string($resolved) && $resolved === $path
+        && ($file['mode'] & 0170000) === 0100000 && $file['nlink'] === 1
+        && !($file['mode'] & 0022) && in_array($file['uid'], $owners, true)
+        && $file['size'] > 0 && $file['size'] <= 2097152
+        && is_array($parent) && is_string($parentResolved) && $parentResolved === $parentPath
+        && ($parent['mode'] & 0170000) === 0040000 && !($parent['mode'] & 0022)
+        && in_array($parent['uid'], $owners, true);
+}
+
 function client_ip(): string
 {
     return (string)($GLOBALS['sls_request_network']['ip'] ?? trim((string)($_SERVER['REMOTE_ADDR'] ?? '')));
@@ -137,7 +172,9 @@ function decode_control_request(string $raw): array
         return ['status' => 413, 'error' => 'request_too_large', 'limit_bytes' => CONTROL_API_MAX_CONFIG_BODY_BYTES,
             'message' => 'The JSON request exceeds 2 MiB. Reduce the configuration payload before retrying.'];
     }
-    $body = json_decode($raw, true, 64);
+    try { $body = \SLS\MassNotify\ApiSecurity::jsonObject($raw); }
+    catch (Throwable $error) { return ['status'=>400, 'error'=>'json_object_required',
+        'message'=>$error instanceof JsonException ? 'Send a valid JSON object.' : $error->getMessage()]; }
     if (!is_array($body) || array_is_list($body)) {
         return ['status' => 400, 'error' => 'json_object_required'];
     }
@@ -180,7 +217,7 @@ function cidr_match(string $ip, string $cidr): bool
         return false;
     }
     [$network, $bits] = explode('/', $cidr, 2);
-    if (!filter_var($network, FILTER_VALIDATE_IP)) {
+    if (!filter_var($network, FILTER_VALIDATE_IP) || !preg_match('/^[0-9]{1,3}$/D', $bits)) {
         return false;
     }
     $bits = (int)$bits;
@@ -210,13 +247,16 @@ function ip_allowed(array $control, string $ip): bool
     if (empty($control['ip_allowlist_enabled'])) {
         return true;
     }
+    $source = filter_var($ip, FILTER_VALIDATE_IP) ? @inet_pton($ip) : false;
+    if (!is_string($source)) { return false; }
     $items = preg_split('/[\r\n,]+/', (string)($control['ip_allowlist'] ?? '')) ?: [];
     foreach ($items as $item) {
         $item = trim($item);
         if ($item === '') {
             continue;
         }
-        if (hash_equals($item, $ip) || cidr_match($ip, $item)) {
+        $literal = filter_var($item, FILTER_VALIDATE_IP) ? @inet_pton($item) : false;
+        if ((is_string($literal) && is_string($source) && hash_equals($literal, $source)) || cidr_match($ip, $item)) {
             return true;
         }
     }
@@ -242,7 +282,8 @@ function api_state_open(string $path, bool $create = false, bool $exclusive = fa
         if ($handle === false) { throw new RuntimeException('state_open_failed'); }
     } else {
         if (!is_array($before)) { return null; }
-        if (($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1) {
+        if (($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1
+            || ($before['mode'] & 0137) || !in_array($before['uid'], [0, posix_geteuid()], true)) {
             throw new RuntimeException('state_unsafe');
         }
         // Linux opens O_RDWR FIFOs without waiting for another endpoint. A
@@ -255,6 +296,7 @@ function api_state_open(string $path, bool $create = false, bool $exclusive = fa
     $current = @lstat($path);
     if (!is_array($metadata) || !is_array($current)
         || !api_state_metadata_matches($metadata, $current)
+        || ($metadata['mode'] & 0137) || !in_array($metadata['uid'], [0, posix_geteuid()], true)
         || ($before !== false && !api_state_metadata_matches($before, $metadata))) {
         fclose($handle);
         throw new RuntimeException('state_changed_or_unsafe');
@@ -268,8 +310,12 @@ function api_state_parent_matches(string $directory, $handle): bool
     $current = @lstat($directory);
     $opened = fstat($handle);
     return is_array($current) && is_array($opened)
-        && ($current['mode'] & 0170000) === 0040000
-        && $current['dev'] === $opened['dev'] && $current['ino'] === $opened['ino'];
+        && ($current['mode'] & 0170000) === 0040000 && ($opened['mode'] & 0170000) === 0040000
+        && $current['dev'] === $opened['dev'] && $current['ino'] === $opened['ino']
+        && $current['uid'] === $opened['uid'] && $current['gid'] === $opened['gid']
+        && $current['mode'] === $opened['mode']
+        && in_array($current['uid'], [0, posix_geteuid()], true)
+        && ($current['mode'] & 0022) === 0;
 }
 
 function api_state_lock($handle, float $deadline): bool
@@ -301,7 +347,11 @@ function api_state_transaction(string $path, int $maximum, callable $update, int
             $component .= '/' . $part;
             clearstatcache(true, $component);
             $metadata = @lstat($component);
-            if (!is_array($metadata) || ($metadata['mode'] & 0170000) !== 0040000) {
+            $sharedTemporary = is_array($metadata) && $metadata['uid'] === 0
+                && ($metadata['mode'] & 01000) !== 0 && ($metadata['mode'] & 0002) !== 0;
+            if (!is_array($metadata) || ($metadata['mode'] & 0170000) !== 0040000
+                || !in_array($metadata['uid'], [0, posix_geteuid()], true)
+                || (($metadata['mode'] & 0022) !== 0 && !$sharedTemporary)) {
                 throw new RuntimeException('state_directory_unsafe');
             }
         }
@@ -333,8 +383,9 @@ function api_state_transaction(string $path, int $maximum, callable $update, int
             if ($original['size'] > $maximum) { throw new RuntimeException('state_oversized'); }
             $raw = stream_get_contents($legacy, $maximum + 1);
             if (!is_string($raw) || strlen($raw) > $maximum) { throw new RuntimeException('state_oversized'); }
-            $data = json_decode($raw, true, 32);
-            if (!is_array($data) || ($data !== [] && array_is_list($data)) || json_last_error() !== JSON_ERROR_NONE) {
+            try { $data = \SLS\MassNotify\ApiSecurity::jsonObject($raw, true); }
+            catch (Throwable $error) { throw new RuntimeException('state_invalid'); }
+            if (!is_array($data) || ($data !== [] && array_is_list($data))) {
                 throw new RuntimeException('state_invalid');
             }
         }
@@ -397,9 +448,9 @@ function api_rate_entries_valid(array $data, int $maximum, bool $desktop): bool
 {
     if (count($data) > $maximum) { return false; }
     foreach ($data as $key => $entry) {
-        if (!is_string($key) || !preg_match($desktop ? '/^(ok:|failed:)?[a-f0-9]{64}$/' : '/^[a-f0-9]{64}$/', $key)
+        if (!is_string($key) || !preg_match($desktop ? '/^(ok:|failed:)?[a-f0-9]{64}$/D' : '/^[a-f0-9]{64}$/D', $key)
             || !is_array($entry) || !is_string($entry['bucket'] ?? null)
-            || !preg_match('/^[0-9]{12}$/', $entry['bucket'])
+            || !preg_match('/^[0-9]{12}$/D', $entry['bucket'])
             || !is_int($entry['count'] ?? null) || $entry['count'] < 0) {
             return false;
         }
@@ -432,7 +483,32 @@ function control_rate_allowed(array $control, string $ip): bool
 
 function audit_control_api(string $ip, string $action, int $status, bool $ok): void
 {
+    if (isset($GLOBALS['sls_control_audit_context']) && is_array($GLOBALS['sls_control_audit_context'])
+        && isset($GLOBALS['sls_control_principal']['id'])) {
+        $GLOBALS['sls_control_audit_context']['recorded'] = true;
+        $GLOBALS['sls_control_audit_context']['action'] = $action;
+        $GLOBALS['sls_control_audit_context']['status'] = $status;
+        $GLOBALS['sls_control_audit_context']['ok'] = $ok;
+    }
     $action = substr(preg_replace('/[^a-z0-9_.-]+/i', '_', $action) ?: 'unknown', 0, 80);
+    if (!$ok && !isset($GLOBALS['sls_control_principal']['id'])) {
+        // Rejected anonymous traffic must not start one Python process per request.
+        $sample = api_state_transaction(dirname(CONTROL_API_RATE_FILE).'/control-api-rejection-samples.json', 4096,
+            static function (array $rows) use ($action): array {
+                $now=time();
+                foreach ($rows as $key=>$at) {
+                    if (!is_string($key) || !preg_match('/^[a-z0-9_.-]{1,80}$/D',$key) || !is_int($at) || $at>$now+30) {
+                        throw new RuntimeException('state_invalid');
+                    }
+                    if ($now-$at>=60) { unset($rows[$key]); }
+                }
+                if (isset($rows[$action])) { return ['allowed'=>false,'write'=>false,'data'=>$rows]; }
+                if (count($rows)>=32) { return ['allowed'=>false,'write'=>false,'data'=>$rows]; }
+                $rows[$action]=$now;
+                return ['allowed'=>true,'write'=>true,'data'=>$rows];
+            }, 0);
+        if (!$sample) { return; }
+    }
     // Header presence is metadata only. Never copy a key into either journal.
     $credentialsPresent = provided_key() !== '';
     $recordData = [
@@ -450,7 +526,7 @@ function audit_control_api(string $ip, string $action, int $status, bool $ok): v
         $record = json_encode($recordData, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n";
         // PHP's fopen cannot request O_NOFOLLOW/O_NONBLOCK. The existing
         // protected runtime performs descriptor-safe bounded append and fsync.
-        if (function_exists('proc_open') && is_file(CONTROL_API_AUDIT_HELPER)
+        if (function_exists('proc_open') && control_audit_helper_safe(CONTROL_API_AUDIT_HELPER)
             && is_executable('/usr/bin/python3') && is_executable('/usr/bin/timeout')) {
             $command = ['/usr/bin/timeout', '--signal=KILL', '2', '/usr/bin/python3', '-I',
                 CONTROL_API_AUDIT_HELPER, '--append-control-audit'];
@@ -498,11 +574,18 @@ function read_json_file(string $path): array
         $metadata = fstat($handle);
         if ($metadata['size'] > 1048576) { throw new RuntimeException('status_oversized'); }
         $raw = stream_get_contents($handle, 1048577);
-        $value = is_string($raw) && strlen($raw) <= 1048576 ? json_decode($raw, true, 64, JSON_THROW_ON_ERROR) : null;
+        $value = is_string($raw) && strlen($raw) <= 1048576 ? \SLS\MassNotify\ApiSecurity::jsonObject($raw, true) : null;
         if (!is_array($value) || ($value !== [] && array_is_list($value))) { throw new RuntimeException('status_invalid'); }
         clearstatcache(true, $path);
         $current = @lstat($path);
-        if (!is_array($current) || !api_state_metadata_matches($metadata, $current) || $current['size'] !== $metadata['size']) {
+        $after = fstat($handle);
+        foreach (['dev', 'ino', 'uid', 'gid', 'mode', 'nlink', 'size', 'mtime', 'ctime'] as $field) {
+            if (!is_array($current) || !is_array($after) || $metadata[$field] !== $after[$field]
+                || $after[$field] !== $current[$field]) {
+                throw new RuntimeException('status_changed');
+            }
+        }
+        if (!api_state_metadata_matches($metadata, $current)) {
             throw new RuntimeException('status_changed');
         }
         return $value;
@@ -512,6 +595,39 @@ function read_json_file(string $path): array
 function recent_events(int $limit): array
 {
     return \SLS\MassNotify\EventLog::page(EVENTS_FILE, $limit)['events'];
+}
+
+function control_preauth_admission()
+{
+    // Bound configuration, parsing, auditing and authenticated module work.
+    // These permanent lock files carry no grants or recipient data.
+    $slsPreauthLease = null;
+    try {
+        $parent=dirname(CONTROL_API_RATE_FILE); $account=posix_getpwnam('asterisk');
+        if (!is_array($account)) { throw new RuntimeException('runtime_account_missing'); }
+        $component='';
+        foreach (explode('/',trim($parent,'/')) as $part) {
+            $component.='/'.$part; clearstatcache(true,$component); $meta=@lstat($component);
+            $sharedTmp=$part==='tmp' && is_array($meta) && $meta['uid']===0 && ($meta['mode']&01000);
+            if (!$meta || ($meta['mode']&0170000)!==0040000 || (($meta['mode']&0022) && !$sharedTmp)
+                || !in_array($meta['uid'],[0,$account['uid']],true)) { throw new RuntimeException('state_parent_unsafe'); }
+        }
+        for ($slot=0;$slot<4;$slot++) {
+            $handle=api_state_open($parent.'/control-api-preauth-'.$slot.'.lock',true);
+            $meta=fstat($handle);
+        $expectedGroup=posix_geteuid()===0 ? posix_getegid() : $account['gid'];
+        if (!in_array($meta['uid'],[0,$account['uid']],true) || $meta['gid']!==$expectedGroup
+                || ($meta['mode']&07027) || $meta['size']!==0) { fclose($handle); throw new RuntimeException('state_unsafe'); }
+            if (flock($handle,LOCK_EX|LOCK_NB)) { $slsPreauthLease=$handle; break; }
+            fclose($handle);
+        }
+    } catch (Throwable $error) {
+        header('Retry-After: 2'); respond(503,['ok'=>false,'error'=>'preauthentication_storage_unavailable','retryable'=>true]);
+    }
+    if ($slsPreauthLease===null) {
+        header('Retry-After: 1'); respond(429,['ok'=>false,'error'=>'preauthentication_busy','retryable'=>true]);
+    }
+    return $slsPreauthLease;
 }
 
 function freepbx_module()
@@ -585,6 +701,22 @@ if ($principal === null) {
     respond(401, ['ok' => false, 'error' => 'unauthorized']);
 }
 $GLOBALS['sls_control_principal'] = $principal;
+$GLOBALS['sls_control_audit_context'] = [
+    'ip' => $clientIp,
+    'action' => 'authenticated_request',
+    'status' => 500,
+    'ok' => false,
+    'recorded' => false,
+];
+register_shutdown_function(static function (): void {
+    $context = $GLOBALS['sls_control_audit_context'] ?? null;
+    if (!is_array($context) || !empty($context['recorded']) || !isset($GLOBALS['sls_control_principal']['id'])) { return; }
+    audit_control_api((string)($context['ip'] ?? ''), (string)($context['action'] ?? 'authenticated_request'),
+        (int)($context['status'] ?? 500), ($context['ok'] ?? false) === true);
+});
+// Keep admission through the response. PHP closes the request-owned descriptor
+// on exit; authentication cannot release the budget before expensive parsing
+// or FreePBX bootstrap. Desktop streams use their separate admission limits.
 
 function require_permission(string $scope, string $action, bool $unrestricted = false): void
 {
@@ -600,6 +732,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     $query = control_get_resource($_GET);
     if (isset($query['error'])) { audit_control_api($clientIp, 'invalid_query', 400, false); respond(400, ['ok' => false, 'error' => $query['error']]); }
     $resource = $query['resource'];
+    $GLOBALS['sls_control_audit_context']['action'] = 'get_' . $resource;
     require_permission('read', 'get_' . $resource);
     if (in_array($resource, ['enterprise_capabilities','incident_templates'], true)) {
         if (($principal['id'] ?? '') === 'legacy') {
@@ -737,13 +870,18 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     respond(405, ['ok' => false, 'error' => 'method_not_allowed']);
 }
 
-$contentType = strtolower(trim(explode(';', (string)($_SERVER['CONTENT_TYPE'] ?? ''))[0]));
-if ($contentType !== 'application/json') {
+$contentType = $_SERVER['CONTENT_TYPE'] ?? '';
+if (!is_string($contentType) || !preg_match('/^application\/json(?:\s*;|$)/iD', $contentType)) {
     audit_control_api($clientIp, 'unsupported_media_type', 415, false);
     respond(415, ['ok' => false, 'error' => 'content_type_must_be_json']);
 }
 
-$contentLength = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);
+$contentLengthHeader = $_SERVER['CONTENT_LENGTH'] ?? '0';
+if (!is_string($contentLengthHeader) || !preg_match('/^[0-9]{1,10}$/D', $contentLengthHeader)) {
+    audit_control_api($clientIp, 'invalid_content_length', 400, false);
+    respond(400, ['ok' => false, 'error' => 'invalid_content_length']);
+}
+$contentLength = (int)$contentLengthHeader;
 if ($contentLength > CONTROL_API_MAX_CONFIG_BODY_BYTES) {
     audit_control_api($clientIp, 'request_too_large', 413, false);
     respond(413, ['ok' => false, 'error' => 'request_too_large', 'limit_bytes' => CONTROL_API_MAX_CONFIG_BODY_BYTES,
@@ -760,6 +898,7 @@ if (isset($decodedRequest['error'])) {
 $body = $decodedRequest['body'];
 
 $action = strtolower(trim((string)($body['action'] ?? '')));
+$GLOBALS['sls_control_audit_context']['action'] = $action !== '' ? $action : 'unsupported_action';
 $scope = ['retry_announcement' => 'send', 'send_announcement' => 'send', 'preview_announcement' => 'send', 'test_nws' => 'test',
     'trigger_nws_test' => 'test', 'get_config' => 'config', 'update_config' => 'config',
     'start_incident' => 'send', 'update_incident' => 'send', 'incident_roll_call' => 'config', 'incident_checklist' => 'config', 'enterprise_template_start'=>'send'][$action] ?? '';
@@ -791,10 +930,14 @@ if ($action === 'send_announcement' || $action === 'preview_announcement') {
         audit_control_api($clientIp, $action, 400, false);
         respond(400, ['ok' => false, 'error' => 'invalid_announcement_fields', 'message' => $error->getMessage()]);
     }
-    if ((!empty($body['browser_recipient_ids']) || !empty($body['connector_ids']) || !empty($body['options']['browser_recipient_ids']) || !empty($body['options']['connector_ids']))
-        && (($principal['id']??'')==='legacy' || ($principal['audience']['unrestricted']??false)!==true)) {
+    $labsRequest=[];
+    foreach (['browser_recipient_ids','connector_ids'] as $field) {
+        $labsRequest[$field]=array_values(array_unique(array_merge($body[$field] ?? [],$body['options'][$field] ?? [])));
+    }
+    if (array_filter($labsRequest)
+        && (($principal['id']??'')==='legacy' || !\SLS\MassNotify\ApiSecurity::permitsResolvedAnnouncement($principal,$labsRequest,$config))) {
         audit_control_api($clientIp,$action,403,false);
-        respond(403,['ok'=>false,'error'=>'labs_audience_not_permitted','message'=>'Browser and connector delivery requires an unrestricted named sender.']);
+        respond(403,['ok'=>false,'error'=>'labs_audience_not_permitted','message'=>'Browser and connector delivery requires a named sender with explicit permission.']);
     }
 }
 try {
@@ -830,7 +973,8 @@ try {
     }
 
     if ($action === 'retry_announcement') {
-        if (!is_string($body['job_id'] ?? null) || count(array_diff(array_keys($body), ['action', 'job_id'])) > 0) {
+        if (!is_string($body['job_id'] ?? null) || !preg_match('/^job_[a-f0-9]{32}$/D', $body['job_id'])
+            || count(array_diff(array_keys($body), ['action', 'job_id'])) > 0) {
             respond(400, ['ok' => false, 'error' => 'job_id_required']);
         }
         $result = $module->retryFailedAnnouncementJob($body['job_id'], ['trigger_source' => 'Control API']);
@@ -843,7 +987,7 @@ try {
         $idempotencyKey=request_header_value('Idempotency-Key');
         if ($action==='send_announcement' && $idempotencyKey!=='') {
             try {
-                require_once '/var/www/html/admin/modules/slsmassnotifyserver/ControlIdempotency.php';
+                require_once dirname(__DIR__, 2) . '/admin/modules/slsmassnotifyserver/ControlIdempotency.php';
                 $result=(new \SLS\MassNotify\ControlIdempotency('/var/lib/asterisk/SLS_Mass_Notifications_Plugin/control-idempotency'))
                     ->submit($idempotencyKey,$principal,$body,static fn()=> $module->controlApiSendAnnouncement($body),time());
             } catch (InvalidArgumentException $error) {

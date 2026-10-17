@@ -1489,7 +1489,10 @@ class Utils
             throw $e;
         }
 
-        XMLSecEnc::staticLocateKeyInfo($objKey, $objDSig);
+        /* Embedded KeyInfo is untrusted and unnecessary when the caller pins a certificate. */
+        if (empty($cert) && empty($multiCerts)) {
+            XMLSecEnc::staticLocateKeyInfo($objKey, $objDSig);
+        }
 
         if (!empty($multiCerts)) {
             // If multiple certs are provided, I may ignore $cert and

@@ -45,6 +45,17 @@ class ModuleTrust(unittest.TestCase):
     def check(self):
         return TRUST.emit_hashes(self.store, 'dashboard', self.web)
 
+    def test_retained_generation_usage_is_read_only_and_rejects_links(self):
+        before={str(path.relative_to(self.store)):path.read_bytes() for path in self.store.rglob('*') if path.is_file()}
+        report=TRUST.storage_report(self.store)
+        self.assertEqual(report['generation_count'],1)
+        self.assertIs(report['cleanup_performed'],False)
+        self.assertIs(report['generations'][0]['active'],True)
+        self.assertEqual(before,{str(path.relative_to(self.store)):path.read_bytes() for path in self.store.rglob('*') if path.is_file()})
+        generation=self.store/report['generations'][0]['generation']
+        (generation/'unexpected-link').symlink_to('/etc')
+        with self.assertRaises(TRUST.TrustError):TRUST.storage_report(self.store)
+
     def test_expected_inventory_is_the_signature_source(self):
         value = self.check()
         self.assertIn('safe.php = ' + TRUST.digest(self.files['safe.php']), value)

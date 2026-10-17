@@ -5,17 +5,156 @@ import os
 from pathlib import Path
 import pwd
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
+
+if os.environ.get('SLS_TEST_NAMESPACE') != 'entered' or any(
+    os.environ.get('SLS_TEST_PARENT_' + label + '_NS') in
+    (None, '', os.readlink('/proc/self/ns/' + kind))
+    for label, kind in [('MOUNT', 'mnt'), ('NET', 'net'), ('PID', 'pid')]
+):
+    raise SystemExit('Use the private fixture runner; no installed voices were changed.')
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT/'slsmassnotifyserver/bin/sls_mass_notify_install_piper_voices.sh').read_text()
 PREFIX = SOURCE[:SOURCE.index('download_file() {')]
 FUNCTION = re.search(r'^download_file\(\) \{.*?(?=^[a-z_]+\(\) \{|\Z)', SOURCE, re.M|re.S).group(0)
+DIRECTORY_FUNCTION = re.search(r'^ensure_piper_install_directories\(\) \{.*?(?=^[a-z_]+\(\) \{|\Z)', SOURCE, re.M|re.S).group(0)
+CURRENT_FUNCTION = re.search(r'^voice_file_is_current\(\) \{.*?(?=^[a-z_]+\(\) \{|\Z)', SOURCE, re.M|re.S).group(0)
+COMPATIBILITY_FUNCTION = re.search(r'^install_piper_compatibility_path\(\) \{.*?(?=^[a-z_]+\(\) \{|\Z)', SOURCE, re.M|re.S).group(0)
+
+PROMOTION = SOURCE.split('SLS_PIPER_VOICE_SOURCE="$tmp"',1)[1].split("<<'PY' || {\n",1)[1].split('\nPY\n',1)[0]
+VOICE_REPAIR = SOURCE.split('secure_piper_voice_tree() {',1)[1].split("<<'PY'\n",1)[1].split('\nPY\n',1)[0]
 
 
 class VoiceDownload(unittest.TestCase):
+    def test_compatibility_scan_rejects_excess_entries_before_mutation(self):
+        if os.environ.get('SLS_TEST_NAMESPACE') != 'entered': self.fail('Run through the isolation wrapper')
+        result=subprocess.run(['/bin/bash','-c',DIRECTORY_FUNCTION+'\nensure_piper_install_directories'],capture_output=True,text=True,timeout=5)
+        self.assertEqual(result.returncode,0,result.stderr)
+        piper=Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper')
+        if (piper/'venv').exists(): shutil.rmtree(piper/'venv')
+        junk=[]
+        for index in range(128):
+            path=piper/('excess-%03d' % index);path.write_text('preserved');junk.append(path)
+        script='set -euo pipefail\nPIPER_ARTIFACTS_CHANGED=0\n'+COMPATIBILITY_FUNCTION+'\ninstall_piper_compatibility_path\n'
+        result=subprocess.run(['/bin/bash','-c',script],capture_output=True,text=True,timeout=5)
+        self.assertNotEqual(result.returncode,0)
+        self.assertFalse((piper/'venv').exists())
+        self.assertTrue(all(path.read_text()=='preserved' for path in junk))
+        for path in junk:path.unlink()
+
+    def test_compatibility_ownership_repair_is_reported(self):
+        if os.environ.get('SLS_TEST_NAMESPACE') != 'entered': self.fail('Run through the isolation wrapper')
+        result=subprocess.run(['/bin/bash','-c',DIRECTORY_FUNCTION+'\nensure_piper_install_directories'],capture_output=True,text=True,timeout=5)
+        self.assertEqual(result.returncode,0,result.stderr)
+        piper=Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper')
+        binary=piper/'venv/bin';binary.mkdir(parents=True,exist_ok=True)
+        link=binary/'piper';link.unlink(missing_ok=True);link.symlink_to('/usr/local/bin/piper')
+        account=pwd.getpwnam('asterisk');os.chown(link,account.pw_uid,account.pw_gid,follow_symlinks=False)
+        script='set -euo pipefail\nPIPER_ARTIFACTS_CHANGED=0\n'+COMPATIBILITY_FUNCTION+'\ninstall_piper_compatibility_path\necho "$PIPER_ARTIFACTS_CHANGED"\n'
+        result=subprocess.run(['/bin/bash','-c',script],capture_output=True,text=True,timeout=5)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(result.stdout.strip(),'1')
+        self.assertEqual((link.lstat().st_uid,link.lstat().st_gid),(0,0))
+        shutil.rmtree(piper/'venv')
+
+    def test_existing_voice_validation_is_bounded_and_rejects_aliases(self):
+        if os.environ.get('SLS_TEST_NAMESPACE') != 'entered': self.fail('Run through the isolation wrapper')
+        voices=Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices')
+        voices.mkdir(parents=True,exist_ok=True)
+        target=voices/'en_US-lessac-low.onnx.json'
+        body=b'v'*4882
+        digest=hashlib.sha256(body).hexdigest()
+        script=PREFIX+CURRENT_FUNCTION+'\nvoice_file_is_current "$1" "$2" 4882\n'
+        target.unlink(missing_ok=True)
+        result=subprocess.run(['/bin/bash','-c',script,'fixture',str(target),digest],capture_output=True,text=True,timeout=5)
+        self.assertNotEqual(result.returncode,0)
+        self.assertNotIn('Traceback',result.stderr)
+        target.write_bytes(body);target.chmod(0o644)
+        result=subprocess.run(['/bin/bash','-c',script,'fixture',str(target),digest],capture_output=True,text=True,timeout=5)
+        self.assertEqual(result.returncode,0,result.stderr)
+        victim=voices/'voice-victim';victim.write_bytes(body);victim.chmod(0o644)
+        target.unlink();target.symlink_to(victim)
+        result=subprocess.run(['/bin/bash','-c',script,'fixture',str(target),digest],capture_output=True,text=True,timeout=5)
+        self.assertNotEqual(result.returncode,0)
+        target.unlink();os.link(victim,target)
+        result=subprocess.run(['/bin/bash','-c',script,'fixture',str(target),digest],capture_output=True,text=True,timeout=5)
+        self.assertNotEqual(result.returncode,0)
+        target.unlink();target.write_bytes(body+b'x');target.chmod(0o644)
+        result=subprocess.run(['/bin/bash','-c',script,'fixture',str(target),digest],capture_output=True,text=True,timeout=5)
+        self.assertNotEqual(result.returncode,0)
+        target.unlink();victim.unlink()
+
+    def test_install_directory_creation_is_anchored_and_rejects_a_symlinked_data_path(self):
+        if os.environ.get('SLS_TEST_NAMESPACE') != 'entered': self.fail('Run through the isolation wrapper')
+        result = subprocess.run(['/bin/bash', '-c', DIRECTORY_FUNCTION + '\nensure_piper_install_directories'],
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runtime = Path('/usr/local/bin/sls_mass_notify/piper')
+        data_piper = Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper')
+        self.assertTrue(runtime.is_dir() and not runtime.is_symlink())
+        self.assertTrue((data_piper / 'voices').is_dir())
+        held = data_piper.with_name('piper-held')
+        data_piper.rename(held)
+        victim = Path('/tmp/sls-piper-directory-victim')
+        victim.mkdir()
+        sentinel = victim / 'preserved'
+        sentinel.write_text('preserved')
+        data_piper.symlink_to(victim, target_is_directory=True)
+        try:
+            result = subprocess.run(['/bin/bash', '-c', DIRECTORY_FUNCTION + '\nensure_piper_install_directories'],
+                                    capture_output=True, text=True, timeout=5)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(sentinel.read_text(), 'preserved')
+            self.assertFalse((victim / 'voices').exists())
+        finally:
+            data_piper.unlink(missing_ok=True)
+            held.rename(data_piper)
+
+    def test_promotion_rechecks_the_actual_staging_bytes_and_preserves_prior_voice(self):
+        if os.environ.get('SLS_TEST_NAMESPACE') != 'entered': self.fail('Run through the isolation wrapper')
+        with tempfile.TemporaryDirectory(prefix='sls-voice-promotion-') as directory:
+            root=Path(directory)
+            source=root/'staged'
+            body=b'fixture pinned model bytes'
+            source.write_bytes(body);source.chmod(0o600)
+            target=Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices/en_US-lessac-low.onnx')
+            target.parent.mkdir(parents=True,exist_ok=True)
+            target.write_bytes(b'prior voice')
+            environment={**os.environ,'SLS_PIPER_VOICE_SOURCE':str(source),'SLS_PIPER_VOICE_TARGET':str(target),
+                         'SLS_PIPER_VOICE_SHA256':hashlib.sha256(body).hexdigest(),'SLS_PIPER_VOICE_BYTES':str(len(body))}
+            result=subprocess.run(['/usr/bin/python3','-I','-c',PROMOTION],env=environment,capture_output=True,text=True,timeout=5)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(target.read_bytes(),body)
+            account=pwd.getpwnam('asterisk')
+            self.assertEqual(target.stat().st_uid,account.pw_uid)
+            self.assertEqual(target.stat().st_mode&0o777,0o644)
+            # A download changing between verification and promotion must leave
+            # the current voice intact; this test never invokes Piper or curl.
+            source.write_bytes(b'x'*len(body))
+            result=subprocess.run(['/usr/bin/python3','-I','-c',PROMOTION],env=environment,capture_output=True,text=True,timeout=5)
+            self.assertNotEqual(result.returncode,0)
+            self.assertEqual(target.read_bytes(),body)
+            self.assertEqual(list(target.parent.glob('.voice.*')),[])
+
+    def test_regular_voice_permission_repair_is_bounded_and_repeatable(self):
+        if os.environ.get('SLS_TEST_NAMESPACE') != 'entered': self.fail('Run through the isolation wrapper')
+        voices=Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices')
+        voices.mkdir(parents=True,exist_ok=True)
+        target=voices/'en_US-lessac-low.onnx'
+        target.write_bytes(b'private fixture voice');target.chmod(0o600)
+        before=target.read_bytes();inode=target.stat().st_ino
+        environment={**os.environ,'PIPER_VOICE_PERMISSION_ROOT':str(voices)}
+        for unused in range(2):
+            result=subprocess.run(['/usr/bin/python3','-I','-c',VOICE_REPAIR],env=environment,capture_output=True,text=True,timeout=5)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(target.read_bytes(),before)
+            self.assertEqual(target.stat().st_ino,inode)
+            self.assertEqual(target.stat().st_mode&0o777,0o644)
+
     def test_offline_voice_cache_is_hash_checked_and_never_falls_back_to_network(self):
         if os.environ.get('SLS_TEST_NAMESPACE') != 'entered': self.fail('Run through the isolation wrapper')
         with tempfile.TemporaryDirectory() as name:
@@ -72,9 +211,10 @@ if os.environ['FIXTURE_CASE'].startswith('interrupt_'):
             self.addCleanup(target.write_bytes,previous) if previous is not None else self.addCleanup(target.unlink, missing_ok=True)
             target.write_bytes(b'preserved voice')
             for case, success in [('oversize',False),('flood',False),('interrupt_TERM',False),('interrupt_INT',False),('interrupt_HUP',False),('valid',True)]:
-                script = PREFIX+FUNCTION+'\nLOG_FILE="$TMPDIR/log"\nexport FIXTURE_OWNER_PID="$BASHPID"\ndownload_file "$1" "$2" "$3"\n'
+                fixture_function=FUNCTION.replace('/usr/bin/curl',str(curl))
+                script = PREFIX+fixture_function+'\nLOG_FILE="$TMPDIR/log"\nexport FIXTURE_OWNER_PID="$BASHPID"\ndownload_file "$1" "$2" "$3"\n'
                 result = subprocess.run(['bash','-c',script,'fixture','https://fixture.invalid/voice',str(target),hashlib.sha256(body).hexdigest()],
-                    env={**os.environ,'PATH':str(tools)+':/usr/bin:/bin','TMPDIR':name,'FIXTURE_BODY':str(source),'FIXTURE_CASE':case},
+                    env={**os.environ,'FIXTURE_TOOLS':str(tools),'TMPDIR':name,'FIXTURE_BODY':str(source),'FIXTURE_CASE':case},
                     capture_output=True,text=True,timeout=10)
                 self.assertEqual(result.returncode==0,success,case+': '+result.stderr)
                 if case.startswith('interrupt_'):

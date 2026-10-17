@@ -3,6 +3,7 @@
 import configparser
 import importlib.util
 import json
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -29,6 +30,38 @@ def config(directory="/unused"):
 
 
 class DesktopPayloadTests(unittest.TestCase):
+    def test_alert_decoder_rejects_malformed_routing_fields(self):
+        import base64
+        invalid = [
+            {'id': ['not-text'], 'properties': {}},
+            {'id': 'fixture', 'properties': {'event': {'unexpected': True}}},
+            {'id': 'fixture', 'properties': {'references': 'not-a-list'}},
+            {'id': 'fixture', 'properties': {'references': [{'identifier': ['bad']}] }},
+        ]
+        for alert in invalid:
+            encoded = base64.b64encode(json.dumps(alert).encode()).decode()
+            with self.subTest(alert=alert), self.assertRaises(RuntimeError):
+                notify.alert_from_json_b64(encoded)
+
+    def test_publication_preserves_original_enrollment_after_final_boundary(self):
+        with tempfile.TemporaryDirectory(prefix='sls-enrollment-publication-') as directory:
+            path = Path(directory) / 'events.jsonl'
+            settings = config(directory)
+            settings['api'] = {'events_file': str(path)}
+            settings['desktop'] = {'client_ids': json.dumps({'alice': 'replacement-alice', 'bob': 'original-bob', 'carol': 'new-carol'})}
+            record = {'id': 'frozen-event', 'desktop_all': True, 'desktop_recipients': ['alice', 'bob'], 'message': 'Fixture'}
+            original = json.dumps({'alice': 'original-alice', 'bob': 'original-bob'})
+            with mock.patch.dict(os.environ, {'SLS_DESKTOP_CLIENT_IDS_SNAPSHOT': original}):
+                notify.append_sipnotify_event(settings, record)
+            saved = json.loads(path.read_text())
+            self.assertEqual(saved['desktop_client_ids'], {'bob': 'original-bob'})
+            self.assertEqual(saved['desktop_recipients'], ['bob'])
+            self.assertIs(saved['desktop_all'], False)
+            before = path.read_bytes()
+            with mock.patch.dict(os.environ, {'SLS_DESKTOP_CLIENT_IDS_SNAPSHOT': '[]'}), self.assertRaises(OSError):
+                notify.append_sipnotify_event(settings, record)
+            self.assertEqual(path.read_bytes(), before)
+
     def test_only_explicit_boolean_marks_a_test(self):
         for flag in (False, None, "false", "true", 1, True):
             weather = notify.alert_api_record({"id": "live-test-wording", "is_test": True,
@@ -97,6 +130,50 @@ class DesktopPayloadTests(unittest.TestCase):
                     notify.render_announcement_image(config(directory), "Fixture", "Message", desktop=True)
             self.assertEqual(list(Path(directory).iterdir()), [])
 
+    def test_generated_asset_staging_rejects_path_substitution(self):
+        with tempfile.TemporaryDirectory(prefix='sls-media-stage-') as directory:
+            root = Path(directory)
+            victim = root / 'victim'
+            victim.write_text('preserve')
+            _path, directory_fd = notify.generated_asset_directory(root)
+            name = None
+            descriptor = None
+            try:
+                name, descriptor, original = notify.create_generated_stage(directory_fd, '.xml')
+                os.unlink(name, dir_fd=directory_fd)
+                os.symlink(victim.name, name, dir_fd=directory_fd)
+                with self.assertRaisesRegex(OSError, 'changed unexpectedly'):
+                    notify.generated_stage_identity(directory_fd, name, descriptor, original)
+                notify.unlink_generated_stage(directory_fd, name, original)
+                self.assertTrue((root / name).is_symlink())
+                self.assertEqual(victim.read_text(), 'preserve')
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+                os.close(directory_fd)
+
+    def test_rejected_stage_mode_leaves_no_file(self):
+        with tempfile.TemporaryDirectory(prefix='sls-media-mode-') as directory:
+            _path, directory_fd = notify.generated_asset_directory(directory)
+            previous = os.umask(0o777)
+            try:
+                with self.assertRaisesRegex(OSError, 'staging file is unsafe'):
+                    notify.create_generated_stage(directory_fd, '.png')
+            finally:
+                os.umask(previous)
+                os.close(directory_fd)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_hosted_payload_is_private_while_staged_and_published_without_clobber(self):
+        with tempfile.TemporaryDirectory(prefix='sls-media-payload-') as directory:
+            settings = config(directory)
+            url = notify.hosted_phone_payload(settings, '<fixture/>')
+            output = Path(directory) / url.rsplit('/', 1)[-1]
+            self.assertEqual(output.read_text(), '<fixture/>\n')
+            self.assertEqual(output.stat().st_mode & 0o777, 0o644)
+            self.assertEqual(output.stat().st_nlink, 1)
+            self.assertEqual([row.name for row in Path(directory).iterdir() if row.name.startswith('.sls-generated-')], [])
+
     def test_desktop_publication_retains_plain_text_and_phone_xml(self):
         phone_xml = notify.yealink_image_xml("http://pbx.example.test:8080/sls_mass_notify/phone.png")
         desktop_url = "https://pbx.example.test:8443/sls_mass_notify/desktop.png"
@@ -137,13 +214,17 @@ class DesktopPayloadTests(unittest.TestCase):
             self.assertEqual(result.stderr, "")
             return json.loads(result.stdout)
 
-    def test_api_uses_actual_external_https_port_only_for_configured_host(self):
+    def test_configured_https_port_is_preserved_and_unconfigured_port_uses_host(self):
         path = "/sls_mass_notify/announcement_20260920235959_" + "a" * 24 + ".png"
         settings = {"public_pbx_host": "pbx.example.test", "sipnotify": {"base_url": "https://pbx.example.test:9443/api/sipnotify"}}
         event = {"image_url": "http://pbx.example.test:8080" + path, "xml": "phone unchanged", "description": "Full text"}
         for host in ("pbx.example.test:8443", "PBX.EXAMPLE.TEST:8443"):
             result = self.public_payload(settings, event, {"HTTP_HOST": host, "SERVER_PORT": "443", "HTTPS": "on"})
-            self.assertEqual(result, {**event, "image_url": "https://pbx.example.test:8443" + path, "is_test": False})
+            self.assertEqual(result, {**event, "image_url": "https://pbx.example.test:9443" + path, "is_test": False})
+        forwarded = {"public_pbx_host":"pbx.example.test","sipnotify":{"base_url":"https://pbx.example.test:8443/api/sipnotify"}}
+        self.assertEqual(self.public_payload(forwarded,event,{"HTTP_HOST":"pbx.example.test","HTTPS":"on"})['image_url'],"https://pbx.example.test:8443"+path)
+        no_port = {"public_pbx_host":"pbx.example.test","sipnotify":{"base_url":"https://pbx.example.test/api/sipnotify"}}
+        self.assertEqual(self.public_payload(no_port,event,{"HTTP_HOST":"pbx.example.test:8443","HTTPS":"on"})['image_url'],"https://pbx.example.test:8443"+path)
         for host in ("attacker.test:8443", "pbx.example.test:8443\r\nHost: attacker.test", "pbx.example.test:0",
                      "pbx.example.test:65536", "pbx.example.test:8443@attacker.test", ["pbx.example.test:8443"]):
             result = self.public_payload(settings, event, {"HTTP_HOST": host, "HTTP_X_FORWARDED_HOST": "attacker.test:9999"})

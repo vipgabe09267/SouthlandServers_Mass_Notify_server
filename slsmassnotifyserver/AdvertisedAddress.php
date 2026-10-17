@@ -14,6 +14,17 @@ final class SlsAdvertisedAddress
         if (preg_match('/^[0-9.]+$/D', $host) && !filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
             throw new \DomainException(_('The advertised IPv4 address is invalid.'));
         }
+        if ($host === 'localhost' || $host === 'localhost.localdomain' || str_ends_with($host, '.localhost')) {
+            throw new \DomainException(_('Enter a PBX hostname that other notification clients can reach.'));
+        }
+        if (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            $octets = array_map('intval', explode('.', $host));
+            if ($octets[0] === 0 || $octets[0] === 127
+                || ($octets[0] === 169 && $octets[1] === 254)
+                || $octets[0] >= 224) {
+                throw new \DomainException(_('Enter a unicast PBX IPv4 address that notification clients can reach.'));
+            }
+        }
         return $host;
     }
 
@@ -98,17 +109,20 @@ final class SlsAdvertisedAddress
             $seen[$key] = true; $remaining = (int)(($deadline - microtime(true)) * 1000);
             if ($remaining < 100) { break; }
             $body = ''; $curl = curl_init($url);
-            curl_setopt_array($curl, [CURLOPT_CONNECT_TO => [$host . ':' . $fields['api_port'] . ':' . ($address === '::1' ? '[::1]' : $address) . ':' . $port],
-                CURLOPT_NOPROXY => '*', CURLOPT_FOLLOWLOCATION => false,
+            if ($curl === false) { $codes[] = -1; continue; }
+            $configured = curl_setopt_array($curl, [CURLOPT_CONNECT_TO => [$host . ':' . $fields['api_port'] . ':' . ($address === '::1' ? '[::1]' : $address) . ':' . $port],
+                CURLOPT_PROTOCOLS => CURLPROTO_HTTPS, CURLOPT_NOPROXY => '*', CURLOPT_PROXY => '', CURLOPT_FOLLOWLOCATION => false, CURLOPT_MAXREDIRS => 0,
                 CURLOPT_SSL_VERIFYPEER => true, CURLOPT_SSL_VERIFYHOST => 2,
+                CURLOPT_SSLVERSION => CURL_SSLVERSION_TLSv1_2,
                 CURLOPT_CONNECTTIMEOUT_MS => min(500, $remaining), CURLOPT_TIMEOUT_MS => min(1500, $remaining),
                 CURLOPT_HTTPHEADER => ['Accept: application/json'],
                 CURLOPT_WRITEFUNCTION => static function ($handle, $chunk) use (&$body) {
                     if (strlen($body) + strlen($chunk) > 8192) { return 0; }
                     $body .= $chunk; return strlen($chunk);
                 }]);
+            if (!$configured) { curl_close($curl); $codes[] = -1; continue; }
             $readCertificate = defined('CURLOPT_CERTINFO') && defined('CURLINFO_CERTINFO') && function_exists('openssl_x509_parse');
-            if ($readCertificate) { curl_setopt($curl, CURLOPT_CERTINFO, true); }
+            if ($readCertificate) { $readCertificate = curl_setopt($curl, CURLOPT_CERTINFO, true); }
             curl_exec($curl); $error = curl_errno($curl); $status = (int)curl_getinfo($curl, CURLINFO_HTTP_CODE);
             $certificate = $readCertificate ? curl_getinfo($curl, CURLINFO_CERTINFO) : [];
             curl_close($curl);

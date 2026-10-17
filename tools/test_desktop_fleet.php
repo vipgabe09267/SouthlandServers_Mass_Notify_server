@@ -20,6 +20,10 @@ fleetCheck(DesktopFleet::readiness($client,$changed,DesktopFleet::DEFAULT_MINIMU
 fleetCheck(DesktopFleet::readiness($client,$changed,'1.10.0',$now)['compatibility']==='upgrade_required','Explicit administrator minimum was weakened');
 $changed=$seen; $changed['client_report']['sse_protocol']=3;
 fleetCheck(DesktopFleet::readiness($client,$changed,'',$now)['compatibility']==='unsupported_protocol','Unknown protocol shown as supported');
+foreach ([['payload_schema'],['sse_protocol'],['payload_schema','sse_protocol']] as $missing) {
+    $changed=$seen;foreach($missing as $field){unset($changed['client_report'][$field]);}
+    fleetCheck(DesktopFleet::readiness($client,$changed,'1.2.3',$now)['compatibility']==='protocol_not_reported','Missing protocol metadata was inferred from the app version.');
+}
 $changed=$seen; $changed['client_report']['reported_at']=gmdate('c',$now-86401);
 fleetCheck(DesktopFleet::readiness($client,$changed,'1.2.3',$now)['compatibility']==='stale_report','Old metadata treated as current');
 fleetCheck(DesktopFleet::readiness(['client_id'=>'cli_new','enabled'=>'1'],$seen,'1.2.3',$now)['compatibility']==='not_reported','Another device inherited compatibility');
@@ -28,6 +32,10 @@ foreach ([null,[],true,' 1.2.3','1.2','01.2.3','1.2.3<script>',str_repeat('1',50
 foreach (['','1.2.3','0.1.5-beta','1.2.3-rc.2'] as $good) { fleetCheck(DesktopFleet::validMinimum($good),'Valid minimum rejected'); }
 $changed=$seen; unset($changed['connected_until']);
 fleetCheck(DesktopFleet::readiness($client,$changed,'',$now)['connection']==='recent','Polling activity treated as disconnected');
+foreach ([[], (string)($now+30), true, (float)($now+30)] as $invalidConnectedUntil) {
+    $changed=$seen; $changed['connected_until']=$invalidConnectedUntil;
+    fleetCheck(DesktopFleet::readiness($client,$changed,'',$now)['connection']==='recent','Malformed stream expiry was coerced into an active connection.');
+}
 $changed['seen_at']=gmdate('c',$now+61);
 fleetCheck(DesktopFleet::readiness($client,$changed,'',$now)['connection']==='clock_error','Future presence treated as current');
 if (!interface_exists('BMO')) { interface BMO {} }

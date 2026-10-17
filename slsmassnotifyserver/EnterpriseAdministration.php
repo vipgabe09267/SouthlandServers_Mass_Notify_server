@@ -1,6 +1,7 @@
 <?php
 declare(strict_types=1);
 namespace FreePBX\modules;
+require_once __DIR__.'/ImmediateSettings.php';
 require_once __DIR__ . '/LabsSafety.php';
 require_once __DIR__ . '/BetaNotice.php';
 use SLS\MassNotify\LabsSafety;
@@ -52,6 +53,12 @@ trait SlsEnterpriseAdministration
             if (isset($changes['beta_notice'])) {
                 $activeChanges['beta_notice'] = BetaNotice::merge($active['beta_notice'] ?? [], $changes['beta_notice']);
             }
+            if (isset($changes['labs_safety'])) {
+                $currentSafety = LabsSafety::normalize($active['labs_safety'] ?? []);
+                $acceptedSafety = LabsSafety::normalize($changes['labs_safety']);
+                $currentSafety['receipts'] = array_replace($currentSafety['receipts'], $acceptedSafety['receipts']);
+                $activeChanges['labs_safety'] = LabsSafety::normalize($currentSafety);
+            }
             $active = array_replace($active, $activeChanges);
             $active = $this->normalizeSettings($active);
             $this->assertEnterpriseActivationSafe($active);
@@ -62,19 +69,23 @@ trait SlsEnterpriseAdministration
                 if (isset($changes['beta_notice'])) {
                     $pendingChanges['beta_notice'] = BetaNotice::merge($pending['beta_notice'] ?? [], $active['beta_notice']);
                 }
+                if (isset($changes['labs_safety'])) {
+                    $pendingSafety = LabsSafety::normalize($pending['labs_safety'] ?? []);
+                    $acceptedSafety = LabsSafety::normalize($changes['labs_safety']);
+                    $pendingSafety['receipts'] = array_replace($pendingSafety['receipts'], $acceptedSafety['receipts']);
+                    $pendingChanges['labs_safety'] = LabsSafety::normalize($pendingSafety);
+                }
                 $pending = array_replace($pending, $pendingChanges);
                 $pending = $this->normalizeSettings($pending);
                 $this->assertEnterpriseActivationSafe($pending);
             }
-            // Keep pending edits from silently reverting a security decision.
-            // Active is written first; if the second write fails, reload before
-            // retrying. The protected writer preserves a configuration backup.
-            $this->writeSettingsFileUnlocked(self::SETTINGS_JSON, $active, true);
+            [$active,$pending]=\SLS\MassNotify\ImmediateSettings::prepare($active,$pending,array_keys($changes));
+            \SLS\MassNotify\ImmediateSettings::commitFiles(self::SETTINGS_JSON, self::PENDING_SETTINGS_JSON,
+                $active, $pending, function (string $path, array $settings, bool $backup): void {
+                    $this->writeSettingsFileUnlocked($path, $settings, $backup);
+                });
             $this->rememberSettingsFingerprint(self::SETTINGS_JSON);
-            if ($pending !== null) {
-                $this->writeSettingsFileUnlocked(self::PENDING_SETTINGS_JSON, $pending, false);
-                $this->rememberSettingsFingerprint(self::PENDING_SETTINGS_JSON);
-            }
+            if ($pending !== null) { $this->rememberSettingsFingerprint(self::PENDING_SETTINGS_JSON); }
         } finally {
             if ($lock !== null) { $this->releaseSettingsLock($lock); }
             $this->releaseNativeBackupFileLock($activity);
@@ -112,8 +123,7 @@ trait SlsEnterpriseAdministration
         $principal = $this->assertEnterpriseAdministrator();
         $this->getCsrfToken();
         $result = LabsSafety::accept($_SESSION, $input, (string)$principal['username'], session_id());
-        $config = LabsSafety::normalize($this->getActiveSettings()['labs_safety'] ?? []);
-        $config['receipts'][$result['feature']] = $result['receipt'];
+        $config = ['schema'=>1, 'receipts'=>[$result['feature']=>$result['receipt']]];
         $this->saveEnterpriseNamespace('labs_safety', $config);
         return ['success'=>true, 'message'=>'Warning acknowledged. The feature remains disabled until you explicitly enable and save it.'];
     }
@@ -121,22 +131,30 @@ trait SlsEnterpriseAdministration
     public function enterpriseAdministratorAction(string $action,array $input): array
     {
         $this->assertEnterpriseAdministrator();
-        if ($action==='danger_begin') { return $this->beginEnterpriseDangerWarning($input['feature']??''); }
+        if ($action==='danger_begin') {
+            $feature=$input['feature']??'';if(!is_string($feature)){throw new \InvalidArgumentException('Danger-warning feature must be text.');}
+            return $this->beginEnterpriseDangerWarning($feature);
+        }
         if ($action==='danger_accept') { return $this->acceptEnterpriseDangerWarning($input); }
         if (in_array($action,['identity_save','directory_save','directory_preview','directory_apply','subscriber_save','subscriber_invite','subscriber_revoke','subscriber_push_key','subscriber_push_test'],true)) {
             return $this->enterpriseLabsAction($action,$input);
         }
-        if (in_array($action,['operations_save','operations_archive','approval_list','approval_approve','approval_submit','approval_reject','floorplan_overlay','drill_start','drill_review','drill_report'],true)) {
+        if (in_array($action,['operations_save','operations_archive','approval_list','approval_approve','approval_submit','approval_reject','floorplan_overlay','floorplan_retire','drill_start','drill_review','drill_report'],true)) {
             return $this->enterpriseOperationsAction($action,$input);
         }
         switch ($action) {
-            case 'cluster_save': return $this->configureEnterpriseCluster($input['config']??[],$input['revision']??'');
+            case 'cluster_save':
+                $config=$input['config']??null;$revision=$input['revision']??null;
+                if(!is_array($config)||array_is_list($config)||!is_string($revision)){throw new \InvalidArgumentException('Cluster settings and revision are invalid.');}
+                return $this->configureEnterpriseCluster($config,$revision);
             case 'cluster_status': return ['success'=>true,'status'=>$this->getEnterpriseClusterStatus()];
             case 'cluster_prerequisites': return ['success'=>true,'prerequisites'=>$this->enterprisePbxReadiness()];
             case 'cluster_initialize': return $this->initializeEnterpriseClusterJournal();
             case 'cluster_control': return $this->enterpriseClusterControl($input);
             case 'cluster_mirror': return $this->enterpriseMirrorConfiguration();
-            case 'cluster_handoff': return $this->enterpriseClusterHandoff($input['node_id']??'');
+            case 'cluster_handoff':
+                if(!is_string($input['node_id']??null)){throw new \InvalidArgumentException('Cluster node identifier must be text.');}
+                return $this->enterpriseClusterHandoff($input['node_id']);
             case 'cluster_distribute': return $this->enterpriseDistributeJob($input);
             case 'cluster_receipt': return $this->enterpriseSiteReceipt($input);
             case 'cluster_recovery': return $this->enterpriseClusterRecoveryState();
@@ -145,12 +163,17 @@ trait SlsEnterpriseAdministration
             case 'integrations_continuity': return $this->getEnterpriseContinuityReport();
             case 'integrations_report': return $this->exportEnterpriseIntegrationReport();
             case 'integrations_archive': return $this->maintainEnterpriseIntegrationJournal($input);
+            case 'integrations_resolve': return $this->resolveEnterpriseIntegrationUncertainty($input);
             case 'integrations_oauth_refresh': return $this->refreshEnterpriseMeetingToken();
             case 'integrations_oauth_revoke': return $this->revokeEnterpriseMeetingToken();
             case 'integrations_meeting':
-                $id=$input['incident_id']??'';unset($input['incident_id']);return $this->createIncidentMeeting($id,$input['input']??$input);
+                $id=$input['incident_id']??'';$meetingInput=$input['input']??null;
+                if(!is_string($id)||($meetingInput!==null&&!is_array($meetingInput))){throw new \InvalidArgumentException('Incident meeting input is invalid.');}
+                unset($input['incident_id']);return $this->createIncidentMeeting($id,$meetingInput??$input);
             case 'integrations_door': return $this->controlIntegrationDoor($input);
-            case 'integrations_speaker_telemetry': return $this->readIntegrationSpeakerTelemetry($input['speaker_id']??'');
+            case 'integrations_speaker_telemetry':
+                if(!is_string($input['speaker_id']??null)){throw new \InvalidArgumentException('Speaker identifier must be text.');}
+                return $this->readIntegrationSpeakerTelemetry($input['speaker_id']);
             case 'integrations_labs_send': return $this->sendIntegrationLabsAnnouncement($input);
             case 'integrations_cap_validate': return $this->validatePublicWarningAcceptance($input);
             case 'integrations_speaker_send': return $this->sendIntegrationSpeakerAnnouncement($input);

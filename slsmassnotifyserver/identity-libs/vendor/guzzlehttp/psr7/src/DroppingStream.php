@@ -31,7 +31,12 @@ final class DroppingStream implements StreamInterface
 
     public function write(string $string): int
     {
-        $diff = $this->maxLength - $this->stream->getSize();
+        $size = $this->stream->getSize();
+        if ($size === null) {
+            throw new \RuntimeException('Cannot enforce a maximum length on a stream with an unknown size');
+        }
+
+        $diff = $this->maxLength - $size;
 
         // Begin returning 0 when the underlying stream is too large.
         if ($diff <= 0) {

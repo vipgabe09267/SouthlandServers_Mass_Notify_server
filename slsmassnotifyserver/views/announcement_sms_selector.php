@@ -1,20 +1,23 @@
 <?php
 // IDs only; SMS numbers remain in the administrator's saved-recipient editor.
-$smsSelectorField = (string)($sms_selector_field ?? '');
-if (!in_array($smsSelectorField, ['announcement_sms_recipient_ids', 'group_sms_recipient_ids', 'schedule_sms_recipient_ids'], true)) { throw new DomainException('Unknown SMS recipient form.'); }
+if (!is_string($sms_selector_field ?? null)
+    || !in_array($sms_selector_field, ['announcement_sms_recipient_ids', 'group_sms_recipient_ids', 'schedule_sms_recipient_ids'], true)) { throw new DomainException('Unknown SMS recipient form.'); }
+$smsSelectorField = $sms_selector_field;
 $smsSelectorId = 'sls-' . str_replace('_', '-', $smsSelectorField);
 $smsSelectorRows = array_values(array_filter((array)($smsRecipients ?? []), 'is_array'));
 $smsSelectorEscape = static function ($value) { return htmlspecialchars((string)$value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); };
 ?>
 <style>
-.sls-sms-selector { border:1px solid #dfe5ec; border-radius:7px; margin-bottom:12px; background:#fff; }
+.sls-sms-selector { --selector-surface:var(--sls-raised,#fff);--selector-line:var(--sls-border,#dfe5ec);--selector-muted:var(--sls-muted,#475569);--selector-warning:var(--sls-warning,#92400e);border:1px solid var(--selector-line); border-radius:7px; margin-bottom:12px; background:var(--selector-surface); }
 .sls-sms-selector>summary { display:flex; gap:8px; align-items:center; cursor:pointer; padding:10px 12px; font-weight:600; }
 .sls-sms-selector .sls-sms-selector-body { padding:0 12px 12px; }
-.sls-sms-selector .sls-sms-selected { margin-left:auto; color:#475569; font-size:12px; font-weight:400; }
+.sls-sms-selector .sls-sms-selected { margin-left:auto; color:var(--selector-muted); font-size:12px; font-weight:400; }
 .sls-sms-selector .sls-sms-selector-list { max-height:220px; overflow:auto; margin-top:9px; }
 .sls-sms-selector .checkbox { margin:7px 0; overflow-wrap:anywhere; }
-.sls-sms-selector .sls-sms-unavailable { color:#92400e; }
+.sls-sms-selector .sls-sms-unavailable { color:var(--selector-warning); }
 .sls-sms-selector .help-block { font-size:12px; margin-bottom:0; }
+@media(prefers-color-scheme:dark){.sls-sms-selector{--selector-surface:var(--sls-raised,#111b2b);--selector-line:var(--sls-border,#40506a);--selector-muted:var(--sls-muted,#b5c2d4);--selector-warning:var(--sls-warning,#fbbf24)}}
+[data-theme=dark] .sls-sms-selector,body.dark .sls-sms-selector{--selector-surface:var(--sls-raised,#111b2b);--selector-line:var(--sls-border,#40506a);--selector-muted:var(--sls-muted,#b5c2d4);--selector-warning:var(--sls-warning,#fbbf24)}
 </style>
 <details class="sls-destination-panel sls-sms-selector" id="<?php echo $smsSelectorEscape($smsSelectorId); ?>">
     <summary><i class="fa fa-commenting" aria-hidden="true"></i><span><?php echo _('SMS'); ?></span><span class="sls-sms-selected" data-sms-selected aria-live="polite"></span><i class="fa fa-chevron-down" aria-hidden="true"></i></summary>

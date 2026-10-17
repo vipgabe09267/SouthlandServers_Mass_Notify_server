@@ -6,6 +6,7 @@ import base64
 import contextlib
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import pwd
@@ -46,13 +47,24 @@ def _invalid_constant(value):
     raise ValueError("Non-finite JSON values are unsupported.")
 
 
+def _finite_float(value):
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("Non-finite JSON numbers are unsupported.")
+    return number
+
+
 def _object(raw, maximum):
     if isinstance(raw, str):
-        raw = raw.encode("utf-8")
+        try:
+            raw = raw.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ConfigCryptoError("The protected configuration contains invalid Unicode text.") from exc
     if not isinstance(raw, bytes) or not raw or len(raw) > maximum:
         raise ConfigCryptoError("The protected configuration exceeds its size limit.")
     try:
-        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs, parse_constant=_invalid_constant)
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs,
+                           parse_constant=_invalid_constant, parse_float=_finite_float)
     except (UnicodeError, ValueError, RecursionError) as exc:
         raise ConfigCryptoError("The protected configuration contains invalid JSON.") from exc
     if not isinstance(value, dict) or not value:
@@ -60,12 +72,22 @@ def _object(raw, maximum):
     pending = [(value, 1)]
     while pending:
         item, depth = pending.pop()
-        if depth > 64:
+        if isinstance(item, (dict, list)) and depth > 64:
             raise ConfigCryptoError("The protected configuration exceeds its JSON nesting limit.")
         if isinstance(item, dict):
-            pending.extend((child, depth + 1) for child in item.values() if isinstance(child, (dict, list)))
+            for key in item:
+                try:
+                    key.encode("utf-8")
+                except UnicodeEncodeError as exc:
+                    raise ConfigCryptoError("The protected configuration contains invalid Unicode text.") from exc
+            pending.extend((child, depth + 1) for child in item.values())
         elif isinstance(item, list):
-            pending.extend((child, depth + 1) for child in item if isinstance(child, (dict, list)))
+            pending.extend((child, depth + 1) for child in item)
+        elif isinstance(item, str):
+            try:
+                item.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ConfigCryptoError("The protected configuration contains invalid Unicode text.") from exc
     return value
 
 
@@ -122,15 +144,25 @@ def _read_protected(path, maximum, keyring=False):
             descriptor = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
             try:
                 before = os.fstat(descriptor)
-                if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_mode & 0o027
-                        or (keyring and before.st_uid != 0) or not 1 <= before.st_size <= maximum):
+                try:
+                    account = pwd.getpwnam('asterisk')
+                    owners = {0, os.geteuid(), account.pw_uid}
+                    groups = {0, os.getegid(), account.pw_gid}
+                except KeyError:
+                    owners = {0, os.geteuid()}; groups = {0, os.getegid()}
+                def safe(info):
+                    mode = stat.S_IMODE(info.st_mode)
+                    return (stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and mode in (0o600, 0o640)
+                            and info.st_uid in ({0} if keyring else owners)
+                            and (mode == 0o600 or info.st_gid in groups) and 1 <= info.st_size <= maximum)
+                if not safe(before):
                     raise ConfigCryptoError("The protected configuration or encryption key file has unsafe permissions or size.")
                 with os.fdopen(os.dup(descriptor), "rb") as stream:
                     raw = stream.read(maximum + 1)
                 after = os.fstat(descriptor)
                 current = os.stat(name, dir_fd=parent, follow_symlinks=False)
                 fields = ("st_dev", "st_ino", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
-                if any(getattr(before, field) != getattr(after, field) or getattr(after, field) != getattr(current, field) for field in fields) or len(raw) != before.st_size:
+                if not safe(after) or not safe(current) or any(getattr(before, field) != getattr(after, field) or getattr(after, field) != getattr(current, field) for field in fields + ('st_mode','st_uid','st_gid')) or len(raw) != before.st_size:
                     raise ConfigCryptoError("The protected configuration changed or could not be read completely.")
                 return raw
             finally:
@@ -179,7 +211,10 @@ def read_config(path, keyring_path=None, allow_legacy=True):
 
 def encode_with_keyring(settings, ring):
     validate_keyring(ring)
-    plain = json.dumps(settings, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    try:
+        plain = json.dumps(settings, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise ConfigCryptoError("The protected configuration contains unsupported values or invalid Unicode text.") from exc
     _object(plain, MAX_PLAIN_BYTES)
     key_id = ring["active"]
     nonce = os.urandom(12)

@@ -1,5 +1,5 @@
 <style>
-.sls-test-receipts { margin:12px 0; padding:14px 16px; border:1px solid #dfe5ec; border-radius:8px; background:transparent; }
+.sls-test-receipts { margin:12px 0; padding:14px 16px; border:1px solid var(--sls-border,#dfe5ec); border-radius:8px; background:transparent; }
 .sls-test-receipt-summary { margin:0 0 10px; font-weight:600; }
 .sls-test-receipts details { margin-bottom:10px; }
 .sls-test-receipts summary { cursor:pointer; }

@@ -2,6 +2,7 @@
 
 // Southland Servers Mass Notifications Server by the Southland Servers Group
 require_once dirname(__DIR__) . '/SchedulePresentation.php';
+require_once dirname(__DIR__) . '/api/sls-mass-notify/security.php';
 
 $schedules = is_array($scheduled_announcements ?? null)
 	? $scheduled_announcements
@@ -123,6 +124,8 @@ $targetSummary = static function (array $schedule) {
 	if (!empty($targets['email_recipient_ids'])) { $parts[] = sprintf(_('%d email recipient(s)'), count((array)$targets['email_recipient_ids'])); }
 	if (!empty($targets['webhook_ids'])) { $parts[] = sprintf(_('%d webhook(s)'), count((array)$targets['webhook_ids'])); }
 	if (!empty($targets['sms_recipient_ids'])) { $parts[] = sprintf(_('%d SMS recipient(s)'), count((array)$targets['sms_recipient_ids'])); }
+	if (!empty($targets['browser_recipient_ids'])) { $parts[] = sprintf(_('%d browser subscriber(s)'), count((array)$targets['browser_recipient_ids'])); }
+	if (!empty($targets['connector_ids'])) { $parts[] = sprintf(_('%d connector(s)'), count((array)$targets['connector_ids'])); }
 	if (!empty($targets['voice_recipient_ids'])) {
 		$parts[] = sprintf(_('%d external voice recipient(s)'), count((array)$targets['voice_recipient_ids']));
 	}
@@ -359,7 +362,7 @@ $defaultOccurrenceLocal = $nextPbxHour->setTime((int)$nextPbxHour->format('H'), 
 <div class="modal fade sls-schedule-modal" id="sls-schedule-modal" tabindex="-1" role="dialog" aria-labelledby="sls-schedule-modal-title" aria-hidden="true">
 	<div class="modal-dialog" role="document"><div class="modal-content">
 		<form method="post" action="config.php?display=slsmassnotifyserver_scheduling" id="sls-schedule-form">
-			<?php $recipient_selection_form_id = 'sls-schedule-form'; $recipient_selection_keys = ['schedule_extensions', 'schedule_groups', 'schedule_desktop_clients', 'schedule_voice_recipient_ids', 'schedule_email_recipient_ids', 'schedule_sms_recipient_ids', 'schedule_webhook_ids']; include __DIR__ . '/recipient_selection.php'; ?>
+			<?php $recipient_selection_form_id = 'sls-schedule-form'; $recipient_selection_keys = ['schedule_extensions', 'schedule_groups', 'schedule_desktop_clients', 'schedule_voice_recipient_ids', 'schedule_email_recipient_ids', 'schedule_sms_recipient_ids', 'schedule_webhook_ids', 'schedule_browser_recipient_ids', 'schedule_connector_ids']; include __DIR__ . '/recipient_selection.php'; ?>
 			<div class="modal-header"><button type="button" class="close" data-dismiss="modal" aria-label="<?php echo htmlspecialchars(_('Close')); ?>"><span aria-hidden="true">&times;</span></button><h3 class="modal-title" id="sls-schedule-modal-title"><?php echo _('Create Scheduled Announcement'); ?></h3></div>
 			<div class="modal-body">
 				<input type="hidden" name="slsmassnotifyserver_csrf" value="<?php echo htmlspecialchars($csrfToken); ?>">
@@ -388,6 +391,16 @@ $defaultOccurrenceLocal = $nextPbxHour->setTime((int)$nextPbxHour->format('H'), 
 					<?php $email_selector_field = 'schedule_email_recipient_ids'; include __DIR__ . '/announcement_email_selector.php'; ?>
 					<?php $sms_selector_field = 'schedule_sms_recipient_ids'; include __DIR__ . '/announcement_sms_selector.php'; ?>
                     <?php $webhook_selector_field = 'schedule_webhook_ids'; include __DIR__ . '/audience_webhook_selector.php'; ?>
+                    <details class="form-group"><summary><i class="fa fa-flask" aria-hidden="true"></i> <?php echo _('Labs recipients'); ?></summary>
+                        <p class="help-block"><?php echo _('Enabled browser subscribers and notification connectors. Delivery rechecks enrollment and sender permissions.'); ?></p>
+                        <div class="row" id="sls-schedule-labs">
+                        <?php foreach (\SLS\MassNotify\ApiSecurity::labsDirectory($settings) as $field=>$rows) { ?>
+                            <div class="col-sm-6"><div class="form-group"><label><?php echo $field==='browser_recipient_ids' ? _('Browser subscribers') : _('Notification connectors'); ?></label><div class="sls-target-box">
+                            <?php if (!$rows) { ?><p class="text-muted"><?php echo _('None configured.'); ?></p><?php } foreach ($rows as $id=>$row) { ?>
+                                <div class="checkbox"><label><input type="checkbox" name="schedule_<?php echo htmlspecialchars($field); ?>[]" value="<?php echo htmlspecialchars($id, ENT_QUOTES, 'UTF-8'); ?>"> <?php echo htmlspecialchars($row['label'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?><?php if (!$row['available']) { ?> <span class="text-warning"><?php echo _('disabled'); ?></span><?php } ?></label></div>
+                            <?php } ?></div></div></div>
+                        <?php } ?></div><div id="sls-schedule-unavailable-labs"></div>
+                    </details>
 					<div class="form-group"><label><?php echo _('External voice recipients'); ?></label><div class="sls-target-box"><div id="sls-schedule-unavailable-voice"></div>
 						<?php if (empty($voiceRecipients)) { ?><p class="text-muted"><?php echo _('Enable external voice and save recipients in General Settings.'); ?></p><?php } foreach ($voiceRecipients as $recipient) { ?><div class="checkbox"><label><input type="checkbox" name="schedule_voice_recipient_ids[]" value="<?php echo htmlspecialchars((string)($recipient['id'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>"> <?php echo htmlspecialchars((string)($recipient['name'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?> <span class="text-muted"><?php echo htmlspecialchars((string)($recipient['number'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?></span></label></div><?php } ?>
 					</div><p class="help-block"><?php echo _('External recipients require announcement audio. Their saved number and enabled state are checked again at delivery time.'); ?></p></div>
@@ -527,6 +540,7 @@ $defaultOccurrenceLocal = $nextPbxHour->setTime((int)$nextPbxHour->format('H'), 
 		if(document.getElementById('sls-calendar-panel').slsCalendar)document.getElementById('sls-calendar-panel').slsCalendar.reset();
 		document.getElementById('sls-schedule-email-recipient-ids').slsEmailSelection([]);
 		document.getElementById('sls-schedule-sms-recipient-ids').slsSmsSelection([]);
+		document.getElementById('sls-schedule-webhook-ids').slsWebhookSelection([]);
 		document.getElementById('sls-schedule-unavailable-voice').textContent = '';
 		setValue('sls-schedule-id', '');
 		setValue('sls-schedule-lateness', 15);
@@ -537,6 +551,7 @@ $defaultOccurrenceLocal = $nextPbxHour->setTime((int)$nextPbxHour->format('H'), 
 		setValue('sls-schedule-color', '#1f2937');
 		setValue('sls-schedule-title', 'Announcement');
 		document.getElementById('sls-schedule-enabled').checked = true;
+        document.getElementById('sls-schedule-unavailable-labs').textContent='';
 		occurrenceList.innerHTML = '';
 		addOccurrence('');
 		document.getElementById('sls-schedule-modal-title').textContent = <?php echo json_encode(_('Create Scheduled Announcement')); ?>;
@@ -562,6 +577,17 @@ $defaultOccurrenceLocal = $nextPbxHour->setTime((int)$nextPbxHour->format('H'), 
 			document.getElementById('sls-schedule-email-recipient-ids').slsEmailSelection(targets.email_recipient_ids || []);
 			document.getElementById('sls-schedule-sms-recipient-ids').slsSmsSelection(targets.sms_recipient_ids || []);
             document.getElementById('sls-schedule-webhook-ids').slsWebhookSelection(targets.webhook_ids || []);
+            ['browser_recipient_ids','connector_ids'].forEach(function(field) {
+                var selector='schedule_'+field+'[]', saved=targets[field]||[];
+                setChecked(selector,saved);
+                var known=Array.prototype.map.call(form.querySelectorAll('[name="'+selector+'"]'),function(input){return input.value;});
+                saved.filter(function(id){return known.indexOf(id)===-1;}).forEach(function(id){
+                    var row=document.createElement('div'), label=document.createElement('label'), input=document.createElement('input');
+                    row.className='checkbox text-warning';input.type='checkbox';input.name=selector;input.value=id;input.checked=true;
+                    label.appendChild(input);label.appendChild(document.createTextNode(' Unavailable Labs recipient ('+id+') — remove it or review its enrollment.'));
+                    row.appendChild(label);document.getElementById('sls-schedule-unavailable-labs').appendChild(row);
+                });
+            });
 			setChecked('schedule_voice_recipient_ids[]', targets.voice_recipient_ids || []);
 			var knownVoiceIds = Array.prototype.map.call(form.querySelectorAll('[name="schedule_voice_recipient_ids[]"]'), function(input) { return input.value; });
 			(targets.voice_recipient_ids || []).forEach(function(id) {
@@ -637,10 +663,10 @@ $defaultOccurrenceLocal = $nextPbxHour->setTime((int)$nextPbxHour->format('H'), 
 			window.alert(<?php echo json_encode(_('Add at least one date and time.')); ?>);
 			return;
 		}
-		var recipient = form.querySelector('input[name="schedule_all_phones"]:checked, input[name="schedule_all_desktops"]:checked, input[name="schedule_extensions[]"]:checked, input[name="schedule_groups[]"]:checked, input[name="schedule_desktop_clients[]"]:checked, input[name="schedule_voice_recipient_ids[]"]:checked, input[name="schedule_email_recipient_ids[]"]:checked, input[name="schedule_sms_recipient_ids[]"]:checked, input[name="schedule_webhook_ids[]"]:checked');
+		var recipient = form.querySelector('input[name="schedule_all_phones"]:checked, input[name="schedule_all_desktops"]:checked, input[name="schedule_extensions[]"]:checked, input[name="schedule_groups[]"]:checked, input[name="schedule_desktop_clients[]"]:checked, input[name="schedule_voice_recipient_ids[]"]:checked, input[name="schedule_email_recipient_ids[]"]:checked, input[name="schedule_sms_recipient_ids[]"]:checked, input[name="schedule_webhook_ids[]"]:checked, input[name="schedule_browser_recipient_ids[]"]:checked, input[name="schedule_connector_ids[]"]:checked');
 		if (!recipient) {
 			event.preventDefault();
-			window.alert(<?php echo json_encode(_('Select at least one phone, group, desktop, external voice, or saved email or SMS recipient.')); ?>);
+			window.alert(<?php echo json_encode(_('Select at least one notification recipient.')); ?>);
 			return;
 		}
 		scheduleFormSubmitting = true;

@@ -617,6 +617,11 @@ value do not need to change anything. In 2.x, the copy stopped silently when the
 destination could not make progress. For a guaranteed full copy, use a normal
 writable stream such as a file or `php://temp` stream.
 
+`DroppingStream::write()` now throws `RuntimeException` when its underlying
+stream reports an unknown size. Earlier versions treated an unknown size as
+zero and could write beyond the configured maximum. Use a stream that reports
+its current size when a hard maximum is required.
+
 #### Stream Timeout Detection
 
 Timed-out stream operations now throw

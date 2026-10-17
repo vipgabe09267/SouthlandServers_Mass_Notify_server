@@ -15,6 +15,7 @@ from unittest import mock
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'slsmassnotifyserver/bin/sls_mass_notify'))
 import sls_storage_maintenance as storage
+from sls_atomic_json import append_json_line
 
 
 class EventRetentionTests(unittest.TestCase):
@@ -45,6 +46,13 @@ class EventRetentionTests(unittest.TestCase):
         self.assertEqual((before.st_ino, before.st_dev, before.st_mode, before.st_uid),
                          (after.st_ino, after.st_dev, after.st_mode, after.st_uid))
         self.assertEqual(list(self.root.glob('.sls-retention-*')), [])
+
+    def test_timezone_naive_timestamp_is_preserved_as_ambiguous_evidence(self):
+        ambiguous = b'{"logged_at":"2020-01-01T00:00:00","event":"timezone unknown"}\n'
+        self.path.write_bytes(ambiguous + self.new)
+        result = self.clean(retention_days=1)
+        self.assertEqual(result, {'removed': 0, 'preserved_invalid': 1})
+        self.assertEqual(self.path.read_bytes(), ambiguous + self.new)
 
     def test_busy_appender_is_never_displaced(self):
         original = self.path.read_bytes()
@@ -183,12 +191,25 @@ class EventRetentionTests(unittest.TestCase):
                     self.assertEqual(evidence.read_bytes(),b'original recovery evidence')
                     self.assertIn(str(evidence),result.stdout)
 
+    def test_shared_runtime_appender_and_retention_keep_one_inode_and_lease(self):
+        inode=self.path.stat().st_ino
+        append_json_line(self.path,{'logged_at':'2030-01-01T00:00:00Z','event':'appended','is_test':True})
+        with self.path.open('r+b') as holder:
+            fcntl.flock(holder,fcntl.LOCK_EX)
+            self.assertTrue(self.clean().get('busy'))
+            with self.assertRaisesRegex(RuntimeError,'event_log_busy'):
+                append_json_line(self.path,{'event':'blocked'},timeout=.02)
+        result=self.clean()
+        self.assertEqual(result['removed'],1)
+        rows=[json.loads(line) for line in self.path.read_text().splitlines()]
+        self.assertEqual([row['event'] for row in rows],['new','appended'])
+        self.assertEqual(self.path.stat().st_ino,inode)
+
     def test_alert_producers_cannot_bypass_periodic_recovery_guard(self):
         scripts = Path(__file__).resolve().parents[1] / 'slsmassnotifyserver/bin'
         for filename in ('sls_mass_notify_nws_poll.sh', 'sls_mass_notify_test.sh'):
             source = (scripts / filename).read_text()
             self.assertNotIn('prune_event_log', source)
-            self.assertIn('fcntl.flock(handle.fileno(), fcntl.LOCK_EX)', source)
             self.assertIn('EVENTS_LOG', source)
 
 

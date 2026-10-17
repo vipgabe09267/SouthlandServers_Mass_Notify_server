@@ -85,6 +85,7 @@
             if (draft.kind === 'cap') {
                 field('feed_url','Trusted CAP URL','Public HTTPS on port 443; direct CAP 1.2 or inline CAP Atom feed. Redirects and private addresses are rejected.',{max:2048});
                 field('sender','Trusted CAP sender','Must exactly match the CAP sender field. Feed wording never changes recipients or severity.',{max:200});
+                field('language','CAP language','Use a language tag such as en, en-US or es. Matching source text includes instructions and affected areas; SLS does not translate it.',{max:35});
             }
             if (draft.kind === 'emergency_call') {
                 field('callers_text','Authorized internal callers','Comma-separated existing PJSIP extensions. Assign callers at one reviewed location.',{max:2100});
@@ -115,7 +116,7 @@
     }
     function defaults(key, kind) {
         const common = {id:'',name:'',enabled:false,kind:kind || (key === 'rules' ? 'panic' : 'brightsign_udp')};
-        if (key === 'rules') return {...common,location_id:'',template_id:'',fields:{},action_ids:[],allow_tests:false,max_age_seconds:300,cooldown_seconds:60,event:'',sender:'',feed_url:'',callers_text:'',numbers_text:'',dial_extension:'',confirmation_prompt:'Emergency alert activation. Press one to send the configured alert. Hang up to cancel.'};
+        if (key === 'rules') return {...common,location_id:'',template_id:'',fields:{},action_ids:[],allow_tests:false,max_age_seconds:300,cooldown_seconds:60,event:'',sender:'',language:'en',feed_url:'',callers_text:'',numbers_text:'',dial_extension:'',confirmation_prompt:'Emergency alert activation. Press one to send the configured alert. Hang up to cancel.'};
         return common.kind === 'script' ? {...common,path:'',sha256:''} : {...common,host:'',port:common.kind === 'brightsign_udp' ? 5000 : 443,message:'',scheme:'https',led:'10000',clear:false};
     }
     function open(key, item) {
@@ -131,7 +132,7 @@
             item.fields = {};
             for (const field of state.templates.find(t => t.id === draft.template_id)?.fields || []) item.fields[field.key] = draft['binding_' + field.key] ?? '';
             if (['sensor','cap'].includes(draft.kind)) keys.push('event');
-            if (draft.kind === 'cap') keys.push('feed_url','sender');
+            if (draft.kind === 'cap') keys.push('feed_url','sender','language');
             if (draft.kind === 'panic') { keys.push('dial_extension','confirmation_prompt'); item.callers=draft.callers_text.split(',').map(v=>v.trim()).filter(Boolean); }
             if (draft.kind === 'emergency_call') { for (const key of ['callers','numbers']) item[key] = draft[key + '_text'].split(',').map(v => v.trim()).filter(Boolean); }
         } else if (draft.kind === 'script') keys.push('path','sha256');
@@ -141,16 +142,24 @@
     }
     async function save(remove) {
         if (busy) return;
-        busy = true; root.setAttribute('aria-busy','true'); const buttons = [...root.querySelectorAll('button')]; buttons.forEach(b => b.disabled = true);
+        busy = true; root.setAttribute('aria-busy','true');
+        const controls = [...root.querySelectorAll('button,input,select,textarea')], disabled = controls.map(control => control.disabled);
+        controls.forEach(control => { control.disabled = true; });
+        const controller = new AbortController(), timer = window.setTimeout(() => controller.abort(), 20000);
         try {
             const body = new URLSearchParams({slsmassnotifyserver_csrf:data.csrf,payload:JSON.stringify({...payload(),remove})});
-            const response = await fetch('config.php?display=slsmassnotifyserver_automations',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});
-            const result = await response.json(); if (!result.success) throw new Error(result.message || 'Settings save did not confirm completion. Reload before retrying.');
+            const response = await fetch('config.php?display=slsmassnotifyserver_automations',{method:'POST',credentials:'same-origin',cache:'no-store',headers:{'Content-Type':'application/x-www-form-urlencoded'},body,signal:controller.signal});
+            const result = await response.json();
+            if (!response.ok || !result || result.success !== true) throw new Error(result?.message || 'Settings save did not confirm completion. Reload before retrying.');
             state = result.state; dirty = false; draft = null; el('editor').hidden = true;
             el('secret').value = result.enrollment_secret || ''; el('enrollment').hidden = !result.enrollment_secret;
             display(); status(result.message,true);
-        } catch (error) { status(error.message,false); }
-        finally { busy = false; root.removeAttribute('aria-busy'); buttons.forEach(b => b.disabled = false); }
+        } catch (error) { status(error.name === 'AbortError' || error instanceof TypeError
+            ? 'The PBX did not confirm the change within 20 seconds. Reload saved settings before retrying; do not assume the save failed.' : error.message,false); }
+        finally {
+            window.clearTimeout(timer); busy = false; root.removeAttribute('aria-busy');
+            controls.forEach((control,index) => { if (control.isConnected) control.disabled = disabled[index]; });
+        }
     }
     root.querySelectorAll('[data-auto-add]').forEach(button => button.addEventListener('click', () => { if (leave()) open(button.dataset.autoAdd); }));
     el('editor').addEventListener('submit', event => { event.preventDefault(); save(false); });

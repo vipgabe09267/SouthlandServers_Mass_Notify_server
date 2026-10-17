@@ -38,11 +38,13 @@ class ReceiptContractTests(unittest.TestCase):
             namespace['push_announcement']({}, 'fixture', [], api_only=True, desktop_targets=['alice'])
         self.assertEqual(capture.getvalue(), '')
 
-    def run_ack(self, event_id, recipient='alice', broken_storage=False):
+    def run_ack(self, event_id, recipient='alice', broken_storage=False, enrolled_client='fixture-client'):
         source = API.read_text()
         route = source[source.index("if ($endpoint === 'desktop/ack') {"):source.index('$streamRequested =')]
         blocks = []
-        for start, end in [('function atomic_replace_journal', 'function retained_events'),
+        for start, end in [('function api_state_parent_matches', 'function api_state_lock'),
+                           ('function desktop_timestamp', 'function atomic_replace_journal'),
+                           ('function atomic_replace_journal', 'function retained_events'),
                            ('function record_desktop_acknowledgement', '\n\n$endpoint ='),
                            ('function desktop_event_routed_to_client', 'function desktop_stream_events_after_cursor')]:
             offset = source.index(start)
@@ -55,13 +57,15 @@ class ReceiptContractTests(unittest.TestCase):
                                   'json_encode(["event_id"=>' + json.dumps(event_id) + '])')
             fixture = '''<?php
 const RETENTION_MAX_EVENTS = 1000;
+const MAX_EVENT_ID_BYTES = 2048;
 function retention_days($settings) { return 90; }
 function respond($status, $body) { echo json_encode(['status'=>$status, 'body'=>$body]); exit; }
 function update_desktop_seen(...$args) {}
-function retained_events($settings) { return [['id'=>'fixture-event', 'desktop_recipients'=>[RECIPIENT]]]; }
+function retained_events($settings) { return [['id'=>'fixture-event', 'desktop_recipients'=>[RECIPIENT], 'desktop_client_ids'=>[RECIPIENT=>'fixture-client']]]; }
 $endpoint='desktop/ack'; $username='alice'; $client=['username'=>'alice','client_id'=>'fixture-client']; $settings=[];
-'''.replace('RECIPIENT', json.dumps(recipient))
+'''.replace('RECIPIENT', json.dumps(recipient)).replace("'client_id'=>'fixture-client'", "'client_id'=>"+json.dumps(enrolled_client))
             fixture += '\nconst DESKTOP_ACK_DIRECTORY = ' + json.dumps(str(directory)) + ';\n'
+            fixture += 'require_once ' + json.dumps(str(API.parent.parent/'sls-mass-notify/security.php')) + ';\n'
             script = Path(temporary) / 'fixture.php'
             script.write_text(fixture + '\n'.join(blocks) + route)
             result = subprocess.run(['php', str(script)], capture_output=True, text=True, check=True, timeout=10)
@@ -74,6 +78,7 @@ $endpoint='desktop/ack'; $username='alice'; $client=['username'=>'alice','client
         self.assertEqual(accepted['body']['event_id'], 'fixture-event')
         self.assertEqual(self.run_ack('fixture-event', recipient='bob')['status'], 400)
         self.assertEqual(self.run_ack('unknown')['status'], 400)
+        self.assertEqual(self.run_ack('fixture-event', enrolled_client='replacement-client')['status'], 400)
 
     def test_storage_failure_is_retryable_http503(self):
         failed = self.run_ack('fixture-event', broken_storage=True)

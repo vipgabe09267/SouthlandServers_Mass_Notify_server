@@ -189,10 +189,14 @@ can use **Audio: None**. Existing upgrade routes are preserved.
 Each recipient receives separate text and branded HTML through local Postfix.
 **Accepted by PBX mail service** confirms local submission, not inbox delivery.
 A bounded `postqueue -j` check stops SLS mail at 200 queued messages or when
-queue state is unverifiable. Shared limits are 120/minute, 1,000/hour and 5,000/day;
-system faults have stricter limits of 2, 10 and 20. All SLS producers share limits,
-including password recovery; other PBX mail is unaffected. Cron output goes to
-bounded diagnostics rather than email.
+queue state is unverifiable. Shared admission limits are 120 requests and 1,000
+recipients per minute, 1,000 requests and 5,000 recipients per hour, and 5,000
+requests and 25,000 recipients per day. System mail is limited to 2/10/20
+requests and 100/500/1,000 recipients over those windows. Account mail,
+including password recovery, is limited to 10/100/500 requests and the same
+10/100/500 recipient counts. One request can contain at most 50 recipients.
+Other PBX mail is unaffected. Cron output goes to bounded diagnostics rather
+than email.
 
 Submitted announcements freeze exact recipient IDs/addresses and sender identity.
 Email keeps its original 15-minute expiry and a 90-second batch budget.
@@ -224,6 +228,24 @@ PBX HTTPS URL and configured public Control API port. Discord must reach that ro
 Weather emails include the spoken announcement, affected areas, full NWS description
 and protective instructions. New observations continue while frozen queued alerts
 are delivered in order, with expiry/cancellation/deduplication checks.
+Speech uses official instructions when supplied; generic protective advice is
+used only when the alert lacks instructions. Invalid enabled quiet-hour times
+suppress noncritical delivery, while explicitly selected critical events retain
+their override.
+
+Weather features remain bounded to 256 KiB each. Larger map geometry is carried
+through private input streams with the full instructions and alert identity,
+avoiding operating-system argument limits. Invalid or oversized data is
+rejected before submission; speech duration and complete email body limits
+still apply.
+
+Legacy line-based Weather history is bounded to 5,000 records and 2 MiB per file.
+Startup preserves existing records, including Heat Advisories. It refuses new
+delivery at capacity, unsafe files and missing history behind a required marker;
+it never deletes records merely to reopen admission. Preserve recovery exports
+and review the affected history before retrying. An explicit manual replay is
+separate from automatic deduplication.
+
 Weather/Lightning workers can run disjoint audiences concurrently; shared
 recipients and area state remain ordered. Admitted work expires no later than
 3,200 seconds after starting or one hour after initial queueing.

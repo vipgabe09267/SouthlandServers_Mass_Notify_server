@@ -15,6 +15,7 @@ import pwd
 import re
 import stat
 import secrets
+import time
 
 LIMIT = 1048576
 LOCK = 'audio-reservations.lock'
@@ -161,7 +162,18 @@ def _locked(directory, writing, nonblocking):
                     os.fchown(lock_fd, info.st_uid, info.st_gid)
                 os.fchmod(lock_fd, 0o640)
             _regular(lock_fd, directory_fd, LOCK, info.st_uid, len(MARKER))
-            fcntl.flock(lock_fd, (fcntl.LOCK_EX if writing else fcntl.LOCK_SH) | (fcntl.LOCK_NB if nonblocking else 0))
+            operation=fcntl.LOCK_EX if writing else fcntl.LOCK_SH
+            deadline=time.monotonic()+1
+            while True:
+                try:
+                    fcntl.flock(lock_fd,operation|fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if nonblocking:
+                        raise
+                    if time.monotonic()>=deadline:
+                        raise RuntimeError('Paging reservation storage is busy; no additional audio was submitted') from None
+                    time.sleep(.01)
             _regular(lock_fd, directory_fd, LOCK, info.st_uid, len(MARKER))
             _directory_identity(directory_fd, path)
             if created:

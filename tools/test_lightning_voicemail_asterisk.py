@@ -20,10 +20,11 @@ import threading
 import time
 import wave
 
-if (os.environ.get('SLS_TEST_NAMESPACE') != 'entered'
-        or os.environ.get('SLS_TEST_PARENT_NET_NS') in (None, os.readlink('/proc/self/ns/net'))
-        or os.environ.get('SLS_TEST_PARENT_MOUNT_NS') in (None, os.readlink('/proc/self/ns/mnt'))):
-    raise SystemExit('Use the verified isolated runner.')
+if os.environ.get('SLS_TEST_NAMESPACE') != 'entered' or any(
+    os.environ.get('SLS_TEST_PARENT_' + label + '_NS') in (None, '', os.readlink('/proc/self/ns/' + kind))
+    for label, kind in [('MOUNT', 'mnt'), ('NET', 'net'), ('PID', 'pid')]
+):
+    raise SystemExit('Use the private fixture runner for Lightning voicemail.')
 sys.dont_write_bytecode = True
 repo = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo / 'slsmassnotifyserver/bin/sls_mass_notify'))

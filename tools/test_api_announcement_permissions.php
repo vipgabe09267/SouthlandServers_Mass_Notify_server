@@ -64,5 +64,12 @@ try{
  foreach([$fixture->getAnnouncementJob($jobId),$fixture->retryFailedAnnouncementJob($jobId)] as $result){
    if(($result['error_code']??'')!=='permission_denied')throw new RuntimeException('Another key could read or retry a restricted job.');
  }
+	 $foreignId='job_'.str_repeat('c',32);$old=gmdate('c',time()-90);
+	 $foreign=['id'=>$foreignId,'state'=>'queued','created_at'=>$old,'startup_attempted_at'=>$old,'request'=>$request,'receipts'=>[],'message'=>'fixture'];
+	 $foreignPath=$directory.'/'.$foreignId.'.json';file_put_contents($foreignPath,json_encode($foreign));$beforeForeign=file_get_contents($foreignPath);
+	 $foreignResult=$fixture->getAnnouncementJob($foreignId);
+	 if(($foreignResult['error_code']??'')!=='permission_denied'||file_get_contents($foreignPath)!==$beforeForeign||file_exists($foreignPath.'.lock')){
+	   throw new RuntimeException('Unauthorized job polling reconciled or mutated another credential\'s queued work.');
+	 }
 }finally{unset($GLOBALS['sls_control_principal']);foreach(glob($directory.'/*')?:[] as $file)unlink($file);rmdir($directory);}
 echo "Resolved API audiences, queued revocation, recipient intersection and job ownership passed.\n";

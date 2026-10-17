@@ -1,13 +1,15 @@
 <?php
 $e=static fn($value):string=>htmlspecialchars((string)$value,ENT_QUOTES|ENT_SUBSTITUTE,'UTF-8');
-$revision=substr(hash_file('sha256',__DIR__.'/enterprise.js'),0,12);
+$scriptHash=@hash_file('sha256',__DIR__.'/enterprise.js');$styleHash=@hash_file('sha256',__DIR__.'/enterprise.css');
+if (!is_string($scriptHash)||!is_string($styleHash)) { throw new RuntimeException('Enterprise Labs assets are unavailable. Repair the signed SLS module before opening this page.'); }
+$revision=substr(hash('sha256',$scriptHash.$styleHash),0,12);
 ?>
 <link rel="stylesheet" href="modules/slsmassnotifyserver/views/enterprise.css?v=<?php echo $revision; ?>">
 <div id="sls-enterprise" class="container-fluid"><div class="display full-border"><div class="fpbx-container">
 <header class="sls-ent-heading"><div><h1><i class="fa fa-flask" aria-hidden="true"></i> SLS Enterprise Labs</h1><p>Optional tools for coordinated delivery, identity and incident response.</p></div><?php include __DIR__.'/labs.php'; ?></header>
 <div class="sls-ent-notice"><i class="fa fa-info-circle" aria-hidden="true"></i><div>All new features start disabled. Automated protocol checks do not qualify real PBXs, providers or physical devices. Validate your complete deployment before relying on it.</div></div>
 <nav class="sls-ent-tabs" aria-label="Enterprise Labs sections">
-<?php foreach(['continuity'=>['server','Continuity and remote sites'],'identity'=>['key','Identity and subscribers'],'integrations'=>['plug','Devices and providers'],'operations'=>['clipboard','Incident coordination']] as $key=>[$icon,$label]): ?>
+<?php foreach(['continuity'=>['server','Continuity and remote sites'],'identity'=>['users','Directory and subscribers'],'integrations'=>['plug','Devices and providers'],'operations'=>['clipboard','Incident coordination']] as $key=>[$icon,$label]): ?>
 <a href="#labs-<?php echo $key; ?>" data-labs-tab="<?php echo $key; ?>"><i class="fa fa-<?php echo $icon; ?>" aria-hidden="true"></i> <?php echo $label; ?></a>
 <?php endforeach; ?></nav>
 <div id="sls-enterprise-status" class="sls-ent-notice" role="status" tabindex="-1" hidden></div>
@@ -17,6 +19,10 @@ $revision=substr(hash_file('sha256',__DIR__.'/enterprise.js'),0,12);
 <section data-labs-panel="operations" hidden>
 <div class="sls-ent-heading"><div><h2>Incident coordination <?php include __DIR__.'/labs.php'; ?></h2><p>Private floor plans, drill assignments, on-duty audiences and two-person review.</p></div><button class="btn btn-primary" id="sls-operations-save" type="button"><i class="fa fa-save" aria-hidden="true"></i> Save coordination settings</button></div>
 <label class="sls-ent-toggle"><input type="checkbox" id="sls-operations-enabled"> Enable incident coordination</label>
+<?php if (isset($operations['floorplan_storage'])): $usage=$operations['floorplan_storage']; ?>
+<p class="help-block"><i class="fa fa-hdd-o" aria-hidden="true"></i> Private floor plans: <?php echo (int)$usage['image_count']; ?> / 100 images, <?php echo $e(number_format(($usage['image_bytes']+$usage['pending_upload_bytes'])/1048576,1)); ?> / 32 MiB. Interrupted uploads older than one day are removed on the next upload.</p>
+<?php endif; ?>
+<section class="sls-ent-card"><h3><i class="fa fa-picture-o" aria-hidden="true"></i> Stored floor-plan images</h3><p>Download an image before retiring it. Retirement is allowed only after active, staged and retained configuration references are checked under lock.</p><div id="sls-floorplan-storage"></div></section>
 <div class="sls-ent-grid">
 <?php foreach(['floorplans'=>['map-o','Private floor plans','Plans remain private. Place locations and devices on an uploaded PNG or JPEG.'],
     'drills'=>['calendar-check-o','Central drills','Assign owners, deadlines and review objectives. Every launch is explicitly marked as a drill.'],
@@ -29,7 +35,7 @@ $revision=substr(hash_file('sha256',__DIR__.'/enterprise.js'),0,12);
 <section class="sls-ent-card"><h3><i class="fa fa-calendar" aria-hidden="true"></i> Drill report</h3><div id="sls-enterprise-drills"></div><button class="btn btn-default" id="sls-drill-export" type="button"><i class="fa fa-download" aria-hidden="true"></i> Export drill report</button></section>
 </section>
 <dialog id="sls-enterprise-editor" class="sls-ent-dialog"><form id="sls-enterprise-editor-form"><header><h2 id="sls-enterprise-editor-title"></h2><button type="button" data-close-enterprise aria-label="Close editor">×</button></header><div id="sls-enterprise-editor-body" class="sls-ent-dialog-body"></div><footer><button type="button" class="btn btn-default" data-close-enterprise>Close</button><button type="submit" class="btn btn-primary" id="sls-enterprise-editor-submit">Save in editor</button></footer></form></dialog>
-<dialog id="sls-labs-danger" class="sls-ent-dialog sls-ent-danger" aria-labelledby="sls-labs-danger-title"><header><h2 id="sls-labs-danger-title"></h2></header><div class="sls-ent-dialog-body"><p id="sls-labs-danger-body"></p><label><input type="checkbox" id="sls-labs-danger-agree" disabled> <span id="sls-labs-danger-agreement"></span> <span id="sls-labs-danger-countdown">(5s)</span></label><p id="sls-labs-danger-error" role="alert" hidden></p></div><footer><button type="button" id="sls-labs-danger-cancel" class="btn btn-default">Cancel</button><button type="button" id="sls-labs-danger-accept" class="btn btn-danger" disabled>Accept risk</button></footer></dialog>
+<?php $endpoint='config.php?display=slsmassnotifyserver_enterprise';$csrf=$csrf_token;$safetyFeature='enterprise_labs';$safetyAutomatic=true;$safetySelectors='[data-labs-panel], .sls-ent-tabs';include __DIR__.'/labs_danger.php'; ?>
 <script type="application/json" id="sls-enterprise-data"><?php echo json_encode(['csrf'=>$csrf_token,'operations'=>$operations,'safety'=>$safety,'safety_revision'=>\SLS\MassNotify\LabsSafety::revision()],JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT|JSON_THROW_ON_ERROR); ?></script>
 <script src="modules/slsmassnotifyserver/views/enterprise.js?v=<?php echo $revision; ?>" defer></script>
 </div></div></div>

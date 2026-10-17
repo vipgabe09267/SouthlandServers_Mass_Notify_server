@@ -49,7 +49,7 @@ def partition(raw):
         selected = False
         if line.endswith(b'\n'):
             try:
-                record = json.loads(line, object_pairs_hook=storage.reject_duplicate_json)
+                record = storage.runtime_json(line)
                 storage.encode_security_audit(record)
                 selected = storage.human_audit_record(record)
             except (ValueError, TypeError, AttributeError, UnicodeError):
@@ -125,7 +125,7 @@ def split(directory, recover=False):
         if established:
             if load(parent, '.audit-separation-required') != b'SLS_AUDIT_SEPARATION_V1\n':
                 raise RuntimeError('Migration marker is missing or damaged')
-            value = json.loads(load(parent, 'audit-separation.json'), object_pairs_hook=storage.reject_duplicate_json)
+            value = storage.runtime_json(load(parent, 'audit-separation.json'))
             storage.validate_audit_separation(value, complete=False)
             if value['state'] == 'complete':
                 for name, evidence in value['snapshots'].items():

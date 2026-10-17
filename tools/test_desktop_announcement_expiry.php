@@ -8,6 +8,15 @@ if (!is_string($source)) {
 	exit(1);
 }
 
+$timestampStart = strpos($source, 'function desktop_timestamp');
+$timestampEnd = $timestampStart === false ? false : strpos($source, "\n\nfunction desktop_private_directory_open", $timestampStart);
+if ($timestampStart === false || $timestampEnd === false) {
+	fwrite(STDERR, "Unable to locate desktop timestamp helper.\n");
+	exit(1);
+}
+eval(substr($source, $timestampStart, $timestampEnd - $timestampStart));
+if (!defined('MAX_EVENT_ID_BYTES')) { define('MAX_EVENT_ID_BYTES', 2048); }
+
 $start = strpos($source, 'function announcement_display_expired');
 $end = $start === false ? false : strpos($source, "\n\n\$endpoint =", $start);
 if ($start === false || $end === false) {
@@ -46,11 +55,11 @@ assert_same(false, announcement_display_expired([
 	'display_expires_at' => '2026-07-31T17:59:00Z',
 	'expires' => '2026-07-31T17:59:00Z',
 ], $now), 'Weather alert was incorrectly filtered by announcement expiry.');
-assert_same(false, announcement_display_expired([
+assert_same(true, announcement_display_expired([
 	'kind' => 'announcement',
 	'display_timeout_seconds' => 60,
 	'display_expires_at' => 'not-a-time',
-], $now), 'Malformed expiry was not handled safely.');
+], $now), 'Malformed expiry was not rejected safely.');
 
 assert_same(true, desktop_event_display_expired([
 	'kind' => 'alert', 'expires' => '2026-07-31T17:59:00Z',
@@ -106,7 +115,8 @@ $weatherEvents = [
 	['id' => 'expired-weather', 'kind' => 'alert', 'desktop_all' => true, 'expires' => '2026-07-31T17:59:00Z'],
 ];
 $weatherBatch = desktop_stream_events_after_cursor($weatherEvents, 'desktop-a', 'missing-cursor', $now);
-assert_same(['new-weather'], array_column($weatherBatch['events'], 0), 'Weather replay included expired or superseded instructions.');
+assert_same([], $weatherBatch['events'], 'A missing Weather cursor replayed retained instructions.');
+assert_same(true, $weatherBatch['cursor_gap'] ?? false, 'A missing Weather cursor did not report a history gap.');
 assert_same('expired-weather', $weatherBatch['last_event_id'], 'Weather expiry did not advance the cursor.');
 $weatherEvents[] = ['id' => 'cancel-weather', 'kind' => 'alert', 'chain_key' => 'storm-1', 'message_type' => 'Cancel', 'desktop_all' => true];
 $cancelledBatch = desktop_stream_events_after_cursor($weatherEvents, 'desktop-a', '@sls:empty', $now);

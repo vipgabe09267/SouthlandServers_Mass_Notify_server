@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import urllib.request
+from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
@@ -166,7 +167,7 @@ with tempfile.TemporaryDirectory(prefix="sls-xweather-crash-") as directory:
         mock.patch.object(worker, "EVENTS_LOG", events_path),
         mock.patch.object(worker, "load_config", return_value=(config, xweather)),
         mock.patch.object(worker, "fetch_payload", return_value={}),
-        mock.patch.object(worker, "normalize_records", return_value=[{"id": "strike-1"}]),
+        mock.patch.object(worker, "normalize_records", return_value=[{"id": "strike-1", "timestamp": first_poll_time}]),
         mock.patch.object(worker, "nearest_strike_miles", return_value=1.0),
         mock.patch.object(worker, "quiet_hours_active", return_value=False),
         mock.patch.object(worker, "generate_audio", return_value="test/sound"),
@@ -174,9 +175,9 @@ with tempfile.TemporaryDirectory(prefix="sls-xweather-crash-") as directory:
         mock.patch.object(worker, "send_visual", side_effect=send_visual),
         mock.patch.object(worker.time, "sleep", return_value=None),
     )
-    for patcher in common_patches:
-        patcher.start()
-    try:
+    with ExitStack() as patch_stack:
+        for patcher in common_patches:
+            patch_stack.enter_context(patcher)
         with mock.patch.dict(worker.os.environ, {"XWEATHER_DRY_RUN": "0"}, clear=True):
             with mock.patch.object(worker.time, "time", return_value=first_poll_time):
                 with mock.patch.object(worker, "commit_local_event_state", side_effect=crash_before_commit):
@@ -215,6 +216,9 @@ with tempfile.TemporaryDirectory(prefix="sls-xweather-crash-") as directory:
             # local channel even though this injection happens just before them.
             for path in (state_path, retry_path, status_path, log_path, events_path):
                 path.unlink(missing_ok=True)
+                # Start an independent fixture; never model lost established
+                # state by leaving its permanent marker and then resetting it.
+                path.with_name(path.name+'.lock').unlink(missing_ok=True)
             local_deliveries.update(audio=0, visual=0)
             intent_crash_time = first_poll_time + 120
             # Simulate an upgrade with a live pre-0.1.0 cluster that has no
@@ -224,6 +228,7 @@ with tempfile.TemporaryDirectory(prefix="sls-xweather-crash-") as directory:
                 '{"active":true,"notified":false,"empty_polls":0,"last_query":0}\n',
                 encoding="utf-8",
             )
+            state_path.chmod(0o640)
 
             def queue_intent_then_crash(*args, **kwargs):
                 real_queue_external_delivery(*args, **kwargs)
@@ -264,6 +269,7 @@ with tempfile.TemporaryDirectory(prefix="sls-xweather-crash-") as directory:
             # zero phone/Desktop targets.
             for path in (state_path, retry_path, status_path, log_path, events_path):
                 path.unlink(missing_ok=True)
+                path.with_name(path.name+'.lock').unlink(missing_ok=True)
             local_deliveries.update(audio=0, visual=0)
             queue_failure_time = first_poll_time + 240
             with mock.patch.object(
@@ -321,10 +327,6 @@ with tempfile.TemporaryDirectory(prefix="sls-xweather-crash-") as directory:
                         fail("Lightning interval-cooldown external retry did not succeed")
             if delivery_order != ["retry"]:
                 fail(f"Lightning interval cooldown skipped or duplicated its bounded external retry: {delivery_order}")
-    finally:
-        for patcher in reversed(common_patches):
-            patcher.stop()
-
 nws_source = (RUNTIME.parent / "sls_mass_notify_nws_poll.sh").read_text(encoding="utf-8")
 if '[ "$NWS_API_BASE_URL" != "https://api.weather.gov" ]' not in nws_source:
     fail("NWS shell worker lacks its independent canonical-origin gate")

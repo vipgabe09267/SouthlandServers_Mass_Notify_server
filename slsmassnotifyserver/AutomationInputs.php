@@ -7,7 +7,10 @@ final class AutomationInputs
 {
     public static function authenticate(array $rule, string $raw, array $headers, int $now): bool
     {
-        if (!in_array($rule['kind'],['panic','sensor'],true) || !$rule['enabled'] || strlen($raw)>16384) { return false; }
+        if (!is_string($rule['kind'] ?? null) || !in_array($rule['kind'],['panic','sensor'],true)
+            || ($rule['enabled'] ?? null) !== true || !is_string($rule['id'] ?? null)
+            || !preg_match('/^trg_[a-f0-9]{24}$/D',$rule['id']) || !is_string($rule['secret'] ?? null)
+            || !preg_match('/^[a-f0-9]{64}$/D',$rule['secret']) || strlen($raw)>16384) { return false; }
         $timestamp=$headers['timestamp'] ?? ''; $signature=$headers['signature'] ?? '';
         if (!is_string($timestamp) || !preg_match('/^[0-9]{10}$/D',$timestamp) || abs($now-(int)$timestamp)>60
             || !is_string($signature) || !preg_match('/^[a-f0-9]{64}$/D',$signature)) { return false; }
@@ -54,14 +57,19 @@ final class AutomationInputs
             $rawReferences=$text('references',$alert);
             if (strlen($rawReferences)>32768) { throw new \InvalidArgumentException('CAP reference list is too large.'); }
             if ($rawReferences!=='') {
+                $seenReferences=[];
                 foreach (preg_split('/\s+/',$rawReferences) as $reference) {
                     $parts=explode(',',$reference);
                     if (count($parts)!==3 || $parts[0]!==$sender || count($refs)>=50) { throw new \InvalidArgumentException('CAP references must identify at most 50 messages from the configured sender.'); }
-                    $refs[]=self::reference($rule,$parts[0],IncidentConfig::text($parts[1],200,'Referenced CAP identifier'),self::timestamp($parts[2]));
+                    $referenceSent=self::timestamp($parts[2]);
+                    if($referenceSent>=$sent){throw new \InvalidArgumentException('CAP references must identify an earlier source message.');}
+                    $referenceId=self::reference($rule,$parts[0],IncidentConfig::text($parts[1],200,'Referenced CAP identifier'),$referenceSent);
+                    if(isset($seenReferences[$referenceId])){throw new \InvalidArgumentException('CAP references must not repeat a source message.');}
+                    $seenReferences[$referenceId]=true;$refs[]=$referenceId;
                 }
             }
             if (in_array($type,['Update','Cancel'],true) && !$refs) { throw new \InvalidArgumentException('CAP Update/Cancel requires explicit source references.'); }
-            $base=['request_id'=>$own,'sent_at'=>$sent,'is_test'=>$status!=='Actual','caller'=>'','references'=>[$own],
+            $base=['request_id'=>$own,'sent_at'=>$sent,'is_test'=>$status!=='Actual','caller'=>'','references'=>array_merge([$own],$refs),
                 'invalidate'=>$type==='Alert' ? [] : $refs,'operation'=>strtolower($type)];
             if ($type==='Cancel') { $out[]=$base+['expires_at'=>$sent+$rule['max_age_seconds'],'event'=>$rule['event'],'message'=>'']; continue; }
             $infos=$xpath->query('c:info',$alert);
@@ -69,14 +77,30 @@ final class AutomationInputs
             foreach ($infos as $info) {
                 if ($text('event',$info)!==$rule['event']) { continue; }
                 $language=$text('language',$info);
-                if ($language!=='' && !preg_match('/^en(?:-|$)/i',$language)) { continue; }
+                $selected=strtolower($rule['language'] ?? 'en');
+                $language=strtolower($language ?: 'en');
+                if ($language!==$selected && !str_starts_with($language,$selected.'-')) { continue; }
                 $expires=self::timestamp($text('expires',$info));
                 $effective=$text('effective',$info);
                 // No future activation or implicit severity/recipient escalation.
                 if ($effective!=='' && self::timestamp($effective)>time()+15) { continue; }
                 $headline=$text('headline',$info);
                 if ($headline==='') { $headline=$rule['event']; }
-                $out[]=$base+['expires_at'=>$expires,'event'=>$rule['event'],'message'=>IncidentConfig::text($headline,200,'CAP headline')];
+                $parts=[IncidentConfig::text($headline,200,'CAP headline')];
+                foreach (['description'=>2000,'instruction'=>2000] as $field=>$maximum) {
+                    $value=$text($field,$info);
+                    if ($value!=='') { $parts[]=IncidentConfig::text($value,$maximum,'CAP '.$field); }
+                }
+                $areas=$xpath->query('c:area',$info);
+                if ($areas->length>20) { throw new \InvalidArgumentException('CAP contains too many affected areas.'); }
+                $names=[];
+                foreach ($areas as $area) {
+                    $value=$text('areaDesc',$area);
+                    if ($value!=='') { $names[]=IncidentConfig::text($value,400,'CAP affected area'); }
+                }
+                if ($names) { $parts[]=implode('; ',array_unique($names)); }
+                $out[]=$base+['expires_at'=>$expires,'event'=>$rule['event'],
+                    'message'=>IncidentConfig::text(implode("\n\n",$parts),3000,'Complete CAP message')];
                 break;
             }
         }
@@ -99,17 +123,23 @@ final class AutomationInputs
     public static function fetch(string $url): string
     {
         $parts=parse_url($url); $host=$parts['host'] ?? ''; $port=$parts['port'] ?? 443;
-        if (($parts['scheme'] ?? '')!=='https' || isset($parts['user']) || isset($parts['pass']) || isset($parts['fragment']) || !preg_match('/^[A-Za-z0-9.-]{1,253}$/D',$host) || $port!==443) { throw new \DomainException('Trusted CAP feeds require a public HTTPS hostname on port 443.'); }
-        $addresses=gethostbynamel($host);
+        if (strlen($url)>2048 || !filter_var($url,FILTER_VALIDATE_URL) || ($parts['scheme'] ?? '')!=='https'
+            || isset($parts['user']) || isset($parts['pass']) || isset($parts['fragment'])
+            || preg_match('/[\\\\\x00-\x20\x7f]/',$url)
+            || !is_string($host) || !preg_match('/^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/D',$host)
+            || $port!==443) { throw new \DomainException('Trusted CAP feeds require a public HTTPS hostname on port 443.'); }
+        $addresses=array_values(array_unique(gethostbynamel($host) ?: []));
         if (!$addresses || count($addresses)>32) { throw new \RuntimeException('CAP feed hostname could not be resolved.'); }
         foreach ($addresses as $ip) {
             if (!self::publicAddress($ip)) { throw new \DomainException('CAP feed DNS contains a private or reserved address.'); }
         }
-        $handle=curl_init($url); $body='';
-        curl_setopt_array($handle,[CURLOPT_FOLLOWLOCATION=>false,CURLOPT_CONNECTTIMEOUT=>3,CURLOPT_TIMEOUT=>8,CURLOPT_PROTOCOLS=>CURLPROTO_HTTPS,
-            CURLOPT_SSL_VERIFYPEER=>true,CURLOPT_SSL_VERIFYHOST=>2,CURLOPT_PROXY=>'',CURLOPT_RESOLVE=>[$host.':443:'.$addresses[0]],
+        if(!function_exists('curl_init')){throw new \RuntimeException('CAP feed HTTPS support is unavailable.');}
+        $handle=curl_init($url);if($handle===false){throw new \RuntimeException('CAP feed HTTPS request could not be initialized.');}$body='';
+        $configured=curl_setopt_array($handle,[CURLOPT_FOLLOWLOCATION=>false,CURLOPT_MAXREDIRS=>0,CURLOPT_CONNECTTIMEOUT=>3,CURLOPT_TIMEOUT=>8,CURLOPT_PROTOCOLS=>CURLPROTO_HTTPS,
+            CURLOPT_SSL_VERIFYPEER=>true,CURLOPT_SSL_VERIFYHOST=>2,CURLOPT_SSLVERSION=>CURL_SSLVERSION_TLSv1_2,CURLOPT_PROXY=>'',CURLOPT_NOPROXY=>'*',CURLOPT_RESOLVE=>[$host.':443:'.$addresses[0]],
             CURLOPT_HTTPHEADER=>['Accept: application/cap+xml, application/atom+xml, application/xml','Accept-Encoding: identity'],
             CURLOPT_WRITEFUNCTION=>static function($curl,string $chunk) use(&$body): int { if (strlen($body)+strlen($chunk)>1048576) { return 0; } $body.=$chunk; return strlen($chunk); }]);
+        if(!$configured){curl_close($handle);throw new \RuntimeException('CAP feed HTTPS safeguards could not be configured.');}
         try {
             $ok=curl_exec($handle); $status=curl_getinfo($handle,CURLINFO_RESPONSE_CODE);
             if ($ok===false || $status!==200) { throw new \RuntimeException('CAP feed fetch failed, exceeded 8 seconds/1 MiB, or returned HTTP '.$status.'. Redirects are not followed.'); }

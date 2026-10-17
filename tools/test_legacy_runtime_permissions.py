@@ -108,6 +108,19 @@ class PermissionRecoveryTests(unittest.TestCase):
         recovery.repair(self.data, self.approval)
         self.assertEqual(path.read_bytes(), body); self.assertEqual(path.stat().st_ino, inode)
 
+    def test_permanent_history_marker_mode_is_repaired_without_replacement(self):
+        marker=self.file(recovery.PHONE_HISTORY_MARKER_NAME,recovery.PHONE_HISTORY_MARKER)
+        body=marker.read_bytes();inode=marker.stat().st_ino
+        result=recovery.repair(self.data,self.approval)
+        self.assertIn(recovery.PHONE_HISTORY_MARKER_NAME,result['repaired_files'])
+        self.assertEqual(marker.read_bytes(),body);self.assertEqual(marker.stat().st_ino,inode)
+        self.assertEqual(stat.S_IMODE(marker.stat().st_mode),0o640)
+        marker.write_bytes(b'X');marker.chmod(0o644)
+        before=self.metadata()
+        with self.assertRaisesRegex(recovery.PermissionRecoveryError,'marker is malformed'):
+            recovery.repair(self.data,self.approval)
+        self.assertEqual(self.metadata(),before)
+
     def add_configs(self):
         self.file('announcement-activity.lock'); self.file('mass-notifications.config.lock')
         for name in recovery.CONFIG_NAMES:
@@ -117,7 +130,8 @@ class PermissionRecoveryTests(unittest.TestCase):
         self.add_configs(); before = self.metadata(); ring = self.keyring.read_bytes(); ring_inode = self.keyring.stat().st_ino
         encrypted = {name: (self.data / name).read_bytes() for name in recovery.CONFIG_NAMES}
         result = recovery.repair(self.data, self.approval)
-        self.assertEqual(set(result['repaired_files']), {*recovery.NAMES, '.'})
+        expected={name for name in recovery.NAMES if (self.data/name).exists()}
+        self.assertEqual(set(result['repaired_files']), {*expected, '.'})
         for name, previous in before.items():
             current = self.metadata()[name]
             self.assertEqual(current[:4], previous[:4]); self.assertEqual(current[5], previous[5])
@@ -271,6 +285,7 @@ class PermissionRecoveryTests(unittest.TestCase):
     def test_malformed_journal_never_partially_tightens_locks(self):
         for body in (b'{', b'{"schema":1,"schema":1,"batches":{}}',
                      b'{"schema":true,"batches":{}}', b'{"schema":1,"batches":{},"collector":NaN}',
+                     b'{"schema":1,"batches":{},"unused":1e309}',
                      b'{"schema":1,"batches":[]}'):
             with self.subTest(body=body):
                 self.file('phone-admission.json', body)

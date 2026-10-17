@@ -20,7 +20,7 @@ import wave
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sls_phone_admission import DATA, PhoneAdmissionError, PhoneAdmissionStore, PhoneAmi, read_settings, read_private_json, checked_limit, accountcode
+from sls_phone_admission import DATA, PhoneAdmissionError, PhoneAdmissionStore, PhoneAmi, read_settings, read_private_json, checked_limit, accountcode, checked_json
 from sls_nws_delivery_claims import CoordinationError, _account_ids, _open_directory, _validate_parent_directory
 
 TOKEN = re.compile(r'[a-f0-9]{32}')
@@ -176,8 +176,9 @@ class VoicemailMedia:
         try:
             self.file_info(fd, 4096)
             raw = os.read(fd, 4097)
-            value = json.loads(raw)
-            if (not isinstance(value, dict) or value.get('token') != token or value.get('schema') != 1
+            value = checked_json(raw)
+            if (not isinstance(value, dict) or value.get('token') != token
+                    or type(value.get('schema')) is not int or value['schema'] != 1
                     or value.get('kind') not in ('live', 'snapshot') or value.get('state') not in ('recording', 'complete')
                     or any(type(value.get(key)) not in (int, float) or not math.isfinite(value[key]) or value[key] < 0
                            for key in ('created_at', 'expires_at'))):
@@ -190,7 +191,7 @@ class VoicemailMedia:
                     or not math.isfinite(value['duration_seconds']) or not .5 <= value['duration_seconds'] <= value['max_seconds']):
                 raise ValueError('lease')
             return value
-        except (ValueError, OSError):
+        except (ValueError, OSError, PhoneAdmissionError):
             raise PhoneAdmissionError('phone_voicemail_audio_invalid') from None
         finally:
             os.close(fd)
@@ -459,7 +460,8 @@ def reserve_quota(directory, token, seconds):
     try:
         admission = Admission(read_settings(directory), 1, directory=directory)
         control = admission.file('speech-admission.lock')
-        fcntl.flock(control, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if not admission.available(control):
+            raise BlockingIOError('speech admission budget is busy')
         slots = [admission.file('speech-slot-%02d.lock' % index) for index in range(MAX_SLOTS)]
         rows = generated_inventory(admission.directory, admission.web)
         used = sum(row[3].st_size for row in rows)
@@ -488,7 +490,8 @@ def release_quota(directory, token):
     try:
         admission = Admission(read_settings(directory), 1, directory=directory)
         control = admission.file('speech-admission.lock')
-        fcntl.flock(control, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if not admission.available(control):
+            raise BlockingIOError('speech admission budget is busy')
         for index in range(MAX_SLOTS):
             slot = admission.file('speech-slot-%02d.lock' % index)
             rows = admission.record(slot)
@@ -518,7 +521,15 @@ def _cleanup_media(directory):
         store = PhoneAdmissionStore(directory)
         if not any(re.fullmatch(r'[a-f0-9]{32}\.json', name) for name in names): return 0
         try: state = read_private_json('phone-admission.json', directory)
-        except FileNotFoundError: state = {'schema': 1, 'batches': {}, 'collector': None}
+        except FileNotFoundError:
+            history_parent = _open_directory(Path(directory))
+            try:
+                _validate_parent_directory(history_parent)
+                if store.read_history_marker(history_parent) is not None:
+                    raise PhoneAdmissionError('phone_state_history_missing') from None
+            finally:
+                os.close(history_parent)
+            state = {'schema': 1, 'batches': {}, 'collector': None}
         store.validate(state)
         active = {token for token, batch in state['batches'].items() if batch['status'] != 'closed'}
         active.update(batch['voicemail']['source_token'] for batch in state['batches'].values()
@@ -870,7 +881,7 @@ def main():
         if sys.argv[1:] != ['--live-request']:
             return 64
         raw = sys.stdin.buffer.read(4097)
-        request = json.loads(raw)
+        request = checked_json(raw)
         if len(raw) > 4096 or not isinstance(request, dict) or set(request) != {'action', 'token', 'channel', 'seconds'}:
             raise PhoneAdmissionError('phone_voicemail_request_invalid')
         if request['action'] != 'prepare':

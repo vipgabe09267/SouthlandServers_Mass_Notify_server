@@ -1,6 +1,7 @@
 <?php
 declare(strict_types=1);
 namespace SLS\MassNotify;
+if (!class_exists('SlsAtomicJson', false)) { require_once __DIR__.'/bin/sls_mass_notify/sls_atomic_json.php'; }
 
 /** Failed-password windows survive cookies, restarts and parallel workers. */
 final class OperatorLoginRate
@@ -10,7 +11,7 @@ final class OperatorLoginRate
     private static function safe(string $path, array $meta, bool $lock=false): void
     {
         if (($meta['mode']&0170000)!==0100000 || ($meta['mode']&0027) || $meta['uid']!==posix_geteuid()
-            || $meta['nlink']!==1 || $meta['size']>($lock?0:self::MAX_BYTES) || is_link($path)) {
+            || $meta['nlink']!==1 || $meta['size']>($lock?32:self::MAX_BYTES) || is_link($path)) {
             throw new \RuntimeException('operator_failure_storage_unsafe');
         }
     }
@@ -20,48 +21,21 @@ final class OperatorLoginRate
         $parent=dirname($path);clearstatcache(true,$parent);$meta=@lstat($parent);
         if (!$meta || realpath($parent)!==$parent || ($meta['mode']&0170000)!==0040000 || ($meta['mode']&0022)
             || $meta['uid']!==posix_geteuid()) { throw new \RuntimeException('operator_failure_storage_unsafe'); }
-        $lockPath=$path.'.lock';clearstatcache(true,$lockPath);$before=@lstat($lockPath);$mask=umask(0037);
-        if ($before) { self::safe($lockPath,$before,true); }
-        try {
-            $lock=@fopen($lockPath,$before?'r+b':'x+b');
-            if (!$lock && !$before) { clearstatcache(true,$lockPath);$before=@lstat($lockPath);if($before){self::safe($lockPath,$before,true);$lock=@fopen($lockPath,'r+b');} }
-        } finally { umask($mask); }
-        if (!$lock) { throw new \RuntimeException('operator_failure_storage_unavailable'); }
-        $temporary=null;$output=null;
-        try {
-            $opened=fstat($lock);clearstatcache(true,$lockPath);$named=@lstat($lockPath);
-            if (!$named || !$opened || $opened['dev']!==$named['dev'] || $opened['ino']!==$named['ino']) { throw new \RuntimeException('operator_failure_storage_changed'); }
-            self::safe($lockPath,$opened,true);
-            $deadline=microtime(true)+2;
-            while(!flock($lock,LOCK_EX|LOCK_NB)){if(microtime(true)>=$deadline){throw new \RuntimeException('operator_failure_storage_busy');}usleep(10000);}
-            clearstatcache(true,$path);$old=@lstat($path);
-            $state=['schema'=>1,'last_time'=>0,'ips'=>[]];
-            if ($old) {
-                self::safe($path,$old);$input=@fopen($path,'rb');
-                if (!$input) { throw new \RuntimeException('operator_failure_storage_unavailable'); }
-                try {
-                    $opened=fstat($input);if($opened['ino']!==$old['ino']||$opened['dev']!==$old['dev']){throw new \RuntimeException('operator_failure_storage_changed');}
-                    $raw=stream_get_contents($input,self::MAX_BYTES+1);
-                } finally { fclose($input); }
-                if(strlen($raw)>self::MAX_BYTES){throw new \RuntimeException('operator_failure_storage_invalid');}
-                $state=json_decode($raw,true,8,JSON_THROW_ON_ERROR);
+        foreach([$path=>false,$path.'.lock'=>true] as $file=>$isLock){
+            clearstatcache(true,$file);$named=@lstat($file);if($named){self::safe($file,$named,$isLock);}
+        }
+        return \SlsAtomicJson::transaction($path,['schema'=>1,'last_time'=>0,'ips'=>[]],static function(array $state)use($path,$work):array{
+            // Preserve this limiter's stricter runtime-account ownership rule.
+            foreach([$path=>false,$path.'.lock'=>true] as $file=>$isLock){
+                clearstatcache(true,$file);$named=@lstat($file);if($named){self::safe($file,$named,$isLock);}
             }
             if (!is_array($state) || array_diff(array_keys($state),['schema','last_time','ips']) || ($state['schema']??null)!==1
                 || !is_int($state['last_time']??null) || !is_array($state['ips']??null) || count($state['ips'])>512) {
                 throw new \RuntimeException('operator_failure_storage_invalid');
             }
             $result=$work($state);
-            $bytes=json_encode($state,JSON_THROW_ON_ERROR);if(strlen($bytes)>self::MAX_BYTES){throw new \RuntimeException('operator_failure_storage_full');}
-            $temporary=$parent.'/.operator-failures-'.bin2hex(random_bytes(16));$mask=umask(0037);
-            try{$output=@fopen($temporary,'x+b');}finally{umask($mask);}
-            if(!$output || fwrite($output,$bytes)!==strlen($bytes)||!fflush($output)||!fsync($output)){throw new \RuntimeException('operator_failure_storage_write_failed');}
-            fclose($output);$output=null;clearstatcache(true,$path);$current=@lstat($path);
-            if(($old===false)!==($current===false)||($old&&($old['dev']!==$current['dev']||$old['ino']!==$current['ino']))){throw new \RuntimeException('operator_failure_storage_changed');}
-            if(!rename($temporary,$path)){throw new \RuntimeException('operator_failure_storage_write_failed');}$temporary=null;
-            $directory=@fopen($parent,'r');if(!$directory){throw new \RuntimeException('operator_failure_storage_write_failed');}
-            try{if(!fsync($directory)){throw new \RuntimeException('operator_failure_storage_write_failed');}}finally{fclose($directory);}
-            return $result;
-        } finally {if(is_resource($output)){fclose($output);}if($temporary!==null){@unlink($temporary);}fclose($lock);}
+            return [$state,$result,true];
+        },self::MAX_BYTES,true,true);
     }
 
     private static function prepare(array &$state, int $now): int

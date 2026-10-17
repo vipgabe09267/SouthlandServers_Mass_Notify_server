@@ -18,6 +18,9 @@ try {
     symlink($source,$root.'/sounds/custom/linked.wav');
     $list=Recordings::catalogue($root.'/sounds',['custom/uploads/Fire drill'=>'Fire drill']);
     recordingCheck(count($list)===2 && in_array('Fire drill',array_column($list,'label'),true),'Nested uploads, language and display name missing');
+    $normalized=Recordings::catalogue($root.'/sounds',['custom/uploads/Fire drill'=>['invalid'], 'es/custom/Spanish alert'=>str_repeat('x',400)]);
+    recordingCheck($normalized[0]['label']==='custom/uploads/Fire drill' || $normalized[1]['label']==='custom/uploads/Fire drill','Non-string recording label was not replaced safely');
+    recordingCheck(max(array_map('strlen',array_column($normalized,'label')))<=240,'Recording label exceeded its UI bound');
     $cache = $root.'/recordings-cache.json';
     $page = Recordings::cataloguePage($root.'/sounds', [], '', 0, 1, $cache);
     recordingCheck($page['total']===2 && $page['has_more'] && $page['next_offset']===1 && $page['scan_complete'], 'Recording pagination metadata incorrect');

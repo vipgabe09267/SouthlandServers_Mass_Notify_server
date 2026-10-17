@@ -33,7 +33,7 @@ try{
  $auth['recovery_hashes']=[hash('sha256','01234567-01234567-01234567-01234567')];
  $account=['id'=>$id,'username'=>'fixture','name'=>'Fixture','email'=>'fixture@example.test','source'=>'portal','enabled'=>true,'expires_at'=>1900003600,'role'=>'administrator','site_ids'=>[],'group_ids'=>[],'auth'=>$auth];
  $account['identity']=Auth::identity($account);$settings['operator_access']=Access::normalize(['enabled'=>false,'portal_enabled'=>true,'accounts'=>[$account]]);
- $module->seed($settings);file_put_contents(RecoveryFixture::PENDING_SETTINGS_JSON,json_encode($settings+['pending_only'=>'keep']));
+ $module->seed($settings);file_put_contents(RecoveryFixture::PENDING_SETTINGS_JSON,json_encode($settings+['pending_only'=>'keep']));chmod(RecoveryFixture::PENDING_SETTINGS_JSON,0640);
  $issue=static function()use($module,$id):array{$out=$module->manageOperatorPasswordReset('generate_reset_link',['id'=>$id]);recoveryCheck($out['success'],$out['message']??'Generate failed');return $out;};
  $token=static fn(array $out):string=>parse_url($out['reset_url'],PHP_URL_FRAGMENT)===false?'':substr(parse_url($out['reset_url'],PHP_URL_FRAGMENT),6);
  $out=$issue();$raw=$token($out);
