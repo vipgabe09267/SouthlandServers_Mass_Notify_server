@@ -1,4 +1,4 @@
-dist/
+/dist/
 *.tgz
 module.sig
 __pycache__/

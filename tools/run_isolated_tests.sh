@@ -98,6 +98,8 @@ cp "$ROOT_DIR"/slsmassnotifyserver/bin/sls_mass_notify_*.{php,sh,py} /usr/local/
 chown -R root:root /usr/local/bin/sls_mass_notify
 mkdir -p /var/lib/asterisk/SLS_Mass_Notifications_Plugin
 export PYTHONDONTWRITEBYTECODE=1 TMPDIR=/tmp SLS_TEST_READONLY_SOURCE="$ROOT_DIR"
+mkdir -m 0700 /tmp/sls-browser-config /tmp/sls-browser-cache
+export XDG_CONFIG_HOME=/tmp/sls-browser-config XDG_CACHE_HOME=/tmp/sls-browser-cache
 umask 027
 cd "$ROOT_DIR"
 python3 -I "$ROOT_DIR/slsmassnotifyserver/bin/sls_mass_notify/sls_config_crypto.py" init >/dev/null

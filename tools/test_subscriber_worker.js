@@ -3,12 +3,14 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
+const fixtureTime = Date.now();
+class FixtureDate extends Date { static now() { return fixtureTime; } }
 const handlers = new Map(), stored = new Map(), displayed = [], opened = [];
 let disappearOnMatch = '';
 const ledger = { async match(request) { if (request.url === disappearOnMatch) { disappearOnMatch = ''; stored.delete(request.url); return undefined; } return stored.get(request.url)?.clone(); }, async put(request, response) { stored.set(request.url, response.clone()); }, async keys() { return [...stored.keys()].map(url => new Request(url)); }, async delete(request) { return stored.delete(request.url); } };
 const self = { location: { origin: 'https://pbx.example.test' }, addEventListener(type, handler) { handlers.set(type, handler); }, registration: { async showNotification(title, options) { displayed.push({ title, options }); } } };
-vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../slsmassnotifyserver/portal/subscriber-worker.js'), 'utf8'), { self, caches: { async open(name) { assert.equal(name, 'sls-browser-push-v1'); return ledger; } }, clients: { async openWindow(url) { opened.push(url); } }, Date, Request, Response, URL, Number });
-const now = Math.floor(Date.now() / 1000), event = { event_id: 'fixture_1', title: 'Fixture', message: 'Message', is_test: true, expires_at: now + 300 };
+vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../slsmassnotifyserver/portal/subscriber-worker.js'), 'utf8'), { self, caches: { async open(name) { assert.equal(name, 'sls-browser-push-v1'); return ledger; } }, clients: { async openWindow(url) { opened.push(url); } }, Date: FixtureDate, Request, Response, URL, Number });
+const now = Math.floor(fixtureTime / 1000), event = { event_id: 'fixture_1', title: 'Fixture', message: 'Message', is_test: true, expires_at: now + 300 };
 async function push(value) { let work; handlers.get('push')({ data: { json() { return value; } }, waitUntil(promise) { work = promise; } }); await work; }
 (async () => {
   await push(event); await push(event); assert.equal(displayed.length, 1); assert.equal(displayed[0].title, 'SLS · TEST · Fixture');
