@@ -4,7 +4,7 @@
 
 # SLS Mass Notifications Server
 
-Phone, desktop, weather, lightning and scheduled notifications for FreePBX 17 on Debian 12. `0.1.7-beta` prerelease candidate · AGPL-3.0-or-later. Publication is pending.
+Phone, desktop, weather, lightning and scheduled notifications for FreePBX 17 on Debian 12. `0.1.7-beta` prerelease · AGPL-3.0-or-later.
 
 > **Beta software for noncritical testing. Do not rely on SLS for critical or urgent notifications.** Each FreePBX administrator accepts the warning once; their acknowledgment survives upgrades. Confirmation requires five visible seconds.
 
@@ -12,39 +12,30 @@ Phone, desktop, weather, lightning and scheduled notifications for FreePBX 17 on
 
 ## Install or update
 
-The candidate is not published yet. Once released, run as **root** on the PBX.
-For a first installation, use [publisher verification](docs/FIRST_INSTALL_VERIFICATION.md)
-before executing downloaded code. If you already have an independently verified
-installer hash, the short workflow is:
+Run as **root** on the PBX to install or update to **v0.1.7-beta**:
 
 ```bash
-SLS_INSTALL_DIR="$(mktemp -d /tmp/sls-verified-install.XXXXXXXX)"
-cd "$SLS_INSTALL_DIR"
+cd "$(mktemp -d /tmp/sls-install.XXXXXXXX)" &&
 curl -fsSL -o sls-install.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.7-beta/tools/install_release.sh
-SLS_INSTALLER_SHA256='REPLACE_WITH_THE_INDEPENDENTLY_VERIFIED_INSTALLER_SHA256'
-printf '%s  sls-install.sh\n' "$SLS_INSTALLER_SHA256" | sha256sum --check || exit 1
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.7-beta/tools/install_release.sh &&
+printf '%s\n' 'd890c6e54a93ee68a045f6525e2bb7590a55e299d4d094fa7d12c568efbe9f48  sls-install.sh' | sha256sum --check &&
 SLS_MASS_NOTIFY_TGZ_URL='https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/slsmassnotifyserver-0.1.7-beta/slsmassnotifyserver-0.1.7-beta.tgz' \
 bash ./sls-install.sh
 ```
 
-This command installs or upgrades using the publisher-signed package. Each release version identifies one signed package. Existing settings and credentials are preserved.
+The command checks the released installer's SHA-256 before running it; the installer verifies the publisher-signed package. Existing settings and credentials are preserved. See [independent publisher verification](docs/FIRST_INSTALL_VERIFICATION.md) for additional verification steps.
 
 Open **Mass Notify** in FreePBX, complete the setup wizard, review the timezone and use **Apply Config** when prompted. Forwarded ports are optional installation settings; shared defaults remain HTTPS 443 and HTTP 80. See [installation requirements, offline packages and supported layouts](INSTALL.md).
 
 ## Uninstall
 
-The installed uninstaller works **offline**, with no download or reinstallation:
-
-```bash
-sudo slsconsole uninstall
-```
-
-Direct command for installations that include the removal script but lack `slsconsole`:
+Run the included local uninstaller. It works **offline**, with no download or reinstallation:
 
 ```bash
 sudo /usr/local/bin/sls_mass_notify/sls_mass_notify_uninstall.sh
 ```
+
+You can also use `sudo slsconsole uninstall`.
 
 Normal removal preserves configuration, backups, uploaded tones, schedule/delivery history and logs. It drains SLS workers and refuses active phone delivery. Missing unrelated runtime helpers do not prevent removal; changed security evidence requires review. Complete purge is destructive and requires confirmation. See [removal and purge](INSTALL.md#uninstall) and [recovery-key retention](docs/RECOVERY.md).
 
