@@ -325,10 +325,24 @@ raise SystemExit(module.main())
             'Contact: <sip:1001@127.0.0.1:5999>;expires='+str(expires)+'\r\n'
             'Expires: '+str(expires)+'\r\nMax-Forwards: 70\r\n'
             'User-Agent: Yealink T48G private fixture\r\nContent-Length: 0\r\n\r\n')
-        peer.sendto(message.encode(),('127.0.0.1',5068))
+        request=message.encode()
+        deadline=time.monotonic()+4
+        next_transmit=time.monotonic()
+        interval=.5
+        # An endpoint can appear in config inventory before the UDP transport
+        # starts receiving. Retransmit this same non-INVITE transaction using
+        # SIP T1/T2 intervals; do not extend its four-second response deadline.
         with registration_condition:
-            if not registration_condition.wait_for(lambda:sequence in registration_responses,timeout=4):
-                raise RuntimeError('Private SIP REGISTER timed out: '+(root/'console.log').read_text()[-3000:])
+            while sequence not in registration_responses:
+                now=time.monotonic()
+                if now>=deadline:
+                    raise RuntimeError('Private SIP REGISTER timed out: '+(root/'console.log').read_text()[-3000:])
+                if now>=next_transmit:
+                    peer.sendto(request,('127.0.0.1',5068))
+                    next_transmit=now+interval
+                    interval=min(interval*2,2)
+                registration_condition.wait_for(lambda:sequence in registration_responses,
+                    timeout=max(0,min(next_transmit,deadline)-time.monotonic()))
             response=registration_responses.pop(sequence)
         if not response.startswith('SIP/2.0 200 '):
             raise RuntimeError('Private SIP REGISTER failed: '+response+'; '+(root/'console.log').read_text()[-3000:])
