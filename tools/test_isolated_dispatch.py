@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import tarfile
 import unittest
 import xml.etree.ElementTree as ET
 
@@ -79,6 +80,61 @@ command python3 -I "$ROOT_DIR/tools/verify_passkey_vendor.py"
             self.assertEqual(result.returncode,0,result.stdout+result.stderr)
             self.assertTrue(package.is_file())
             self.assertIn(str(package),result.stdout)
+
+    def archive_script(self):
+        source = (ROOT / 'tools/build_tgz.sh').read_text()
+        start = source.index('sls_archive_members() {')
+        end = source.index('\nchmod 0640 "${PACKAGE}"', start)
+        return 'ROOT_DIR="$1"; MODULE=slsmassnotifyserver; PACKAGE="$2"\n' + source[start:end]
+
+    def test_archive_ignores_empty_directories_and_normalizes_checkout_permissions(self):
+        with tempfile.TemporaryDirectory(prefix='sls-canonical-archive-') as folder:
+            root = Path(folder)
+            module = root / 'slsmassnotifyserver'
+            nested = module / 'nested'
+            nested.mkdir(parents=True, mode=0o700)
+            hidden = nested / '.htaccess'; hidden.write_text('Require all denied\n'); hidden.chmod(0o600)
+            license_file = module / 'LICENSE'; license_file.write_text('fixture license\n'); license_file.chmod(0o600)
+            executable = nested / 'worker'; executable.write_text('#!/bin/sh\nexit 0\n'); executable.chmod(0o700)
+            empty_file = nested / 'empty'; empty_file.touch(mode=0o600)
+            empty_tree = nested / 'unused' / 'empty'; empty_tree.mkdir(parents=True)
+            first = root / 'first.tgz'; second = root / 'second.tgz'
+            def build(package):
+                return subprocess.run(['bash', '-euo', 'pipefail', '-c', self.archive_script(),
+                    'fixture', str(root), str(package)], capture_output=True, text=True, timeout=15)
+            result = build(first)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            empty_tree.rmdir(); empty_tree.parent.rmdir()
+            nested.chmod(0o755); hidden.chmod(0o644); license_file.chmod(0o644)
+            executable.chmod(0o755); empty_file.chmod(0o644)
+            result = build(second)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            with tarfile.open(first) as archive:
+                entries = {entry.name: entry for entry in archive.getmembers()}
+                self.assertEqual(set(entries), {'slsmassnotifyserver', 'slsmassnotifyserver/LICENSE',
+                    'slsmassnotifyserver/nested', 'slsmassnotifyserver/nested/.htaccess',
+                    'slsmassnotifyserver/nested/empty', 'slsmassnotifyserver/nested/worker'})
+                self.assertEqual(archive.extractfile('slsmassnotifyserver/nested/.htaccess').read(), b'Require all denied\n')
+                for name, entry in entries.items():
+                    self.assertEqual(entry.mode, 0o755 if entry.isdir() or name.endswith('/worker') else 0o644)
+
+    def test_archive_rejects_links_instead_of_silently_omitting_them(self):
+        with tempfile.TemporaryDirectory(prefix='sls-canonical-link-') as folder:
+            root = Path(folder); module = root / 'slsmassnotifyserver'; module.mkdir()
+            target = module / 'regular'; target.write_text('fixture\n')
+            for name, create in [('symlink', lambda path: path.symlink_to(target)),
+                                 ('hardlink', lambda path: os.link(target, path))]:
+                with self.subTest(name=name):
+                    link = module / name; create(link)
+                    try:
+                        result = subprocess.run(['bash', '-euo', 'pipefail', '-c', self.archive_script(),
+                            'fixture', str(root), str(root / (name + '.tgz'))],
+                            capture_output=True, text=True, timeout=15)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn('Unsafe archive source entry:', result.stderr)
+                    finally:
+                        link.unlink()
 
     def test_staged_cli_worker_is_readable_after_runtime_account_handoff(self):
         result = subprocess.run(['/usr/sbin/runuser','-u','asterisk','--','/usr/bin/php',

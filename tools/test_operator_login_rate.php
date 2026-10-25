@@ -1,5 +1,28 @@
 <?php
 declare(strict_types=1);
+namespace SLS\MassNotify {
+ // Model lstat resolving an inode before a legitimate replacement, then
+ // obtaining its attributes after that inode has been retired.
+ function lstat(string $path) {
+  $meta=\lstat($path);$probe=$GLOBALS['operatorRateRetirementProbe']??null;
+  if(!$meta||!is_array($probe)||$path!==$probe['path'])return $meta;
+  $lock=\fopen($path.'.lock','r+b');if(!$lock)throw new \RuntimeException('Retirement probe lock unavailable');
+  try{
+   if(!\flock($lock,LOCK_EX|LOCK_NB))return $meta;
+   try{
+    $original=\fopen($path,'rb');if(!$original)throw new \RuntimeException('Retirement probe data unavailable');
+    try{
+     $bytes=\stream_get_contents($original);$temporary=$path.'.replacement';
+     if(!is_string($bytes)||\file_put_contents($temporary,$bytes)!==strlen($bytes)
+       ||!\chmod($temporary,0640)||!\rename($temporary,$path))throw new \RuntimeException('Retirement probe replacement failed');
+     $meta=\fstat($original);$GLOBALS['operatorRateRetirementProbe']['observations']++;
+    }finally{\fclose($original);}
+   }finally{\flock($lock,LOCK_UN);}
+  }finally{\fclose($lock);}
+  return $meta;
+ }
+}
+namespace {
 require dirname(__DIR__).'/slsmassnotifyserver/OperatorPortal.php';
 use SLS\MassNotify\{OperatorLoginRate as Rate,OperatorPortal as Portal};
 $checks=0;
@@ -43,16 +66,33 @@ try{
   link($target,$root.'/hardlink');denied(static fn()=>Rate::begin($path,$ip,$now+970),'Hard link accepted');unlink($root.'/hardlink');
   chmod($target,0660);denied(static fn()=>Rate::begin($path,$ip,$now+970),'Writable file accepted');chmod($target,0640);
   rename($target,$root.'/safe');symlink($root.'/safe',$target);denied(static fn()=>Rate::begin($path,$ip,$now+970),'Symlink accepted');unlink($target);rename($root.'/safe',$target);
+  $original=file_get_contents($target);$oversized=str_repeat('x',($type==='file'?524288:32)+1);file_put_contents($target,$oversized);
+  denied(static fn()=>Rate::begin($path,$ip,$now+970),'Oversized storage accepted');rateCheck(file_get_contents($target)===$oversized,'Rejected oversized storage was changed');file_put_contents($target,$original);
+  if(posix_geteuid()===0){chown($target,1);denied(static fn()=>Rate::begin($path,$ip,$now+970),'Unexpected owner accepted');rateCheck(file_get_contents($target)===$original,'Rejected foreign-owned storage was changed');chown($target,0);}
  }
  chmod($root,0770);denied(static fn()=>Rate::begin($path,$ip,$now+970),'Writable parent accepted');chmod($root,0700);
+ // An unlocked observer can see the retired inode's zero link count. The
+ // limiter must inspect the current data only while owning its permanent lease.
+ $retirement=$root.'/retirement.json';$grant=Rate::begin($retirement,$ip,$now+971);Rate::finish($retirement,$ip,$grant['reservation'],false,$now+971);
+ $lockIdentity=stat($retirement.'.lock');$GLOBALS['operatorRateRetirementProbe']=['path'=>$retirement,'observations'=>0];
+ $retired=\SLS\MassNotify\lstat($retirement);
+ rateCheck($retired['nlink']===0&&$GLOBALS['operatorRateRetirementProbe']['observations']===1,'Retired-inode control did not reproduce an atomic replacement');
+ $GLOBALS['operatorRateRetirementProbe']['observations']=0;
+ $grant=Rate::begin($retirement,$ip,$now+972);rateCheck($grant['retry_after']===0,'Legitimate replacement prevented login admission');
+ Rate::finish($retirement,$ip,$grant['reservation'],false,$now+972);
+ rateCheck($GLOBALS['operatorRateRetirementProbe']['observations']===0,'Limiter inspected replaceable data without its permanent lease');
+ clearstatcache(true,$retirement.'.lock');$afterLock=stat($retirement.'.lock');
+ rateCheck($lockIdentity['dev']===$afterLock['dev']&&$lockIdentity['ino']===$afterLock['ino'],'Atomic replacement changed the permanent lock');
+ unset($GLOBALS['operatorRateRetirementProbe']);
  $expiry=$root.'/expiry.json';for($i=0;$i<20;$i++){$at=$now+intdiv($i,6)*300;$g=Rate::begin($expiry,$ip,$at);Rate::finish($expiry,$ip,$g['reservation'],true,$at);}
  rateCheck(Rate::begin($expiry,$ip,$now+900+86400)['retry_after']===0,'Expired daily lock survived');
  // Concurrent workers reserve before expensive password hashing.
  $concurrent=$root.'/concurrent.json';$children=[];
  for($i=0;$i<12;$i++){
-  $pid=pcntl_fork();if($pid===0){$g=Rate::begin($concurrent,$ip,$now);file_put_contents($root.'/worker-'.$i,json_encode($g));exit(0);}if($pid<0)throw new RuntimeException('Fork failed');$children[]=$pid;
+  $pid=pcntl_fork();if($pid===0){try{$g=Rate::begin($concurrent,$ip,$now);if(file_put_contents($root.'/worker-'.$i,json_encode($g))===false)throw new RuntimeException('Worker result write failed');exit(0);}catch(Throwable $error){fwrite(STDERR,'Concurrent limiter worker: '.$error->getMessage()."\n");exit(1);}}if($pid<0)throw new RuntimeException('Fork failed');$children[]=$pid;
  }
- foreach($children as$pid){pcntl_waitpid($pid,$status);rateCheck(pcntl_wexitstatus($status)===0,'Concurrent limiter worker failed');}
+ $statuses=[];foreach($children as$pid){pcntl_waitpid($pid,$status);$statuses[]=$status;}
+ foreach($statuses as$status)rateCheck(pcntl_wifexited($status)&&pcntl_wexitstatus($status)===0,'Concurrent limiter worker failed');
  $grants=[];for($i=0;$i<12;$i++){$g=json_decode(file_get_contents($root.'/worker-'.$i),true);if(!$g['retry_after'])$grants[]=$g;}
  rateCheck(count($grants)===6,'Parallel workers bypassed six-attempt budget');foreach($grants as$g)Rate::finish($concurrent,$ip,$g['reservation'],true,$now);
  rateCheck(count(array_values(json_decode(file_get_contents($concurrent),true)['ips'])[0]['failures'])===6,'Concurrent failures were lost');
@@ -63,3 +103,4 @@ try{
  $state=json_decode(file_get_contents($general),true);rateCheck(($state['global']['count']??0)===11,'Recovery cleared global budget');
  echo "$checks durable password-limit, expiry, recovery, protected storage and concurrency checks passed.\n";
 }finally{foreach(glob($root.'/*')as$f)unlink($f);rmdir($root);}
+}

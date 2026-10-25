@@ -47,14 +47,14 @@ class DesktopApiDeliveryTests(unittest.TestCase):
     def tearDown(self):
         self.fixture.cleanup()
 
-    def php(self, statements, endpoint=False):
+    def php(self, statements, endpoint=False, timeout=30):
         harness = self.directory / "harness.php"
         contents = self.prefix + "\numask(0027);\n" + statements
         if endpoint:
             contents += "\n$endpoint =" + self.endpoint
         harness.write_text(contents, encoding="utf-8")
         result = subprocess.run(
-            ["php", str(harness)], capture_output=True, text=True, timeout=30, check=False
+            ["php", str(harness)], capture_output=True, text=True, timeout=timeout, check=False
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stderr, "", result.stderr)
@@ -385,6 +385,8 @@ class DesktopApiDeliveryTests(unittest.TestCase):
         self.assertEqual(result["retry"], [60, 40, 1])
 
     def test_full_failure_table_does_not_evict_budgets_or_block_authenticated_namespace(self):
+        # This exercises 1,000 sequential durable registrations, rather than
+        # one request's latency. Allow bounded disk/CPU variation on CI runners.
         result = self.php("""
             $data = [];
             for ($i = 0; $i < 2048; $i++) {
@@ -398,7 +400,7 @@ class DesktopApiDeliveryTests(unittest.TestCase):
             }
             $saved = json_decode(file_get_contents(DESKTOP_AUTH_RATE_FILE), true);
             echo json_encode(['failed' => $failed, 'valid' => $valid, 'count' => count($saved), 'original_preserved' => isset($saved[array_key_first($data)]), 'within_size_bound' => filesize(DESKTOP_AUTH_RATE_FILE) <= 524288]);
-        """)
+        """, timeout=90)
         self.assertEqual(result, {"failed": False, "valid": True, "count": 3048, "original_preserved": True, "within_size_bound": True})
 
     def test_cursor_polling_pages_backlog_without_skipping_expired_records(self):

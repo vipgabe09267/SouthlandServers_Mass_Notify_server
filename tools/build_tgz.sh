@@ -664,9 +664,42 @@ for required in \
   }
 done
 
-tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner --mode='go-w' \
+sls_archive_members() {
+  command python3 -I - "${ROOT_DIR}" "${MODULE}" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+root = Path(sys.argv[1])
+module = root / sys.argv[2]
+
+def members(path):
+    if path.name in {'module.sig', '__pycache__'} or path.name.endswith('.pyc'):
+        return []
+    info = path.lstat()
+    if info.st_mode & 0o6000:
+        raise SystemExit(f'Unsafe archive source permissions: {path}')
+    if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+        return [path.relative_to(root)]
+    if not stat.S_ISDIR(info.st_mode):
+        raise SystemExit(f'Unsafe archive source entry: {path}')
+    descendants = []
+    for child in sorted(path.iterdir(), key=lambda value: os.fsencode(value.name)):
+        descendants.extend(members(child))
+    return [path.relative_to(root), *descendants] if descendants else []
+
+paths = members(module)
+if not paths:
+    raise SystemExit('Module source has no archive files.')
+sys.stdout.buffer.write(b'\0'.join(os.fsencode(path) for path in paths) + b'\0')
+PY
+}
+
+sls_archive_members | tar --no-recursion --null --verbatim-files-from \
+  --mtime='@0' --owner=0 --group=0 --numeric-owner --mode='a=rX,u+w' \
   --exclude='module.sig' --exclude='__pycache__' --exclude='*.pyc' \
-  -C "${ROOT_DIR}" -cf - "${MODULE}" | gzip -n -9 > "${PACKAGE}"
+  -C "${ROOT_DIR}" -cf - --files-from=- | gzip -n -9 > "${PACKAGE}"
 chmod 0640 "${PACKAGE}"
 
 TGZ_PATH="${PACKAGE}" MODULE_NAME="${MODULE}" MODULE_VERSION="${VERSION}" python3 - <<'PY'

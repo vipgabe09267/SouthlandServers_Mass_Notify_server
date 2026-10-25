@@ -31,7 +31,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends libedit2 libxslt1.1 liburiparser1 asterisk22-core=22.10.1-1.sng12 asterisk22-doc=22.10.1-1.sng12 asterisk22-voicemail=22.10.1-1.sng12
           asterisk -V
-          mkdir -p /var/lib/asterisk /var/spool/asterisk /etc/asterisk /etc/sls-mass-notify /usr/local/bin/sls_mass_notify /var/www/html/admin/modules/slsmassnotifyserver
+          mkdir -p /var/lib/asterisk /var/spool/asterisk /etc/asterisk /etc/sls-mass-notify /usr/local/bin/sls_mass_notify /var/www/html/admin/modules/slsmassnotifyserver /var/www/html/sls_mass_notify
           touch /etc/freepbx.conf
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7, pinned
         with:

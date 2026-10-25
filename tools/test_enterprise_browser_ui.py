@@ -113,6 +113,10 @@ require_once MODULE.((($_GET['display']??'')==='slsmassnotifyserver_operators')?
         # Browser renderings use the same layout foundation as the PBX, while
         # JSON actions and private image downloads keep their exact responses.
         shell = '<?php if(($_SERVER["REQUEST_METHOD"]??"GET")==="GET"&&!isset($_GET["image_id"])) { echo \'<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">\';'
+        if 'bootstrap.css' not in cls.theme_assets:
+            # FreePBX supplies this layout reset. Keep its box model when the
+            # disposable runner has no optional exact Bootstrap asset.
+            shell += 'echo \'<style>*,*::before,*::after{box-sizing:border-box}body{margin:0}</style>\';'
         for name in cls.theme_assets:
             shell += 'echo '+json.dumps('<link rel="stylesheet" href="/pbx-ui/'+name+'">')+';'
         shell += 'echo \'</head><body>\'; } ?>'

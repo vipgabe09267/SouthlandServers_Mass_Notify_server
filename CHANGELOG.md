@@ -4,6 +4,8 @@
 
 ### Installation and security
 
+- Produce the same release archive from a clean checkout and a working tree with incidental empty directories; normalize archive modes without dropping hidden files or executable helpers.
+- Validate operator login failure state under its permanent transaction lock, avoiding false unsafe-storage errors during concurrent atomic updates while retaining ownership, permission and link checks.
 - Update the pinned setuptools packaging dependency to 84.2.1 with verified wheel hashes and refreshed installer workspace measurements.
 - Accept both exact managed collector service templates during upgrade inspection and rollback, including the resource-accounting template. Continue rejecting custom commands, privilege changes and systemd overrides.
 - Make local uninstaller help read-only and reject unsupported arguments before host operations. Correct the disposable VM purge scenario to use the documented removal setting.

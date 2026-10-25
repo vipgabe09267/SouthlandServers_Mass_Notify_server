@@ -21,9 +21,10 @@ final class OperatorLoginRate
         $parent=dirname($path);clearstatcache(true,$parent);$meta=@lstat($parent);
         if (!$meta || realpath($parent)!==$parent || ($meta['mode']&0170000)!==0040000 || ($meta['mode']&0022)
             || $meta['uid']!==posix_geteuid()) { throw new \RuntimeException('operator_failure_storage_unsafe'); }
-        foreach([$path=>false,$path.'.lock'=>true] as $file=>$isLock){
-            clearstatcache(true,$file);$named=@lstat($file);if($named){self::safe($file,$named,$isLock);}
-        }
+        // The data inode can retire during another worker's atomic replacement.
+        // Validate it under the permanent lock below, rather than an unlocked snapshot.
+        $lockPath=$path.'.lock';clearstatcache(true,$lockPath);$named=@lstat($lockPath);
+        if($named){self::safe($lockPath,$named,true);}
         return \SlsAtomicJson::transaction($path,['schema'=>1,'last_time'=>0,'ips'=>[]],static function(array $state)use($path,$work):array{
             // Preserve this limiter's stricter runtime-account ownership rule.
             foreach([$path=>false,$path.'.lock'=>true] as $file=>$isLock){
