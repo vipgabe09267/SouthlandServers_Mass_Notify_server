@@ -138,12 +138,15 @@ class DesktopApiDeliveryTests(unittest.TestCase):
             with selectors.DefaultSelector() as selector:
                 selector.register(process.stdout,selectors.EVENT_READ)
                 deadline=time.monotonic()+4
-                while b'event: authenticated' not in initial and time.monotonic()<deadline:
+                # The first keepalive follows the immediate policy recheck.
+                # Change settings after that read, rather than racing the handshake.
+                while b': keepalive ' not in initial and time.monotonic()<deadline:
                     for key,_ in selector.select(max(0,deadline-time.monotonic())):
                         chunk=os.read(key.fileobj.fileno(),8192)
                         if not chunk:break
                         initial+=chunk
             self.assertIn(b'event: authenticated',initial)
+            self.assertIn(b': keepalive ',initial)
             path=self.directory/'settings.json';settings=json.loads(path.read_text());settings['enterprise_labs']['enabled']=False
             replacement=self.directory/'updated-settings.json';replacement.write_text(json.dumps(settings));replacement.chmod(0o640);os.replace(replacement,path)
             remaining,errors=process.communicate(timeout=10)
