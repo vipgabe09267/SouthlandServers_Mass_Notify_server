@@ -74,6 +74,8 @@ Install, update, repair and removal share private maintenance/worker/configurati
 
 Downloads have HTTPS, size, time and hash bounds. Piper uses pinned hash-locked binary wheels and verified voice models. Protected imports compile authenticated source rather than executing legacy bytecode. Served PHP is checked independently of CLI PHP. Unsupported layouts, permissions or service states require review; the installer does not weaken host policy to force success.
 
+The explicit `0.1.8-beta --correction` bootstrap downloads a separately signed offline bundle and two checksum-pinned verification helpers. Their bytes are checked before execution; they read the real publisher ledger and enforce its current keys, revocations and expiry. Missing or unsafe established policy fails closed. The correction does not initialize, replace or rewind that policy, and the original immutable release assets remain unchanged.
+
 Offline candidates require the publisher signature, signed manifest and an explicitly trusted archive SHA-256. The digest is exactly 64 hexadecimal characters. Archive validation rejects duplicate or ambiguous paths, links, special files, writable executable payloads, oversized content and ambiguous module metadata before extraction. A checksum alone cannot authorize installation.
 
 Transactions retain authenticated recovery programs and snapshots before mutation. Recovery preserves configuration and newer delivery history. Failed transitions retain their last valid stage; incomplete rollback blocks another mutation. Module activation uses same-filesystem renames. Root logs, locks, snapshots and spool repairs use bounded identity/type/ownership checks.

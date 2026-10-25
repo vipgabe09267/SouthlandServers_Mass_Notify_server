@@ -21,9 +21,20 @@ The installer detects these capabilities and installs only missing Debian packag
 
 ## Recommended Install
 
-For a fresh installation, use the [checksum-pinned v0.1.8-beta bootstrap command in README](README.md#install-or-update). It authenticates the installer before execution. For an existing installation, use **General Settings > Check for updates > Install Selected Release**, which retains the established publisher trust policy. Do not use a floating branch or download a replacement publisher key.
+### 0.1.8-beta installation correction
 
-Before publisher trust is initialized, the fresh bootstrap also supports `--inspect` and `--recover` with the exact transaction path printed in the log. After initialization, use the installed verified updater or independently verify the matching standalone installer for inspection/recovery; the fresh bootstrap will refuse to bypass that policy.
+Use the [current correction command in README](README.md#install-or-update)
+for the separately signed `0.1.8-beta` correction. Its matching installer,
+manifest, signature and TGZ are distributed on the
+[`correction-0.1.8-beta` branch](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/tree/correction-0.1.8-beta);
+the original immutable release assets remain unchanged. Do not mix files from
+the two bundles. Existing publisher trust remains in force, and the ordinary
+updater does not reinstall an equal version. See [verification and publisher
+policy](docs/FIRST_INSTALL_VERIFICATION.md#018-beta-installation-correction).
+
+For this `0.1.8-beta` bundle, use the [checksum-pinned correction command in README](README.md#install-or-update) for fresh installations and existing PBXs. It must authenticate the signed installer and package before execution. For routine upgrades to later releases, use **General Settings > Check for updates > Install Selected Release**, which retains the established publisher trust policy. Do not download a replacement publisher key or bypass an existing policy.
+
+Before publisher trust is initialized, the original release's fresh bootstrap also supports `--inspect` and `--recover` with the exact transaction path printed in the log. After initialization, use the installed verified updater or independently verify the matching standalone installer for inspection/recovery; the fresh bootstrap will refuse to bypass that policy.
 
 The standalone release installer remains available to administrators who independently verify it using [FIRST_INSTALL_VERIFICATION.md](docs/FIRST_INSTALL_VERIFICATION.md). Keep its signature, manifest and recovery evidence together.
 
@@ -292,4 +303,4 @@ The supported adapter remains Debian 12, FreePBX 17 and the documented runtime p
 
 ### Previously installed withdrawn candidate
 
-0.1.8-beta upgrades earlier 0.1.6-beta builds using a distinct version and signed package. Releases are immutable: fixes after publication require a newer version. The updater intentionally ignores equal versions. Do not bypass package signatures, delete trust inventories or downgrade protected configuration to make the update appear newer.
+0.1.8-beta upgrades earlier 0.1.6-beta builds using a distinct version and signed package. Published release assets remain immutable. The separately signed same-version correction requires the explicit correction command above; the ordinary updater intentionally ignores equal versions. Do not bypass package signatures, delete trust inventories or downgrade protected configuration to make the update appear newer.

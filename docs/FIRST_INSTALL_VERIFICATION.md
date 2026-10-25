@@ -1,5 +1,24 @@
 # Verify a first installation
 
+## 0.1.8-beta installation correction
+
+For the corrected `0.1.8-beta` installer, use the [current checksum-pinned
+correction command](../README.md#install-or-update). The separately signed
+[correction bundle](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/tree/correction-0.1.8-beta)
+contains a matching installer, `release-manifest.json`, `release-manifest.sig`
+and `slsmassnotifyserver-0.1.8-beta.tgz`. Do not mix these with the original
+release assets. The original immutable release remains unchanged.
+
+This correction retains version `0.1.8-beta`; the ordinary updater does not
+reinstall an equal version. Existing installations need the explicit correction
+command. Their established publisher policy, including revocations and validity
+dates, remains authoritative; do not remove or bypass it. Correction mode checks
+the hashes of its verification helpers before running them against that policy.
+Failed verification against an established policy stops the correction; it does
+not fall back to the fresh-install key. A fresh PBX uses the unchanged publisher key below.
+
+## Manual verification of the original release
+
 The first installation has no trusted SLS verifier on the PBX. Verify the
 downloaded installer with the host's OpenSSL and Python before executing it.
 Upgrades through the installed protected updater already verify the release
@@ -15,9 +34,10 @@ MCowBQYDK2VwAyEAFMDOgOaBGcaI8d+v0w/NX4RbwGlBsoktNc2V2F8UkUQ=
 -----END PUBLIC KEY-----
 ```
 
-The following commands use a root-private directory and execute no downloaded
-code until both signature and installer hash checks succeed. The `0.1.8-beta`
-candidate is not published yet; use this version only after release approval.
+The following reference commands use the original immutable `0.1.8-beta`
+release assets. They create a root-private directory and execute no downloaded
+code until both signature and installer hash checks succeed. Use the correction
+command above when the corrected installer is required.
 
 ```bash
  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 \

@@ -4,6 +4,7 @@
 
 ### Installation and security
 
+- Distribute the signed 0.1.8-beta AMI installer correction separately from the immutable original release. Add an explicit correction bootstrap for fresh and existing PBXs, retaining the established publisher policy and verifying both package and installer before execution.
 - Recognize native AMI `[Syntax]` / `Action:` documentation without requiring a presentation heading. Apply the same check to installation, repair and restore; already registered custom providers do not trigger module loading or package repair. Reject failed, empty, malformed or mismatched CLI responses.
 - Produce the same release archive from a clean checkout and a working tree with incidental empty directories; normalize archive modes without dropping hidden files or executable helpers.
 - Validate operator login failure state under its permanent transaction lock, avoiding false unsafe-storage errors during concurrent atomic updates while retaining ownership, permission and link checks.

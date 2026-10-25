@@ -12,19 +12,17 @@ Phone, desktop, weather, lightning and scheduled notifications for FreePBX 17 on
 
 ## Install or update
 
-**Existing installation:** open SLS **General Settings**, choose **Check for updates**, then **Install Selected Release**. This uses the PBX's established publisher trust policy.
-
-**Fresh installation:** run this versioned command as **root**.
+Run the correction command below as **root** for a fresh installation, an upgrade, or a repeated installation of **0.1.8-beta**. It fixes AMI detection on Asterisk 20 and custom builds. The original immutable release assets remain available for recovery; this command uses the separately signed correction bundle.
 
 ```bash
 cd "$(mktemp -d /tmp/sls-install.XXXXXXXX)" &&
 curl -fsSL -o sls-bootstrap.sh \
-  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/slsmassnotifyserver-0.1.8-beta/tools/install_bootstrap.sh &&
-printf '%s\n' 'e5f3eb32fdbeee1ab6720e7db564295543fda7cc0a769e12cce27c4525a18bb1  sls-bootstrap.sh' | sha256sum --check &&
-bash ./sls-bootstrap.sh 0.1.8-beta
+  https://raw.githubusercontent.com/vipgabe09267/SouthlandServers_Mass_Notify_server/correction-0.1.8-beta/install_bootstrap.sh &&
+printf '%s\n' '3039a6b1a877695c1515e672366abde03d2702abb1f9b12f88107ab3128c27fb  sls-bootstrap.sh' | sha256sum --check &&
+bash ./sls-bootstrap.sh 0.1.8-beta --correction
 ```
 
-The pinned bootstrap verifies the publisher signature, release identity, signing expiry and installer hash before executing the installer. The installer verifies the package and PBX prerequisites before activation. A PBX with an explicit publisher trust policy must use its installed verified updater or approved recovery process. See [installation profiles](INSTALL.md) and [manual verification](docs/FIRST_INSTALL_VERIFICATION.md).
+The pinned bootstrap verifies the signature, release identity, expiry, installer and package before execution. Its pinned verifier honors an existing publisher policy and refuses incomplete or revoked authority. No policy is reset. For future version upgrades, use **General Settings > Check for updates > Install Selected Release**. See [installation profiles](INSTALL.md) and [manual verification](docs/FIRST_INSTALL_VERIFICATION.md).
 
 ## Uninstall
 
