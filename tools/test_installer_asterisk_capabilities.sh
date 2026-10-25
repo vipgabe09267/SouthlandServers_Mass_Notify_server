@@ -75,6 +75,9 @@ mock_padding_lines=0
 mock_heading_case="title"
 mock_heading_ansi=1
 mock_reported_capability_name=""
+mock_manager_documentation=""
+mock_manager_silent=0
+mock_manager_exit_status=0
 
 log() {
   :
@@ -431,10 +434,19 @@ asterisk() {
       ;;
     "manager show command ${mock_capability_name}")
       if [ "$mock_capability_type" = "manager" ] && [ "$mock_available" -eq 1 ]; then
-        printf "  -= Info about Manager Command '%s' =-\n" "$heading_name"
+        [ "$mock_manager_silent" -eq 0 ] || return 0
+        if [ -n "$mock_manager_documentation" ]; then
+          printf '%s\n' "$mock_manager_documentation"
+        else
+          printf '%s\n' '[Synopsis]' 'Manage channel state.' '' '[Description]' \
+            'The manager action is registered by the active Asterisk build.' '' '[Syntax]'
+          printf 'Action: %s\n' "$heading_name"
+          printf '%s\n' '[ActionID:] <value>' 'Channel: <value>'
+        fi
       else
         printf 'No such command.\n'
       fi
+      return "$mock_manager_exit_status"
       ;;
     "module load "*)
       mock_load_calls=$((mock_load_calls + 1))
@@ -510,18 +522,107 @@ asterisk_capability_available application Dial
 mock_capability_type="manager"
 mock_capability_name="MuteAudio"
 mock_available=1
+# Asterisk 20/22 manager help uses an Action line under [Syntax], without the
+# function/application-style "Info about" heading.
+for mock_capability_name in MuteAudio PlayDTMF Setvar Getvar; do
+  asterisk_capability_available manager "$mock_capability_name"
+done
+mock_capability_name="MuteAudio"
+mock_manager_documentation=$'\033[1;35m  [sYnTaX]  \033[0m\r\n\t aCtIoN \t:  mUtEaUdIo\t\r\n[ActionID:] <value>\r\nChannel: <value>\r\n'
 asterisk_capability_available manager MuteAudio
+mock_manager_documentation=""
 mock_reported_capability_name="MuteAudioExtra"
 if asterisk_capability_available manager MuteAudio; then
   printf 'A different manager command passed exact capability verification.\n' >&2
   exit 1
 fi
 mock_reported_capability_name=""
+
+# Neither prose, a similarly named action nor an unrelated documentation
+# section establishes the requested manager capability.
+for mock_manager_documentation in \
+  $'[Syntax]\nAction: MuteAudioExtra' \
+  $'[Syntax]\nAction: OtherMuteAudio' \
+  $'[Syntax]\nAction: MuteAudio extra' \
+  $'[Syntax]\nAction: "MuteAudio"' \
+  $'[Syntax]\nDescription: Action: MuteAudio' \
+  $'[Syntax]\nChannel: <value>\nAction: MuteAudio' \
+  $'[Syntax]\nAction: MuteAudio\nAction: MuteAudio' \
+  $'[Syntax]\nAction: MuteAudio\n[Syntax]\nAction: MuteAudio' \
+  $'[Synopsis]\nAction: MuteAudio' \
+  $'Action: MuteAudio\n[Syntax]\nChannel: <value>' \
+  $'[Syntax]\nChannel: <value>\n[Description]\nAction: MuteAudio' \
+  $'[Syntax] extra\nAction: MuteAudio' \
+  "  -= Info about Manager Command 'MuteAudio' =-" \
+  $'No such command.\n[Syntax]\nAction: MuteAudio' \
+  $'Unable to connect to remote asterisk (does /var/run/asterisk/asterisk.ctl exist?)\n[Syntax]\nAction: MuteAudio'; do
+  if asterisk_capability_available manager MuteAudio; then
+    printf 'Invalid or failed manager CLI documentation passed capability verification: %q\n' \
+      "$mock_manager_documentation" >&2
+    exit 1
+  fi
+done
+mock_manager_documentation=""
+mock_manager_silent=1
+if asterisk_capability_available manager MuteAudio; then
+  printf 'An empty, successful manager CLI response passed capability verification.\n' >&2
+  exit 1
+fi
+mock_manager_silent=0
+mock_manager_exit_status=1
+if asterisk_capability_available manager MuteAudio; then
+  printf 'A failed manager CLI call with valid-looking help passed capability verification.\n' >&2
+  exit 1
+fi
+mock_manager_exit_status=0
 mock_available=0
 if asterisk_capability_available manager MuteAudio; then
   printf 'An unavailable manager command passed capability verification.\n' >&2
   exit 1
 fi
+
+# Registered actions can come from a custom/unpackaged Asterisk build. Do not
+# inspect package ownership or load/reinstall anything after a successful probe.
+(
+  mock_custom_provider_calls="$(mktemp /tmp/sls-custom-asterisk-provider.XXXXXX)"
+  trap 'rm -f "$mock_custom_provider_calls"' EXIT
+  mock_available=1
+  mock_load_calls=0
+  mock_reload_calls=0
+  asterisk_module_file() {
+    printf 'provider path lookup\n' >>"$mock_custom_provider_calls"
+    printf '/opt/community-asterisk/modules/%s\n' "$1"
+  }
+  asterisk_provider_package() {
+    printf 'provider ownership lookup\n' >>"$mock_custom_provider_calls"
+    return 1
+  }
+  repair_asterisk_provider_package() {
+    printf 'provider package repair\n' >>"$mock_custom_provider_calls"
+    return 1
+  }
+  refresh_apt_metadata() {
+    printf 'apt metadata refresh\n' >>"$mock_custom_provider_calls"
+    return 1
+  }
+  apt-get() {
+    printf 'apt invocation\n' >>"$mock_custom_provider_calls"
+    return 1
+  }
+  dpkg-query() {
+    printf 'dpkg invocation\n' >>"$mock_custom_provider_calls"
+    return 1
+  }
+  for mock_capability_name in MuteAudio PlayDTMF; do
+    ensure_asterisk_capability manager "$mock_capability_name" res_custom_provider.so
+  done
+  for mock_capability_name in Setvar Getvar; do
+    require_asterisk_capability manager "$mock_capability_name"
+  done
+  [ "$mock_load_calls" -eq 0 ]
+  [ "$mock_reload_calls" -eq 0 ]
+  [ ! -s "$mock_custom_provider_calls" ]
+)
 
 mock_capability_type="function"
 mock_capability_name="PJSIP_HEADER"

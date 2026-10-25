@@ -60,7 +60,7 @@ URL="${SLS_MASS_NOTIFY_TGZ_URL:-${1:-}}"
 SHA256="${SLS_MASS_NOTIFY_SHA256:-}"
 TOKEN="${SLS_MASS_NOTIFY_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
 LOG_FILE="${SLS_MASS_NOTIFY_INSTALL_LOG:-/tmp/slsmassnotifyserver-install.log}"
-EXPECTED_TGZ_SHA256="4b467010088f54e29fab00065060672aba75e4adbc7f1c3b00c047fc5808ba9e"
+EXPECTED_TGZ_SHA256="d1b798c482d9d9f82122fa563c0a505eac57ebada50eeef221891880684734b6"
 DATA_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin"
 CONFIG_FILE="$DATA_DIR/mass-notifications.config"
 CONFIG_SNAPSHOT=""
@@ -1889,8 +1889,45 @@ asterisk_capability_available() {
       marker="Info about Application '$capability_name'"
       ;;
     manager)
-      capability_info="$(asterisk_cli_output "manager show command $capability_name")"
-      marker="Info about Manager Command '$capability_name'"
+      if ! capability_info="$(asterisk -rx "manager show command $capability_name" 2>&1)"; then
+        return 1
+      fi
+      capability_info="$(strip_asterisk_ansi <<<"$capability_info")"
+      # Manager help has no common presentation heading across Asterisk builds.
+      # Its Syntax section identifies the registered action on both 20 and 22.
+      LC_ALL=C awk -v wanted="$capability_name" '
+function trim(value) {
+  sub(/^[[:space:]]+/, "", value)
+  sub(/[[:space:]]+$/, "", value)
+  return value
+}
+{
+  line = trim($0)
+  lower = tolower(line)
+  if (lower ~ /^(no such command|unable to connect to remote asterisk|asterisk is not running|usage:)/) invalid = 1
+  if (lower == "[syntax]") {
+    sections++
+    in_syntax = 1
+    first = 1
+    next
+  }
+  if (line ~ /^\[[^][]+\]$/) { in_syntax = 0; next }
+  if (!in_syntax || line == "") next
+  separator = index(line, ":")
+  key = separator ? tolower(trim(substr(line, 1, separator - 1))) : ""
+  value = separator ? tolower(trim(substr(line, separator + 1))) : ""
+  if (first) {
+    first = 0
+    if (key != "action" || value != tolower(wanted)) invalid = 1
+  }
+  if (key == "action") {
+    actions++
+    if (value != tolower(wanted)) invalid = 1
+  }
+}
+END { exit !(sections == 1 && actions == 1 && !invalid) }
+' <<<"$capability_info"
+      return
       ;;
     *)
       log "Unknown Asterisk capability type: $capability_type"

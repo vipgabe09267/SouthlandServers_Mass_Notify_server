@@ -4,6 +4,7 @@
 
 ### Installation and security
 
+- Recognize native AMI `[Syntax]` / `Action:` documentation without requiring a presentation heading. Apply the same check to installation, repair and restore; already registered custom providers do not trigger module loading or package repair. Reject failed, empty, malformed or mismatched CLI responses.
 - Produce the same release archive from a clean checkout and a working tree with incidental empty directories; normalize archive modes without dropping hidden files or executable helpers.
 - Validate operator login failure state under its permanent transaction lock, avoiding false unsafe-storage errors during concurrent atomic updates while retaining ownership, permission and link checks.
 - Update the pinned setuptools packaging dependency to 84.2.1 with verified wheel hashes and refreshed installer workspace measurements.

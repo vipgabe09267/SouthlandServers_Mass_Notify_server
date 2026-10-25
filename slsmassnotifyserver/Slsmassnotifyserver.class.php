@@ -16344,6 +16344,34 @@ PY;
 		return $decoded;
 	}
 
+	private function asteriskCapabilityHelpMatches(string $type, string $name, string $output, int $status): bool
+	{
+		if ($status !== 0 || !in_array($type, ['function', 'application', 'manager'], true)
+			|| !preg_match('/^[A-Za-z][A-Za-z0-9_]{0,79}$/D', $name)) { return false; }
+		$text = preg_replace('/\x1b\[[0-?]*[ -\/]*[@-~]/', '', $output);
+		if (!is_string($text)) { return false; }
+		if ($type !== 'manager') {
+			return stripos($text, "Info about " . $type . " '" . $name . "'") !== false;
+		}
+		$syntaxCount = 0; $actionCount = 0; $inSyntax = false; $firstLine = null; $action = '';
+		foreach (preg_split('/\n/', $text) as $line) {
+			$line = trim($line, " \t\r\n\v\f");
+			if (preg_match('/^(?:No such command|Unable to connect to remote asterisk|Asterisk is not running|Usage:)/i', $line)) { return false; }
+			if (preg_match('/^\[([^\]]+)\]$/D', $line, $heading)) {
+				$inSyntax = strcasecmp($heading[1], 'Syntax') === 0;
+				if ($inSyntax) { $syntaxCount++; $firstLine = null; }
+				continue;
+			}
+			if (!$inSyntax || $line === '') { continue; }
+			if ($firstLine === null) { $firstLine = $line; }
+			if (preg_match('/^Action[ \t]*:[ \t]*(.*)$/iD', $line, $match)) {
+				$actionCount++; $action = trim($match[1], " \t\r\n\v\f");
+			}
+		}
+		return $syntaxCount === 1 && $actionCount === 1 && is_string($firstLine)
+			&& preg_match('/^Action[ \t]*:/i', $firstLine) === 1 && strcasecmp($action, $name) === 0;
+	}
+
 	private function verifyNativePostRestoreIntegration($rootChecks = true)
 	{
 		$restoreMarker = $this->loadNativeRestoreMarker();
@@ -16871,9 +16899,7 @@ PY;
 				? 'manager show command ' . $capability[1]
 				: 'core show ' . $capability[0] . ' ' . $capability[1];
 			@exec('/usr/bin/timeout --signal=TERM --kill-after=2 30 /usr/sbin/asterisk -rx ' . escapeshellarg($command) . ' 2>&1', $capabilityOutput, $capabilityStatus);
-			$capabilityText = preg_replace('/\x1b\[[0-9;]*[A-Za-z]/', '', implode("\n", $capabilityOutput));
-			$heading = "Info about " . ($capability[0] === 'manager' ? 'Manager Command' : $capability[0]) . " '" . $capability[1] . "'";
-			if ($capabilityStatus !== 0 || stripos((string)$capabilityText, $heading) === false) {
+			if (!$this->asteriskCapabilityHelpMatches($capability[0], $capability[1], implode("\n", $capabilityOutput), $capabilityStatus)) {
 				throw new \RuntimeException(sprintf(_('Post-restore verification could not find Asterisk %s %s.'), $capability[0], $capability[1]));
 			}
 		}

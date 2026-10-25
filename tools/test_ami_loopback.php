@@ -51,6 +51,32 @@ namespace {
     $assert = static function ($condition, $message) use (&$checks) {
         $checks++; if (!$condition) { throw new RuntimeException($message); }
     };
+    foreach (['MuteAudio','PlayDTMF','Setvar','Getvar'] as $action) {
+        foreach (["[Syntax]\nAction: {$action}\nChannel: <value>\n[Arguments]\nChannel\n",
+                  "\033[1;35m[SYNTAX]\033[0m\r\n  action : " . strtolower($action) . " \t\r\n[ActionID:] <value>\r\n[Arguments]\r\n",
+                  "  -= Info about Manager Command '{$action}' =-\n[Syntax]\nAction: {$action}\n"] as $help) {
+            $assert($call('asteriskCapabilityHelpMatches','manager',$action,$help,0), 'Valid manager action syntax was rejected: '.$action);
+        }
+        foreach ([1,2,124] as $status) {
+            $assert(!$call('asteriskCapabilityHelpMatches','manager',$action,"[Syntax]\nAction: {$action}\n",$status), 'Failed CLI status approved manager support.');
+        }
+    }
+    foreach (['', "No such command\n", "Info about Manager Command 'MuteAudio'\n",
+              "[Description]\nAction: MuteAudio\n", "[Syntax]\nAction: PlayDTMF\n",
+              "[Syntax]\nAction: MuteAudioExtra\n", "[Syntax]\nAction: PrefixMuteAudio\n",
+              "[Syntax]\nAction: MuteAudio extra\n", "[Syntax]\nAction: MuteAudio\0\n",
+              "[Syntax]\nChannel: <value>\nAction: MuteAudio\n",
+              "[Syntax]\nAction: MuteAudio\nAction: MuteAudio\n",
+              "[Syntax]\nAction: MuteAudio\n[Syntax]\nAction: MuteAudio\n",
+              "[Syntax]\nAction: Other\n[Description]\nAction: MuteAudio\n",
+              "No such command 'manager show command MuteAudio'\n[Syntax]\nAction: MuteAudio\n",
+              "Unable to connect to remote asterisk\n[Syntax]\nAction: MuteAudio\n",
+              "Asterisk is not running\n[Syntax]\nAction: MuteAudio\n",
+              "Usage: manager show command\n[Syntax]\nAction: MuteAudio\n"] as $help) {
+        $assert(!$call('asteriskCapabilityHelpMatches','manager','MuteAudio',$help,0), 'Invalid or spoofed manager help approved support.');
+    }
+    $assert($call('asteriskCapabilityHelpMatches','function','MUTEAUDIO',"Info about Function 'MUTEAUDIO'",0), 'Existing function detection changed.');
+    $assert($call('asteriskCapabilityHelpMatches','application','Page',"Info about Application 'Page'",0), 'Existing application detection changed.');
     $_SERVER['HTTP_HOST'] = 'pbx.example.test';
     $settings = $call('getDefaultSettings');
     $settings['ami']['password'] = 'synthetic-secret-do-not-log';
