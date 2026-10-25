@@ -46,6 +46,20 @@ class HealthSnapshots(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
 
+    def test_transient_missing_reports_require_sustained_observation_before_email(self):
+        state=self.base/'email-state.json';config={'system_notification_emails':'fixture@example.invalid'};sent=[]
+        sender=lambda *args,**kwargs: sent.append(args) or True
+        faults=MODULE.collect_health_faults(worker(),storage(checked_at=NOW-301),now=NOW)
+        def process(value,now):return MODULE.process_faults(config,value,state,sender=sender,now=now)
+        self.assertEqual(process(faults,NOW)['sent'],0)
+        self.assertEqual(process(faults,NOW+119)['sent'],0)
+        self.assertEqual(process({},NOW+120)['sent'],0)
+        self.assertFalse(sent,'A recovered health snapshot generated an email')
+        self.assertEqual(process(faults,NOW+180)['sent'],0)
+        self.assertEqual(process(faults,NOW+300)['sent'],1)
+        self.assertEqual(process(faults,NOW+360)['sent'],0)
+        self.assertEqual(len(sent),1)
+
     def test_media_cache_faults_clear_with_current_measurements(self):
         for flag in ('media_over_budget', 'media_scan_incomplete'):
             self.assertIn('storage', MODULE.collect_health_faults(worker(), storage(**{flag: True}), now=NOW))

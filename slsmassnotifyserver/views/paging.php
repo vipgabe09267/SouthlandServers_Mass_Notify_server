@@ -111,7 +111,7 @@ $help = static function (string $id, string $text) use ($escape): void {
     <?php echo load_view(__DIR__ . '/hero.php', ['hero_image' => $hero_image ?? '']); ?>
     <div id="sls-paging-page-content">
     <div class="sls-paging-heading">
-        <div><h1><i class="fa fa-bullhorn text-primary" aria-hidden="true"></i> <?php echo _('Dial-in Paging'); ?> <?php include __DIR__ . '/labs.php'; ?></h1><p class="text-muted"><?php echo _('Choose a paging number, add a group, then Apply Config. Authorized callers dial the number and choose a group to speak live.'); ?></p></div>
+        <div><h1><i class="fa fa-bullhorn text-primary" aria-hidden="true"></i> <?php echo _('Dial-in Paging'); ?> <?php include __DIR__ . '/labs.php'; ?></h1><p class="text-muted"><?php echo _('Choose a paging number, add a group, then Apply Config. Callers choose a group and wait for the ready tone before speaking.'); ?></p></div>
         <span class="sls-paging-badge"><i class="fa fa-users" aria-hidden="true"></i> <span id="sls-paging-group-count" aria-live="polite"></span></span>
     </div>
     <div class="alert <?php echo !empty($active_paging_enabled) ? 'alert-info' : 'alert-warning'; ?>" role="status">

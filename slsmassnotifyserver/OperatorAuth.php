@@ -1,7 +1,9 @@
 <?php
 declare(strict_types=1);
 namespace SLS\MassNotify;
+require_once __DIR__.'/PasskeyConfig.php';
 require_once __DIR__.'/OperatorRecovery.php';
+require_once __DIR__.'/PasswordBlocklist.php';
 
 /** Independent portal credentials. Authentication state lives in .config. */
 final class OperatorAuth
@@ -19,8 +21,11 @@ final class OperatorAuth
 
     public static function password(string $password): string
     {
-        if (!preg_match('//u',$password) || mb_strlen($password)<15 || strlen($password)>128 || preg_match('/\p{C}/u',$password)) {
+        if (!preg_match('//u',$password) || mb_strlen($password,'UTF-8')<15 || strlen($password)>128 || preg_match('/\p{C}/u',$password)) {
             throw new \DomainException('Use a password of at least 15 characters and at most 128 bytes, without control characters.');
+        }
+        if (PasswordBlocklist::contains($password)) {
+            throw new \DomainException('This password is in the local common-password blocklist. Choose a different passphrase.');
         }
         if (in_array('argon2id',password_algos(),true)) {
             return password_hash($password,PASSWORD_ARGON2ID,self::ARGON);
@@ -50,7 +55,7 @@ final class OperatorAuth
 
     public static function normalize($value): array
     {
-        if (!is_array($value) || array_diff(array_keys($value),['password_hash','version','totp_secret_enc','totp_last_counter','recovery_hashes','force_password_change','password_recovery'])
+        if (!is_array($value) || array_diff(array_keys($value),['password_hash','version','totp_secret_enc','totp_last_counter','recovery_hashes','force_password_change','password_recovery','passkeys'])
             || !self::validHash($value['password_hash']??null) || !is_string($value['version']??null)
             || !preg_match('/^[a-f0-9]{64}$/D',$value['version']) || !is_bool($value['force_password_change']??null)
             || !is_string($value['totp_secret_enc']??null) || !preg_match('/^(?:|op1:[A-Za-z0-9+\/]{80})$/D',$value['totp_secret_enc'])
@@ -60,6 +65,7 @@ final class OperatorAuth
         }
         foreach ($value['recovery_hashes'] as $hash) { if (!is_string($hash) || !preg_match('/^[a-f0-9]{64}$/D',$hash)) { throw new \DomainException('Invalid operator recovery record.'); } }
         if (array_key_exists('password_recovery',$value)) { $value['password_recovery']=OperatorRecovery::normalize($value['password_recovery']); }
+        if(array_key_exists('passkeys',$value)){$value['passkeys']=PasskeyConfig::normalize($value['passkeys']);}
         return $value;
     }
 
@@ -144,6 +150,7 @@ final class OperatorAuth
         $account['totp_enrolled']=is_array($auth) && $auth['totp_secret_enc']!=='';
         $account['recovery_remaining']=is_array($auth)?count($auth['recovery_hashes']):0;
         $account['password_change_required']=is_array($auth) && $auth['force_password_change'];
+        if(is_array($auth)&&!empty($auth['passkeys'])){$account['passkeys']=PasskeyConfig::publicRows($auth['passkeys']);}
         if (is_array($auth)) {
             $state=OperatorRecovery::normalize($auth['password_recovery']??[]);
             $account['password_recovery']=['emails_remaining'=>2-$state['emails_sent'],

@@ -1,6 +1,7 @@
 <?php
 declare(strict_types=1);
 namespace SLS\MassNotify;
+require_once __DIR__.'/api/sls-mass-notify/person-profiles.php';
 require_once __DIR__.'/DirectoryConfig.php';
 require_once __DIR__.'/EnterpriseIdentityHttp.php';
 require_once __DIR__.'/IncidentConfig.php';
@@ -83,7 +84,7 @@ final class DirectorySync
     }
     public static function revision(array $settings): string
     {
-        return hash('sha256',json_encode([$settings['directory_sync']??[],$settings['incident_workflows']??[],$settings['subscriber_browser']??[]],JSON_THROW_ON_ERROR));
+        return hash('sha256',json_encode([$settings['directory_sync']??[],$settings['incident_workflows']??[],$settings['subscriber_browser']??[],$settings['announcement_groups']??[]],JSON_THROW_ON_ERROR));
     }
     public static function plan(array $settings,array $source,array $incoming): array
     {
@@ -99,7 +100,7 @@ final class DirectorySync
         $deactivated=count(array_filter($changes,static fn($row)=>$row['kind']==='deactivate'));$previous=count(array_filter($source['records'],static fn($row)=>$row['active']));
         $percent=$previous?min(100,(int)ceil(100*$deactivated/$previous)):0;
         return ['source_id'=>$source['id'],'revision'=>self::revision($settings),'records'=>$incoming,'changes'=>$changes,'active'=>count(array_filter($incoming,static fn($r)=>$r['active'])),'template_ids'=>$source['template_ids'],
-            'deactivation_count'=>$deactivated,'deactivation_percent'=>$percent,'requires_deactivation_confirmation'=>$deactivated>0&&$percent>=($source['maximum_deactivation_percent']??25)];
+            'affected_audiences'=>PersonProfiles::affected($settings,array_column(array_filter($changes,static fn($r)=>in_array($r['kind'],['deactivate','remove_inactive'],true)),'person_id')),'deactivation_count'=>$deactivated,'deactivation_percent'=>$percent,'requires_deactivation_confirmation'=>$deactivated>0&&$percent>=($source['maximum_deactivation_percent']??25)];
     }
     public static function apply(array $settings,array $source,array $incoming): array
     {

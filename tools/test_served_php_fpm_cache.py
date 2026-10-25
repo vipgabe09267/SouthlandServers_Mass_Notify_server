@@ -79,9 +79,14 @@ class ServedFpmCache(unittest.TestCase):
             self.fail('This qualification needs the PHP 8.2 FPM binary; install it in the disposable CI runner')
         with tempfile.TemporaryDirectory(prefix='sls-fpm-cache-') as temporary:
             root=Path(temporary); root.chmod(0o755)
+            policy=ROOT/'slsmassnotifyserver/bin/sls_mass_notify/php-security-policy.json'
+            (root/'php-security-policy.json').write_bytes(policy.read_bytes());(root/'php-security-policy.json').chmod(0o644)
+            helper=(ROOT/'slsmassnotifyserver/api/sls-mass-notify/runtime-security.php').read_text()
+            helper=helper.replace("dirname(__DIR__, 2).'/bin/sls_mass_notify/php-security-policy.json'","__DIR__.'/php-security-policy.json'")
+            (root/'runtime-security.php').write_text(helper);(root/'runtime-security.php').chmod(0o644)
             script=root/'index.php'
             candidate=(ROOT/'slsmassnotifyserver/api/sls-mass-notify/index.php').read_text()
-            script.write_text(candidate.replace("'module_version'=>'0.1.7-beta'", "'module_version'=>'0.1.6-beta'", 1)); script.chmod(0o644)
+            script.write_text(candidate.replace("'module_version'=>'0.1.8-beta'", "'module_version'=>'0.1.7-beta'", 1)); script.chmod(0o644)
             address=root/'fpm.sock'; configuration=root/'fpm.conf'
             configuration.write_text(f'''[global]
 pid = {root}/fpm.pid
@@ -110,9 +115,9 @@ catch_workers_output = yes
                         time.sleep(.05)
                 else: self.fail('Private FPM did not start')
                 self.assertTrue(before['ok']); self.assertEqual(before['php_sapi'],'fpm-fcgi')
-                self.assertEqual(before['module_version'],'0.1.6-beta')
+                self.assertEqual(before['module_version'],'0.1.7-beta')
                 script.write_text(candidate)
-                self.assertEqual(request(address,script)['module_version'],'0.1.6-beta')
+                self.assertEqual(request(address,script)['module_version'],'0.1.7-beta')
                 if busy_seconds:
                     marker=root/'busy.entered'; marker.write_text(''); marker.chmod(0o666)
                     busy_script=root/'busy.php'
@@ -138,7 +143,7 @@ catch_workers_output = yes
                 for unused in range(80):
                     try:
                         after=request(address,script)
-                        if after['module_version']=='0.1.7-beta': break
+                        if after['module_version']=='0.1.8-beta': break
                     except (OSError,RuntimeError): pass
                     time.sleep(.05)
                 else: self.fail('Reload did not replace cached PHP source')

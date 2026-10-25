@@ -25,8 +25,8 @@ async function push(value) { let work; handlers.get('push')({ data: { json() { r
   self.registration.showNotification = show;
   for (const bad of [{ ...event, event_id: 'expired', expires_at: now - 1 }, { ...event, event_id: 'too-far', expires_at: now + 601 }, { ...event, event_id: '../path' }, { ...event, event_id: 'string-test', is_test: 'true' }, null]) await push(bad);
   assert.equal(displayed.length, 2);
-  let closed = false, work; handlers.get('notificationclick')({ notification: { data: { expires_at: now + 300 }, close() { closed = true; } }, waitUntil(promise) { work = promise; } }); await work;
-  assert(closed); assert.deepEqual(opened, ['/mass-notify/subscriber.php']);
+  let closed = false, work; handlers.get('notificationclick')({ notification: { data: { expires_at: now + 300, event_id: 'fixture' }, close() { closed = true; } }, waitUntil(promise) { work = promise; } }); await work;
+  assert(closed); assert.deepEqual(opened, ['/mass-notify/subscriber.php?event=fixture']);
   handlers.get('notificationclick')({ notification: { data: { expires_at: now - 1 }, close() {} }, waitUntil() { throw Error('Expired notification opened a page'); } });
   disappearOnMatch = 'https://pbx.example.test/mass-notify/subscriber.php?event=fixture_1';
   await push({ ...event, event_id: 'cleanup-race' });

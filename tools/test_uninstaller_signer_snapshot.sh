@@ -98,7 +98,9 @@ cleanup_recovery_signer
       log() { :; }
       UNINSTALL_MAINTENANCE_LOCK_FD=""
       acquire_maintenance_coordination
-      [ -z "$UNINSTALL_MAINTENANCE_LOCK_FD" ]
+      [ -n "$UNINSTALL_MAINTENANCE_LOCK_FD" ]
+      [ "$(readlink -f "/proc/$$/fd/$UNINSTALL_MAINTENANCE_LOCK_FD")" = "$SLS_MASS_NOTIFY_MAINTENANCE_LOCK" ]
+      flock -n "$UNINSTALL_MAINTENANCE_LOCK_FD"
     '
 )
 

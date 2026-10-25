@@ -2,6 +2,8 @@
 // Southland Servers Mass Notifications Server by the Southland Servers Group
 $settings = is_array($settings ?? null) ? $settings : [];
 require_once dirname(__DIR__) . '/AdvertisedAddress.php';
+require_once dirname(__DIR__).'/RegionalVoices.php';
+require_once dirname(__DIR__) . '/api/sls-mass-notify/media-policy.php';
 $addressFields = \FreePBX\modules\SlsAdvertisedAddress::fields($settings);
 $saveResult = $save_result ?? null;
 $applyResult = $apply_result ?? null;
@@ -61,7 +63,8 @@ if (empty($discordWebhooks) && !empty($settings['discord_webhook_url'])) {
 $genericWebhooks = is_array($settings['generic_webhooks'] ?? null) ? $settings['generic_webhooks'] : [];
 $announcementWebhooks = is_array($settings['announcement_webhooks'] ?? null) ? $settings['announcement_webhooks'] : [];
 $renderWebhookFormat = static function ($type, $name, $selected = 'native') {
-	$options = ['native' => $type === 'announcement' ? _('Discord-compatible') : _('SLS event JSON'), 'slack' => _('Slack incoming webhook'), 'teams_workflow' => _('Microsoft Teams Workflows')];
+    $options = ['native' => $type === 'announcement' ? _('Discord-compatible') : _('SLS event JSON'), 'slack' => _('Slack incoming webhook'), 'teams_workflow' => _('Microsoft Teams Workflows'),
+        'teams_bearer' => _('Teams Workflows · tenant bearer · Labs'), 'google_chat' => _('Google Chat · Labs'), 'mattermost' => _('Mattermost · Labs')];
 	echo '<label>' . _('Integration') . '<select class="form-control" data-field="payload_format" name="' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8') . '">';
 	foreach ($options as $value => $label) {
 		echo '<option value="' . $value . '"' . ($selected === $value ? ' selected' : '') . '>' . htmlspecialchars($label, ENT_QUOTES, 'UTF-8') . '</option>';
@@ -196,7 +199,8 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 .sls-empty-state { padding:22px 16px; border:1px dashed #cbd5e1; border-radius:6px; color:#64748b; text-align:center; background:#f8fafc; }
 .sls-destination-note { margin:12px 0 0; }
 .sls-save-actions { margin:26px 0 34px; padding:16px; border:1px solid #dfe5ec; border-radius:8px; background:#f8fafc; }
-.sls-update-controls { display:flex; align-items:center; flex-wrap:wrap; gap:10px; }
+.sls-update-controls { display:flex; align-items:center; flex-wrap:wrap; gap:10px; margin:10px 0; }
+.sls-update-current{margin:12px 0 6px;padding-top:16px;border-top:1px solid #dfe5ec}.sls-update-current .btn{min-height:36px}.sls-settings-subheading{font-size:18px;margin-top:24px}
 .sls-operation-status {
 	display:grid;
 	grid-template-columns:34px minmax(0,1fr);
@@ -257,7 +261,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 @media (max-width:991px) { .sls-danger-grid { grid-template-columns:1fr; } }
 @media(max-width:767px){.sls-editor-row,#sls-format-editor-list .sls-editor-row,.sls-webhook-row{display:block}.sls-editor-row>*,.sls-webhook-row>*{margin-bottom:8px}.sls-manager-modal .modal-dialog{width:auto}.sls-manager-card .text-right{text-align:left;margin-top:10px}#sls-format-editor-list .sls-editor-row [data-remove-format]{margin-top:4px !important}}
 </style>
-<div class="container-fluid">
+<div class="container-fluid" id="sls-general-settings">
 	<?php echo load_view(__DIR__ . '/hero.php', ['hero_image' => $hero_image ?? '']); ?>
 	<div class="row">
 		<div class="col-sm-12">
@@ -510,6 +514,12 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						</div>
 					</div>
 				</div>
+                <details class="form-group"><summary><?php echo _('Regional speech packs'); ?> <?php include __DIR__.'/labs.php'; ?></summary>
+                    <p class="help-block"><?php echo _('Optional downloads. Save and Apply Config, then run Repair Installation to install selected packs. Existing voice selections remain unchanged. Use Listen to check pronunciation before sending.'); ?></p>
+                    <?php foreach (\SLS\MassNotify\RegionalVoices::catalogue() as $packId=>$pack): ?>
+                    <div class="checkbox"><label><input type="checkbox" name="speech_optional_voice_packs[]" value="<?php echo htmlspecialchars($packId,ENT_QUOTES,'UTF-8'); ?>" <?php echo in_array($packId,$settings['speech_optional_voice_packs']??[],true)?'checked':''; ?>> <?php echo htmlspecialchars($pack['label'],ENT_QUOTES,'UTF-8'); ?> · <?php echo number_format(array_sum(array_column($pack['files'],'size'))/1048576,1); ?> MiB</label></div>
+                    <?php endforeach; ?>
+                </details>
                 <div class="form-group">
                     <label for="sls-pronunciation"><i class="fa fa-commenting-o text-primary" aria-hidden="true"></i> <?php echo _('Announcement pronunciation'); ?></label>
                     <textarea class="form-control" id="sls-pronunciation" name="announcement_pronunciation_text" rows="4" maxlength="40000" aria-describedby="sls-pronunciation-help" placeholder="<?php echo htmlspecialchars(_('Example: PBX = P B X')); ?>"><?php echo htmlspecialchars(implode("\n", array_map(static function ($row) { return $row['phrase'].' = '.$row['spoken']; }, $settings['announcement_pronunciation'] ?? [])), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?></textarea>
@@ -547,8 +557,8 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 				<input type="hidden" name="desktop_clients_present" value="1">
 				<div class="form-group" style="max-width:420px">
 					<label for="sls-desktop-minimum-version"><?php echo _('Minimum desktop app version'); ?></label>
-					<input class="form-control" id="sls-desktop-minimum-version" name="desktop_minimum_version" type="text" maxlength="40" placeholder="1.0.10-beta" value="<?php echo htmlspecialchars($settings['desktop_minimum_version'] ?? '', ENT_QUOTES, 'UTF-8'); ?>">
-					<p class="help-block"><?php echo _('Optional. Help & Diagnostics flags reporting apps below this version. This advisory policy does not block delivery. Older apps that do not report their version remain marked Not reported.'); ?></p>
+					<input class="form-control" id="sls-desktop-minimum-version" name="desktop_minimum_version" type="text" maxlength="40" placeholder="1.0.13-beta" value="<?php echo htmlspecialchars($settings['desktop_minimum_version'] ?? '', ENT_QUOTES, 'UTF-8'); ?>">
+					<p class="help-block"><?php echo _('Default: 1.0.13-beta. Leave blank to use the default. Older, invalid or unreported app versions show Update required in Help. This advisory does not block notification delivery.'); ?></p>
 				</div>
 				<input type="hidden" name="desktop_clients_json" id="sls-desktop-clients-json" value="">
 					<p class="help-block"><?php echo _('Each desktop app should use its own username and password against /api/sipnotify/desktop. Client IDs are generated automatically and cannot be edited. Passwords are AES-encrypted in the central config file.'); ?></p>
@@ -700,8 +710,13 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 				<div class="panel panel-default">
 					<div class="panel-heading"><strong><i class="fa fa-shield" aria-hidden="true"></i> <?php echo _('Generated image and phone XML access'); ?></strong></div>
 					<div class="panel-body">
-						<?php $mediaAccess = array_replace(['network_restricted'=>false, 'allowed_cidrs'=>[], 'max_age_minutes'=>0], $settings['media_access'] ?? []); ?>
+						<?php $mediaAccess = \SLS\MassNotify\MediaAccess::normalize($settings['media_access'] ?? []); ?>
 						<p class="help-block"><?php echo _('Images and phone XML use unguessable URLs without a desktop password or browser session. Optional restrictions below apply to every new download, including existing URLs. They do not retract content already downloaded. Defaults preserve existing device access.'); ?></p>
+                        <div class="checkbox"><label><input type="hidden" name="media_access[desktop_authentication]" value="0"><input type="checkbox" name="media_access[desktop_authentication]" value="1" <?php echo $mediaAccess['desktop_authentication']?'checked':''; ?>> <?php echo _('Require desktop credentials for announcement images'); ?></label></div>
+                        <p class="help-block"><?php echo _('Requires a desktop release with authenticated media support. Older clients retain the message text.'); ?></p>
+                        <div class="checkbox"><label><input type="hidden" name="media_access[phone_capabilities]" value="0"><input type="checkbox" name="media_access[phone_capabilities]" value="1" <?php echo $mediaAccess['phone_capabilities']?'checked':''; ?>> <?php echo _('Require short-lived phone image and XML links'); ?></label></div>
+                        <div class="checkbox"><label><input type="checkbox" name="media_access[revoke_phone_links]" value="1"> <?php echo _('Revoke existing phone links when these settings are applied'); ?></label></div>
+                        <p class="help-block"><?php echo _('Enable authenticated desktop images first. Phone links expire after ten minutes. Qualify handset downloads before enabling; already active displays may lose access. Link holders can fetch that file until expiry. Treat SIP and web access logs as private.'); ?></p>
 						<input type="hidden" name="media_access[network_restricted]" value="0">
 						<div class="checkbox"><label><input type="checkbox" name="media_access[network_restricted]" value="1" <?php echo $mediaAccess['network_restricted'] ? 'checked' : ''; ?>> <?php echo _('Allow generated media only from listed networks'); ?></label></div>
 						<div class="row">
@@ -738,19 +753,20 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 				<?php if (($packageStatus['state'] ?? '') === 'update') { ?>
 					<div class="alert alert-warning"><i class="fa fa-exclamation-triangle" aria-hidden="true"></i> <strong><?php echo htmlspecialchars($packageStatus['label'] ?? _('Update available')); ?></strong><?php if (!empty($packageStatus['message'])) { ?> <?php echo htmlspecialchars($packageStatus['message']); ?><?php } ?></div>
 				<?php } ?>
-				<div class="row">
-					<div class="col-md-3">
+				<h4 class="sls-settings-subheading"><i class="fa fa-cloud-download" aria-hidden="true"></i> <?php echo _('Module updates'); ?></h4><p class="help-block"><?php echo _('Check for updates uses your applied policy and installs nothing. Install Selected Release appears when a newer eligible release is found. The installer verifies publisher signatures and preserves your settings.'); ?></p>
+<div class="row">
+					<div class="col-md-4">
 						<label><?php echo _('Notification Log Retention Days'); ?></label>
 						<input class="form-control" name="log_retention_days" type="number" min="1" max="365" value="<?php echo (int)($settings['log_retention_days'] ?? 90); ?>">
 					</div>
-					<div class="col-md-3">
-						<label><?php echo _('Automatic GitHub Updates'); ?></label>
-						<select class="form-control" name="updates[github_enabled]">
+					<div class="col-md-4">
+						<label><?php echo _('Automatic updates'); ?></label>
+						<select class="form-control" id="sls-automatic-updates" name="updates[github_enabled]" aria-describedby="sls-automatic-update-help">
 							<option value="0" <?php echo empty($updates['github_enabled']) ? 'selected' : ''; ?>><?php echo _('Disabled'); ?></option>
 							<option value="1" <?php echo !empty($updates['github_enabled']) ? 'selected' : ''; ?>><?php echo _('Enabled'); ?></option>
-						</select>
+						</select><p id="sls-automatic-update-help" class="help-block"><?php echo _('Opt-in. Save General Settings and Apply Config to activate this policy. Automatic checks run hourly at minute 17.'); ?></p>
 					</div>
-					<div class="col-md-3">
+					<div class="col-md-4">
 						<label for="sls-update-channel"><?php echo _('Update Channel'); ?></label>
 						<select id="sls-update-channel" class="form-control" name="updates[channel]">
 							<option value="beta" <?php echo ($updates['channel'] ?? 'beta') === 'beta' ? 'selected' : ''; ?>><?php echo _('Beta and stable releases'); ?></option>
@@ -758,15 +774,13 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						</select>
 						<p class="help-block"><?php echo _('Every installation requires a valid publisher signature. Stable waits until a stable release is published.'); ?></p>
 					</div>
-					<div class="col-md-3">
+					<div class="col-md-12 sls-update-current">
 						<label><?php echo _('Installed Package Version'); ?></label>
 						<p class="form-control-static"><code><?php echo htmlspecialchars($package_version ?? 'unknown'); ?></code> <span class="label <?php echo $packageStatusClass; ?>"><?php echo htmlspecialchars($packageStatus['label'] ?? 'LATEST'); ?></span></p>
 						<div class="sls-update-controls">
 							<button type="submit" class="btn btn-default btn-sm" name="slsmassnotifyserver_action" value="check_updates" formnovalidate<?php echo $updateProgressBusy ? ' disabled' : ''; ?>><i class="fa fa-search" aria-hidden="true"></i> <?php echo _('Check for updates'); ?></button>
 							<?php if ($hasPackageUpdate) { ?>
 								<button type="submit" class="btn btn-warning btn-sm" name="slsmassnotifyserver_action" value="manual_update" formnovalidate<?php echo $updateProgressBusy ? ' disabled' : ''; ?>><i class="fa fa-refresh" aria-hidden="true"></i> <?php echo _('Install Selected Release'); ?></button>
-							<?php } elseif (($packageStatus['state'] ?? '') === 'error') { ?>
-								<button type="submit" class="btn btn-warning btn-sm" name="slsmassnotifyserver_action" value="manual_update" formnovalidate<?php echo $updateProgressBusy ? ' disabled' : ''; ?>><i class="fa fa-repeat" aria-hidden="true"></i> <?php echo _('Retry update'); ?></button>
 							<?php } ?>
 						</div>
 						<?php if (($packageStatus['message'] ?? '') !== '') { ?><p class="help-block" role="status"><?php echo htmlspecialchars($packageStatus['message'], ENT_QUOTES, 'UTF-8'); ?></p><?php } ?>
@@ -778,7 +792,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						<div class="row">
 							<div class="col-sm-6 col-md-3 form-group">
 								<label for="sls-update-pin"><?php echo _('Pinned version'); ?></label>
-								<input id="sls-update-pin" class="form-control" name="updates[pinned_version]" maxlength="19" placeholder="0.1.7-beta" value="<?php echo htmlspecialchars($updates['pinned_version'] ?? '', ENT_QUOTES, 'UTF-8'); ?>" aria-describedby="sls-update-pin-help">
+								<input id="sls-update-pin" class="form-control" name="updates[pinned_version]" maxlength="19" placeholder="0.1.8-beta" value="<?php echo htmlspecialchars($updates['pinned_version'] ?? '', ENT_QUOTES, 'UTF-8'); ?>" aria-describedby="sls-update-pin-help">
 								<p id="sls-update-pin-help" class="help-block"><?php echo _('Optional exact version. Leave blank for the newest eligible release. An older pin holds the current installation; it does not downgrade it.'); ?></p>
 							</div>
 							<div class="col-sm-6 col-md-3 form-group">
@@ -1026,12 +1040,9 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 			var controls = document.querySelector('.sls-update-controls');
 			if (controls) {
 				Array.prototype.forEach.call(controls.querySelectorAll('button'), function(button) { button.disabled = false; });
-				if (state === 'failed' && !controls.querySelector('[value="manual_update"]')) {
-					var retry = document.createElement('button');
-					retry.type = 'submit'; retry.name = 'slsmassnotifyserver_action'; retry.value = 'manual_update';
-					retry.className = 'btn btn-warning btn-sm'; retry.formNoValidate = true;
-					retry.textContent = <?php echo json_encode(_('Retry update')); ?>;
-					controls.appendChild(retry);
+				if (state === 'failed') {
+					var checkAgain = controls.querySelector('[value="check_updates"]');
+					if (checkAgain) checkAgain.textContent = <?php echo json_encode(_('Retry update check')); ?>;
 				}
 			}
 			if (state === 'complete') {
@@ -1314,7 +1325,7 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						label.style.display = 'block'; label.style.marginTop = '10px';
 						label.textContent = field === 'bearer_token' ? 'Bearer token' : 'HMAC-SHA256 signing secret';
 						var input = document.createElement('input');
-						input.type = 'password'; input.className = 'form-control'; input.maxLength = 512;
+                        input.type = 'password'; input.className = 'form-control'; input.maxLength = field === 'bearer_token' ? 8192 : 512;
 						input.autocomplete = 'new-password'; input.placeholder = 'Leave blank to keep the stored value';
 						input.setAttribute('data-auth-field', field); label.appendChild(input); auth.appendChild(label);
 						var clearLabel = document.createElement('label'); clearLabel.style.marginRight = '16px';
@@ -1324,10 +1335,10 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
 						auth.appendChild(clearLabel);
 					});
 					var hint = document.createElement('p'); hint.className = 'help-block';
-					hint.textContent = 'For native HTTPS receivers only. Slack and Teams Workflows use the secret in their URL; these optional headers are not sent to them. Secrets stay in the protected central configuration.';
+                    hint.textContent = 'SLS JSON supports bearer and HMAC authentication. Teams tenant bearer sends only the bearer token; obtain one for the workflow’s configured tenant and renew it before expiry. Other formats use their saved webhook URL.';
 					auth.appendChild(hint); row.appendChild(auth);
 				}
-				auth.hidden = format && format.value !== 'native';
+                auth.hidden = format && !['native', 'teams_bearer'].includes(format.value);
 				auth.querySelectorAll('[data-auth-field]').forEach(function(input) {
 					input.name = prefix + '[' + input.getAttribute('data-auth-field') + ']';
 				});
@@ -1555,3 +1566,6 @@ foreach ((array)($settings['sipnotify']['format_overrides'] ?? []) as $extension
  profiles.forEach(addProfile); add.addEventListener('click',function() { addProfile({}); });
 }());
 </script>
+
+<script><?php readfile(__DIR__.'/save_state.js'); ?>
+window.SlsSaveState.attach(document.getElementById('sls-general-settings'),{mode:'apply',initial:'<?php echo $hasPendingChanges?'pending':'active'; ?>'});</script>

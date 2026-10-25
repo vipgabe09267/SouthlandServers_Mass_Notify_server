@@ -19,10 +19,13 @@ final class AutomationConfig
     }
     public static function action($value): array
     {
-        $row = IncidentConfig::object($value, ['id','name','enabled','kind','host','port','message','scheme','led','clear','path','sha256'], 'Trigger action');
+        $row = IncidentConfig::object($value, ['id','name','enabled','kind','host','port','message','scheme','led','clear','path','sha256','execution_mode'], 'Trigger action');
         $out = ['id'=>self::id($row['id'] ?? '', 'act'), 'name'=>IncidentConfig::text($row['name'] ?? '', 80, 'Action name'),
             'enabled'=>IncidentConfig::flag($row['enabled'] ?? false, 'Action enabled'), 'kind'=>$row['kind'] ?? ''];
         if ($out['kind'] === 'script') {
+            $mode=$row['execution_mode']??'trusted';
+            if(!in_array($mode,['trusted','restricted'],true)){throw new \InvalidArgumentException('Choose trusted or restricted script execution.');}
+            if(array_key_exists('execution_mode',$row)){$out['execution_mode']=$mode;}
             $out['path'] = IncidentConfig::identifier($row['path'] ?? '', '/^\/(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.(?:sh|js)$/D', 'Absolute script path');
             if (str_contains($out['path'], '/./') || str_contains($out['path'], '/../') || strlen($out['path']) > 512) { throw new \InvalidArgumentException('Use a canonical absolute script path without relative components.'); }
             $out['sha256'] = IncidentConfig::identifier($row['sha256'] ?? '', '/^[a-f0-9]{64}$/D', 'Approved script SHA-256');

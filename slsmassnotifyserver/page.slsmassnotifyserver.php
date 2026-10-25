@@ -119,7 +119,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action'] ?? '') === 'send_announcement') {
-	slsmassnotifyserver_json_response($slsmassnotifyserver->sendSipNotifyAnnouncement(
+    $rehearsalScenario=null;
+    if(array_key_exists('announcement_rehearsal',$_POST)){
+        require_once __DIR__.'/DeliveryRehearsal.php';
+        try{$rehearsalScenario=\SLS\MassNotify\DeliveryRehearsal::scenario(['default'=>$_POST['announcement_rehearsal']]);}
+        catch(InvalidArgumentException $error){slsmassnotifyserver_json_response(['success'=>false,'delivery_started'=>false,'message'=>$error->getMessage()]);}
+    }
+	$result=$slsmassnotifyserver->sendSipNotifyAnnouncement(
 		$_POST['announcement_extensions'] ?? [],
 		$_POST['announcement_body'] ?? '',
 		!empty($_POST['announcement_mass_notify']),
@@ -127,7 +133,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action
 		$_POST['announcement_groups'] ?? [],
 		[
 			'phones_all' => !empty($_POST['announcement_all_phones']),
-			'preview' => !empty($_POST['announcement_preview']),
+			'preview' => $rehearsalScenario!==null || !empty($_POST['announcement_preview']),
+            '_review_requested'=>!empty($_POST['announcement_review']),
+            ...(!empty($_POST['announcement_review'])||isset($_POST['announcement_review_token'])?['_review_token'=>$_POST['announcement_review_token']??null]:[]),
 			'desktop_all' => !empty($_POST['announcement_all_desktops']),
 			'desktop_clients' => $_POST['announcement_desktop_clients'] ?? [],
 			'webhook_ids' => $_POST['announcement_webhooks'] ?? [],
@@ -143,7 +151,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action
 			'opening_tone' => $_POST['announcement_opening_tone'] ?? '',
 			'closing_tone' => $_POST['announcement_closing_tone'] ?? '',
 		]
-	));
+	);
+    if($rehearsalScenario!==null&&!empty($result['success'])){
+        $result['rehearsal']=\SLS\MassNotify\DeliveryRehearsal::simulate($result,$rehearsalScenario);
+    }
+    slsmassnotifyserver_json_response($result);
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['slsmassnotifyserver_action'] ?? '') === 'save_announcement_group') {

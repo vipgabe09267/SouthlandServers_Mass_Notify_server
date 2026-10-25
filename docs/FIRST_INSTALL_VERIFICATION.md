@@ -16,7 +16,7 @@ MCowBQYDK2VwAyEAFMDOgOaBGcaI8d+v0w/NX4RbwGlBsoktNc2V2F8UkUQ=
 ```
 
 The following commands use a root-private directory and execute no downloaded
-code until both signature and installer hash checks succeed. The `0.1.7-beta`
+code until both signature and installer hash checks succeed. The `0.1.8-beta`
 candidate is not published yet; use this version only after release approval.
 
 ```bash
@@ -27,7 +27,7 @@ candidate is not published yet; use this version only after release approval.
   umask 077
   SLS_INSTALL_DIR="$(/usr/bin/mktemp -d /tmp/sls-verified-install.XXXXXXXX)"
   cd "$SLS_INSTALL_DIR"
-  SLS_VERSION='0.1.7-beta'
+  SLS_VERSION='0.1.8-beta'
   SLS_TAG="slsmassnotifyserver-$SLS_VERSION"
   SLS_RELEASE="https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/releases/download/$SLS_TAG"
   /usr/bin/curl --disable --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 60 --max-filesize 16384 -fsSL -o release-manifest.json "$SLS_RELEASE/release-manifest.json"

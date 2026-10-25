@@ -38,9 +38,9 @@ class TriggerActions(unittest.TestCase):
         cls.worker_path.write_bytes(WORKER.read_bytes())
         cls.worker_path.chmod(0o644)
 
-    def worker(self, action, event=None, timeout=15):
+    def worker(self, action, event=None, timeout=15, worker_path=None):
         value = {'action': action, 'event': event or {'event_id':'test','message':'fixture only'}}
-        result = subprocess.run(['/usr/sbin/runuser', '-u', 'nobody', '--', '/usr/bin/python3', str(self.worker_path)],
+        result = subprocess.run(['/usr/sbin/runuser', '-u', 'nobody', '--', '/usr/bin/python3', str(worker_path or self.worker_path)],
             input=json.dumps(value), capture_output=True, text=True, timeout=timeout,
             env={'PATH':'/usr/bin:/bin','SHOULD_NOT_REACH_SCRIPT':'secret','PYTHONDONTWRITEBYTECODE':'1'})
         self.assertTrue(result.stdout, result.stderr)
@@ -50,6 +50,36 @@ class TriggerActions(unittest.TestCase):
         path = self.directory / ('script-' + os.urandom(8).hex() + '.' + extension)
         path.write_text(text); path.chmod(0o644)
         return {'enabled':True,'kind':'script','path':str(path),'sha256':hashlib.sha256(path.read_bytes()).hexdigest()}
+
+    def test_restricted_mode_requires_isolation_without_fallback(self):
+        action=self.script('echo SHOULD_NOT_RUN\n');action['execution_mode']='restricted'
+        if not Path('/usr/bin/bwrap').exists():
+            result=self.worker(action)
+            self.assertEqual(result['state'],'failed');self.assertIn('No unrestricted fallback',result['detail'])
+            self.assertNotIn('SHOULD_NOT_RUN',result['detail'])
+        else:
+            command=actions.restricted_command(7,'/bin/bash')
+            self.assertIn('--unshare-all',command);self.assertIn('--disable-userns',command)
+            self.assertNotIn('/etc',command);self.assertNotIn('/var/lib/asterisk',command)
+
+    def test_actual_restricted_script_when_private_binary_is_supplied(self):
+        binary=os.environ.get('SLS_BWRAP_FIXTURE','')
+        if not binary:self.skipTest('Supply the private verified Debian bubblewrap binary for kernel qualification.')
+        self.assertTrue(Path(binary).is_file())
+        subprocess.run(['mount','--bind',binary,'/usr/bin/false'],check=True,timeout=5)
+        try:
+            probe=subprocess.run(['/usr/sbin/runuser','-u','nobody','--','/usr/bin/false','--unshare-user','--ro-bind','/','/','--','/bin/true'],capture_output=True,text=True,timeout=5,cwd='/')
+            if probe.returncode and any(message in probe.stderr for message in ['Operation not permitted','kernel does not allow non-privileged user namespaces']):self.skipTest('The current kernel denies unprivileged user namespaces; no unrestricted fallback is permitted.')
+            self.assertEqual(probe.returncode,0,probe.stderr)
+            worker=self.directory/'restricted-wire.py'
+            source=WORKER.read_text();old="binary=Path('/usr/bin/bwrap')";self.assertIn(old,source)
+            worker.write_text(source.replace(old,"binary=Path('/usr/bin/false')"));worker.chmod(0o644)
+            action=self.script('test -z "${SHOULD_NOT_REACH_SCRIPT:-}" || exit 11\ntest ! -e /var/lib/asterisk || exit 12\ntest ! -e /etc/sls-mass-notify || exit 13\nprintf private > /tmp/in-sandbox-only\n/usr/bin/python3 -I -c \'import socket; s=socket.socket(); s.settimeout(1); assert s.connect_ex(("192.168.240.10",9)) != 0\'\n')
+            action['execution_mode']='restricted'
+            result=self.worker(action,worker_path=worker)
+            self.assertEqual(result['state'],'completed',result)
+            self.assertFalse(Path('/tmp/in-sandbox-only').exists())
+        finally:subprocess.run(['umount','/usr/bin/false'],check=True,timeout=5)
 
     def test_script_requires_unprivileged_account(self):
         action = self.script('exit 0\n')

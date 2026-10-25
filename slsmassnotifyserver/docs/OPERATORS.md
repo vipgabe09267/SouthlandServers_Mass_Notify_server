@@ -14,8 +14,9 @@ installation-specific port. A portal login grants no FreePBX or UCP session.
 3. At first sign-in, the operator chooses a personal password, adds the displayed
    setup key to a time-based authenticator, verifies its six-digit code, and
    saves the ten recovery codes. Enrollment is mandatory.
-4. Later sign-ins require the password and a current authenticator code or one
-   unused recovery code. Neither a password alone nor a PBX login opens Operations.
+4. Later sign-ins require the password and a current authenticator code, one
+   unused recovery code or an enrolled passkey when explicitly enabled. Neither
+   a password alone nor a PBX login opens Operations.
 
 Site and location grants include descendants. Grants are combined; personal
 assignments alone allow notifications only to those devices. A username never
@@ -45,6 +46,8 @@ at the next sign-in. An authenticator reset also requires a new
 initial password and invalidates the old seed and recovery codes. Reset a lost
 login here; do not delete protected authentication or delivery data.
 
+New and changed passwords are checked against a bundled common-password blocklist.
+Existing passwords are not rejected at sign-in because of a later policy change.
 Passwords use salted Argon2id with 64 MiB, four passes and one thread. Systems
 without Argon2id use PBKDF2-HMAC-SHA256 with 600,000 iterations. Authenticator
 seeds use account-bound AES-GCM encryption derived from the existing configuration
@@ -77,6 +80,24 @@ Full PBX administrators retain account-management recovery in the PBX admin pane
 Existing PBX role assignments are preserved for module permissions; create dedicated
 portal logins for their independent password/TOTP access. Imported/restored accounts
 start disabled and require administrator review before use.
+
+## Optional passkeys — Labs
+
+In Operator Access, enable **Allow local operator passkeys** and save. Each
+operator then opens **Security** in the portal, enters a fresh TOTP code, names
+the key and completes browser enrollment. Up to five keys are supported. The
+authenticator must verify its user, for example with a PIN or biometric check.
+
+At the second sign-in step, **Use a passkey instead** replaces the TOTP prompt;
+it does not bypass the password or configured SSO step. TOTP and unused recovery
+codes remain available. Enrollment and revocation sign other sessions out.
+An authenticator reset removes enrolled passkeys. Canceling enrollment consumes
+that TOTP code; wait for the next code before trying again.
+
+Passkeys bind to the saved DNS hostname and exact advertised HTTPS origin,
+including a forwarded port. Test the intended browser/authenticator combination
+before relying on it. No private key leaves the authenticator, and FreePBX/UCP
+authentication is unchanged.
 
 ## Password recovery
 

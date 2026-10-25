@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -306,6 +307,19 @@ def inventory(requirements=REQUIREMENTS, site_packages=None):
                            'licenses': [{'license': {'id': value}} for value in package.get('license', [])],
                            'externalReferences': [{'type': 'vcs', 'url': package['source']['url']}],
                            'properties': properties})
+    specification=importlib.util.spec_from_file_location('sls_passkey_vendor_verifier',ROOT/'tools/verify_passkey_vendor.py')
+    passkeys=importlib.util.module_from_spec(specification);specification.loader.exec_module(passkeys)
+    passkey_lock,passkey_baseline=passkeys.verify()
+    by_purl={component['purl']:component for component in components if isinstance(component.get('purl'),str)}
+    for package in passkey_lock['packages']:
+        name,release=package['name'],package['version'];purl='pkg:composer/'+quote(name,safe='/._-')+'@'+quote(release,safe='.-+')
+        if purl in by_purl:
+            by_purl[purl].setdefault('properties',[]).append({'name':'sls:also-used-by','value':'isolated-passkey-worker'});continue
+        component={'type':'library','bom-ref':purl,'name':name,'version':release,'purl':purl,
+                   'licenses':[{'license':{'id':value}} for value in package.get('license',[])],
+                   'externalReferences':[{'type':'vcs','url':package['source']['url']}],
+                   'properties':[{'name':'sls:source-revision','value':package['source']['reference']},{'name':'sls:execution-boundary','value':'isolated-passkey-worker'}]}
+        components.append(component);by_purl[purl]=component
     version = ET.parse(ROOT / 'slsmassnotifyserver/module.xml').findtext('version')
     bom = {'bomFormat': 'CycloneDX', 'specVersion': '1.6', 'version': 1,
            'metadata': {'component': {'type': 'application', 'name': 'slsmassnotifyserver', 'version': version,
@@ -313,7 +327,8 @@ def inventory(requirements=REQUIREMENTS, site_packages=None):
                         'properties': [{'name': 'sls:inventory-kind', 'value': 'installed' if site_packages else 'release-pins'},
                                        {'name': 'sls:requirements-sha256', 'value': digest},
                                        {'name': 'sls:composer-vendor-baseline-sha256', 'value': baseline_digest},
-                                       {'name': 'sls:scope', 'value': 'Piper Python environment, PHP callback validator, locked PHP identity libraries and bundled dashboard chart library; OS packages, FreePBX modules and voice models are separate inventories.'}]},
+                                       {'name':'sls:passkey-vendor-baseline-sha256','value':passkey_baseline},
+                                       {'name': 'sls:scope', 'value': 'Piper Python environment, PHP callback validator, locked PHP identity/passkey libraries and bundled dashboard chart library; OS packages, FreePBX modules and voice models are separate inventories.'}]},
            'components': components,
            'dependencies': [{'ref': 'pkg:npm/chart.js@2.9.4', 'dependsOn': sorted(embedded)}]}
     seed = json.dumps(bom, sort_keys=True, separators=(',', ':'))

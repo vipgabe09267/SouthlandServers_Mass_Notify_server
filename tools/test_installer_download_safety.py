@@ -175,7 +175,7 @@ rm -rf -- "$DOWNLOAD_DIR"
         script = r'''
 source "$1"
 TGZ="$2"
-URL="https://github.com/example/project/releases/download/slsmassnotifyserver-0.1.7-beta/slsmassnotifyserver-0.1.7-beta.tgz"
+URL="https://github.com/example/project/releases/download/slsmassnotifyserver-0.1.8-beta/slsmassnotifyserver-0.1.8-beta.tgz"
 SHA256=""
 fetch_release_asset() { printf 'not-the-published-package' >"$2"; }
 verify_publisher_release() { return 0; }
@@ -215,6 +215,22 @@ verify_tgz
             result = subprocess.run(['bash', '-c', script, '_', str(INSTALLER), str(archive), digest],
                                     capture_output=True, text=True, timeout=15)
             self.assertNotEqual(result.returncode, 0, label)
+
+    def test_dependency_archive_admitted_with_fixed_upper_member_bound(self):
+        xml = f'<module><rawname>slsmassnotifyserver</rawname><version>{VERSION}</version></module>'.encode()
+        script = 'source "$1"; URL=""; TGZ="$2"; SHA256="$3"; verify_publisher_release() { return 0; }; verify_tgz'
+        for count, accepted in ((3000, True), (5001, False)):
+            archive = self.directory / ('members-%d.tgz' % count)
+            with tarfile.open(archive, 'w:gz') as handle:
+                for index in range(count):
+                    name = 'module.xml' if index == 0 else 'vendor/fixture-%04d.php' % index
+                    body = xml if index == 0 else b'<?php /* dependency fixture */'
+                    info = tarfile.TarInfo('slsmassnotifyserver/' + name)
+                    info.mode = 0o644; info.size = len(body)
+                    handle.addfile(info, io.BytesIO(body))
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            result = subprocess.run(['bash', '-c', script, '_', str(INSTALLER), str(archive), digest], capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
 
     def test_archive_rejects_ambiguous_or_unsafe_module_metadata(self):
         valid = f'<module><rawname>slsmassnotifyserver</rawname><version>{VERSION}</version></module>'.encode()

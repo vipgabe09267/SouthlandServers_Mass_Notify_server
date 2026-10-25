@@ -86,6 +86,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
  try {
   if($action==='save_schedule_programmes') {$configuration=\SLS\MassNotify\ScheduleProgrammes::normalize(json_decode($_POST['programmes_json'],true,32,JSON_THROW_ON_ERROR));file_put_contents(__DIR__.'/saved.json',json_encode($configuration));header('Location: /');return;}
   if($action==='recording_catalogue') {$labels=[];for($i=0;$i<205;$i++){$labels['custom/fixture-'.sprintf('%03d',$i)]='Fixture recording '.sprintf('%03d',$i);}$answer=['success'=>true]+\SLS\MassNotify\SystemRecordings::cataloguePage(__DIR__.'/sounds',$labels,$_POST['query'],(int)$_POST['offset'],100);}
+  elseif($action==='preview_programme_calendar') {$answer=['success'=>true]+\SLS\MassNotify\ScheduleProgrammes::visualPreview(json_decode($_POST['programme_json'],true,32,JSON_THROW_ON_ERROR),$_POST['focus'],$_POST['view']);}
   elseif($action==='preview_schedule_calendar') {
    $configuration=\SLS\MassNotify\ScheduleProgrammes::normalize(file_exists(__DIR__.'/saved.json')?json_decode(file_get_contents(__DIR__.'/saved.json'),true):['enabled'=>true,'calendars'=>[['id'=>'cal_'.str_repeat('a',24),'name'=>'Fixture','timezone'=>'America/Chicago','cycle_start'=>'2030-01-01','cycle_mode'=>'school_days','day_types'=>['A','B'],'date_types'=>[],'calendar'=>['until'=>'2030-06-14','weekdays'=>[1,2,3,4,5],'exclusions'=>[],'overrides'=>[]]]]]);
    $calendar=$_POST['schedule_programme_id']?\SLS\MassNotify\ScheduleProgrammes::snapshot($configuration,$_POST['schedule_programme_id'],$_POST['schedule_programme_types']):json_decode($_POST['schedule_calendar_json'],true);
@@ -202,6 +203,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
             page.set_viewport_size({'width':width,'height':1000});page.locator('#sls-shared-calendars').evaluate('(n)=>n.open=true')
             page.locator('.sls-programme-card').first.evaluate('(n)=>n.open=true')
             fields=page.locator('.sls-programme-grid input');fields.nth(0).fill('X'*80)
+            page.locator('.sls-programme-card details').evaluate_all('(items)=>items.forEach(n=>n.open=true)')
             for text in ['Add holiday ranges','Add whole-day substitutions','Add time overrides']:page.get_by_role('button',name=text,exact=True).click()
             self.bounds()
             tables=page.locator('.sls-programme-table')
@@ -215,6 +217,61 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
         self.assertEqual(row['name'],'X'*80);self.assertEqual(row['date_types'],[{'date':'2030-06-03','day_type':'B'}]);self.assertEqual(row['calendar']['overrides'][0]['time'],'10:30')
         page.locator('#sls-shared-calendars').evaluate('(n)=>n.open=true');page.locator('.sls-programme-card').evaluate('(n)=>n.open=true');self.bounds()
         self.assertEqual(page.locator('.sls-programme-table').nth(1).locator('input').nth(1).input_value(),'B');self.assertEqual(self.errors,[])
+    def test_visual_calendar_real_preview_edit_and_accessible_reflow(self):
+        page=self.page
+        page.locator('#sls-shared-calendars').evaluate('(n)=>n.open=true')
+        page.locator('.sls-programme-card').first.evaluate('(n)=>n.open=true')
+        visual=page.locator('.sls-programme-visual')
+        visual.get_by_role('button',name='Preview current draft',exact=True).click()
+        visual.locator('.sls-programme-day').first.wait_for()
+        self.assertEqual(visual.locator('.sls-programme-day').count(),42)
+        visual.get_by_label('Date',exact=True).fill('2030-02-04')
+        visual.get_by_label('Calendar view',exact=True).select_option('week')
+        page.wait_for_function('document.querySelectorAll(".sls-programme-day").length===7')
+        visual.locator('button.sls-programme-day').first.click()
+        edit=visual.locator('.sls-programme-date-editor')
+        edit.get_by_label('Day programme',exact=True).select_option('B')
+        edit.get_by_label('Temporary replacement time',exact=True).fill('10:30')
+        edit.get_by_role('button',name='Update draft',exact=True).click()
+        page.wait_for_function('document.querySelector(".sls-programme-date-editor").hidden')
+        self.assertFalse((self.root/'saved.json').exists())
+        visual.get_by_label('Calendar view',exact=True).select_option('list')
+        visual.locator('table tbody tr').first.wait_for()
+        for width,zoom in [(320,1),(1280,2),(1280,4)]:
+            page.set_viewport_size({'width':width,'height':1000})
+            page.evaluate('(zoom)=>document.body.style.zoom=zoom',zoom)
+            self.bounds()
+        page.evaluate('document.body.style.zoom=1')
+        page.emulate_media(color_scheme='dark',reduced_motion='reduce')
+        self.assertEqual(visual.locator('input,select').evaluate_all('(items)=>items.filter(n=>!n.labels?.length&&!n.getAttribute("aria-label")).length'),0)
+        self.assertEqual(self.errors,[])
+
+    def test_save_state_cancel_preserves_earlier_unsaved_changes_and_contrast(self):
+        page=self.page
+        source=(ROOT/'slsmassnotifyserver/views/save_state.js').read_text()
+        page.evaluate('()=>{const n=document.createElement("section");n.id="save-state-fixture";n.innerHTML="<h2>Save state</h2><form><label>Field<input></label></form>";document.body.append(n);}')
+        page.add_script_tag(content=source)
+        page.evaluate('()=>window.SlsSaveState.attach(document.getElementById("save-state-fixture"),{mode:"immediate"})')
+        root=page.locator('#save-state-fixture')
+        root.dispatch_event('sls:editor-opened')
+        root.locator('input').fill('temporary')
+        self.assertEqual(root.get_attribute('data-save-state'),'unsaved')
+        root.dispatch_event('sls:editor-closed')
+        self.assertEqual(root.get_attribute('data-save-state'),'active')
+        root.locator('input').fill('earlier change')
+        root.dispatch_event('sls:editor-opened')
+        root.locator('input').fill('cancelled edit')
+        root.dispatch_event('sls:editor-closed')
+        self.assertEqual(root.get_attribute('data-save-state'),'unsaved')
+        root.evaluate('(n)=>n.dispatchEvent(new CustomEvent("sls:save-state",{detail:"active"}))')
+        colors=root.locator('.label').evaluate('(n)=>({fg:getComputedStyle(n).color,bg:getComputedStyle(n).backgroundColor})')
+        def luminance(rgb):
+            values=[int(v)/255 for v in re.findall(r"[0-9]+",rgb)[:3]]
+            values=[v/12.92 if v<=0.04045 else ((v+0.055)/1.055)**2.4 for v in values]
+            return sum(v*w for v,w in zip(values,[0.2126,0.7152,0.0722]))
+        a,b=sorted([luminance(colors['fg']),luminance(colors['bg'])])
+        self.assertGreaterEqual((b+0.05)/(a+0.05),4.5)
+
     def test_shared_calendar_names_render_as_inert_text(self):
         attack='<img src=x onerror="window.__slsProgrammeXss=1">'
         self.page.locator('#sls-shared-calendars > summary').click()
@@ -223,7 +280,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
         name=card.locator('.sls-programme-grid input').first
         self.assertTrue(name.is_visible())
         name.fill(attack)
-        self.assertEqual(card.locator('summary').text_content(),attack)
+        self.assertEqual(card.locator(':scope > summary').text_content(),attack)
         self.assertEqual(card.locator('summary img').count(),0)
         self.assertIsNone(self.page.evaluate('window.__slsProgrammeXss'))
         self.assertEqual(self.errors,[])

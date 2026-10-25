@@ -1,0 +1,118 @@
+{
+  "$id": "https://southlandservers.xyz/schemas/sls/notification-1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "created_at": {
+      "format": "date-time",
+      "pattern": "(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+      "type": "string"
+    },
+    "display_expires_at": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "const": ""
+        },
+        {
+          "format": "date-time",
+          "type": "string"
+        }
+      ],
+      "description": "An absolute server deadline, or null/empty when no server display deadline was set. Clients still enforce their maximum announcement lifetime."
+    },
+    "display_timeout_seconds": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "id": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "type": "string",
+      "x-sls-maximum-utf8-bytes": 2048
+    },
+    "image_authentication": {
+      "const": "desktop_basic"
+    },
+    "image_url": {
+      "anyOf": [
+        {
+          "const": ""
+        },
+        {
+          "format": "uri",
+          "pattern": "^https://[^\\s]+$",
+          "type": "string"
+        }
+      ]
+    },
+    "incident": {
+      "additionalProperties": true,
+      "properties": {
+        "incident_id": {
+          "pattern": "^inc_[a-f0-9]{32}$",
+          "type": "string"
+        },
+        "is_test": {
+          "type": "boolean"
+        },
+        "kind": {
+          "enum": [
+            "initial",
+            "update",
+            "all_clear",
+            "escalation"
+          ]
+        },
+        "schema": {
+          "const": 1
+        },
+        "sequence": {
+          "maximum": 250,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "severity": {
+          "enum": [
+            "information",
+            "warning",
+            "critical"
+          ]
+        }
+      },
+      "required": [
+        "schema",
+        "incident_id",
+        "sequence",
+        "kind",
+        "severity",
+        "is_test"
+      ],
+      "type": "object"
+    },
+    "is_test": {
+      "type": "boolean"
+    },
+    "kind": {
+      "enum": [
+        "announcement",
+        "alert"
+      ]
+    },
+    "message": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "created_at",
+    "is_test"
+  ],
+  "title": "SLS notification payload schema 1",
+  "type": "object"
+}

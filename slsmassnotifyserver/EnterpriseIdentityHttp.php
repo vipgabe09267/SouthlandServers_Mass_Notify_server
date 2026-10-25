@@ -10,15 +10,16 @@ final class EnterpriseIdentityHttp
     private static function policy(array $value): array
     {
         if(array_is_list($value)){$value=['hosts'=>$value,'private_pins'=>[]];}
-        if(array_diff(array_keys($value),['hosts','private_pins'])||!is_array($value['hosts']??null)||!array_is_list($value['hosts'])
+        if(array_diff(array_keys($value),['hosts','private_pins','tls'])||!is_array($value['hosts']??null)||!array_is_list($value['hosts'])
             || !is_array($value['private_pins']??[])||!array_is_list($value['private_pins']??[])){throw new \DomainException('Provider endpoint network policy is invalid.');}
         $hosts=[];foreach($value['hosts'] as $host){$host=EnterpriseIdentityConfig::hostname($host);if(isset($hosts[$host])){throw new \DomainException('Provider endpoint hostnames must not repeat.');}$hosts[$host]=true;}
         $pins=[];foreach($value['private_pins']??[] as $pin){if(!is_array($pin)||array_diff(array_keys($pin),['host','ip'])){throw new \DomainException('Private endpoint policy is invalid.');}$host=EnterpriseIdentityConfig::hostname($pin['host']??'');$ip=self::canonicalIp($pin['ip']??'');if(!isset($hosts[$host])||isset($pins[$host])||!self::isPrivatePin($ip)){throw new \DomainException('Private endpoint policy contains an invalid host or address.');}$pins[$host]=$ip;}
-        return ['hosts'=>array_keys($hosts),'private_pins'=>$pins];
+        require_once __DIR__.'/ScopedTls.php';
+        return ['hosts'=>array_keys($hosts),'private_pins'=>$pins,'tls'=>ScopedTls::normalize($value['tls']??[])];
     }
     public static function networkPolicy(array $provider): array
     {
-        return ['hosts'=>$provider['endpoint_hosts']??[],'private_pins'=>$provider['private_endpoint_pins']??[]];
+        return ['hosts'=>$provider['endpoint_hosts']??[],'private_pins'=>$provider['private_endpoint_pins']??[]]+(isset($provider['tls'])?['tls'=>$provider['tls']]:[]);
     }
     private static function canonicalIp($value): string
     {
@@ -71,11 +72,24 @@ final class EnterpriseIdentityHttp
     public static function request(string $url,array $policy,string $method='GET',array $form=[],array $headers=[]): array
     {
         $parts=parse_url($url);if(!is_array($parts)||isset($parts['fragment'])){throw new \DomainException('Provider endpoint URL is invalid.');}$validated=$url;if(isset($parts['query'])){if(!preg_match('/^startIndex=[1-9][0-9]{0,4}&count=200$/D',$parts['query'])){throw new \DomainException('Unsupported provider endpoint query.');}$validated=substr($url,0,strpos($url,'?'));}
+        return self::perform($url,$validated,$policy,$method,$form,$headers,12000);
+    }
+
+    public static function directoryRequest(string $url,array $policy,string $method='GET',array $form=[],array $headers=[],int $timeoutMs=12000): array
+    {
+        require_once __DIR__.'/DirectoryCloud.php';
+        DirectoryCloud::requestUrl($url);
+        if ($timeoutMs < 1 || $timeoutMs > 12000) { throw new \DomainException('Cloud directory request deadline is invalid.'); }
+        return self::perform($url,explode('?',$url,2)[0],$policy,$method,$form,$headers,$timeoutMs);
+    }
+
+    private static function perform(string $url,string $validated,array $policy,string $method,array $form,array $headers,int $timeoutMs): array
+    {
         $validated=EnterpriseIdentityConfig::url($validated,'Provider endpoint');$host=EnterpriseIdentityConfig::hostname(parse_url($validated,PHP_URL_HOST));$port=(int)(parse_url($validated,PHP_URL_PORT)??443);$address=self::pinnedAddress($host,$policy);
         if(!function_exists('curl_init')||!defined('CURLOPT_RESOLVE')){throw new \DomainException('The PHP cURL runtime cannot pin provider DNS results.');}
         $h=curl_init($url);if($h===false){throw new \DomainException('Provider HTTPS request could not be initialized.');}$body='';$resolveAddress=str_contains($address,':')?'['.$address.']':$address;
-        $options=[CURLOPT_PROTOCOLS=>CURLPROTO_HTTPS,CURLOPT_REDIR_PROTOCOLS=>CURLPROTO_HTTPS,CURLOPT_FOLLOWLOCATION=>false,CURLOPT_SSL_VERIFYPEER=>true,
-            CURLOPT_SSL_VERIFYHOST=>2,CURLOPT_SSLVERSION=>CURL_SSLVERSION_TLSv1_2,CURLOPT_CONNECTTIMEOUT=>5,CURLOPT_TIMEOUT=>12,CURLOPT_PROXY=>'',CURLOPT_NOPROXY=>'*',
+        $options=ScopedTls::curlOptions(self::policy($policy)['tls'])+[CURLOPT_PROTOCOLS=>CURLPROTO_HTTPS,CURLOPT_REDIR_PROTOCOLS=>CURLPROTO_HTTPS,CURLOPT_FOLLOWLOCATION=>false,CURLOPT_SSL_VERIFYPEER=>true,
+            CURLOPT_SSL_VERIFYHOST=>2,CURLOPT_SSLVERSION=>CURL_SSLVERSION_TLSv1_2,CURLOPT_CONNECTTIMEOUT_MS=>min(5000,$timeoutMs),CURLOPT_TIMEOUT_MS=>$timeoutMs,CURLOPT_PROXY=>'',CURLOPT_NOPROXY=>'*',
             CURLOPT_RESOLVE=>[$host.':'.$port.':'.$resolveAddress],CURLOPT_HTTPHEADER=>$headers,
             CURLOPT_WRITEFUNCTION=>static function($curl,string $bytes)use(&$body):int{if(strlen($body)+strlen($bytes)>1048576){return 0;}$body.=$bytes;return strlen($bytes);}];
         if($method==='POST'){$options[CURLOPT_POST]=true;$options[CURLOPT_POSTFIELDS]=http_build_query($form,'','&',PHP_QUERY_RFC3986);}

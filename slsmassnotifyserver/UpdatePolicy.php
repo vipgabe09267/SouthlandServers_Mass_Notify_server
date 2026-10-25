@@ -18,7 +18,7 @@ final class UpdatePolicy
         }
         if (isset($value['channel']) && !in_array($value['channel'],['stable','beta'],true)) { $errors[]='Choose the stable or beta update channel.'; }
         if (is_string($value['pinned_version'] ?? null) && $value['pinned_version']!==''
-            && !preg_match('/^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}(?:-beta)?$/D',$value['pinned_version'])) { $errors[]='Pin a release such as 0.1.7-beta, or leave the version blank.'; }
+            && !preg_match('/^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}(?:-beta)?$/D',$value['pinned_version'])) { $errors[]='Pin a release such as 0.1.8-beta, or leave the version blank.'; }
         foreach (['window_start','window_end'] as $key) {
             if (is_string($value[$key] ?? null) && $value[$key]!=='' && !preg_match('/^(?:[01][0-9]|2[0-3]):[0-5][0-9]$/D',$value[$key])) { $errors[]='Update window times must use HH:MM in the PBX operating-system timezone.'; }
         }

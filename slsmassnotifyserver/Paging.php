@@ -491,5 +491,9 @@ PY;
         $ext->add('sls-live-paging-autoanswer', 's', '', new \ext_setvar('SLS_PAGING_TARGET', '${CHANNEL(endpoint)}'));
         $ext->add('sls-live-paging-autoanswer', 's', '', new \ext_gosub(1, 's', 'sls-alert-autoanswer', '${SLS_PAGING_TARGET}'));
         $ext->add('sls-live-paging-autoanswer', 's', '', new \ext_return());
+        // ConfBridge's caller-only menu executes this context directly. Let it
+        // fall through so it restores the original IVR/Gosub stack itself.
+        $ext->add('sls-live-paging-ready', 's', '', new \extension('AGI(' . self::RUNTIME_DIR . '/sls_mass_notify_live_paging.php,--ready)'));
+        $ext->add('sls-live-paging-ready', 's', '', new \extension('StopPlayTones()'));
     }
 }

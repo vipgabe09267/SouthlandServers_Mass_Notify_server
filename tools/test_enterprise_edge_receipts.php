@@ -28,7 +28,7 @@ $config=['enabled'=>true,'remote_enabled'=>true,'mode'=>'edge','cluster_id'=>'te
     'edge_assets'=>[['id'=>'tone','path'=>$asset,'sha256'=>hash('sha256',$audio)]],
     'peers'=>[['node_id'=>'coordinator','site_id'=>'site','role'=>'coordinator','https_url'=>'https://localhost/fixture',
         'cert_sha256'=>str_repeat('a',64),'hmac_secret'=>str_repeat('b',64)]]];
-$runtime=new EnterpriseClusterRuntime(['enterprise_cluster'=>$config],$root.'/enterprise-cluster',str_repeat('c',64),null,static fn()=>['enterprise_cluster'=>$config]);
+$runtime=new EnterpriseClusterRuntime(['enterprise_labs'=>['enabled'=>true],'enterprise_cluster'=>$config],$root.'/enterprise-cluster',str_repeat('c',64),null,static fn()=>['enterprise_labs'=>['enabled'=>true],'enterprise_cluster'=>$config]);
 $runtime->initialize();$edge=new EnterpriseClusterEdge($runtime);$device=$edge->authenticate('speaker',$token);$other=$edge->authenticate('other',$otherToken);$now=time();
 $job=['id'=>'job-a','delivery_id'=>'delivery-a','site_id'=>'site','created_at'=>$now,'expires_at'=>$now+60,
     'recipients'=>['speaker'],'channels'=>['local_audio','local_display'],'intent'=>$intent,'content_sha256'=>$fingerprint,'offline_approved'=>true];

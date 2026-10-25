@@ -65,7 +65,7 @@ const complete = {state: 'complete', success: true, created_at: new Date().toISO
     };
     vm.createContext(cooldownContext);
     installWidgetTransport(cooldownContext);
-    vm.runInContext(source.slice(source.indexOf('\tvar cooldownPollBusy ='),source.indexOf("\tform.addEventListener('submit'")),cooldownContext);
+    vm.runInContext(source.slice(source.indexOf('\tvar cooldownPollBusy ='),source.indexOf("    var deliveryReview=null")),cooldownContext);
     assert.strictEqual(interval.delay,60000,'Idle dashboard refresh became unnecessarily frequent');
     cooldownContext.document.hidden=true;interval.fn();listeners.focusin();listeners.visibilitychange();
     assert.strictEqual(cooldownRequests,0,'Background dashboard issued cooldown requests');

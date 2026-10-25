@@ -126,6 +126,12 @@ trait SlsOperators
         foreach ($access['accounts']??[] as $index=>$account) {
             unset($access['accounts'][$index]['auth']['totp_last_counter'],$access['accounts'][$index]['auth']['recovery_hashes'],
                 $access['accounts'][$index]['auth']['password_recovery']);
+            foreach($access['accounts'][$index]['auth']['passkeys']??[] as $keyIndex=>$key){
+                $record=json_decode($key['record'],true,16,JSON_THROW_ON_ERROR);
+                unset($record['counter'],$record['backupEligible'],$record['backupStatus'],$record['uvInitialized']);
+                $access['accounts'][$index]['auth']['passkeys'][$keyIndex]['record']=json_encode($record,JSON_THROW_ON_ERROR);
+                unset($access['accounts'][$index]['auth']['passkeys'][$keyIndex]['last_used_at']);
+            }
         }
         return hash('sha256', json_encode([$access, $settings['location_directory'] ?? [],
             $settings['announcement_groups'] ?? [], $settings['desktop_clients']??[], $settings['outbound_voice']['recipients']??[],
@@ -192,8 +198,8 @@ trait SlsOperators
     {
         $lock=null;
         try {
-            if (array_diff(array_keys($input),['revision','enabled','portal_enabled','accounts']) || !is_string($input['revision']??null)
-                || !is_bool($input['enabled']??null) || !is_bool($input['portal_enabled']??false) || !is_array($input['accounts']??null) || !array_is_list($input['accounts'])
+            if (array_diff(array_keys($input),['revision','enabled','portal_enabled','passkeys_enabled','accounts']) || !is_string($input['revision']??null)
+                || !is_bool($input['enabled']??null) || !is_bool($input['portal_enabled']??false) || !is_bool($input['passkeys_enabled']??false) || !is_array($input['accounts']??null) || !array_is_list($input['accounts'])
                 || count($input['accounts'])>100) { throw new \DomainException('The operator form is invalid or exceeds 100 accounts. Reload Operator Access.'); }
             // Verify administrator authority before doing expensive password work.
             $directory=$this->operatorDirectory(); $available=[];
@@ -235,9 +241,11 @@ trait SlsOperators
                     if (!empty($row['reset_totp'])) {
                         if (!isset($hashes[$index])) { throw new \DomainException('Set a new initial password when resetting an authenticator. Existing sessions will be revoked.'); }
                         $auth['totp_secret_enc']=''; $auth['totp_last_counter']=-1; $auth['recovery_hashes']=[];
+                        unset($auth['passkeys']);
                     }
                     // A disable/re-enable cycle must never revive an old session.
-                    if (($input['portal_enabled']??false)!==($active['operator_access']['portal_enabled']??false)) {
+                    if (($input['portal_enabled']??false)!==($active['operator_access']['portal_enabled']??false)
+                        ||($input['passkeys_enabled']??false)!==($active['operator_access']['passkeys_enabled']??false)) {
                         $auth['version']=bin2hex(random_bytes(32));
                     }
                     if ($old && (($row['enabled']??false)!==$old['enabled'] || ($row['email']??'')!==($old['email']??'') || $row['expires_at']!==$old['expires_at'])) {
@@ -259,7 +267,8 @@ trait SlsOperators
                 }
                 unset($row['password'],$row['reset_totp'],$row['rebind']); $rows[]=$row;
             }
-            $config=OperatorAccess::normalize(['schema'=>1,'enabled'=>$input['enabled'],'portal_enabled'=>$input['portal_enabled']??false,'accounts'=>$rows]);
+            $config=OperatorAccess::normalize(['schema'=>1,'enabled'=>$input['enabled'],'portal_enabled'=>$input['portal_enabled']??false,'passkeys_enabled'=>$input['passkeys_enabled']??false,'accounts'=>$rows]);
+            if($config['passkeys_enabled']&&!($active['operator_access']['passkeys_enabled']??false)){require_once __DIR__.'/OperatorPasskeys.php';\SLS\MassNotify\OperatorPasskeys::verifyRuntime();}
             if (array_intersect(array_column($rows,'id'),array_column($active['control_api']['credentials']??[],'id'))) { throw new \DomainException('An operator ID conflicts with a Control API key. Recreate that login.'); }
             $nodes=array_column(LocationDirectory::effective($active['location_directory']??[])['nodes'],null,'id'); $catalog=$this->locationCatalog($active);
             foreach ($config['accounts'] as $row) {
@@ -321,6 +330,56 @@ trait SlsOperators
         } finally { $this->releaseSettingsLock($lock); }
     }
 
+    public function operatorPasskeyOperation(string $id,string $identity,string $operation,array $input): array
+    {
+        require_once __DIR__.'/OperatorPasskeys.php';
+        if(!in_array($operation,['register_begin','register_finish','authenticate_begin','authenticate_finish','revoke'],true)){
+            throw new \DomainException('Unsupported operator passkey operation.');
+        }
+        $allowed=match($operation){'register_begin','revoke'=>['code','credential_id'],
+            'register_finish'=>['state','credential','name'],'authenticate_begin'=>[], 'authenticate_finish'=>['state','credential']};
+        if(array_diff(array_keys($input),$allowed)){throw new \DomainException('The passkey request has unsupported fields.');}
+        $lock=$this->acquireSettingsLock(true);
+        try{
+            $active=$this->loadSettingsFile(self::SETTINGS_JSON);$config=OperatorAccess::normalize($active['operator_access']??[]);
+            if(!$config['portal_enabled']||!$config['passkeys_enabled']){throw new \DomainException('Operator passkeys have not been enabled.');}
+            foreach($config['accounts'] as &$account){
+                if($account['id']!==$id||!$account['enabled']||$account['source']!=='portal'||!OperatorAccess::activeAccount($account)||!\SLS\MassNotify\OperatorAuth::ready($account)){continue;}
+                if(!hash_equals(\SLS\MassNotify\OperatorAuth::identity($account),$identity)){throw new \DomainException('This operator login changed. Sign in again.');}
+                $changed=false;$result=[];$auth=$account['auth'];$now=time();
+                if(in_array($operation,['register_begin','revoke'],true)){
+                    $code=$input['code']??'';
+                    if(!is_string($code)||!preg_match('/^[0-9]{6}$/D',$code)){throw new \DomainException('Enter a fresh six-digit authenticator code to manage passkeys.');}
+                    $counter=\SLS\MassNotify\OperatorAuth::counter(\SLS\MassNotify\OperatorAuth::open($auth['totp_secret_enc'],$id,$active),$code,$now,$auth['totp_last_counter']);
+                    if($counter===null){throw new \DomainException('The authenticator code is invalid or already used. Wait for the next code.');}
+                    $auth['totp_last_counter']=$counter;$changed=true;
+                }
+                if(str_ends_with($operation,'_begin')){
+                    $result=\SLS\MassNotify\OperatorPasskeys::begin($active,$account,$operation==='register_begin'?'register':'authenticate',$now);
+                }elseif($operation==='register_finish'){
+                    if(!is_array($input['state']??null)||!is_string($input['credential']??null)||!is_string($input['name']??null)){throw new \DomainException('The passkey registration is incomplete.');}
+                    $saved=\SLS\MassNotify\OperatorPasskeys::register($active,$account,$input['state'],$input['credential'],$input['name'],$now);
+                    $auth['passkeys'][]=$saved;$auth['version']=bin2hex(random_bytes(32));$changed=true;
+                }elseif($operation==='authenticate_finish'){
+                    if(!is_array($input['state']??null)||!is_string($input['credential']??null)){throw new \DomainException('The passkey assertion is incomplete.');}
+                    $saved=\SLS\MassNotify\OperatorPasskeys::authenticate($active,$account,$input['state'],$input['credential'],$now);
+                    foreach($auth['passkeys'] as &$key){if(hash_equals($key['credential_id'],$saved['credential_id'])){$key=$saved;break;}}unset($key);$changed=true;
+                }else{
+                    $credentialId=$input['credential_id']??'';
+                    if(!is_string($credentialId)){throw new \DomainException('Select a saved passkey.');}
+                    $keys=$auth['passkeys']??[];$auth['passkeys']=array_values(array_filter($keys,static fn($key)=>!hash_equals($key['credential_id'],$credentialId)));
+                    if(count($keys)===count($auth['passkeys'])){throw new \DomainException('This passkey is no longer enrolled.');}
+                    $auth['version']=bin2hex(random_bytes(32));$changed=true;
+                }
+                if(!OperatorAccess::activeAccount($account,time())||(isset($input['state'])&&($input['state']['expires_at']??0)<=time())){throw new \DomainException('The operator or passkey challenge expired during verification.');}
+                $account['auth']=\SLS\MassNotify\OperatorAuth::normalize($auth);$account['identity']=\SLS\MassNotify\OperatorAuth::identity($account);$updated=$account;unset($account);
+                if($changed){$this->writeOperatorConfig($active,$config);}
+                return $result+['account'=>$updated];
+            }unset($account);
+            throw new \DomainException('This operator login is disabled, expired or unavailable.');
+        }finally{$this->releaseSettingsLock($lock);}
+    }
+
     private function withOperator(array $principal, callable $work): array
     {
         $existed = array_key_exists('sls_control_principal', $GLOBALS); $old = $GLOBALS['sls_control_principal'] ?? null;
@@ -369,12 +428,22 @@ trait SlsOperators
             foreach (IncidentConfig::escalationSteps($record['template']['escalation']) as $step) { $whole = $whole && OperatorAccess::delivery($principal, $step['delivery'], $settings); }
         }
         if (!$whole && !$roster) { return null; }
-        return array_intersect_key($record, array_flip(['id', 'title', 'severity', 'state', 'is_test', 'created_at']))
+        return array_intersect_key($record, array_flip(['id', 'title', 'message', 'severity', 'state', 'is_test', 'created_at']))
             + ['roster'=>$roster, 'responses'=>$responses, 'response_counts'=>$counts, 'can_update'=>$whole && OperatorAccess::may($principal, 'send'),
                 'submission_states'=>array_values(array_unique(array_column($record['operations'] ?? [], 'state')))];
     }
 
-    public function operatorOperationsState(string $cursor = ''): array
+    public function operatorFocusedIncident(string $id): array
+    {
+        if (!preg_match('/^inc_[a-f0-9]{32}$/D', $id)) { throw new \DomainException('Select a valid incident.'); }
+        $principal = $this->currentOperator();
+        $record = $this->incidentStore()->read($id);
+        $projected = $record ? $this->operatorIncidentProjection($record, $principal) : null;
+        if (!$projected) { throw new \DomainException('This incident is unavailable or outside your current assignments.'); }
+        return $projected;
+    }
+
+    public function operatorOperationsState(string $cursor = '', string $incidentId = ''): array
     {
         $principal = $this->currentOperator(); $settings = $this->getActiveSettings(); $catalog = $this->locationCatalog($settings);
         $allowed = ApiSecurity::allowedAudience($principal, $settings);
@@ -389,7 +458,9 @@ trait SlsOperators
                 }
             }
         }
-        $incidents = []; $listing = $this->incidentService()->listing(10, $cursor);
+        $incidents = []; $listing = $incidentId === '' ? $this->incidentService()->listing(10, $cursor)
+            : ['incidents' => [], 'next_cursor' => ''];
+        if ($incidentId !== '') { $incidents[] = $this->operatorFocusedIncident($incidentId); }
         foreach ($listing['incidents'] as $summary) {
             // The history index deliberately contains no roster or delivery
             // snapshot. Load only this bounded page's records before applying
@@ -646,6 +717,6 @@ trait SlsOperators
         $identity_settings=isset($GLOBALS['sls_operator_portal_principal'])?'':$this->renderOperatorIdentitySettings($endpoint,$csrf_token);
         return load_view(__DIR__.'/views/operators.php',compact('state','csrf_token','endpoint','identity_settings'));
     }
-    public function renderOperationsPage(string $cursor = '', string $endpoint = 'config.php?display=slsmassnotifyserver_operations', ?string $csrf = null): string
-    { return load_view(__DIR__.'/views/operations.php', ['state'=>$this->operatorOperationsState($cursor), 'csrf_token'=>$csrf ?? $this->getCsrfToken(), 'endpoint'=>$endpoint]); }
+    public function renderOperationsPage(string $cursor = '', string $endpoint = 'config.php?display=slsmassnotifyserver_operations', ?string $csrf = null, string $incidentId = ''): string
+    { return load_view(__DIR__.'/views/operations.php', ['state'=>$this->operatorOperationsState($cursor, $incidentId), 'csrf_token'=>$csrf ?? $this->getCsrfToken(), 'endpoint'=>$endpoint, 'focused_incident'=>$incidentId]); }
 }

@@ -76,7 +76,7 @@ RETRYABLE_PRE_SUBMISSION_ERRORS = {
     "request_timeout",
     "tls_failure",
 }
-USER_AGENT = "SouthlandServers-Mass-Notifications-Server/0.1.7-beta"
+USER_AGENT = "SouthlandServers-Mass-Notifications-Server/0.1.8-beta"
 DISCORD_HOSTS = {"discord.com", "discordapp.com", "canary.discord.com", "ptb.discord.com"}
 DISCORD_PATH = re.compile(r"^/api/webhooks/[0-9]+/[A-Za-z0-9._~-]+$")
 # Downloaded and bundled artwork; providers retrieve it from this PBX, not
@@ -512,7 +512,7 @@ def incident_operator_link(config, incident_id):
     if not 1 <= port <= 65535:
         return ""
     origin = "https://" + host.lower() + (":" + str(port) if port != 443 else "")
-    return origin + "/admin/config.php?display=slsmassnotifyserver_incidents&incident_id=" + incident_id
+    return origin + "/mass-notify/?view=operations&incident_id=" + incident_id
 
 
 def collaboration_incident_context(value):
@@ -548,7 +548,7 @@ def collaboration_incident_context(value):
 
 def build_collaboration_payload(adapter, title, body, event="", severity="", fields=None,
                                 timestamp="", source="", event_id="", *, incident_id="", config=None, incident_context=None):
-    if not isinstance(adapter, str) or adapter not in {"slack", "teams_workflow"}:
+    if not isinstance(adapter, str) or adapter not in {"slack", "teams_workflow", "teams_bearer", "google_chat", "mattermost"}:
         raise DestinationError("invalid_payload_format", submission_possible=False)
     title = _integration_text(title) or "SLS Mass Notification"
     body = _integration_text(body)
@@ -586,7 +586,14 @@ def build_collaboration_payload(adapter, title, body, event="", severity="", fie
     # workflow/host wrapping, and apply the same conservative limit to Slack.
     if len(text.encode("utf-8")) > 24 * 1024:
         raise DestinationError("payload_too_large", submission_possible=False)
-    if adapter == "slack":
+    if adapter in {"google_chat", "mattermost"}:
+        # These formats interpret mentions in text. Break mention syntax while
+        # retaining the full instructions; recipient selection stays in SLS.
+        rendered = text.replace('@', '@\u200b').replace('<', '\u2039').replace('>', '\u203a')
+        if incident_url:
+            rendered += '\n\nOpen incident in SLS: ' + incident_url
+        payload = {'text': rendered}
+    elif adapter == "slack":
         # Block Kit plain_text never interprets alert content as mentions or
         # Markdown. Escape the notification fallback and disable auto parsing.
         fallback = title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -633,7 +640,7 @@ def webhook_auth_headers(authentication, body, event_id, now=None):
     headers = {}
     for field in ('bearer_token', 'signing_secret'):
         secret = authentication.get(field, '')
-        if not isinstance(secret, str) or len(secret) > 512 or re.search(r'[^\x21-\x7e]', secret):
+        if not isinstance(secret, str) or len(secret) > (8192 if field == 'bearer_token' else 512) or re.search(r'[^\x21-\x7e]', secret):
             raise DestinationError('invalid_webhook_authentication')
     if authentication.get('bearer_token'):
         headers['Authorization'] = 'Bearer ' + authentication['bearer_token']
@@ -878,7 +885,9 @@ def _deliver(row, payload, event_id, transport, resolver, sleep, deadline, clock
             return _budget_failure(row, attempt - 1)
         request_timeout = min(DEFAULT_TIMEOUT, remaining)
         try:
-            auth = row.get('authentication', {}) if row.get('payload_format', 'native') == 'native' else {}
+            adapter = row.get('payload_format', 'native')
+            auth = row.get('authentication', {}) if adapter == 'native' else (
+                {'bearer_token': row.get('authentication', {}).get('bearer_token', '')} if adapter == 'teams_bearer' else {})
             kwargs = {'authentication': auth} if any(auth.values()) else {}
             if submission_guard is not None:
                 kwargs['submission_guard'] = submission_guard

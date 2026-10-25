@@ -164,6 +164,7 @@ final class OperatorPortal
         $navigation='';
         if ($authenticated) {
             $navigation='<nav aria-label="Operator portal"><a '.($view==='operations'?'aria-current="page" ':'').'href="'.self::BASE.'">Operations</a>';
+            $navigation.='<a '.($view==='security'?'aria-current="page" ':'').'href="'.self::BASE.'?view=security">Security</a>';
             if (($principal['operator_role'] ?? '')==='administrator') {
                 $navigation.='<a '.($view==='access'?'aria-current="page" ':'').'href="'.self::BASE.'?view=access">Operator access</a>';
             }

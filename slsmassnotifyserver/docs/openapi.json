@@ -1,0 +1,2507 @@
+{
+  "components": {
+    "schemas": {
+      "Acknowledgment": {
+        "additionalProperties": false,
+        "properties": {
+          "event_id": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string",
+            "x-sls-maximum-utf8-bytes": 2048
+          }
+        },
+        "required": [
+          "event_id"
+        ],
+        "type": "object"
+      },
+      "Action_enterprise_template_start": {
+        "additionalProperties": true,
+        "description": "See CONTROL_API.md for the complete validated request and response contract for enterprise_template_start. Additional fields are not automatically permitted by the server.",
+        "properties": {
+          "action": {
+            "const": "enterprise_template_start"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object",
+        "x-sls-idempotency": "request_id",
+        "x-sls-maximum-body-bytes": 65536,
+        "x-sls-scope": "send"
+      },
+      "Action_get_config": {
+        "additionalProperties": true,
+        "description": "See CONTROL_API.md for the complete validated request and response contract for get_config. Additional fields are not automatically permitted by the server.",
+        "properties": {
+          "action": {
+            "const": "get_config"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object",
+        "x-sls-idempotency": "none",
+        "x-sls-maximum-body-bytes": 65536,
+        "x-sls-scope": "config"
+      },
+      "Action_incident_checklist": {
+        "additionalProperties": true,
+        "description": "See CONTROL_API.md for the complete validated request and response contract for incident_checklist. Additional fields are not automatically permitted by the server.",
+        "properties": {
+          "action": {
+            "const": "incident_checklist"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object",
+        "x-sls-idempotency": "request_id",
+        "x-sls-maximum-body-bytes": 65536,
+        "x-sls-scope": "config"
+      },
+      "Action_incident_roll_call": {
+        "additionalProperties": true,
+        "description": "See CONTROL_API.md for the complete validated request and response contract for incident_roll_call. Additional fields are not automatically permitted by the server.",
+        "properties": {
+          "action": {
+            "const": "incident_roll_call"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object",
+        "x-sls-idempotency": "request_id",
+        "x-sls-maximum-body-bytes": 65536,
+        "x-sls-scope": "config"
+      },
+      "Action_preview_announcement": {
+        "additionalProperties": true,
+        "description": "See CONTROL_API.md for the complete validated request and response contract for preview_announcement. Additional fields are not automatically permitted by the server.",
+        "properties": {
+          "action": {
+            "const": "preview_announcement"
+          },
+          "extensions": {
+            "items": {
+              "pattern": "^[0-9]{1,20}$",
+              "type": "string"
+            },
+            "maxItems": 1000,
+            "type": "array"
+          },
+          "groups": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 200,
+            "type": "array"
+          },
+          "is_test": {
+            "default": false,
+            "type": "boolean"
+          },
+          "mass_notify": {
+            "type": "boolean"
+          },
+          "message": {
+            "maxLength": 500,
+            "minLength": 1,
+            "type": "string"
+          },
+          "options": {
+            "additionalProperties": true,
+            "description": "Validated delivery options; see CONTROL_API.md. Authorities and recipients are enforced by the current credential.",
+            "type": "object"
+          },
+          "tts_audio": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "action",
+          "message"
+        ],
+        "type": "object",
+        "x-sls-idempotency": "none",
+        "x-sls-maximum-body-bytes": 65536,
+        "x-sls-scope": "send"
+      },
+      "Action_rehearse_announcement": {
+        "additionalProperties": true,
+        "description": "See CONTROL_API.md for the complete validated request and response contract for rehearse_announcement. Additional fields are not automatically permitted by the server.",
+        "properties": {
+          "action": {
+            "const": "rehearse_announcement"
+          },
+          "extensions": {
+            "items": {
+              "pattern": "^[0-9]{1,20}$",
+              "type": "string"
+            },
+            "maxItems": 1000,
+            "type": "array"
+          },
+          "groups": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 200,
+            "type": "array"
+          },
+          "is_test": {
+            "default": false,
+            "type": "boolean"
+          },
+          "mass_notify": {
+            "type": "boolean"
+          },
+          "message": {
+            "maxLength": 500,
+            "minLength": 1,
+            "type": "string"
+          },
+          "options": {
+            "additionalProperties": true,
+            "description": "Validated delivery options; see CONTROL_API.md. Authorities and recipients are enforced by the current credential.",
+            "type": "object"
+          },
+          "simulation": {
+            "additionalProperties": false,
+            "description": "Synthetic planning outcomes only; no transport request or durable delivery receipt is created.",
+            "properties": {
+              "channels": {
+                "additionalProperties": false,
+                "properties": {
+                  "audio": {
+                    "enum": [
+                      "accepted",
+                      "refused",
+                      "uncertain",
+                      "unavailable",
+                      "expired"
+                    ]
+                  },
+                  "browser_push": {
+                    "enum": [
+                      "accepted",
+                      "refused",
+                      "uncertain",
+                      "unavailable",
+                      "expired"
+                    ]
+                  },
+                  "connector": {
+                    "enum": [
+                      "accepted",
+                      "refused",
+                      "uncertain",
+                      "unavailable",
+                      "expired"
+                    ]
+                  },
+                  "desktop": {
+                    "enum": [
+                      "accepted",
+                      "refused",
+                      "uncertain",
+                      "unavailable",
+                      "expired"
+                    ]
+                  },
+                  "email": {
+                    "enum": [
+                      "accepted",
+                      "refused",
+                      "uncertain",
+                      "unavailable",
+                      "expired"
+                    ]
+                  },
+                  "external_voice": {
+                    "enum": [
+                      "accepted",
+                      "refused",
+                      "uncertain",
+                      "unavailable",
+                      "expired"
+                    ]
+                  },
+                  "sip_notify": {
+                    "enum": [
+                      "accepted",
+                      "refused",
+                      "uncertain",
+                      "unavailable",
+                      "expired"
+                    ]
+                  },
+                  "sms": {
+                    "enum": [
+                      "accepted",
+                      "refused",
+                      "uncertain",
+                      "unavailable",
+                      "expired"
+                    ]
+                  },
+                  "webhook": {
+                    "enum": [
+                      "accepted",
+                      "refused",
+                      "uncertain",
+                      "unavailable",
+                      "expired"
+                    ]
+                  }
+                },
+                "type": "object"
+              },
+              "default": {
+                "enum": [
+                  "accepted",
+                  "refused",
+                  "uncertain",
+                  "unavailable",
+                  "expired"
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "tts_audio": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "action",
+          "message"
+        ],
+        "type": "object",
+        "x-sls-idempotency": "none",
+        "x-sls-maximum-body-bytes": 65536,
+        "x-sls-scope": "send"
+      },
+      "Action_retry_announcement": {
+        "additionalProperties": true,
+        "description": "See CONTROL_API.md for the complete validated request and response contract for retry_announcement. Additional fields are not automatically permitted by the server.",
+        "properties": {
+          "action": {
+            "const": "retry_announcement"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object",
+        "x-sls-idempotency": "none",
+        "x-sls-maximum-body-bytes": 65536,
+        "x-sls-scope": "send"
+      },
+      "Action_send_announcement": {
+        "additionalProperties": true,
+        "description": "See CONTROL_API.md for the complete validated request and response contract for send_announcement. Additional fields are not automatically permitted by the server.",
+        "properties": {
+          "action": {
+            "const": "send_announcement"
+          },
+          "extensions": {
+            "items": {
+              "pattern": "^[0-9]{1,20}$",
+              "type": "string"
+            },
+            "maxItems": 1000,
+            "type": "array"
+          },
+          "groups": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 200,
+            "type": "array"
+          },
+          "is_test": {
+            "default": false,
+            "type": "boolean"
+          },
+          "mass_notify": {
+            "type": "boolean"
+          },
+          "message": {
+            "maxLength": 500,
+            "minLength": 1,
+            "type": "string"
+          },
+          "options": {
+            "additionalProperties": true,
+            "description": "Validated delivery options; see CONTROL_API.md. Authorities and recipients are enforced by the current credential.",
+            "type": "object"
+          },
+          "tts_audio": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "action",
+          "message"
+        ],
+        "type": "object",
+        "x-sls-idempotency": "Idempotency-Key",
+        "x-sls-maximum-body-bytes": 65536,
+        "x-sls-scope": "send"
+      },
+      "Action_start_incident": {
+        "additionalProperties": true,
+        "description": "See CONTROL_API.md for the complete validated request and response contract for start_incident. Additional fields are not automatically permitted by the server.",
+        "properties": {
+          "action": {
+            "const": "start_incident"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object",
+        "x-sls-idempotency": "request_id",
+        "x-sls-maximum-body-bytes": 65536,
+        "x-sls-scope": "send"
+      },
+      "Action_test_nws": {
+        "additionalProperties": true,
+        "description": "See CONTROL_API.md for the complete validated request and response contract for test_nws. Additional fields are not automatically permitted by the server.",
+        "properties": {
+          "action": {
+            "const": "test_nws"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object",
+        "x-sls-idempotency": "none",
+        "x-sls-maximum-body-bytes": 65536,
+        "x-sls-scope": "test"
+      },
+      "Action_trigger_nws_test": {
+        "additionalProperties": true,
+        "description": "See CONTROL_API.md for the complete validated request and response contract for trigger_nws_test. Additional fields are not automatically permitted by the server.",
+        "properties": {
+          "action": {
+            "const": "trigger_nws_test"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object",
+        "x-sls-idempotency": "none",
+        "x-sls-maximum-body-bytes": 65536,
+        "x-sls-scope": "test"
+      },
+      "Action_update_config": {
+        "additionalProperties": true,
+        "description": "See CONTROL_API.md for the complete validated request and response contract for update_config. Additional fields are not automatically permitted by the server.",
+        "properties": {
+          "action": {
+            "const": "update_config"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object",
+        "x-sls-idempotency": "none",
+        "x-sls-maximum-body-bytes": 2097152,
+        "x-sls-scope": "config"
+      },
+      "Action_update_incident": {
+        "additionalProperties": true,
+        "description": "See CONTROL_API.md for the complete validated request and response contract for update_incident. Additional fields are not automatically permitted by the server.",
+        "properties": {
+          "action": {
+            "const": "update_incident"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object",
+        "x-sls-idempotency": "request_id",
+        "x-sls-maximum-body-bytes": 65536,
+        "x-sls-scope": "send"
+      },
+      "Error": {
+        "additionalProperties": true,
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "ok": {
+            "const": false
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "error"
+        ],
+        "type": "object"
+      },
+      "Notification": {
+        "additionalProperties": true,
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "pattern": "(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+            "type": "string"
+          },
+          "display_expires_at": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "const": ""
+              },
+              {
+                "format": "date-time",
+                "type": "string"
+              }
+            ],
+            "description": "An absolute server deadline, or null/empty when no server display deadline was set. Clients still enforce their maximum announcement lifetime."
+          },
+          "display_timeout_seconds": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string",
+            "x-sls-maximum-utf8-bytes": 2048
+          },
+          "image_authentication": {
+            "const": "desktop_basic"
+          },
+          "image_url": {
+            "anyOf": [
+              {
+                "const": ""
+              },
+              {
+                "format": "uri",
+                "pattern": "^https://[^\\s]+$",
+                "type": "string"
+              }
+            ]
+          },
+          "incident": {
+            "additionalProperties": true,
+            "properties": {
+              "incident_id": {
+                "pattern": "^inc_[a-f0-9]{32}$",
+                "type": "string"
+              },
+              "is_test": {
+                "type": "boolean"
+              },
+              "kind": {
+                "enum": [
+                  "initial",
+                  "update",
+                  "all_clear",
+                  "escalation"
+                ]
+              },
+              "schema": {
+                "const": 1
+              },
+              "sequence": {
+                "maximum": 250,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "severity": {
+                "enum": [
+                  "information",
+                  "warning",
+                  "critical"
+                ]
+              }
+            },
+            "required": [
+              "schema",
+              "incident_id",
+              "sequence",
+              "kind",
+              "severity",
+              "is_test"
+            ],
+            "type": "object"
+          },
+          "is_test": {
+            "type": "boolean"
+          },
+          "kind": {
+            "enum": [
+              "announcement",
+              "alert"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "is_test"
+        ],
+        "title": "SLS notification payload schema 1",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "ControlKey": {
+        "description": "Use a named, scoped Control API credential. Expiry and enabled state are checked on every request.",
+        "scheme": "bearer",
+        "type": "http"
+      },
+      "DesktopLogin": {
+        "description": "Dedicated desktop enrollment credentials. Original recipient enrollment IDs remain authoritative.",
+        "scheme": "basic",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "Additive Control API, notification schema 1 and desktop SSE protocol 2. Labs features require explicit configuration. Use the configured public HTTPS origin, including a forwarded port when applicable.",
+    "license": {
+      "identifier": "AGPL-3.0-or-later",
+      "name": "AGPL-3.0-or-later"
+    },
+    "title": "SLS Mass Notifications API",
+    "version": "0.1.8-beta"
+  },
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "openapi": "3.1.1",
+  "paths": {
+    "/api/sipnotify/desktop": {
+      "get": {
+        "operationId": "pollDesktop",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "last_event_id",
+            "schema": {
+              "maxLength": 2048,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 25,
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Optional returned feed validator. An unchanged authenticated response is still HTTP 200 with an empty events page.",
+            "in": "header",
+            "name": "If-None-Match",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful response. A transport acceptance is not a human acknowledgment."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "DesktopLogin": []
+          }
+        ]
+      }
+    },
+    "/api/sipnotify/desktop/ack": {
+      "post": {
+        "operationId": "recordDesktopReceipt",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Acknowledgment"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "properties": {
+                    "event_id": {
+                      "maxLength": 2048,
+                      "minLength": 1,
+                      "type": "string",
+                      "x-sls-maximum-utf8-bytes": 2048
+                    },
+                    "ok": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "event_id"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Received by desktop app; no human-read claim."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "DesktopLogin": []
+          }
+        ]
+      }
+    },
+    "/api/sipnotify/desktop/incident": {
+      "get": {
+        "description": "Reads only incident data assigned to the current original desktop enrollment. Opening a record does not acknowledge or respond to it.",
+        "operationId": "readAssignedDesktopIncident",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "incident_id",
+            "required": true,
+            "schema": {
+              "pattern": "^inc_[a-f0-9]{32}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful response. A transport acceptance is not a human acknowledgment."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "DesktopLogin": []
+          }
+        ]
+      }
+    },
+    "/api/sipnotify/desktop/incident/respond": {
+      "post": {
+        "description": "Explicit human response, separate from software receipt. The server rechecks current incident and audience authority.",
+        "operationId": "respondToAssignedDesktopIncident",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "incident_id": {
+                    "pattern": "^inc_[a-f0-9]{32}$",
+                    "type": "string"
+                  },
+                  "note": {
+                    "maxLength": 500,
+                    "type": "string"
+                  },
+                  "request_id": {
+                    "pattern": "^[a-f0-9]{32}$",
+                    "type": "string"
+                  },
+                  "response": {
+                    "enum": [
+                      "received",
+                      "safe",
+                      "needs_assistance"
+                    ]
+                  }
+                },
+                "required": [
+                  "incident_id",
+                  "request_id",
+                  "response"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful response. A transport acceptance is not a human acknowledgment."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "DesktopLogin": []
+          }
+        ]
+      }
+    },
+    "/api/sipnotify/desktop/media": {
+      "get": {
+        "operationId": "downloadDesktopImage",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "event_id",
+            "required": true,
+            "schema": {
+              "maxLength": 2048,
+              "minLength": 1,
+              "type": "string",
+              "x-sls-maximum-utf8-bytes": 2048
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "image/png": {
+                "schema": {
+                  "format": "binary",
+                  "maxLength": 5242880,
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Same-origin PNG for this original recipient, before the alert expiry and maximum ten-minute announcement lifetime."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "DesktopLogin": []
+          }
+        ]
+      }
+    },
+    "/api/sipnotify/desktop/stream": {
+      "get": {
+        "operationId": "streamDesktop",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Last-Event-ID",
+            "schema": {
+              "maxLength": 2048,
+              "minLength": 1,
+              "type": "string",
+              "x-sls-maximum-utf8-bytes": 2048
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "SSE protocol 2. Heartbeats approximately every 15 seconds. Shared PHP-FPM pools direct clients to cursor-aware polling."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "DesktopLogin": []
+          }
+        ],
+        "x-sls-sse-protocol": 2
+      }
+    },
+    "/api/sls-mass-notify/": {
+      "get": {
+        "operationId": "readControlResource",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "resource",
+            "required": false,
+            "schema": {
+              "default": "status",
+              "enum": [
+                "status",
+                "capabilities",
+                "audiences",
+                "delivery",
+                "events",
+                "readiness",
+                "metrics",
+                "desktop_fleet",
+                "config",
+                "incidents",
+                "incident",
+                "incident_report",
+                "enterprise_capabilities",
+                "incident_templates",
+                "recordings"
+              ]
+            }
+          },
+          {
+            "description": "Prometheus is available for metrics only.",
+            "in": "query",
+            "name": "format",
+            "schema": {
+              "default": "json",
+              "enum": [
+                "json",
+                "prometheus"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              },
+              "text/plain": {
+                "description": "Prometheus exposition for resource=metrics&format=prometheus only; requires monitor scope.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful response. A transport acceptance is not a human acknowledgment."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ControlKey": []
+          }
+        ],
+        "x-sls-resources": [
+          "status",
+          "capabilities",
+          "audiences",
+          "delivery",
+          "events",
+          "readiness",
+          "metrics",
+          "desktop_fleet",
+          "config",
+          "incidents",
+          "incident",
+          "incident_report",
+          "enterprise_capabilities",
+          "incident_templates",
+          "recordings"
+        ]
+      },
+      "post": {
+        "operationId": "controlAction",
+        "parameters": [
+          {
+            "description": "Durable send_announcement retry identity. Incident operations use their request_id field.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "schema": {
+              "maxLength": 128,
+              "minLength": 16,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "discriminator": {
+                  "mapping": {
+                    "enterprise_template_start": "#/components/schemas/Action_enterprise_template_start",
+                    "get_config": "#/components/schemas/Action_get_config",
+                    "incident_checklist": "#/components/schemas/Action_incident_checklist",
+                    "incident_roll_call": "#/components/schemas/Action_incident_roll_call",
+                    "preview_announcement": "#/components/schemas/Action_preview_announcement",
+                    "rehearse_announcement": "#/components/schemas/Action_rehearse_announcement",
+                    "retry_announcement": "#/components/schemas/Action_retry_announcement",
+                    "send_announcement": "#/components/schemas/Action_send_announcement",
+                    "start_incident": "#/components/schemas/Action_start_incident",
+                    "test_nws": "#/components/schemas/Action_test_nws",
+                    "trigger_nws_test": "#/components/schemas/Action_trigger_nws_test",
+                    "update_config": "#/components/schemas/Action_update_config",
+                    "update_incident": "#/components/schemas/Action_update_incident"
+                  },
+                  "propertyName": "action"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/Action_send_announcement"
+                  },
+                  {
+                    "$ref": "#/components/schemas/Action_preview_announcement"
+                  },
+                  {
+                    "$ref": "#/components/schemas/Action_rehearse_announcement"
+                  },
+                  {
+                    "$ref": "#/components/schemas/Action_retry_announcement"
+                  },
+                  {
+                    "$ref": "#/components/schemas/Action_test_nws"
+                  },
+                  {
+                    "$ref": "#/components/schemas/Action_trigger_nws_test"
+                  },
+                  {
+                    "$ref": "#/components/schemas/Action_get_config"
+                  },
+                  {
+                    "$ref": "#/components/schemas/Action_update_config"
+                  },
+                  {
+                    "$ref": "#/components/schemas/Action_start_incident"
+                  },
+                  {
+                    "$ref": "#/components/schemas/Action_update_incident"
+                  },
+                  {
+                    "$ref": "#/components/schemas/Action_incident_roll_call"
+                  },
+                  {
+                    "$ref": "#/components/schemas/Action_incident_checklist"
+                  },
+                  {
+                    "$ref": "#/components/schemas/Action_enterprise_template_start"
+                  }
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful response. A transport acceptance is not a human acknowledgment."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request refused or outcome could not be confirmed. Check the error code before retrying.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying a throttled or temporarily unavailable request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ControlKey": []
+          }
+        ]
+      }
+    }
+  },
+  "servers": [
+    {
+      "url": "https://{pbx_origin}",
+      "variables": {
+        "pbx_origin": {
+          "default": "pbx.example.test",
+          "description": "Configured PBX hostname with optional public HTTPS port, e.g. pbx.example.test:8443."
+        }
+      }
+    }
+  ]
+}

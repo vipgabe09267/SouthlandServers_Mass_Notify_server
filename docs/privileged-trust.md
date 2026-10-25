@@ -179,3 +179,17 @@ and pending configuration fingerprints and retained phone history before clearin
 recovery markers. Failed checks retain the root-private baseline path in the log;
 operational ledgers are never restored from that baseline. Child service and PHP
 processes close the lifetime pipe so detached children cannot retain the guard.
+
+## Dashboard hook boundary reviewed for 0.1.8
+
+FreePBX 17's Dashboard discovers sections from its own `sections` directory and
+loads each matching class from that same directory. Its hook index does not
+provide an arbitrary module-local class path. SLS therefore retains its two
+independently approved Dashboard files. Removing them without changing the
+upstream loader would remove the dashboard announcement panel.
+
+The Framework menu insertion also remains an exact reviewed overlay. A move to
+module-local navigation needs full theme and PBX upgrade acceptance before it
+can replace that path. This candidate reduces update failures through verified
+stock reconciliation and a bounded signed-package cache; it does not weaken
+integrity checks or infer approval from current live hashes.

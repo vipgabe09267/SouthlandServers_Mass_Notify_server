@@ -58,7 +58,10 @@ final class EnterpriseIntegrationsService
     }
     public function meeting(array $config,array $incident,array $input,?callable $effect=null): array
     {
-        $input=IncidentConfig::object($input,['request_id','duration_minutes','start_at'],'Incident meeting');
+        $input=IncidentConfig::object($input,['provider','request_id','duration_minutes','start_at'],'Incident meeting');
+        if (array_key_exists('provider',$input)) {
+            $config=\SLS\MassNotify\MeetingAccounts::select($config,\SLS\MassNotify\MeetingAccounts::provider($input['provider']));
+        }
         if (($config['enabled']??'0')!=='1' || ($incident['state']??'')!=='open') { throw new \DomainException('Meeting creation requires an enabled provider and an open incident.'); }
         $duration=$input['duration_minutes']??30; if (!is_int($duration) || $duration<5 || $duration>240) { throw new \InvalidArgumentException('Meeting duration must be 5–240 minutes.'); }
         $start=$input['start_at']??null; if (!is_int($start) || $start<$this->now() || $start>$this->now()+86400) { throw new \InvalidArgumentException('Choose a meeting start within 24 hours.'); }

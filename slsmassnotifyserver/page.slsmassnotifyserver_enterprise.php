@@ -12,6 +12,7 @@ catch (\Throwable $error) {
 if (($_SERVER['REQUEST_METHOD']??'')==='GET' && isset($_GET['image_id'])) {
     \SLS\MassNotify\AdminResponse::requireClearBuffers();
     try {
+        $module->requireEnterprisePageAcknowledgment();
         if(!is_string($_GET['image_id'])){throw new \InvalidArgumentException('Invalid image identifier.');}
         $image=$module->getEnterpriseFloorplanImage($_GET['image_id']);
         $download=$_GET['download']??'0';if(!is_string($download)||!in_array($download,['0','1'],true)){throw new \InvalidArgumentException('Invalid image response mode.');}
@@ -28,6 +29,7 @@ if (($_SERVER['REQUEST_METHOD']??'')==='POST') {
         $csrf=$_POST['slsmassnotifyserver_csrf']??null;
         if(!is_string($csrf)||!$module->validateCsrfToken($csrf)){http_response_code(403);throw new \DomainException('Security token expired. Reload Enterprise Labs before submitting.');}
         if(($_POST['action']??'')==='floorplan_upload'){
+            $module->requireEnterprisePageAcknowledgment();
             $result=$module->uploadEnterpriseFloorplan($_FILES['floorplan']??[]);
         }else{
             $raw=$_POST['payload']??null;
@@ -38,6 +40,7 @@ if (($_SERVER['REQUEST_METHOD']??'')==='POST') {
                 $action=$payload['action'];$input=$payload['input'];
             }else{$action=$_POST['action']??'';$input=$payload;}
             if(!is_string($action)){throw new \InvalidArgumentException('Enterprise Labs action must be a string.');}
+            if (!in_array($action,['danger_begin','danger_accept'],true)) { $module->requireEnterprisePageAcknowledgment(); }
             $result=$module->enterpriseAdministratorAction($action,$input);
         }
     }catch(\JsonException $error){http_response_code(400);$result=['success'=>false,'message'=>'The request contains invalid JSON. Reload the editor and try again.'];}

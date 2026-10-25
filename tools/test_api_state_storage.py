@@ -76,7 +76,7 @@ class ApiStateStorageTests(unittest.TestCase):
         source = source.replace("__DIR__ . '/event-log.php'", json.dumps(str(ROOT / 'slsmassnotifyserver/api/sls-mass-notify/event-log.php')))
         helper = json.dumps(str(ROOT / 'slsmassnotifyserver/api/sls-mass-notify/security.php'))
         source = source.replace("dirname(__DIR__) . '/sls-mass-notify/security.php'", helper).replace("__DIR__ . '/security.php'", helper)
-        for name in ['contract.php', 'config-crypto.php']:
+        for name in ['contract.php', 'config-crypto.php', 'desktop-feed-cache.php']:
             path = json.dumps(str(ROOT/'slsmassnotifyserver/api/sls-mass-notify'/name))
             source = source.replace("__DIR__ . '/" + name + "'", path)
             source = source.replace("dirname(__DIR__) . '/sls-mass-notify/" + name + "'", path)

@@ -82,7 +82,7 @@ class ServedPhp(unittest.TestCase):
             self.assertEqual(body['probe'],'sls_served_php_v1');self.assertTrue(body['ok']);self.assertEqual(body['missing'],[])
             self.assertTrue(body['runtime_account_ok']);self.assertRegex(body['php_version'],r'^8\.[0-9]+\.[0-9]+')
             self.assertEqual(body['php_sapi'],'cli-server')
-            self.assertEqual(body['module_version'],'0.1.7-beta')
+            self.assertEqual(body['module_version'],'0.1.8-beta')
             self.assertTrue(all(value is True for value in body['extensions'].values()))
             self.assertTrue(all(value is True for value in body['functions'].values()))
             self.assertEqual(set(body),{'probe','ok','missing','module_version','php_version','php_sapi','runtime_account_ok','extensions','functions'})

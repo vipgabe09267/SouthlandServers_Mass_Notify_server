@@ -6,6 +6,7 @@ require_once __DIR__ . '/OperatorAuth.php';
 require_once __DIR__ . '/OperatorAccess.php';
 require_once __DIR__ . '/DeviceAcceptance.php';
 require_once __DIR__ . '/bin/sls_mass_notify/sls_runtime_state.php';
+require_once __DIR__ . '/EnterpriseLabsConfig.php';
 
 /** Read-only continuity review. It opens no network or device connection. */
 final class EnterpriseContinuity
@@ -73,6 +74,7 @@ final class EnterpriseContinuity
 
     public static function report(array $settings, string $moduleVersion = ''): array
     {
+        $settings = EnterpriseLabsConfig::disableWhenOff($settings);
         $running = RuntimeState::running($settings);
         $notifications = $running && $settings !== [];
         $integrations = is_array($settings['enterprise_integrations'] ?? null) ? $settings['enterprise_integrations'] : [];

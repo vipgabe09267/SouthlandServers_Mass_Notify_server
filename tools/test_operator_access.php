@@ -236,7 +236,7 @@ try {
     operatorCheck(in_array('1000',array_column($state['devices']['extensions'],'id'),true),'Device-choice projection changed the numeric extension identity.');
     operatorCheck(!str_contains($projected,$secret)&&!str_contains($projected,$used['account']['auth']['password_hash'])&&!isset($state['access']['accounts'][0]['auth']),'Editor exposed MFA/password material.');
     $public=$state['access']['accounts'][0];
-    foreach(['identity_current','totp_enrolled','recovery_remaining','password_change_required','password_recovery','access_expired'] as $key)unset($public[$key]);
+    foreach(['identity_current','totp_enrolled','recovery_remaining','password_change_required','password_recovery','access_expired','passkeys'] as $key)unset($public[$key]);
     operatorCheck($m->saveOperatorAccess(['revision'=>$m->accessRevision(),'enabled'=>false,'portal_enabled'=>false,'accounts'=>[$public]])['success'],'Portal disable failed.');
     operatorCheck($m->portalAccount('portal_person')===null && \SLS\MassNotify\ApiSecurity::currentCredential($m->settings,$id)===null,'Disabled portal retained login or queued authority.');
     operatorReject(fn()=>$m->operatorAuthUpdate($id,$identity,'totp',$enrolled['recovery_codes'][1]));

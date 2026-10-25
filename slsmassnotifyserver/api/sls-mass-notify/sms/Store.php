@@ -17,7 +17,7 @@ final class Store
     {
         $this->directory=rtrim($directory,'/');
         if (!extension_loaded('pdo_sqlite')) { throw new \RuntimeException('sms_sqlite_unavailable'); }
-        if (!file_exists($directory) && !is_link($directory) && !@mkdir($directory,0700)) { throw new \RuntimeException('sms_storage_unavailable'); }
+        if (!file_exists($directory) && !is_link($directory) && !@mkdir($directory,0700) && !is_dir($directory)) { throw new \RuntimeException('sms_storage_unavailable'); }
         $meta=$this->directory(); $this->directoryIdentity=$meta;
         $path=$this->directory.'/deliveries.sqlite'; $marker=$this->directory.'/initialized';
         $mask=umask(0077); $lock=null;

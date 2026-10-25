@@ -7,7 +7,9 @@ if (!class_exists(ApiSecurity::class, false)) {
 /** Shared by the Control and desktop APIs. No framework bootstrap or side effects. */
 final class ApiSecurity
 {
-    public const SCOPES = ['read', 'send', 'test', 'config'];
+    public const MAX_SAVED_AUDIENCES=200;
+    public const SCOPES = ['read', 'send', 'test', 'config', 'monitor', 'fleet_read', 'incident_read'];
+    public const LEGACY_SCOPES = ['read', 'send', 'test', 'config'];
     public const AUDIENCES = ['extensions', 'desktop_client_ids', 'announcement_group_ids', 'nws_zone_ids', 'voice_recipient_ids', 'webhook_ids', 'email_recipient_ids', 'sms_recipient_ids', 'browser_recipient_ids', 'connector_ids'];
 
     public static function jsonObject(string $raw, bool $allowLegacyEmptyList = false, int $maximumDepth = 64): array
@@ -130,14 +132,14 @@ final class ApiSecurity
         if (!is_array($value) || !array_is_list($value) || count($value) > 100) { throw new \DomainException('Control API supports up to 100 named credentials.'); }
         $result = []; $ids = []; $hashes = [];
         foreach ($value as $row) {
-            if (!is_array($row) || array_diff(array_keys($row), ['id', 'name', 'secret_hash', 'scopes', 'audience', 'created_at', 'revoked_at'])
+            if (!is_array($row) || array_diff(array_keys($row), ['id', 'name', 'secret_hash', 'scopes', 'audience', 'created_at', 'revoked_at', 'expires_at', 'enabled'])
                 || !is_string($row['id'] ?? null) || !preg_match('/^api_[a-f0-9]{24}$/D', $row['id']) || isset($ids[$row['id']])
                 || !is_string($row['secret_hash'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $row['secret_hash'])
                 || isset($hashes[$row['secret_hash']])
                 || !is_string($row['name'] ?? null) || trim($row['name']) === '' || strlen($row['name']) > 80 || preg_match('/[\x00-\x1f\x7f]/', $row['name'])) {
                 throw new \DomainException('A named API credential has invalid metadata.');
             }
-            $scopes = self::values($row['scopes'] ?? [], '/^(read|send|test|config)$/D', 4);
+            $scopes = self::values($row['scopes'] ?? [], '/^(read|send|test|config|monitor|fleet_read|incident_read)$/D', count(self::SCOPES));
             if (!$scopes) { throw new \DomainException('Select at least one API permission.'); }
             $audience = self::audience($row['audience'] ?? []);
             if (!$audience['unrestricted'] && in_array('config', $scopes, true)) { throw new \DomainException('Configuration permission requires an unrestricted audience.'); }
@@ -150,8 +152,14 @@ final class ApiSecurity
                 }
             }
             $ids[$row['id']] = true; $hashes[$row['secret_hash']] = true;
+            $expires = array_key_exists('expires_at', $row) ? $row['expires_at'] : 0;
+            $enabled = array_key_exists('enabled', $row) ? $row['enabled'] : true;
+            if (!is_int($expires) || $expires < 0 || $expires > 253402300799 || !is_bool($enabled)) {
+                throw new \DomainException('API credential expiry must be a UTC Unix timestamp, or zero for no expiry; Enabled must be a boolean.');
+            }
             $result[] = ['id' => $row['id'], 'name' => trim($row['name']), 'secret_hash' => $row['secret_hash'],
-                'scopes' => $scopes, 'audience' => $audience, 'created_at' => $row['created_at'], 'revoked_at' => $row['revoked_at']];
+                'scopes' => $scopes, 'audience' => $audience, 'created_at' => $row['created_at'], 'revoked_at' => $row['revoked_at'],
+                'expires_at'=>$expires, 'enabled'=>$enabled];
         }
         return $result;
     }
@@ -159,10 +167,14 @@ final class ApiSecurity
     /** Return a new row plus its one-time secret. Only the row belongs in .config. */
     public static function issue(array $input): array
     {
+        $expiry = $input['expires_at'] ?? 0;
+        if (!is_int($expiry) || $expiry < 0 || ($expiry !== 0 && $expiry <= time())) {
+            throw new \DomainException('Choose a future expiry time, or no expiry.');
+        }
         $secret = 'sls_' . rtrim(strtr(base64_encode(random_bytes(32)), '+/', '-_'), '=');
         $row = ['id' => 'api_' . bin2hex(random_bytes(12)), 'name' => $input['name'] ?? '',
             'secret_hash' => hash('sha256', $secret), 'scopes' => $input['scopes'] ?? [],
-            'audience' => $input['audience'] ?? [], 'created_at' => gmdate('c'), 'revoked_at' => ''];
+            'audience' => $input['audience'] ?? [], 'created_at' => gmdate('c'), 'revoked_at' => '', 'expires_at'=>$expiry, 'enabled'=>true];
         return ['credential' => self::credentials([$row])[0], 'secret' => $secret];
     }
 
@@ -177,17 +189,36 @@ final class ApiSecurity
         return $credentials;
     }
 
+    public static function credentialActive(array $credential, ?int $now = null): bool
+    {
+        $expires = array_key_exists('expires_at', $credential) ? $credential['expires_at'] : 0;
+        $enabled = array_key_exists('enabled', $credential) ? $credential['enabled'] : true;
+        return ($credential['revoked_at'] ?? '') === '' && $enabled === true
+            && is_int($expires) && $expires >= 0 && ($expires === 0 || $expires > ($now ?? time()));
+    }
+
+    public static function permitsReadResource(array $principal, string $resource): bool
+    {
+        if (self::permits($principal, 'read')) { return true; }
+        if ($resource === 'capabilities') {
+            return (bool)array_intersect($principal['scopes'] ?? [], ['monitor','fleet_read','incident_read']);
+        }
+        $required = ['status'=>'monitor', 'readiness'=>'monitor', 'metrics'=>'monitor',
+            'desktop_fleet'=>'fleet_read', 'incidents'=>'incident_read', 'incident'=>'incident_read', 'incident_report'=>'incident_read'];
+        return isset($required[$resource]) && self::permits($principal, $required[$resource]);
+    }
+
     public static function authenticate(array $control, string $secret): ?array
     {
         if ($secret === '' || strlen($secret) > 128) { return null; }
         $legacy = $control['api_key'] ?? '';
         if (is_string($legacy) && $legacy !== '' && hash_equals($legacy, $secret)) {
-            return ['id' => 'legacy', 'name' => 'Legacy Control API', 'scopes' => self::SCOPES, 'audience' => self::audience(['unrestricted' => true])];
+            return ['id' => 'legacy', 'name' => 'Legacy Control API', 'scopes' => self::LEGACY_SCOPES, 'audience' => self::audience(['unrestricted' => true])];
         }
         try { $rows = self::credentials($control['credentials'] ?? []); } catch (\DomainException $e) { return null; }
         $digest = hash('sha256', $secret); $match = null;
         foreach ($rows as $row) {
-            if (hash_equals($row['secret_hash'], $digest) && $row['revoked_at'] === '') { unset($row['secret_hash']); $match = $row; }
+            if (hash_equals($row['secret_hash'], $digest) && self::credentialActive($row)) { unset($row['secret_hash']); $match = $row; }
         }
         return $match;
     }
@@ -211,7 +242,7 @@ final class ApiSecurity
         if (empty($settings['control_api']['enabled'])) { return null; }
         try { $rows = self::credentials($settings['control_api']['credentials'] ?? []); } catch (\DomainException $e) { return null; }
         foreach ($rows as $row) {
-            if (hash_equals($row['id'], $id) && $row['revoked_at'] === '') { unset($row['secret_hash']); return $row; }
+            if (hash_equals($row['id'], $id) && self::credentialActive($row)) { unset($row['secret_hash']); return $row; }
         }
         return null;
     }
@@ -256,6 +287,9 @@ final class ApiSecurity
     /** A saved location snapshot must not authorize a reused desktop username. */
     public static function groupDesktopBindingsValid(array $group, array $settings): bool
     {
+        require_once __DIR__.'/person-profiles.php';
+        if(!PersonProfiles::active($group,$settings)){return false;}
+
         if (!array_key_exists('location_snapshot', $group) && !array_key_exists('desktop_bindings', $group)) { return true; }
         $snapshot = $group['location_snapshot'] ?? ['schema' => 1, 'desktop_bindings' => $group['desktop_bindings']];
         if (!is_array($snapshot) || !in_array($snapshot['schema'] ?? null, [1, 2], true)

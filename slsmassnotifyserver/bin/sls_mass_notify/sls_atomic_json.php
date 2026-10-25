@@ -55,7 +55,7 @@ REGEX;
         if ($keys!==$decodedKeys) { throw new RuntimeException('json_storage_duplicate_key'); }
     }
 
-    public static function transaction(string $path, array $defaults, callable $work, int $maximum = 1048576, bool $requireExisting = true, bool $requireObject = false)
+    public static function transaction(string $path, array $defaults, callable $work, int $maximum = 1048576, bool $requireExisting = true, bool $requireObject = false, bool $allowEmptyUninitialized = false)
     {
         if ($maximum < 2 || $maximum > 64 * 1024 * 1024) { throw new InvalidArgumentException('json_storage_capacity_invalid'); }
         $directory = dirname($path);
@@ -113,6 +113,7 @@ REGEX;
             clearstatcache(true, $path); $before = @lstat($path);
             if (!$before && $marker !== '' && $requireExisting) { throw new RuntimeException('json_storage_missing'); }
             $rows = $defaults;
+            $initializeEmpty = false;
             if ($before) {
                 $data = $open($path, 'r+b');
                 try {
@@ -126,13 +127,20 @@ REGEX;
                             throw new RuntimeException('json_storage_changed');
                         }
                     }
-                    if (!is_string($raw) || $raw === '' || strlen($raw) !== $opened['size']) {
+                    if (!is_string($raw) || strlen($raw) !== $opened['size']) {
                         throw new RuntimeException('json_storage_invalid');
                     }
-                    if ($requireObject && !str_starts_with(ltrim($raw),'{')) { throw new RuntimeException('json_storage_invalid'); }
-                    $rows = json_decode($raw, true, 64, JSON_THROW_ON_ERROR);
-                    self::validateJsonKeys($raw);
-                    if (!is_array($rows)) { throw new RuntimeException('json_storage_invalid'); }
+                    // One caller explicitly adopts its known legacy empty file.
+                    // A durable or partially written marker forbids reinitializing
+                    // missing history. All file and permanent-lock checks still apply.
+                    if ($allowEmptyUninitialized && $raw === '' && $marker === '') {
+                        $initializeEmpty = true;
+                    } else {
+                        if ($raw === '' || ($requireObject && !str_starts_with(ltrim($raw),'{'))) { throw new RuntimeException('json_storage_invalid'); }
+                        $rows = json_decode($raw, true, 64, JSON_THROW_ON_ERROR);
+                        self::validateJsonKeys($raw);
+                        if (!is_array($rows)) { throw new RuntimeException('json_storage_invalid'); }
+                    }
                 } finally { fclose($data); }
             }
             $outcome = $work($rows);
@@ -146,7 +154,7 @@ REGEX;
                 throw new RuntimeException('json_storage_object_required');
             }
             $verifyLease();
-            if ($changed || !$before) {
+            if ($changed || !$before || $initializeEmpty) {
                 $bytes = ($requireObject && $next === [])
                     ? "{}\n"
                     : json_encode($next, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n";

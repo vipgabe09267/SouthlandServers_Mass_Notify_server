@@ -16,6 +16,8 @@ if (($_GET['sls_installer_runtime'] ?? '') === '1'
         if (!$extensions[$extension]) { $missing[] = $extension; }
     }
     if (PHP_VERSION_ID < 80200) { $missing[] = 'php_8_2_or_newer'; }
+    require_once __DIR__.'/runtime-security.php';
+    if (!\SLS\MassNotify\PhpSecurityPolicy::evaluate(PHP_VERSION)['ok']) { $missing[] = 'php_security_floor'; }
     $functions = [];
     foreach (['exec','proc_open','posix_geteuid','posix_getpwnam','openssl_encrypt','openssl_decrypt','sodium_crypto_aead_xchacha20poly1305_ietf_encrypt','sodium_crypto_pwhash_str'] as $function) {
         $functions[$function] = function_exists($function);
@@ -32,7 +34,7 @@ if (($_GET['sls_installer_runtime'] ?? '') === '1'
     header('Cache-Control: no-store');
     header('X-Content-Type-Options: nosniff');
     echo json_encode(['probe' => 'sls_served_php_v1', 'ok' => !$missing, 'missing' => $missing,
-        'module_version'=>'0.1.7-beta',
+        'module_version'=>'0.1.8-beta',
         'php_version'=>PHP_VERSION, 'php_sapi'=>PHP_SAPI, 'runtime_account_ok'=>$runtimeAccountOk,
         'extensions'=>$extensions, 'functions'=>$functions]);
     exit;
@@ -98,7 +100,7 @@ function respond(int $code, array $payload): void
 function config(): array
 {
     if (!isset($GLOBALS['sls_preauth_lease'])) { $GLOBALS['sls_preauth_lease']=control_preauth_admission(); }
-    try { return \FreePBX\modules\SlsConfigCrypto::readFile(CONFIG_FILE); }
+    try { return \SLS\MassNotify\ControlContract::effectiveLabs(\FreePBX\modules\SlsConfigCrypto::readFile(CONFIG_FILE)); }
     catch (Throwable $error) { respond(503, ['ok' => false, 'error' => 'config_unavailable']); }
 }
 
@@ -193,9 +195,10 @@ function control_get_resource(array $query): array
     $resource = $query['resource'] ?? 'status';
     if (!is_string($resource) || strlen($resource) > 32) { return ['error' => 'invalid_resource']; }
     $resource = strtolower(trim($resource));
-    if (!in_array($resource, ['status', 'capabilities', 'audiences', 'delivery', 'events', 'readiness', 'desktop_fleet', 'config', 'incidents', 'incident', 'incident_report','enterprise_capabilities','incident_templates','recordings'], true)) {
+    if (!in_array($resource, ['status', 'capabilities', 'audiences', 'delivery', 'events', 'readiness', 'metrics', 'desktop_fleet', 'config', 'incidents', 'incident', 'incident_report','enterprise_capabilities','incident_templates','recordings'], true)) {
         return ['error' => 'unknown_resource'];
     }
+    if (array_key_exists('format',$query) && ($resource!=='metrics' || !is_string($query['format']) || !in_array($query['format'],['json','prometheus'],true))) { return ['error'=>'invalid_format']; }
     foreach (['job_id' => 64, 'incident_id' => 64, 'cursor' => $resource === 'events' ? 768 : 160, 'revision' => 160] as $field => $limit) {
         if (isset($query[$field]) && (!is_string($query[$field]) || strlen($query[$field]) > $limit)) { return ['error' => 'invalid_' . $field]; }
     }
@@ -318,24 +321,26 @@ function api_state_parent_matches(string $directory, $handle): bool
         && ($current['mode'] & 0022) === 0;
 }
 
-function api_state_lock($handle, float $deadline): bool
+function api_state_lock($handle, float $deadline, int $operation = LOCK_EX): bool
 {
     do {
         $blocked = 0;
-        if (flock($handle, LOCK_EX | LOCK_NB, $blocked)) { return true; }
+        if (flock($handle, $operation | LOCK_NB, $blocked)) { return true; }
         if (!$blocked || microtime(true) >= $deadline) { return false; }
         usleep(2000);
     } while (microtime(true) < $deadline);
     return false;
 }
 
-function api_state_transaction(string $path, int $maximum, callable $update, int $waitMilliseconds = 250): bool
+function api_state_transaction(string $path, int $maximum, callable $update, int $waitMilliseconds = 250, bool $sharedRead = false): bool
 {
     $GLOBALS['sls_api_state_error'] = '';
     $directory = dirname($path);
     $parent = $lock = $legacy = $temporaryHandle = null;
     $temporary = '';
     $temporaryIdentity = null;
+    $upgradeRequired = false;
+    $operation = $sharedRead ? LOCK_SH : LOCK_EX;
     $deadline = microtime(true) + min(250, max(0, $waitMilliseconds)) / 1000;
     try {
         if ($path === '' || $path[0] !== '/' || strpos($path, "\0") !== false
@@ -360,7 +365,7 @@ function api_state_transaction(string $path, int $maximum, callable $update, int
             throw new RuntimeException('state_directory_unavailable');
         }
         $lock = api_state_open($path . '.lock', true);
-        if (!api_state_lock($lock, $deadline)) { throw new RuntimeException('state_locked'); }
+        if (!api_state_lock($lock, $deadline, $operation)) { throw new RuntimeException('state_locked'); }
         clearstatcache(true, $path . '.lock');
         $lockNow = @lstat($path . '.lock');
         if (!is_array($lockNow) || !api_state_metadata_matches(fstat($lock), $lockNow)
@@ -373,7 +378,7 @@ function api_state_transaction(string $path, int $maximum, callable $update, int
         if (is_resource($legacy)) {
             // Existing releases lock the data inode. During upgrade, defer to
             // any active old writer as well as serializing new sidecar users.
-            if (!api_state_lock($legacy, $deadline)) { throw new RuntimeException('state_locked'); }
+            if (!api_state_lock($legacy, $deadline, $operation)) { throw new RuntimeException('state_locked'); }
             $original = fstat($legacy);
             clearstatcache(true, $path);
             $current = @lstat($path);
@@ -391,39 +396,43 @@ function api_state_transaction(string $path, int $maximum, callable $update, int
         }
         $result = $update($data);
         if (empty($result['write'])) { return !empty($result['allowed']); }
-        $encoded = json_encode((object)$result['data'], JSON_UNESCAPED_SLASHES) . "\n";
-        if (json_last_error() !== JSON_ERROR_NONE || strlen($encoded) > $maximum) {
-            throw new RuntimeException('state_oversized');
+        if ($sharedRead) {
+            $upgradeRequired = true;
+        } else {
+            $encoded = json_encode((object)$result['data'], JSON_UNESCAPED_SLASHES) . "\n";
+            if (json_last_error() !== JSON_ERROR_NONE || strlen($encoded) > $maximum) {
+                throw new RuntimeException('state_oversized');
+            }
+            if (!api_state_parent_matches($directory, $parent)) {
+                throw new RuntimeException('state_directory_changed');
+            }
+            $temporary = $directory . '/.sls-api-state-' . bin2hex(random_bytes(16));
+            $temporaryHandle = api_state_open($temporary, true, true);
+            $temporaryIdentity = fstat($temporaryHandle);
+            $written = 0;
+            while ($written < strlen($encoded)) {
+                $amount = @fwrite($temporaryHandle, substr($encoded, $written));
+                if ($amount === false || $amount === 0) { throw new RuntimeException('state_write_failed'); }
+                $written += $amount;
+            }
+            if (!fflush($temporaryHandle) || !function_exists('fsync') || !@fsync($temporaryHandle)) {
+                throw new RuntimeException('state_sync_failed');
+            }
+            clearstatcache(true, $path);
+            $current = @lstat($path);
+            clearstatcache(true, $temporary);
+            $temporaryNow = @lstat($temporary);
+            if (($original === null ? $current !== false : (!is_array($current)
+                    || !api_state_metadata_matches($original, $current) || $current['size'] !== $original['size']))
+                || !is_array($temporaryNow) || !api_state_metadata_matches(fstat($temporaryHandle), $temporaryNow)
+                || !api_state_parent_matches($directory, $parent)) {
+                throw new RuntimeException('state_changed_or_unsafe');
+            }
+            if (!@rename($temporary, $path)) { throw new RuntimeException('state_replace_failed'); }
+            $temporary = '';
+            if (!@fsync($parent)) { throw new RuntimeException('state_directory_sync_failed'); }
+            return !empty($result['allowed']);
         }
-        if (!api_state_parent_matches($directory, $parent)) {
-            throw new RuntimeException('state_directory_changed');
-        }
-        $temporary = $directory . '/.sls-api-state-' . bin2hex(random_bytes(16));
-        $temporaryHandle = api_state_open($temporary, true, true);
-        $temporaryIdentity = fstat($temporaryHandle);
-        $written = 0;
-        while ($written < strlen($encoded)) {
-            $amount = @fwrite($temporaryHandle, substr($encoded, $written));
-            if ($amount === false || $amount === 0) { throw new RuntimeException('state_write_failed'); }
-            $written += $amount;
-        }
-        if (!fflush($temporaryHandle) || !function_exists('fsync') || !@fsync($temporaryHandle)) {
-            throw new RuntimeException('state_sync_failed');
-        }
-        clearstatcache(true, $path);
-        $current = @lstat($path);
-        clearstatcache(true, $temporary);
-        $temporaryNow = @lstat($temporary);
-        if (($original === null ? $current !== false : (!is_array($current)
-                || !api_state_metadata_matches($original, $current) || $current['size'] !== $original['size']))
-            || !is_array($temporaryNow) || !api_state_metadata_matches(fstat($temporaryHandle), $temporaryNow)
-            || !api_state_parent_matches($directory, $parent)) {
-            throw new RuntimeException('state_changed_or_unsafe');
-        }
-        if (!@rename($temporary, $path)) { throw new RuntimeException('state_replace_failed'); }
-        $temporary = '';
-        if (!@fsync($parent)) { throw new RuntimeException('state_directory_sync_failed'); }
-        return !empty($result['allowed']);
     } catch (Throwable $exception) {
         $reason = $exception instanceof RuntimeException && preg_match('/^state_[a-z_]+$/', $exception->getMessage())
             ? $exception->getMessage() : 'state_storage_failed';
@@ -442,6 +451,9 @@ function api_state_transaction(string $path, int $maximum, callable $update, int
         if (is_resource($lock)) { fclose($lock); }
         if (is_resource($parent)) { fclose($parent); }
     }
+    // Release both shared leases, then reread under exclusive locks. Never
+    // commit a decision made against a snapshot that another writer can change.
+    return $upgradeRequired && api_state_transaction($path, $maximum, $update, $waitMilliseconds);
 }
 
 function api_rate_entries_valid(array $data, int $maximum, bool $desktop): bool
@@ -515,6 +527,7 @@ function audit_control_api(string $ip, string $action, int $status, bool $ok): v
         'created_at' => gmdate('c'), 'ip' => substr($ip, 0, 64),
         'method' => substr((string)($_SERVER['REQUEST_METHOD'] ?? ''), 0, 12),
         'action' => $action, 'status' => $status, 'ok' => $ok, 'credentials_present' => $credentialsPresent,
+        'duration_ms'=>min(600000,max(0,(int)round((microtime(true)-(float)($_SERVER['REQUEST_TIME_FLOAT']??microtime(true)))*1000))),
     ];
     if (!$credentialsPresent) { $recordData['actor'] = 'api:no-key'; }
     if ($credentialsPresent && isset($GLOBALS['sls_control_principal']['id'])) { $recordData['credential_id'] = (string)$GLOBALS['sls_control_principal']['id']; }
@@ -721,8 +734,12 @@ register_shutdown_function(static function (): void {
 function require_permission(string $scope, string $action, bool $unrestricted = false): void
 {
     $principal = $GLOBALS['sls_control_principal'] ?? [];
-    if (!\SLS\MassNotify\ApiSecurity::permits($principal, $scope)
-        || ($unrestricted && ($principal['audience']['unrestricted'] ?? false) !== true)) {
+    $readResource = $scope === 'read' && str_starts_with($action, 'get_') ? substr($action, 4) : '';
+    $allowed = $readResource !== '' ? \SLS\MassNotify\ApiSecurity::permitsReadResource($principal, $readResource)
+        : \SLS\MassNotify\ApiSecurity::permits($principal, $scope);
+    $scopedRead = ($readResource === 'readiness' && \SLS\MassNotify\ApiSecurity::permits($principal, 'monitor'))
+        || ($readResource === 'desktop_fleet' && \SLS\MassNotify\ApiSecurity::permits($principal, 'fleet_read'));
+    if (!$allowed || ($unrestricted && !$scopedRead && ($principal['audience']['unrestricted'] ?? false) !== true)) {
         audit_control_api(client_ip(), $action, 403, false);
         respond(403, ['ok' => false, 'error' => 'permission_denied', 'required_scope' => $scope]);
     }
@@ -809,12 +826,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         audit_control_api($clientIp, 'get_events', 200, true);
         respond(200, ['ok'=>true, 'resource'=>'events'] + $page);
     }
+    if ($resource === 'metrics') {
+        try {
+            require_once dirname(__DIR__,2).'/admin/modules/slsmassnotifyserver/Monitoring.php';
+            $report=\SLS\MassNotify\Monitoring::read(dirname(CONFIG_FILE));
+        } catch (Throwable $error) { respond(503,['ok'=>false,'error'=>'metrics_unavailable','retryable'=>true]); }
+        audit_control_api($clientIp,'get_metrics',200,true);
+        if (($_GET['format']??'json')==='prometheus') {
+            http_response_code(200);header('Content-Type: text/plain; version=0.0.4; charset=utf-8');
+            header('Cache-Control: no-store');header('X-Content-Type-Options: nosniff');
+            echo \SLS\MassNotify\Monitoring::prometheus($report);exit;
+        }
+        respond(200,['ok'=>true,'resource'=>'metrics']+$report);
+    }
     if ($resource === 'readiness') {
         require_permission('read', 'get_readiness', true);
         try { $report = freepbx_module()->getDeploymentReadiness(); }
         catch (Throwable $error) {
             audit_control_api($clientIp, 'get_readiness', 503, false);
             respond(503, ['ok'=>false, 'error'=>'readiness_unavailable', 'message'=>'The PBX readiness report could not be generated. Check the module diagnostics and PHP error log.']);
+        }
+        if (!\SLS\MassNotify\ApiSecurity::permits($principal, 'read')) {
+            $report = array_intersect_key($report, array_flip(['schema','check_schema_version','generated_at','version','operational_ready','attention_count','unknown_count','checks']));
+            $report['checks'] = array_map(static fn($row)=>array_intersect_key($row, array_flip(['id','code','state','reason_code','age_seconds','maximum_age_seconds'])), $report['checks'] ?? []);
         }
         audit_control_api($clientIp, 'get_readiness', 200, true);
         respond(200, ['ok'=>true, 'resource'=>'readiness'] + $report);
@@ -835,6 +869,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         require_permission('read', 'get_desktop_fleet', true);
         try { $fleet = freepbx_module()->getDesktopFleet(); }
         catch (Throwable $error) { respond(503, ['ok'=>false, 'error'=>'fleet_inventory_unavailable', 'retryable'=>true]); }
+        $fleet=\SLS\MassNotify\ControlContract::fleet($principal,$config,$fleet);
         audit_control_api($clientIp, 'get_desktop_fleet', 200, true);
         respond(200, ['ok'=>true, 'resource'=>'desktop_fleet'] + $fleet);
     }
@@ -850,7 +885,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
             respond(500, ['ok' => false, 'error' => 'internal_error']);
         }
     }
-    if (($principal['audience']['unrestricted'] ?? false) !== true) {
+    if (($principal['audience']['unrestricted'] ?? false) !== true || !\SLS\MassNotify\ApiSecurity::permits($principal, 'read')) {
         // Operational status.json can contain recipient names and incident text.
         audit_control_api($clientIp, 'get_status', 200, true);
         respond(200, ['ok' => true, 'resource' => 'status', 'status' => ['control_api_enabled' => true]]);
@@ -899,7 +934,7 @@ $body = $decodedRequest['body'];
 
 $action = strtolower(trim((string)($body['action'] ?? '')));
 $GLOBALS['sls_control_audit_context']['action'] = $action !== '' ? $action : 'unsupported_action';
-$scope = ['retry_announcement' => 'send', 'send_announcement' => 'send', 'preview_announcement' => 'send', 'test_nws' => 'test',
+$scope = ['retry_announcement' => 'send', 'send_announcement' => 'send', 'preview_announcement' => 'send', 'rehearse_announcement'=>'send', 'test_nws' => 'test',
     'trigger_nws_test' => 'test', 'get_config' => 'config', 'update_config' => 'config',
     'start_incident' => 'send', 'update_incident' => 'send', 'incident_roll_call' => 'config', 'incident_checklist' => 'config', 'enterprise_template_start'=>'send'][$action] ?? '';
 if ($scope === '') { audit_control_api($clientIp, 'unsupported_action', 400, false); respond(400, ['ok' => false, 'error' => 'unsupported_action']); }
@@ -923,7 +958,18 @@ if ($action === 'update_config') {
         respond(403, ['ok' => false, 'error' => 'administrator_only_setting']);
     }
 }
-if ($action === 'send_announcement' || $action === 'preview_announcement') {
+if (in_array($action,['send_announcement','preview_announcement','rehearse_announcement'],true)) {
+    $rehearsalScenario=[];
+    if ($action==='rehearse_announcement') {
+        try {
+            require_once dirname(__DIR__,2).'/admin/modules/slsmassnotifyserver/DeliveryRehearsal.php';
+            $rehearsalScenario=\SLS\MassNotify\DeliveryRehearsal::scenario($body['simulation']??[]);
+            unset($body['simulation']);
+        } catch (InvalidArgumentException $error) {
+            audit_control_api($clientIp,$action,400,false);
+            respond(400,['ok'=>false,'error'=>'invalid_rehearsal_scenario','message'=>$error->getMessage()]);
+        }
+    }
     $body['action'] = $action;
     try { $body = \SLS\MassNotify\ControlContract::announcementInput($body); }
     catch (InvalidArgumentException $error) {
@@ -983,7 +1029,7 @@ try {
         respond(!empty($result['success']) ? 200 : 400, ['ok' => !empty($result['success']), 'action' => $action] + $result);
     }
 
-    if ($action === 'send_announcement' || $action === 'preview_announcement') {
+    if (in_array($action,['send_announcement','preview_announcement','rehearse_announcement'],true)) {
         $idempotencyKey=request_header_value('Idempotency-Key');
         if ($action==='send_announcement' && $idempotencyKey!=='') {
             try {
@@ -1003,6 +1049,11 @@ try {
                     'message'=>'Submission could not be confirmed. Check delivery history before sending with a different key.']);
             }
         } else { $result = $module->controlApiSendAnnouncement($body); }
+        if ($action==='rehearse_announcement') {
+            $result['execution_mode']='rehearsal';$result['delivery_started']=false;$result['transports_attempted']=[];
+            if (!empty($result['success']) && ($result['preview']??false)!==true) { throw new \RuntimeException('Rehearsal did not return a no-delivery preview.'); }
+            if (!empty($result['success'])) { $result['rehearsal']=\SLS\MassNotify\DeliveryRehearsal::simulate($result,$rehearsalScenario); }
+        }
         if (($result['error_code'] ?? '') === 'permission_denied') { audit_control_api($clientIp, $action, 403, false); respond(403, ['ok' => false, 'error' => 'audience_not_permitted']); }
         if (($result['error_code']??'')==='announcement_submission_uncertain') { audit_control_api($clientIp,$action,409,false); respond(409,['ok'=>false,'error'=>'announcement_submission_uncertain']+$result); }
         audit_control_api($clientIp, $action, !empty($result['success']) ? 200 : 400, !empty($result['success']));

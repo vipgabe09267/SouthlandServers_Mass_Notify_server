@@ -37,6 +37,13 @@ foreach ([['enabled' => true, 'steps' => []], ['enabled' => true, 'steps' => arr
     ladder_reject(static fn() => IncidentConfig::template($base + ['escalation' => $policy]), 'Invalid or ambiguous ladder accepted.');
 }
 ladder_reject(static fn() => IncidentConfig::template(array_replace($base, ['roster' => [], 'escalation' => ['enabled' => true, 'steps' => $steps]])), 'Enabled ladder without a roster accepted.');
+foreach ([['kind' => 'unknown'], ['kind' => 'needs_assistance', 'target' => 1],
+    ['kind' => 'below_quorum', 'mode' => 'percent', 'target' => 101],
+    ['kind' => 'below_quorum', 'mode' => 'count', 'target' => 2],
+    ['kind' => 'below_quorum', 'target' => '50'], ['kind' => 'below_quorum', 'target' => 0]] as $condition) {
+    ladder_reject(static fn() => IncidentConfig::template($base + ['escalation' => ['enabled' => true,
+        'steps' => [array_replace($step(60, 'x'), ['condition' => $condition])]]]), 'Invalid response condition accepted.');
+}
 $legacy = IncidentConfig::template($base + ['escalation' => ['enabled' => true, 'after_seconds' => 60, 'delivery' => ['desktop_clients' => ['legacy.supervisor']]]]);
 ladder_check(count($legacy['escalation']['steps']) === 1 && $legacy['escalation']['steps'][0]['after_seconds'] === 60, 'Legacy one-step policy did not retain its timing.');
 $now = 1800000000; $sent = []; $frozen = []; $mode = 'ok';
@@ -105,6 +112,40 @@ $template['escalation']['steps'][2]['delivery']['audio_mode'] = 'tts';
 ladder_check(IncidentConfig::render($template, [], 'es')['message'] === 'Texto de prueba', 'A supported language lost its reviewed wording.');
 $template['language_variants'][0]['locale'] = 'ja';
 ladder_reject(static fn() => IncidentConfig::render($template, [], 'ja'), 'Unsupported voice guard missed a later escalation step.');
+// Quorum uses only explicit human responses. Branches remain independent, and
+// a later assistance request can activate a previously skipped earlier rule.
+$conditional = array_replace($base, ['delivery' => ['desktop_clients' => ['one.desktop', 'two.desktop', 'three.desktop']], 'roster' => [
+    ['id' => 'one', 'name' => 'One', 'desktop_username' => 'one.desktop'],
+    ['id' => 'two', 'name' => 'Two', 'desktop_username' => 'two.desktop'],
+    ['id' => 'three', 'name' => 'Three', 'desktop_username' => 'three.desktop']],
+    'escalation' => ['enabled' => true, 'steps' => [
+        $step(60, 'assistance') + ['condition' => ['kind' => 'needs_assistance']],
+        $step(120, 'quorum') + ['condition' => ['kind' => 'below_quorum', 'mode' => 'percent', 'target' => 67]],
+        $step(180, 'no.response') + ['condition' => ['kind' => 'no_response']]]]]);
+$template = IncidentConfig::template($conditional); $branch = $service->start($start(45), $actor);
+$before = count($sent); $now += 60; $service->process();
+ladder_check(count($sent) === $before, 'Assistance condition sent without a human request.');
+$service->respond($branch['id'], ['request_id' => $request(46), 'person_id' => 'one', 'response' => 'safe'], $actor);
+$service->respond($branch['id'], ['request_id' => $request(47), 'person_id' => 'two', 'response' => 'received'], $actor);
+$now += 60; $service->process();
+ladder_check(count($sent) === $before + 1 && end($sent)['delivery']['desktop_clients'] === ['quorum'], '67 percent of three people must round up to three human responses.');
+$state = $store->read($branch['id']); $detail = end($state['timeline'])['details'];
+$claims = array_values(array_filter($state['timeline'], static fn($event) => isset($event['details']['condition'])));
+ladder_check(count($claims) === 1 && $claims[0]['details']['human_response_counts']['received'] === 1, 'Quorum decision lacks attributable human response evidence.');
+$service->respond($branch['id'], ['request_id' => $request(48), 'person_id' => 'three', 'response' => 'needs_assistance'], $actor);
+$service->process(); ladder_check(count($sent) === $before + 1, 'Late assistance bypassed spacing.');
+$now += 60; $service->process();
+ladder_check(count($sent) === $before + 2 && end($sent)['delivery']['desktop_clients'] === ['assistance'], 'Skipped earlier assistance branch could not activate later.');
+$now += 60; $service->process();
+ladder_check(count($sent) === $before + 2, 'No-response branch counted a received assistance response as absent.');
+$service->respond($branch['id'], ['request_id' => $request(49), 'person_id' => 'three', 'response' => 'safe'], $actor);
+ladder_check($store->metadata($branch['id'])['due_at'] === null, 'Completed quorum retained a pending branch.');
+$service->update($branch['id'], ['request_id' => $request(54), 'kind' => 'all_clear', 'message' => 'Fixture all clear'], $actor);
+$threshold = $template; $threshold['escalation']['steps'][1]['condition'] = ['kind' => 'below_quorum', 'mode' => 'count', 'target' => 2];
+$pure = $state; $pure['template'] = $threshold; $pure['operations'] = []; $pure['responses']['three'] = ['response' => 'safe'];
+ladder_check(IncidentConfig::nextEscalation($pure) === null, 'Reached count quorum or handset receipt semantics changed.');
+$pure['responses'] = []; $pure['desktop_receipts'] = ['one' => true, 'two' => true, 'three' => true];
+ladder_check(IncidentConfig::nextEscalation($pure)['number'] === 2, 'Software receipts counted as human responses.');
 // Two real processes compete for the same next step using durable store locks.
 $template = IncidentConfig::template($base + ['escalation' => ['enabled' => true, 'steps' => $steps]]);
 $race = $service->start($start(50), $actor); $now += 60;

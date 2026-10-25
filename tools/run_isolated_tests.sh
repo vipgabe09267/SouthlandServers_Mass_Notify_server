@@ -7,13 +7,17 @@ if [[ "${SLS_TEST_NAMESPACE:-}" != "entered" ]]; then
     printf 'Run this isolation wrapper as root; it needs private mount/network/PID namespaces. No installer is run.\n' >&2
     exit 2
   fi
-  exec unshare --mount --net --pid --fork --mount-proc env \
+  if [[ "${1:-}" != --single && "${1:-}" != --build ]]; then
+    exec python3 -I "$ROOT_DIR/tools/isolated_dispatch.py" "$@"
+  fi
+  exec unshare --mount --net --pid --fork --kill-child=KILL --mount-proc env \
     SLS_TEST_NAMESPACE=entered \
     SLS_TEST_PARENT_MOUNT_NS="$(readlink /proc/self/ns/mnt)" \
     SLS_TEST_PARENT_NET_NS="$(readlink /proc/self/ns/net)" \
     SLS_TEST_PARENT_PID_NS="$(readlink /proc/self/ns/pid)" \
     bash "$0" "$@"
 fi
+if [[ "${1:-}" == --single ]]; then shift; fi
 # Never trust the stage marker alone: refuse all mounts if a caller inherited
 # that variable without entering fresh namespaces.
 for kind in MOUNT NET PID; do
@@ -53,7 +57,13 @@ for row in rows:
 for target in sorted(targets, key=lambda value: (value.count('/'), len(value)), reverse=True):
     if sys.argv[1] and target == sys.argv[1]:
         continue
-    descriptor = os.open(target, os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        descriptor = os.open(target, os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except (FileNotFoundError, NotADirectoryError):
+        # An outer fixture may cover /run or /tmp with a private filesystem.
+        # Its unreachable old child mounts cannot expose their hidden contents;
+        # the visible ancestor is still remounted below.
+        continue
     try:
         with open(f'/proc/self/fdinfo/{descriptor}', encoding='utf-8') as handle:
             actual = next(line.split()[1] for line in handle if line.startswith('mnt_id:'))
@@ -64,6 +74,15 @@ for target in sorted(targets, key=lambda value: (value.count('/'), len(value)), 
     command = ['mount', '-t', 'tmpfs', '-o', 'ro,mode=000,size=4k', 'tmpfs', target] if targets[target][actual] == 'autofs' else ['mount', '-o', 'remount,bind,ro', target]
     subprocess.run(command, check=True, timeout=15)
 SLS_READONLY_MOUNTS
+# Keep one descriptor to public vendor metadata across nested /tmp and PBX
+# state mounts. No live configuration, socket or database is carried through.
+asterisk_documentation_fd=""
+for documentation in /var/lib/asterisk/documentation/core-en_US.xml /tmp/sls-asterisk-vendor-docs/core-en_US.xml; do
+  if [[ -f "$documentation" && ! -L "$documentation" ]]; then
+    exec {asterisk_documentation_fd}<"$documentation"
+    break
+  fi
+done
 mount -t tmpfs -o mode=1777,size=768M tmpfs /tmp
 mount -t tmpfs -o mode=755,size=64M tmpfs /run
 mount -t tmpfs -o mode=700,size=16M tmpfs /root
@@ -72,9 +91,30 @@ if [[ -d /dev/shm && ! -L /dev/shm ]]; then
 fi
 # A disposable Asterisk needs its vendor XML documentation to initialize Stasis.
 # Preserve only this public module metadata before hiding all PBX state.
-if [[ -f /var/lib/asterisk/documentation/core-en_US.xml && ! -L /var/lib/asterisk/documentation/core-en_US.xml ]]; then
+if [[ -n "$asterisk_documentation_fd" ]]; then
   mkdir -p /tmp/sls-asterisk-vendor-docs
-  cp /var/lib/asterisk/documentation/core-en_US.xml /tmp/sls-asterisk-vendor-docs/
+  python3 -I - "$asterisk_documentation_fd" <<'SLS_PUBLIC_DOCUMENTATION'
+import os
+import pathlib
+import stat
+import sys
+descriptor = int(sys.argv[1])
+before = os.fstat(descriptor)
+if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or not 0 < before.st_size <= 4194304:
+    raise SystemExit('Public Asterisk fixture metadata is unsafe or oversized.')
+raw = bytearray()
+while len(raw) <= 4194304:
+    chunk = os.read(descriptor, min(65536, 4194305 - len(raw)))
+    if not chunk:
+        break
+    raw.extend(chunk)
+identity = lambda value: (value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+    value.st_gid, value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+if len(raw) != before.st_size or identity(os.fstat(descriptor)) != identity(before):
+    raise SystemExit('Public Asterisk fixture metadata changed while copying.')
+pathlib.Path('/tmp/sls-asterisk-vendor-docs/core-en_US.xml').write_bytes(raw)
+SLS_PUBLIC_DOCUMENTATION
+  exec {asterisk_documentation_fd}<&-
 fi
 mount -t tmpfs -o mode=755,size=64M tmpfs /var/lib/asterisk
 mount -t tmpfs -o mode=755,size=32M tmpfs /var/spool/asterisk
@@ -94,7 +134,13 @@ fi
 mount --bind /dev/null /etc/freepbx.conf
 mount -t tmpfs -o mode=755,size=32M tmpfs /usr/local/bin/sls_mass_notify
 cp -a "$ROOT_DIR/slsmassnotifyserver/bin/sls_mass_notify/." /usr/local/bin/sls_mass_notify/
-cp "$ROOT_DIR"/slsmassnotifyserver/bin/sls_mass_notify_*.{php,sh,py} /usr/local/bin/sls_mass_notify/ 2>/dev/null || true
+(
+  shopt -s nullglob
+  helpers=("$ROOT_DIR"/slsmassnotifyserver/bin/sls_mass_notify_*.{php,sh,py})
+  ((${#helpers[@]})) || { printf 'Isolated runtime helper sources are missing.\n' >&2; exit 2; }
+  # Match protected installation modes independently of the caller's umask.
+  install -m 0755 -- "${helpers[@]}" /usr/local/bin/sls_mass_notify/
+)
 chown -R root:root /usr/local/bin/sls_mass_notify
 mkdir -p /var/lib/asterisk/SLS_Mass_Notifications_Plugin
 export PYTHONDONTWRITEBYTECODE=1 TMPDIR=/tmp SLS_TEST_READONLY_SOURCE="$ROOT_DIR"
@@ -120,7 +166,10 @@ account=pwd.getpwnam('asterisk')
 crypto._atomic_write(path,crypto.encode_config({'enterprise_cluster':{'enabled':False}}),account.pw_uid,account.pw_gid)
 SLS_FIXTURE_POLICY
 if [[ "${1:-}" == --build ]]; then
-  workspace="$(mktemp -d /tmp/sls-isolated-build.XXXXXXXX)"
+  # Nested suites replace /tmp and /run with fresh filesystems. Keep their
+  # read-only source outside those paths, in the ignored artifact directory.
+  workspace="$(mktemp -d "$BUILD_OUTPUT/.sls-isolated-build.XXXXXXXX")"
+  trap 'rm -rf -- "$workspace"' EXIT
   chmod 0755 "$workspace"
   tar -C "$ROOT_DIR" --exclude='./.git' --exclude='./dist' --exclude='__pycache__' --exclude='*.pyc' -cf - . \
     | tar -C "$workspace" -xf -

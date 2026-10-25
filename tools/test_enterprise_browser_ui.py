@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import socket
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -44,12 +45,28 @@ class EnterpriseBrowserTests(unittest.TestCase):
         cls.fixture = helper.PortalHttpTests
         cls.fixture.setUpClass()
         cls.root = cls.fixture.root
-        settings = {**cls.fixture.original, 'enterprise_identity': {}, 'directory_sync': {}, 'subscriber_browser': {}}
+        # Optional exact PBX presentation assets, copied into the private web
+        # fixture. Never load a production route or an external font service.
+        cls.theme_assets = []
+        for variable, name, limit in [('SLS_UI_BOOTSTRAP_CSS','bootstrap.css',1048576),
+                                      ('SLS_UI_FONT_CSS','font-awesome.css',1048576),
+                                      ('SLS_UI_THEME_CSS','pbx-theme.css',1048576),
+                                      ('SLS_UI_FONT_WOFF2','fontawesome-webfont.woff2',1048576)]:
+            configured = os.environ.get(variable)
+            if not configured: continue
+            path = Path(configured)
+            if path.is_symlink() or not path.is_file() or not 1 <= path.stat().st_size <= limit:
+                raise RuntimeError('The supplied public PBX presentation fixture is unsafe or missing: '+variable)
+            body = path.read_bytes()
+            if name == 'font-awesome.css': body = body.replace(b'../fonts/', b'/pbx-ui/')
+            (cls.root/name).write_bytes(body)
+            if name.endswith('.css'): cls.theme_assets.append(name)
+        settings = {**cls.fixture.original, 'enterprise_labs': {'enabled': True}, 'enterprise_identity': {}, 'directory_sync': {}, 'subscriber_browser': {}}
         cls.fixture.write_settings(settings)
         php = '''<?php
 declare(strict_types=1);
-require MODULE.'/EnterpriseIdentityManagement.php';require MODULE.'/EnterpriseAdministration.php';
-require MODULE.'/Operators.php';require MODULE.'/EnterpriseClusterConfig.php';require MODULE.'/EnterpriseOperationsConfig.php';require MODULE.'/EnterpriseIntegrations.php';require MODULE.'/ConfigCrypto.php';
+require_once MODULE.'/EnterpriseIdentityManagement.php';require_once MODULE.'/EnterpriseAdministration.php';
+require_once MODULE.'/Operators.php';require_once MODULE.'/EnterpriseClusterConfig.php';require_once MODULE.'/EnterpriseOperationsConfig.php';require_once MODULE.'/EnterpriseIntegrations.php';require_once MODULE.'/ConfigCrypto.php';
 use SLS\\MassNotify\\{EnterpriseIdentityConfig,DirectoryConfig,SubscriberConfig,IncidentConfig,IncidentStore,EnterpriseOperationsConfig,EnterpriseClusterConfig,EnterpriseIntegrationsConfig,LabsSafety};
 use FreePBX\\modules\\SlsConfigCrypto;
 define('SLS_IDENTITY_FIXTURE',FIXTURE);define('FREEPBX_IS_AUTH',true);
@@ -78,20 +95,28 @@ if(!function_exists('_')){function _($v){return $v;}}
  public function getEnterpriseClusterConfiguration():array{return EnterpriseClusterConfig::defaults();}
  public function renderClusterPage(string $endpoint,string $csrf):string{return load_view(MODULE.'/views/cluster.php',['config'=>$this->getEnterpriseClusterConfiguration(),'endpoint'=>$endpoint,'csrf'=>$csrf,'revision'=>str_repeat('a',64)]);}
  public function configureEnterpriseCluster(array $input):array{$settings=$this->getActiveSettings();$settings['enterprise_cluster']=$input;$this->assertEnterpriseActivationSafe($settings);return ['success'=>true,'revision'=>str_repeat('b',64),'message'=>'Inert browser fixture: no cluster activation.'];}
- public function getEnterpriseIntegrationState():array{$cfg=EnterpriseIntegrationsConfig::normalize($this->getActiveSettings()['enterprise_integrations']??[]);return ['config'=>EnterpriseIntegrationsConfig::redacted($cfg),'revision'=>hash('sha256',json_encode($cfg,JSON_THROW_ON_ERROR)),'catalog'=>EnterpriseIntegrationsConfig::catalog(),'history'=>[['request_id'=>str_repeat('a',32),'kind'=>'meeting','state'=>'uncertain','created_at'=>time()-600,'finished_at'=>time()-590,'detail'=>'Fixture uncertainty']],'sensor_health'=>[],'storage_error'=>'','journal_usage'=>[],'browser_people'=>[],'runtime_dependencies'=>['curl'=>true,'openssl'=>true,'dom'=>true],'extensions'=>['1000'],'sms_recipients'=>[],'voice_recipients'=>[],'people'=>[],'incidents'=>[]];}
+ public function getEnterpriseIntegrationState():array{$cfg=EnterpriseIntegrationsConfig::normalize($this->getActiveSettings()['enterprise_integrations']??[]);return ['config'=>EnterpriseIntegrationsConfig::redacted($cfg),'revision'=>hash('sha256',json_encode($cfg,JSON_THROW_ON_ERROR)),'catalog'=>EnterpriseIntegrationsConfig::catalog(),'radio_catalog'=>\SLS\MassNotify\RadioGateway::catalog(),'history'=>[['request_id'=>str_repeat('a',32),'kind'=>'meeting','state'=>'uncertain','created_at'=>time()-600,'finished_at'=>time()-590,'detail'=>'Fixture uncertainty']],'sensor_health'=>[],'storage_error'=>'','journal_usage'=>[],'browser_people'=>[],'runtime_dependencies'=>['curl'=>true,'openssl'=>true,'dom'=>true],'extensions'=>['1000'],'sms_recipients'=>[],'voice_recipients'=>[],'people'=>[],'incidents'=>[]];}
+ public function enterpriseOperationsPeople():array{return $this->enterpriseOperationsState()['people'];}
  public function enterpriseOperationsState():array{$cfg=EnterpriseOperationsConfig::normalize($this->getActiveSettings()['enterprise_operations']??[]);return ['config'=>$cfg,'revision'=>hash('sha256',json_encode($cfg,JSON_THROW_ON_ERROR)),'sites'=>[['id'=>'site_a','name'=>'Fixture Site']],'people'=>[['id'=>'pbx:fixture-admin','name'=>'Fixture administrator'],['id'=>'pbx:reviewer','name'=>'Fixture reviewer']],'templates'=>[['id'=>'tpl_'.str_repeat('a',24),'name'=>'Browser template','fields'=>[]]],'audiences'=>[['id'=>'grp_'.str_repeat('a',24),'name'=>'Saved fixture audience']],'marker_choices'=>[['kind'=>'location','id'=>'room_a','name'=>'Fixture room']],'tones'=>[],'timezone'=>'UTC','timezones'=>['UTC','America/Chicago'],'reviews'=>[],'drill_report'=>[],'incident_choices'=>[['id'=>'inc_'.str_repeat('a',32),'name'=>'Assigned browser incident']]];}
  public function getEnterpriseFloorplanImage(string $id):array{if($id!=='img_'.str_repeat('a',64)){throw new DomainException('Unknown private fixture image.');}return ['type'=>'image/png','bytes'=>base64_decode(substr(file_get_contents(FIXTURE.'/browser-image.txt'),22),true)];}
  public function enterpriseOperationsAction(string $action,array $input):array{if($action==='floorplan_overlay'){if($input!==['plan_id'=>'plan_'.str_repeat('a',24),'incident_id'=>'inc_'.str_repeat('a',32)]){throw new DomainException('Unexpected private overlay selection.');}return ['success'=>true,'plan'=>['image_id'=>'img_'.str_repeat('a',64),'markers'=>[['label'=>'Fixture room','x'=>50,'y'=>50,'status'=>'unconfirmed']]],'observed_at'=>gmdate('c'),'meaning'=>'Human responses remain separate from transport receipts.'];}if($action==='drill_report'){return ['success'=>true,'assignments'=>[]];}if($action!=='operations_save'){throw new DomainException('Only editor saves are inert in this fixture.');}$cfg=EnterpriseOperationsConfig::normalize($input['config']);$this->saveEnterpriseNamespace('enterprise_operations',$cfg,$input['revision']);return ['success'=>true,'message'=>'Fixture coordination settings saved.'];}
 }
 class FreePBX{public static function create(){return (object)['Slsmassnotifyserver'=>new EnterpriseBrowserCentral()];}}
 session_name('SLSCENTRALFIXTURE');session_start();
-require MODULE.((($_GET['display']??'')==='slsmassnotifyserver_operators')?'/page.slsmassnotifyserver_operators.php':'/page.slsmassnotifyserver_enterprise.php');
+require_once MODULE.((($_GET['display']??'')==='slsmassnotifyserver_operators')?'/page.slsmassnotifyserver_operators.php':'/page.slsmassnotifyserver_enterprise.php');
 '''
         # The canonical writer remains under test; fixture configuration and
         # operational storage are private temporary files, never host PBX data.
         model = model.replace("'incident_workflows'=>IncidentConfig::class", "'incident_workflows'=>IncidentConfig::class,'enterprise_operations'=>EnterpriseOperationsConfig::class,'enterprise_integrations'=>EnterpriseIntegrationsConfig::class,'labs_safety'=>LabsSafety::class")
         model = model.replace('protected function assertEnterpriseActivationSafe(array $s):void{}', '')
         source = re.sub(r'\bFIXTURE\b',lambda _:json.dumps(str(cls.root)),(php + model).replace('MODULE', json.dumps(str(MODULE))))
+        # Browser renderings use the same layout foundation as the PBX, while
+        # JSON actions and private image downloads keep their exact responses.
+        shell = '<?php if(($_SERVER["REQUEST_METHOD"]??"GET")==="GET"&&!isset($_GET["image_id"])) { echo \'<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">\';'
+        for name in cls.theme_assets:
+            shell += 'echo '+json.dumps('<link rel="stylesheet" href="/pbx-ui/'+name+'">')+';'
+        shell += 'echo \'</head><body>\'; } ?>'
+        source = source.replace("session_name('SLSCENTRALFIXTURE');session_start();", "session_name('SLSCENTRALFIXTURE');session_start();\n?>"+shell+"<?php\n")
         (cls.root / 'central.php').write_text(source)
         # Render the actual account view in FreePBX's table-width shell with
         # populated protected activity, including long and escaped actor text.
@@ -105,7 +130,7 @@ require MODULE.((($_GET['display']??'')==='slsmassnotifyserver_operators')?'/pag
                              'operator_id':'api_'+'a'*24,'operator_username':'saved-'+'c'*134})
         (cls.root/'browser-security.json').write_text(json.dumps(activity))
         operator_view='''<?php
-require MODULE.'/SecurityAudit.php';
+require_once MODULE.'/SecurityAudit.php';
 if(!function_exists('_')){function _($v){return $v;}}
 $rows=json_decode(file_get_contents(__DIR__.'/browser-security.json'),true,16,JSON_THROW_ON_ERROR);
 $state=['access'=>['enabled'=>false,'portal_enabled'=>false,'accounts'=>[]],
@@ -117,8 +142,21 @@ $csrf_token=str_repeat('b',64);$endpoint='/operator-config.php';$identity_settin
 </style></head><body><div id="page_body"><?php include MODULE.'/views/operators.php';?></div></body></html>
 '''.replace('MODULE',json.dumps(str(MODULE)))
         (cls.root/'operator-config.php').write_text(operator_view)
+        jquery=os.environ.get('SLS_UI_JQUERY')
+        cls.dashboard_available=bool(jquery and Path(jquery).is_file())
+        if cls.dashboard_available:
+            (cls.root/'widget-jquery.js').write_bytes(Path(jquery).read_bytes())
+            widget=r'''<?php
+if(!function_exists('_')){function _($v){return $v;}}
+$setup_complete=true;$csrf_token=str_repeat('b',64);
+$announcement_targets=[['extension'=>'1000','name'=>'Private fixture handset','registered'=>true]];
+?><!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>*{box-sizing:border-box}body{margin:0;padding:8px;font:14px Arial,sans-serif}.form-control{display:block;width:100%}.btn{padding:7px 12px}.modal{display:none}pre{white-space:pre-wrap}</style>
+<script src="/widget-jquery.js"></script></head><body><?php include MODULE.'/dashboard/views/sections/sls-mass-notify-announcement.php';?></body></html>
+'''.replace('MODULE',json.dumps(str(MODULE)))
+            (cls.root/'widget.php').write_text(widget)
         incident_view=r'''<?php
-require MODULE.'/IncidentService.php';require MODULE.'/IncidentLanguages.php';
+require_once MODULE.'/IncidentService.php';require_once MODULE.'/IncidentLanguages.php';
 if(!function_exists('_')){function _($v){return $v;}}
 function load_view($path,$variables=[]){extract($variables);ob_start();include $path;return ob_get_clean();}
 if($_SERVER['REQUEST_METHOD']==='POST'){
@@ -146,19 +184,46 @@ echo load_view(MODULE.'/views/incidents.php',['templates'=>[$template],'active_t
 ?></body></html>
 '''.replace('MODULE',json.dumps(str(MODULE)))
         (cls.root/'incident-view.php').write_text(incident_view)
-        seed = '''require MODULE.'/ConfigCrypto.php';require MODULE.'/IncidentConfig.php';require MODULE.'/EnterpriseOperationsConfig.php';
-$s=['control_api'=>['base_url'=>'https://pbx.example.test/api/sls-mass-notify'],'incident_workflows'=>['schema'=>1,'templates'=>[\\SLS\\MassNotify\\IncidentConfig::template(['id'=>'tpl_'.str_repeat('a',24),'name'=>'Browser template','title'=>'Fixture','message'=>'Fixture','delivery'=>['extensions'=>['1000']]])]],'operator_access'=>['accounts'=>[]]];
+        seed = '''require_once MODULE.'/ConfigCrypto.php';require_once MODULE.'/IncidentConfig.php';require_once MODULE.'/EnterpriseOperationsConfig.php';
+$s=['enterprise_labs'=>['enabled'=>true],'control_api'=>['base_url'=>'https://pbx.example.test/api/sls-mass-notify'],'incident_workflows'=>['schema'=>1,'templates'=>[\\SLS\\MassNotify\\IncidentConfig::template(['id'=>'tpl_'.str_repeat('a',24),'name'=>'Browser template','title'=>'Fixture','message'=>'Fixture','delivery'=>['extensions'=>['1000']]])]],'operator_access'=>['accounts'=>[]]];
 $s['enterprise_operations']=\\SLS\\MassNotify\\EnterpriseOperationsConfig::normalize(['enabled'=>true,'floorplans'=>['enabled'=>true,'plans'=>[['id'=>'plan_'.str_repeat('a',24),'name'=>'Private assigned plan','enabled'=>true,'site_id'=>'site_a','image_id'=>'img_'.str_repeat('a',64),'markers'=>[]]]]]);
 file_put_contents(FIXTURE.'/active.config',\\FreePBX\\modules\\SlsConfigCrypto::encode($s));chmod(FIXTURE.'/active.config',0640);'''
         import subprocess
         subprocess.run(['php', '-r', seed.replace('MODULE', json.dumps(str(MODULE))).replace('FIXTURE', json.dumps(str(cls.root)))], check=True, capture_output=True)
+        diagnostic_view=r'''<?php
+require_once MODULE.'/api/sls-mass-notify/security.php';require_once MODULE.'/api/sls-mass-notify/sms/Service.php';require_once MODULE.'/DeviceAcceptance.php';
+function load_view($path,$variables=[]){extract($variables);ob_start();include $path;return ob_get_clean();}
+if($_SERVER['REQUEST_METHOD']==='POST'){file_put_contents(__DIR__.'/general-post.json',json_encode($_POST));header('Content-Type: text/plain');echo 'Inert UI fixture: request captured; no update or notification.';return;}
+?><!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>*{box-sizing:border-box}body{margin:0;font:14px Arial;color:#334155}.container-fluid{padding:0 15px}table{width:100%;border-collapse:collapse}td,th{padding:8px;text-align:left}.label{padding:3px 6px;border-radius:4px}.label-info{background:#dbeafe}.label-warning{background:#fef3c7}.label-danger{color:#b91c1c}.panel{border:1px solid #ddd;border-radius:6px;margin:12px 0}.panel-heading,.panel-body{padding:12px}.btn{padding:9px 12px;border:1px solid #aaa;border-radius:4px;display:inline-block}.row{display:flex;flex-wrap:wrap}.col-md-4{width:33.333%;padding:12px}.col-md-12{width:100%;padding:12px}.form-control{display:block;width:100%;padding:8px;min-height:36px;border:1px solid #ccc;border-radius:4px}.help-block{font-size:13px;line-height:1.5;color:#64748b}label{display:block}@media(max-width:600px){.col-md-4{width:100%}}</style></head><body><?php
+if(isset($_GET['settings'])){
+ $settings=['log_retention_days'=>90,'phone_device_limit'=>25,'desktop_client_limit'=>25,'updates'=>['github_enabled'=>'0','channel'=>'beta']];$csrf_token='fixture-csrf';$package_version='0.1.8-beta';$package_update_status=['state'=>'update','label'=>'Fixture update available','message'=>'Synthetic release; no installation.'];
+ include MODULE.'/views/other_settings.php';
+}else{
+ $diagnostics=['checks'=>[['label'=>'Postfix service and queue','ok'=>true,'detail'=>'Postfix running. Zero queued messages.'],['label'=>'Phone collector','ok'=>false,'detail'=>'Fixture error: authenticated heartbeat missing. Check the collector service journal.']],
+ 'endpoints'=>[['extension'=>'1000','devices'=>[['format'=>'yealink','transport'=>'tls','user_agent'=>'Yealink T48G'],['format'=>'grandstream','transport'=>'udp','user_agent'=>'Grandstream GRP'],['format'=>'polycom','transport'=>'tcp','user_agent'=>'Polycom VVX']]]],
+ 'desktop_clients'=>array_map(static fn($i)=>['name'=>'Desktop '.$i,'client_id'=>'cli_'.$i,'client_version'=>'','compatibility'=>'not_reported','upgrade_required'=>true,'connection'=>'recent'],range(1,70))];
+ include MODULE.'/views/help.php';
+}
+?></body></html>
+'''.replace('MODULE',json.dumps(str(MODULE)))
+        (cls.root/'diagnostic-view.php').write_text(diagnostic_view)
         router = '''<?php
 $_SERVER['HTTPS']='on';$path=parse_url($_SERVER['REQUEST_URI'],PHP_URL_PATH);
+if(preg_match('~^/pbx-ui/(bootstrap\.css|font-awesome\.css|pbx-theme\.css|fontawesome-webfont\.woff2)$~D',$path,$asset)){
+ header('Content-Type: '.(str_ends_with($asset[1],'.woff2')?'font/woff2':'text/css'));readfile(__DIR__.'/'.$asset[1]);return;
+}
+if($path==='/diagnostics.php'){require __DIR__.'/diagnostic-view.php';return;}
+if($path==='/widget.php'){require __DIR__.'/widget.php';return;}
+if($path==='/widget-jquery.js'){header('Content-Type: application/javascript');readfile(__DIR__.'/widget-jquery.js');return;}
 if($path==='/config.php'){require __DIR__. (($_GET['display']??'')==='slsmassnotifyserver_incidents' ? '/incident-view.php' : '/central.php');return;}
 if($path==='/operator-config.php'&&$_SERVER['REQUEST_METHOD']==='GET'){require __DIR__.'/operator-config.php';return;}
 if(preg_match('~^/modules/slsmassnotifyserver/views/([a-z_]+\\.(?:js|css))$~D',$path,$m)){header('Content-Type: '.(str_ends_with($m[1],'.js')?'text/javascript':'text/css'));readfile(MODULE.'/views/'.$m[1]);return;}
+if($path==='/mass-notify/display.php'){require __DIR__.'/mass-notify/display.php';return;}
+if($path==='/mass-notify/display.js'){header('Content-Type: application/javascript');readfile(MODULE.'/portal/display.js');return;}
 if($path==='/mass-notify/'){require __DIR__.'/mass-notify/index.php';return;}http_response_code(404);
 '''.replace('MODULE', json.dumps(str(MODULE)))
+        display_source=(MODULE/'portal/display.php').read_text().replace("'/var/www/html/admin/modules/slsmassnotifyserver'",json.dumps(str(MODULE))).replace("'/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config'",json.dumps(str(cls.root/'settings.json')))
+        (cls.root/'mass-notify/display.php').write_text(display_source)
         (cls.root / 'router.php').write_text(router)
         # Real local password+MFA sessions feed the production portal view and
         # script. The fixture's submission adapter records payloads only.
@@ -236,6 +301,46 @@ if($path==='/mass-notify/'){require __DIR__.'/mass-notify/index.php';return;}htt
         if errors:print('\n'.join(errors[-10:]),flush=True)
         cls.context.close();cls.browser.close();cls.playwright.stop();cls.proxy.shutdown();cls.proxy.server_close();cls.proxy_thread.join();cls.fixture.tearDownClass()
 
+    def test_audience_search_paging_ownership_and_config_budget(self):
+        html=subprocess.check_output(['php','-r',
+            '$escape=static fn($v)=>htmlspecialchars((string)$v,ENT_QUOTES|ENT_SUBSTITUTE,"UTF-8");include $argv[1];',
+            str(MODULE/'views/audiences.php')],text=True,timeout=10)
+        state={'audiences':[{'id':'grp_'+format(i,'024x'),'name':'Person '+str(i).zfill(3),
+            'members':{'extensions':[]},'identities_current':True} for i in range(200)],
+            'catalog':{'extensions':{'1000':{'id':'1000','label':'Private handset','available':True}}},'people':[],
+            'configuration_budget':{'used_bytes':102400,'maximum_bytes':2097152,'audience_bytes':51200,
+                'remaining_bytes':1994752,'within_limit':True}}
+        bootstrap='''const state=STATE;
+        document.getElementById('sls-audiences').hidden=false;
+        new SlsAudienceEditor({state:()=>state,channels:{extensions:['Phones','phone']},canEdit:()=>true,
+            request:async(action,input)=>{window.audienceSaved={action,input};return {state};},
+            onSaved:()=>{},announce:message=>{window.audienceMessage=message;}});'''.replace('STATE',json.dumps(state).replace('<','\\u003c'))
+        page=self.context.new_page();errors=[];page.on('pageerror',lambda error:errors.append(str(error)))
+        try:
+            page.set_content('<style>body{margin:8px;font-family:Arial,sans-serif}'+(MODULE/'views/locations.css').read_text()+'</style><main id="sls-locations">'+html+'</main><script>'+(MODULE/'views/audiences.js').read_text()+'\n'+bootstrap+'</script>')
+            cards=page.locator('#sls-audience-list article')
+            self.assertEqual(cards.count(),25)
+            self.assertTrue(page.get_by_role('button',name='Add audience',exact=True).is_disabled())
+            self.assertIn('100.0 / 2048 KiB',page.locator('#sls-audience-budget').inner_text())
+            page.get_by_role('button',name='Show more audiences',exact=True).click()
+            self.assertEqual(cards.count(),50)
+            page.get_by_label('Find an audience',exact=True).fill('Person 199')
+            self.assertEqual(cards.count(),1)
+            page.get_by_role('button',name='Edit',exact=True).click()
+            page.locator('#sls-audience-form details > summary').filter(has_text='Person profile').click()
+            page.get_by_label('This audience contains one person’s devices',exact=True).check()
+            self.assertFalse(page.locator('#sls-audience-ownership').is_checked())
+            page.get_by_label('Preferred language',exact=True).select_option('es')
+            page.locator('#sls-audience-ownership').check()
+            page.set_viewport_size({'width':MOBILE_WIDTH,'height':844})
+            self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'),MOBILE_WIDTH)
+            page.get_by_role('button',name='Save audience',exact=True).click()
+            self.assertEqual(page.evaluate('window.audienceSaved.input.person_profile'),
+                {'directory_person_id':'','language':'es','ownership_reviewed':True})
+            self.assertEqual(errors,[])
+        finally:page.close()
+        print('Audience Chromium: 200 saved entries, 25-row paging, name search, explicit ownership, encoded-config budget and mobile layout passed.',flush=True)
+
     def test_beta_notice_blocks_labs_warning_until_acknowledgment(self):
         page = self.context.new_page()
         try:
@@ -263,7 +368,8 @@ if($path==='/mass-notify/'){require __DIR__.'/mass-notify/index.php';return;}htt
         page = self.page
         url = self.browser_url + '/config.php?display=slsmassnotifyserver_enterprise'
         page.goto(url)
-        self.assertEqual(page.locator('#sls-enterprise').count(), 1, page.content()[:2000])
+        self.assertEqual(page.locator('#sls-enterprise-locked').count(), 1, page.content()[:2000])
+        self.assertEqual(page.locator('#sls-cluster-config').count(),0,'Unacknowledged settings were included in the response')
         page.locator('#sls-labs-danger[open]').wait_for()
         self.assertEqual(page.locator('[data-danger-review]').count(), 0)
         self.assertIn('DANGER! DO NOT USE ON PRODUCTION READY SERVERS!', page.locator('#sls-labs-danger-title').inner_text())
@@ -285,12 +391,29 @@ if($path==='/mass-notify/'){require __DIR__.'/mass-notify/index.php';return;}htt
         self.assertGreaterEqual(time.monotonic() - started, 4.8)
         page.locator('#sls-labs-danger-agree').check()
         page.locator('#sls-labs-danger-accept').click()
-        page.wait_for_function('!document.getElementById("sls-labs-danger").open')
+        page.locator('#sls-enterprise').wait_for()
+        page.wait_for_function('()=>typeof window.SlsLabsActivation==="function"')
+        # This editor fixture explicitly enables its sample floor plan.
+        self.assertEqual(page.locator('#sls-labs-activation .label').inner_text(),'Active')
         page.reload()
         page.wait_for_timeout(300)
         self.assertEqual(page.locator('#sls-labs-danger[open]').count(), 0)
         self.assertFalse(page.locator('#sls-cluster-config input[name=enabled]').is_checked())
         self.assertFalse(page.locator('#sls-cluster-config input[name=mirroring_enabled]').is_checked())
+        self.assertLess(page.locator('#sls-cluster-config .sls-field-help').first.bounding_box()['height'],30)
+        self.assertGreaterEqual(page.locator('#sls-cluster-config select[name=mode]').bounding_box()['height'],36)
+        help_icon = page.locator('#sls-cluster-config .sls-field-help').first
+        help_icon.hover()
+        tooltip = page.locator('#sls-labs-field-tooltip')
+        self.assertTrue(tooltip.is_visible())
+        self.assertEqual(tooltip.inner_text(), help_icon.get_attribute('data-help'))
+        self.assertIn('Standalone is local only.', tooltip.inner_text())
+        bounds = tooltip.bounding_box()
+        self.assertGreaterEqual(bounds['x'], 0)
+        self.assertLessEqual(bounds['x'] + bounds['width'], page.viewport_size['width'])
+        help_icon.focus(); page.keyboard.press('Escape')
+        self.assertFalse(tooltip.is_visible())
+        if os.environ.get('SLS_REVIEW_SCREENSHOTS')=='1':print('SLS_UI_SCREENSHOT '+json.dumps({'name':'continuity','data':base64.b64encode(page.screenshot()).decode()}),flush=True)
         page.locator('[data-labs-tab="identity"]').click()
         self.assertEqual(page.locator('[data-save-config="identity"]').count(), 0)
         page.goto(self.browser_url + '/config.php?display=slsmassnotifyserver_operators')
@@ -302,6 +425,7 @@ if($path==='/mass-notify/'){require __DIR__.'/mass-notify/index.php';return;}htt
         self.assertEqual(provider['vendor'], 'entra');self.assertFalse(provider['enabled'])
         page.goto(url)
         page.locator('[data-labs-tab="operations"]').click()
+        if os.environ.get('SLS_REVIEW_SCREENSHOTS')=='1':print('SLS_UI_SCREENSHOT '+json.dumps({'name':'incident-coordination','data':base64.b64encode(page.screenshot(full_page=True)).decode()}),flush=True)
         for section, fields in [('dual_approval', {'Name':'Fixture approval','Review lifetime (seconds)':'300'}),
                                 ('drills', {'Name':'Fixture drill','Completion deadline':'2027-01-01T12:00'}),
                                 ('shift_routing', {'Name':'Fixture shift','Start time':'08:00','End time':'17:00'})]:
@@ -335,11 +459,13 @@ if($path==='/mass-notify/'){require __DIR__.'/mass-notify/index.php';return;}htt
         with page.expect_navigation():page.locator('#sls-operations-save').click()
         self.assertEqual(page.locator('[data-operation-list="drills"] .sls-ent-row').count(),1)
         page.locator('[data-labs-tab="integrations"]').click()
+        page.locator('[data-provider-kind="speakers"] > summary').click()
         page.locator('[data-add="speaker"]').click()
         self.assertEqual(page.locator('#sls-integration-speakers .sls-integration-row').count(),1)
         page.get_by_text('Record reviewed provider evidence',exact=True).click()
         self.assertEqual(page.get_by_label('Reviewed outcome',exact=True).count(),1)
         self.assertEqual(page.get_by_label('Evidence reference',exact=True).count(),1)
+        page.locator('#sls-provider-operations > summary').click()
         labs_submit=page.locator('#sls-integration-labs-send [type="submit"]')
         page.locator('#sls-integration-labs-message').fill('Isolated browser fixture')
         labs_submit.click()
@@ -360,6 +486,155 @@ if($path==='/mass-notify/'){require __DIR__.'/mass-notify/index.php';return;}htt
         self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), MOBILE_WIDTH)
         page.set_viewport_size({'width':1440,'height':1000})
         print('Central Chromium: tabs, revisioned identity POST, typed approval/drill/shift/floorplan editors, private overlay refresh, speaker row, five-second warning and mobile width passed.',flush=True)
+
+    def test_disabled_labs_badge(self):
+        path=self.root/'active.config';before=path.read_bytes();page=self.context.new_page()
+        try:
+            code='require '+json.dumps(str(MODULE/'ConfigCrypto.php'))+';$p=$argv[1];$s=\\FreePBX\\modules\\SlsConfigCrypto::readFile($p);$s["enterprise_labs"]=["enabled"=>false];foreach(["enterprise_cluster","directory_sync","subscriber_browser","enterprise_integrations","enterprise_operations"] as $key){if(isset($s[$key]))$s[$key]["enabled"]=false;}file_put_contents($p,\\FreePBX\\modules\\SlsConfigCrypto::encode($s));'
+            subprocess.run(['php','-r',code,str(path)],check=True,capture_output=True)
+            page.goto(self.browser_url+'/config.php?display=slsmassnotifyserver_enterprise')
+            page.locator('#sls-enterprise').wait_for()
+            page.wait_for_function('()=>typeof window.SlsLabsActivation==="function"')
+            self.assertEqual(page.locator('#sls-labs-activation .label').inner_text(),'Inactive')
+            self.assertEqual(page.locator('#sls-labs-activation .label').evaluate('(n)=>getComputedStyle(n).backgroundColor'),'rgb(185, 28, 28)')
+            self.assertIn('label-danger',page.locator('#sls-labs-activation .label').get_attribute('class'))
+            self.assertIn('Risk warning acknowledged', page.locator('.sls-labs-risk-receipt').inner_text())
+            self.assertTrue(page.locator('#sls-integration-form [data-setting="enabled"]').is_disabled())
+            page.locator('#sls-labs-configure').click()
+            dialog=page.locator('#sls-labs-feature-manager[open]')
+            page.wait_for_function('!document.getElementById("sls-labs-master").disabled')
+            self.assertEqual(dialog.locator('[data-labs-feature]').count(),22)
+            self.assertTrue(dialog.locator('[data-labs-feature="floorplans"]').is_disabled())
+            self.assertTrue(dialog.locator('#sls-labs-feature-save').is_disabled())
+            self.assertIn('DANGER! DO NOT USE ON PRODUCTION READY SERVERS!',dialog.locator('footer').inner_text())
+            dialog.locator('#sls-labs-master').check()
+            self.assertTrue(dialog.locator('[data-labs-feature="floorplans"]').is_enabled())
+            if os.environ.get('SLS_REVIEW_SCREENSHOTS')=='1':
+                page.set_viewport_size({'width':320,'height':1000})
+                dialog.evaluate('(n)=>n.scrollTop=0')
+                print('SLS_UI_SCREENSHOT '+json.dumps({'name':'feature-manager-mobile','data':base64.b64encode(page.screenshot()).decode()}),flush=True)
+                page.set_viewport_size({'width':1440,'height':1000})
+            dialog.locator('#sls-labs-feature-agree').check()
+            with page.expect_navigation(wait_until='load'):
+                dialog.locator('#sls-labs-feature-save').click()
+            page.wait_for_function('document.getElementById("sls-labs-activation").querySelector("span").textContent==="Active" && !document.getElementById("sls-labs-feature-manager").open')
+            self.assertTrue(page.locator('[data-labs-tab-status]').evaluate_all('(rows)=>rows.every(row=>row.textContent==="Off")'))
+            page.locator('#sls-labs-configure').click()
+            page.wait_for_function('!document.getElementById("sls-labs-master").disabled')
+            dialog=page.locator('#sls-labs-feature-manager[open]')
+            self.assertFalse(dialog.locator('#sls-labs-feature-agree').is_checked())
+            dialog.locator('[data-labs-feature="floorplans"]').check()
+            for width in [320,1440]:
+                page.set_viewport_size({'width':width,'height':1000})
+                self.assertTrue(dialog.evaluate('(n)=>n.scrollWidth<=n.clientWidth+2'))
+            if os.environ.get('SLS_REVIEW_SCREENSHOTS')=='1':print('SLS_UI_SCREENSHOT '+json.dumps({'name':'feature-manager','data':base64.b64encode(page.screenshot()).decode()}),flush=True)
+            dialog.locator('#sls-labs-feature-agree').check()
+            with page.expect_navigation(wait_until='load'):
+                dialog.locator('#sls-labs-feature-save').click()
+            page.wait_for_function('!document.getElementById("sls-labs-feature-manager").open && document.querySelector("[data-labs-tab=operations] [data-labs-tab-status]").textContent==="On"')
+            self.assertEqual(page.locator('#sls-labs-activation .label').inner_text(),'Active')
+            page.locator('#sls-labs-configure').click()
+            page.wait_for_function('!document.getElementById("sls-labs-master").disabled')
+            dialog=page.locator('#sls-labs-feature-manager[open]')
+            dialog.locator('#sls-labs-master').uncheck()
+            self.assertTrue(dialog.locator('[data-labs-feature]').evaluate_all('(rows)=>rows.every(row=>!row.checked && row.matches(":disabled"))'))
+            dialog.locator('#sls-labs-feature-agree').check()
+            with page.expect_navigation(wait_until='load'):
+                dialog.locator('#sls-labs-feature-save').click()
+            page.wait_for_function('!document.getElementById("sls-labs-feature-manager").open && document.getElementById("sls-labs-activation").querySelector("span").textContent==="Inactive"')
+            self.assertEqual(page.locator('#sls-labs-activation .label').inner_text(),'Inactive')
+            self.assertEqual(page.locator('.sls-save-state').inner_text(),'Saved')
+        finally:
+            page.close();path.write_bytes(before)
+
+    def test_health_and_update_controls(self):
+        page=self.context.new_page();errors=[];page.on('pageerror',lambda error:errors.append(str(error)))
+        try:
+            page.goto(self.browser_url+'/diagnostics.php')
+            self.assertEqual(page.locator('.sls-help-endpoint-table tbody tr').count(),1,page.content()[:2800]+(self.root/'server.log').read_text()[-1800:])
+            self.assertEqual(page.locator('.sls-help-endpoint-table td:nth-child(3) .sls-phone-contact').all_text_contents(),['TLS1','UDP2','TCP3'])
+            self.assertEqual(page.locator('.sls-help-endpoint-table td:nth-child(4) .sls-phone-contact').all_text_contents(),['Yealink T48G1','Grandstream GRP2','Polycom VVX3'])
+            self.assertEqual(page.locator('.sls-help-checks th:nth-child(2)').evaluate('(n)=>getComputedStyle(n).whiteSpace'),'nowrap')
+            desktops=page.locator('.panel').filter(has=page.locator('h4',has_text='Desktop Clients')).locator('.sls-help-scroll-table')
+            self.assertTrue(desktops.evaluate('(n)=>n.scrollHeight>n.clientHeight && getComputedStyle(n).overflowY==="auto"'))
+            if os.environ.get('SLS_REVIEW_SCREENSHOTS')=='1':print('SLS_UI_SCREENSHOT '+json.dumps({'name':'help-contacts','data':base64.b64encode(page.screenshot(full_page=True)).decode()}),flush=True)
+            for action in ['check_updates','manual_update']:
+                page.goto(self.browser_url+'/diagnostics.php?settings=1&fixture_action='+action+'#settings-maintenance')
+                page.locator('[data-settings-section="maintenance"]').wait_for(state='visible')
+                self.assertEqual(page.locator('#sls-automatic-updates').input_value(),'0')
+                page.locator('[name="updates[channel]"]').select_option('stable')
+                if action=='check_updates' and os.environ.get('SLS_REVIEW_SCREENSHOTS')=='1':print('SLS_UI_SCREENSHOT '+json.dumps({'name':'updates','data':base64.b64encode(page.screenshot(full_page=True)).decode()}),flush=True)
+                page.locator('[value="'+action+'"]').click()
+                page.get_by_text('Inert UI fixture: request captured',exact=False).wait_for()
+                posted=json.loads((self.root/'general-post.json').read_text())
+                self.assertEqual(posted['slsmassnotifyserver_action'],action)
+                self.assertEqual(posted['slsmassnotifyserver_csrf'],'fixture-csrf')
+            self.assertEqual(errors,[])
+        finally:page.close()
+
+    def test_models_and_independent_meeting_accounts(self):
+        page=self.context.new_page();before=(self.root/'active.config').read_bytes()
+        errors=[];page.on('pageerror',lambda error:errors.append(str(error)))
+        try:
+            page.goto(self.browser_url+'/config.php?display=slsmassnotifyserver_enterprise#labs-integrations')
+            self.assertEqual(page.locator('[data-provider-section]:visible').count(), 2)
+            page.locator('[data-provider-category="all"]').click()
+            self.assertEqual(page.locator('[data-provider-section]:visible').count(), 10)
+            self.assertEqual(page.locator('.sls-provider-editor[open]').count(),0,'Provider settings should start collapsed')
+            self.assertEqual(page.locator('[data-provider-status]').all_text_contents(),['Off']*10)
+            if os.environ.get('SLS_REVIEW_SCREENSHOTS')=='1':print('SLS_UI_SCREENSHOT '+json.dumps({'name':'devices-default','data':base64.b64encode(page.screenshot(full_page=True)).decode()}),flush=True)
+            page.locator('[data-provider-kind="speakers"] > summary').click()
+            page.locator('[data-add="speaker"]').click()
+            speaker=page.locator('#sls-integration-speakers .sls-integration-row').last
+            self.assertTrue(speaker.evaluate('(n)=>n.open'))
+            page.locator('[data-provider-kind="meetings"] > summary').click()
+            zoom=page.locator('.sls-meeting-account').filter(has=page.locator('[data-meeting-account-status="zoom"]'))
+            zoom.locator(':scope > summary').click()
+            zoom.locator('[data-oauth-action="refresh"]').click()
+            page.locator('#sls-integration-status').get_by_text('Save integration settings before renewing or removing an account.',exact=True).wait_for()
+            self.assertEqual(page.locator('#sls-integration-speakers .sls-integration-row').count(),1)
+            zoom.locator(':scope > summary').click()
+            speaker.get_by_label('Name',exact=True).fill('Fixture speaker')
+            speaker.get_by_label('Brand',exact=True).select_option('axis')
+            speaker=page.locator('#sls-integration-speakers .sls-integration-row').last
+            self.assertTrue(speaker.evaluate('(n)=>n.open'),'Changing a brand collapsed the editor')
+            model=speaker.get_by_label('Speaker model',exact=False)
+            self.assertEqual(model.evaluate('(n)=>n.tagName'),'SELECT')
+            self.assertIn('C1410 Mk II',model.locator('option').all_text_contents())
+            tip = speaker.locator('.sls-field-help').first
+            tip.hover()
+            self.assertEqual(page.locator('#sls-labs-field-tooltip').inner_text(), tip.get_attribute('data-help'))
+            page.locator('[data-provider-kind="radios"] > summary').click()
+            page.locator('[data-add="radio"]').click()
+            radio=page.locator('#sls-integration-radios .sls-integration-row').last
+            choices=radio.get_by_label('Gateway model / SIP profile',exact=False)
+            self.assertEqual(choices.evaluate('(n)=>n.tagName'),'SELECT')
+            self.assertIn('Omnitronics IPR110+',choices.locator('option').all_text_contents())
+            radio.get_by_role('button',name='Remove',exact=True).click()
+            page.locator('#sls-integration-speakers .sls-integration-row').last.get_by_role('button',name='Remove',exact=True).click()
+            for provider in ['zoom','google_meet','webex']:
+                account=page.locator('.sls-meeting-account').filter(has=page.locator('[data-meeting-account-status="'+provider+'"]'))
+                account.locator(':scope > summary').click()
+                token='google_access_token' if provider=='google_meet' else provider+'_access_token'
+                account.locator('[data-setting="meetings.'+token+'"]').fill('fixture-'+provider+'-token')
+            page.locator('#sls-integration-form [type="submit"]').click()
+            page.locator('#sls-integration-status').get_by_text('Integration settings saved',exact=False).wait_for()
+            page.locator('#sls-provider-operations > summary').click()
+            provider=page.locator('#sls-integration-meeting-provider')
+            self.assertEqual(provider.locator('option').all_text_contents(),['Select a saved provider account','Zoom','Google Meet','Webex'])
+            for item in ['zoom','google_meet','webex']:provider.select_option(item);self.assertEqual(provider.input_value(),item)
+            self.assertTrue(page.locator('[data-setting="meetings.zoom_access_token"]').input_value()=='')
+            self.assertEqual(errors,[])
+            if os.environ.get('SLS_REVIEW_SCREENSHOTS')=='1':print('SLS_UI_SCREENSHOT '+json.dumps({'name':'devices-and-meetings','data':base64.b64encode(page.screenshot(full_page=True)).decode()}),flush=True)
+            for width in [320,390,1440]:
+                page.set_viewport_size({'width':width,'height':1000})
+                self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'),width)
+            page.locator('.sls-provider-editor[open] > summary').evaluate_all('(rows)=>rows.forEach(n=>n.click())')
+            page.locator('#sls-provider-operations > summary').click()
+            page.set_viewport_size({'width':320,'height':1000})
+            if os.environ.get('SLS_REVIEW_SCREENSHOTS')=='1':print('SLS_UI_SCREENSHOT '+json.dumps({'name':'devices-mobile','data':base64.b64encode(page.screenshot(full_page=True)).decode()}),flush=True)
+        finally:
+            page.close();(self.root/'active.config').write_bytes(before)
 
     def test_operator_sso_administration_and_nag_copy(self):
         page=self.page
@@ -557,6 +832,152 @@ if($path==='/mass-notify/'){require __DIR__.'/mass-notify/index.php';return;}htt
         page.set_viewport_size({'width':MOBILE_WIDTH,'height':844})
         self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'),MOBILE_WIDTH)
         print('Portal Chromium: actual local password/MFA session, expired approval controls, frozen review POST, drill launch/review POST, private response overlay and mobile width passed.',flush=True)
+
+    def test_dashboard_review_and_rehearsal_preserve_serialized_recipients(self):
+        if not self.dashboard_available:
+            if os.environ.get('SLS_UI_REQUIRED')=='1':self.fail('Set SLS_UI_JQUERY to a preinstalled public jQuery asset for dashboard qualification.')
+            self.skipTest('A preinstalled jQuery fixture was not supplied.')
+        from email.parser import BytesParser
+        page=self.context.new_page();page.set_default_timeout(5000);errors=[];requests=[]
+        page.on('pageerror',lambda error:errors.append(str(error)))
+        def response(route):
+            request=route.request
+            if request.method!='POST':route.continue_();return
+            message=BytesParser().parsebytes(('Content-Type: '+request.headers['content-type']+'\r\n\r\n').encode()+request.post_data_buffer)
+            fields={part.get_param('name',header='content-disposition'):part.get_payload(decode=True).decode() for part in message.get_payload()}
+            requests.append(fields)
+            if fields.get('announcement_rehearsal'):
+                result={'success':True,'rehearsal':{'simulated':True,'delivery_started':False,'counts':{'audio':1},'simulated_receipts':[{'channel':'audio','target':'1000','outcome':fields['announcement_rehearsal'],'detail':'Synthetic fixture only.'}],'message':'Rehearsal only. No delivery job was created.'}}
+            elif fields.get('announcement_preview')=='1':
+                result={'success':True,'review':{'token':'private-review-token','expires_at':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime(time.time()+300)),
+                    'counts':{'phones':1},'recipients':{'phones':['1000']},'unavailable_phones':[],
+                    'speech':{'mode':'tts','maximum_seconds':30,'revision':'fixture','external_revision':'fixture'}}}
+            else:result={'success':True,'message':'Inert send fixture.','receipts':[],'cooldown_remaining':0}
+            route.fulfill(status=200,content_type='application/json',body=json.dumps(result))
+        page.route('**/config.php?display=slsmassnotifyserver',response)
+        try:
+            page.goto(self.browser_url+'/widget.php')
+            page.locator('details.sls-destination-panel').first.locator('summary').click()
+            phone=page.locator('input[name="announcement_extensions[]"]');phone.check()
+            page.locator('#dashboard_announcement_body').fill('Private review <script>window.reviewInjected=true</script>')
+            submit=page.locator('#dashboard-sls-mass-notify-announcement-submit')
+            submit.click();page.locator('#sls-delivery-review').wait_for(state='visible')
+            page.wait_for_function('!document.querySelector("input[name=\\"announcement_extensions[]\\"]").disabled')
+            self.assertIn('Send Announcement',submit.inner_text())
+            self.assertEqual(len(requests),1)
+            self.assertEqual(requests[0]['sls_recipient_selection_complete'],'1')
+            self.assertEqual(json.loads(requests[0]['sls_recipient_selection_json'])['announcement_extensions'],['1000'])
+            self.assertNotIn('announcement_extensions[]',requests[0])
+            submit.click();page.wait_for_function('!document.getElementById("dashboard-sls-mass-notify-announcement-submit").disabled')
+            self.assertEqual(requests[-1]['announcement_review_token'],'private-review-token')
+            self.assertNotIn('announcement_preview',requests[-1])
+            page.locator('summary').filter(has_text='Delivery rehearsal').click()
+            page.locator('#sls-rehearsal-outcome').select_option('uncertain')
+            page.locator('#sls-rehearsal-run').click()
+            page.wait_for_function('document.getElementById("sls-rehearsal-result").textContent.includes("uncertain")')
+            self.assertEqual(requests[-1]['announcement_preview'],'1')
+            self.assertEqual(json.loads(requests[-1]['sls_recipient_selection_json'])['announcement_extensions'],['1000'])
+            self.assertEqual(sum('announcement_preview' not in row for row in requests),1)
+            self.assertFalse(page.evaluate('!!window.reviewInjected'))
+            for width,zoom in [(320,'1'),(640,'2'),(1280,'4')]:
+                page.set_viewport_size({'width':width,'height':1000});page.evaluate('z=>document.documentElement.style.zoom=z',zoom)
+                self.assertTrue(page.evaluate('document.documentElement.scrollWidth<=document.documentElement.clientWidth+2'),page.evaluate('({width:innerWidth,zoom:document.documentElement.style.zoom,scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth,overflow:[...document.querySelectorAll("body *")].filter(e=>e.getBoundingClientRect().right>innerWidth+2).slice(0,6).map(e=>[e.tagName,e.id,e.className,e.getBoundingClientRect().right])})'))
+            self.assertEqual(errors,[])
+            if os.environ.get('SLS_UI_EXPORT_SCREENSHOTS')=='1':
+                for width,name in [(1440,'dashboard-desktop.png'),(320,'dashboard-mobile.png')]:
+                    page.evaluate('document.documentElement.style.zoom="1"');page.set_viewport_size({'width':width,'height':1000})
+                    print('SLS_UI_SCREENSHOT '+json.dumps({'name':name,'data':base64.b64encode(page.screenshot(full_page=True)).decode()}),flush=True)
+        finally:page.close()
+
+    def test_browser_display_images_keep_credentials_on_exact_origin_and_route(self):
+        page=self.context.new_page()
+        calls=[];polls=0
+        png=base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jGxkAAAAASUVORK5CYII=')
+        def route(request):
+            nonlocal polls
+            path=request.request.url.split(self.browser_url,1)[-1]
+            calls.append((path,request.request.headers.get('authorization')))
+            if path.startswith('/api/sipnotify/desktop/media') or path.startswith('/sls_mass_notify/'):
+                request.fulfill(status=200,content_type='image/png',body=png);return
+            if path.startswith('/api/sipnotify/desktop/ack'):
+                request.fulfill(status=200,content_type='application/json',body=json.dumps({'ok':True,'event_id':request.request.post_data_json['event_id']}),headers={'Date':__import__('email.utils',fromlist=['formatdate']).formatdate(usegmt=True)});return
+            polls+=1;events=[]
+            if polls==2:
+                created=__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()
+                for event_id,image,authentication in [('auth-image',self.browser_url+'/api/sipnotify/desktop/media?event_id=auth-image','desktop_basic'),('foreign-image','https://foreign.invalid/hidden.png','desktop_basic'),('legacy-image',self.browser_url+'/sls_mass_notify/fixture.png','')]:
+                    events.append({'id':event_id,'title':'Browser fixture','message':'Useful plain text','is_test':True,'created_at':created,'display_timeout_seconds':60,'image_url':image,'image_authentication':authentication})
+            request.fulfill(status=200,content_type='application/json',headers={'Date':__import__('email.utils',fromlist=['formatdate']).formatdate(usegmt=True)},body=json.dumps({'ok':True,'events':events,'last_event_id':'legacy-image' if polls>1 else 'baseline','has_more':False,'cursor_gap':False}))
+        try:
+            original_settings=(self.root/'settings.json').read_bytes()
+            self.fixture.write_settings({**self.fixture.original,'enterprise_labs':{'enabled':True},'enterprise_integrations':{'enabled':'1','browser_display':{'enabled':'1'}}})
+            page.route('**/api/sipnotify/**',route);page.route('**/sls_mass_notify/**',route)
+            response=page.goto(self.browser_url+'/mass-notify/display.php')
+            self.assertEqual(response.status,200,page.content()[:800])
+            self.assertIn("img-src 'self' blob:",response.headers['content-security-policy'])
+            page.bring_to_front()
+            page.locator('[name=username]').fill('fixture');page.locator('[name=password]').fill('fixture-password');page.get_by_role('button',name='Connect display',exact=True).click()
+            page.wait_for_function('()=>document.querySelectorAll("#display-alerts img").length===2',timeout=10000)
+            self.assertEqual(page.locator('#display-alerts article').count(),3)
+            self.assertTrue(all(value.startswith('blob:') for value in page.locator('#display-alerts img').evaluate_all('(images)=>images.map(n=>n.src)')))
+            expected='Basic '+base64.b64encode(b'fixture:fixture-password').decode()
+            self.assertIn(('/api/sipnotify/desktop/media?event_id=auth-image',expected),calls)
+            self.assertIn(('/sls_mass_notify/fixture.png',None),calls)
+            self.assertFalse(any('foreign.invalid' in path for path,_ in calls))
+            page.get_by_role('button',name='Disconnect',exact=True).click()
+            self.assertEqual(page.locator('#display-alerts article').count(),0)
+            self.assertEqual(page.locator('[name=password]').input_value(),'')
+        finally:
+            if 'original_settings' in locals():(self.root/'settings.json').write_bytes(original_settings)
+            page.close()
+
+    def test_browser_display_reconnect_ignores_previous_credentials_inflight(self):
+        original_settings=(self.root/'settings.json').read_bytes()
+        self.fixture.write_settings({**self.fixture.original,'enterprise_labs':{'enabled':True},'enterprise_integrations':{'enabled':'1','browser_display':{'enabled':'1'}}})
+        first='Basic '+base64.b64encode(b'first:fixture-password').decode()
+        second='Basic '+base64.b64encode(b'second:fixture-password').decode()
+        try:
+            for old_status in (200,401):
+                with self.subTest(old_status=old_status):
+                    page=self.context.new_page();held=[];second_queries=[];page_errors=[]
+                    page.on('pageerror',lambda error:page_errors.append(str(error)))
+                    def payload(cursor):
+                        return json.dumps({'ok':True,'events':[],'last_event_id':cursor,'has_more':False,'cursor_gap':False})
+                    def route(request):
+                        credential=request.request.headers.get('authorization')
+                        if credential==first:held.append(request);return
+                        self.assertEqual(credential,second)
+                        second_queries.append(request.request.url)
+                        request.fulfill(status=200,content_type='application/json',body=payload('second-baseline'),headers={'Date':__import__('email.utils',fromlist=['formatdate']).formatdate(usegmt=True)})
+                    try:
+                        page.route('**/api/sipnotify/**',route)
+                        page.goto(self.browser_url+'/mass-notify/display.php');page.bring_to_front()
+                        page.locator('[name=username]').fill('first');page.locator('[name=password]').fill('fixture-password')
+                        page.get_by_role('button',name='Connect display',exact=True).click()
+                        page.wait_for_function('()=>document.getElementById("display-status").textContent.includes("Connecting")')
+                        deadline=time.monotonic()+3
+                        while not held and time.monotonic()<deadline:page.wait_for_timeout(20)
+                        self.assertEqual(len(held),1)
+                        page.get_by_role('button',name='Disconnect',exact=True).click()
+                        page.locator('[name=username]').fill('second');page.locator('[name=password]').fill('fixture-password')
+                        page.get_by_role('button',name='Connect display',exact=True).click()
+                        page.wait_for_function('()=>document.getElementById("display-status").textContent.startsWith("Connected")')
+                        try:
+                            held[0].fulfill(status=old_status,content_type='application/json',body=payload('first-baseline'),headers={'Date':__import__('email.utils',fromlist=['formatdate']).formatdate(usegmt=True)})
+                        except Exception as error:
+                            if not any(word in str(error).lower() for word in ('closed','cancel','invalid interception','already handled')):raise
+                        page.wait_for_timeout(200)
+                        self.assertTrue(page.locator('#display-login').evaluate('(node)=>node.hidden'),'A stale authentication response disconnected the new display login.')
+                        deadline=time.monotonic()+7
+                        while len(second_queries)<2 and time.monotonic()<deadline:page.wait_for_timeout(40)
+                        self.assertGreaterEqual(len(second_queries),2)
+                        self.assertIn('last_event_id=second-baseline',second_queries[1],'A previous credential response replaced the new cursor.')
+                        self.assertEqual(page_errors,[])
+                    finally:
+                        for pending in held:
+                            try:pending.abort()
+                            except Exception:pass
+                        page.close()
+        finally:(self.root/'settings.json').write_bytes(original_settings)
 
     def test_populated_operator_security_activity_is_safe_and_bounded(self):
         page=self.page

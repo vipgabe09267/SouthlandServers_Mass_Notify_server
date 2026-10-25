@@ -20,6 +20,12 @@ select a separate Lessac medium voice or follow the announcement voice; both
 choices are frozen when submitted. Carrier bandwidth still limits call quality.
 Speech above the configured duration limit is rejected rather than cut off.
 
+**Regional speech packs · Labs** adds optional UK English (`en_GB-cori-high`) and
+Mexican Spanish (`es_MX-ald-medium`). Select packs in General Settings, save and
+Apply Config, then run Repair Installation to download and verify them. They are
+not downloaded by default. Select the installed voice and listen to a preview;
+SLS does not translate the supplied text.
+
 The Dashboard previews phone images and internal/external speech without
 contacting recipients. Speech previews omit tones and show the complete spoken
 text. Changing text invalidates an older preview. Up to 50 literal pronunciation
@@ -313,3 +319,5 @@ Trust only reverse proxies you administer, with exact configured IPv4/IPv6 CIDRs
 and overwritten forwarding headers. Leave the list empty for direct connections.
 Malformed/missing information from a trusted proxy is rejected; forwarded hostnames
 are never trusted. Credential/proxy management requires the authenticated PBX admin.
+
+Missing or stale worker/storage snapshots must remain unconfirmed for two minutes before a system email is sent. Dashboard diagnostics remain immediate. A brief recovery clears the pending observation; a confirmed disk, audit or delivery failure retains its normal reporting. Lock contention during retention is deferred without generating a failure alert.

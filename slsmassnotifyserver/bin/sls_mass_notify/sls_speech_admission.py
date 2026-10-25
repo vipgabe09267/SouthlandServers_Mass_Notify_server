@@ -338,6 +338,9 @@ def speech_output(command, seconds):
 
 
 def launch(command, timeout, slot=0, output_fd=None, max_bytes=None):
+    if command and command[0] == PIPER:
+        command = [str(Path(PIPER).with_name('python3')), '-I',
+                   str(Path(__file__).resolve().with_name('sls_piper_worker.py')), *command[1:]]
     parent = os.getpid()
     def prepare():
         # Stop synthesis when its admission supervisor is killed externally.

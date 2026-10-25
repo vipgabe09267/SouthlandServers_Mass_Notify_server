@@ -1,6 +1,6 @@
 # Enterprise operator portal and scoped Control API
 
-These are unpublished Labs features. **DO NOT USE ON PRODUCTION SERVERS.** All enterprise configuration starts disabled. Configure operator SSO under FreePBX **Operator Access**; other enterprise settings remain under **Enterprise Labs**. The operator portal and Control API cannot activate features or accept a Labs safety receipt.
+These are Labs features. **DO NOT USE ON PRODUCTION SERVERS.** All enterprise configuration starts disabled. Configure operator SSO under FreePBX **Operator Access**; other enterprise settings remain under **Enterprise Labs**. The operator portal and Control API cannot activate features or accept a Labs safety receipt.
 
 The existing `/mass-notify/` portal shows only an authenticated person's current assignments. When enterprise operations are enabled it includes assigned announcement approvals, assigned drill launches and objective reviews, an attributable JSON drill report, and site-assigned private PNG/JPEG floor plans. An expired approval disables approve/submit while retaining rejection of the unsubmitted request. Rejecting a pending incident review clears that operation's pending state so a later update can proceed. Already submitted announcements retain their history.
 

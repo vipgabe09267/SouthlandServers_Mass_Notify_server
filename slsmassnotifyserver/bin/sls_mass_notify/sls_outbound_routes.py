@@ -353,11 +353,13 @@ class _Proof:
         rows = self.rows(context)
         self.includes(context, rows)
         body = [row for row in rows if 'Application' in row]
-        if not body or any(row['Extension'] != 's' or row['Application'].lower() not in {'noop', 'return', 'macroexit', 'set'} for row in body):
+        if not body or any(row['Extension'] != 's' or row['Application'].lower() not in {'noop', 'return', 'macroexit', 'set', 'gosub'} for row in body):
             _fail('outbound_predial_hook_unsupported')
         for row in body:
             data = row['AppData']
-            if row['Application'].lower() == 'set':
+            if row['Application'].lower() == 'gosub':
+                self.extension_only_hook(data)
+            elif row['Application'].lower() == 'set':
                 # Common administrator connected-line hook: preserve it, but
                 # accept no route/options changes, extra calls or arbitrary DB writes.
                 if data not in {
@@ -369,6 +371,37 @@ class _Proof:
                     _fail('outbound_predial_hook_unsupported')
             elif '${' in data or '$[' in data:
                 _fail('outbound_predial_hook_unsupported')
+
+    def extension_only_hook(self, data):
+        """Prove a desk-phone-only callback returns before any side effect.
+
+        SLS outbound admission binds a Local/ origin, so the exact PJSIP
+        channel guard below cannot pass. Retain the full observed context in
+        the fingerprint without executing or trusting its unreachable body.
+        """
+        match = re.fullmatch(r'([A-Za-z][A-Za-z0-9_-]{0,79}),s,1\(\)', data)
+        if not match:
+            _fail('outbound_predial_hook_unsupported')
+        context = match[1]
+        rows = self.rows(context)
+        self.includes(context, rows)
+        body = sorted((row for row in rows if 'Application' in row), key=lambda row: int(row['Priority']))
+        if len(body) < 4 or any(row['Extension'] != 's' for row in body):
+            _fail('outbound_predial_hook_unsupported')
+        first, user, channel = body[:3]
+        if first['Application'].lower() != 'noop' or re.search(r'[$\\]', first['AppData']):
+            _fail('outbound_predial_hook_unsupported')
+        user_guard = re.fullmatch(r'\$\["\$\{AMPUSER\}"!="([0-9]{1,20})"\]\?([A-Za-z][A-Za-z0-9_]*)', user['AppData'])
+        if user['Application'].lower() != 'gotoif' or not user_guard:
+            _fail('outbound_predial_hook_unsupported')
+        extension, label = user_guard.groups()
+        prefix = 'PJSIP/' + extension + '-'
+        expected = '$["${CHANNEL(name):0:' + str(len(prefix)) + '}"!="' + prefix + '"]?' + label
+        destinations = [row for row in body if row.get('ExtensionLabel') == label]
+        if (channel['Application'].lower() != 'gotoif' or channel['AppData'] != expected
+                or len(destinations) != 1 or int(destinations[0]['Priority']) <= 3
+                or destinations[0]['Application'].lower() != 'return' or destinations[0]['AppData'] != ''):
+            _fail('outbound_predial_hook_unsupported')
 
     def call(self, context, data, application):
         if application == 'macro':

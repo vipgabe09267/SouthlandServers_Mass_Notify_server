@@ -29,6 +29,17 @@ def hardware(cpu=2, memory=4, total=60, available=4):
 
 
 class ResourceCapacityTests(unittest.TestCase):
+    def test_browser_shards_allow_simultaneous_atomic_replacements(self):
+        storage = RESOURCE.storage_requirements()
+        parts = storage['component_budgets_bytes'][RESOURCE.MANAGED_TREES['data']]
+        # Receipts do not share a browser session lock. Each hexadecimal shard
+        # can retain its old 4 MiB ledger while writing its replacement.
+        shards = {digit: 4 * RESOURCE.MIB for digit in '0123456789abcdef'}
+        maximum_existing = sum(shards.values())
+        concurrent_replacements = sum(shards.values())
+        self.assertGreaterEqual(parts['browser_evidence_and_atomic_write_headroom'],
+                                maximum_existing + concurrent_replacements)
+
     def test_read_only_and_inode_exhausted_targets_fail_with_specific_diagnostics(self):
         for field, code in (('read_only', 'storage_read_only'), ('inodes_exhausted', 'storage_inodes_exhausted')):
             measured = hardware()
@@ -62,7 +73,7 @@ class ResourceCapacityTests(unittest.TestCase):
         def filesystems(budgets, inode_budgets=None):
             scratch = '/tmp' if '/tmp' in budgets else '/var/tmp'
             return [{'device': 'data', 'paths': [p for p in budgets if p != scratch],
-                     'available_bytes': 2 * GIB, 'required_free_bytes': sum(v for p, v in budgets.items() if p != scratch)},
+                     'available_bytes': 4 * GIB, 'required_free_bytes': sum(v for p, v in budgets.items() if p != scratch)},
                     {'device': 'scratch', 'paths': [scratch], 'available_bytes': (64 * RESOURCE.MIB if scratch == '/tmp' else 2 * GIB),
                      'required_free_bytes': budgets[scratch]}]
         with patch.object(RESOURCE, 'trusted_temporary_directory', return_value=True), \
@@ -152,7 +163,7 @@ class ResourceCapacityTests(unittest.TestCase):
                 name, version = line.split('==')
                 pins[name] = version
         self.assertEqual(RESOURCE.PINNED_VERSIONS, pins, 'Re-measure pinned wheels/runtime when requirements change.')
-        self.assertEqual(RESOURCE.PINNED_WHEEL_BYTES, 77802965)
+        self.assertEqual(RESOURCE.PINNED_WHEEL_BYTES, 77861012)
 
     def test_fresh_and_installed_storage_budgets_explain_every_component(self):
         fresh = RESOURCE.storage_requirements()
@@ -299,6 +310,18 @@ class ResourceCapacityTests(unittest.TestCase):
             self.assertLess(measured['free_budgets_bytes'][RESOURCE.MANAGED_TREES['sip_api']], RESOURCE.MIB)
             (root/'assets/link').symlink_to('/etc/passwd')
             with self.assertRaises(RESOURCE.ResourceProbeError): RESOURCE.measure_release_payloads(root)
+
+    def test_pinned_dependency_payload_fits_but_entry_growth_remains_bounded(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            for index in range(3000):
+                (root / ('dependency-%04d.php' % index)).touch()
+            measured = RESOURCE.measure_release_payloads(root)
+            self.assertEqual(measured[RESOURCE.MANAGED_TREES['module']]['entries'], 3001)
+            for index in range(3000, 5001):
+                (root / ('dependency-%04d.php' % index)).touch()
+            with self.assertRaises(RESOURCE.ResourceProbeError):
+                RESOURCE.measure_release_payloads(root)
 
     def test_missing_aes_dependency_returns_a_specific_error_without_traceback(self):
         with tempfile.TemporaryDirectory() as name:

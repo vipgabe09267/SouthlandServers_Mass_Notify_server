@@ -5,7 +5,7 @@ function escalationEditor(parent, policy) {
     const heading = node('h3');
     heading.append(node('i', {class: 'fa fa-level-up', 'aria-hidden': 'true'}), document.createTextNode(' Escalation ladder'));
     section.append(heading, node('p', {class: 'sls-inc-help'},
-        'Add up to five follow-ups for people with no response, missing or needing assistance. Delays start when the initial announcement obtains a job ID. Each step has its own destinations. App receipts do not count as human responses. An all-clear stops future steps; sent alerts remain unchanged.'));
+        'Add up to five follow-ups with their own destinations and human-response conditions. Delays start when the initial announcement obtains a job ID. App receipts do not count as human responses. An all-clear stops future steps.'));
     const enabled = check(section, 'Enable automatic follow-ups for this template', !!policy.enabled);
     enabled.id = 'sls-inc-escalation-enabled';
     const container = node('div'), rows = node('div'), empty = node('p', {class: 'sls-inc-help'}, 'No follow-ups configured. Add a step and select its destinations.');
@@ -25,6 +25,10 @@ function escalationEditor(parent, policy) {
             entry.summary.textContent = 'Step ' + (index + 1) + ' · ' + (entry.name.value.trim() || 'Unnamed follow-up') + ' · after ' + entry.delay.value + ' seconds';
             entry.up.disabled = !enabled.checked || index === 0;
             entry.down.disabled = !enabled.checked || index === entries.length - 1;
+            const quorum = entry.condition.value === 'below_quorum';
+            entry.threshold.hidden = !quorum;
+            entry.mode.disabled = entry.target.disabled = !enabled.checked || !quorum;
+            entry.target.max = entry.mode.value === 'percent' ? '100' : '1000';
         });
     }
     function create(value) {
@@ -43,9 +47,24 @@ function escalationEditor(parent, policy) {
         const delay = node('input', {type: 'number', min: '60', max: '86400', step: '1', required: 'required', 'data-escalation-delay': 'true'});
         delay.value = String(value.after_seconds || (entries.length ? Number(entries[entries.length - 1].delay.value) + 300 : 300));
         field(grid, 'Delay after initial job (seconds)', delay, 'Every later step needs a larger delay.');
+        const condition = node('select');
+        [['outstanding', 'Any outstanding person'], ['no_response', 'People have not responded'],
+            ['needs_assistance', 'Someone needs assistance'], ['below_quorum', 'Human response quorum not reached']]
+            .forEach(([key, label]) => condition.append(node('option', {value: key}, label)));
+        condition.value = value.condition?.kind || 'outstanding';
+        field(grid, 'Send this follow-up when', condition);
+        const threshold = node('div', {class: 'sls-inc-grid'}); card.append(threshold);
+        const mode = node('select');
+        mode.append(node('option', {value: 'percent'}, 'Percent of saved roster'), node('option', {value: 'count'}, 'Number of people'));
+        mode.value = value.condition?.mode || 'percent';
+        field(threshold, 'Quorum unit', mode);
+        const target = node('input', {type: 'number', min: '1', max: '100', step: '1'});
+        target.value = String(value.condition?.target || 100);
+        field(threshold, 'Required human responses', target, 'Received and Safe responses count toward quorum. Assistance requests remain a separate condition.');
         const getDelivery = deliveryEditor(card, value.delivery, 'Destinations for this step');
-        const entry = {card, summary, name, delay, getDelivery, up, down}; entries.push(entry);
+        const entry = {card, summary, name, delay, condition, threshold, mode, target, getDelivery, up, down}; entries.push(entry);
         name.addEventListener('input', refresh); delay.addEventListener('input', refresh);
+        condition.addEventListener('change', refresh); mode.addEventListener('change', refresh);
         function move(direction) {
             const index = entries.indexOf(entry), next = index + direction;
             if (next < 0 || next >= entries.length) return;
@@ -61,7 +80,9 @@ function escalationEditor(parent, policy) {
     const initial = Array.isArray(policy.steps) ? policy.steps : (policy.enabled || policy.delivery ? [{name: 'Supervisor follow-up', after_seconds: policy.after_seconds, delivery: policy.delivery}] : []);
     initial.forEach(create); refresh();
     return () => {
-        const steps = entries.map(entry => ({name: entry.name.value.trim(), after_seconds: Number(entry.delay.value), delivery: entry.getDelivery()}));
+        const steps = entries.map(entry => ({name: entry.name.value.trim(), after_seconds: Number(entry.delay.value), delivery: entry.getDelivery(),
+            condition: entry.condition.value === 'below_quorum'
+                ? {kind: 'below_quorum', mode: entry.mode.value, target: Number(entry.target.value)} : {kind: entry.condition.value}}));
         if (enabled.checked && !steps.length) throw Error('Add at least one follow-up before enabling escalation.');
         let previous = 0;
         steps.forEach(step => {

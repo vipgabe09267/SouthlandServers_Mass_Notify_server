@@ -83,6 +83,31 @@ def limits():
         raise OSError('Could not set no_new_privs')
 
 
+def restricted_command(descriptor, interpreter):
+    """No host data mounts, network, inherited descriptors or privilege fallback."""
+    binary=Path('/usr/bin/bwrap')
+    try:
+        for path in (binary, *binary.parents):
+            info=path.lstat()
+            if info.st_uid!=0 or info.st_mode & 0o7022 or (path==binary and not stat.S_ISREG(info.st_mode)):
+                raise OSError('unsafe bubblewrap installation')
+        if not os.access(binary,os.X_OK):raise OSError('bubblewrap is not executable')
+    except OSError as error:
+        raise ActionError('Restricted scripts require a root-owned operating-system bubblewrap installation with user namespaces enabled. No unrestricted fallback was attempted.') from error
+    command=[str(binary),'--unshare-all','--die-with-parent','--new-session','--disable-userns','--cap-drop','ALL',
+             '--clearenv','--setenv','PATH','/usr/bin:/bin','--setenv','LANG','C.UTF-8','--setenv','SLS_EVENT_SCHEMA','1',
+             '--ro-bind','/usr/bin','/usr/bin','--ro-bind','/usr/lib','/usr/lib']
+    for path in ('/bin','/lib','/lib64'):
+        if Path(path).is_symlink():command+=['--symlink',os.readlink(path),path]
+        elif Path(path).is_dir():command+=['--ro-bind',path,path]
+    command+=['--proc','/proc','--dev','/dev','--size','16777216','--tmpfs','/tmp','--dir','/run',
+              '--ro-bind','/proc/self/fd/'+str(descriptor),'/run/action'+('.js' if interpreter.endswith('/node') else '.sh'),
+              '--remount-ro','/','--remount-ro','/dev','--remount-ro','/proc','--chdir','/tmp','--',interpreter]
+    if interpreter.endswith('/node'):command+=['--preserve-symlinks-main','--max-old-space-size=64']
+    command+=['/run/action'+('.js' if interpreter.endswith('/node') else '.sh')]
+    return command
+
+
 def run_script(action, event, *, seconds=10):
     if os.geteuid() == 0:
         raise ActionError('Script actions must run as the PBX runtime account, never root.')
@@ -98,6 +123,10 @@ def run_script(action, event, *, seconds=10):
         if interpreter == '/usr/bin/node':
             command.append('--preserve-symlinks-main')
         command.append('/proc/self/fd/' + str(descriptor))
+        if action.get('execution_mode','trusted')=='restricted':
+            command=restricted_command(descriptor,interpreter)
+        elif action.get('execution_mode','trusted')!='trusted':
+            raise ActionError('Choose trusted or restricted script execution.')
         process = subprocess.Popen(command, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, pass_fds=(descriptor,), cwd='/',
             env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'SLS_EVENT_SCHEMA': '1'},

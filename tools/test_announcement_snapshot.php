@@ -2,6 +2,7 @@
 declare(strict_types=1);
 if (!interface_exists('BMO')) { interface BMO {} }
 require_once dirname(__DIR__) . '/slsmassnotifyserver/Slsmassnotifyserver.class.php';
+require_once dirname(__DIR__) . '/slsmassnotifyserver/DeliveryRehearsal.php';
 
 $directory = sys_get_temp_dir() . '/sls-announcement-snapshot-' . bin2hex(random_bytes(8));
 mkdir($directory, 0700);
@@ -14,9 +15,10 @@ foreach (['sendSipNotifyAnnouncement', 'resolveAnnouncementRequest', 'dispatchAn
 }
 // Exercise the real orchestration/preflight methods with only disposable paths
 // and inert delivery adapters. No FreePBX bootstrap or network is available here.
+$methods = str_replace("require_once __DIR__.'/DeliveryReview.php';", 'require_once ' . var_export(dirname(__DIR__) . '/slsmassnotifyserver/DeliveryReview.php', true) . ';', $methods);
 $fixtureSource = <<<'PHP'
 class AnnouncementSnapshotFixture {
-    use \FreePBX\modules\SlsAnnouncementDelivery;
+    use \FreePBX\modules\SlsAnnouncementDelivery { deliverResolvedAnnouncement as private actualPreviewDelivery; }
     use \FreePBX\modules\SlsEnterpriseOperations;
     use \FreePBX\modules\SlsAnnouncementEmail; use \FreePBX\modules\SlsAnnouncementSms;
     use \FreePBX\modules\SlsOutboundVoice;
@@ -42,6 +44,7 @@ class AnnouncementSnapshotFixture {
     private function setOwnership($path) {}
     private function getAnnouncementCooldownState() { return ['remaining'=>0]; }
     private function getSipNotifyTargets() { return $this->phones; }
+    private function getDeviceOverrideInventory() { return ['devices'=>$this->phones]; }
     private function getDesktopClients($settings) { return $settings['desktop_clients'] ?? []; }
     private function normalizeDesktopUsername($value) { return strtolower($value); }
     private function normalizeDesktopClientId($value) { return strtolower($value); }
@@ -53,7 +56,7 @@ class AnnouncementSnapshotFixture {
     private function normalizeAnnouncementTimeoutMode($mode) { return $mode; }
     private function normalizeAnnouncementTimeoutSeconds($seconds) { return $seconds; }
     private function sanitizeScheduleText($text, $limit, $single) { return substr($text, 0, $limit); }
-    private function deliverResolvedAnnouncement($request) { return ['success'=>true, 'request'=>$request]; }
+    private function deliverResolvedAnnouncement($request) { return !empty($request['preview']) ? $this->actualPreviewDelivery($request) : ['success'=>true, 'request'=>$request]; }
     private function normalizeTtsVolume($value, $fallback) { return $value; }
     private function getAvailablePiperVoices() { return array_map(static function ($path) { return ['path'=>$path]; }, $this->voices); }
     private function isValidPiperVoiceFile($path) { return in_array($path, $this->voices, true); }
@@ -99,6 +102,17 @@ $module->settings = ['announcement_piper_voice'=>'original-voice', 'announcement
     ['id'=>'hook', 'enabled'=>'1', 'name'=>'Original receiver', 'url'=>'https://hooks.example.com/original-secret'],
 ]];
 try {
+    $reviewFixture = new AnnouncementSnapshotFixture();
+    $reviewFixture->settings = ['announcement_piper_voice'=>'original-voice', 'desktop_auth_key'=>base64_encode(str_repeat('k',32))];
+    $review = $reviewFixture->sendSipNotifyAnnouncement(['1000'], 'Private no-delivery review', false, true, [], ['preview'=>true, '_review_requested'=>true]);
+    $rehearsal=\SLS\MassNotify\DeliveryRehearsal::simulate($review,['default'=>'uncertain']);
+    if (empty($review['success']) || empty($review['preview']) || $review['delivery_started'] !== false
+        || $review['transports_attempted'] !== [] || $review['review']['counts']['phones'] !== 1
+        || !$review['review']['token'] || $reviewFixture->preparedVoices !== []
+        || $rehearsal['simulated_receipts'][0]['outcome']!=='uncertain' || $rehearsal['transports_attempted']!==[]
+        || glob($directory.'/announcement-jobs/job_*.json') !== [] || file_exists($directory.'/capture.jsonl')) {
+        throw new RuntimeException('Actual delivery review started synthesis, queued work or a transport.');
+    }
     foreach ([['array message'], 1234, true, "Invalid \xFF text"] as $invalidMessage) {
         set_error_handler(static function () { return true; });
         try {
@@ -107,6 +121,12 @@ try {
         if (($invalid['error_code'] ?? '') !== 'invalid_message' || ($invalid['delivery_started'] ?? true)) {
             throw new RuntimeException('Malformed announcement text reached delivery orchestration.');
         }
+    }
+    $boundary=$module->sendSipNotifyAnnouncement(['1000'],str_repeat('é',500),true,false,[],['title'=>str_repeat('界',80)]);
+    if(empty($boundary['success'])||mb_strlen($boundary['request']['message']??'')!==500||mb_strlen($boundary['request']['title']??'')!==80){throw new RuntimeException('Exact multilingual title/body limit was rejected or shortened.');}
+    foreach([['message'=>str_repeat('é',501),'title'=>'Boundary','error'=>'message_too_long'],['message'=>'Boundary','title'=>str_repeat('界',81),'error'=>'title_too_long']] as $case){
+        $refused=$module->sendSipNotifyAnnouncement(['1000'],$case['message'],true,false,[],['title'=>$case['title']]);
+        if(($refused['error_code']??'')!==$case['error']||($refused['delivery_started']??true)){throw new RuntimeException('Oversized announcement reached delivery.');}
     }
     $unicode = $module->sendSipNotifyAnnouncement(['1000'], "Aviso: evacuación — 日本語", true, false);
     if (($unicode['request']['message'] ?? '') !== "Aviso: evacuación — 日本語") {

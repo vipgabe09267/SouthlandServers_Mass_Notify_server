@@ -6,6 +6,7 @@ Successful begin is permanently uncertain until its receipt is committed.
 """
 import importlib.util
 import json
+import math
 import os
 import subprocess
 import sys
@@ -36,6 +37,11 @@ def require_running(settings):
         raise ClusterFenced('SLS notifications are stopped; run sudo slsconsole start to resume')
 
 
+def labs_enabled(settings):
+    value = settings.get('enterprise_labs', {})
+    return isinstance(value, dict) and not set(value).difference({'enabled'}) and value.get('enabled') is True
+
+
 def enabled(settings=None):
     if settings is None:
         # Existing unit tools may exercise a transport without a PBX config.
@@ -48,10 +54,12 @@ def enabled(settings=None):
         settings = _crypto.read_config(CONFIG)
     require_running(settings)
     value = settings.get('enterprise_cluster', {})
-    return isinstance(value, dict) and value.get('enabled') in (True, '1')
+    return labs_enabled(settings) and isinstance(value, dict) and value.get('enabled') in (True, '1')
 
 
-def _call(value):
+def _call(value, *, timeout=14):
+    if isinstance(timeout, bool) or not isinstance(timeout, (int,float)) or not math.isfinite(timeout) or not 0 < timeout <= 14:
+        raise ClusterFenced('Cluster coordination timeout is invalid')
     helper = HELPER
     if not helper.is_file():
         helper = Path(__file__).resolve().parent / 'sls_mass_notify_cluster_effect.php'
@@ -63,7 +71,7 @@ def _call(value):
     try:
         result = subprocess.run(['/usr/bin/php', str(helper)], input=body,
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                timeout=14, check=False, close_fds=True,
+                                timeout=timeout, check=False, close_fds=True,
                                 env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C'})
         if result.returncode != 0 or len(result.stdout) > 65536:
             raise ClusterFenced('Cluster witness or protected state blocked this effect')
@@ -75,7 +83,7 @@ def _call(value):
         raise ClusterFenced('Cluster effect authorization is unavailable or uncertain') from exc
 
 
-def begin(channel, target, payload, *, delivery_id='', created_at=None, expires_at=None, settings=None):
+def begin(channel, target, payload, *, delivery_id='', created_at=None, expires_at=None, settings=None, timeout=14):
     active_enabled = enabled()
     if not active_enabled and (settings is None or not enabled(settings)):
         return None
@@ -85,13 +93,15 @@ def begin(channel, target, payload, *, delivery_id='', created_at=None, expires_
     if not delivery_id or created_at <= 0 or time.time() >= expires_at:
         raise ClusterFenced('Cluster effect lacks a stable unexpired delivery identity')
     request = {'delivery_id': delivery_id, 'created_at': created_at, 'expires_at': expires_at, 'payload': payload}
-    return _call({'action': 'begin', 'channel': channel, 'target': str(target), 'request': request}).get('claim')
+    return _call({'action': 'begin', 'channel': channel, 'target': str(target), 'request': request},
+                 **({'timeout':timeout} if timeout != 14 else {})).get('claim')
 
 
-def finish(claim, *, uncertain=False, category='accepted'):
+def finish(claim, *, uncertain=False, category='accepted', timeout=14):
     if claim is None:
         return
-    _call({'action': 'finish', 'claim': claim, 'receipt': {'uncertain': bool(uncertain), 'category': category, 'completed_at': int(time.time())}})
+    _call({'action': 'finish', 'claim': claim, 'receipt': {'uncertain': bool(uncertain), 'category': category, 'completed_at': int(time.time())}},
+          **({'timeout':timeout} if timeout != 14 else {}))
 
 
 def fence_legacy(settings=None):

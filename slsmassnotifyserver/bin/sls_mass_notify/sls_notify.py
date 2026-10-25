@@ -6,9 +6,11 @@ import configparser
 from contextlib import contextmanager
 import fcntl
 import hashlib
+import hmac
 import html
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -19,11 +21,15 @@ import sys
 import tempfile
 import time
 import textwrap
+from urllib.parse import urlsplit
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import sys as _config_sys
 _config_sys.dont_write_bytecode = True
+_config_sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sls_desktop_history as _desktop_history
+import sls_desktop_feed_cache as _desktop_feed_cache
 _config_crypto_spec = importlib.util.spec_from_file_location("sls_config_crypto", Path(__file__).resolve().with_name("sls_config_crypto.py"))
 _config_crypto = importlib.util.module_from_spec(_config_crypto_spec)
 _config_crypto_spec.loader.exec_module(_config_crypto)
@@ -69,8 +75,19 @@ class PhoneVisualLease:
         self.committed = True
 
 
+class GuardedContactAmi:
+    """Bound each connected-contact operation to its current page lease."""
+    def __init__(self, ami, guard):
+        self.ami, self.guard = ami, guard
+
+    def action(self, *args, **kwargs):
+        if not self.guard():
+            raise RuntimeError('The live-page visual request expired')
+        return self.ami.action(*args, **kwargs)
+
+
 @contextmanager
-def phone_visual_owner(extension, owner='', expected_owner='', directory=None):
+def phone_visual_owner(extension, owner='', expected_owner='', directory=None, continuing=False):
     """Serialize a handset's pushes; a page may clear only its own last popup."""
     if not re.fullmatch(r'[0-9]{1,20}', str(extension)):
         raise ValueError('Invalid phone visual recipient')
@@ -79,6 +96,8 @@ def phone_visual_owner(extension, owner='', expected_owner='', directory=None):
             raise ValueError('Invalid phone visual owner')
     if owner and expected_owner:
         raise ValueError('A visual push cannot claim and clear an owner together')
+    if type(continuing) is not bool or (continuing and not owner):
+        raise ValueError('Continuing a visual push requires its owner')
     directory = Path(directory) if directory is not None else PHONE_VISUAL_STATE
     directory.mkdir(mode=0o750, exist_ok=True)
     meta = directory.lstat()
@@ -92,29 +111,45 @@ def phone_visual_owner(extension, owner='', expected_owner='', directory=None):
         os.close(directory_fd)
         raise OSError('Phone visual state directory changed while it was opened')
     path_name = str(extension) + '.json'
+    lock_name = path_name + '.lock'
+    descriptor = lock_descriptor = None
     try:
-        descriptor = os.open(path_name,
-                             os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
-                             0o640, dir_fd=directory_fd)
-    except BaseException:
-        os.close(directory_fd)
-        raise
-    try:
-        opened = os.fstat(descriptor)
-        if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.geteuid()
-                or opened.st_gid != os.getegid() or opened.st_nlink != 1
-                or stat.S_IMODE(opened.st_mode) not in (0o600, 0o640)
-                or opened.st_size > 512):
-            raise OSError('Phone visual state file is unsafe')
+        lock_descriptor = os.open(lock_name,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o640, dir_fd=directory_fd)
+        lock_metadata = os.fstat(lock_descriptor)
+        if (not stat.S_ISREG(lock_metadata.st_mode) or lock_metadata.st_uid != os.geteuid()
+                or lock_metadata.st_gid != os.getegid() or lock_metadata.st_nlink != 1
+                or stat.S_IMODE(lock_metadata.st_mode) not in (0o600, 0o640) or lock_metadata.st_size != 0):
+            raise OSError('Phone visual state lock is unsafe')
+        def lock_identity(value):
+            return (value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid, value.st_nlink, value.st_size)
+        def verify_lock():
+            current_lock = os.stat(lock_name, dir_fd=directory_fd, follow_symlinks=False)
+            current_directory = directory.lstat()
+            if (lock_identity(current_lock) != lock_identity(lock_metadata)
+                    or lock_identity(os.fstat(lock_descriptor)) != lock_identity(lock_metadata)
+                    or (current_directory.st_dev, current_directory.st_ino, current_directory.st_mode,
+                        current_directory.st_uid, current_directory.st_gid)
+                    != (opened_directory.st_dev, opened_directory.st_ino, opened_directory.st_mode,
+                        opened_directory.st_uid, opened_directory.st_gid)):
+                raise OSError('Phone visual state lock or directory changed')
         deadline = time.monotonic() + 3
         while True:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
                     raise OSError('Phone visual state is busy') from None
                 time.sleep(.01)
+        verify_lock()
+        descriptor = os.open(path_name,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o640, dir_fd=directory_fd)
+        opened = os.fstat(descriptor)
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.geteuid()
+                or opened.st_gid != os.getegid() or opened.st_nlink != 1
+                or stat.S_IMODE(opened.st_mode) not in (0o600, 0o640) or opened.st_size > 512):
+            raise OSError('Phone visual state file is unsafe')
         current = os.stat(path_name, dir_fd=directory_fd, follow_symlinks=False)
         if ((current.st_dev, current.st_ino, current.st_mode, current.st_uid,
              current.st_gid, current.st_nlink, current.st_size)
@@ -145,7 +180,13 @@ def phone_visual_owner(extension, owner='', expected_owner='', directory=None):
             # Unknown ownership never authorizes a completion push. A new
             # ordinary alert can replace a corrupt, non-secret marker.
             saved = {}
+        verify_lock()
         if expected_owner and (not isinstance(saved, dict) or saved.get('owner') != expected_owner):
+            yield PhoneVisualLease(False)
+            return
+        if continuing and saved.get('owner') != owner:
+            # A later-joining handset cannot reclaim an extension after a newer
+            # announcement replaced this page's ownership.
             yield PhoneVisualLease(False)
             return
         # Keep the lock until every contact for this extension is submitted.
@@ -187,6 +228,7 @@ def phone_visual_owner(extension, owner='', expected_owner='', directory=None):
                         != (opened_directory.st_dev, opened_directory.st_ino,
                             opened_directory.st_mode, opened_directory.st_uid, opened_directory.st_gid)):
                     raise OSError('Phone visual state directory changed before it was saved')
+                verify_lock()
                 os.replace(temporary_name, path_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
                 temporary_name = None
                 named_committed = os.stat(path_name, dir_fd=directory_fd, follow_symlinks=False)
@@ -209,7 +251,10 @@ def phone_visual_owner(extension, owner='', expected_owner='', directory=None):
                     except FileNotFoundError:
                         pass
     finally:
-        os.close(descriptor)
+        if descriptor is not None:
+            os.close(descriptor)
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
         os.close(directory_fd)
 
 ALERT_MAP = {
@@ -523,6 +568,29 @@ class AmiClient:
                     return response, events
 
 
+def ami_live_paging_actions(ami):
+    """Read-only discovery of actions visible to the authenticated AMI account."""
+    response, _ = ami.action({"Action": "ListCommands"})
+    if (not isinstance(response, dict) or len(response) > 512
+            or response.get("Response") != "Success"):
+        raise RuntimeError("AMI action discovery failed")
+    required = ("MuteAudio", "PlayDTMF", "Setvar", "Getvar")
+    names = {name.lower() for name in required}
+    commands = {}
+    for key, value in response.items():
+        if not isinstance(key, str):
+            raise RuntimeError("AMI action discovery is invalid")
+        lowered = key.lower()
+        if lowered in names:
+            if (lowered in commands or not isinstance(value, str)
+                    or not value.strip() or len(value) > 4096):
+                raise RuntimeError("AMI paging action discovery is ambiguous")
+            commands[lowered] = value
+    if any(name.lower() not in commands for name in required):
+        raise RuntimeError("AMI caller-ready paging actions are unavailable or unauthorized")
+    return {name: "authorized" for name in required}
+
+
 def resolve_local_ami_endpoint(ami):
     values = {}
     amportal = Path("/etc/amportal.conf")
@@ -582,6 +650,39 @@ def desktop_media_base_url(host, configured_api_url=""):
     return f"https://{authority}/sls_mass_notify"
 
 
+def radio_gateway_extensions(settings):
+    labs = settings.get('enterprise_labs', {})
+    if not isinstance(labs, dict) or labs.get('enabled') is not True:
+        return []
+    integrations = settings.get('enterprise_integrations', {})
+    if not isinstance(integrations, dict) or integrations.get('enabled') not in ('1', 1, True):
+        return []
+    radios = integrations.get('radios', {})
+    if not isinstance(radios, dict) or radios.get('enabled') not in ('1', 1, True):
+        return []
+    rows = radios.get('devices', [])
+    if not isinstance(rows, list) or len(rows) > 25:
+        raise ValueError('Radio gateway visual exclusions are invalid')
+    seen = set(); result = []
+    for row in rows:
+        if (not isinstance(row, dict) or not isinstance(row.get('extension'), str)
+                or not re.fullmatch(r'[0-9]{1,12}', row['extension']) or row['extension'] in seen
+                or type(row.get('enabled', '0')) not in (str, int, bool)
+                or row.get('enabled', '0') not in ('0', '1', 0, 1, False, True)):
+            raise ValueError('Radio gateway visual exclusions are invalid')
+        seen.add(row['extension'])
+        if row.get('enabled', '0') in ('1', 1, True): result.append(row['extension'])
+    return sorted(result)
+
+
+def audio_only_visual_exclusions(config):
+    raw = config.get('visual', 'audio_only_extensions', fallback='')
+    rows = raw.split(',') if raw else []
+    if len(rows) > 25 or any(not re.fullmatch(r'[0-9]{1,12}', row) for row in rows):
+        raise ValueError('Radio gateway visual exclusions are invalid')
+    return set(rows)
+
+
 def load_config():
     config = configparser.ConfigParser(interpolation=None)
     if CENTRAL_SETTINGS_FILE.is_file():
@@ -639,6 +740,10 @@ def load_config():
                 "web_dir": "/var/www/html/sls_mass_notify",
                 "public_base_url": phone_media_base_url(host, media_scheme, sipnotify.get("media_base_url")),
                 "desktop_public_base_url": desktop_media_base_url(host, sipnotify.get("base_url")),
+                "phone_capabilities": "yes" if (settings.get("media_access") or {}).get("phone_capabilities") is True else "no",
+                "phone_capability_key": str(settings.get("desktop_auth_key") or ""),
+                "phone_capability_generation": str((settings.get("media_access") or {}).get("phone_capability_generation") or "0000000000000000"),
+                "audio_only_extensions": ','.join(radio_gateway_extensions(settings)),
                 "image_width": "480",
                 "image_height": "272",
                 "retry_delays": "",
@@ -985,6 +1090,26 @@ def open_background_image(path):
         raise
 
 
+def phone_media_url(config, base, filename, *, now=None):
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,179}\.(?:png|xml)', filename):
+        raise ValueError('Invalid generated phone media filename')
+    url = f"{base}/{filename}"
+    if not config.getboolean('visual', 'phone_capabilities', fallback=False):
+        return url
+    if urlsplit(base).scheme!='https':raise ValueError('Short-lived phone media links require HTTPS. Disable the capability option for legacy HTTP phones.')
+    try:
+        key = base64.b64decode(config.get('visual', 'phone_capability_key', fallback=''), validate=True)
+    except (ValueError, TypeError) as error:
+        raise ValueError('Phone media capability key is unavailable') from error
+    if len(key) != 32:
+        raise ValueError('Phone media capability key is unavailable')
+    expires = str(int(time.time() if now is None else now) + 600)
+    generation=config.get('visual','phone_capability_generation',fallback='0000000000000000')
+    if not re.fullmatch(r'[a-f0-9]{16}',generation):raise ValueError('Phone capability generation is unavailable')
+    signature = hmac.new(key, f'sls-phone-media-v2\n{filename}\n{expires}\n{generation}'.encode('ascii'), hashlib.sha256).hexdigest()
+    return f'{url}?sls_exp={expires}&sls_sig={signature}&sls_gen={generation}'
+
+
 def render_alert_image(config, alert):
     props = alert.get("properties", {})
     priority = alert_priority(props)
@@ -1030,7 +1155,7 @@ def render_alert_image(config, alert):
         validate_rendered_png(output_fd, width, height)
         publish_generated_stage(directory_fd, staging_name, output_name, output_fd, staging_metadata)
         staging_name = None
-        return f"{public_base_url}/{output_name}"
+        return phone_media_url(config, public_base_url, output_name)
     finally:
         if staging_name is not None:
             unlink_generated_stage(directory_fd, staging_name, staging_metadata)
@@ -1208,7 +1333,7 @@ def hosted_phone_payload(config, xml_payload):
                                  maximum=JOURNAL_MAX_LINE_BYTES)
         publish_generated_stage(directory_fd, staging_name, output_name, staging_fd, staging_metadata)
         staging_name = None
-        return f"{public_base_url}/{output_name}"
+        return phone_media_url(config, public_base_url, output_name)
     finally:
         if staging_name is not None:
             unlink_generated_stage(directory_fd, staging_name, staging_metadata)
@@ -1339,7 +1464,7 @@ def render_announcement_image(config, title, message, background_color="#1f2937"
     while len(body_lines) < 5:
         body_lines.append("")
 
-    output_name = "announcement_" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "_" + secrets.token_hex(12) + ".png"
+    output_name = "announcement_" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "_" + secrets.token_hex(12) + ("_desktop.png" if desktop else ".png")
     background_color = normalize_hex_color(background_color)
     background_image_path = Path(background_image) if background_image else None
     web_dir, directory_fd = generated_asset_directory(web_dir)
@@ -1399,7 +1524,7 @@ def render_announcement_image(config, title, message, background_color="#1f2937"
         validate_rendered_png(output_fd, width, height)
         publish_generated_stage(directory_fd, staging_name, output_name, output_fd, staging_metadata)
         staging_name = None
-        return f"{public_base_url}/{output_name}"
+        return f"{public_base_url}/{output_name}" if desktop else phone_media_url(config, public_base_url, output_name)
     finally:
         if background_fd is not None:
             os.close(background_fd)
@@ -1562,10 +1687,12 @@ def detect_phone_format(user_agent, endpoint=""):
     return "unknown"
 
 
-def asterisk_contact_uri_inventory(endpoints, max_seconds=5):
+def asterisk_contact_uri_inventory(endpoints, max_seconds=5, submission_guard=None):
     inventory = {}
     deadline = time.monotonic() + max_seconds
     for endpoint in sorted(set(endpoints or [])):
+        if submission_guard is not None and not submission_guard():
+            raise RuntimeError('The connected-contact inventory lease expired')
         if not re.fullmatch(r"[0-9]{1,20}", endpoint):
             continue
         remaining = deadline - time.monotonic()
@@ -1577,7 +1704,7 @@ def asterisk_contact_uri_inventory(endpoints, max_seconds=5):
                 cwd="/",
                 capture_output=True,
                 text=True,
-                timeout=min(5, remaining),
+                timeout=min(1 if submission_guard is not None else 5, remaining),
                 check=False,
             )
         except Exception as exc:
@@ -1611,7 +1738,7 @@ def contact_uri_for_event(event, endpoint, inventory, contact_index=0):
     return candidates[0] if len(candidates) == 1 else ""
 
 
-def get_registered_endpoint_info(ami, allowed_targets=None, format_overrides=None, resolve_contact_uris=False):
+def get_registered_endpoint_info(ami, allowed_targets=None, format_overrides=None, resolve_contact_uris=False, submission_guard=None):
     response, events = ami.action({"Action": "PJSIPShowContacts"}, "ContactListComplete")
     if response.get("Response", "").lower() == "error":
         if ami_response_is_empty_contact_inventory(response):
@@ -1626,7 +1753,10 @@ def get_registered_endpoint_info(ami, allowed_targets=None, format_overrides=Non
         endpoint = str(ami_field(event, "Endpoint", "AOR", "ObjectName")).split("/", 1)[0].strip()
         if endpoint and (not allowed_targets or endpoint in allowed_targets) and not registered_contact_uri(ami_field(event, 'Contact', 'Uri')):
             candidate_endpoints.add(endpoint)
-    contact_uri_inventory = asterisk_contact_uri_inventory(candidate_endpoints) if resolve_contact_uris else {}
+    contact_uri_inventory = asterisk_contact_uri_inventory(candidate_endpoints,
+        **({'submission_guard': submission_guard} if submission_guard is not None else {})) if resolve_contact_uris else {}
+    if submission_guard is not None and not submission_guard():
+        raise RuntimeError('The connected-contact inventory lease expired')
     contact_uri_offsets = {}
     endpoints = {}
     skipped = []
@@ -1889,16 +2019,21 @@ class NotifyBatchError(RuntimeError):
         self.result = result
 
 
-def send_notify(ami, target, xml_payload, phone_format="yealink", target_field="Endpoint"):
+def send_notify(ami, target, xml_payload, phone_format="yealink", target_field="Endpoint", coordination_deadline=None):
     if target_field not in {"Endpoint", "URI"}:
         raise ValueError("Invalid PJSIPNotify target field")
+    if coordination_deadline is not None and (isinstance(coordination_deadline,bool)
+            or not isinstance(coordination_deadline,(int,float)) or not math.isfinite(coordination_deadline)):
+        raise ValueError('Invalid live-page coordination deadline')
     content_type = notify_content_type_for_format(phone_format)
     attempts = []
+    def coordination_budget():
+        return {} if coordination_deadline is None else {'timeout':min(2,max(.05,coordination_deadline-time.monotonic()))}
     for event_name in notify_events_for_format(phone_format):
         claim = None
         try:
             claim = _cluster_guard.begin('sip_notify', str(target) + ':' + event_name,
-                                         {'xml': xml_payload, 'event': event_name, 'target_field': target_field})
+                                         {'xml': xml_payload, 'event': event_name, 'target_field': target_field}, **coordination_budget())
             response, _ = ami.action({
                 "Action": "PJSIPNotify",
                 target_field: target,
@@ -1908,10 +2043,10 @@ def send_notify(ami, target, xml_payload, phone_format="yealink", target_field="
                     f"Content={xml_payload}",
                 ],
             })
-            _cluster_guard.finish(claim, uncertain=False, category='ami_response_received')
+            _cluster_guard.finish(claim, uncertain=False, category='ami_response_received', **coordination_budget())
         except Exception:
             try:
-                _cluster_guard.finish(claim, uncertain=True, category='ami_submission_uncertain')
+                _cluster_guard.finish(claim, uncertain=True, category='ami_submission_uncertain', **coordination_budget())
             except Exception:
                 pass
             attempts.append({"event": event_name, "response": "unavailable", "message_category": "ami_action_error"})
@@ -2066,7 +2201,7 @@ def lock_journal_file(descriptor, deadline):
 
 def read_journal_lines(handle, path, expected_metadata):
     from collections import deque
-    retained = deque(maxlen=JOURNAL_MAX_RECORDS)
+    retained = deque()
     if os.fstat(handle.fileno()).st_size > JOURNAL_MAX_BYTES:
         raise OSError("Desktop journal exceeds the byte limit; existing evidence was preserved")
     total = 0
@@ -2283,6 +2418,15 @@ def append_sipnotify_event(config, record, submission_guard=None):
             set_journal_file_metadata(journal_handle.fileno())
             lines = read_journal_lines(journal_handle, path, metadata)
             record_id = record["id"]
+            if not any(json.loads(line).get('id') == record_id for line in lines):
+                archived = _desktop_history.lookup(path, record_id)
+                if archived is not None:
+                    if (archived.get('kind') != record.get('kind')
+                            or (archived.get('is_test') is True) != (record.get('is_test') is True)):
+                        raise OSError('Desktop publication identity conflicts with retained evidence')
+                    # Repeating an archived publication cannot make an expired
+                    # event live again or widen its original audience.
+                    return
             replaced = False
             if record_id:
                 for index, line in enumerate(lines):
@@ -2318,6 +2462,10 @@ def append_sipnotify_event(config, record, submission_guard=None):
                         replaced = True
             if not replaced:
                 lines.append(encoded)
+            try:
+                lines = _desktop_history.compact(path, lines, JOURNAL_MAX_BYTES, JOURNAL_MAX_RECORDS, record_id)
+            except (RuntimeError, ValueError) as error:
+                raise OSError('Desktop history could not be preserved; publication was not changed') from error
             journal_identity(journal_handle.fileno(), path)
             journal_identity(lock_handle.fileno(), lock_path)
             claim = None
@@ -2330,9 +2478,11 @@ def append_sipnotify_event(config, record, submission_guard=None):
             try:
                 # The authority check occurs after temporary bytes are fsynced,
                 # immediately before replacing the externally visible feed.
-                atomic_write_journal(path, lines[-JOURNAL_MAX_RECORDS:], metadata,
+                atomic_write_journal(path, lines, metadata,
                                      submission_guard=guarded_publication)
                 _cluster_guard.finish(claim, uncertain=False, category='desktop_publication_committed')
+                try:_desktop_feed_cache.publish(path,lines,config.get('visual','phone_capability_key',fallback=''))
+                except (OSError,ValueError,RuntimeError,TypeError):logging.warning('Desktop feed cache unavailable; authenticated readers will use the durable journal')
             except Exception:
                 try:
                     _cluster_guard.finish(claim, uncertain=True, category='desktop_publication_uncertain')
@@ -2489,7 +2639,7 @@ def announcement_api_record(alert_id, message, xml_payload, extensions, desktop_
 
 
 
-def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_results=False, attempt_label="initial", unavailable_targets=None, defer_unavailable_failure=False, visual_owner='', clear_visual_owner=''):
+def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_results=False, attempt_label="initial", unavailable_targets=None, defer_unavailable_failure=False, visual_owner='', clear_visual_owner='', strict_contacts=False, continuation_extensions=(), submission_guard=None, operation_deadline=None):
     # Keep the historical integer return (contact coverage of accepted actions)
     # for callers. It is not a count of handset deliveries. The structured result
     # reports AMI submissions and independently addressed contacts separately.
@@ -2499,14 +2649,20 @@ def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_resul
     submitted_contact_targets = 0
     failed_contact_targets = 0
     ami_attempts = 0
+    superseded_extensions = 0
     results = []
     unavailable_targets = sorted(set(unavailable_targets or []) - set(endpoint_info))
-    capabilities = pjsip_notify_capabilities()
+    # A connected-contact request never falls back to Endpoint. Attempt only
+    # the URI AMI operation; unsupported servers return a concrete refusal.
+    # Avoid three unguarded CLI capability probes in this bounded live path.
+    capabilities = {'contact_uri_usable': True} if strict_contacts else pjsip_notify_capabilities()
 
     def submit(extension, info, target, phone_format, target_field, requested_formats,
                requested_route, fallback_reason, resolved_contacts, coverage, unavailable=False):
         nonlocal successes, submitted_targets, failed_targets
         nonlocal submitted_contact_targets, failed_contact_targets, ami_attempts
+        if not unavailable and submission_guard is not None and not submission_guard():
+            raise RuntimeError('The live page no longer permits this visual submission')
         record = {
             "alert_id": safe_notify_log_value(alert_id),
             "attempt": safe_notify_log_value(attempt_label),
@@ -2535,7 +2691,8 @@ def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_resul
                 record["target_field"] = None
             else:
                 try:
-                    result = send_notify(ami, target, xml_payload, phone_format, target_field)
+                    result = send_notify(ami, target, xml_payload, phone_format, target_field,
+                        **({'coordination_deadline':operation_deadline or time.monotonic()+8} if strict_contacts else {}))
                     details = result.details
                 except NotifySubmissionError as exc:
                     details = exc.details
@@ -2591,10 +2748,15 @@ def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_resul
         mixed_formats = len(contact_formats) > 1
         use_contact_uri = bool(
             contact_targets
-            and mixed_formats
+            and (mixed_formats or strict_contacts)
             and len(contact_targets) == len(contacts)
             and capabilities.get("contact_uri_usable")
         )
+
+        if strict_contacts and not use_contact_uri:
+            # Never fan out a connected-contact-only popup to ringing handsets.
+            return submit(extension, info, '', 'generic', None, contact_formats,
+                          'contact_uri', 'connected_contact_uri_unavailable', len(contact_targets), 0, unavailable=True)
 
         if mixed_formats and not use_contact_uri:
             # Preserve the portable generic endpoint fallback when each vendor's
@@ -2630,9 +2792,12 @@ def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_resul
         return accepted
 
     for extension, info in sorted(endpoint_info.items()):
-        with phone_visual_owner(extension, visual_owner, clear_visual_owner) as lease:
+        with phone_visual_owner(extension, visual_owner, clear_visual_owner,
+                                continuing=extension in continuation_extensions) as lease:
             if lease and route_extension(extension, info):
                 lease.commit()
+            elif not lease:
+                superseded_extensions += 1
 
     for extension in unavailable_targets:
         submit(extension, {}, extension, "", None, [], "endpoint", "none", 0, 0, unavailable=True)
@@ -2672,7 +2837,7 @@ def send_notify_batch(ami, endpoint_info, payload_builder, alert_id, print_resul
             "handset delivery is not confirmed",
             summary,
         )
-    if endpoint_info and successes == 0 and not clear_visual_owner:
+    if endpoint_info and successes == 0 and not clear_visual_owner and superseded_extensions != len(endpoint_info):
         raise NotifyBatchError("SIP NOTIFY was not submitted to Asterisk for any requested endpoint", summary)
     return successes
 
@@ -2728,7 +2893,8 @@ def push_alert(
     if not valid_event_identifier(alert_id):
         raise ValueError('Alert publication requires a bounded text event ID')
     primary_xml_payload = build_xml(config, alert)
-    requested_extensions = sorted(targets or [])
+    excluded = audio_only_visual_exclusions(config)
+    requested_extensions = sorted(set(targets or []) - excluded)
     desktop_targets = sorted(set(desktop_targets or []))
     if api_only:
         if not desktop_targets and not desktop_all:
@@ -2755,6 +2921,7 @@ def push_alert(
         config["ami"].get("password", ""),
     ) as ami:
         endpoint_info = get_registered_endpoint_info(ami, targets, endpoint_format_overrides(config), resolve_contact_uris=True)
+        endpoint_info = {extension: info for extension, info in endpoint_info.items() if extension not in excluded}
         extensions = sorted(endpoint_info.keys())
         phone_formats = endpoint_format_summary(endpoint_info)
         logging.info("Pushing %s alert %s priority=%s to %d registered endpoints formats=%s", event, alert_id, priority, len(extensions), phone_formats)
@@ -2789,14 +2956,31 @@ def push_alert(
         raise_unavailable_notify_targets(missing_extensions)
 
 
-def push_announcement(config, message, targets, print_results=True, api_publish=True, api_only=False, image=False, title="Announcement", background_color="#1f2937", background_image="", desktop_targets=None, desktop_all=False, timeout_seconds=0, is_test=False, incident=None, latest_start=None, visual_owner='', clear_visual_owner=''):
+def push_announcement(config, message, targets, print_results=True, api_publish=True, api_only=False, image=False, title="Announcement", background_color="#1f2937", background_image="", desktop_targets=None, desktop_all=False, timeout_seconds=0, is_test=False, incident=None, latest_start=None, visual_owner='', clear_visual_owner='', contact_targets=None, continuation_extensions=(), submission_guard=None, operation_deadline=None):
+    if operation_deadline is not None and (contact_targets is None or isinstance(operation_deadline,bool)
+            or not isinstance(operation_deadline,(int,float)) or not math.isfinite(operation_deadline) or operation_deadline <= 0):
+        raise ValueError('Connected live-page operation deadline is invalid')
+    if contact_targets is not None:
+        if (api_publish or api_only or desktop_targets or desktop_all or not (visual_owner or clear_visual_owner)
+                or not isinstance(contact_targets, dict) or not contact_targets or len(contact_targets) > 1000
+                or set(contact_targets) != set(targets or [])
+                or any(not isinstance(key, str) or not re.fullmatch(r'[0-9]{1,20}', key)
+                       or not isinstance(values, list) or not 1 <= len(values) <= 1000
+                       or any(not isinstance(uri, str) or registered_contact_uri(uri) != uri for uri in values)
+                       or len(values) != len(set(values))
+                       for key, values in contact_targets.items())
+                or sum(map(len, contact_targets.values())) > 1000):
+            raise ValueError('Connected live-page contact scope is invalid')
     if latest_start is not None and not api_only:
         raise ValueError('A scheduled publication deadline requires the desktop-only sender')
-    submission_guard = scheduled_start_guard(latest_start) if latest_start is not None else None
+    if latest_start is not None:
+        submission_guard = scheduled_start_guard(latest_start)
     incident = normalize_incident_context(incident)
     if incident is not None and incident['is_test'] != (is_test is True):
         raise ValueError('Incident and announcement test metadata disagree')
     timeout_seconds = normalize_announcement_timeout_seconds(timeout_seconds)
+    excluded = audio_only_visual_exclusions(config)
+    requested_extensions = sorted(set(targets or []) - excluded)
     if image:
         xml_payload = build_announcement_image_xml(config, message, title, background_color, background_image, timeout_seconds)
     else:
@@ -2836,15 +3020,29 @@ def push_announcement(config, message, targets, print_results=True, api_publish=
         config["ami"].getint("port", 5038),
         config["ami"].get("username", "slsmassnotify"),
         config["ami"].get("password", ""),
+        **({'timeout': 2} if contact_targets is not None else {}),
     ) as ami:
-        endpoint_info = get_registered_endpoint_info(ami, targets, endpoint_format_overrides(config), resolve_contact_uris=True)
+        if contact_targets is not None and submission_guard is not None:
+            ami = GuardedContactAmi(ami, submission_guard)
+        endpoint_info = get_registered_endpoint_info(ami, targets, endpoint_format_overrides(config), resolve_contact_uris=True,
+            **({'submission_guard': submission_guard} if contact_targets is not None and submission_guard is not None else {}))
+        endpoint_info = {extension: info for extension, info in endpoint_info.items() if extension not in excluded}
+        if contact_targets is not None:
+            narrowed = {}
+            for extension, info in endpoint_info.items():
+                contacts = [row for row in info.get('contacts', [])
+                            if registered_contact_uri(row.get('contact', '')) in contact_targets[extension]]
+                if contacts:
+                    narrowed[extension] = dict(info, contacts=contacts,
+                        formats=sorted({row.get('format') or info.get('format', 'generic') for row in contacts}))
+            endpoint_info = narrowed
         extensions = sorted(endpoint_info.keys())
         phone_formats = endpoint_format_summary(endpoint_info)
         logging.info("Pushing SIP NOTIFY announcement %s to %d registered endpoints formats=%s", alert_id, len(extensions), phone_formats)
-        if targets and not extensions:
-            requested = ", ".join(sorted(targets))
+        if requested_extensions and not extensions:
+            requested = ", ".join(requested_extensions)
             raise RuntimeError(f"No requested phone endpoints are registered/reachable for SIP NOTIFY: {requested}")
-        missing_extensions = sorted(set(targets or []) - set(extensions))
+        missing_extensions = sorted(set(requested_extensions) - set(extensions))
         def payload_builder(fmt):
             payload = xml_payload if fmt == 'yealink' else build_phone_xml_for_format(config, fmt, 'announcement', message=message, image=image, title=title, background_color=background_color, background_image=background_image, timeout_seconds=timeout_seconds)
             return payload.replace("Beep='yes'", "Beep='no'") if clear_visual_owner else payload
@@ -2852,6 +3050,9 @@ def push_announcement(config, message, targets, print_results=True, api_publish=
             ami, endpoint_info, payload_builder, alert_id, print_results, "initial",
             unavailable_targets=missing_extensions, defer_unavailable_failure=True,
             visual_owner=visual_owner, clear_visual_owner=clear_visual_owner,
+            strict_contacts=contact_targets is not None, continuation_extensions=continuation_extensions,
+            submission_guard=submission_guard,
+            operation_deadline=operation_deadline,
         )
         if api_publish and not desktop_pre_published:
             append_sipnotify_event(config, announcement_api_record(alert_id, message, xml_payload, extensions, desktop_targets, desktop_all, phone_formats, title=title, background_color=background_color, image=image, timeout_seconds=timeout_seconds, is_test=is_test, desktop_image_url=desktop_image_url, incident=incident))
@@ -3085,6 +3286,7 @@ def main():
                     "ping": "pong",
                     "pjsip_show_contacts": contact_status,
                     "pjsip_notify": "authorized",
+                    "live_paging_actions": ami_live_paging_actions(ami),
                 }, sort_keys=True))
             return 0
         if args.list_endpoints_json:

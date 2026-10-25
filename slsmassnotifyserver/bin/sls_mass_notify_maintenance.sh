@@ -678,6 +678,12 @@ fi
 
 
 # Generated speech and composite audio are short-lived delivery artifacts.
+/usr/bin/timeout --signal=TERM --kill-after=5 15 /usr/bin/python3 -I \
+  "$RUNTIME_DIR/sls_mail_evidence.py" >&"$LOG_FD" 2>&1 \
+  || log "Read-only Postfix evidence was not refreshed; existing mail evidence may be stale."
+/usr/bin/timeout --signal=TERM --kill-after=5 15 /usr/bin/python3 -I \
+  "$RUNTIME_DIR/sls_support_snapshot.py" >&"$LOG_FD" 2>&1 \
+  || log "The redacted support snapshot was not refreshed; existing monitoring data may be stale."
 /usr/bin/env -u GITHUB_TOKEN -u GH_TOKEN -u SLS_MASS_NOTIFY_GITHUB_TOKEN /usr/sbin/runuser -u asterisk -- \
   /usr/bin/timeout --signal=TERM --kill-after=5 300 /usr/bin/python3 -I \
   "$RUNTIME_DIR/sls_storage_maintenance.py" >&"$LOG_FD" 2>&1 \

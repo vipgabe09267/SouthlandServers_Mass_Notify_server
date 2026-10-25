@@ -67,7 +67,7 @@ $assetRevision = substr(hash('sha256', hash_file('sha256', __DIR__ . '/locations
                 <fieldset class="sls-location-channel-options"><legend><?php echo _('Recipient types'); ?></legend><div id="sls-location-channels"></div></fieldset>
                 <button type="button" class="btn btn-default" id="sls-location-preview"><i class="fa fa-search" aria-hidden="true"></i> <?php echo _('Review audience'); ?></button>
                 <div id="sls-location-preview-result" hidden><h3 id="sls-location-preview-heading"></h3><div class="alert alert-warning" id="sls-location-preview-issues" hidden></div><div id="sls-location-preview-members"></div>
-                    <div class="sls-location-create"><div class="form-group"><label for="sls-location-group-name"><?php echo _('Audience group name'); ?></label><input class="form-control" id="sls-location-group-name" maxlength="64" autocomplete="off"><span class="help-block"><?php echo _('Up to 20 saved announcement groups. A new name keeps the previous group and its schedules intact.'); ?></span></div><button type="button" class="btn btn-primary" id="sls-location-create-group"><i class="fa fa-plus-circle" aria-hidden="true"></i> <?php echo _('Create group'); ?></button></div>
+                    <div class="sls-location-create"><div class="form-group"><label for="sls-location-group-name"><?php echo _('Audience group name'); ?></label><input class="form-control" id="sls-location-group-name" maxlength="64" autocomplete="off"><span class="help-block"><?php echo _('Up to 200 saved audiences. A new name keeps the previous group and its schedules intact.'); ?></span></div><button type="button" class="btn btn-primary" id="sls-location-create-group"><i class="fa fa-plus-circle" aria-hidden="true"></i> <?php echo _('Create group'); ?></button></div>
                 </div>
             </div>
         </section>
@@ -81,3 +81,6 @@ $assetRevision = substr(hash('sha256', hash_file('sha256', __DIR__ . '/locations
 <script src="modules/slsmassnotifyserver/views/audiences.js?v=<?php echo $assetRevision; ?>" defer></script>
 <script src="modules/slsmassnotifyserver/views/locations.js?v=<?php echo $assetRevision; ?>" defer></script>
 </div></div></div>
+
+<script><?php readfile(__DIR__.'/save_state.js'); ?>
+window.SlsSaveState.attach(document.getElementById('sls-locations'),{mode:'apply',initial:'<?php echo !empty($state['pending'])?'pending':'active'; ?>'});</script>

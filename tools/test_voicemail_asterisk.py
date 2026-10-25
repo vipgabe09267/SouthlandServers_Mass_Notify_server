@@ -40,9 +40,9 @@ with tempfile.TemporaryDirectory(prefix='sls-native-voicemail-') as folder:
     config.write_text('[directories]\n' + ''.join(key + '=' + str(value) + '\n' for key, value in paths.items())
                       + '[options]\nverbose=3\n')
     (root / 'etc/modules.conf').write_text('[modules]\nautoload=no\n' + ''.join('load=' + name + '.so\n' for name in (
-        'res_timing_timerfd', 'res_speech', 'res_agi', 'res_clioriginate', 'res_adsi', 'res_smdi', 'app_playback', 'app_read', 'app_senddtmf', 'app_voicemail',
+        'res_timing_timerfd', 'res_speech', 'res_agi', 'res_mutestream', 'res_clioriginate', 'res_adsi', 'res_smdi', 'app_playtones', 'app_playback', 'app_waitforsilence', 'app_read', 'app_senddtmf', 'app_voicemail',
         'app_mixmonitor', 'app_stack', 'app_exec', 'app_verbose', 'pbx_config', 'func_channel', 'func_callerid',
-        'func_db', 'func_vmcount', 'format_wav', 'codec_ulaw', 'codec_alaw', 'func_dialplan', 'func_strings')))
+        'func_db', 'func_vmcount', 'format_wav', 'codec_ulaw', 'codec_alaw', 'func_dialplan', 'func_strings', 'func_timeout')))
     (root / 'etc/logger.conf').write_text('[general]\n[logfiles]\nevidence => notice,warning,error,verbose\n')
     voicemail = '[general]\nformat=wav\nmaxsecs=20\nminsecs=1\nmaxsilence=0\nreview=no\n[default]\n1001=1234,Fixture,,,attach=no|delete=no\n'
     (root / 'etc/voicemail.conf').write_text(voicemail)
@@ -84,13 +84,18 @@ file_put_contents($argv[2],json_encode($settings));echo json_encode(\\SLS\\MassN
     with wave.open(str(speech), 'wb') as handle:
         handle.setnchannels(1); handle.setsampwidth(2); handle.setframerate(8000)
         handle.writeframes(b''.join(struct.pack('<h', int(9000 * math.sin(index * math.tau * 700 / 8000))) for index in range(32000)))
+    with wave.open(str(root/'data/sounds/beep.wav'),'wb') as handle:
+        handle.setnchannels(1);handle.setsampwidth(2);handle.setframerate(8000)
+        handle.writeframes(b''.join(struct.pack('<h',int(9000*math.sin(index*math.tau*880/8000))) for index in range(2400)))
     (root / 'data/sounds/SLS_Mass_Notifications_Plugin/voicemail').symlink_to(data / 'sounds/voicemail')
     agi = root / 'agi/live.php'
     agi.write_text('''#!/usr/bin/php
 <?php
 require LIBRARY;
-class NativeFixtureAgi extends \\SLS\\MassNotify\\LivePagingAgi {
- public function notifyGroup(array $group,string $caller,array $settings):array{return ['status'=>'not_requested'];}
+$dispatcher=file_get_contents(DISPATCHER);
+$start=strpos($dispatcher,'class SlsLivePagingNotifyAgi ');$end=strpos($dispatcher,'$agi = new SlsLivePagingNotifyAgi',$start);
+eval(substr($dispatcher,$start,$end-$start));
+class NativeFixtureAgi extends SlsLivePagingNotifyAgi {
  protected function rejectAdmission($result):array {file_put_contents(REJECT,json_encode($result));return parent::rejectAdmission($result);}
 }
 $agi=new NativeFixtureAgi(STDIN,STDOUT);$env=$agi->environment();
@@ -100,7 +105,7 @@ try {
  $result=$session->run();
 } catch(Throwable $e){$result=['status'=>'exception','error'=>$e->getMessage()];}
 file_put_contents(RESULT,json_encode($result));
-'''.replace('LIBRARY', json.dumps(str(library))).replace('DATA', json.dumps(str(data)))
+'''.replace('LIBRARY', json.dumps(str(library))).replace('DISPATCHER',json.dumps(str(repo/'slsmassnotifyserver/bin/sls_mass_notify_live_paging.php'))).replace('DATA', json.dumps(str(data)))
        .replace('RESULT', json.dumps(str(root / 'results/live.json')))
        .replace('REJECT', json.dumps(str(root / 'results/rejected.json'))))
     agi.chmod(0o755)
@@ -116,7 +121,8 @@ exten => s,1,Answer()
  same => n,SendDTMF(1#,100,100)
  same => n,Wait(0.3)
  same => n,SendDTMF(0123#,100,100)
- same => n,Wait(0.8)
+ same => n,WaitForNoise(100,1,8)
+ same => n,WaitForSilence(40,1,5)
  same => n,Playback(speech)
  same => n,Hangup()
 [sls-live-paging-external]
@@ -160,8 +166,10 @@ exten => s,1,Set(AGISIGHUP=no)
                 if deposits and deposits[0]['voicemail'].get('result'): break
                 result_file = root / 'results/live.json'
                 if result_file.exists() and json.loads(result_file.read_text()).get('status') != 'page_ended':
+                    rejected = root / 'results/rejected.json'
                     raise RuntimeError('Private live paging failed: ' + result_file.read_text()
-                                       + '\n' + (root / 'results/rejected.json').read_text() + '\n' + (root / 'log/evidence').read_text()[-5000:])
+                                       + '\n' + (rejected.read_text() if rejected.exists() else 'Admission was not reached.')
+                                       + '\n' + (root / 'log/evidence').read_text()[-5000:])
                 time.sleep(.1)
             else:
                 raise RuntimeError('Native voicemail did not complete: ' + (root / 'log/evidence').read_text()[-10000:]

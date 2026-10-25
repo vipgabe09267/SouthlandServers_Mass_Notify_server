@@ -53,7 +53,7 @@ repair_piper_permissions_only
 
     def test_post_restore_verifies_every_supported_voice_artifact(self):
         names = set(re.findall(r'\["([^"\n]+\.onnx(?:\.json)?)"\]', VOICE_INSTALLER))
-        block = MODULE_SOURCE.split('$hashes = [', 1)[1].split('];', 1)[0]
+        block = re.search(r'\$hashes\s*=\s*[^\n]*\+\s*\[(.*?)\n\s*\];', MODULE_SOURCE, re.S).group(1)
         self.assertTrue(names)
         self.assertEqual([name for name in sorted(names) if repr(name) not in block], [])
 

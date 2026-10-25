@@ -118,10 +118,13 @@ if ($fixture->requestManualUpdate()['success'] || !$fixture->requestUpdateCheck(
     || end($fixture->requests) !== ['/fixture/update.request', 'check-only']) {
     update_contract_fail('Check-only and installation requests were not kept separate.');
 }
-foreach (['value="check_updates" formnovalidate', "elseif ((\$packageStatus['state'] ?? '') === 'error')",
-         "button.disabled = false", "retry.formNoValidate = true"] as $control) {
+foreach (['value="check_updates" formnovalidate', "Retry update check",
+         "button.disabled = false", "checkAgain.textContent"] as $control) {
     if (strpos($settingsView, $control) === false) {
         update_contract_fail('The update controls cannot recover after a failed or blocked form submission.');
     }
+}
+if (strpos($settingsView, "retry.value = 'manual_update'") !== false) {
+    update_contract_fail('A check-only failure must not offer an installation retry.');
 }
 echo "Failed-check retry and check-only request behavior passed.\n";

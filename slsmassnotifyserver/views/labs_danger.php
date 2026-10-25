@@ -2,7 +2,7 @@
 $safetyEscape=static fn(string $value):string=>htmlspecialchars($value,ENT_QUOTES|ENT_SUBSTITUTE,'UTF-8');
 $safetySettings=['labs_safety'=>\SLS\MassNotify\LabsSafety::normalize($safety)];
 $safetyData=['endpoint'=>$endpoint,'csrf'=>$csrf,'feature'=>$safetyFeature,'automatic'=>$safetyAutomatic,
-    'selectors'=>$safetySelectors,'acknowledged'=>\SLS\MassNotify\LabsSafety::hasReceipt($safetySettings,$safetyFeature)];
+    'selectors'=>$safetySelectors,'reload_on_accept'=>!empty($safetyReload),'acknowledged'=>\SLS\MassNotify\LabsSafety::hasReceipt($safetySettings,$safetyFeature)];
 ?>
 <link rel="stylesheet" href="modules/slsmassnotifyserver/views/labs_danger.css?v=<?= $safetyEscape(substr(hash_file('sha256',__DIR__.'/labs_danger.css'),0,16)) ?>">
 <dialog id="sls-labs-danger" class="sls-ent-dialog sls-ent-danger" aria-labelledby="sls-labs-danger-title" aria-describedby="sls-labs-danger-body">

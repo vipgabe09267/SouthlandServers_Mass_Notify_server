@@ -3,6 +3,7 @@
 declare(strict_types=1);
 require_once dirname(__DIR__) . '/sls-mass-notify/security.php';
 require_once dirname(__DIR__) . '/sls-mass-notify/config-crypto.php';
+require_once dirname(__DIR__) . '/sls-mass-notify/desktop-feed-cache.php';
 
 const EVENTS_FILE = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/sipnotify/sipnotify_events.jsonl';
 const SETTINGS_FILE = '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config';
@@ -44,7 +45,7 @@ function respond(int $status, array $payload): void
         exit;
     }
     http_response_code($status);
-    $encoded = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+    $encoded = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     echo ($encoded === false ? '{"ok":false,"error":"encoding_failed"}' : $encoded) . "\n";
     exit;
 }
@@ -124,6 +125,23 @@ function settings_config(): array
 {
     try { return \FreePBX\modules\SlsConfigCrypto::readFile(SETTINGS_FILE); }
     catch (Throwable $error) { respond(503, ['ok' => false, 'error' => 'config_unavailable']); }
+}
+
+/** Browser displays require both switches; ordinary desktop clients remain independent. */
+function desktop_browser_display_permitted(array $settings): bool
+{
+    if (request_header_value('X-SLS-Browser-Display') !== '1') { return true; }
+    if (!class_exists(\SLS\MassNotify\EnterpriseLabsConfig::class, false)) {
+        $library = dirname(__DIR__, 2) . '/EnterpriseLabsConfig.php';
+        if (!is_file($library)) { $library = '/var/www/html/admin/modules/slsmassnotifyserver/EnterpriseLabsConfig.php'; }
+        if (!is_file($library)) { return false; }
+        require_once $library;
+    }
+    try {
+        $config = $settings['enterprise_integrations'] ?? [];
+        return \SLS\MassNotify\EnterpriseLabsConfig::enabled($settings)
+            && ($config['enabled'] ?? '0') === '1' && ($config['browser_display']['enabled'] ?? '0') === '1';
+    } catch (\InvalidArgumentException $error) { return false; }
 }
 
 function decrypt_desktop_password(string $encoded, array $settings): string
@@ -225,24 +243,26 @@ function api_state_parent_matches(string $directory, $handle): bool
         && ($current['mode'] & 0022) === 0;
 }
 
-function api_state_lock($handle, float $deadline): bool
+function api_state_lock($handle, float $deadline, int $operation = LOCK_EX): bool
 {
     do {
         $blocked = 0;
-        if (flock($handle, LOCK_EX | LOCK_NB, $blocked)) { return true; }
+        if (flock($handle, $operation | LOCK_NB, $blocked)) { return true; }
         if (!$blocked || microtime(true) >= $deadline) { return false; }
         usleep(2000);
     } while (microtime(true) < $deadline);
     return false;
 }
 
-function api_state_transaction(string $path, int $maximum, callable $update, int $waitMilliseconds = 250): bool
+function api_state_transaction(string $path, int $maximum, callable $update, int $waitMilliseconds = 250, bool $sharedRead = false): bool
 {
     $GLOBALS['sls_api_state_error'] = '';
     $directory = dirname($path);
     $parent = $lock = $legacy = $temporaryHandle = null;
     $temporary = '';
     $temporaryIdentity = null;
+    $upgradeRequired = false;
+    $operation = $sharedRead ? LOCK_SH : LOCK_EX;
     $deadline = microtime(true) + min(250, max(0, $waitMilliseconds)) / 1000;
     try {
         if ($path === '' || $path[0] !== '/' || strpos($path, "\0") !== false
@@ -267,7 +287,7 @@ function api_state_transaction(string $path, int $maximum, callable $update, int
             throw new RuntimeException('state_directory_unavailable');
         }
         $lock = api_state_open($path . '.lock', true);
-        if (!api_state_lock($lock, $deadline)) { throw new RuntimeException('state_locked'); }
+        if (!api_state_lock($lock, $deadline, $operation)) { throw new RuntimeException('state_locked'); }
         clearstatcache(true, $path . '.lock');
         $lockNow = @lstat($path . '.lock');
         if (!is_array($lockNow) || !api_state_metadata_matches(fstat($lock), $lockNow)
@@ -280,7 +300,7 @@ function api_state_transaction(string $path, int $maximum, callable $update, int
         if (is_resource($legacy)) {
             // Existing releases lock the data inode. During upgrade, defer to
             // any active old writer as well as serializing new sidecar users.
-            if (!api_state_lock($legacy, $deadline)) { throw new RuntimeException('state_locked'); }
+            if (!api_state_lock($legacy, $deadline, $operation)) { throw new RuntimeException('state_locked'); }
             $original = fstat($legacy);
             clearstatcache(true, $path);
             $current = @lstat($path);
@@ -298,39 +318,43 @@ function api_state_transaction(string $path, int $maximum, callable $update, int
         }
         $result = $update($data);
         if (empty($result['write'])) { return !empty($result['allowed']); }
-        $encoded = json_encode((object)$result['data'], JSON_UNESCAPED_SLASHES) . "\n";
-        if (json_last_error() !== JSON_ERROR_NONE || strlen($encoded) > $maximum) {
-            throw new RuntimeException('state_oversized');
+        if ($sharedRead) {
+            $upgradeRequired = true;
+        } else {
+            $encoded = json_encode((object)$result['data'], JSON_UNESCAPED_SLASHES) . "\n";
+            if (json_last_error() !== JSON_ERROR_NONE || strlen($encoded) > $maximum) {
+                throw new RuntimeException('state_oversized');
+            }
+            if (!api_state_parent_matches($directory, $parent)) {
+                throw new RuntimeException('state_directory_changed');
+            }
+            $temporary = $directory . '/.sls-api-state-' . bin2hex(random_bytes(16));
+            $temporaryHandle = api_state_open($temporary, true, true);
+            $temporaryIdentity = fstat($temporaryHandle);
+            $written = 0;
+            while ($written < strlen($encoded)) {
+                $amount = @fwrite($temporaryHandle, substr($encoded, $written));
+                if ($amount === false || $amount === 0) { throw new RuntimeException('state_write_failed'); }
+                $written += $amount;
+            }
+            if (!fflush($temporaryHandle) || !function_exists('fsync') || !@fsync($temporaryHandle)) {
+                throw new RuntimeException('state_sync_failed');
+            }
+            clearstatcache(true, $path);
+            $current = @lstat($path);
+            clearstatcache(true, $temporary);
+            $temporaryNow = @lstat($temporary);
+            if (($original === null ? $current !== false : (!is_array($current)
+                    || !api_state_metadata_matches($original, $current) || $current['size'] !== $original['size']))
+                || !is_array($temporaryNow) || !api_state_metadata_matches(fstat($temporaryHandle), $temporaryNow)
+                || !api_state_parent_matches($directory, $parent)) {
+                throw new RuntimeException('state_changed_or_unsafe');
+            }
+            if (!@rename($temporary, $path)) { throw new RuntimeException('state_replace_failed'); }
+            $temporary = '';
+            if (!@fsync($parent)) { throw new RuntimeException('state_directory_sync_failed'); }
+            return !empty($result['allowed']);
         }
-        if (!api_state_parent_matches($directory, $parent)) {
-            throw new RuntimeException('state_directory_changed');
-        }
-        $temporary = $directory . '/.sls-api-state-' . bin2hex(random_bytes(16));
-        $temporaryHandle = api_state_open($temporary, true, true);
-        $temporaryIdentity = fstat($temporaryHandle);
-        $written = 0;
-        while ($written < strlen($encoded)) {
-            $amount = @fwrite($temporaryHandle, substr($encoded, $written));
-            if ($amount === false || $amount === 0) { throw new RuntimeException('state_write_failed'); }
-            $written += $amount;
-        }
-        if (!fflush($temporaryHandle) || !function_exists('fsync') || !@fsync($temporaryHandle)) {
-            throw new RuntimeException('state_sync_failed');
-        }
-        clearstatcache(true, $path);
-        $current = @lstat($path);
-        clearstatcache(true, $temporary);
-        $temporaryNow = @lstat($temporary);
-        if (($original === null ? $current !== false : (!is_array($current)
-                || !api_state_metadata_matches($original, $current) || $current['size'] !== $original['size']))
-            || !is_array($temporaryNow) || !api_state_metadata_matches(fstat($temporaryHandle), $temporaryNow)
-            || !api_state_parent_matches($directory, $parent)) {
-            throw new RuntimeException('state_changed_or_unsafe');
-        }
-        if (!@rename($temporary, $path)) { throw new RuntimeException('state_replace_failed'); }
-        $temporary = '';
-        if (!@fsync($parent)) { throw new RuntimeException('state_directory_sync_failed'); }
-        return !empty($result['allowed']);
     } catch (Throwable $exception) {
         $reason = $exception instanceof RuntimeException && preg_match('/^state_[a-z_]+$/', $exception->getMessage())
             ? $exception->getMessage() : 'state_storage_failed';
@@ -349,6 +373,9 @@ function api_state_transaction(string $path, int $maximum, callable $update, int
         if (is_resource($lock)) { fclose($lock); }
         if (is_resource($parent)) { fclose($parent); }
     }
+    // Release both shared leases, then reread under exclusive locks. Never
+    // commit a decision made against a snapshot that another writer can change.
+    return $upgradeRequired && api_state_transaction($path, $maximum, $update, $waitMilliseconds);
 }
 
 function api_rate_entries_valid(array $data, int $maximum, bool $desktop): bool
@@ -381,7 +408,9 @@ function desktop_rate_retry_after(?int $now = null): int
 function desktop_auth_attempt_allowed(string $ip, string $username, bool $authenticated = false, ?int $now = null, bool $checkOnly = false, int $authenticatedCapacity = 1000): bool
 {
     $bucket = gmdate('YmdHi', $now ?? time());
-    return api_state_transaction(DESKTOP_AUTH_RATE_FILE, 524288, static function (array $data) use ($ip, $username, $authenticated, $checkOnly, $authenticatedCapacity, $bucket): array {
+    $sharded=false;$seedCount=0;
+    $allowed=api_state_transaction(DESKTOP_AUTH_RATE_FILE, 524288, static function (array $data) use ($ip, $username, $authenticated, $checkOnly, $authenticatedCapacity, $bucket, &$sharded, &$seedCount): array {
+        $sharded=false;$seedCount=0;
         if (!api_rate_entries_valid($data, 3048, true)) { throw new RuntimeException('state_invalid'); }
         $data = array_filter($data, static function (array $entry) use ($bucket): bool { return $entry['bucket'] === $bucket; });
         $legacy = false;
@@ -406,6 +435,7 @@ function desktop_auth_attempt_allowed(string $ip, string $username, bool $authen
             return ['allowed' => $allowed, 'write' => !$checkOnly, 'data' => $data];
         }
         $namespaceCounts = ['ok:' => 0, 'failed:' => 0];
+        $registryChanged=false;
         foreach (array_keys($data) as $storedKey) {
             $namespaceCounts[strpos($storedKey, 'ok:') === 0 ? 'ok:' : 'failed:']++;
         }
@@ -426,13 +456,33 @@ function desktop_auth_attempt_allowed(string $ip, string $username, bool $authen
                     continue;
                 }
                 $namespaceCounts[$namespace]++;
+                $registryChanged=true;
             }
             $entry = $data[$entryKey] ?? ['bucket' => $bucket, 'count' => 0];
+            if($authenticated){
+                // The shared file admits at most the configured fleet once per
+                // minute. Request counters use 256 fixed shards, avoiding a
+                // whole-fleet fsync on every successful poll or receipt.
+                $seedCount=$entry['count'];$sharded=true;
+                $data[$entryKey]=$entry;
+                $allowed=$allowed&&$entry['count']<$limit;
+                continue;
+            }
             $entry['count'] = min($limit, $entry['count']) + 1;
             $data[$entryKey] = $entry;
             $allowed = $allowed && $entry['count'] <= $limit;
         }
-        return ['allowed' => $allowed, 'write' => !$checkOnly, 'data' => $data];
+        return ['allowed' => $allowed, 'write' => !$checkOnly&&(!$authenticated||$registryChanged), 'data' => $data];
+    }, 250, $authenticated || $checkOnly);
+    if(!$allowed||!$sharded){return $allowed;}
+    $identity=hash('sha256','authenticated:'.$username);
+    $path=DESKTOP_AUTH_RATE_FILE.'.ok-'.substr($identity,0,2).'.json';
+    return api_state_transaction($path,131072,static function(array $data)use($identity,$bucket,$seedCount):array{
+        if(!api_rate_entries_valid($data,1000,true)){throw new RuntimeException('state_invalid');}
+        $data=array_filter($data,static fn(array $entry):bool=>$entry['bucket']===$bucket);
+        $key='ok:'.$identity;$entry=$data[$key]??['bucket'=>$bucket,'count'=>$seedCount];
+        $entry['count']=min(120,max($seedCount,$entry['count']))+1;$data[$key]=$entry;
+        return ['allowed'=>$entry['count']<=120,'write'=>true,'data'=>$data];
     });
 }
 
@@ -485,15 +535,29 @@ function update_desktop_seen(array $client, array $presence = [], array $setting
         // A reused username must never inherit another device's receipts or
         // reported version. Probes without metadata retain same-device evidence.
         if (($previous['client_id'] ?? '') !== ($client['client_id'] ?? '')) { $previous = []; }
+        $address=substr((string)($GLOBALS['sls_request_network']['ip'] ?? $_SERVER['REMOTE_ADDR'] ?? ''),0,64);
+        $report=desktop_client_report();
+        $reportValues=$report;
+        $previousReport=is_array($previous['client_report']??null)?$previous['client_report']:[];
+        unset($reportValues['reported_at'],$previousReport['reported_at']);
+        $seen=isset($previous['seen_at'])&&is_string($previous['seen_at'])?desktop_timestamp($previous['seen_at']):null;
+        $unchanged=($previous['ip']??'')===$address
+            && ($previous['name']??'')===substr((string)($client['name']??''),0,200)
+            && (!$report || $previousReport===$reportValues);
+        foreach(array_intersect_key($presence,array_flip(['ack_event_id','ack_at','connected_until'])) as $key=>$value){
+            $unchanged=$unchanged&&array_key_exists($key,$previous)&&$previous[$key]===$value;
+        }
+        if($unchanged&&$seen!==null&&$seen<=time()&&time()-$seen<30){
+            return ['allowed'=>true,'write'=>false,'data'=>$data];
+        }
         unset($data[$username]);
         $data = array_slice($data, -999, null, true);
         $data[$username] = array_merge($previous, [
             'seen_at' => gmdate('c'),
-            'ip' => substr((string)($GLOBALS['sls_request_network']['ip'] ?? $_SERVER['REMOTE_ADDR'] ?? ''), 0, 64),
+            'ip' => $address,
             'client_id' => substr((string)($client['client_id'] ?? ''), 0, 128),
             'name' => substr((string)($client['name'] ?? ''), 0, 200),
         ], array_intersect_key($presence, array_flip(['ack_event_id', 'ack_at', 'connected_until'])));
-        $report = desktop_client_report();
         if ($report) { $data[$username]['client_report'] = $report; }
         return ['allowed' => true, 'write' => true, 'data' => $data];
     }, 0);
@@ -662,7 +726,7 @@ function desktop_journal_open(string $path, string $error)
 function desktop_journal_lock($handle, float $deadline): void
 {
     do {
-        if (@flock($handle, LOCK_EX | LOCK_NB)) { return; }
+        if (@flock($handle, LOCK_SH | LOCK_NB)) { return; }
         if (microtime(true) >= $deadline) { throw new RuntimeException('journal_locked'); }
         usleep(10000);
     } while (true);
@@ -694,6 +758,22 @@ function desktop_journal_failure(string $error): void
     respond(503, ['ok' => false, 'error' => $error, 'retryable' => true]);
 }
 
+function desktop_feed_validator(array $settings,array $client,string $cursor): ?string
+{
+    if(!desktop_event_id_valid($cursor)&&$cursor!=='@sls:empty'){return null;}
+    $identity=[];
+    foreach([EVENTS_FILE,SETTINGS_FILE] as $path){
+        clearstatcache(true,$path);$info=@lstat($path);
+        if(!is_array($info)||($info['mode']&0170000)!==0100000||$info['nlink']!==1||($info['mode']&0137)
+            ||!in_array($info['uid'],[0,posix_geteuid()],true)||realpath($path)!==$path){return null;}
+        $identity[]=[$info['dev'],$info['ino'],$info['size'],$info['mtime'],$info['ctime']];
+    }
+    $key=base64_decode((string)($settings['desktop_auth_key']??''),true);
+    if(!is_string($key)||strlen($key)!==32){return null;}
+    $payload=[$identity,$client['username']??'',$client['client_id']??'',$cursor,retention_days($settings),intdiv(time(),60)];
+    return '"sls-feed-v1-'.hash_hmac('sha256',json_encode($payload,JSON_THROW_ON_ERROR),$key).'"';
+}
+
 function retained_events(array $settings): array
 {
     static $cachedFingerprint = null;
@@ -712,6 +792,11 @@ function retained_events(array $settings): array
         if (is_array($metadata) && $metadata['size'] > 67108864) { throw new RuntimeException('journal_too_large'); }
         $fingerprint = is_array($metadata) ? implode(':', [$metadata['dev'], $metadata['ino'], $metadata['size'], $metadata['mtime'], $metadata['ctime'], retention_days($settings)]) : '';
         if ($fingerprint !== '' && $fingerprint === $cachedFingerprint && time() - $cachedAt < 15) { return $cachedEvents; }
+        $client=$GLOBALS['slsDesktopCurrentClient']??null;
+        if(is_array($metadata)&&is_array($client)){
+            $indexed=\SLS\MassNotify\DesktopFeedCache::read($eventsFile,$metadata,$settings,$client,retention_days($settings),'desktop_timestamp');
+            if($indexed!==null){return $indexed;}
+        }
         // Release the previous snapshot before allocating a changed journal.
         $cachedEvents = []; $cachedFingerprint = null;
         $deadline = microtime(true) + 0.25;
@@ -724,7 +809,7 @@ function retained_events(array $settings): array
         $metadata = fstat($handle);
         if ($metadata['size'] > 67108864) { throw new RuntimeException('journal_too_large'); }
         $cutoff = time() - retention_days($settings) * 86400;
-        $events = []; $lines = []; $sequence = 0; $bytes = 0; $physicalLines = 0; $changed = false;
+        $events = []; $sequence = 0; $bytes = 0; $physicalLines = 0;
         $readDeadline = microtime(true) + 5.0;
         while (!feof($handle)) {
             $line = fgets($handle, 262146);
@@ -732,7 +817,7 @@ function retained_events(array $settings): array
             $bytes += strlen($line); $physicalLines++;
             if ($bytes > 67108864 || $physicalLines > 100000 || microtime(true) > $readDeadline) { throw new RuntimeException('journal_scan_limit'); }
             if (strlen($line) > 262144) { throw new RuntimeException('journal_line_too_large'); }
-            if (trim($line) === '') { $changed = true; continue; }
+            if (trim($line) === '') { continue; }
             desktop_journal_memory(max(4194304, strlen($line) * 32));
             try { $event = \SLS\MassNotify\ApiSecurity::jsonObject($line); }
             catch (Throwable $error) { throw new RuntimeException('journal_corrupt'); }
@@ -741,18 +826,13 @@ function retained_events(array $settings): array
                 throw new RuntimeException('journal_corrupt');
             }
             $created = isset($event['created_at']) ? $created : null;
-            if ($created !== null && $created < $cutoff) { $changed = true; continue; }
-            $events[$sequence] = $event; $lines[$sequence] = rtrim($line, "\r\n") . "\n"; $sequence++;
-            if (substr($line, -1) !== "\n") { $changed = true; }
-            if (count($events) > RETENTION_MAX_EVENTS) { unset($events[$sequence - RETENTION_MAX_EVENTS - 1], $lines[$sequence - RETENTION_MAX_EVENTS - 1]); $changed = true; }
+            if ($created !== null && $created < $cutoff) { continue; }
+            $events[$sequence] = $event;$sequence++;
+            if (count($events) > RETENTION_MAX_EVENTS) { unset($events[$sequence - RETENTION_MAX_EVENTS - 1]); }
         }
         if (!desktop_journal_identity($handle, $eventsFile) || !desktop_journal_identity($lockHandle, $lockFile)) { throw new RuntimeException('journal_unavailable'); }
-        if ($changed) {
-            desktop_journal_memory(array_sum(array_map('strlen', $lines)) + 1048576);
-            $normalized = implode('', $lines);
-            if (!atomic_replace_journal($eventsFile, $normalized, null, $metadata)) { throw new RuntimeException('journal_persist_failed'); }
-            unset($normalized);
-        }
+        // Polling and streaming are readers. The authenticated publisher
+        // compacts the feed only after retaining evicted private evidence.
         $events = array_values($events);
         clearstatcache(true, $eventsFile);
         $metadata = @lstat($eventsFile);
@@ -768,6 +848,60 @@ function retained_events(array $settings): array
     }
 }
 
+function desktop_history_event(string $eventId): ?array
+{
+    $directory = dirname(EVENTS_FILE).'/history';
+    if (!file_exists($directory) && !is_link($directory)) { return null; }
+    $parent = desktop_private_directory_open($directory);
+    if ($parent === false) { throw new RuntimeException('desktop_history_unavailable'); }
+    $handle = null;
+    try {
+        $path = $directory.'/'.hash('sha256', $eventId).'.json';
+        clearstatcache(true, $path); $before = @lstat($path);
+        if ($before === false) { return null; }
+        if (($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1 || ($before['mode'] & 0137)
+            || !in_array($before['uid'], [0, posix_geteuid()], true) || $before['size'] > 528384) {
+            throw new RuntimeException('desktop_history_unsafe');
+        }
+        // Opening read/write does not truncate/create and cannot wait for a
+        // writer if a local race substitutes a FIFO before the identity check.
+        $handle = @fopen($path, 'r+b');
+        if ($handle === false || !desktop_journal_identity($handle, $path)) { throw new RuntimeException('desktop_history_changed'); }
+        stream_set_blocking($handle, false);
+        $raw = stream_get_contents($handle, 528385);
+        $after = fstat($handle);
+        if (!is_string($raw) || strlen($raw) !== $before['size'] || !desktop_journal_identity($handle, $path)
+            || !api_state_parent_matches($directory, $parent)) { throw new RuntimeException('desktop_history_changed'); }
+        foreach (['dev','ino','mode','uid','gid','nlink','size','mtime','ctime'] as $field) {
+            if ($before[$field] !== $after[$field]) { throw new RuntimeException('desktop_history_changed'); }
+        }
+        $record = \SLS\MassNotify\ApiSecurity::jsonObject($raw, false, 16);
+        if (count($record) !== 5 || ($record['schema'] ?? null) !== 1 || ($record['id'] ?? null) !== $eventId
+            || !is_int($record['bytes'] ?? null) || $record['bytes'] < 1 || $record['bytes'] > 262144
+            || !is_string($record['sha256'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $record['sha256'])
+            || !is_string($record['zlib_base64'] ?? null) || strlen($record['zlib_base64']) > 524288) {
+            throw new RuntimeException('desktop_history_corrupt');
+        }
+        $compressed = base64_decode($record['zlib_base64'], true);
+        if (!is_string($compressed) || base64_encode($compressed) !== $record['zlib_base64'] || !function_exists('gzuncompress')) {
+            throw new RuntimeException('desktop_history_compression_unavailable');
+        }
+        $decoded = @gzuncompress($compressed, 262144);
+        if (!is_string($decoded) || strlen($decoded) !== $record['bytes'] || !hash_equals($record['sha256'], hash('sha256', $decoded))) {
+            throw new RuntimeException('desktop_history_corrupt');
+        }
+        $inflater = inflate_init(ZLIB_ENCODING_DEFLATE);
+        if (@inflate_add($inflater, $compressed, ZLIB_FINISH) !== $decoded || inflate_get_status($inflater) !== ZLIB_STREAM_END
+            || inflate_get_read_len($inflater) !== strlen($compressed)) { throw new RuntimeException('desktop_history_corrupt'); }
+        $event = \SLS\MassNotify\ApiSecurity::jsonObject($decoded);
+        if (($event['id'] ?? null) !== $eventId) { throw new RuntimeException('desktop_history_corrupt'); }
+        return $event;
+    } finally {
+        if (is_resource($handle)) { fclose($handle); }
+        fclose($parent);
+    }
+}
+
 function desktop_stream_slot(string $username)
 {
     $directory = dirname(EVENTS_FILE) . '/stream-slots';
@@ -777,7 +911,7 @@ function desktop_stream_slot(string $username)
         respond(503, ['ok' => false, 'error' => 'stream_capacity_unavailable']);
     }
     try {
-        if (is_link($directory) || (!is_dir($directory) && !@mkdir($directory, 0750))
+        if (is_link($directory) || (!is_dir($directory) && !@mkdir($directory, 0750) && !is_dir($directory))
             || !api_state_parent_matches($parentDirectory, $parentHandle)
             || realpath($directory) !== $directory) {
             respond(503, ['ok' => false, 'error' => 'stream_capacity_unavailable']);
@@ -910,9 +1044,15 @@ function desktop_event_routed_to_client(array $event, string $username, ?string 
     return $all === true || in_array($username, $recipients, true);
 }
 
-function desktop_event_public_payload(array $event, array $settings): array
+function desktop_event_public_payload(array $event, array $settings, ?array $client = null): array
 {
     unset($event['desktop_client_ids']);
+    if($client!==null){
+        // The route already authorized this client. Do not disclose the rest
+        // of the fleet in every recipient's payload.
+        $event['desktop_all']=false;
+        $event['desktop_recipients']=[(string)$client['username']];
+    }
     // Old retained records predate the explicit flag. Only boolean true marks
     // a test; wording and truthy strings must never change alert semantics.
     $event['is_test'] = ($event['is_test'] ?? false) === true;
@@ -925,7 +1065,7 @@ function desktop_event_public_payload(array $event, array $settings): array
     $host = strtolower($host);
     $parts = [];
     if (!preg_match('#\Ahttps?://' . preg_quote($host, '#')
-        . '(?::([0-9]{1,5}))?(/sls_mass_notify/announcement_[0-9]{14}_[a-f0-9]{6,32}\.png)\z#iD', $url, $parts)
+        . '(?::([0-9]{1,5}))?(/sls_mass_notify/announcement_[0-9]{14}_[a-f0-9]{6,32}(?:_desktop)?\.png)\z#iD', $url, $parts)
         || ($parts[1] !== '' && ((int)$parts[1] < 1 || (int)$parts[1] > 65535))) { return $event; }
 
     $authority = $host;
@@ -952,6 +1092,10 @@ function desktop_event_public_payload(array $event, array $settings): array
         $authority = $host . (isset($matches[1]) ? ':' . (int)$matches[1] : '');
     }
     $event['image_url'] = 'https://' . $authority . $parts[2];
+    if(($settings['media_access']['desktop_authentication']??false)===true){
+        $eventId=desktop_event_id($event);
+        if($eventId!==null){$event['image_url']='https://'.$authority.'/api/sipnotify/desktop/media?event_id='.rawurlencode($eventId);$event['image_authentication']='desktop_basic';}
+    }
     return $event;
 }
 
@@ -1060,6 +1204,25 @@ function desktop_poll_snapshot(array $events, string $username, int $limit, ?int
         'eligible_count' => count($batch['events']),
         'window_truncated' => count($batch['events']) > $limit,
     ];
+}
+
+function desktop_bound_poll_page(array $events,array $batch,bool $cursorRequested,int $maximumBytes=720896): array
+{
+    if($maximumBytes<262144||$maximumBytes>720896){throw new RuntimeException('poll_page_budget_invalid');}
+    $bytes=0;$selected=[];$indexes=$cursorRequested?array_keys($events):array_reverse(array_keys($events));
+    foreach($indexes as $index){
+        $encoded=json_encode($events[$index],JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR);
+        if(strlen($encoded)+1>$maximumBytes){throw new RuntimeException('desktop_event_too_large');}
+        if($bytes+strlen($encoded)+1>$maximumBytes){break;}
+        $selected[]=$events[$index];$bytes+=strlen($encoded)+1;
+    }
+    if(!$cursorRequested){$selected=array_reverse($selected);}
+    if(count($selected)<count($events)){
+        if($cursorRequested){$batch['has_more']=true;$batch['last_event_id']=desktop_event_id($selected[count($selected)-1]);}
+        else{$batch['window_truncated']=true;}
+    }
+    $batch['events']=$selected;
+    return $batch;
 }
 
 function record_desktop_acknowledgement(array $settings, array $client, array $event, ?int $now = null): bool
@@ -1184,7 +1347,7 @@ function record_desktop_acknowledgement(array $settings, array $client, array $e
 }
 
 $endpoint = endpoint_slug();
-if (!in_array($endpoint, ['desktop', 'desktop/stream', 'desktop/ack', 'desktop/incident', 'desktop/incident/respond'], true)) {
+if (!in_array($endpoint, ['desktop', 'desktop/stream', 'desktop/ack', 'desktop/media', 'desktop/incident', 'desktop/incident/respond'], true)) {
     respond(404, ['ok' => false, 'error' => 'unknown_endpoint']);
 }
 $settings = settings_config();
@@ -1227,6 +1390,37 @@ if (!desktop_auth_attempt_allowed($remoteIp, $basicUser, !empty($client), null, 
 if (empty($client)) {
     header('WWW-Authenticate: Basic realm="SLS Mass Notify Desktop"');
     respond(401, ['ok' => false, 'error' => 'unauthorized']);
+}
+
+$GLOBALS['slsDesktopCurrentClient']=$client;
+// A receipt completes an existing delivery; disabling Labs does not discard it.
+if ($endpoint !== 'desktop/ack' && !desktop_browser_display_permitted($settings)) {
+    respond(403, ['ok'=>false, 'error'=>'browser_display_disabled']);
+}
+if ($endpoint==='desktop/media') {
+    $eventId=$_GET['event_id']??null;
+    if (!is_string($eventId)||!desktop_event_id_valid($eventId)||array_diff(array_keys($_GET),['event_id'])) {
+        respond(400,['ok'=>false,'error'=>'invalid_media_request']);
+    }
+    $found=null;
+    foreach(retained_events($settings) as $candidate){if(desktop_event_id($candidate)===$eventId){$found=$candidate;break;}}
+    if($found===null){$found=desktop_history_event($eventId);}
+    if(!is_array($found)||!desktop_event_routed_to_client($found,(string)$client['username'],(string)($client['client_id']??''))
+        ||desktop_event_display_expired($found)){respond(404,['ok'=>false,'error'=>'media_not_available']);}
+    $created=desktop_timestamp((string)($found['created_at']??''));
+    if($created===null||$created>time()+60||time()>=$created+600){respond(404,['ok'=>false,'error'=>'media_not_available']);}
+    $image=$found['image_url']??'';
+    $parts=is_string($image)?parse_url($image):false;
+    $path=is_array($parts)?($parts['path']??''):'';
+    $host=(string)($settings['public_pbx_host']??($settings['sipnotify']['pbx_host']??''));
+    if(!is_array($parts)||strtolower((string)($parts['host']??''))!==strtolower($host)||isset($parts['user'])||isset($parts['pass'])
+        ||!is_string($path)||!preg_match('#^/sls_mass_notify/(announcement_[0-9]{14}_[a-f0-9]{6,32}(?:_desktop)?\.png)$#D',$path,$match)){
+        respond(404,['ok'=>false,'error'=>'media_not_available']);
+    }
+    require_once dirname(__DIR__).'/sls-mass-notify/media-policy.php';
+    $media=\SLS\MassNotify\MediaAccess::response($_SERVER,$match[1],SETTINGS_FILE,'/var/www/html/sls_mass_notify',null,['desktop_authorized'=>true]);
+    http_response_code($media['status']);header('Content-Type: '.$media['type']);header('Content-Length: '.strlen($media['body']));
+    echo $media['body'];exit;
 }
 
 update_desktop_seen($client, [], $settings);
@@ -1280,6 +1474,19 @@ if ($endpoint === 'desktop/ack') {
             }
             update_desktop_seen($client, ['ack_event_id' => $eventId, 'ack_at' => gmdate('c')], $settings);
             respond(200, ['ok' => true, 'event_id' => $eventId, 'receipt_type' => 'client_acknowledgement']);
+        }
+    }
+    if ($eventId !== '') {
+        try { $archived = desktop_history_event($eventId); }
+        catch (Throwable $error) {
+            header('Retry-After: 5'); respond(503, ['ok'=>false, 'error'=>'desktop_history_unavailable', 'retryable'=>true]);
+        }
+        if (is_array($archived) && desktop_event_routed_to_client($archived, $username, (string)($client['client_id'] ?? ''))) {
+            if (!record_desktop_acknowledgement($settings, $client, $archived)) {
+                header('Retry-After: 5'); respond(503, ['ok'=>false, 'error'=>'acknowledgement_persist_failed', 'retryable'=>true]);
+            }
+            update_desktop_seen($client, ['ack_event_id'=>$eventId, 'ack_at'=>gmdate('c')], $settings);
+            respond(200, ['ok'=>true, 'event_id'=>$eventId, 'receipt_type'=>'client_acknowledgement']);
         }
     }
     respond(400, ['ok' => false, 'error' => 'unknown_or_unauthorized_event']);
@@ -1358,6 +1565,12 @@ if ($streamRequested) {
                 desktop_stream_release_slots($streamSlots);
                 exit;
             }
+            if (!desktop_browser_display_permitted($settings)) {
+                echo "event: revoked\ndata: {\"ok\":false,\"error\":\"browser_display_disabled\"}\n\n";
+                desktop_stream_flush();
+                desktop_stream_release_slots($streamSlots);
+                exit;
+            }
             $lastAuthCheck = $tick;
         }
 		$streamBatch = desktop_stream_events_after_cursor(
@@ -1373,7 +1586,7 @@ if ($streamRequested) {
 		$hasOutput = !empty($streamBatch['cursor_gap']);
 		foreach ($streamBatch['events'] as $streamEvent) {
 			[$eventId, $event] = $streamEvent;
-			$event = desktop_event_public_payload($event, $settings);
+			$event = desktop_event_public_payload($event, $settings, $client);
 			$hasOutput = true;
 			echo 'id: ' . str_replace(["\r", "\n"], '', (string)$eventId) . "\n";
 			echo "event: notification\n";
@@ -1408,6 +1621,13 @@ if ($resumeCursor === '') {
     $resumeCursor = trim($queryCursor);
 }
 if ($resumeCursor !== '' && $resumeCursor !== '@sls:empty' && !desktop_event_id_valid($resumeCursor)) { respond(400, ['ok' => false, 'error' => 'invalid_cursor']); }
+$feedGeneration=desktop_feed_validator($settings,$client,'@sls:empty');
+$expectedValidator=$cursorRequested?desktop_feed_validator($settings,$client,$resumeCursor):null;
+$providedValidator=request_header_value('If-None-Match');
+if($expectedValidator!==null&&strlen($providedValidator)<128&&hash_equals($expectedValidator,$providedValidator)){
+    header('ETag: '.$expectedValidator);
+    respond(200,['ok'=>true,'events'=>[],'latest'=>null,'count'=>0,'last_event_id'=>$resumeCursor,'cursor_gap'=>false,'has_more'=>false,'eligible_count'=>0,'window_truncated'=>false,'unchanged'=>true,'transport'=>'json_poll','poll_interval_seconds'=>5]);
+}
 $journalEvents = retained_events($settings);
 if ($cursorRequested) {
     $pollBatch = desktop_poll_events_after_cursor($journalEvents, $username, $resumeCursor, $limit, null, (string)($client['client_id'] ?? ''));
@@ -1418,11 +1638,17 @@ if ($cursorRequested) {
     $pollBatch = desktop_poll_snapshot($journalEvents, $username, $limit, null, (string)($client['client_id'] ?? ''));
     $events = $pollBatch['events'];
 }
-$events = array_map(static function (array $event) use ($settings): array {
-    return desktop_event_public_payload($event, $settings);
+$events = array_map(static function (array $event) use ($settings,$client): array {
+    return desktop_event_public_payload($event, $settings, $client);
 }, $events);
+try{$pollBatch=desktop_bound_poll_page($events,$pollBatch,$cursorRequested);$events=$pollBatch['events'];}
+catch(Throwable $error){header('Retry-After: 5');respond(503,['ok'=>false,'error'=>'desktop_page_unavailable','retryable'=>true]);}
 $latest = empty($events) ? null : $events[count($events) - 1];
 
+if(empty($pollBatch['has_more'])&&$feedGeneration!==null&&$feedGeneration===desktop_feed_validator($settings,$client,'@sls:empty')){
+    $validator=desktop_feed_validator($settings,$client,(string)$pollBatch['last_event_id']);
+    if($validator!==null){header('ETag: '.$validator);}
+}
 $publicHost = trim((string)($settings['public_pbx_host'] ?? ''));
 respond(200, [
     'ok' => true,
@@ -1435,6 +1661,12 @@ respond(200, [
     'latest' => $latest,
     'events' => $events,
     'transport' => 'json_poll',
+    'transport_capabilities' => [
+        'preferred' => PHP_SAPI === 'fpm-fcgi' ? 'json_poll' : 'sse',
+        'sse_available' => PHP_SAPI !== 'fpm-fcgi',
+        'reason_code' => PHP_SAPI === 'fpm-fcgi' ? 'shared_php_fpm_pool' : 'bounded_stream_slots',
+        'sse_protocol' => 2, 'payload_schema' => 1,
+    ],
     'last_event_id' => (string)$pollBatch['last_event_id'],
     'cursor_gap' => (bool)$pollBatch['cursor_gap'],
     'has_more' => (bool)$pollBatch['has_more'],

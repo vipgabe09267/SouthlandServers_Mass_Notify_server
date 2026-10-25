@@ -129,8 +129,7 @@ class QueueTests(unittest.TestCase):
     def test_provider_duplicates_are_rejected_before_observation(self):
         raw = json.dumps({'type': 'FeatureCollection', 'features': [feature()]})
         raw = raw.replace('"features": [', '"features": [], "features": [', 1)
-        response = mock.Mock(returncode=0, stdout=raw.encode(), stderr=b'')
-        with mock.patch.object(queue.subprocess, 'run', return_value=response):
+        with mock.patch.object(queue._nws_http,'fetch',return_value=raw.encode()):
             with self.assertRaises(ValueError):
                 queue.fetch_zone('TXC491')
 
@@ -247,26 +246,17 @@ class QueueTests(unittest.TestCase):
         item = feature(); item['properties']['expires'] = iso(time.time()-1)
         self.assertFalse(queue.actionable(item, time.time()))
 
-    def test_fetch_allows_system_dns_failover_with_bounded_deadlines(self):
-        result = mock.Mock(returncode=0, stdout=b'{"type":"FeatureCollection","features":[]}', stderr=b'')
-        with mock.patch.object(queue.subprocess, 'run', return_value=result) as run:
-            self.assertEqual(queue.fetch_zone('TXC491'), [])
-        command = run.call_args.args[0]
-        self.assertGreater(int(command[command.index('--connect-timeout')+1]), 5)
-        self.assertEqual(command[command.index('--max-time')+1], '20')
-        self.assertEqual(run.call_args.kwargs['timeout'], 50)
-        self.assertNotIn('-k', command)
-        self.assertNotIn('--insecure', command)
-        self.assertNotIn('--resolve', command)
+    def test_fetch_uses_shared_conditional_client_with_one_deadline(self):
+        raw=b'{"type":"FeatureCollection","features":[]}'
+        with mock.patch.object(queue._nws_http,'fetch',return_value=raw) as fetch:
+            self.assertEqual(queue.fetch_zone('TXC491'),[])
+        fetch.assert_called_once_with('TXC491',directory=queue.DATA,budget=25)
 
-    def test_fetch_failures_are_useful_without_leaking_responses(self):
-        for code, stderr, expected in [(6, b'SECRET', 'DNS'),
-            (28, b'curl: (28) Resolving timed out SECRET', 'DNS'),
-            (60, b'SECRET', 'TLS'), (22, b'curl: (22) The requested URL returned error: 503 SECRET', 'HTTP 503'),
-            (28, b'Connection timed out SECRET', 'timed out')]:
-            with mock.patch.object(queue.subprocess, 'run', return_value=mock.Mock(returncode=code, stderr=stderr, stdout=b'SECRET')):
-                with self.assertRaises(queue.WeatherPollError) as error: queue.fetch_zone('TXC491')
-                self.assertIn(expected, str(error.exception)); self.assertNotIn('SECRET', str(error.exception))
+    def test_fetch_failures_are_useful_without_inventing_an_empty_observation(self):
+        for message in ['Weather.gov DNS resolution failed','Weather.gov TLS verification failed','Weather.gov temporarily unavailable (HTTP 503)']:
+            with mock.patch.object(queue._nws_http,'fetch',side_effect=OSError(message)):
+                with self.assertRaises(queue.WeatherPollError) as error:queue.fetch_zone('TXC491')
+                self.assertEqual(str(error.exception),message)
 
     def test_poll_failure_then_recovery_resets_only_api_fault(self):
         row = ['north','North','TXC491','1000','','','0','21:00','06:00','','']

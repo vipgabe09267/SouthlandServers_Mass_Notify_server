@@ -308,9 +308,11 @@ class RetentionTests(unittest.TestCase):
             with mock.patch.object(storage, 'DATA', self.data), mock.patch.object(storage, 'WEB', self.web), \
                     mock.patch.object(storage, 'OUTGOING', self.spool), mock.patch.object(storage, 'EVENT_LOGS', ()), \
                     mock.patch.object(storage.time, 'time', return_value=self.now), mock.patch('builtins.print'):
-                self.assertEqual(storage.main(), 1)
+                self.assertEqual(storage.main(), 0)
         self.assertFalse(orphan.exists())
         self.assertEqual(audit.read_text(), '{}\n')
+        summary = json.loads((self.data / 'storage-summary.json').read_text())
+        self.assertEqual(summary['maintenance_failed_stages'], [])
 
     def test_state_reader_and_audit_refuse_hardlinks_and_busy_locks(self):
         victim = self.root / 'state'; victim.write_text('{}')

@@ -13,7 +13,7 @@ $recipientSelectionKeys = array_values((array)($recipient_selection_keys ?? []))
 	if (!form) return;
 	var field = form.querySelector('[name="sls_recipient_selection_json"]');
 	var complete = form.querySelector('[name="sls_recipient_selection_complete"]');
-	form.addEventListener('submit', function () {
+	function collectRecipients() {
 		complete.value = '0';
 		var selection = {}, inputs = [];
 		keys.forEach(function (key) {
@@ -29,6 +29,8 @@ $recipientSelectionKeys = array_values((array)($recipient_selection_keys ?? []))
 		window.setTimeout(function () {
 			inputs.forEach(function (state) { state.input.disabled = state.disabled; });
 		}, 0);
-	}, true);
+	}
+    form.addEventListener('submit', collectRecipients, true);
+    form.addEventListener('sls:collect-recipients', collectRecipients);
 }());
 </script>

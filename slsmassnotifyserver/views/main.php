@@ -99,7 +99,7 @@ $notificationTypeMeta = [
 			<?php } ?>
 
 			<?php if (empty($events)) { ?>
-				<div class="sls-log-empty"><i class="fa fa-inbox" aria-hidden="true"></i><strong><?php echo _('No matching notification events'); ?></strong><div><?php echo _('New deliveries will appear here automatically after they are recorded.'); ?></div></div>
+				<div class="sls-log-empty"><i class="fa fa-inbox" aria-hidden="true"></i><strong><?php echo _('No matching notification events'); ?></strong><div><?php echo _('Refresh this view after sending an announcement to see its recorded delivery.'); ?></div></div>
 			<?php } else { ?>
 				<div class="table-responsive sls-log-table-wrap"><table class="table sls-log-table">
 					<colgroup><col style="width:14%"><col style="width:30%"><col style="width:17%"><col style="width:15%"><col style="width:16%"><col style="width:8%"></colgroup>

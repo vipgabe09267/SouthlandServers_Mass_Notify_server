@@ -3,6 +3,7 @@ declare(strict_types=1);
 namespace FreePBX\modules;
 require_once __DIR__.'/EnterpriseIntegrationsConfig.php';
 require_once __DIR__.'/EnterpriseAnnouncementChannels.php';
+require_once __DIR__.'/AnnouncementLimits.php';
 use SLS\MassNotify\{EnterpriseIntegrationsConfig,EnterpriseIntegrationsService,EnterpriseIntegrationsStore,EnterprisePublicWarning,IncidentConfig,AutomationConfig};
 
 trait SlsEnterpriseIntegrations
@@ -43,7 +44,7 @@ trait SlsEnterpriseIntegrations
             } catch (\Throwable $exception) { $error='Protected integration history is unavailable. Check storage before submitting another provider action.'; }
         }
         return ['config'=>EnterpriseIntegrationsConfig::redacted($config),'revision'=>hash('sha256',json_encode($config,JSON_THROW_ON_ERROR)),
-            'catalog'=>EnterpriseIntegrationsConfig::catalog(),'history'=>$history,'sensor_health'=>$health,'storage_error'=>$error,'journal_usage'=>$usage,
+            'catalog'=>EnterpriseIntegrationsConfig::catalog(),'radio_catalog'=>\SLS\MassNotify\RadioGateway::catalog(),'history'=>$history,'sensor_health'=>$health,'storage_error'=>$error,'journal_usage'=>$usage,
             'extensions'=>array_map('strval',$this->getConfiguredPjsipExtensionNumbers()),
             'sms_recipients'=>array_map(static fn($r)=>['id'=>$r['id'],'name'=>$r['name']??$r['id']],$settings['announcement_sms']['recipients']??[]),
             'voice_recipients'=>array_map(static fn($r)=>['id'=>$r['id'],'name'=>$r['name']??$r['id']],$settings['outbound_voice']['recipients']??[]),
@@ -79,6 +80,23 @@ trait SlsEnterpriseIntegrations
                 elseif (($merged[$section][$field]??'')==='') { $merged[$section][$field]=$current[$section][$field]; }
             }
         }
+        if (isset($value['meetings']['oauth_profiles'])) {
+            $profiles=IncidentConfig::object($value['meetings']['oauth_profiles'],\SLS\MassNotify\MeetingAccounts::PROVIDERS,'Meeting accounts');
+            foreach (\SLS\MassNotify\MeetingAccounts::PROVIDERS as $provider) {
+                $profile=IncidentConfig::object($profiles[$provider]??[],array_merge(array_keys(\SLS\MassNotify\MeetingAccounts::defaults()),['oauth_client_secret_configured','oauth_refresh_token_configured']),'Meeting account');
+                foreach (['oauth_client_secret','oauth_refresh_token'] as $field) {
+                    unset($profile[$field.'_configured']);
+                    $path='meetings.oauth_profiles.'.$provider.'.'.$field;
+                    if (in_array($path,$clear,true)) $profile[$field]='';
+                    elseif (($profile[$field]??'')==='') $profile[$field]=$current['meetings']['oauth_profiles'][$provider][$field];
+                }
+                $merged['meetings']['oauth_profiles'][$provider]=array_replace($current['meetings']['oauth_profiles'][$provider],$profile);
+            }
+        } elseif (isset($value['meetings'])) {
+            // Existing clients may still edit the selected provider's flat renewal fields.
+            $provider=\SLS\MassNotify\MeetingAccounts::provider($merged['meetings']['provider']);
+            $merged['meetings']['oauth_profiles'][$provider]=array_intersect_key($merged['meetings'],\SLS\MassNotify\MeetingAccounts::defaults());
+        }
         if (isset($value['speakers']['devices'])) {
             if (!is_array($value['speakers'])||!is_array($value['speakers']['devices'])||!array_is_list($value['speakers']['devices'])) { throw new \InvalidArgumentException('Speaker profiles must be a list of objects.'); }
             $old=array_column($current['speakers']['devices'],null,'id');
@@ -91,6 +109,13 @@ trait SlsEnterpriseIntegrations
                 if (in_array($path,$clear,true)) { $row['telemetry_password']=''; }
                 elseif (($row['telemetry_password']??'')==='') { $row['telemetry_password']=$old[$rowId]['telemetry_password']??''; }
             } unset($row);
+        }
+        if(isset($value['radios']['devices'])){
+            if(!is_array($value['radios'])||!is_array($value['radios']['devices'])||!array_is_list($value['radios']['devices'])||count($value['radios']['devices'])>25){throw new \InvalidArgumentException('Radio gateways must be a list of at most 25 objects.');}
+            foreach($merged['radios']['devices'] as &$row){
+                if(!is_array($row)){throw new \InvalidArgumentException('Radio gateways must be objects.');}
+                if(($row['id']??'')===''){$row['id']='rad_'.bin2hex(random_bytes(12));}
+            }unset($row);
         }
         if(isset($value['connectors']['destinations'])){
             if(!is_array($value['connectors'])||!is_array($value['connectors']['destinations'])||!array_is_list($value['connectors']['destinations'])){throw new \InvalidArgumentException('Connector destinations must be a list of objects.');}
@@ -111,6 +136,12 @@ trait SlsEnterpriseIntegrations
         }
         $extensions=array_map('strval',$this->getConfiguredPjsipExtensionNumbers());
         foreach ($config['speakers']['devices'] as $speaker) { if (!in_array($speaker['extension'],$extensions,true)) { throw new \DomainException('Enroll speakers as existing PBX PJSIP extensions before selecting them in SLS.'); } }
+        $speakerExtensions=array_column($config['speakers']['devices'],'extension');
+        foreach($config['radios']['devices'] as $radio){
+            if(!in_array($radio['extension'],$extensions,true)||in_array($radio['extension'],$speakerExtensions,true)){
+                throw new \DomainException('A radio gateway needs its own existing PJSIP extension, separate from saved SIP speakers.');
+            }
+        }
         $settings=$this->getActiveSettings(); $sms=array_column($settings['announcement_sms']['recipients']??[],null,'id'); $voice=array_column($settings['outbound_voice']['recipients']??[],null,'id');
         foreach ($config['responses']['bindings'] as $row) {
             if (($row['sms_recipient_id']!=='' && !isset($sms[$row['sms_recipient_id']])) || ($row['voice_recipient_id']!=='' && !isset($voice[$row['voice_recipient_id']]))) { throw new \DomainException('Response participants must use currently saved SMS and voice recipients.'); }
@@ -161,32 +192,56 @@ trait SlsEnterpriseIntegrations
     }
     public function createIncidentMeeting(string $id,array $input): array
     {
-        $this->assertEnterpriseAdministrator(); $config=$this->enabledEnterpriseIntegration('meetings'); $incident=$this->incidentStore()->read($id);
-        if (!$incident) { throw new \DomainException('Incident does not exist.'); }
-        if(($config['oauth_refresh_enabled']??'0')==='1'&&($config['oauth_expires_at']??0)>0&&$config['oauth_expires_at']<=time()+60){$this->refreshEnterpriseMeetingToken();$config=$this->enabledEnterpriseIntegration('meetings');}
+        $this->assertEnterpriseAdministrator();
+        $input=IncidentConfig::object($input,['provider','request_id','start_at','duration_minutes'],'Incident meeting');
+        $provider=\SLS\MassNotify\MeetingAccounts::provider($input['provider']??$this->enabledEnterpriseIntegration('meetings')['provider']);
+        $config=\SLS\MassNotify\MeetingAccounts::select($this->enabledEnterpriseIntegration('meetings'),$provider);
+        $incident=$this->incidentStore()->read($id);
+        if (!$incident || ($incident['state']??'')!=='open') throw new \DomainException('Choose an open incident before creating a meeting.');
+        if ($config['oauth_refresh_enabled']==='1' && $config['oauth_expires_at']>0 && $config['oauth_expires_at']<=time()+60) {
+            $this->refreshEnterpriseMeetingToken(['provider'=>$provider]);
+            $config=\SLS\MassNotify\MeetingAccounts::select($this->enabledEnterpriseIntegration('meetings'),$provider);
+        }
+        $input['provider']=$provider;
         $request=EnterpriseIntegrationsConfig::requestId($input['request_id']??'');
-        return ['success'=>true]+$this->enterpriseIntegrationsService()->meeting($config,$incident,$input,$this->integrationEffect($request,'incident_meeting',$id,['incident'=>$id,'input'=>$input,'provider'=>$config['provider']]));
+        return ['success'=>true]+$this->enterpriseIntegrationsService()->meeting($config,$incident,$input,
+            $this->integrationEffect($request,'incident_meeting',$id,['incident'=>$id,'input'=>$input,'provider'=>$provider]));
     }
-    public function refreshEnterpriseMeetingToken(): array
+    public function refreshEnterpriseMeetingToken(array $input=[]): array
     {
-        $this->assertEnterpriseAdministrator();$config=$this->enterpriseIntegrationsConfig();$revision=hash('sha256',json_encode($config,JSON_THROW_ON_ERROR));$id=hash('sha256',json_encode($config['meetings'],JSON_THROW_ON_ERROR));
+        $this->assertEnterpriseAdministrator();
+        $input=IncidentConfig::object($input,['provider'],'Meeting token renewal');
+        $config=$this->enterpriseIntegrationsConfig();
+        $selected=\SLS\MassNotify\MeetingAccounts::select($config['meetings'],\SLS\MassNotify\MeetingAccounts::provider($input['provider']??$config['meetings']['provider']));
+        $revision=hash('sha256',json_encode($config,JSON_THROW_ON_ERROR));
+        $id=hash('sha256',json_encode($selected,JSON_THROW_ON_ERROR));
         $state=$this->enterpriseLabsStore();$state->transaction('oauth_refresh',static function(array &$rows)use($id):void{
             if(isset($rows[$id])){throw new \DomainException('This OAuth refresh was already attempted. Review provider authorization and save replacement credentials before trying again.');}
             if(count($rows)>=1000){throw new \DomainException('OAuth refresh audit allocation reached. Review its private history.');}$rows[$id]=['state'=>'claimed','created_at'=>time()];
         });
-        require_once __DIR__.'/EnterpriseIntegrationsProvider.php';$config['meetings']=(new \SLS\MassNotify\EnterpriseIntegrationsProvider())->refreshMeeting($config['meetings'],time());
+        require_once __DIR__.'/EnterpriseIntegrationsProvider.php';
+        $renewed=(new \SLS\MassNotify\EnterpriseIntegrationsProvider())->refreshMeeting($selected,time());
+        $config['meetings']=\SLS\MassNotify\MeetingAccounts::replace($config['meetings'],$renewed);
         $this->saveEnterpriseNamespace('enterprise_integrations',$config,$revision);
         $state->transaction('oauth_refresh',static function(array &$rows)use($id):void{$rows[$id]['state']='saved';$rows[$id]['finished_at']=time();});
-        return ['success'=>true,'message'=>'Provider tokens renewed and saved to encrypted configuration.','expires_at'=>gmdate('c',$config['meetings']['oauth_expires_at'])];
+        return ['success'=>true,'message'=>'The selected provider token was renewed and saved.','provider'=>$selected['provider'],
+            'expires_at'=>gmdate('c',$renewed['oauth_expires_at']),'state'=>$this->getEnterpriseIntegrationState()];
     }
-    public function revokeEnterpriseMeetingToken(): array
+    public function revokeEnterpriseMeetingToken(array $input=[]): array
     {
-        $this->assertEnterpriseAdministrator();$config=$this->enterpriseIntegrationsConfig();$revision=hash('sha256',json_encode($config,JSON_THROW_ON_ERROR));$provider=$config['meetings'];
-        $config['meetings']['enabled']='0';$config['meetings']['oauth_refresh_enabled']='0';$config['meetings']['oauth_refresh_token']='';$config['meetings']['oauth_expires_at']=0;
-        foreach(['zoom_access_token','google_access_token','webex_access_token'] as $field){$config['meetings'][$field]='';}
+        $this->assertEnterpriseAdministrator();
+        $input=IncidentConfig::object($input,['provider'],'Meeting token revocation');
+        $config=$this->enterpriseIntegrationsConfig();$revision=hash('sha256',json_encode($config,JSON_THROW_ON_ERROR));
+        $selected=\SLS\MassNotify\MeetingAccounts::select($config['meetings'],\SLS\MassNotify\MeetingAccounts::provider($input['provider']??$config['meetings']['provider']));
+        $cleared=array_replace($selected,\SLS\MassNotify\MeetingAccounts::defaults());
+        $cleared[\SLS\MassNotify\MeetingAccounts::tokenField($selected['provider'])]='';
+        $config['meetings']=\SLS\MassNotify\MeetingAccounts::replace($config['meetings'],$cleared);
         $this->saveEnterpriseNamespace('enterprise_integrations',$config,$revision);
-        require_once __DIR__.'/EnterpriseIntegrationsProvider.php';try{$result=(new \SLS\MassNotify\EnterpriseIntegrationsProvider())->revokeMeeting($provider);}catch(\Throwable $error){$result=['revoked'=>false,'provider_contacted'=>true];}
-        return ['success'=>true,'message'=>'Local meeting access disabled and tokens removed.','provider_revocation'=>$result];
+        require_once __DIR__.'/EnterpriseIntegrationsProvider.php';
+        try{$result=(new \SLS\MassNotify\EnterpriseIntegrationsProvider())->revokeMeeting($selected);}
+        catch(\Throwable $error){$result=['revoked'=>false,'provider_contacted'=>true,'detail'=>'Remote revocation was not confirmed. Revoke this app in the provider account.'];}
+        return ['success'=>true,'message'=>'The selected provider credentials were removed locally.','provider_revocation'=>$result,
+            'state'=>$this->getEnterpriseIntegrationState()];
     }
     public function controlIntegrationDoor(array $input): array
     {
@@ -212,12 +267,24 @@ trait SlsEnterpriseIntegrations
         return $this->sendSipNotifyAnnouncement(array_values(array_unique($extensions)),$message,false,true,[],['audio_mode'=>'tts',
             'title'=>IncidentConfig::text($input['title']??'Speaker announcement',80,'Speaker title'),'trigger_source'=>'Enterprise SIP speaker','_is_test'=>$test]);
     }
+    public function sendIntegrationRadioAnnouncement(array $input): array
+    {
+        $this->assertEnterpriseAdministrator();$this->enabledEnterpriseIntegration('radios');
+        $input=IncidentConfig::object($input,['radio_ids','message','title','is_test'],'Radio announcement');
+        $ids=IncidentConfig::listOf($input['radio_ids']??[],25,'Radio gateway selection');
+        $context=\SLS\MassNotify\RadioGateway::select($this->getActiveSettings(),$ids);
+        $extensions=array_values(array_column($context['bindings'],'extension'));
+        return $this->sendSipNotifyAnnouncement($extensions,IncidentConfig::text($input['message']??'',500,'Radio message'),false,true,[],[
+            'audio_mode'=>'tts','title'=>IncidentConfig::text($input['title']??'Radio page',80,'Radio title'),
+            'trigger_source'=>'SIP radio gateway','_is_test'=>IncidentConfig::flag($input['is_test']??true,'Radio drill flag'),
+            '_test_channels'=>['audio'=>$extensions],'_radio_context'=>$context]);
+    }
     public function sendIntegrationLabsAnnouncement(array $input): array
     {
         $this->assertEnterpriseAdministrator();
         $input=IncidentConfig::object($input,['browser_recipient_ids','connector_ids','message','title','is_test'],'Labs announcement');
-        return $this->controlApiSendAnnouncement(['targets'=>[],'message'=>IncidentConfig::text($input['message']??'',1500,'Announcement message'),
-            'title'=>IncidentConfig::text($input['title']??'Labs delivery test',100,'Announcement title'),
+        return $this->controlApiSendAnnouncement(['targets'=>[],'message'=>IncidentConfig::text($input['message']??'',\SLS\MassNotify\AnnouncementLimits::MESSAGE_CHARACTERS,'Announcement message'),
+            'title'=>IncidentConfig::text($input['title']??'Labs delivery test',\SLS\MassNotify\AnnouncementLimits::TITLE_CHARACTERS,'Announcement title'),
             'browser_recipient_ids'=>IncidentConfig::listOf($input['browser_recipient_ids']??[],50,'Browser recipients'),
             'connector_ids'=>IncidentConfig::listOf($input['connector_ids']??[],20,'Connectors'),
             'options'=>['audio_mode'=>'none','_is_test'=>IncidentConfig::flag($input['is_test']??true,'Test flag'),'force_queue'=>true]]);

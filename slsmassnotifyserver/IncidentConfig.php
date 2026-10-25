@@ -14,16 +14,60 @@ final class IncidentConfig
         return [['name' => 'Supervisor follow-up', 'after_seconds' => $policy['after_seconds'] ?? 300, 'delivery' => $policy['delivery'] ?? []]];
     }
 
+    public static function responseCounts(array $record): array
+    {
+        $counts = ['expected' => count($record['template']['roster']), 'no_response' => 0,
+            'received' => 0, 'safe' => 0, 'needs_assistance' => 0, 'missing' => 0];
+        foreach ($record['template']['roster'] as $person) {
+            $response = $record['responses'][$person['id']]['response'] ?? 'no_response';
+            if (!array_key_exists($response, $counts) || $response === 'expected') {
+                throw new \RuntimeException('The incident contains an unsupported human response.');
+            }
+            $counts[$response]++;
+        }
+        return $counts;
+    }
+
+    public static function escalationCondition($value, int $rosterSize): array
+    {
+        $row = self::object($value, ['kind', 'mode', 'target'], 'Escalation condition');
+        $kind = $row['kind'] ?? 'outstanding';
+        if (!in_array($kind, ['outstanding', 'no_response', 'needs_assistance', 'below_quorum'], true)) {
+            throw new \InvalidArgumentException('Select a supported human-response escalation condition.');
+        }
+        if ($kind !== 'below_quorum') {
+            if (array_key_exists('mode', $row) || array_key_exists('target', $row)) {
+                throw new \InvalidArgumentException('Only response quorum conditions accept a threshold.');
+            }
+            return ['kind' => $kind];
+        }
+        $mode = $row['mode'] ?? 'percent'; $target = $row['target'] ?? 100;
+        $maximum = $mode === 'percent' ? 100 : $rosterSize;
+        if (!in_array($mode, ['percent', 'count'], true) || !is_int($target) || $target < 1 || $target > $maximum) {
+            throw new \InvalidArgumentException('A response quorum needs 1–100 percent or a whole-person count within the saved roster.');
+        }
+        return ['kind' => $kind, 'mode' => $mode, 'target' => $target];
+    }
+
+    private static function conditionMatches(array $condition, array $counts): bool
+    {
+        switch ($condition['kind']) {
+            case 'no_response': return $counts['no_response'] > 0;
+            case 'needs_assistance': return $counts['needs_assistance'] > 0;
+            case 'below_quorum':
+                $required = $condition['mode'] === 'percent'
+                    ? (int)ceil($counts['expected'] * $condition['target'] / 100) : $condition['target'];
+                return $counts['received'] + $counts['safe'] < $required;
+            default: return $counts['no_response'] + $counts['missing'] + $counts['needs_assistance'] > 0;
+        }
+    }
+
     /** One next attempt; uncertain submissions block automatic progression. */
     public static function nextEscalation(array $record): ?array
     {
         $policy = $record['template']['escalation'];
         if ($record['state'] !== 'open' || empty($policy['enabled']) || $record['opened_at'] === '') { return null; }
-        $unresolved = false;
-        foreach ($record['template']['roster'] as $person) {
-            if (in_array($record['responses'][$person['id']]['response'] ?? 'no_response', ['no_response', 'missing', 'needs_assistance'], true)) { $unresolved = true; break; }
-        }
-        if (!$unresolved) { return null; }
+        $counts = self::responseCounts($record);
         $attempts = [];
         foreach ($record['operations'] as $operation) {
             if ($operation['state'] === 'submitting' || $operation['state'] === 'uncertain') { return null; }
@@ -36,19 +80,25 @@ final class IncidentConfig
         $opened = strtotime($record['opened_at']);
         if ($opened === false) { return null; }
         $steps = self::escalationSteps($policy);
+        $latest = null; $latestIndex = null;
+        foreach ($attempts as $number => $attempt) {
+            $at = strtotime($attempt['finished_at'] ?? $attempt['claimed_at']);
+            if ($at === false) { return null; }
+            if ($latest === null || $at >= $latest) { $latest = $at; $latestIndex = $number - 1; }
+        }
         foreach ($steps as $index => $step) {
             $number = $index + 1;
             if (isset($attempts[$number])) { continue; }
+            $condition = self::escalationCondition($step['condition'] ?? [], $counts['expected']);
+            if (!self::conditionMatches($condition, $counts)) { continue; }
             $due = $opened + $step['after_seconds'];
-            if ($index > 0) {
-                if (!isset($attempts[$index])) { return null; }
-                // A delayed worker never catches up by firing several levels
-                // together. Preserve the configured interval between levels.
-                $previous = strtotime($attempts[$index]['finished_at'] ?? $attempts[$index]['claimed_at']);
-                if ($previous === false) { return null; }
-                $due = max($due, $previous + $step['after_seconds'] - $steps[$index - 1]['after_seconds']);
+            if ($latest !== null) {
+                // Conditional branches can become relevant out of order. Never
+                // burst them, even after a worker outage or a late assistance reply.
+                $interval = max(60, $step['after_seconds'] - ($steps[$latestIndex]['after_seconds'] ?? 0));
+                $due = max($due, $latest + $interval);
             }
-            return $step + ['number' => $number, 'due_at' => $due];
+            return array_replace($step, ['condition' => $condition, 'number' => $number, 'due_at' => $due]);
         }
         return null;
     }
@@ -246,7 +296,7 @@ final class IncidentConfig
         $policy = self::object($row['escalation'] ?? [], ['enabled', 'after_seconds', 'delivery', 'steps'], 'Supervisor escalation');
         $enabled = self::flag($policy['enabled'] ?? false, 'Escalation enabled'); $steps = []; $previous = 0;
         foreach (self::escalationSteps($policy) as $index => $step) {
-            $step = self::object($step, ['name', 'after_seconds', 'delivery'], 'Escalation step');
+            $step = self::object($step, ['name', 'after_seconds', 'delivery', 'condition'], 'Escalation step');
             $seconds = $step['after_seconds'] ?? 300;
             if (!is_int($seconds) || $seconds < 60 || $seconds > 86400 || $seconds <= $previous) {
                 throw new \InvalidArgumentException('Escalation delays must be increasing whole seconds from 60 through 86400, measured from the initial job.');
@@ -254,7 +304,8 @@ final class IncidentConfig
             $delivery = self::delivery($step['delivery'] ?? []);
             if ($enabled && !self::hasAudience($delivery)) { throw new \InvalidArgumentException('Every enabled escalation step requires explicit destinations.'); }
             $steps[] = ['name' => self::text($step['name'] ?? ('Supervisor follow-up ' . ($index + 1)), 80, 'Escalation step name'),
-                'after_seconds' => $seconds, 'delivery' => $delivery];
+                'after_seconds' => $seconds, 'delivery' => $delivery,
+                'condition' => self::escalationCondition($step['condition'] ?? [], count($out['roster']))];
             $previous = $seconds;
         }
         if ($enabled && (!$out['roster'] || !$steps)) { throw new \InvalidArgumentException('Enabled escalation requires a person roster and at least one configured follow-up.'); }

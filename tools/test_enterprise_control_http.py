@@ -27,6 +27,7 @@ class EnterpriseControlHttpTests(unittest.TestCase):
         self.template_id = 'tpl_' + 'a' * 24
         self.offsite_id = 'tpl_' + 'b' * 24
         self.settings = {
+            'enterprise_labs': {'enabled': True},
             'control_api': {'enabled': True, 'rate_limit_enabled': False,
                             'api_key': 'legacy-example-key-1234567890',
                             'credentials': [self.named['credential'], self.read['credential'], self.send['credential']]},
@@ -110,6 +111,21 @@ class EnterpriseControlHttpTests(unittest.TestCase):
         self.assertFalse(templates['enabled'])
         self.assertEqual(templates['templates'], [])
         self.assertEqual(self.request(self.named['secret'], payload)[0], 403)
+
+    def test_master_off_masks_legacy_flags_without_changing_normal_api_scopes(self):
+        self.settings['enterprise_labs']['enabled'] = False
+        self.write()
+        status, discovery = self.request(self.named['secret'], resource='enterprise_capabilities')
+        self.assertEqual(status, 200, discovery)
+        self.assertFalse(discovery['features']['enterprise_labs'])
+        self.assertFalse(discovery['features']['operations'])
+        status, templates = self.request(self.named['secret'], resource='incident_templates')
+        self.assertEqual(status, 200, templates)
+        self.assertFalse(templates['enabled'])
+        self.assertEqual(templates['templates'], [])
+        status, body = self.request(self.named['secret'], {'action': 'enterprise_template_start',
+            'template_id': self.template_id, 'request_id': '4'*32, 'fields': {}, 'is_test': True})
+        self.assertEqual(status, 403, body)
 
 
 if __name__ == '__main__':

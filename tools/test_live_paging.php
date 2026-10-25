@@ -41,6 +41,7 @@ class PagingFixtureAgi extends LivePagingAgi
     public function hangup(): void { $this->calls[] = ['hangup']; }
     protected function command(string $command, int $timeout = 5): string { $this->calls[] = ['command', $command]; return '200 result=0'; }
     public function autoHangup(int $seconds): void { $this->calls[] = ['deadline', $seconds]; }
+    public function preparePageInput(): bool { $this->calls[]=['input_muted']; return true; }
     public function admitPhones(array $recipients, string $caller, string $groupId = ''): array
     {
         $this->calls[] = ['admission', $recipients, $caller, $groupId];
@@ -57,7 +58,7 @@ class PagingFixtureAgi extends LivePagingAgi
     {
         $this->calls[] = ['notify', $group['group_id'], $caller, $group['notify_extensions']];
         if ($this->throwNotification) { throw new RuntimeException('fixture_text_failure'); }
-        return $this->notification ?? parent::notifyGroup($group, $caller, $settings);
+        return ($this->notification ?? parent::notifyGroup($group, $caller, $settings)) + ['ready_gate'=>true];
     }
     public function play(string $file): void { $this->calls[] = ['play', $file]; }
     public function finishGroupNotification(): array { $this->calls[] = ['finish_notify']; return parent::finishGroupNotification(); }
@@ -264,16 +265,30 @@ try { (new LivePagingState($unsafeDirectory))->claim(['1001'], 30); throw new Lo
 catch (RuntimeException $expected) { paging_check(file_get_contents($victim) === 'preserve', 'Reservation symlink modified its target'); }
 
 $configPath = $root . '/protected.config'; file_put_contents($configPath, json_encode($settings)); chmod($configPath, 0640);
+paging_check(\FreePBX\modules\SlsConfigCrypto::fileFingerprint($configPath) === hash_file('sha256',$configPath), 'Bounded paging configuration fingerprint changed its bytes');
 paging_check(LivePagingSession::loadSettings($configPath)['live_paging']['extension'] === '700', 'Protected config fixture failed');
 chmod($configPath, 0644);
 try { LivePagingSession::loadSettings($configPath); throw new LogicException('Public config accepted'); }
 catch (RuntimeException $expected) { paging_check($expected->getMessage() === 'paging_config_unsafe', 'Wrong protected config failure'); }
+try { \FreePBX\modules\SlsConfigCrypto::fileFingerprint($configPath); throw new LogicException('Fingerprint accepted public configuration'); }
+catch (RuntimeException $expected) { }
+chmod($configPath,0640);$fingerprintLink=$root.'/fingerprint-link';symlink($configPath,$fingerprintLink);
+try { \FreePBX\modules\SlsConfigCrypto::fileFingerprint($fingerprintLink); throw new LogicException('Fingerprint followed a symbolic link'); }
+catch (RuntimeException $expected) { }
+$oversized=$root.'/fingerprint-oversized';$handle=fopen($oversized,'x+b');
+ftruncate($handle,\FreePBX\modules\SlsConfigCrypto::MAX_FILE_BYTES+1);fclose($handle);chmod($oversized,0640);
+try { \FreePBX\modules\SlsConfigCrypto::fileFingerprint($oversized); throw new LogicException('Fingerprint accepted oversized configuration'); }
+catch (RuntimeException $expected) { }
 if (function_exists('posix_mkfifo')) {
     $fifo = $root . '/config-fifo'; posix_mkfifo($fifo, 0600);
     $started = microtime(true);
     try { LivePagingSession::loadSettings($fifo); throw new LogicException('Config FIFO accepted'); }
     catch (RuntimeException $expected) { paging_check($expected->getMessage() === 'paging_config_unsafe', 'Wrong FIFO failure'); }
     paging_check(microtime(true) - $started < 0.5, 'Config FIFO blocked before validation');
+    $started = microtime(true);
+    try { \FreePBX\modules\SlsConfigCrypto::fileFingerprint($fifo); throw new LogicException('Fingerprint accepted a FIFO'); }
+    catch (RuntimeException $expected) { }
+    paging_check(microtime(true) - $started < 0.5, 'Paging fingerprint blocked on a FIFO');
 }
 $lockDirectory = $root . '/locked'; mkdir($lockDirectory, 0700);
 $lockHandle = fopen($lockDirectory . '/audio-reservations.lock', 'c+'); flock($lockHandle, LOCK_EX);
@@ -305,6 +320,52 @@ for ($i = 0; $i < 60; $i++) { $state->authenticationAllowed('source-' . $i, true
 paging_check(!$state->authenticationAllowed('fresh-source', false, 1800000120), 'Global failed PIN budget was not bounded');
 
 $module = new PagingFixtureModule($settings);
+// Legacy fopen-based installations left an empty journal and empty sidecar.
+// Adopt only that uninitialized state; an initialized empty/corrupt store fails.
+foreach ([false, true] as $withSidecar) {
+    $legacy = $root . '/empty-auth-' . (int)$withSidecar; mkdir($legacy, 0700);
+    $journal = $legacy . '/live-paging-auth.json'; $sidecar = $journal . '.lock';
+    file_put_contents($journal, ''); chmod($journal, 0640);
+    if ($withSidecar) { file_put_contents($sidecar, ''); chmod($sidecar, 0640); $inode = fileinode($sidecar); }
+    $legacyState = new LivePagingState($legacy);
+    paging_check($legacyState->authenticationAllowed('1000', false, 1800000000), 'A known empty legacy PIN journal rejected paging');
+    $initialized = json_decode(file_get_contents($journal), true, 16, JSON_THROW_ON_ERROR);
+    paging_check($initialized['global'] === 0 && $initialized['bucket'] === gmdate('YmdHi', 1800000000), 'Legacy initialization did not save its bounded PIN state');
+    paging_check(file_get_contents($sidecar) === "SLS_JSON_V1\n" && (!$withSidecar || fileinode($sidecar) === $inode), 'Legacy migration replaced the permanent sidecar');
+    for ($attempt = 0; $attempt < 10; $attempt++) { $legacyState->authenticationAllowed('1000', true, 1800000000); }
+    paging_check(!$legacyState->authenticationAllowed('1000', false, 1800000000), 'Adopted journal lost its PIN attempt limit');
+    file_put_contents($journal, '');
+    try { $legacyState->authenticationAllowed('1000', false, 1800000000); throw new LogicException('Initialized empty PIN state was reset'); }
+    catch (RuntimeException $expected) { paging_check($expected->getMessage() === 'json_storage_invalid', 'Wrong initialized-store failure'); }
+}
+foreach (['{invalid', ''] as $raw) {
+    $negative = $root . '/invalid-auth-' . strlen($raw); mkdir($negative, 0700);
+    $journal = $negative . '/live-paging-auth.json'; file_put_contents($journal, $raw); chmod($journal, 0640);
+    if ($raw === '') { file_put_contents($journal.'.lock', 'SLS_'); chmod($journal.'.lock', 0640); }
+    try { (new LivePagingState($negative))->authenticationAllowed('1000'); throw new LogicException('Damaged PIN journal was adopted'); }
+    catch (RuntimeException|JsonException $expected) { paging_check(file_get_contents($journal) === $raw, 'Rejected PIN state changed'); }
+}
+echo "Legacy PIN journals: empty uninitialized adoption, permanent lock identity, failure limits and corrupt-state refusal passed.\n";
+$strict = $root . '/strict-empty'; mkdir($strict, 0700);
+file_put_contents($strict . '/state.json', ''); chmod($strict . '/state.json', 0640);
+try {
+    \SlsAtomicJson::transaction($strict . '/state.json', [], static fn($rows) => [$rows, true, false]);
+    throw new LogicException('A generic JSON store adopted an empty file');
+} catch (RuntimeException $expected) {
+    paging_check($expected->getMessage() === 'json_storage_invalid', 'Wrong generic empty-store failure');
+}
+foreach (['symlink', 'hardlink', 'public'] as $kind) {
+    $unsafe = $root . '/legacy-' . $kind; mkdir($unsafe, 0700);
+    $victim = $unsafe . '/victim'; file_put_contents($victim, ''); chmod($victim, 0640);
+    $journal = $unsafe . '/live-paging-auth.json';
+    if ($kind === 'symlink') { symlink($victim, $journal); }
+    elseif ($kind === 'hardlink') { link($victim, $journal); }
+    else { file_put_contents($journal, ''); chmod($journal, 0644); }
+    try { (new LivePagingState($unsafe))->authenticationAllowed('1000'); throw new LogicException('Unsafe legacy journal accepted'); }
+    catch (RuntimeException $expected) { paging_check($expected->getMessage() === 'json_storage_unsafe', 'Wrong unsafe legacy-store failure'); }
+    paging_check(file_get_contents($victim) === '' && file_get_contents($journal) === '', 'Rejected legacy state changed');
+}
+echo "Legacy PIN recovery retains generic JSON, file-permission, symlink and hardlink refusal.\n";
 $post = $settings['live_paging'];
 $post['allowed_callers'] = json_encode($post['allowed_callers']);
 unset($post['groups'][0]['pin_hash']); $post['groups'][0]['pin'] = '0042';
@@ -383,7 +444,7 @@ paging_rejects(static function () use ($eleven) { LivePagingConfig::normalize($e
 $agi = new PagingFixtureAgi($variables, ['1', '0123']);
 [$session] = $newSession($agi, $independent, 'independent-pin');
 $result = $session->run();
-paging_check($result['status'] === 'page_ended' && $result['text_notification'] === ['status' => 'not_requested', 'requested' => 0], 'Independent PIN group failed or empty text targets expanded');
+paging_check($result['status'] === 'page_ended' && $result['text_notification'] === ['status' => 'not_requested', 'requested' => 0, 'ready_gate'=>true], 'Independent PIN group failed or empty text targets expanded');
 $admissions = array_values(array_filter($agi->calls, static function ($call) { return $call[0] === 'admission'; }));
 paging_check($admissions[0][3] === 'paging_staff', 'Admission lost the exact selected group identity');
 $agi = new PagingFixtureAgi($variables, ['10', '0123']);
@@ -425,7 +486,7 @@ foreach (['failed', 'uncertain', 'submitted'] as $textState) {
 $agi = new PagingFixtureAgi($variables, ['1', '0123']); $agi->throwNotification = true;
 [$session] = $newSession($agi, $withText, 'text-exception');
 $result = $session->run();
-paging_check($result['status'] === 'page_ended' && $result['text_notification']['status'] === 'failed', 'Text dispatcher exception blocked audio');
+paging_check($result['status'] === 'paging_ready_gate_unavailable' && $result['text_notification']['status'] === 'failed', 'A failed readiness dispatcher allowed ungated audio');
 $agi = new PagingFixtureAgi($variables, ['1', '0000', '0000', '0000']);
 [$session] = $newSession($agi, $withText, 'text-pin-denied');
 paging_check($session->run()['status'] === 'invalid_pin'

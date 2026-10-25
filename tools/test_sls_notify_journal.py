@@ -45,6 +45,53 @@ def concurrent_append(journal_path, process_index, iterations, barrier):
 
 
 class JournalPersistenceTests(unittest.TestCase):
+    def test_byte_pressure_archives_expired_evidence_and_preserves_receipt_binding(self):
+        from datetime import timedelta
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / 'events.jsonl'
+            old_time = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+            records = [{'id':'old-'+str(index), 'kind':'alert', 'created_at':old_time,
+                        'message':'x'*1500, 'desktop_all':False, 'desktop_recipients':['alice'],
+                        'desktop_client_ids':{'alice':'client-one'}} for index in range(2)]
+            journal.write_text(''.join(json.dumps(row)+'\n' for row in records))
+            config = journal_config(journal)
+            with mock.patch.object(SENDER_MODULE, 'JOURNAL_MAX_BYTES', 4096):
+                SENDER_MODULE.append_sipnotify_event(config, {'id':'new', 'kind':'alert', 'message':'y'*1500})
+            live = [json.loads(line) for line in journal.read_text().splitlines()]
+            self.assertEqual([row['id'] for row in live], ['old-1','new'])
+            self.assertEqual(SENDER_MODULE._desktop_history.lookup(journal, 'old-0'), records[0])
+            self.assertEqual(self.run_php_journal_harness(journal, 'echo json_encode(desktop_history_event("old-0"));'), records[0])
+            self.assertFalse(self.run_php_journal_harness(journal,
+                '$event=desktop_history_event("old-0"); echo json_encode(desktop_event_routed_to_client($event,"alice","replacement-client"));'))
+            before = journal.read_bytes()
+            SENDER_MODULE.append_sipnotify_event(config, {'id':'old-0', 'kind':'alert', 'message':'changed'})
+            self.assertEqual(journal.read_bytes(), before, 'Archived publication was made live again')
+
+    def test_byte_pressure_never_drops_unexpired_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / 'events.jsonl'
+            records = [{'id':'live-'+str(index), 'kind':'alert', 'created_at':datetime.now(timezone.utc).isoformat(),
+                        'message':'x'*1500} for index in range(2)]
+            journal.write_text(''.join(json.dumps(row)+'\n' for row in records))
+            before = journal.read_bytes()
+            with mock.patch.object(SENDER_MODULE, 'JOURNAL_MAX_BYTES', 4096), self.assertRaisesRegex(OSError,'unexpired'):
+                SENDER_MODULE.append_sipnotify_event(journal_config(journal), {'id':'new', 'kind':'alert', 'message':'y'*1500})
+            self.assertEqual(journal.read_bytes(), before)
+            self.assertFalse((journal.parent/'history').exists())
+
+    def test_history_rejects_compression_bombs_and_conflicting_identity(self):
+        import hashlib
+        import zlib
+        history = SENDER_MODULE._desktop_history
+        record = {'schema':1, 'id':'event', 'bytes':1, 'sha256':hashlib.sha256(b'x').hexdigest(),
+                  'zlib_base64':__import__('base64').b64encode(zlib.compress(b'x'*(2*1024*1024))).decode()}
+        with self.assertRaises(OSError): history.decode_record(record, 'event')
+        raw = b'{"id":"event"}'
+        record.update(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest(),
+                      zlib_base64=__import__('base64').b64encode(zlib.compress(raw)+b'trailing').decode())
+        with self.assertRaises(OSError): history.decode_record(record, 'event')
+        with self.assertRaises(OSError): history.decode_record(record, 'other')
+
     def test_real_python_publication_is_readable_without_timestamp_or_history_rewrite(self):
         with tempfile.TemporaryDirectory() as directory:
             journal = Path(directory) / 'events.jsonl'
@@ -227,6 +274,7 @@ class JournalPersistenceTests(unittest.TestCase):
     def run_php_journal_harness(self, journal, statements, raw=False):
         source = DESKTOP_API.read_text(encoding="utf-8")
         prefix = source.split("function announcement_display_expired", 1)[0]
+        prefix += "\nfunction desktop_event_routed_to_client" + source.split("function desktop_event_routed_to_client", 1)[1].split("function desktop_event_public_payload", 1)[0]
         # Python publication sets asterisk ownership. Model the web reader's
         # actual account while retaining root-owned synthetic fixture inputs.
         prefix = prefix.replace('declare(strict_types=1);', '''declare(strict_types=1);
@@ -237,6 +285,9 @@ function posix_geteuid() { return \\posix_getpwnam('asterisk')['uid']; }
         include = "require_once dirname(__DIR__) . '/sls-mass-notify/security.php';"
         self.assertIn(include, prefix)
         prefix = prefix.replace(include, "require_once " + json.dumps(str(DESKTOP_API.parent.parent / "sls-mass-notify/security.php")) + ";", 1)
+        cache_include = "require_once dirname(__DIR__) . '/sls-mass-notify/desktop-feed-cache.php';"
+        self.assertIn(cache_include, prefix)
+        prefix = prefix.replace(cache_include, "require_once " + json.dumps(str(DESKTOP_API.parent.parent / "sls-mass-notify/desktop-feed-cache.php")) + ";", 1)
         crypto_include = "require_once dirname(__DIR__) . '/sls-mass-notify/config-crypto.php';"
         self.assertIn(crypto_include, prefix)
         prefix = prefix.replace(crypto_include, "require_once " + json.dumps(str(DESKTOP_API.parent.parent / "sls-mass-notify/config-crypto.php")) + ";", 1)
@@ -487,13 +538,13 @@ function posix_geteuid() { return \\posix_getpwnam('asterisk')['uid']; }
 
         append_event.assert_not_called()
 
-    def test_php_retention_uses_the_shared_lock_and_atomic_replacement(self):
+    def test_php_retention_reads_under_shared_lock_without_deleting_evidence(self):
         source = DESKTOP_API.read_text(encoding="utf-8")
         retained = source.split("function retained_events", 1)[1].split(
             "function announcement_display_expired", 1
         )[0]
         self.assertIn("$eventsFile . '.lock'", retained)
-        self.assertIn("atomic_replace_journal($eventsFile, $normalized, null, $metadata)", retained)
+        self.assertNotIn("atomic_replace_journal($eventsFile", retained)
         self.assertNotIn("ftruncate", retained)
 
         with tempfile.TemporaryDirectory() as directory:
@@ -513,9 +564,10 @@ function posix_geteuid() { return \\posix_getpwnam('asterisk')['uid']; }
             self.assertEqual([event["id"] for event in result["events"]], ["retained"])
             self.assertEqual(
                 result["raw"],
-                '{"kind":"announcement","id":"retained","created_at":"2026-08-22T12:00:00Z"}\n',
+                '{"kind":"announcement","id":"retained","created_at":"2026-08-22T12:00:00Z"}\n'
+                '{"id":"expired","created_at":"2000-01-01T00:00:00Z"}\n',
             )
-            self.assertNotEqual(journal.stat().st_ino, original_inode)
+            self.assertEqual(journal.stat().st_ino, original_inode)
             lock_file = Path(str(journal) + ".lock")
             self.assertTrue(lock_file.is_file())
             self.assertEqual(lock_file.stat().st_mode & 0o777, 0o640)

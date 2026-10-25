@@ -101,7 +101,8 @@ class VisualOwnerTests(unittest.TestCase):
                 try:
                     for entry in Path('/proc/self/fd').iterdir():
                         try:
-                            if os.readlink(entry)==str(self.state/'1000.json'): os.close(int(entry.name))
+                            if os.readlink(entry) in {str(self.state/'1000.json'), str(self.state/'1000.json.lock')}:
+                                os.close(int(entry.name))
                         except OSError: pass
                     with self.lease(self.next_token) as lease: lease.commit()
                     os._exit(0)
@@ -109,8 +110,9 @@ class VisualOwnerTests(unittest.TestCase):
             try:
                 self.assertEqual(os.waitpid(pid,os.WNOHANG),(0,0))
             finally:
-                # Release in the parent before waiting; inherited lock fd is
-                # closed by process exit once the child completes its push.
+                # Release the parent's lease before waiting. The child closed
+                # its inherited marker and permanent mutex descriptors, so
+                # only the parent's lease can hold up its new acquisition.
                 pass
         self.assertEqual(os.waitpid(pid,0)[1],0)
         with self.lease(expected=self.token) as permitted: self.assertFalse(permitted)

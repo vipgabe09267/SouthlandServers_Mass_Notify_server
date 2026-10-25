@@ -2,18 +2,20 @@
 declare(strict_types=1);
 namespace SLS\MassNotify;
 require_once __DIR__.'/identity-libs/vendor/autoload.php';
+require_once __DIR__.'/IncidentConfig.php';
 use Firebase\JWT\JWT;
 
 /** RFC 8291 encryption and RFC 8292 VAPID using OpenSSL and the vendored JWT library. */
 final class BrowserPush
 {
     public const MAX_PAYLOAD_BYTES=3000;
-    public static function validateContent(string $title,string $message,bool $isTest): void
+    public static function validateContent(string $title,string $message,bool $isTest,?array $incident=null): void
     {
         // Reserve the complete supported ID and expiry width before queueing;
         // JSON escaping and multibyte text count toward the encrypted wire limit.
         self::payload(['event_id'=>str_repeat('x',128),'title'=>$title,'message'=>$message,
-            'expires_at'=>PHP_INT_MAX,'is_test'=>$isTest]);
+            'expires_at'=>PHP_INT_MAX,'is_test'=>$isTest,'browser_receipt'=>['subscriber_id'=>'sub_'.str_repeat('a',24),'expires_at'=>PHP_INT_MAX,'event_key'=>str_repeat('a',64),'endpoint_id'=>str_repeat('a',64),'token'=>str_repeat('a',64)]]
+            +($incident===null?[]:['incident'=>$incident]));
     }
     private static function payload(array $event): string
     {
@@ -22,7 +24,18 @@ final class BrowserPush
             ||mb_strlen($event['title'],'UTF-8')>80||!is_bool($event['is_test']??null)){
             throw new \DomainException('Browser push requires valid UTF-8 text, a title of at most 80 characters and an explicit test flag.');
         }
-        $payload=json_encode(array_intersect_key($event,array_flip(['event_id','title','message','expires_at','is_test'])),JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR);
+        if(array_key_exists('incident',$event)){
+            if(IncidentConfig::context($event['incident'])['is_test']!==$event['is_test']){throw new \DomainException('Browser incident test context conflicts with its announcement.');}
+        }
+        if(array_key_exists('browser_receipt',$event)){
+            $proof=$event['browser_receipt'];
+            if(!is_array($proof)||array_diff(array_keys($proof),['subscriber_id','expires_at','event_key','endpoint_id','token'])||count($proof)!==5
+                ||!is_string($proof['subscriber_id']??null)||!preg_match('/^sub_[a-f0-9]{24}$/D',$proof['subscriber_id'])||($proof['expires_at']??null)!==($event['expires_at']??null)){
+                throw new \DomainException('Browser receipt proof is invalid.');
+            }
+            foreach(['event_key','endpoint_id','token'] as $key){if(!is_string($proof[$key]??null)||!preg_match('/^[a-f0-9]{64}$/D',$proof[$key])){throw new \DomainException('Browser receipt proof is invalid.');}}
+        }
+        $payload=json_encode(array_intersect_key($event,array_flip(['event_id','title','message','expires_at','is_test','incident','browser_receipt'])),JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR);
         if(strlen($payload)>self::MAX_PAYLOAD_BYTES){throw new \DomainException('Browser push exceeds 3,000 encoded bytes including the title, JSON escaping and reserved event metadata. Shorten the message or remove browser recipients; no browser request was sent.');}
         return $payload;
     }

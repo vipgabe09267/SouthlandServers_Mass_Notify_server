@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Actual producer and ACK handler in inert, private fixtures; no PBX or network."""
 import ast
+import configparser
 from contextlib import redirect_stdout
 import io
 import json
@@ -21,21 +22,23 @@ class ReceiptContractTests(unittest.TestCase):
         tree = ast.parse(source.read_text())
         function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'push_announcement')
         normalize = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'normalize_incident_context')
+        exclusions = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'audio_only_visual_exclusions')
         namespace = {'json': json, 're': re, 'normalize_announcement_timeout_seconds': int,
                      'build_announcement_xml': mock.Mock(return_value='xml'),
                      'new_announcement_id': mock.Mock(return_value='exact-event'),
                      'announcement_api_record': lambda event, *args, **kwargs: {'id': event},
                      'append_sipnotify_event': mock.Mock()}
-        exec(compile(ast.Module(body=[normalize, function], type_ignores=[]), str(source), 'exec'), namespace)
+        exec(compile(ast.Module(body=[normalize, exclusions, function], type_ignores=[]), str(source), 'exec'), namespace)
+        config = configparser.ConfigParser()
         capture = io.StringIO()
         with redirect_stdout(capture):
-            namespace['push_announcement']({}, 'fixture', [], api_only=True, desktop_targets=['alice'])
+            namespace['push_announcement'](config, 'fixture', [], api_only=True, desktop_targets=['alice'])
         self.assertEqual(json.loads(capture.getvalue().removeprefix('SLS_DESKTOP_PUBLICATION ')), {'event_id': 'exact-event'})
         self.assertEqual(namespace['append_sipnotify_event'].call_args.args[1]['id'], 'exact-event')
         namespace['append_sipnotify_event'].side_effect = OSError('fixture storage failure')
         capture = io.StringIO()
         with redirect_stdout(capture), self.assertRaises(OSError):
-            namespace['push_announcement']({}, 'fixture', [], api_only=True, desktop_targets=['alice'])
+            namespace['push_announcement'](config, 'fixture', [], api_only=True, desktop_targets=['alice'])
         self.assertEqual(capture.getvalue(), '')
 
     def run_ack(self, event_id, recipient='alice', broken_storage=False, enrolled_client='fixture-client'):
@@ -45,6 +48,7 @@ class ReceiptContractTests(unittest.TestCase):
         for start, end in [('function api_state_parent_matches', 'function api_state_lock'),
                            ('function desktop_timestamp', 'function atomic_replace_journal'),
                            ('function atomic_replace_journal', 'function retained_events'),
+                           ('function desktop_history_event', 'function desktop_stream_slot'),
                            ('function record_desktop_acknowledgement', '\n\n$endpoint ='),
                            ('function desktop_event_routed_to_client', 'function desktop_stream_events_after_cursor')]:
             offset = source.index(start)
@@ -64,6 +68,7 @@ function update_desktop_seen(...$args) {}
 function retained_events($settings) { return [['id'=>'fixture-event', 'desktop_recipients'=>[RECIPIENT], 'desktop_client_ids'=>[RECIPIENT=>'fixture-client']]]; }
 $endpoint='desktop/ack'; $username='alice'; $client=['username'=>'alice','client_id'=>'fixture-client']; $settings=[];
 '''.replace('RECIPIENT', json.dumps(recipient)).replace("'client_id'=>'fixture-client'", "'client_id'=>"+json.dumps(enrolled_client))
+            fixture += '\nconst EVENTS_FILE = ' + json.dumps(str(Path(temporary) / 'feed.jsonl')) + ';\n'
             fixture += '\nconst DESKTOP_ACK_DIRECTORY = ' + json.dumps(str(directory)) + ';\n'
             fixture += 'require_once ' + json.dumps(str(API.parent.parent/'sls-mass-notify/security.php')) + ';\n'
             script = Path(temporary) / 'fixture.php'

@@ -4,12 +4,16 @@
         constructor(options) {
             this.options = options;
             this.draft = null;
-            this.dirty = false;
+            this.dirty = false;this.visible=25;
             this.el = name => document.getElementById('sls-audience-' + name);
+            this.el('search').addEventListener('input',()=>{this.visible=25;this.refresh();});
+            this.el('more').addEventListener('click',()=>{this.visible+=25;this.refresh();});
             this.el('add').addEventListener('click', () => this.open(null));
             this.el('close').addEventListener('click', () => { if (this.mayLeave()) this.close(); });
             this.el('form').addEventListener('input', () => { this.dirty = true; });
             this.el('form').addEventListener('submit', event => this.save(event));
+            this.el('person-enabled').addEventListener('change',()=>{this.el('person-fields').hidden=!this.el('person-enabled').checked;});
+            this.el('person').addEventListener('change',()=>{this.el('ownership').checked=false;this.personCandidates();});
             window.addEventListener('beforeunload', event => { if (this.dirty) { event.preventDefault(); event.returnValue = ''; } });
             this.refresh();
         }
@@ -25,11 +29,22 @@
             const state = this.options.state(), list = this.el('list');
             list.replaceChildren();
             const audiences = state.audiences || [];
-            this.el('add').disabled = audiences.length >= 20;
+            this.el('add').disabled = audiences.length >= Number(this.el('count').dataset.maximum);
+            const query=this.el('search').value.trim().toLocaleLowerCase();
+            const matches=audiences.filter(row=>row.name.toLocaleLowerCase().includes(query));
+            this.el('count').textContent=`${audiences.length} of ${this.el('count').dataset.maximum} audiences · ${matches.length} matching`;
+            const budget=state.configuration_budget,budgetLabel=this.el('budget');
+            if(budget&&Number.isInteger(budget.used_bytes)&&Number.isInteger(budget.maximum_bytes)&&budget.maximum_bytes>0){
+                budgetLabel.textContent=`Saved configuration: ${(budget.used_bytes/1024).toFixed(1)} / ${(budget.maximum_bytes/1024).toFixed(0)} KiB · audiences ${(budget.audience_bytes/1024).toFixed(1)} KiB · ${(budget.remaining_bytes/1024).toFixed(1)} KiB available. Unsaved edits are not included.`;
+                budgetLabel.className='help-block'+(!budget.within_limit?' text-danger':budget.used_bytes>=budget.maximum_bytes*.9?' text-warning':'');
+            }else{budgetLabel.textContent='';}
+            this.el('more').hidden=matches.length<=this.visible;
             if (!audiences.length) list.append(this.node('p', 'No audiences configured. Add a person’s devices or a group of recipients.', 'sls-location-empty'));
-            audiences.forEach(row => {
+            if(audiences.length&&!matches.length)list.append(this.node('p','No matching audiences.','sls-location-empty'));
+            matches.slice(0,this.visible).forEach(row => {
                 const card = this.node('article', undefined, 'sls-location-card'), body = this.node('div', undefined, 'sls-location-card-body');
                 body.append(this.node('h3', row.name));
+                if(row.person_profile)body.append(this.node('p','Person · '+row.person_profile.language,'help-block'));
                 const counts = Object.entries(this.options.channels).filter(([key]) => row.members[key].length)
                     .map(([key, definition]) => row.members[key].length + ' ' + definition[0].toLowerCase());
                 body.append(this.node('p', counts.join(' · '), 'help-block'));
@@ -60,11 +75,26 @@
             this.draft = row ? JSON.parse(JSON.stringify(row)) : {id: '', name: '', members: Object.fromEntries(Object.keys(this.options.channels).map(key => [key, []]))};
             this.dirty = false;
             this.el('name').value = this.draft.name;
+            const profile=this.draft.person_profile;
+            this.el('person-enabled').checked=!!profile;this.el('person-fields').hidden=!profile;
+            this.el('ownership').checked=false;this.el('language').value=profile?.language||'en';
+            this.el('person').replaceChildren();
+            const manual=this.node('option','Manual person profile');manual.value='';this.el('person').append(manual);
+            (this.options.state().people||[]).forEach(person=>{const option=this.node('option',person.name);option.value=person.id;this.el('person').append(option);});
+            if(profile?.directory_person_id&&!Array.from(this.el('person').options).some(o=>o.value===profile.directory_person_id)){
+                const missing=this.node('option','Inactive or removed directory person');missing.value=profile.directory_person_id;missing.disabled=true;this.el('person').append(missing);
+            }
+            this.el('person').value=profile?.directory_person_id||'';this.personCandidates();
+
             this.el('title').textContent = row ? 'Edit audience' : 'New audience';
             this.el('members').replaceChildren();
             Object.entries(this.options.channels).forEach(([channel, definition]) => this.renderChannel(channel, definition));
             this.el('form').hidden = false; this.count();
             this.el('form').scrollIntoView({block: 'start', behavior: 'smooth'}); this.el('name').focus({preventScroll: true});
+        }
+        personCandidates() {
+            const person=(this.options.state().people||[]).find(row=>row.id===this.el('person').value);
+            this.el('person-candidates').textContent=person?.phone_candidates?.length?'Imported numbers to review: '+person.phone_candidates.join(' · '):'';
         }
         count() { this.el('total').textContent = Object.values(this.draft.members).reduce((sum, ids) => sum + ids.length, 0) + ' selected'; }
         renderChannel(channel, definition) {
@@ -100,7 +130,7 @@
         async save(event) {
             event.preventDefault();
             try {
-                const result = await this.options.request('save_audience', {id: this.draft.id, name: this.el('name').value, members: this.draft.members});
+                const result = await this.options.request('save_audience', {id: this.draft.id, name: this.el('name').value, members: this.draft.members, person_profile:this.el('person-enabled').checked?{directory_person_id:this.el('person').value,language:this.el('language').value,ownership_reviewed:this.el('ownership').checked}:null});
                 this.close(); this.options.onSaved(result);
             } catch (error) { this.options.announce(error.message, false); }
         }

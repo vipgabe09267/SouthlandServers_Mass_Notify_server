@@ -280,6 +280,11 @@ def run_live_poller_case(
             collection = json.loads(payload_path.read_text())
             collection['features'][0]['geometry'] = {'type': 'LineString', 'coordinates': [[41, -90]] * 10000}
             payload_path.write_text(json.dumps(collection))
+        fetch_path=root/'nws-http-fixture.py'
+        write_executable(fetch_path, "#!/usr/bin/python3\nimport os,sys\nfrom pathlib import Path\nsys.stdout.buffer.write(Path(os.environ['NWS_TEST_PAYLOAD_SOURCE']).read_bytes())\n")
+        poller_path=root/'nws-poller-fixture.sh'
+        poller_code=POLLER.read_text().replace('/usr/local/bin/sls_mass_notify/sls_nws_http.py',str(fetch_path))
+        poller_path.write_text(poller_code);poller_path.chmod(0o755)
         config_path = root / "mass-notifications.config"
         config_path.write_text('{"enabled":"1"}\n', encoding="utf-8")
         loader_path = root / "config-loader.py"
@@ -497,7 +502,7 @@ def run_live_poller_case(
             "PYTHONDONTWRITEBYTECODE": "1",
         })
         result = subprocess.run(
-            [str(POLLER)],
+            [str(poller_path)],
             env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -524,7 +529,7 @@ def run_live_poller_case(
             environment["NWS_CRASH_AFTER_INTENT"] = "0"
             environment["NWS_CRASH_AFTER_VISUAL"] = "0"
             restarted = subprocess.run(
-                [str(POLLER)],
+                [str(poller_path)],
                 env=environment,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -543,7 +548,7 @@ def run_live_poller_case(
             assert local_state.read_bytes() == b"{corrupt\n"
             local_state.unlink()
             repaired = subprocess.run(
-                [str(POLLER)],
+                [str(poller_path)],
                 env=environment,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

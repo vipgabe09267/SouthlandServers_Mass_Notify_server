@@ -41,11 +41,8 @@ The response contains `ok: true`, `resource: readiness`,
 `schema: sls-deployment-readiness-v1`, timezone-aware `generated_at`, module
 `version`, `operational_ready`, `attention_count`, `unknown_count`, `checks` and
 `verification_scope`. Each check has an `id`, `label`, `state` (`ok`, `warning`
-or `unknown`) and a readable `detail`. Checks such as `clock`, `certificate` and
-`capacity` have semantic IDs. The `runtime_N` IDs reflect the current diagnostic
-list position and can change when checks are reordered or added; do not treat
-their number as a stable identity. Use the aggregate readiness fields for the
-overall result.
+or `unknown`) and a readable `detail`. Runtime check IDs are positional; use the
+aggregate readiness fields rather than assuming an index across releases.
 Runtime checks exclude passwords, API keys and announcement bodies. Internal
 paths, capacity measurements and administrator-entered device-test observations
 are included, so treat downloaded reports as confidential operational information.
@@ -139,3 +136,5 @@ FastCGI route.
 Local success does not certify 1,000-client throughput, handset display, full
 audio playback, provider acceptance or human receipt. Perform those acceptance
 tests with the intended devices, routes and providers before operational use.
+
+Missing or stale worker/storage snapshots must remain unconfirmed for two minutes before a system email is sent. Dashboard diagnostics remain immediate. A brief recovery clears the pending observation; a confirmed disk, audit or delivery failure retains its normal reporting. Lock contention during retention is deferred without generating a failure alert.

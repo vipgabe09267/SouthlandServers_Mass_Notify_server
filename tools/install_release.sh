@@ -55,12 +55,12 @@ if [ -n "${SLS_MASS_NOTIFY_MODULE:-}" ] \
     "SLS_MASS_NOTIFY_MODULE is fixed to the FreePBX raw module name '$MODULE'; refusing an alternate value." >&2
   exit 2
 fi
-TGZ="${SLS_MASS_NOTIFY_TGZ:-/tmp/slsmassnotifyserver-0.1.7-beta.tgz}"
+TGZ="${SLS_MASS_NOTIFY_TGZ:-/tmp/slsmassnotifyserver-0.1.8-beta.tgz}"
 URL="${SLS_MASS_NOTIFY_TGZ_URL:-${1:-}}"
 SHA256="${SLS_MASS_NOTIFY_SHA256:-}"
 TOKEN="${SLS_MASS_NOTIFY_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
 LOG_FILE="${SLS_MASS_NOTIFY_INSTALL_LOG:-/tmp/slsmassnotifyserver-install.log}"
-EXPECTED_TGZ_SHA256="a516ec2f707caedba5f04d9613d3a4043265a2b10156a0dba1904b2934a78558"
+EXPECTED_TGZ_SHA256="3533c0991db2b52ee03e7973eebbc94087a5cc72daf14565dc44d3873eb63406"
 DATA_DIR="/var/lib/asterisk/SLS_Mass_Notifications_Plugin"
 CONFIG_FILE="$DATA_DIR/mass-notifications.config"
 CONFIG_SNAPSHOT=""
@@ -656,6 +656,10 @@ commit_authenticated_installer() {
     digest="$(sha256sum "$inventory" | cut -d ' ' -f 1)" || return 1
     /usr/bin/python3 -I "$TRUST_TOOL" --root "$TRUST_ROOT" enroll-reviewed --inventory "$inventory" --sha256 "$digest" || return 1
   done
+  run_logged /usr/bin/python3 -I "$INSTALL_BOOTSTRAP_DIR/sls_upgrade_trust.py" \
+    --workspace "$UPGRADE_TRUST_DIR" --trust-root "$TRUST_ROOT" --cache-stock \
+    --coordination-fd "$INSTALL_MAINTENANCE_LOCK_FD" \
+    --coordination-lock "${SLS_MASS_NOTIFY_MAINTENANCE_LOCK:-/run/lock/sls-mass-notify-maintenance.lock}" || return 1
   protected_install_phase plan
 }
 
@@ -1711,6 +1715,7 @@ acquire_maintenance_coordination() {
     descriptor="${descriptor_path##*/}"
     if [[ "$descriptor" =~ ^[0-9]+$ ]] && flock -n "$descriptor"; then
       log "Using the maintenance worker's inherited installation lock."
+      INSTALL_MAINTENANCE_LOCK_FD="$descriptor"
       return 0
     fi
   done
@@ -1882,6 +1887,10 @@ asterisk_capability_available() {
     application)
       capability_info="$(asterisk_cli_output "core show application $capability_name")"
       marker="Info about Application '$capability_name'"
+      ;;
+    manager)
+      capability_info="$(asterisk_cli_output "manager show command $capability_name")"
+      marker="Info about Manager Command '$capability_name'"
       ;;
     *)
       log "Unknown Asterisk capability type: $capability_type"
@@ -2137,10 +2146,19 @@ ensure_required_asterisk_capabilities() {
   ensure_asterisk_capability function IF func_logic.so || return 1
   ensure_asterisk_capability function DB func_db.so || return 1
   ensure_asterisk_capability function CALLERID func_callerid.so || return 1
+  ensure_asterisk_capability function TIMEOUT func_timeout.so || return 1
+  ensure_asterisk_capability function MUTEAUDIO res_mutestream.so || return 1
+  ensure_asterisk_capability function CONFBRIDGE app_confbridge.so || return 1
+  ensure_asterisk_capability manager MuteAudio res_mutestream.so || return 1
+  ensure_asterisk_capability manager PlayDTMF app_senddtmf.so || return 1
+  require_asterisk_capability manager Setvar || return 1
+  require_asterisk_capability manager Getvar || return 1
   ensure_asterisk_capability application ConfBridge app_confbridge.so || return 1
   ensure_asterisk_capability application Page app_page.so || return 1
   ensure_asterisk_capability application AGI res_agi.so || return 1
   ensure_asterisk_capability application Playback app_playback.so || return 1
+  ensure_asterisk_capability application PlayTones app_playtones.so || return 1
+  ensure_asterisk_capability application StopPlayTones app_playtones.so || return 1
   ensure_asterisk_capability application Read app_read.so || return 1
   ensure_asterisk_capability application ExecIf app_exec.so || return 1
   ensure_asterisk_capability application Gosub app_stack.so || return 1
@@ -2306,7 +2324,7 @@ verify_asterisk_module_startup_persistence() {
     func_pjsip_contact.so func_pjsip_aor.so func_strings.so func_channel.so \
     func_logic.so func_db.so func_callerid.so app_exec.so \
     app_page.so app_confbridge.so app_stack.so app_verbose.so \
-    res_agi.so app_read.so app_playback.so; do
+    res_agi.so app_read.so app_playback.so func_timeout.so; do
     asterisk_module_starts_persistently "$module_name" || {
       log "Required Asterisk module is available now but is blocked after restart by /etc/asterisk/modules.conf: $module_name"
       log "Enable Asterisk module autoloading or explicitly load that module through the PBX-managed module configuration, then rerun the installer."
@@ -2604,12 +2622,12 @@ PHONE_RESOURCE_BASELINE = 100
 PHONE_CONTACTS_PER_CPU = 200
 PHONE_MEMORY_PER_CONTACT = 2 * MIB
 PHONE_MEMORY_ROUNDING = 256 * MIB
-# Reference measured 2026-10-02 on Debian12/CPython3.11/amd64 with every exact pin.
+# Reference measured 2026-10-23 on Debian12/CPython3.11/amd64 with every exact pin.
 # The compressed wheel sizes are from the corresponding PyPI version JSON APIs.
-PINNED_VENV_ALLOCATED = 217780224
-PINNED_VENV_FILES = 4376
-PINNED_WHEEL_BYTES = 77802965
-PINNED_VERSIONS = {'pip': '26.2.1', 'setuptools': '84.0.0', 'wheel': '0.48.0',
+PINNED_VENV_ALLOCATED = 218210304
+PINNED_VENV_FILES = 4387
+PINNED_WHEEL_BYTES = 77861012
+PINNED_VERSIONS = {'pip': '26.2.1', 'setuptools': '84.2.1', 'wheel': '0.48.0',
                    'piper-tts': '1.8.0', 'onnxruntime': '1.30.0', 'numpy': '2.4.6',
                    'flatbuffers': '25.12.19', 'packaging': '26.3',
                    'pathvalidate': '3.3.1', 'protobuf': '7.36.2'}
@@ -2625,6 +2643,7 @@ VOICE_BYTES = {'en_US-lessac-low.onnx': 63201294, 'en_US-lessac-low.onnx.json': 
                'de_DE-thorsten-low.onnx.json': 4159,
                'pt_BR-faber-medium.onnx': 63201294,
                'pt_BR-faber-medium.onnx.json': 4855}
+REGIONAL_VOICE_BYTES = {'es_MX-ald-medium': {'es_MX-ald-medium.onnx.json': 4878, 'es_MX-ald-medium.onnx': 63201294}, 'en_GB-cori-high': {'en_GB-cori-high.onnx.json': 4963, 'en_GB-cori-high.onnx': 114219352}}
 MANAGED_TREES = {'runtime': '/usr/local/bin/sls_mass_notify',
                  'venv': '/usr/local/bin/sls_mass_notify/piper/venv',
                  'voices': '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices',
@@ -2652,7 +2671,7 @@ def rounded(value, unit=4096):
     return (int(value) + unit - 1) // unit * unit
 
 
-def storage_requirements(measured=None, missing_voices=None, allocation_units=None, temporary_directory='/tmp', *, mode='install', payloads=None):
+def storage_requirements(measured=None, missing_voices=None, allocation_units=None, temporary_directory='/tmp', *, mode='install', payloads=None, optional_packs=()):
     """Explain each byte reservation; retained history is not a fixed quota.
 
     Installation workspaces may overlap bounded state updates/compaction.
@@ -2675,8 +2694,12 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
     runtime, voices, data = (MANAGED_TREES[name] for name in ('runtime', 'voices', 'data'))
     reference_venv = PINNED_VENV_ALLOCATED + PINNED_VENV_FILES * (unit(runtime) - 4096)
     venv = max(reference_venv, size('venv'))
-    voice_total = sum(rounded(value, unit(voices)) for value in VOICE_BYTES.values())
-    model_temporary = rounded(max(VOICE_BYTES.values()), unit(voices))
+    voice_sizes=dict(VOICE_BYTES)
+    for pack in optional_packs:
+        if pack not in REGIONAL_VOICE_BYTES:raise ValueError('Unknown optional speech pack')
+        voice_sizes.update(REGIONAL_VOICE_BYTES[pack])
+    voice_total = sum(rounded(value, unit(voices)) for value in voice_sizes.values())
+    model_temporary = rounded(max(voice_sizes.values()), unit(voices))
     if missing_voices is None:
         missing_voices = voice_total
     # Phone and weather state reserve 16 MiB each; encrypted configuration
@@ -2699,7 +2722,13 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
         },
         runtime: {'replacement_runtime': max(size('runtime'), venv + payload(runtime))},
         voices: {'missing_or_replacement_voices': max(int(missing_voices), model_temporary)},
-        data: {'bounded_atomic_state_writes': atomic_state},
+        data: {'bounded_atomic_state_writes': atomic_state,
+               'desktop_delivery_history_headroom': 160 * MIB,
+               # Sixteen independently locked 4 MiB ledgers may replace in parallel.
+               'browser_evidence_and_atomic_write_headroom': 16 * 2 * 4 * MIB,
+               'conditional_weather_cache_and_atomic_write_headroom': 64 * MIB,
+               'desktop_feed_cache_and_atomic_write_headroom': 128 * MIB + 8192,
+               'postfix_evidence_and_atomic_write_headroom': 8 * MIB},
         MANAGED_TREES['config_backups']: {'remaining_bounded_config_backups': backup_growth},
         MANAGED_TREES['module']: {'new_module_payload': payload(MANAGED_TREES['module'])},
         # Independent target mounts each need room for a legal package payload.
@@ -2710,7 +2739,9 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
         # Maintenance compacts logs sequentially, using backup and retained temporary files.
         '/var/log': {'event_log_backup_and_retained_copy': 2 * 64 * MIB},
         '/var/lib/sls-mass-notify-trust': {'new_authenticated_generation': payload('/var/lib/sls-mass-notify-trust'),
-                                         'stock_and_release_manifests': 8 * MIB},
+                                         'stock_and_release_manifests': 8 * MIB,
+                                         'bounded_signed_stock_cache': 4 * 64 * MIB,
+                                         'signed_stock_cache_atomic_write': 64 * MIB},
         temporary_directory: {'release_download_and_metadata': 52 * MIB + 16 * 1024 + 4096,
                  'extracted_release': payload(temporary_directory), 'failed_release_recovery': payload(temporary_directory),
                  # Two retained signed upstream packages and one active GPG
@@ -2720,7 +2751,7 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
                  'quarantined_python_caches': 16 * MIB,
                  'pinned_wheel_downloads': rounded(PINNED_WHEEL_BYTES, unit(temporary_directory)),
                  'wheel_unpack_workspace': venv, 'pip_old_package_recovery': venv,
-                 'one_voice_download': rounded(max(VOICE_BYTES.values()), unit(temporary_directory))},
+                 'one_voice_download': rounded(max(voice_sizes.values()), unit(temporary_directory))},
     }
     if mode != 'install':
         components = {data: {'bounded_atomic_state_writes': atomic_state},
@@ -2740,7 +2771,7 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
             if path not in inode_budgets:
                 inode_budgets[path] = int(payloads.get(path, {}).get('entries', 2000)) + 16
         inode_budgets[runtime] += max(PINNED_VENV_FILES, int(measured.get('venv', {}).get('files', 0)))
-        inode_budgets[voices] = len(VOICE_BYTES) + 4
+        inode_budgets[voices] = len(voice_sizes) + 4
         inode_budgets[temporary_directory] = 2 * int(payloads.get(temporary_directory, {}).get('entries', 2000)) + 128
         inode_budgets[INSTALLER_JOURNAL] = 3 * int(payloads.get(INSTALLER_JOURNAL, {}).get('entries', 2000)) + 128 + sum(
             int(measured.get(name, {}).get('files', 0)) + int(measured.get(name, {}).get('directories', 0))
@@ -2754,7 +2785,7 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
             'pinned_runtime_reference_bytes': reference_venv, 'pinned_wheel_download_bytes': PINNED_WHEEL_BYTES,
             'component_budgets_bytes': components, 'free_budgets_bytes': budgets,
             'inode_budgets': inode_budgets, 'allocation_units': units, 'payloads': payloads,
-            'missing_voice_bytes': missing_voices,
+            'missing_voice_bytes': missing_voices, 'optional_voice_packs':list(optional_packs),
             'temporary_directory': temporary_directory,
             'sls_persistent_free_bytes': sum(value for path, value in budgets.items() if path != temporary_directory),
             'temporary_free_bytes': budgets[temporary_directory],
@@ -2858,7 +2889,7 @@ def measure_tree(path, deadline, maximum_entries=50000, *, cache=None):
     return dict(cache.get(str(root), result))
 
 
-def probe_storage(mode='install', payloads=None):
+def probe_storage(mode='install', payloads=None, optional_packs=()):
     deadline = time.monotonic() + (3 if mode == 'runtime' else 15)
     cache = {}
     measured = {name: measure_tree(path, deadline, cache=cache) for name, path in
@@ -2887,7 +2918,11 @@ def probe_storage(mode='install', payloads=None):
             existing = existing.parent
         units[path] = os.statvfs(existing).f_frsize
     missing = 0
-    for name, expected in VOICE_BYTES.items():
+    voice_sizes=dict(VOICE_BYTES)
+    for pack in optional_packs:
+        if pack not in REGIONAL_VOICE_BYTES:raise ValueError('Unknown optional speech pack')
+        voice_sizes.update(REGIONAL_VOICE_BYTES[pack])
+    for name, expected in voice_sizes.items():
         path = Path(MANAGED_TREES['voices'], name)
         try:
             metadata = path.lstat()
@@ -2895,7 +2930,7 @@ def probe_storage(mode='install', payloads=None):
             metadata = None
         if metadata is None or not stat.S_ISREG(metadata.st_mode) or metadata.st_size != expected:
             missing += rounded(expected, max(4096, units[MANAGED_TREES['voices']]))
-    return storage_requirements(measured, missing, units, mode=mode, payloads=payloads)
+    return storage_requirements(measured, missing, units, mode=mode, payloads=payloads, optional_packs=optional_packs)
 
 
 def measure_release_payloads(source):
@@ -2912,9 +2947,9 @@ def measure_release_payloads(source):
     for directory, dirs, files in os.walk(root, followlinks=False):
         for name in (*dirs, *files):
             path = Path(directory, name); info = path.lstat(); entries += 1
-            if (entries > 2000 or info.st_uid != 0 or info.st_mode & 0o022
+            if (entries > 5000 or info.st_uid != 0 or info.st_mode & 0o022
                     or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode) and info.st_nlink == 1)):
-                raise ResourceProbeError('candidate_source_unsafe', 'The authenticated candidate contains an unsafe entry or exceeds its 2000-entry bound.')
+                raise ResourceProbeError('candidate_source_unsafe', 'The authenticated candidate contains an unsafe entry or exceeds its 5000-entry bound.')
             relative = path.relative_to(root).as_posix()
             size = info.st_size if stat.S_ISREG(info.st_mode) else 0
             total += size
@@ -3074,7 +3109,7 @@ def probe_storage_filesystems(storage, temporary_directory=None):
             payloads = dict(storage.get('payloads', {}))
             if '/tmp' in payloads: payloads[path] = payloads.pop('/tmp')
             candidate = storage_requirements(storage.get('measured_trees'), storage.get('missing_voice_bytes'), units, path,
-                mode=storage.get('mode', 'install'), payloads=payloads)
+                mode=storage.get('mode', 'install'), payloads=payloads, optional_packs=storage.get('optional_voice_packs',()))
         filesystems = probe_filesystems(candidate['free_budgets_bytes'], candidate.get('inode_budgets'))
         if first is None:
             first = (candidate, filesystems)
@@ -3187,6 +3222,9 @@ def configured_limits(path):
                   (('desktop_client_limit', 25), ('phone_device_limit', PHONE_BASELINE))}
     if any(type(limit) is not int or not 1 <= limit <= 1000 for limit in capacities.values()):
         raise ValueError('Invalid notification capacity')
+    optional=value.get('speech_optional_voice_packs',[])
+    if not isinstance(optional,list) or len(optional)>2 or any(not isinstance(pack,str) or pack not in REGIONAL_VOICE_BYTES for pack in optional) or len(set(optional))!=len(optional):raise ValueError('Invalid optional speech packs')
+    if optional:capacities['speech_optional_voice_packs']=optional
     return capacities
 
 
@@ -3430,7 +3468,7 @@ def main(argv=None):
         cpu, memory = probe_compute()
         stage = 'SLS storage'
         payloads = measure_release_payloads(options.candidate_source) if options.candidate_source else None
-        storage = probe_storage(options.mode, payloads)
+        storage = probe_storage(options.mode,payloads,optional_packs=saved['speech_optional_voice_packs']) if saved.get('speech_optional_voice_packs') else probe_storage(options.mode,payloads)
         stage = 'filesystem free space'
         storage, filesystems = probe_storage_filesystems(storage, options.temporary_directory)
         result = evaluate({'effective_cpu_count': cpu, 'effective_memory_bytes': memory,
@@ -3746,7 +3784,7 @@ install_bootstrap_dependencies() {
   else
     missing_packages+=(php-common)
   fi
-  { [ -x /usr/bin/flock ] && [ -x /usr/sbin/runuser ]; } || missing_packages+=(util-linux)
+  { [ -x /usr/bin/flock ] && [ -x /usr/sbin/runuser ] && [ -x /usr/bin/prlimit ]; } || missing_packages+=(util-linux)
   { [ -x /usr/bin/timeout ] && [ -x /usr/bin/readlink ]; } || missing_packages+=(coreutils)
   [ -x /usr/bin/timedatectl ] || missing_packages+=(systemd)
   [ -r /usr/share/zoneinfo/UTC ] || missing_packages+=(tzdata)
@@ -3842,7 +3880,7 @@ install_dependencies() {
     /usr/bin/python3 -I -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM' >/dev/null 2>&1 || add_missing_package python3-cryptography
     [ -x /usr/bin/node ] || add_missing_package nodejs
     { [ -x /usr/bin/crontab ] && [ -x /usr/sbin/cron ]; } || add_missing_package cron
-    { [ -x /usr/bin/flock ] && [ -x /usr/sbin/runuser ]; } || add_missing_package util-linux
+    { [ -x /usr/bin/flock ] && [ -x /usr/sbin/runuser ] && [ -x /usr/bin/prlimit ]; } || add_missing_package util-linux
     { [ -x /usr/bin/timeout ] && [ -x /usr/bin/readlink ]; } || add_missing_package coreutils
 
     if [ "${#missing_packages[@]}" -gt 0 ]; then
@@ -4086,6 +4124,22 @@ PYPHPHANDLER
   log "Detected served PHP profiles: ${SERVED_PHP_PROFILES//$'\n'/, }"
 }
 
+verify_php_security_versions_before_mutation() {
+  local profile version policy
+  policy="$(cat "$STAGING_DIR/$MODULE/bin/sls_mass_notify/php-security-policy.json")" || return 1
+  while IFS= read -r profile; do
+    [ -n "$profile" ] || continue
+    version="${profile%:*}"
+    [ -x "/usr/bin/php$version" ] || { log "PHP $version CLI is missing for the served handler. Install the matching trusted vendor package before retrying. No SLS workers were paused."; return 1; }
+    sls_as_asterisk "/usr/bin/php$version" -n -r '
+$policy=json_decode($argv[1],true,16,JSON_THROW_ON_ERROR);$branch=PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;$floor=$policy["branches"][$branch]??null;
+if (($policy["schema"]??null)!==1 || !is_string($floor) || !preg_match("/^[0-9]+\\.[0-9]+\\.[0-9]+$/D",$floor) || version_compare(PHP_VERSION,$floor,"<") || preg_match("/(?:dev|alpha|beta|rc)/i",PHP_VERSION)) {
+ fwrite(STDERR,"PHP ".PHP_VERSION." does not meet the reviewed PHP security floor ".($floor??"(unqualified branch)").". Update the matching CLI and Apache/FPM packages through the trusted operating-system repository, then retry. No SLS workers were paused.".PHP_EOL);exit(1);
+}
+' "$policy" || return 1
+  done <<<"$SERVED_PHP_PROFILES"
+}
+
 verify_served_php_configuration() {
   local profile version sapi
   while IFS= read -r profile; do
@@ -4095,9 +4149,12 @@ verify_served_php_configuration() {
     sls_as_asterisk /usr/bin/env "PHP_INI_SCAN_DIR=/etc/php/$version/$sapi/conf.d" "/usr/bin/php$version" -c "/etc/php/$version/$sapi/php.ini" -r '
 $missing=[]; foreach (["pdo_sqlite","curl","dom","mbstring","posix","openssl","sodium"] as $extension) { if (!extension_loaded($extension)) $missing[]=$extension; }
 if (PHP_VERSION_ID < 80200) $missing[]="php_8_2_or_newer";
+$securityFloors=["8.2"=>"8.2.35","8.3"=>"8.3.36","8.4"=>"8.4.27","8.5"=>"8.5.12"];
+$branch=PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;
+if (!isset($securityFloors[$branch]) || version_compare(PHP_VERSION,$securityFloors[$branch],"<")) { fwrite(STDERR,"PHP ".PHP_VERSION." does not meet the reviewed security policy. Update this PHP branch using its trusted vendor packages, then retry. Unknown backports need independent vendor review; SLS does not change the PHP branch.".PHP_EOL); exit(1); }
 foreach (["exec","proc_open","posix_geteuid","posix_getpwnam","openssl_encrypt","openssl_decrypt","sodium_crypto_pwhash","sodium_crypto_aead_xchacha20poly1305_ietf_encrypt"] as $function) { if (!function_exists($function)) $missing[]=$function."_enabled"; }
 if ($missing) { fwrite(STDERR,"Served PHP configuration missing: ".implode(", ",$missing).PHP_EOL); exit(1); }
-' || { log "Enable required extensions for PHP $version/$sapi; no module activation has started."; return 1; }
+' || { log "Review the named PHP $version/$sapi security or extension prerequisite; update this handler through trusted vendor packages. No module activation has started."; return 1; }
   done <<<"$SERVED_PHP_PROFILES"
 }
 
@@ -4218,7 +4275,15 @@ copy_private_release_asset() {
   /usr/bin/python3 -I - "$1" "$2" "$3" <<'PYASSET'
 import os, stat, sys
 source, target, bound = sys.argv[1], sys.argv[2], int(sys.argv[3])
-fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+try:
+    fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+except FileNotFoundError:
+    raise SystemExit(
+        'Local release asset is missing: ' + source + '. '
+        'Supply SLS_MASS_NOTIFY_TGZ_URL for a signed release download, or keep '
+        'the matching TGZ, release-manifest.json and release-manifest.sig together. '
+        'Local archives also require SLS_MASS_NOTIFY_SHA256.'
+    ) from None
 try:
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= bound:
@@ -4277,8 +4342,8 @@ verify_tgz() {
       log 'The release archive does not match the explicitly trusted SLS_MASS_NOTIFY_SHA256.'
       return 1
     fi
-  elif [ "$requested_basename" = "slsmassnotifyserver-0.1.7-beta.tgz" ] && [ "$actual_sha" != "$EXPECTED_TGZ_SHA256" ]; then
-    log "$TGZ does not match the current slsmassnotifyserver-0.1.7-beta package."
+  elif [ "$requested_basename" = "slsmassnotifyserver-0.1.8-beta.tgz" ] && [ "$actual_sha" != "$EXPECTED_TGZ_SHA256" ]; then
+    log "$TGZ does not match the current slsmassnotifyserver-0.1.8-beta package."
     log "Expected SHA256: $EXPECTED_TGZ_SHA256"
     log "Actual SHA256:   $actual_sha"
     log "Remove the stale local TGZ or install with SLS_MASS_NOTIFY_TGZ_URL so the current release is downloaded."
@@ -4304,7 +4369,7 @@ total = 0
 seen_module_xml = False
 with tarfile.open(archive, "r:gz") as handle:
     members = handle.getmembers()
-    if not members or len(members) > 2000:
+    if not members or len(members) > 5000:
         raise SystemExit("TGZ has an invalid file count")
     seen = set()
     for member in members:
@@ -4347,8 +4412,8 @@ with tarfile.open(archive, "r:gz") as handle:
     version = root.findall("version")
     if len(rawname) != 1 or (rawname[0].text or "").strip() != module:
         raise SystemExit("module.xml rawname does not match the requested module")
-    if len(version) != 1 or (version[0].text or "").strip() != "0.1.7-beta":
-        raise SystemExit("module.xml does not contain the expected 0.1.7-beta version")
+    if len(version) != 1 or (version[0].text or "").strip() != "0.1.8-beta":
+        raise SystemExit("module.xml does not contain the expected 0.1.8-beta version")
 PY
 }
 
@@ -4378,7 +4443,7 @@ url = os.environ['SLS_RELEASE_URL']
 match = re.fullmatch(r'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/download/slsmassnotifyserver-([0-9]+\.[0-9]+\.[0-9]+(?:-beta)?)/(slsmassnotifyserver-\1\.tgz)', url)
 if url and not match:
     raise SystemExit('Use a signed GitHub release URL or a signed offline package.')
-version, package = match.groups() if match else ('0.1.7-beta', 'slsmassnotifyserver-0.1.7-beta.tgz')
+version, package = match.groups() if match else ('0.1.8-beta', 'slsmassnotifyserver-0.1.8-beta.tgz')
 public_key = b'-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAFMDOgOaBGcaI8d+v0w/NX4RbwGlBsoktNc2V2F8UkUQ=\n-----END PUBLIC KEY-----\n'
 try:
     with tempfile.TemporaryDirectory(prefix='sls-release-verification-') as directory:
@@ -4962,6 +5027,52 @@ module_known() {
   grep -Eq "\\|[[:space:]]*$1[[:space:]]*\\|" <<<"$module_list"
 }
 
+lint_staged_module_php() {
+  local source_root="$1" script php_version_id
+  php_version_id="$(/usr/bin/php -n -r 'echo PHP_VERSION_ID;')" || return 1
+  if [ "$php_version_id" -lt 80500 ] && [ -e "$source_root/passkey-libs/vendor/symfony/polyfill-uuid/bootstrap85.php" ]; then
+    # The authenticated archive contains one upstream branch gated to PHP 8.5.
+    # Match both its exact bytes and its exact version-gated loader before any
+    # parser exception; unrelated PHP files always receive normal syntax checks.
+    /usr/bin/python3 -I - "$source_root" <<'PYPHP_COMPATIBILITY' || return 1
+from pathlib import Path
+import hashlib, os, stat, sys
+root = Path(sys.argv[1])
+expected = {
+    'bootstrap80.php': 'f5fb564b3680b4c79c14697e2e92053b620b90207fe30684ce4b809bd309f07e',
+    'bootstrap85.php': 'ac3e2f020892721841f0083ef34c6794992e6db06b6379969a245f51066e5a85',
+}
+identity = lambda m: (m.st_dev, m.st_ino, m.st_uid, m.st_mode, m.st_nlink,
+    m.st_size, m.st_mtime_ns, m.st_ctime_ns)
+for name, digest in expected.items():
+    path = root / 'passkey-libs/vendor/symfony/polyfill-uuid' / name
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(descriptor, 'rb') as source:
+            before = os.fstat(source.fileno())
+            if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                    or before.st_uid != 0 or before.st_mode & 0o022 or before.st_size > 65536):
+                raise ValueError('unsafe file metadata')
+            body = source.read(65537)
+            after = os.fstat(source.fileno())
+        if (len(body) != before.st_size or identity(before) != identity(after)
+                or identity(after) != identity(path.lstat())
+                or hashlib.sha256(body).hexdigest() != digest):
+            raise ValueError('unexpected file contents')
+    except (OSError, ValueError):
+        raise SystemExit('The reviewed PHP 8.5 compatibility profile differs at ' + name
+            + '. Preserve the package and use its matching verified installer; no PHP checks were bypassed.') from None
+PYPHP_COMPATIBILITY
+  fi
+  while IFS= read -r -d '' script; do
+    if [ "$php_version_id" -lt 80500 ] && [ "$script" = "$source_root/passkey-libs/vendor/symfony/polyfill-uuid/bootstrap85.php" ]; then continue; fi
+    /usr/bin/php -n -l "$script" >/dev/null || {
+      log "The staged module contains an invalid PHP file: $script"
+      return 1
+    }
+  done < <(find "$source_root" -type f -name '*.php' -print0)
+}
+
 stage_module_directory() {
   local module_list inventory_status
   if [ "${SLS_MASS_NOTIFY_INVENTORY_ONLY:-0}" = 1 ]; then
@@ -4989,12 +5100,7 @@ stage_module_directory() {
     log "The staged module tree is incomplete."
     exit 1
   fi
-  while IFS= read -r script; do
-    /usr/bin/php -n -l "$script" >/dev/null || {
-      log "The staged module contains an invalid PHP file: $script"
-      exit 1
-    }
-  done < <(find "$STAGING_DIR/$MODULE" -type f -name '*.php' -print)
+  lint_staged_module_php "$STAGING_DIR/$MODULE" || return 1
   while IFS= read -r script; do
     bash -n "$script" || {
       log "The staged module contains an invalid shell script: $script"
@@ -5143,7 +5249,7 @@ $module = getenv("SLS_MASS_NOTIFY_MODULE") ?: "slsmassnotifyserver";
 $stmt = \FreePBX::Database()->prepare("SELECT version FROM modules WHERE modulename = ? LIMIT 1");
 $stmt->execute([$module]);
 $version = $stmt->fetchColumn();
-exit(is_string($version) && trim($version) === "0.1.7-beta" ? 0 : 1);
+exit(is_string($version) && trim($version) === "0.1.8-beta" ? 0 : 1);
 ' >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1
 }
 
@@ -5379,6 +5485,9 @@ if health.get("pjsip_show_contacts") not in {"authorized", "authorized_empty"}:
     raise SystemExit("AMI PJSIPShowContacts authorization was not confirmed")
 if health.get("pjsip_notify") != "authorized":
     raise SystemExit("AMI PJSIPNotify authorization was not confirmed")
+if health.get("live_paging_actions") != {
+        name: "authorized" for name in ("MuteAudio", "PlayDTMF", "Setvar", "Getvar")}:
+    raise SystemExit("AMI live-paging authorization was not confirmed for MuteAudio, PlayDTMF, Setvar and Getvar")
 PY
 }
 
@@ -5403,7 +5512,7 @@ verify_ami_with_repair() (
     asterisk -rx "manager reload" >>"${INSTALL_LOG_OUTPUT:-$LOG_FILE}" 2>&1 || true
     sleep 2
   done
-  log "SLS AMI authentication, Ping, PJSIPShowContacts, or PJSIPNotify authorization failed after automatic repair. See $LOG_FILE."
+  log "SLS AMI authentication, contact/NOTIFY discovery, or caller-ready paging authorization failed after automatic repair. See $LOG_FILE."
   return 1
 )
 
@@ -5505,9 +5614,9 @@ try:
 except (OSError, ValueError, AssertionError):
     raise SystemExit('The served PHP runtime probe did not reach SLS. Check the local virtual host, API route and PHP handler; CLI PHP alone is insufficient.')
 if result.get('ok') is not True or sys.argv[2] != '200':
-    missing = [name for name in result['missing'] if name in ('pdo_sqlite','curl','dom','mbstring','posix','openssl','sodium','php_8_2_or_newer','exec_enabled','proc_open_enabled','posix_geteuid_enabled','posix_getpwnam_enabled','openssl_encrypt_enabled','openssl_decrypt_enabled','sodium_crypto_aead_xchacha20poly1305_ietf_encrypt_enabled','sodium_crypto_pwhash_str_enabled','web_runtime_must_run_as_asterisk')]
+    missing = [name for name in result['missing'] if name in ('pdo_sqlite','curl','dom','mbstring','posix','openssl','sodium','php_8_2_or_newer','php_security_floor','exec_enabled','proc_open_enabled','posix_geteuid_enabled','posix_getpwnam_enabled','openssl_encrypt_enabled','openssl_decrypt_enabled','sodium_crypto_aead_xchacha20poly1305_ietf_encrypt_enabled','sodium_crypto_pwhash_str_enabled','web_runtime_must_run_as_asterisk')]
     raise SystemExit('The PHP runtime serving Apache is missing: ' + ', '.join(missing) + '. Enable these for the active Apache/FPM PHP version and retry; installing CLI extensions alone does not repair another PHP handler.')
-if result.get('module_version') != '0.1.7-beta':
+if result.get('module_version') != '0.1.8-beta':
     raise SystemExit('The web PHP handler is still serving another SLS release. Review Apache/PHP-FPM reload errors and draining requests, then retry; a CLI file check cannot verify cached web code.')
 print('Served PHP prerequisites verified through the local API route.')
 PY
@@ -6238,6 +6347,7 @@ exit(0);
   }
   runtime_python_files=(
     /usr/local/bin/sls_mass_notify/sls_notify.py
+    /usr/local/bin/sls_mass_notify/sls_live_paging_visual.py
     /usr/local/bin/sls_mass_notify/sls_config.py
     /usr/local/bin/sls_mass_notify/sls_config_crypto.py
     /usr/local/bin/sls_mass_notify/sls_console.py
@@ -6289,6 +6399,14 @@ exit(0);
     /usr/local/bin/sls_mass_notify/sls_install_transaction.py
     /usr/local/bin/sls_mass_notify/sls_phone_inventory.py
     /usr/local/bin/sls_mass_notify/sls_speech_admission.py
+    /usr/local/bin/sls_mass_notify/sls_desktop_history.py
+    /usr/local/bin/sls_mass_notify/sls_desktop_feed_cache.py
+    /usr/local/bin/sls_mass_notify/sls_mail_evidence.py
+    /usr/local/bin/sls_mass_notify/sls_nws_http.py
+    /usr/local/bin/sls_mass_notify/sls_php_security.py
+    /usr/local/bin/sls_mass_notify/sls_piper_worker.py
+    /usr/local/bin/sls_mass_notify/sls_support_snapshot.py
+    /usr/local/bin/sls_mass_notify/sls_weather_payload.py
   )
   for runtime_python in "${runtime_python_files[@]}"; do
     [ -x "$runtime_python" ] || {
@@ -6613,6 +6731,9 @@ main() {
   verify_tgz
   stage_module_directory
   prepare_installer_bootstrap
+  INSTALL_ERROR_CATEGORY="php_security_preflight_failed"
+  verify_php_security_versions_before_mutation
+  INSTALL_ERROR_CATEGORY="install_command_failed"
   bootstrap_missing_dashboard
   set_install_stage "publisher and stock approval" "Review the upgrade evidence directory printed in the log. Standard stock modules bootstrap from signed upstream packages; local differences require independently reviewed inventories. No maintenance changes occur before approval."
   prepare_authenticated_installer

@@ -3,6 +3,63 @@
   const root = document.getElementById('sls-enterprise');
   if (!root) return;
   const data = JSON.parse(document.getElementById('sls-enterprise-data').textContent);
+  const help = document.createElement('div');
+  help.id = 'sls-labs-field-tooltip'; help.className = 'sls-labs-field-tooltip';
+  help.setAttribute('role', 'tooltip'); help.hidden = true; document.body.append(help);
+  let helpTarget;
+  function hideHelp() {
+    if (helpTarget) helpTarget.removeAttribute('aria-describedby');
+    helpTarget = null; help.hidden = true;
+  }
+  function showHelp(target) {
+    if (!target || !root.contains(target) || !target.dataset.help) return;
+    hideHelp(); helpTarget = target; help.textContent = target.dataset.help;
+    target.setAttribute('aria-describedby', help.id); help.hidden = false;
+    const anchor = target.getBoundingClientRect(), box = help.getBoundingClientRect();
+    help.style.left = `${Math.max(8, Math.min(anchor.left, window.innerWidth - box.width - 8))}px`;
+    help.style.top = `${Math.max(8, anchor.bottom + box.height + 16 <= window.innerHeight ? anchor.bottom + 8 : anchor.top - box.height - 8)}px`;
+  }
+  root.addEventListener('mouseover', event => { const target = event.target.closest?.('.sls-field-help'); if (target && target !== helpTarget) showHelp(target); });
+  root.addEventListener('mouseout', event => {
+    if (helpTarget && !helpTarget.contains(event.relatedTarget) && !helpTarget.contains(document.activeElement)) hideHelp();
+  });
+  root.addEventListener('focusin', event => showHelp(event.target.closest?.('.sls-field-help')));
+  root.addEventListener('focusout', event => { if (event.target === helpTarget) hideHelp(); });
+  root.addEventListener('click', event => {
+    const target = event.target.closest?.('.sls-field-help');
+    if (target) { event.preventDefault(); showHelp(target); } else hideHelp();
+  });
+  root.addEventListener('keydown', event => { if (event.key === 'Escape') hideHelp(); });
+  window.addEventListener('resize', hideHelp); window.addEventListener('scroll', hideHelp, true);
+  const features = data.feature_settings || {};
+  let manager = data.feature_manager;
+  let labsEnabled = manager?.config?.enabled === true;
+  window.SlsEnterpriseMasterEnabled = () => labsEnabled;
+  function guardFeatureControls() {
+    const controls = root.querySelectorAll('[data-labs-master-required], #sls-cluster-config input[name="enabled"], #sls-cluster-config input[name="mirroring_enabled"], #sls-cluster-config input[name="remote_enabled"], #sls-cluster-config input[name="offline_cache_enabled"], #sls-integration-form input[data-setting="enabled"], #sls-integration-form input[data-setting$=".enabled"], #sls-integration-form input[data-setting="public_warning.ipaws_enabled"], #sls-operations-enabled, [data-enable-operation]');
+    controls.forEach(control => {
+      if (!labsEnabled && !control.disabled) { control.disabled = true; control.dataset.labsDisabledByMaster = '1'; control.title = 'Enable Enterprise Labs in Feature manager first.'; }
+      else if (labsEnabled && control.dataset.labsDisabledByMaster === '1') { control.disabled = false; delete control.dataset.labsDisabledByMaster; control.removeAttribute('title'); }
+    });
+  }
+  function activation(section, config) {
+    if (section) features[section] = { enabled: config.enabled === true || config.enabled === '1' };
+    const active = labsEnabled;
+    const status = document.getElementById('sls-labs-activation');
+    status.querySelector('span').className = 'label ' + (active ? 'label-success' : 'label-danger');
+    status.querySelector('span').textContent = active ? 'Active' : 'Inactive';
+    status.querySelector('small').textContent = active ? 'Enterprise Labs is enabled.' : 'Enterprise Labs is disabled.';
+    const sections = { continuity: ['enterprise_cluster'], identity: ['directory_sync', 'subscriber_browser'], integrations: ['enterprise_integrations'], operations: ['enterprise_operations'] };
+    root.querySelectorAll('[data-labs-tab]').forEach(link => {
+      let badge = link.querySelector('[data-labs-tab-status]');
+      if (!badge) { badge = document.createElement('span'); badge.dataset.labsTabStatus = ''; link.append(badge); }
+      const on = active && sections[link.dataset.labsTab].some(key => features[key]?.enabled);
+      badge.textContent = on ? 'On' : 'Off'; badge.dataset.enabled = String(on);
+    });
+    guardFeatureControls();
+  }
+  window.SlsLabsActivation = activation;
+  activation();
   const state = data.operations, config = structuredClone(state.config);
   const endpoint = 'config.php?display=slsmassnotifyserver_enterprise';
   const feedback = message => { const box = root.querySelector('#sls-enterprise-status'); box.textContent = message; box.hidden = false; box.focus(); };
@@ -21,6 +78,8 @@
         const serverMessage = typeof result.message === 'string' && result.message.trim() !== '' ? result.message : '';
         throw Error(serverMessage || (response.ok ? 'The server did not confirm this request. Reload saved state before retrying.' : `The request failed (HTTP ${response.status}).`));
       }
+      const sections = {operations_save:'enterprise_operations',directory_save:'directory_sync',subscriber_save:'subscriber_browser'};
+      if (sections[action] && input.config) activation(sections[action], input.config);
       return result;
     } catch(error) {
       if(controller.signal.aborted)throw Error('The PBX did not confirm this request within 25 seconds. Reload saved state before retrying; the request was not retried.');
@@ -28,6 +87,7 @@
     } finally { clearTimeout(timer); requestBusy = false; }
   };
   function tab(key, update = false) {
+    hideHelp();
     const keys = ['continuity', 'identity', 'integrations', 'operations']; if (!keys.includes(key)) key = keys[0];
     root.querySelectorAll('[data-labs-panel]').forEach(n => n.hidden = n.dataset.labsPanel !== key);
     root.querySelectorAll('[data-labs-tab]').forEach(n => { if (n.dataset.labsTab === key) n.setAttribute('aria-current', 'page'); else n.removeAttribute('aria-current'); });
@@ -35,6 +95,69 @@
   }
   root.querySelectorAll('[data-labs-tab]').forEach(n => n.addEventListener('click', event => { event.preventDefault(); tab(n.dataset.labsTab, true); }));
   tab(location.hash.replace(/^#labs-/, '')); window.addEventListener('hashchange', () => tab(location.hash.replace(/^#labs-/, '')));
+  const featureDialog = root.querySelector('#sls-labs-feature-manager');
+  const featureForm = root.querySelector('#sls-labs-features-form');
+  const featureMaster = root.querySelector('#sls-labs-master');
+  const featureChoices = root.querySelector('#sls-labs-feature-choices');
+  const featureAgree = root.querySelector('#sls-labs-feature-agree');
+  const featureSave = root.querySelector('#sls-labs-feature-save');
+  const featureError = root.querySelector('#sls-labs-feature-error');
+  const featureParents = { mirroring: 'cluster', remote_sites: 'cluster', offline_cache: 'cluster', browser_push: 'subscribers', ipaws: 'public_warning' };
+  let featureReady = false, featureSaving = false, featureRequest = 0;
+  const featureInputs = () => Array.from(featureChoices.querySelectorAll('[data-labs-feature]'));
+  function updateFeatureControls() {
+    featureMaster.disabled = featureSaving || !featureReady;
+    featureChoices.querySelectorAll('fieldset').forEach(group => { group.disabled = featureSaving || !featureReady || !featureMaster.checked; });
+    featureAgree.disabled = featureSaving || !featureReady;
+    featureSave.disabled = featureSaving || !featureReady || !featureAgree.checked;
+    featureDialog.querySelectorAll('[data-close-feature-manager]').forEach(button => { button.disabled = featureSaving; });
+  }
+  function showFeatureError(message) { featureError.textContent = message; featureError.hidden = false; featureError.focus(); featureError.scrollIntoView({ block: 'nearest' }); }
+  function populateFeatureManager(value) {
+    if (!value || typeof value.revision !== 'string' || !/^[a-f0-9]{64}$/.test(value.revision) || !Array.isArray(value.catalog) || typeof value.config?.enabled !== 'boolean' || !value.config.features) throw Error('The feature settings could not be read. Reload Enterprise Labs.');
+    manager = value; featureMaster.checked = value.config.enabled; featureChoices.replaceChildren();
+    const groups = new Map();
+    value.catalog.forEach(feature => {
+      if (!/^[a-z][a-z0-9_]{0,63}$/.test(feature.id) || typeof value.config.features[feature.id] !== 'boolean') throw Error('The feature catalog is invalid. Reload Enterprise Labs.');
+      let group = groups.get(feature.group);
+      if (!group) { const fieldset = node('fieldset', undefined, 'sls-feature-group'); fieldset.append(node('legend', feature.group)); group = node('div'); fieldset.append(group); featureChoices.append(fieldset); groups.set(feature.group, group); }
+      const label = node('label', undefined, 'sls-feature-choice'), control = node('input'); control.type = 'checkbox'; control.dataset.labsFeature = feature.id; control.checked = value.config.features[feature.id];
+      const description = node('span'); description.append(node('strong', feature.label), node('small', feature.description)); label.append(control, description); group.append(label);
+    });
+  }
+  featureMaster.addEventListener('change', () => { if (!featureMaster.checked) featureInputs().forEach(control => { control.checked = false; }); updateFeatureControls(); });
+  featureAgree.addEventListener('change', updateFeatureControls);
+  featureChoices.addEventListener('change', event => {
+    const control = event.target.closest('[data-labs-feature]'); if (!control) return;
+    const key = control.dataset.labsFeature;
+    featureInputs().forEach(input => {
+      if (control.checked && input.dataset.labsFeature === featureParents[key]) input.checked = true;
+      if (!control.checked && featureParents[input.dataset.labsFeature] === key) input.checked = false;
+    });
+  });
+  root.querySelector('#sls-labs-configure').addEventListener('click', async () => {
+    const request = ++featureRequest; featureReady = false; featureAgree.checked = false; featureError.hidden = true; featureChoices.replaceChildren(); featureDialog.showModal(); updateFeatureControls();
+    try {
+      const result = await post('labs_features_state');
+      if (!featureDialog.open || request !== featureRequest) return;
+      populateFeatureManager(result.manager); labsEnabled = manager.config.enabled; activation(); featureReady = true; updateFeatureControls();
+    } catch (error) { if (featureDialog.open && request === featureRequest) showFeatureError(error.message); }
+  });
+  featureDialog.querySelectorAll('[data-close-feature-manager]').forEach(button => button.addEventListener('click', () => featureDialog.close()));
+  featureDialog.addEventListener('cancel', event => { if (featureSaving) event.preventDefault(); });
+  featureDialog.addEventListener('close', () => { featureRequest++; });
+  featureForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (!featureReady || featureSaving || !featureAgree.checked || !featureForm.reportValidity()) return;
+    if (['unsaved', 'editor'].includes(root.dataset.saveState)) { showFeatureError('Save your page edits first, or reload the page to discard them before changing enabled features.'); return; }
+    featureSaving = true; featureError.hidden = true; updateFeatureControls();
+    try {
+      const selection = Object.fromEntries(featureInputs().map(control => [control.dataset.labsFeature, control.checked]));
+      const result = await post('labs_features_save', { revision: manager.revision, enabled: featureMaster.checked, features: selection, warning_revision: data.safety_revision, agree: true });
+      populateFeatureManager(result.manager); labsEnabled = manager.config.enabled; activation(); window.SlsSaveState?.set(root, 'saved'); featureDialog.close(); location.reload();
+    } catch (error) { featureReady = false; showFeatureError(error.message + ' Close and reopen Feature manager to check saved choices before retrying.'); }
+    finally { featureSaving = false; updateFeatureControls(); }
+  });
 
   const acknowledge = () => window.SlsLabsSafety.acknowledge();
   const clusterForm = root.querySelector('#sls-cluster-config');
@@ -56,7 +179,8 @@
   const editor = root.querySelector('#sls-enterprise-editor'), form = root.querySelector('#sls-enterprise-editor-form');
   const body = root.querySelector('#sls-enterprise-editor-body'), submit = root.querySelector('#sls-enterprise-editor-submit');
   let handler;
-  function open(title, label = 'Save in editor') { body.replaceChildren(); root.querySelector('#sls-enterprise-editor-title').textContent = title; submit.textContent = label; handler = null; editor.showModal(); }
+  editor.addEventListener('close', () => root.dispatchEvent(new CustomEvent('sls:editor-closed')));
+  function open(title, label = 'Save in editor') { body.replaceChildren(); root.querySelector('#sls-enterprise-editor-title').textContent = title; submit.textContent = label; handler = null; root.dispatchEvent(new CustomEvent('sls:editor-opened')); editor.showModal(); }
   root.querySelectorAll('[data-close-enterprise]').forEach(n => n.addEventListener('click', () => editor.close()));
   form.addEventListener('submit', async event => { event.preventDefault(); if (!handler || !form.reportValidity()) return; submit.disabled = true; try { const close = await handler(); if (close !== false) editor.close(); } catch (error) { feedback(error.message); } finally { submit.disabled = false; } });
   const input = (type, value = '') => { const n = node('input'); n.type = type; n.value = value; return n; };
@@ -104,8 +228,12 @@
       output.append(figure, legend); return false;
     };
   }
-  function saveRow(section, row) { const list = config[section][lists[section]], index = list.findIndex(item => item.id === row.id); if (index < 0) list.push(row); else list[index] = row; rows(); feedback('Saved in this editor. Use Save coordination settings to apply.'); }
-  function editRow(section, original) {
+  function saveRow(section, row) { const list = config[section][lists[section]], index = list.findIndex(item => item.id === row.id); if (index < 0) list.push(row); else list[index] = row; rows(); feedback('Saved in this editor. Use Save coordination settings to apply.');  window.SlsSaveState?.set(root,'editor'); }
+  async function editRow(section, original) {
+    if (section === 'dual_approval' || section === 'drills') {
+      try { state.people = (await post('operations_people')).people; }
+      catch (error) { feedback(error.message); return; }
+    }
     const row = original ? structuredClone(original) : { id: id({ floorplans: 'plan', drills: 'drill', shift_routing: 'shift', dual_approval: 'approval' }[section]), enabled: false, name: '' };
     open(`${original ? 'Edit' : 'Add'} ${labels[section]}`);
     const name = field('Name', input('text', row.name)); name.required = true; name.maxLength = 80;

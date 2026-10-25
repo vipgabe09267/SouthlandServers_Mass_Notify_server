@@ -49,10 +49,13 @@ $credentialLabels = ['extensions' => 'Phones', 'desktop_client_ids' => 'Desktop 
     <div class="sls-credential-create">
       <label for="sls-credential-name">Integration name</label><input id="sls-credential-name" class="form-control" maxlength="80" placeholder="For example, facilities automation" autocomplete="off">
       <fieldset><legend>Permissions</legend><div class="sls-credential-scopes">
-        <?php foreach (['read' => 'Read delivery status', 'send' => 'Send announcements', 'test' => 'Run weather tests', 'config' => 'Read and change configuration'] as $scope => $label): ?>
+        <?php foreach (['monitor' => 'Monitor health and metrics', 'fleet_read' => 'Read permitted desktop inventory', 'incident_read' => 'Read incident records', 'read' => 'Read delivery status', 'send' => 'Send announcements', 'test' => 'Run weather tests', 'config' => 'Read and change configuration'] as $scope => $label): ?>
           <label><input type="checkbox" data-credential-scope="<?php echo $scope; ?>"<?php echo $scope === 'read' ? ' checked' : ''; ?>> <?php echo $credentialEscape($label); ?></label>
         <?php endforeach; ?>
-      </div><p class="help-block">Restricted credentials can read only their own announcement jobs. Configuration access requires an unrestricted audience and cannot create credentials or change proxy trust.</p></fieldset>
+      </div><p class="help-block">Monitoring grants no sending or configuration access. Restricted credentials can read only their own announcement jobs and permitted desktops. Incident and configuration access require an unrestricted audience.</p></fieldset>
+      <label for="sls-credential-expires">Expiry (UTC, optional)</label>
+      <input id="sls-credential-expires" type="datetime-local" class="form-control" step="60" aria-describedby="sls-credential-expires-help">
+      <p id="sls-credential-expires-help" class="help-block">Leave blank for no automatic expiry. Expired credentials cannot authorize queued delivery.</p>
       <label class="sls-credential-unrestricted"><input type="checkbox" data-credential-unrestricted> Allow every current and future recipient</label>
       <p class="help-block"><i class="fa fa-info-circle" aria-hidden="true"></i> Leave unchecked to select permitted recipients below. Saved-group permission includes that group's current members. Weather-test permission applies to the selected zones and their configured recipients.</p>
       <div class="sls-credential-audiences">
@@ -78,6 +81,9 @@ $credentialLabels = ['extensions' => 'Phones', 'desktop_client_ids' => 'Desktop 
       <button type="button" class="btn btn-primary" data-credential-create><i class="fa fa-key" aria-hidden="true"></i> Create credential</button>
     </div>
   </details>
+  <label for="sls-credential-overlap">Previous-key overlap when rotating</label>
+  <select id="sls-credential-overlap" class="form-control" style="max-width:320px"><option value="0">Revoke immediately</option><option value="300">5 minutes</option><option value="3600" selected>1 hour</option><option value="86400">24 hours</option></select>
+  <p class="help-block">Rotation creates a replacement with the same permissions and absolute expiry. Retire the old secret after updating the integration.</p>
 </section>
 <style>
 .sls-credential-card{margin-top:20px}.sls-credential-card .table-responsive{position:relative;overflow-x:auto;max-width:100%}.sls-credential-card table{min-width:620px}.sls-credential-card [hidden]{display:none!important}.sls-credential-create{padding:16px 0}.sls-credential-create>input{max-width:520px;margin-bottom:16px}.sls-credential-create fieldset{margin:14px 0;border:0;padding:0}.sls-credential-create legend{font-size:15px;font-weight:600;margin-bottom:8px}.sls-credential-scopes{display:flex;flex-wrap:wrap;gap:12px 24px}.sls-credential-scopes label,.sls-credential-unrestricted{font-weight:400}.sls-credential-audiences{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.sls-credential-picker{border:1px solid #d7dfe7;border-radius:5px;padding:0 10px;align-self:start;background:#fff}.sls-credential-picker summary{font-size:14px}.sls-credential-picker .badge{float:right;font-weight:400;background:#e7edf4;color:#334155;margin-left:6px}.sls-credential-picker-actions{display:flex;gap:6px;padding:8px 0}.sls-credential-picker-list{max-height:190px;overflow-y:auto;margin-bottom:10px}.sls-credential-picker-list label{display:flex;gap:8px;font-weight:400;padding:6px 2px;margin:0;overflow-wrap:anywhere;cursor:pointer}.sls-credential-picker-list input{flex:0 0 auto}.sls-credential-picker[aria-disabled="true"]{opacity:.6}.sls-credential-secret-controls{display:flex;gap:8px;flex-wrap:wrap}.sls-credential-secret-controls input{flex:1;min-width:180px;font-family:monospace}.sls-credential-card summary{cursor:pointer;font-weight:600;padding:10px 0}.sls-credential-card td{vertical-align:middle!important;overflow-wrap:anywhere}.sls-credential-card small{display:block;color:#596579}@media(max-width:900px){.sls-credential-audiences{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:560px){.sls-credential-audiences{grid-template-columns:1fr}.sls-credential-scopes{display:grid;gap:10px}}
@@ -89,14 +95,40 @@ $credentialLabels = ['extensions' => 'Phones', 'desktop_client_ids' => 'Desktop 
  var rows=<?php echo json_encode($credentialRows, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
  var status=card.querySelector('.sls-credential-status'),secretPanel=card.querySelector('.sls-credential-secret'),secret=card.querySelector('#sls-credential-secret-value'),busy=false;
  function message(text,ok){status.textContent=text;status.className='sls-credential-status alert '+(ok?'alert-success':'alert-danger');status.hidden=false;}
- function render(){var body=card.querySelector('[data-credential-rows]');body.textContent='';if(!rows.length){var empty=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=5;cell.textContent='No named credentials yet.';empty.appendChild(cell);body.appendChild(empty);return;}
- rows.forEach(function(row){var tr=document.createElement('tr');var audience=row.audience||{},count=Object.keys(audience).reduce(function(total,key){return total+(Array.isArray(audience[key])?audience[key].length:0);},0);
- [row.name,(row.scopes||[]).join(', '),audience.unrestricted?'All recipients':count+' permitted selections',row.revoked_at?'Revoked':'Active'].forEach(function(value){var td=document.createElement('td');td.textContent=value;tr.appendChild(td);});
- var id=document.createElement('small');id.textContent=row.id;tr.firstChild.appendChild(id);var action=document.createElement('td');if(!row.revoked_at){var button=document.createElement('button');button.type='button';button.className='btn btn-sm btn-danger';button.textContent='Revoke';button.addEventListener('click',function(){if(window.confirm('Revoke '+row.name+' immediately? Requests using this credential will be rejected.'))submit({credential_action:'revoke',credential_id:row.id});});action.appendChild(button);}tr.appendChild(action);body.appendChild(tr);});}
+ function render() {
+   var body=card.querySelector('[data-credential-rows]');body.textContent='';
+   if(!rows.length){var empty=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=5;cell.textContent='No named credentials yet.';empty.appendChild(cell);body.appendChild(empty);return;}
+   rows.forEach(function(row){
+     var tr=document.createElement('tr'),audience=row.audience||{};
+     var count=Object.keys(audience).reduce(function(total,key){return total+(Array.isArray(audience[key])?audience[key].length:0);},0);
+     var expired=Number.isInteger(row.expires_at)&&row.expires_at>0&&row.expires_at<=Math.floor(Date.now()/1000);
+     var active=!row.revoked_at&&row.enabled!==false&&!expired;
+     var state=row.revoked_at?'Revoked':row.enabled===false?'Disabled':expired?'Expired':'Active';
+     [row.name,(row.scopes||[]).join(', '),audience.unrestricted?'All recipients':count+' permitted selections',state].forEach(function(value){var td=document.createElement('td');td.textContent=value;tr.appendChild(td);});
+     var id=document.createElement('small');id.textContent=row.id;tr.firstChild.appendChild(id);
+     if(row.expires_at>0){var expiry=document.createElement('small');expiry.textContent='Expires '+new Date(row.expires_at*1000).toISOString();tr.children[3].appendChild(expiry);}
+     var usage=document.createElement('small');usage.textContent=row.last_used_at>0?'Last observed use '+new Date(row.last_used_at*1000).toISOString():'No use recorded in the current audit sample.';tr.children[3].appendChild(usage);
+     var actions=document.createElement('td');
+     if(active){var rotate=document.createElement('button');rotate.type='button';rotate.className='btn btn-sm btn-default';rotate.textContent='Rotate';
+       rotate.addEventListener('click',function(){var overlap=card.querySelector('#sls-credential-overlap');if(window.confirm('Rotate '+row.name+'? Previous-key overlap: '+overlap.options[overlap.selectedIndex].text+'.'))submit({credential_action:'rotate',credential_id:row.id,overlap_seconds:overlap.value});});actions.appendChild(rotate);}
+     if(!row.revoked_at){var revoke=document.createElement('button');revoke.type='button';revoke.className='btn btn-sm btn-danger';revoke.textContent='Revoke';revoke.addEventListener('click',function(){if(window.confirm('Revoke '+row.name+' immediately? Requests using this credential will be rejected.'))submit({credential_action:'revoke',credential_id:row.id});});actions.appendChild(revoke);}
+     tr.appendChild(actions);body.appendChild(tr);
+   });
+ }
  function submit(values){if(busy)return;var csrf=document.querySelector('[name="slsmassnotifyserver_csrf"]');if(!csrf){message('Security token is missing. Reload the page.',false);return;}busy=true;card.querySelectorAll('button').forEach(function(button){button.disabled=true;});secret.value='';secretPanel.hidden=true;var body=new URLSearchParams();body.set('slsmassnotifyserver_action','manage_api_credential');body.set('slsmassnotifyserver_csrf',csrf.value);Object.keys(values).forEach(function(key){body.set(key,values[key]);});
  var controller=new AbortController(),timer=window.setTimeout(function(){controller.abort();},20000);
  fetch(window.location.href,{method:'POST',credentials:'same-origin',cache:'no-store',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body:body.toString(),signal:controller.signal}).then(function(response){if(!response.ok)throw new Error('The PBX returned HTTP '+response.status+'. Reload the list before retrying.');return response.json();}).then(function(result){message(result.message||'The PBX did not confirm the change.',result.success===true);if(Array.isArray(result.credentials)){rows=result.credentials;render();}if(result.success===true&&typeof result.secret==='string'){secret.value=result.secret;secretPanel.hidden=false;secret.focus();secret.select();}}).catch(function(error){message(error.name==='AbortError'?'The PBX did not confirm the credential change in time. Reload the list before retrying; do not assume the operation failed.':error.message,false);}).finally(function(){window.clearTimeout(timer);busy=false;card.querySelectorAll('button').forEach(function(button){button.disabled=Boolean(button.closest('[data-credential-audience][aria-disabled="true"]'));});});}
- card.querySelector('[data-credential-create]').addEventListener('click',function(){var name=card.querySelector('#sls-credential-name').value.trim(),scopes=Array.from(card.querySelectorAll('[data-credential-scope]:checked')).map(function(input){return input.dataset.credentialScope;}),audience={unrestricted:card.querySelector('[data-credential-unrestricted]').checked};if(!name||!scopes.length){message('Enter an integration name and select at least one permission.',false);return;}if(scopes.indexOf('config')>=0&&!audience.unrestricted){message('Configuration permission requires an unrestricted audience.',false);return;}card.querySelectorAll('[data-credential-audience]').forEach(function(picker){audience[picker.dataset.credentialAudience]=Array.from(picker.querySelectorAll('[data-credential-recipient]:checked')).map(function(input){return input.value;});});submit({credential_action:'create',credential_json:JSON.stringify({name:name,scopes:scopes,audience:audience})});});
+ card.querySelector('[data-credential-create]').addEventListener('click',function(){
+   var name=card.querySelector('#sls-credential-name').value.trim();
+   var scopes=Array.from(card.querySelectorAll('[data-credential-scope]:checked')).map(function(input){return input.dataset.credentialScope;});
+   var audience={unrestricted:card.querySelector('[data-credential-unrestricted]').checked};
+   if(!name||!scopes.length){message('Enter an integration name and select at least one permission.',false);return;}
+   if(scopes.indexOf('config')>=0&&!audience.unrestricted){message('Configuration permission requires an unrestricted audience.',false);return;}
+   var date=card.querySelector('#sls-credential-expires').value,expires=0;
+   if(date){expires=Math.floor(Date.parse(date+'Z')/1000);if(!Number.isSafeInteger(expires)||expires<=Math.floor(Date.now()/1000)){message('Choose a future expiry in UTC or leave it blank.',false);return;}}
+   card.querySelectorAll('[data-credential-audience]').forEach(function(picker){audience[picker.dataset.credentialAudience]=Array.from(picker.querySelectorAll('[data-credential-recipient]:checked')).map(function(input){return input.value;});});
+   submit({credential_action:'create',credential_json:JSON.stringify({name:name,scopes:scopes,audience:audience,expires_at:expires})});
+ });
  card.querySelector('[data-credential-unrestricted]').addEventListener('change',function(){var checked=this.checked;card.querySelectorAll('[data-credential-audience]').forEach(function(picker){picker.setAttribute('aria-disabled',String(checked));picker.querySelectorAll('input,button').forEach(function(input){input.disabled=checked;});});});
  card.querySelectorAll('[data-credential-audience]').forEach(function(picker){
   var search=picker.querySelector('[data-credential-search]'),count=picker.querySelector('[data-credential-count]');

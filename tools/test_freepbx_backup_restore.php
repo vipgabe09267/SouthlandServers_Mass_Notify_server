@@ -250,7 +250,7 @@ namespace {
 	$withEvidence['files']['operational'] = ['type' => 'slsmassnotify-operational', 'archive_name' => 'operational-evidence.jsonl',
 		'restore_name' => 'operational-evidence.jsonl', 'bytes' => 100, 'sha256' => str_repeat('b', 64)];
 	slsAssert(slsInvoke($module, 'validateNativeBackupManifest', [$withEvidence])['files']['operational']['bytes'] === 100, 'Operational evidence inventory was rejected.');
-	$withEvidence['files']['operational']['bytes'] = 64 * 1024 * 1024 + 1;
+	$withEvidence['files']['operational']['bytes'] = 128 * 1024 * 1024 + 1;
 	$overLimit = false;
 	try { slsInvoke($module, 'validateNativeBackupManifest', [$withEvidence]); } catch (\RuntimeException $error) { $overLimit = true; }
 	slsAssert($overLimit, 'Operational evidence exceeded the native manifest bound.');

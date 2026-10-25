@@ -51,6 +51,28 @@ function checkApiManagement(bool $condition,string $message):void { if(!$conditi
  checkApiManagement(strpos(apiManagementFixtureRead(ApiManagementFixture::SETTINGS_JSON),$created['secret'])===false,'Raw bearer secret reached configuration storage.');
  checkApiManagement(!isset($created['credentials'][0]['secret_hash'])&&!isset($module->apiCredentialMetadata()[0]['secret_hash']),'Credential digest leaked in management output.');
  checkApiManagement($module->writes[0][0]===ApiManagementFixture::SETTINGS_JSON&&$module->writes[1][0]===ApiManagementFixture::PENDING_SETTINGS_JSON,'Paired credential commit did not use active then staged order.');
+ $expires=time()+7200;
+ $expiring=$module->manageApiCredential(['credential_action'=>'create','credential_json'=>json_encode($definition+['expires_at'=>$expires],JSON_THROW_ON_ERROR)]);
+ checkApiManagement($expiring['success'],'Expiring credential was not issued.');
+ $rotated=$module->manageApiCredential(['credential_action'=>'rotate','credential_id'=>$expiring['credential_id'],'overlap_seconds'=>'300']);
+ checkApiManagement($rotated['success']&&$rotated['secret']!==$expiring['secret'],'Rotation did not return a distinct replacement.');
+ foreach([ApiManagementFixture::SETTINGS_JSON,ApiManagementFixture::PENDING_SETTINGS_JSON] as $path){
+   $settings=json_decode(apiManagementFixtureRead($path),true,16,JSON_THROW_ON_ERROR);
+   $old=\SLS\MassNotify\ApiSecurity::authenticate($settings['control_api'],$expiring['secret']);
+   $replacement=\SLS\MassNotify\ApiSecurity::authenticate($settings['control_api'],$rotated['secret']);
+   checkApiManagement($old!==null&&$replacement!==null&&$old['expires_at']<=time()+300&&$replacement['expires_at']===$expires,'Rotation lost overlap or extended absolute expiry.');
+   checkApiManagement($old['scopes']===$replacement['scopes']&&$old['audience']===$replacement['audience'],'Rotation widened permission.');
+ }
+ $retired=$module->manageApiCredential(['credential_action'=>'rotate','credential_id'=>$rotated['credential_id'],'overlap_seconds'=>'0']);
+ checkApiManagement($retired['success'],'Immediate rotation failed.');
+ $settings=json_decode(apiManagementFixtureRead(ApiManagementFixture::SETTINGS_JSON),true,16,JSON_THROW_ON_ERROR);
+ checkApiManagement(\SLS\MassNotify\ApiSecurity::authenticate($settings['control_api'],$rotated['secret'])===null,'Zero-overlap rotation left the previous key active.');
+ checkApiManagement(!\SLS\MassNotify\ApiSecurity::credentialActive(['expires_at'=>time()-1])&&!\SLS\MassNotify\ApiSecurity::credentialActive(['enabled'=>null]),'Expired or malformed credentials remained active.');
+ foreach(['-1','86401','01','abc'] as $overlap){
+   $before=apiManagementFixtureRead(ApiManagementFixture::SETTINGS_JSON);
+   $bad=$module->manageApiCredential(['credential_action'=>'rotate','credential_id'=>$created['credential_id'],'overlap_seconds'=>$overlap]);
+   checkApiManagement(!$bad['success']&&apiManagementFixtureRead(ApiManagementFixture::SETTINGS_JSON)===$before,'Invalid overlap mutated configuration.');
+ }
  $revoked=$module->manageApiCredential(['credential_action'=>'revoke','credential_id'=>$created['credential_id']]);
  checkApiManagement($revoked['success'],'Revocation failed.');
  foreach([ApiManagementFixture::SETTINGS_JSON,ApiManagementFixture::PENDING_SETTINGS_JSON] as $path){
@@ -66,6 +88,8 @@ function checkApiManagement(bool $condition,string $message):void { if(!$conditi
  $failed=$module->manageApiCredential(['credential_action'=>'create','credential_json'=>json_encode($definition,JSON_THROW_ON_ERROR)]);
  checkApiManagement(!$failed['success']&&!isset($failed['secret'])&&apiManagementFixtureRead(ApiManagementFixture::SETTINGS_JSON)===$activeBefore
     &&apiManagementFixtureRead(ApiManagementFixture::PENDING_SETTINGS_JSON)===$pendingBefore,'Failed active write changed paired bytes or falsely confirmed issuance.');
+ $failed=$module->manageApiCredential(['credential_action'=>'rotate','credential_id'=>$retired['credential_id'],'overlap_seconds'=>'0']);
+ checkApiManagement(!$failed['success']&&!isset($failed['secret'])&&apiManagementFixtureRead(ApiManagementFixture::SETTINGS_JSON)===$activeBefore,'Failed rotation revoked the current key or leaked a replacement.');
  $passed=true;
  echo "Named credential issuance, immediate revocation, staged-setting preservation and failed-write behavior passed.\n";
 }finally{apiManagementFixtureCleanup($directory,$passed);}

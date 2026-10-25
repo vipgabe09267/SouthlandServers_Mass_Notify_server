@@ -451,7 +451,7 @@ def enroll_sls(root: Path, archive: Path, manifest_path: Path, signature_path: P
     total = 0
     with tarfile.open(fileobj=io.BytesIO(package), mode='r:gz') as tar:
         members = tar.getmembers()
-        if len(members) > 2000:
+        if len(members) > 5000:
             raise TrustError('publisher archive has too many members')
         for member in members:
             name = member.name.rstrip('/') if member.isdir() else member.name
@@ -546,7 +546,13 @@ def storage_report(root: Path) -> dict:
             finally: os.close(child)
             rows.append({'generation': name, 'active': name in active, 'bytes': allocated, 'files': files,
                          'retention': 'active' if name in active else 'recovery_review_required'})
+        cache_bytes=cache_files=0
+        if 'stock-packages' in names:
+            cache=directory(root/'stock-packages',protected=True)
+            try:cache_bytes,cache_files=measure(cache)
+            finally:os.close(cache)
         return {'schema': 1, 'read_only': True, 'generation_count': len(rows),
+                'stock_package_cache_bytes':cache_bytes,'stock_package_cache_files':cache_files,
                 'generation_bytes': sum(row['bytes'] for row in rows), 'generations': rows,
                 'cleanup_performed': False,
                 'cleanup_policy': 'Preserve active, pending and recovery references. This usage report does not authorize deletion.'}

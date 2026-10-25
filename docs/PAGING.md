@@ -9,6 +9,9 @@ replace the PIN, or make a group PIN-free for authorized internal callers.
 **Apply Config** prepares the spoken prompts and activates the routes. The page
 shows whether paging is currently enabled and whether changes are pending.
 Closing an editor with Cancel does not save it. Up to ten groups can be configured.
+Enter a group number and press pound, or pause for two seconds to advance.
+Both internal and approved external callers use this menu. Group 10 remains
+available, and the PIN prompt keeps its separate input limits.
 Each saved editor separates recipients and phone text, caller access and PINs,
 and external caller approval. With no groups, the page shows an empty state;
 configuration opens only after Add group or Edit.
@@ -17,6 +20,15 @@ The extension check recognizes FreePBX's standard generated `bad-number` fallbac
 as an invalid-number handler, allowing unused codes such as 799 or 7999 to save.
 Actual extensions, outbound patterns, custom routes and modified fallbacks remain
 conflicts. Saving does not activate paging: Save and Apply Config are both required.
+
+If a call ends after group selection, inspect the host journal with
+`journalctl -t sls-mass-notify-paging --since '10 minutes ago'`.
+Outcomes identify configuration, prompt, storage or phone-admission failures;
+entered digits and PINs are never logged. Version 0.1.8-beta recognizes an empty
+legacy `live-paging-auth.json` only when its permanent sidecar has no initialization
+marker. It initializes the PIN-attempt journal without changing the lock inode or
+failure limits. Damaged established state remains blocked for review; do not delete
+the journal or its lock to bypass that check.
 
 ## Live-page voicemail
 
@@ -80,6 +92,38 @@ after the AGI verifies the caller and PIN. It rechecks the saved group before
 reserving phones. SIP text has its own current-configuration check. Neither path
 uses the cell number as an internal recipient or as an outgoing call target.
 PINs and external caller numbers are withheld from redacted configuration exports.
+
+## Ready tone
+
+After choosing a group and entering its PIN, wait for the ready tone before
+speaking. SLS keeps caller input muted while the admitted phone contacts connect.
+The tone plays only to the caller, after those contacts have joined or finished
+their connection attempts. SLS opens the microphone and ends the tone as it
+returns to the intercom, so you can speak as soon as the tone stops.
+
+A phone that does not answer within the configured answer window is omitted from
+the live page. If only eligible voicemail remains, the cue starts the recording
+path without claiming a live intercom connection. Without a connected phone or
+valid voicemail recording, the call ends with the existing failure prompt.
+Missing collector evidence or a failed cue keeps input muted; a short setup
+timeout prevents an indefinite silent wait. The configured maximum page duration
+still applies.
+
+## Live phone text
+
+A handset selected for both audio and SIP text receives its saved **Live paging
+in progress** text after the authenticated phone collector records that handset
+joining the intercom conference. A still-ringing contact receives no early popup.
+Text-only recipients wait until the first audio recipient joins. No audio join
+means no in-progress popup.
+
+Per-handset ordering requires Asterisk's PJSIP NOTIFY URI routing and a configured
+default outbound endpoint. Unavailable URI routing is reported as a live-text
+failure. The companion does not send an endpoint-wide popup to ringing contacts.
+
+When the page ends, SLS replaces its own submitted popups with **Paging ended**,
+using a quiet one-second expiry. A newer announcement retains its popup. Delivery
+and screen clearing still depend on the handset's supported SIP NOTIFY behavior.
 
 ## Validation
 

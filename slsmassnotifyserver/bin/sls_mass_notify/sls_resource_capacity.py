@@ -30,12 +30,12 @@ PHONE_RESOURCE_BASELINE = 100
 PHONE_CONTACTS_PER_CPU = 200
 PHONE_MEMORY_PER_CONTACT = 2 * MIB
 PHONE_MEMORY_ROUNDING = 256 * MIB
-# Reference measured 2026-10-02 on Debian12/CPython3.11/amd64 with every exact pin.
+# Reference measured 2026-10-23 on Debian12/CPython3.11/amd64 with every exact pin.
 # The compressed wheel sizes are from the corresponding PyPI version JSON APIs.
-PINNED_VENV_ALLOCATED = 217780224
-PINNED_VENV_FILES = 4376
-PINNED_WHEEL_BYTES = 77802965
-PINNED_VERSIONS = {'pip': '26.2.1', 'setuptools': '84.0.0', 'wheel': '0.48.0',
+PINNED_VENV_ALLOCATED = 218210304
+PINNED_VENV_FILES = 4387
+PINNED_WHEEL_BYTES = 77861012
+PINNED_VERSIONS = {'pip': '26.2.1', 'setuptools': '84.2.1', 'wheel': '0.48.0',
                    'piper-tts': '1.8.0', 'onnxruntime': '1.30.0', 'numpy': '2.4.6',
                    'flatbuffers': '25.12.19', 'packaging': '26.3',
                    'pathvalidate': '3.3.1', 'protobuf': '7.36.2'}
@@ -51,6 +51,7 @@ VOICE_BYTES = {'en_US-lessac-low.onnx': 63201294, 'en_US-lessac-low.onnx.json': 
                'de_DE-thorsten-low.onnx.json': 4159,
                'pt_BR-faber-medium.onnx': 63201294,
                'pt_BR-faber-medium.onnx.json': 4855}
+REGIONAL_VOICE_BYTES = {'es_MX-ald-medium': {'es_MX-ald-medium.onnx.json': 4878, 'es_MX-ald-medium.onnx': 63201294}, 'en_GB-cori-high': {'en_GB-cori-high.onnx.json': 4963, 'en_GB-cori-high.onnx': 114219352}}
 MANAGED_TREES = {'runtime': '/usr/local/bin/sls_mass_notify',
                  'venv': '/usr/local/bin/sls_mass_notify/piper/venv',
                  'voices': '/var/lib/asterisk/SLS_Mass_Notifications_Plugin/piper/voices',
@@ -78,7 +79,7 @@ def rounded(value, unit=4096):
     return (int(value) + unit - 1) // unit * unit
 
 
-def storage_requirements(measured=None, missing_voices=None, allocation_units=None, temporary_directory='/tmp', *, mode='install', payloads=None):
+def storage_requirements(measured=None, missing_voices=None, allocation_units=None, temporary_directory='/tmp', *, mode='install', payloads=None, optional_packs=()):
     """Explain each byte reservation; retained history is not a fixed quota.
 
     Installation workspaces may overlap bounded state updates/compaction.
@@ -101,8 +102,12 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
     runtime, voices, data = (MANAGED_TREES[name] for name in ('runtime', 'voices', 'data'))
     reference_venv = PINNED_VENV_ALLOCATED + PINNED_VENV_FILES * (unit(runtime) - 4096)
     venv = max(reference_venv, size('venv'))
-    voice_total = sum(rounded(value, unit(voices)) for value in VOICE_BYTES.values())
-    model_temporary = rounded(max(VOICE_BYTES.values()), unit(voices))
+    voice_sizes=dict(VOICE_BYTES)
+    for pack in optional_packs:
+        if pack not in REGIONAL_VOICE_BYTES:raise ValueError('Unknown optional speech pack')
+        voice_sizes.update(REGIONAL_VOICE_BYTES[pack])
+    voice_total = sum(rounded(value, unit(voices)) for value in voice_sizes.values())
+    model_temporary = rounded(max(voice_sizes.values()), unit(voices))
     if missing_voices is None:
         missing_voices = voice_total
     # Phone and weather state reserve 16 MiB each; encrypted configuration
@@ -125,7 +130,13 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
         },
         runtime: {'replacement_runtime': max(size('runtime'), venv + payload(runtime))},
         voices: {'missing_or_replacement_voices': max(int(missing_voices), model_temporary)},
-        data: {'bounded_atomic_state_writes': atomic_state},
+        data: {'bounded_atomic_state_writes': atomic_state,
+               'desktop_delivery_history_headroom': 160 * MIB,
+               # Sixteen independently locked 4 MiB ledgers may replace in parallel.
+               'browser_evidence_and_atomic_write_headroom': 16 * 2 * 4 * MIB,
+               'conditional_weather_cache_and_atomic_write_headroom': 64 * MIB,
+               'desktop_feed_cache_and_atomic_write_headroom': 128 * MIB + 8192,
+               'postfix_evidence_and_atomic_write_headroom': 8 * MIB},
         MANAGED_TREES['config_backups']: {'remaining_bounded_config_backups': backup_growth},
         MANAGED_TREES['module']: {'new_module_payload': payload(MANAGED_TREES['module'])},
         # Independent target mounts each need room for a legal package payload.
@@ -136,7 +147,9 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
         # Maintenance compacts logs sequentially, using backup and retained temporary files.
         '/var/log': {'event_log_backup_and_retained_copy': 2 * 64 * MIB},
         '/var/lib/sls-mass-notify-trust': {'new_authenticated_generation': payload('/var/lib/sls-mass-notify-trust'),
-                                         'stock_and_release_manifests': 8 * MIB},
+                                         'stock_and_release_manifests': 8 * MIB,
+                                         'bounded_signed_stock_cache': 4 * 64 * MIB,
+                                         'signed_stock_cache_atomic_write': 64 * MIB},
         temporary_directory: {'release_download_and_metadata': 52 * MIB + 16 * 1024 + 4096,
                  'extracted_release': payload(temporary_directory), 'failed_release_recovery': payload(temporary_directory),
                  # Two retained signed upstream packages and one active GPG
@@ -146,7 +159,7 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
                  'quarantined_python_caches': 16 * MIB,
                  'pinned_wheel_downloads': rounded(PINNED_WHEEL_BYTES, unit(temporary_directory)),
                  'wheel_unpack_workspace': venv, 'pip_old_package_recovery': venv,
-                 'one_voice_download': rounded(max(VOICE_BYTES.values()), unit(temporary_directory))},
+                 'one_voice_download': rounded(max(voice_sizes.values()), unit(temporary_directory))},
     }
     if mode != 'install':
         components = {data: {'bounded_atomic_state_writes': atomic_state},
@@ -166,7 +179,7 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
             if path not in inode_budgets:
                 inode_budgets[path] = int(payloads.get(path, {}).get('entries', 2000)) + 16
         inode_budgets[runtime] += max(PINNED_VENV_FILES, int(measured.get('venv', {}).get('files', 0)))
-        inode_budgets[voices] = len(VOICE_BYTES) + 4
+        inode_budgets[voices] = len(voice_sizes) + 4
         inode_budgets[temporary_directory] = 2 * int(payloads.get(temporary_directory, {}).get('entries', 2000)) + 128
         inode_budgets[INSTALLER_JOURNAL] = 3 * int(payloads.get(INSTALLER_JOURNAL, {}).get('entries', 2000)) + 128 + sum(
             int(measured.get(name, {}).get('files', 0)) + int(measured.get(name, {}).get('directories', 0))
@@ -180,7 +193,7 @@ def storage_requirements(measured=None, missing_voices=None, allocation_units=No
             'pinned_runtime_reference_bytes': reference_venv, 'pinned_wheel_download_bytes': PINNED_WHEEL_BYTES,
             'component_budgets_bytes': components, 'free_budgets_bytes': budgets,
             'inode_budgets': inode_budgets, 'allocation_units': units, 'payloads': payloads,
-            'missing_voice_bytes': missing_voices,
+            'missing_voice_bytes': missing_voices, 'optional_voice_packs':list(optional_packs),
             'temporary_directory': temporary_directory,
             'sls_persistent_free_bytes': sum(value for path, value in budgets.items() if path != temporary_directory),
             'temporary_free_bytes': budgets[temporary_directory],
@@ -284,7 +297,7 @@ def measure_tree(path, deadline, maximum_entries=50000, *, cache=None):
     return dict(cache.get(str(root), result))
 
 
-def probe_storage(mode='install', payloads=None):
+def probe_storage(mode='install', payloads=None, optional_packs=()):
     deadline = time.monotonic() + (3 if mode == 'runtime' else 15)
     cache = {}
     measured = {name: measure_tree(path, deadline, cache=cache) for name, path in
@@ -313,7 +326,11 @@ def probe_storage(mode='install', payloads=None):
             existing = existing.parent
         units[path] = os.statvfs(existing).f_frsize
     missing = 0
-    for name, expected in VOICE_BYTES.items():
+    voice_sizes=dict(VOICE_BYTES)
+    for pack in optional_packs:
+        if pack not in REGIONAL_VOICE_BYTES:raise ValueError('Unknown optional speech pack')
+        voice_sizes.update(REGIONAL_VOICE_BYTES[pack])
+    for name, expected in voice_sizes.items():
         path = Path(MANAGED_TREES['voices'], name)
         try:
             metadata = path.lstat()
@@ -321,7 +338,7 @@ def probe_storage(mode='install', payloads=None):
             metadata = None
         if metadata is None or not stat.S_ISREG(metadata.st_mode) or metadata.st_size != expected:
             missing += rounded(expected, max(4096, units[MANAGED_TREES['voices']]))
-    return storage_requirements(measured, missing, units, mode=mode, payloads=payloads)
+    return storage_requirements(measured, missing, units, mode=mode, payloads=payloads, optional_packs=optional_packs)
 
 
 def measure_release_payloads(source):
@@ -338,9 +355,9 @@ def measure_release_payloads(source):
     for directory, dirs, files in os.walk(root, followlinks=False):
         for name in (*dirs, *files):
             path = Path(directory, name); info = path.lstat(); entries += 1
-            if (entries > 2000 or info.st_uid != 0 or info.st_mode & 0o022
+            if (entries > 5000 or info.st_uid != 0 or info.st_mode & 0o022
                     or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode) and info.st_nlink == 1)):
-                raise ResourceProbeError('candidate_source_unsafe', 'The authenticated candidate contains an unsafe entry or exceeds its 2000-entry bound.')
+                raise ResourceProbeError('candidate_source_unsafe', 'The authenticated candidate contains an unsafe entry or exceeds its 5000-entry bound.')
             relative = path.relative_to(root).as_posix()
             size = info.st_size if stat.S_ISREG(info.st_mode) else 0
             total += size
@@ -500,7 +517,7 @@ def probe_storage_filesystems(storage, temporary_directory=None):
             payloads = dict(storage.get('payloads', {}))
             if '/tmp' in payloads: payloads[path] = payloads.pop('/tmp')
             candidate = storage_requirements(storage.get('measured_trees'), storage.get('missing_voice_bytes'), units, path,
-                mode=storage.get('mode', 'install'), payloads=payloads)
+                mode=storage.get('mode', 'install'), payloads=payloads, optional_packs=storage.get('optional_voice_packs',()))
         filesystems = probe_filesystems(candidate['free_budgets_bytes'], candidate.get('inode_budgets'))
         if first is None:
             first = (candidate, filesystems)
@@ -613,6 +630,9 @@ def configured_limits(path):
                   (('desktop_client_limit', 25), ('phone_device_limit', PHONE_BASELINE))}
     if any(type(limit) is not int or not 1 <= limit <= 1000 for limit in capacities.values()):
         raise ValueError('Invalid notification capacity')
+    optional=value.get('speech_optional_voice_packs',[])
+    if not isinstance(optional,list) or len(optional)>2 or any(not isinstance(pack,str) or pack not in REGIONAL_VOICE_BYTES for pack in optional) or len(set(optional))!=len(optional):raise ValueError('Invalid optional speech packs')
+    if optional:capacities['speech_optional_voice_packs']=optional
     return capacities
 
 
@@ -856,7 +876,7 @@ def main(argv=None):
         cpu, memory = probe_compute()
         stage = 'SLS storage'
         payloads = measure_release_payloads(options.candidate_source) if options.candidate_source else None
-        storage = probe_storage(options.mode, payloads)
+        storage = probe_storage(options.mode,payloads,optional_packs=saved['speech_optional_voice_packs']) if saved.get('speech_optional_voice_packs') else probe_storage(options.mode,payloads)
         stage = 'filesystem free space'
         storage, filesystems = probe_storage_filesystems(storage, options.temporary_directory)
         result = evaluate({'effective_cpu_count': cpu, 'effective_memory_bytes': memory,

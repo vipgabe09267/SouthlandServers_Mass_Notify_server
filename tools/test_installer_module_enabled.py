@@ -2,6 +2,7 @@
 """Exercise the actual final module check with an inert FreePBX inventory."""
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ START = SOURCE.index('  module_list="$(fwconsole ma list)"', SOURCE.index("verif
 CHECK = SOURCE[START:SOURCE.index("  for required_module in ", START)]
 ROWS = "| Module | Version | Status |\n| framework | 17.0.1 | Enabled |\n| dashboard | 17.0.1 | Enabled |\n"
 ENABLED = "| slsmassnotifyserver | 0.1.7-beta | Enabled |\n"
+PHP_LINT = 'lint_staged_module_php() {' + SOURCE.split('lint_staged_module_php() {',1)[1].split('\n}\n\nstage_module_directory()',1)[0] + '\n}\n'
 
 
 class InstallerModuleEnabled(unittest.TestCase):
@@ -100,6 +102,64 @@ stage_module_directory
         result = self.check(listing)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertIn("VERIFIED", result.stdout)
+
+
+class StagedPhpCompatibility(unittest.TestCase):
+    def lint(self, root):
+        script='set -euo pipefail\nlog(){ printf "%s\\n" "$*"; }\n'+PHP_LINT+'\nlint_staged_module_php "$1"\n'
+        return subprocess.run(['/bin/bash','-c',script,'fixture',str(root)],
+                              capture_output=True,text=True,timeout=90)
+
+    def fixture(self, root):
+        library=Path('passkey-libs/vendor/symfony/polyfill-uuid')
+        (root/library).mkdir(parents=True)
+        for name in ('bootstrap80.php','bootstrap85.php'):
+            shutil.copyfile(ROOT/'slsmassnotifyserver'/library/name,root/library/name)
+            (root/library/name).chmod(0o644)
+        return root/library
+
+    def older_php(self):
+        return int(subprocess.check_output(['/usr/bin/php','-n','-r','echo PHP_VERSION_ID;']))<80500
+
+    def test_actual_complete_candidate_tree_stages_on_current_php(self):
+        result=self.lint(ROOT/'slsmassnotifyserver')
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+
+    def test_modified_loader_or_conditional_file_is_refused(self):
+        if not self.older_php():self.skipTest('The conditional lint exception is only used before PHP 8.5.')
+        for name in ('bootstrap80.php','bootstrap85.php'):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as folder:
+                root=Path(folder);library=self.fixture(root)
+                with (library/name).open('ab') as output:output.write(b'\n// changed bytes\n')
+                result=self.lint(root)
+                self.assertNotEqual(result.returncode,0)
+                self.assertIn('compatibility profile differs',result.stdout+result.stderr)
+
+    def test_unrelated_invalid_php_is_not_exempted(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);self.fixture(root)
+            (root/'broken.php').write_text('<?php function (')
+            result=self.lint(root)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('invalid PHP file',result.stdout+result.stderr)
+
+    def test_same_filename_outside_the_verified_branch_is_not_exempted(self):
+        if not self.older_php():self.skipTest('The conditional syntax is valid on PHP 8.5.')
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);library=self.fixture(root)
+            shutil.copyfile(library/'bootstrap85.php',root/'bootstrap85.php')
+            result=self.lint(root)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('invalid PHP file',result.stdout+result.stderr)
+
+    def test_linked_conditional_file_cannot_authorize_an_exception(self):
+        if not self.older_php():self.skipTest('The conditional lint exception is only used before PHP 8.5.')
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);library=self.fixture(root);path=library/'bootstrap85.php';path.unlink()
+            path.symlink_to(ROOT/'slsmassnotifyserver/passkey-libs/vendor/symfony/polyfill-uuid/bootstrap85.php')
+            result=self.lint(root)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('compatibility profile differs',result.stdout+result.stderr)
 
 
 if __name__ == "__main__":

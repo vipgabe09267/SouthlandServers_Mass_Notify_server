@@ -75,7 +75,7 @@ CURRENT_GROUP_ID = ""
 CURRENT_GROUP_NAME = ""
 CURRENT_GROUP_INDEX = 0
 CURRENT_GROUP_LEGACY = False
-NWS_USER_AGENT = "SouthlandServers-Mass-Notifications-Server/0.1.7-beta (https://southlandservers.xyz)"
+NWS_USER_AGENT = "SouthlandServers-Mass-Notifications-Server/0.1.8-beta (https://southlandservers.xyz)"
 NWS_FORECAST_CACHE_SECONDS = 10 * 60
 NWS_FORECAST_STALE_SECONDS = 30 * 60
 NWS_POINT_CACHE_SECONDS = 24 * 60 * 60
@@ -318,7 +318,7 @@ def fetch_payload(xweather):
         "client_secret": xweather["client_secret"],
     }
     url = "https://data.api.xweather.com/lightning/closest?" + urllib.parse.urlencode(params)
-    request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "SouthlandServers-Mass-Notifications-Server/0.1.7-beta"})
+    request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "SouthlandServers-Mass-Notifications-Server/0.1.8-beta"})
     last_error = None
     maximum_attempts = 1 if xweather.get("_bounded_gate_fallback") else 3
     for attempt in range(maximum_attempts):

@@ -5,7 +5,7 @@ use SLS\MassNotify\{EnterpriseContinuity,OperatorAuth};
 function check(bool $value,string $why):void{if(!$value)throw new RuntimeException($why);}
 $report=EnterpriseContinuity::report([]);check(count($report['channels'])===11&&array_filter($report['channels'],static fn($channel)=>$channel['enabled'])===[],'Unconfigured continuity report enabled a channel');
 $auth=['password_hash'=>OperatorAuth::dummyHash(),'version'=>str_repeat('a',64),'totp_secret_enc'=>'op1:'.str_repeat('A',80),'totp_last_counter'=>-1,'recovery_hashes'=>[],'force_password_change'=>false];
-$settings=['enabled'=>'1','page_group'=>'1000','desktop_clients'=>[['username'=>'1000','enabled'=>true]],'operator_access'=>['enabled'=>true,'portal_enabled'=>true,'accounts'=>[['id'=>'operator','username'=>'Local admin','source'=>'portal','role'=>'administrator','enabled'=>true,'auth'=>$auth]]],
+$settings=['enterprise_labs'=>['enabled'=>true],'enabled'=>'1','page_group'=>'1000','desktop_clients'=>[['username'=>'1000','enabled'=>true]],'operator_access'=>['enabled'=>true,'portal_enabled'=>true,'accounts'=>[['id'=>'operator','username'=>'Local admin','source'=>'portal','role'=>'administrator','enabled'=>true,'auth'=>$auth]]],
  'enterprise_identity'=>['enabled'=>true],'subscriber_browser'=>['enabled'=>true,'push'=>['enabled'=>true]],'enterprise_integrations'=>['enabled'=>'1','connectors'=>['enabled'=>'1']]];
 $report=EnterpriseContinuity::report($settings);$byId=array_column($report['channels'],null,'id');
 check($report['schema']===2&&$byId['browser_push']['enabled']&&str_contains($byId['browser_push']['offline_behavior'],'external'),'Cloud push inaccurately advertised offline capability');
@@ -37,4 +37,9 @@ $settings['operator_access']['accounts'][0]['enabled']=true;$settings['enabled']
 $report=EnterpriseContinuity::report($settings);$byId=array_column($report['channels'],null,'id');check($byId['phones']['enabled']&&$byId['connectors']['enabled']&&$byId['browser_push']['enabled']&&!$byId['weather']['enabled'],'Weather-disabled report incorrectly gated ordinary channels or enabled NWS');
 $settings['xweather']['enabled']='1';check(array_column(EnterpriseContinuity::report($settings)['channels'],null,'id')['weather']['enabled'],'Weather-disabled report hid independently enabled lightning');
 $settings['runtime_enabled']=false;$report=EnterpriseContinuity::report($settings);$byId=array_column($report['channels'],null,'id');check(!$report['notifications_running']&&!$byId['phones']['enabled']&&!$byId['connectors']['enabled']&&!$byId['browser_push']['enabled']&&!$byId['weather']['enabled']&&$report['local_recovery']['ready_for_local_login']&&$byId['identity']['enabled'],'Stopped runtime report admitted notifications or hid recovery/identity');
+$settings['runtime_enabled']=true;$settings['enterprise_labs']['enabled']=false;
+$byId=array_column(EnterpriseContinuity::report($settings)['channels'],null,'id');
+check($byId['phones']['enabled']&&$byId['weather']['enabled']&&$byId['identity']['enabled']
+    &&!$byId['browser_push']['enabled']&&!$byId['connectors']['enabled'],
+    'Disabled Labs did not isolate experimental channels from ordinary phones, Weather and operator identity.');
 echo "Continuity review: disabled defaults, cloud/LAN separation, local recovery, secret isolation and notification-only failover scope passed.\n";

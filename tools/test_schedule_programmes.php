@@ -15,6 +15,17 @@ $row=['id'=>'cal_'.str_repeat('a',24),'name'=>'School year','timezone'=>'America
         'overrides'=>[['date'=>'2027-03-15','time'=>'10:15','reason'=>'Late start']]]];
 $config=['schema'=>1,'enabled'=>true,'calendars'=>[$row]];
 $snapshot=Programmes::snapshot($config,$row['id'],['A']);$dates=Programmes::dateTypes($snapshot);
+$before=json_encode($row,JSON_THROW_ON_ERROR);$month=Programmes::visualPreview($row,'2027-03-15','month');$cells=array_column($month['days'],null,'date');
+verify(count($month['days'])===42&&$month['timezone']==='America/Chicago','Month preview is unbounded or lost its site timezone.');
+verify($cells['2027-03-09']['status']==='holiday'&&!$cells['2027-03-09']['editable']&&$cells['2027-03-09']['reason']==='Holiday','Holiday became an active/editable day.');
+verify($cells['2027-03-15']['day_type']==='EARLY'&&$cells['2027-03-15']['time_override']==='10:15','Preview lost reviewed substitutions or temporary time.');
+verify($cells['2027-03-17']['status']==='skipped'&&$cells['2027-03-17']['editable'],'A skipped date cannot restore its underlying programme.');
+$week=Programmes::visualPreview($row,'2027-03-15','week');verify(count($week['days'])===7&&$week['days'][0]['date']==='2027-03-15','Week preview drifted across DST.');
+verify(json_encode($row,JSON_THROW_ON_ERROR)===$before,'Read-only visual preview changed its source programme.');
+$restored=$row;$restored['date_types']=array_values(array_filter($restored['date_types'],static fn($item)=>$item['date']!=='2027-03-17'));$restored['calendar']['overrides']=[];
+$restoredCells=array_column(Programmes::visualPreview($restored,'2027-03-15','list')['days'],null,'date');
+verify($restoredCells['2027-03-17']['day_type']==='EARLY'&&$restoredCells['2027-03-15']['time_override']==='','Removing overrides changed the repeating cycle or retained the temporary time.');
+reject(static fn()=>Programmes::visualPreview($row,'2027-02-01','month'));reject(static fn()=>Programmes::visualPreview($row,'2027-03-15','unsupported'));
 verify($dates===['2027-03-08'=>'A','2027-03-11'=>'B','2027-03-12'=>'EARLY','2027-03-15'=>'EARLY',
     '2027-03-16'=>'B','2027-03-17'=>'','2027-03-18'=>'A','2027-03-19'=>'B'],'Holiday or substitution incorrectly advanced the cycle.');
 $zone=new DateTimeZone('America/Chicago');

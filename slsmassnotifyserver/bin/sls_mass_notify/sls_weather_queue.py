@@ -30,6 +30,8 @@ import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sls_weather_payload import strict_json, timestamp, validate_collection
+import sls_nws_http as _nws_http
 from sls_nws_delivery_claims import (_open_directory, _validate_parent_directory, _secure_file_metadata,
                                      _checked_file_metadata, _account_ids, _identity)
 from sls_nws_status import mutate_status, reconcile_status
@@ -56,13 +58,6 @@ class WeatherQueueCapacityError(RuntimeError):
     """Capacity failures safe to display without exposing notification bodies."""
 
 
-def strict_json(raw):
-    try:
-        return json.loads(raw, object_pairs_hook=_config_crypto._pairs,
-                          parse_constant=_config_crypto._invalid_constant,
-                          parse_float=_config_crypto._finite_float)
-    except RecursionError as error:
-        raise ValueError('Weather JSON nesting exceeds its limit') from error
 
 
 def compact_terminal_history(data, now):
@@ -98,12 +93,6 @@ def compact_terminal_history(data, now):
                 job.pop('payload', None)
 
 
-def timestamp(value):
-    try:
-        result = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
-        return result.timestamp() if result.tzinfo else 0
-    except (ValueError, TypeError, OverflowError):
-        return 0
 
 
 def alert_key(feature):
@@ -134,42 +123,6 @@ def actionable(feature, now):
             and expires > now)
 
 
-def validate_collection(value):
-    if not isinstance(value, dict) or value.get('type') != 'FeatureCollection' or not isinstance(value.get('features'), list):
-        raise ValueError('Invalid Weather.gov FeatureCollection')
-    if len(value['features']) > 1000:
-        raise ValueError('Weather.gov feature limit exceeded')
-    for feature in value['features']:
-        if not isinstance(feature, dict) or not isinstance(feature.get('properties'), dict):
-            raise ValueError('Malformed Weather.gov feature')
-        props = feature['properties']
-        for name, limit in [('id', 4096), ('event', 120), ('severity', 32), ('status', 32), ('messageType', 32)]:
-            field = props.get(name)
-            if field is not None and (not isinstance(field, str) or len(field.encode('utf-8')) > limit
-                    or re.search(r'[\x00-\x1f\x7f]', field)):
-                raise ValueError('Weather.gov identity/status field is invalid: ' + name)
-        if props.get('status') == 'Actual' and props.get('messageType') not in {'Alert', 'Update', 'Cancel'}:
-            raise ValueError('Weather.gov actual alert message type is invalid')
-        identifier = feature.get('id')
-        if identifier is not None and (not isinstance(identifier, str) or len(identifier.encode('utf-8')) > 4096
-                or re.search(r'[\x00-\x1f\x7f]', identifier)):
-            raise ValueError('Weather.gov feature identity is invalid')
-        if props.get('status') == 'Actual' and props.get('messageType') != 'Cancel':
-            if not (feature.get('id') or props.get('id')) or not props.get('event') or not timestamp(props.get('expires')):
-                raise ValueError('Weather.gov alert is missing identity or expiration')
-        if not isinstance(props.get('references') or [], list):
-            raise ValueError('Weather.gov alert references are malformed')
-        for reference in props.get('references') or []:
-            if not isinstance(reference, dict):
-                raise ValueError('Weather.gov alert reference is not an object')
-            for name in ['identifier', '@id', 'sent']:
-                field = reference.get(name)
-                if field is not None and (not isinstance(field, str) or len(field.encode('utf-8')) > 4096
-                        or re.search(r'[\x00-\x1f\x7f]', field)):
-                    raise ValueError('Weather.gov alert reference identity is invalid')
-        if len(json.dumps(feature, allow_nan=False)) > 256 * 1024:
-            raise ValueError('Weather.gov feature size limit exceeded')
-    return value['features']
 
 
 def read_json_at(directory_fd, name, maximum=MAX_BYTES):
@@ -384,37 +337,10 @@ class WeatherPollError(RuntimeError):
 
 
 def fetch_zone(zone):
-    if not re.fullmatch(r'[A-Z]{2}[CZ][0-9]{3}', zone):
-        raise ValueError('Invalid Weather zone')
-    # The system resolver commonly waits five seconds before trying its next
-    # configured server. A five-second connection limit can defeat healthy DNS
-    # failover. Keep the overall request/worker deadlines bounded and preserve
-    # the administrator's DNS servers, proxy policy, and TLS verification.
     try:
-        result = subprocess.run(['/usr/bin/curl', '-fsS', '--connect-timeout', '12', '--max-time', '20',
-            '--retry', '1', '--retry-max-time', '45', '--max-filesize', '10485760',
-            '-H', 'Accept: application/geo+json', '-H',
-            'User-Agent: SLS-Mass-Notify/0.1.7-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)',
-            'https://api.weather.gov/alerts/active?zone=' + zone + '&status=actual'], capture_output=True, timeout=50, check=False)
-    except subprocess.TimeoutExpired:
-        raise WeatherPollError('Weather.gov request exceeded its retry deadline; check PBX DNS and connectivity.') from None
-    if result.returncode:
-        error = (result.stderr or b'').decode('utf-8', errors='replace').lower()
-        if result.returncode in (5, 6) or (result.returncode == 28 and 'resolving timed out' in error):
-            message = 'Weather.gov DNS resolution failed or timed out; check the PBX DNS servers.'
-        elif result.returncode in (35, 51, 58, 60, 77, 83):
-            message = 'Weather.gov TLS verification/connection failed; check PBX time, CA certificates, and HTTPS access.'
-        elif result.returncode == 22:
-            code = re.search(r'returned error:\s*([1-5][0-9]{2})\b', error)
-            message = 'Weather.gov returned ' + ('HTTP ' + code[1] if code else 'an HTTP error') + '; retrying on the next poll.'
-        elif result.returncode == 28:
-            message = 'Weather.gov connection/request timed out; check PBX DNS and connectivity.'
-        elif result.returncode == 63:
-            message = 'Weather.gov response exceeded the permitted size.'
-        else:
-            message = 'Weather.gov request failed (curl code ' + str(int(result.returncode)) + '); check PBX connectivity.'
-        raise WeatherPollError(message)
-    return validate_collection(strict_json(result.stdout))
+        return validate_collection(strict_json(_nws_http.fetch(zone,directory=DATA,budget=25)))
+    except (OSError,RuntimeError) as error:
+        raise WeatherPollError(str(error)) from None
 
 
 def current_configuration():

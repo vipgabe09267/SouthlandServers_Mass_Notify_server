@@ -100,13 +100,7 @@ NWS_CLAIMED_VOICE_COUNT=0
 NWS_CLAIMED_SMS_COUNT=0
 NWS_LAST_PAGE_HOLD_SECONDS=0
 NWS_AUDIO_LOCK_FD=""
-MAIL_TO=""
 LIVE_EMAIL_TO=""
-DISCORD_WEBHOOK_URL=""
-MAIL_FROM_NAME="SLS Mass Notification System"
-MAIL_FROM_ADDR="no-reply@localhost.localdomain"
-EMAIL_HTML_ENABLED="1"
-SENDMAIL_BIN="/usr/sbin/sendmail"
 SOURCE_EXTENSION=""
 SOURCE_NAME="SLS Mass Notification System"
 DELIVERY_TARGETS=""
@@ -1611,17 +1605,8 @@ if [ -n "$INPUT_PAYLOAD" ]; then
 	ALERTS=$(cat "$INPUT_PAYLOAD")
   echo "$(date): Using validated delivery/test payload" >> "$LOG"
 else
-	ALERTS=$(curl -fsS --retry 3 --retry-all-errors --retry-connrefused --connect-timeout 10 --max-time 30 --max-filesize 10485760 \
-    -H "Accept: application/geo+json" \
-    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.7-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
-    "${NWS_API_BASE_URL%/}/alerts/active?zone=${NWS_ZONE}&status=actual" 2>>"$LOG") || ALERTS=""
-  if [ -z "$ALERTS" ]; then
-    echo "$(date): Initial NWS request failed; retrying over IPv4" >> "$LOG"
-	  ALERTS=$(curl -4 -fsS --retry 2 --retry-all-errors --retry-connrefused --connect-timeout 10 --max-time 30 --max-filesize 10485760 \
-      -H "Accept: application/geo+json" \
-	    -H "User-Agent: SouthlandServers-Mass-Notifications-Server/0.1.7-beta (https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server)" \
-      "${NWS_API_BASE_URL%/}/alerts/active?zone=${NWS_ZONE}&status=actual" 2>>"$LOG") || ALERTS=""
-  fi
+  ALERTS=$(/usr/bin/timeout --signal=TERM --kill-after=2 30 /usr/bin/python3 -I \
+    /usr/local/bin/sls_mass_notify/sls_nws_http.py "$NWS_ZONE" 2>>"$LOG") || ALERTS=""
 fi
 
 if [ -z "$ALERTS" ]; then

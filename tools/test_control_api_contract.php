@@ -20,6 +20,12 @@ $check($audience['webhooks'] === [] && !str_contains(json_encode($audience), 'ht
 $settings['desktop_clients'][0]['client_id'] = 'replacement';
 $changed = ControlContract::audiences($principal, $settings);
 $check($changed['announcement_groups'] === [] && $changed['desktop_clients'] === [] && $changed['phone_targets'] === [], 'A stale desktop binding authorized discovery of a changed saved audience.');
+$fleetReport=['schema'=>1,'private_configuration'=>'SECRET','clients'=>[['client_id'=>'desktop_a','username'=>'alice','password_enc'=>'SECRET'],['client_id'=>'outsider','username'=>'other']]];
+$settings['desktop_clients'][0]['client_id']='desktop_a';
+$projected=ControlContract::fleet($principal,$settings,$fleetReport);
+$check(count($projected['clients'])===1&&$projected['clients'][0]['client_id']==='desktop_a'&&!str_contains(json_encode($projected),'SECRET'),'Saved-group fleet permission leaked a secret or excluded its reviewed desktop.');
+$settings['desktop_clients'][0]['client_id']='replacement';
+$check(ControlContract::fleet($principal,$settings,$fleetReport)['clients']===[],'A reassigned desktop username inherited fleet access.');
 $restricted = ControlContract::capabilities($principal);
 $check(!in_array('events', $restricted['resources'], true), 'Restricted discovery offered unrestricted audit history.');
 $check(!in_array('start_incident', array_column($restricted['actions'], 'action'), true), 'Restricted discovery offered incident mutation.');
@@ -28,12 +34,33 @@ $check(!in_array('recordings', ControlContract::capabilities($principal)['resour
 $principal['scopes'][] = 'config';
 $check(in_array('recordings', ControlContract::capabilities($principal)['resources'], true), 'Read-and-config discovery omitted the recording catalogue.');
 $check(in_array('start_incident', array_column(ControlContract::capabilities($principal)['actions'], 'action'), true), 'Named unrestricted incident sender is missing discovery.');
+$labsConfig=['enterprise_identity'=>['enabled'=>true],'enterprise_integrations'=>['enabled'=>'1'],
+    'enterprise_operations'=>['enabled'=>true,'drills'=>['enabled'=>true]],'live_paging'=>['enabled'=>'1']];
+foreach ([null, ['enabled'=>false], ['enabled'=>'1'], ['enabled'=>true,'unknown'=>true]] as $master) {
+    $candidate=$labsConfig;if($master!==null){$candidate['enterprise_labs']=$master;}
+    $capabilities=ControlContract::enterpriseCapabilities($principal,$candidate);
+    $check(!$capabilities['features']['enterprise_labs']&&!$capabilities['features']['integrations']&&!$capabilities['features']['drills'], 'API advertised disabled Labs capabilities.');
+    $check($capabilities['features']['identity']&&ControlContract::effectiveLabs($candidate)['live_paging']['enabled']==='1', 'Labs master disabled independent operator SSO or paging.');
+}
+$labsConfig['enterprise_labs']=['enabled'=>true];
+$check(ControlContract::enterpriseCapabilities($principal,$labsConfig)['features']['drills'], 'Enabled Labs feature was missing from discovery.');
 $principal['id'] = 'legacy';
 $check(!in_array('start_incident', array_column(ControlContract::capabilities($principal)['actions'], 'action'), true), 'Discovery offered incident mutation to a legacy key.');
+foreach(['monitor'=>['status','capabilities','readiness','metrics'], 'fleet_read'=>['capabilities','desktop_fleet'], 'incident_read'=>['capabilities','incidents','incident','incident_report']] as $scope=>$expected){
+    $reader=ApiSecurity::issue(['name'=>'Narrow reader','scopes'=>[$scope],'audience'=>['unrestricted'=>true]])['credential'];
+    $discovered=ControlContract::capabilities($reader);
+    $actual=$discovered['resources'];sort($actual);sort($expected);
+    $check($actual===$expected&&$discovered['actions']===[], 'A narrow reader gained a mutation or an unrelated resource: '.$scope);
+    $check(!ApiSecurity::permits($reader,'read')&&!ApiSecurity::permits($reader,'send')&&!ApiSecurity::permits($reader,'config'),'Narrow scope implied a broad privilege.');
+}
+$restrictedFleet=ApiSecurity::issue(['name'=>'Fleet reader','scopes'=>['fleet_read'],'audience'=>['unrestricted'=>false,'desktop_client_ids'=>['desktop_a']]])['credential'];
+$check(in_array('desktop_fleet',ControlContract::capabilities($restrictedFleet)['resources'],true),'A recipient-restricted fleet reader cannot discover permitted inventory.');
 $input = ControlContract::announcementInput(['action' => 'preview_announcement', 'message' => 'Fixture', 'is_test' => true,
     'webhook_ids' => ['hook_a'], 'tts_volume' => 100, 'options' => ['preview' => false]]);
 $check($input['options']['preview'] === true && $input['options']['_is_test'] === true, 'Preview or explicit test metadata was not normalized.');
 $check($input['options']['webhook_ids'] === ['hook_a'] && !isset($input['webhook_ids']), 'Top-level webhook selection was not routed to the resolver.');
+$rehearsal=ControlContract::announcementInput(['action'=>'rehearse_announcement','message'=>'Fixture','is_test'=>false,'preview'=>false,'options'=>['preview'=>false]]);
+$check($rehearsal['options']['preview']===true&&$rehearsal['options']['_is_test']===false,'Rehearsal can be changed into a real send or requires test alert marking.');
 $input = ControlContract::announcementInput(['action' => 'send_announcement', 'message' => 'Fixture', 'is_test' => false, 'options' => ['is_test' => true]]);
 $check($input['options']['_is_test'] === false, 'Top-level explicit false did not take precedence over an option.');
 foreach ([['options' => ['_test_channels' => ['sms']]], ['options' => ['_is_test' => true]], ['is_test' => 'true'],

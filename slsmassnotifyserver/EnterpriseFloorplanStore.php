@@ -21,7 +21,7 @@ final class EnterpriseFloorplanStore
         $this->directory=rtrim($directory,'/');
         $parent=@lstat(dirname($this->directory));
         if(!$parent||($parent['mode']&0170000)!==0040000||($parent['mode']&0022)||realpath(dirname($this->directory))!==dirname($this->directory)){throw new \RuntimeException('Private floor plan storage parent is unsafe.');}
-        if(!file_exists($this->directory)&&!is_link($this->directory)){$mask=umask(0077);try{if(!mkdir($this->directory,0700)){throw new \RuntimeException('Private floor plan storage cannot be created.');}}finally{umask($mask);}}
+        if(!file_exists($this->directory)&&!is_link($this->directory)){$mask=umask(0077);try{if(!@mkdir($this->directory,0700)&&!is_dir($this->directory)){throw new \RuntimeException('Private floor plan storage cannot be created.');}}finally{umask($mask);}}
         $this->directory();
     }
     private function directory(): void

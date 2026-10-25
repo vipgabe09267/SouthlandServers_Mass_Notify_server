@@ -1,14 +1,31 @@
 # Enterprise identity, directory sync and browser subscribers (Labs)
 
 Federation verifies the external identity and starts a pending local session.
-The mapped operator must complete current local TOTP or use an unused recovery
-code before access is granted. Provider/grant changes revoke pending and
+The mapped operator must complete current local TOTP, use an unused recovery
+code or verify an explicitly enabled enrolled passkey before access is granted. Provider/grant changes revoke pending and
 established federated sessions. Remote MFA is not inferred from account names,
 roles or unverified claims.
 
 **DO NOT USE ON PRODUCTION SERVERS.** These independent Labs features start disabled. No provider registration, directory credential or recipient invitation is supplied automatically. Tenant-specific acceptance remains necessary: no Entra, Okta, Google Workspace, Keycloak or OneLogin credentials were available during development.
 
 Settings are namespaces of the existing AES-256-GCM central `.config`: `enterprise_identity`, `directory_sync`, and `subscriber_browser`. Provider/client/private-key/bind/SCIM secrets belong there, never in a new credential file. Save actions require an authenticated FreePBX administrator through Operator Access for SSO, or Enterprise Labs for directory and subscriber settings, with the corresponding page’s CSRF token. They take the existing exclusive announcement activity lease before the settings lock and preserve unrelated active and pending settings.
+
+## Read-only cloud directories — Labs
+
+Add a disabled **Entra ID** or **Google Workspace** source in Enterprise Labs.
+For Entra, enter the tenant UUID, application UUID and application secret value;
+grant only application `User.Read.All` with administrator consent. For Google,
+use a service account with domain-wide delegation for
+`https://www.googleapis.com/auth/admin.directory.user.readonly`, its RSA private
+key, a delegated directory administrator and the Workspace customer ID.
+
+Save before running a dry run. SLS accepts only the documented provider HTTPS
+origins and complete paginated snapshots, with a 45-second deadline, ten-page
+limit and 1,000 people per source. Review affected people and audiences before
+applying. A partial response changes nothing. Imported phone values are review
+candidates; they create no operator grants, call recipients or SMS consent.
+Changing connector type requires a new source and reviewed deprovisioning of
+the previous source.
 
 ## Operator federation
 
@@ -70,6 +87,8 @@ An administrator explicitly selects one subscriber and one open incident, then c
 
 The public `/mass-notify/subscriber.php` endpoint has a separate Secure/HttpOnly/SameSite=Strict session, verified HTTPS requirement, no public signup, no account enumeration, no cross-person roster listing, CSRF/origin checks, attempt limits, HTML escaping, no-referrer policy and no-store responses. Verified email possession opens only the bound participant's current incident wording and response. Supported human responses are `received`, `safe`, `needs_assistance` (“I need help”). Notes are bounded to 500 characters. Responses update the existing incident human response field with `source=human_browser_response`; delivery receipt records remain separate. Repeated response request IDs are idempotent; a reused ID for different details is rejected. Closed incidents reject new responses.
 
+An administrator can also choose **Send browser enrollment email** before opening an incident (`subscriber_enroll` in the Control API). This one-use email proof opens only that subscriber's browser preferences and push enrollment. It grants no incident roster or participant access. The existing invitation expiry, identity revocation, hourly email limit and no-automatic-retry rules apply. Incident responses still require a separate incident-bound invitation.
+
 ## Optional browser Web Push
 
 `subscriber_browser.push` contains `enabled` (default false), `private_key_pem` and `subject`. Generate the P-256 VAPID key once in Enterprise Labs; its private key remains in encrypted `.config`, and public settings expose only its public key and configured status. Preserve it with backups. Set a `mailto:` or HTTPS contact and explicitly enable both subscribers and push before enrollment. No native mobile application is supplied.
@@ -107,6 +126,7 @@ Integration entrypoints: `EnterpriseIdentityConfig`, `DirectoryConfig`, `Subscri
 | `directory_preview` | `{source_id,csv?}` or `{source_id,deprovision_all:true}` | Reads a complete source or explicit empty deprovision snapshot, returns diff and one-use `plan_id`. |
 | `directory_apply` | `{plan_id,confirm_deactivation?:boolean}` | Consumes the preview; requires explicit true for a large deactivation. Preserves previous incidents/jobs. |
 | `subscriber_invite` | `{subscriber_id,incident_id}` | One explicit email to the saved address; does not return bearer proof to the browser. |
+| `subscriber_enroll` | `{subscriber_id}` | One expiring verification email for browser preferences; requires no incident and grants no incident-response authority. |
 | `subscriber_revoke` | `{subscriber_id}` | Revokes proofs and rotates saved subscriber session identity. |
 | `subscriber_push_key` | `{}` | Generates one VAPID key in encrypted configuration; refuses replacement of an existing key and leaves push disabled. |
 | `subscriber_push_test` | `{subscriber_id,request_id,title?,message?}` | Standalone-only marked browser test; 32-hex request identity freezes its content and five-minute expiry. Cluster-enabled deployments must use the queued test so witness authority is enforced. |

@@ -2,6 +2,7 @@
 namespace FreePBX\modules;
 require_once __DIR__ . '/api/sls-mass-notify/security.php';
 require_once __DIR__ . '/EnterpriseClusterIntegration.php';
+require_once __DIR__ . '/RadioGateway.php';
 if (!class_exists('SlsAnnouncementJobStore', false)) {
     require_once __DIR__ . '/bin/sls_mass_notify/sls_announcement_jobs.php';
 }
@@ -147,11 +148,40 @@ trait SlsAnnouncementDelivery
             }
         }
         unset($row);
+        $mailEnabled=false;
+        if(array_filter($rows,static fn($row)=>($row['channel']??'')==='email')){
+            $settings=$this->getActiveSettings();
+            $mailEnabled=($settings['enterprise_integrations']['enabled']??'0')==='1'&&($settings['enterprise_integrations']['mail_evidence']['enabled']??'0')==='1';
+            if($mailEnabled){
+                require_once __DIR__.'/MailEvidence.php';$mail=\SLS\MassNotify\MailEvidence::read(self::PLUGIN_DATA_DIR);
+                foreach($rows as &$row){$row=\SLS\MassNotify\MailEvidence::project($row,$mail,time());}unset($row);
+            }
+        }
+        $browserEvidence=null;
+        foreach($rows as &$row){
+            if(($row['channel']??'')!=='browser_push'||!in_array($row['state']??'',['accepted','uncertain'],true)||!is_string($row['event_id']??null)){continue;}
+            try{
+                if(microtime(true)>$deadline){break;}
+                if($browserEvidence===null){require_once __DIR__.'/BrowserEvents.php';$browserEvidence=new \SLS\MassNotify\BrowserEvents($this->enterpriseLabsStore());}
+                $summary=$browserEvidence->summary((string)($row['target']??''),$row['event_id']);
+                if($summary){
+                    $row['browser_software_receipts']=$summary;
+                    if($summary['received']>0){
+                        $row['detail']=$summary['received'].' of '.$summary['endpoints'].' browser endpoint(s) reported receipt; '.$summary['displayed'].' completed the notification request and '.$summary['clicked'].' reported a click. Human responses are separate.';
+                        if($summary['received']===$summary['endpoints']){$row['state']='received';$row['retryable']=false;}
+                    }
+                }
+            }catch(\Throwable $error){$result['receipt_status_error']='Browser software receipt storage could not be checked. Provider acceptance remains separate.';}
+        }
+        unset($row);
         $result['receipts'] = $rows;
         $age = time() - (strtotime((string)$createdAt) ?: 0);
-        $result['receipt_poll_pending'] = $age >= 0 && $age < 600 && count(array_filter($rows, static function ($row) {
-            return ($row['channel'] ?? '') === 'desktop' && ($row['state'] ?? '') === 'published'
-                && !empty($row['event_id']) && array_key_exists('client_id', $row);
+        $result['receipt_poll_pending'] = $age >= 0 && $age < 600 && count(array_filter($rows, static function ($row)use($mailEnabled) {
+            return (($row['channel'] ?? '') === 'desktop' && ($row['state'] ?? '') === 'published'
+                && !empty($row['event_id']) && array_key_exists('client_id', $row))
+                || (($row['channel']??'')==='browser_push'&&in_array($row['state']??'',['accepted','uncertain'],true)&&!empty($row['event_id']))
+                || ($mailEnabled&&($row['channel']??'')==='email'&&in_array($row['state']??'',['accepted','uncertain'],true)
+                    &&!in_array($row['postfix_stage']??'',['relay_accepted','bounced'],true));
         })) > 0;
         return $result;
     }
@@ -293,7 +323,8 @@ trait SlsAnnouncementDelivery
     private function announcementJobDirectory()
     {
         $directory = self::PLUGIN_DATA_DIR . '/announcement-jobs';
-        if (is_link($directory) || (!is_dir($directory) && !@mkdir($directory, 0750))) {
+        if (is_link($directory) || (!is_dir($directory) && !@mkdir($directory, 0750) && !is_dir($directory))
+            || realpath($directory) !== $directory) {
             throw new \RuntimeException('Announcement job storage is unavailable.');
         }
         return $directory;
@@ -718,8 +749,10 @@ trait SlsAnnouncementDelivery
             $selectedDevices = array_values(array_filter($inventory['devices'] ?? [], static function ($device) use ($request) {
                 return in_array((string)$device['extension'], array_map('strval', $request['phones']), true);
             }));
-            return ['success' => true, 'preview' => true, 'sender' => $request['sender'],
+            return ['success' => true, 'preview' => true, 'delivery_started'=>false, 'transports_attempted'=>[], 'sender' => $request['sender'],
                 'phones' => $request['phones'], 'desktops' => $request['desktops'],
+                'browser_recipient_ids'=>$request['browser_recipient_ids']??[], 'connector_ids'=>$request['connector_ids']??[],
+                'radio_extensions'=>array_values(array_column($request['radio_context']['bindings']??[],'extension')),
                 'voice_recipient_ids' => $request['voice_recipient_ids'] ?? [],
                 'email_recipient_ids' => $request['email_recipient_ids'] ?? [], 'sms_recipient_ids' => $request['sms_recipient_ids'] ?? [],
                 'webhooks' => $request['webhooks'], 'audio_mode' => $request['audio_mode'], 'voice' => $request['voice'],
@@ -1121,12 +1154,18 @@ trait SlsAnnouncementDelivery
 
     private function executeResolvedAnnouncementWithActivity(array $request, $progress = null)
     {
+        $maximumAudio=null;
+        if(($request['radio_context']??null)!==null){
+            try{$maximumAudio=\SLS\MassNotify\RadioGateway::current($request['radio_context'],$this->getActiveSettings());}
+            catch(\DomainException|\InvalidArgumentException $error){return ['success'=>false,'delivery_started'=>false,'error_code'=>'radio_profile_changed','message'=>$error->getMessage()];}
+        }
         $channelTargets = function ($channel, array $targets) use ($request) {
             if (!isset($request['only_channels'])) { return $targets; }
             return array_values(array_intersect(array_map('strval', $targets), $request['only_channels'][$channel] ?? []));
         };
         $audioPhones = $channelTargets('audio', $request['phones']);
         $visualPhones = $channelTargets('sip_notify', $request['phones']);
+        if($maximumAudio!==null){$visualPhones=array_values(array_diff($visualPhones,array_column($request['radio_context']['bindings'],'extension')));}
         $request['desktops'] = $channelTargets('desktop', $request['desktops']);
         $request['webhooks'] = $channelTargets('webhook', $request['webhooks']);
         $receipts = [];
@@ -1351,6 +1390,8 @@ trait SlsAnnouncementDelivery
                     'automation_context' => $request['automation_context'] ?? null,
                     'outbound_targets' => $batch['outbound'], 'correlation' => $request['delivery_id'] ?? '',
                     'schedule_deadline_at' => $scheduleDeadline,
+                    'maximum_audio_seconds'=>$maximumAudio,
+                    'radio_context'=>$request['radio_context']??null,
                 ]); } catch (\Throwable $error) { $audio = ['success' => false, 'message' => 'Audio preparation or queueing stopped without a durable result.',
                     'submission_uncertain' => true, 'delivery_started' => true, 'retryable' => false]; }
                 $audioDuration = max($audioDuration, (int)ceil($audio['audio_duration_seconds'] ?? 0));
@@ -1638,6 +1679,7 @@ trait SlsAnnouncementDelivery
             $row = ['channel' => 'email', 'target' => $id, 'state' => 'cancelled', 'retryable' => false,
                 'attempt_id' => $attempt, 'message_id' => is_array($frozen) ? ($frozen['message_id'] ?? '') : '',
                 'email_phase_deadline' => $phaseDeadline, 'submission_started' => false];
+            if(is_array($frozen)&&is_string($frozen['address']??null)){$row['mail_recipient_hash']=hash('sha256',strtolower($frozen['address']));}
             $allowed = false; $settings = $this->getActiveSettings();
             try {
                 $current = $this->announcementEmailTargets($settings)[$id] ?? null;

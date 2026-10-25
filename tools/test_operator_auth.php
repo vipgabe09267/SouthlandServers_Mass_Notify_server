@@ -14,6 +14,9 @@ authCheck(Auth::counter($secret,$code,$now)===$step,'Current code rejected.');
 authCheck(Auth::counter($secret,$code,$now,$step)===null,'A previously consumed code was accepted.');
 authCheck(Auth::counter($secret,Auth::code($secret,$step-2),$now)===null,'Old code accepted.');
 authCheck(Auth::counter($secret,'1234567',$now)===null,'Wrong code length accepted.');
+authCheck(\SLS\MassNotify\PasswordBlocklist::contains('password')&&!\SLS\MassNotify\PasswordBlocklist::contains('fixture personal passphrase 923'),'Local blocklist lookup is incorrect.');
+$previousEncoding=mb_internal_encoding();mb_internal_encoding('ISO-8859-1');try{authReject(fn()=>Auth::password(str_repeat('猫',14)));}finally{mb_internal_encoding($previousEncoding);}
+authReject(fn()=>Auth::password('films+pic+galeries')); // An 18-character entry from the pinned public blocklist.
 $hash=Auth::password('fixture personal passphrase 923');
 authCheck(Auth::validHash($hash)&&Auth::verify('fixture personal passphrase 923',$hash)&&!Auth::verify('wrong passphrase',$hash),'Strong password verification failed.');
 authCheck($hash!==Auth::password('fixture personal passphrase 923'),'Passwords do not use random salts.');

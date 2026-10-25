@@ -26,7 +26,9 @@ final class EnterpriseClusterConfig
     public static function enabled(array $settings): bool
     {
         $value = $settings['enterprise_cluster'] ?? [];
-        return is_array($value) && (($value['enabled'] ?? false) === true || ($value['enabled'] ?? false) === '1');
+        return is_array($settings['enterprise_labs'] ?? null) && ($settings['enterprise_labs']['enabled'] ?? false) === true
+            && !array_diff(array_keys($settings['enterprise_labs']),['enabled'])
+            && is_array($value) && (($value['enabled'] ?? false) === true || ($value['enabled'] ?? false) === '1');
     }
 
     public static function id($value): string

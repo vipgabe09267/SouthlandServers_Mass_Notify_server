@@ -5,6 +5,8 @@ exercise subscriber worker registration under the production CSP and actual
 POST navigation to a separate synthetic IdP origin. Missing browser tools fail
 required qualification; these fixtures make no production login requests.
 
+Dashboard browser checks also require a local public jQuery asset through `SLS_UI_JQUERY`. CI installs Debian's `libjs-jquery` and supplies `/usr/share/javascript/jquery/jquery.min.js`. This fixture dependency does not add or replace the PBX's jQuery installation.
+
 The VM controller retains a private report on prerequisite failure and bounded
 logs on scenario failure. It supports 0.1.6 upgrades, early preparation power
 loss, repair, removal and purge. Controller tests are not successful full PBX
@@ -15,6 +17,8 @@ VM runs. See the [qualification matrix](QUALIFICATION_MATRIX.md).
 `tools/lint_source.sh` checks PHP, shell and Python syntax and the mirrored documentation. `tools/run_isolated_tests.sh` discovers the behavior/failure suites registered in the release build, then masks PBX state and sockets with disposable mount, network and PID namespaces. Privileged container access is required for those namespaces and is confined to the disposable runner. Do not run CI on this production PBX as a self-hosted runner.
 
 Run focused suites while developing; run the complete registered set before a candidate release. Register new meaningful behavior tests in `tools/build_tgz.sh` so both CI and release preparation exercise them. A signing step is deliberately absent from CI.
+
+Concurrency regressions cover simultaneous first-directory creation with valid, linked and non-directory replacements; shared desktop limiter reads with exclusive write revalidation; and receipt retry after lock contention. Browser checks complete obsolete HTTP 200 and 401 responses after a new display login and verify that its session and cursor survive. Recording checks retain case-sensitive names and model an unavailable G.722 decoder. Uninstaller checks verify that help and unsupported arguments cannot reach host operations.
 
 Media-policy qualification starts a separate Apache/mod_php instance inside the private network namespace with dummy configuration and files. It exercises both normal URLs and legacy API prefix aliases, exact image/XML bytes, HEAD requests, network/proxy enforcement, expiry, and failures. Apache and PHP packages are installed only in the disposable CI container; the test does not reload or reconfigure a production web service.
 

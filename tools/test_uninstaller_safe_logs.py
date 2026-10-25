@@ -14,6 +14,21 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = Path(os.environ.get("SLS_UNINSTALL_TEST_SCRIPT", ROOT / "tools/uninstall_release.sh"))
 
 
+class UninstallerArguments(unittest.TestCase):
+    def test_help_and_invalid_arguments_never_begin_host_operations(self):
+        for arguments, expected in ((["--help"],0), (["-h"],0),
+                                    (["--purge"],64), (["--help","unexpected"],64)):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(
+                    ["bash", "-c", 'source "$1"; shift; require_freepbx() { printf "HOST OPERATIONS STARTED\\n"; return 99; }; main "$@"',
+                     "fixture", str(SCRIPT), *arguments],
+                    capture_output=True, text=True, timeout=5,
+                )
+                self.assertEqual(result.returncode, expected, result.stdout+result.stderr)
+                self.assertNotIn("HOST OPERATIONS STARTED", result.stdout+result.stderr)
+                self.assertIn("Usage:", result.stdout+result.stderr)
+
+
 @unittest.skipUnless(os.geteuid() == 0, "Root ownership fixtures require root")
 class UninstallerProtectedFiles(unittest.TestCase):
     def setUp(self):

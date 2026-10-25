@@ -27,6 +27,7 @@ on:
           - 0.1.4-beta
           - 0.1.5-beta
           - 0.1.6-beta
+          - 0.1.7-beta
 permissions:
   contents: read
 jobs:

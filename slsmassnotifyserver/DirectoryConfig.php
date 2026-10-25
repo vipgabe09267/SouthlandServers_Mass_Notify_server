@@ -9,13 +9,19 @@ final class DirectoryConfig
     public static function records($value): array
     {
         if(!is_array($value)||!array_is_list($value)||count($value)>1000){throw new \DomainException('Each directory supports at most 1000 people.');}$out=[];$seen=[];
-        foreach($value as $r){if(!is_array($r)||array_diff(array_keys($r),['external_id','name','email','location','location_id','desktop_username','active'])){throw new \DomainException('Directory person contains unsupported fields.');}
+        foreach($value as $r){if(!is_array($r)||array_diff(array_keys($r),['external_id','name','email','location','location_id','desktop_username','active','phone_candidates'])){throw new \DomainException('Directory person contains unsupported fields.');}
             $external=EnterpriseIdentityConfig::text($r['external_id']??'',256,'Stable external ID');if(isset($seen[$external])){throw new \DomainException('Duplicate stable external ID in directory result.');}$seen[$external]=true;
             $email=$r['email']??'';if(!is_string($email)||strlen($email)>254||($email!==''&&(!filter_var($email,FILTER_VALIDATE_EMAIL)||preg_match('/[\r\n\x00]/',$email)))){throw new \DomainException('Directory email invalid.');}
             $desktop=$r['desktop_username']??'';$loc=$r['location_id']??'';
             if(!is_string($desktop)||!preg_match('/^[A-Za-z0-9_.@-]{0,80}$/D',$desktop)||!is_string($loc)||($loc!==''&&!preg_match('/^loc_[a-f0-9]{24}$/D',$loc))||!is_bool($r['active']??true)){throw new \DomainException('Directory desktop, location ID or active flag invalid.');}
             $out[]=['external_id'=>$external,'name'=>EnterpriseIdentityConfig::text($r['name']??'',100,'Person name'),'email'=>$email,
                 'location'=>EnterpriseIdentityConfig::text($r['location']??'',120,'Location label',true),'location_id'=>$loc,'desktop_username'=>$desktop,'active'=>$r['active']??true];
+            if (array_key_exists('phone_candidates',$r)) {
+                if (!is_array($r['phone_candidates']) || !array_is_list($r['phone_candidates']) || count($r['phone_candidates']) > 5) { throw new \DomainException('A person supports at most five imported phone candidates.'); }
+                $phones=[];
+                foreach ($r['phone_candidates'] as $phone) { $phones[]=EnterpriseIdentityConfig::text($phone,80,'Imported phone candidate'); }
+                $out[array_key_last($out)]['phone_candidates']=array_values(array_unique($phones));
+            }
         }usort($out,static fn($a,$b)=>strcmp($a['external_id'],$b['external_id']));return $out;
     }
     public static function normalize($v): array
@@ -24,10 +30,12 @@ final class DirectoryConfig
         $out=self::defaults();$out['enabled']=$v['enabled']??false;$seen=[];$sources=$v['sources']??[];
         if(!is_array($sources)||!array_is_list($sources)||count($sources)>10){throw new \DomainException('Configure at most ten directory sources.');}
         foreach($sources as $s){
-            if(!is_array($s)||!in_array($s['type']??'',['csv','ldap','scim'],true)){throw new \DomainException('Directory source fields invalid.');}
+            if(!is_array($s)||!in_array($s['type']??'',['csv','ldap','scim','entra','google'],true)){throw new \DomainException('Directory source fields invalid.');}
             $base=['id','name','type','enabled','template_ids','sync_subscribers','records','maximum_deactivation_percent'];
             $specific=$s['type']==='ldap'?['ldap_url','ldap_starttls','ldap_bind_dn','ldap_password','ldap_base_dn','ldap_filter','ldap_attributes','ldap_inactive_values','ldap_inactive_mask']
-                :($s['type']==='scim'?['scim_base_url','scim_token','scim_attributes']:[]);
+                :match($s['type']) {'scim'=>['scim_base_url','scim_token','scim_attributes'],
+                    'entra'=>['tenant_id','client_id','cloud_client_secret'],
+                    'google'=>['google_client_email','google_admin_subject','google_customer','google_private_key'],default=>[]};
             if(array_diff(array_keys($s),array_merge($base,$specific))||!is_string($s['id']??null)||!preg_match('/^dir_[a-f0-9]{24}$/D',$s['id'])||isset($seen[$s['id']])||!is_bool($s['enabled']??false)||!is_bool($s['sync_subscribers']??false)){throw new \DomainException('Directory source fields invalid.');}
             $r=['id'=>$s['id'],'name'=>EnterpriseIdentityConfig::text($s['name']??'',80,'Source name'),'type'=>$s['type'],'enabled'=>$s['enabled']??false,'sync_subscribers'=>$s['sync_subscribers']??false,'template_ids'=>$s['template_ids']??[],'records'=>self::records($s['records']??[])];
             $r['maximum_deactivation_percent']=$s['maximum_deactivation_percent']??25;if(!is_int($r['maximum_deactivation_percent'])||$r['maximum_deactivation_percent']<1||$r['maximum_deactivation_percent']>100){throw new \DomainException('Directory deactivation review threshold must be 1–100 percent.');}
@@ -57,6 +65,7 @@ final class DirectoryConfig
                 $paths=['','/id','/externalId','/userName','/displayName','/name/formatted','/urn:ietf:params:scim:schemas:extension:enterprise:2.0:User/department','/urn:ietf:params:scim:schemas:extension:enterprise:2.0:User/organization','/urn:ietf:params:scim:schemas:extension:enterprise:2.0:User/employeeNumber'];
                 foreach($r['scim_attributes'] as $key=>$path){if(!is_string($path)||!in_array($path,$paths,true)||($path===''&&in_array($key,['external_id','name'],true))){throw new \DomainException('Choose a documented SCIM user mapping.');}}
             }
+            if (in_array($r['type'],['entra','google'],true)) { require_once __DIR__.'/DirectoryCloud.php'; $r+=DirectoryCloud::normalize($s); }
             $out['sources'][]=$r;$seen[$r['id']]=true;
         }return $out;
     }
@@ -65,7 +74,7 @@ final class DirectoryConfig
     {
         $config = self::normalize($config);
         foreach ($config['sources'] as &$source) {
-            foreach (['ldap_password', 'scim_token'] as $key) {
+            foreach (['ldap_password', 'scim_token', 'cloud_client_secret', 'google_private_key'] as $key) {
                 if (array_key_exists($key, $source)) {
                     $source[$key . '_configured'] = is_string($source[$key]) && $source[$key] !== '';
                     $source[$key] = '';

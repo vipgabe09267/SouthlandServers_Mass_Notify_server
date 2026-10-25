@@ -64,7 +64,8 @@ final class PhoneInventory
                     || !is_string($contact['detected_format'] ?? null) || !in_array($contact['detected_format'],self::FORMATS,true)
                     || !is_string($contact['device_key'] ?? null) || !preg_match('/^(?:[a-f0-9]{32})?$/D',$contact['device_key'])
                     || !is_bool($contact['override'] ?? null)
-                    || !in_array($contact['capability'] ?? null,['unverified_generic','vendor_template'],true)) { return $unavailable; }
+                    || !in_array($contact['capability'] ?? null,['unverified_generic','vendor_template'],true)
+                    || (array_key_exists('transport', $contact) && !is_string($contact['transport']))) { return $unavailable; }
                 $transport = strtolower((string)($contact['transport'] ?? ''));
                 if ($transport === '' && is_string($contact['contact'] ?? null) && strlen($contact['contact']) <= 8192
                     && !preg_match('/[\x00-\x1f\x7f]/', $contact['contact'])) {

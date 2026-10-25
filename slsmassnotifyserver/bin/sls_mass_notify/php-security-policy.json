@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "reviewed_at": "2026-10-22",
+  "advisories": ["CVE-2026-109618", "CVE-2026-109619"],
+  "branches": {"8.2": "8.2.35", "8.3": "8.3.36", "8.4": "8.4.27", "8.5": "8.5.12"},
+  "references": ["https://www.php.net/releases/8_2_35.php", "https://security-tracker.debian.org/tracker/CVE-2026-109618", "https://security-tracker.debian.org/tracker/CVE-2026-109619"]
+}

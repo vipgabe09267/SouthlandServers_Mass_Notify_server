@@ -179,6 +179,37 @@ class RouteTests(unittest.TestCase):
         r['AppData'] += 'U(sub-send-obroute-email^${DIAL_NUMBER})'
         with self.assertRaisesRegex(routes.OutboundRouteError, 'dial_options_unsupported'): self.proof()
 
+    def test_extension_only_callback_returns_before_its_body_for_local_origins(self):
+        self.core()
+        hook = self.ami.contexts['macro-dialout-trunk-predial-hook']
+        hook.insert(1, row('macro-dialout-trunk-predial-hook', 'Gosub', 'pbx-business-callback-identity,s,1()'))
+        for index, entry in enumerate(hook, 1): entry['Priority'] = str(index)
+        context = 'pbx-business-callback-identity'
+        self.ami.contexts[context] = [
+            row(context, 'NoOp', 'Checking business callback identity'),
+            row(context, 'GotoIf', '$["${AMPUSER}"!="1000"]?done', 2),
+            row(context, 'GotoIf', '$["${CHANNEL(name):0:11}"!="PJSIP/1000-"]?done', 3),
+            row(context, 'AGI', '/private/callback-lookup.py', 4),
+            {**row(context, 'Return', '', 5), 'ExtensionLabel': 'done'},
+        ]
+        proof = self.proof()
+        self.ami.contexts[context][3]['AppData'] = '/private/changed-lookup.py'
+        self.assertNotEqual(proof['fingerprint'], self.proof()['fingerprint'])
+        approved = copy.deepcopy(self.ami.contexts)
+        for index, changes in [(0, {'Application': 'System', 'AppData': 'unreviewed'}),
+                               (1, {'AppData': '$["${AMPUSER}"="1000"]?done'}),
+                               (2, {'AppData': '$["${CHANNEL(name):0:11}"="PJSIP/1000-"]?done'}),
+                               (2, {'AppData': '$["${CHANNEL(name):0:11}"!="Local/test-"]?done'}),
+                               (4, {'Application': 'Dial', 'AppData': 'PJSIP/extra'})]:
+            self.ami.contexts = copy.deepcopy(approved)
+            self.ami.contexts[context][index].update(changes)
+            with self.subTest(index=index, changes=changes), self.assertRaisesRegex(routes.OutboundRouteError, 'predial_hook'):
+                self.proof()
+        self.ami.contexts = copy.deepcopy(approved)
+        self.ami.contexts[context].append({'Context': context, 'IncludeContext': context+'-custom'})
+        self.ami.contexts[context+'-custom'] = [row(context+'-custom', 'Dial', 'PJSIP/extra')]
+        with self.assertRaises(routes.OutboundRouteError): self.proof()
+
     def test_side_effects_and_confirmation_cannot_evade_proof_in_expressions(self):
         for app, data in [('NoOp', '${DB_DELETE(TRUNK/1/dialopts)}'), ('NoOp', '${${EVIL}(argument)}'),
                           ('Set', 'FORCE_CONFIRM=1'), ('NoOp', '${SHIFT(DIAL_TRUNK_OPTIONS)}')]:
@@ -281,7 +312,7 @@ class AgiRoutePolicyTests(unittest.TestCase):
         self.module = importlib.util.module_from_spec(spec); spec.loader.exec_module(self.module)
         target = self.target; token = self.token
         class FakeAgi:
-            environment = {'agi_uniqueid':'1.1','agi_channel':'Local/'+target['id']+'@sls-outbound-voice-fixture;2'}
+            environment = {'agi_uniqueid':'1.1','agi_channel':'Local/'+target['id']+'@sls-outbound-voice-abc123;2'}
             def __init__(self): self.writes = {}
             def variable(self,name): return {'${SLS_PHONE_TOKEN}':token,'${SLS_PHONE_RECIPIENT}':target['id']}.get(name,'')
             def set(self,name,value): self.writes[name] = value
@@ -307,6 +338,17 @@ class AgiRoutePolicyTests(unittest.TestCase):
         self.assertEqual(self.agi.writes['SLS_PHONE_ALLOW'],'0')
         self.assertNotIn('TRUNK_OPTIONS',self.agi.writes)
         self.assertNotIn('SLS_OUTBOUND_NUMBER',self.agi.writes)
+
+    def test_only_the_bound_local_origin_can_enter_outbound_routing(self):
+        for channel in ('PJSIP/1000-00001', 'Local/'+self.target['id']+'@sls-outbound-voice-abc123;1',
+                        'Local/voice_'+'b'*24+'@sls-outbound-voice-abc123;2',
+                        'Local/'+self.target['id']+'@from-internal-abc123;2'):
+            self.agi.environment = {**self.agi.environment, 'agi_channel': channel}
+            with self.subTest(channel=channel), self.assertRaisesRegex(phone.PhoneAdmissionError, 'phone_outbound_origin_invalid'):
+                self.module.handle('outbound', self.agi, self.store)
+            self.assertNotIn('TRUNK_OPTIONS', self.agi.writes)
+            with self.store.locked() as state:
+                self.assertEqual(state['batches'][self.token]['channels'], {})
 
     def test_policy_schema_never_accepts_global_or_database_setters(self):
         for values in ({'GLOBAL(TRUNK_OPTIONS)':'Ti'}, {'DB(TRUNK/1/dialopts)':'Ti'},

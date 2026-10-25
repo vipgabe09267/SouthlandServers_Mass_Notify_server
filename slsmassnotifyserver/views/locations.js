@@ -184,7 +184,7 @@
         el('group-name').value = existing ? existing.name.slice(0, 64) : '';
     }
     function updateState(result, id) {
-        state = result.state; dirty = false; el('pending').hidden = false; renderTree();
+        state = result.state; dirty = false; el('pending').hidden = false; renderTree(); window.SlsSaveState?.set(root,'pending');
         if (geography) geography.refresh();
         if (audiences) audiences.refresh();
         if (id && saved(id)) openEditor(id);
@@ -275,8 +275,8 @@
                 el('preview-issues').append(node('strong', 'Resolve unavailable recipients before saving this audience.'));
                 const list = node('ul'); preview.unavailable.forEach(row => list.append(node('li', row.id + ' · ' + row.location + ': ' + row.reason))); el('preview-issues').append(list);
             }
-            el('create-group').disabled = preview.unavailable.length > 0 || total === 0 || state.group_count >= 20;
-            if (state.group_count >= 20) announce('All 20 announcement groups are in use. Remove an unused group on the Dashboard before creating another.', false);
+            el('create-group').disabled = preview.unavailable.length > 0 || total === 0 || state.group_count >= (state.group_limit || 200);
+            if (state.group_count >= (state.group_limit || 200)) announce('All saved audience slots are in use. Remove an unused audience before creating another.', false);
             el('preview-result').hidden = false;
         } catch (error) { invalidatePreview(); announce(error.message, false); }
     });

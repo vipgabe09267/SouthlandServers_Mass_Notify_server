@@ -36,7 +36,8 @@ preflight_platform() { :; }
 preflight_python() { :; }
 detect_served_php_profiles() { SERVED_PHP_PROFILES='8.2:apache2'; }
 verify_served_php_configuration() { :; }
-bootstrap_missing_dashboard() { :; }
+verify_php_security_versions_before_mutation() { trace php-security-floor; [ "$scenario" != php-rejected ] || return 38; }
+bootstrap_missing_dashboard() { trace stock-dashboard-bootstrap; }
 preflight_profile_identity() { :; }
 ensure_freepbx_prerequisites() { :; }
 initialize_configuration_keyring() { trace config-keyring-init; }
@@ -145,7 +146,7 @@ class TransactionTests(unittest.TestCase):
    self.assertEqual(pending.read_text(),'{"staged":"preserve exact bytes"}\n')
    trace=(root/'trace').read_text().splitlines()
    journals=list((root/'journal').glob('transaction-*/transaction.json'))
-   if scenario=='approval-rejected':
+   if scenario in ('approval-rejected','php-rejected'):
     self.assertEqual(journals,[])
    else:
     self.assertEqual(len(journals),1)
@@ -164,16 +165,20 @@ class TransactionTests(unittest.TestCase):
     self.assertLess(trace.index('protected-activate --apply'),trace.index('asterisk-fwconsole-reload'))
     self.assertLess(trace.index('asterisk-fwconsole-reload'),trace.index('protected-verify'))
     self.assertEqual(trace[-1],'success')
-    phases=['approval-preflight','chown-protected','legacy-permissions-repaired','approved-prerequisites','previous-collector-healthy','approved-snapshot','protected-prepare --apply']
+    phases=['php-security-floor','stock-dashboard-bootstrap','approval-preflight','chown-protected','legacy-permissions-repaired','approved-prerequisites','previous-collector-healthy','approved-snapshot','protected-prepare --apply']
     self.assertEqual([trace.index(item) for item in phases],sorted(trace.index(item) for item in phases))
     self.assertFalse((root/'recovery').exists())
    else:
     self.assertEqual((module/'module.xml').read_text(),'original')
-    if scenario=='approval-rejected':
+    if scenario in ('approval-rejected','php-rejected'):
      self.assertFalse(any(x.startswith('static-') for x in trace))
-     self.assertIn('failure-31-install_command_failed',trace)
+     failure='failure-38-php_security_preflight_failed' if scenario=='php-rejected' else 'failure-31-install_command_failed'
+     self.assertIn(failure,trace)
      self.assertNotIn('chown-protected',trace)
      self.assertNotIn('legacy-permissions-repaired',trace)
+     if scenario=='php-rejected':
+      self.assertNotIn('stock-dashboard-bootstrap',trace)
+      self.assertNotIn('approval-preflight',trace)
     elif scenario=='unknown-prepared-stage':
      self.assertFalse(any(x.startswith('static-') for x in trace))
      self.assertIn('failure-2-installer_stage_recording_failed',trace)
@@ -192,7 +197,7 @@ class TransactionTests(unittest.TestCase):
       self.assertIn('failure-'+str(expected)+'-install_rollback_failed',trace)
    # The EXIT guard always releases worker slots, including every failure path.
    import fcntl
-   if scenario not in ('approval-rejected','unknown-prepared-stage','chown-failed','legacy-permissions-failed','collector-failed'):
+   if scenario not in ('approval-rejected','php-rejected','unknown-prepared-stage','chown-failed','legacy-permissions-failed','collector-failed'):
     with (data/'schedule-runner.lock').open('r+') as handle:fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
    else:
     self.assertFalse((data/'schedule-runner.lock').exists())
@@ -201,6 +206,7 @@ class TransactionTests(unittest.TestCase):
   self.run_case('success',0,True)
   self.run_case('final-failed',34,True)
  def test_prerequisite_rejection_does_not_restore_or_disable_old_automation(self):self.run_case('approval-rejected',31)
+ def test_security_floor_rejection_precedes_stock_bootstrap_and_trust_mutation(self):self.run_case('php-rejected',38)
  def test_failure_stages_preserve_old_module_config_and_operational_records(self):
   for scenario,code in [('prepare-failed',32),('install-failed',33),('final-failed',34),('pending-drift',1)]:
    with self.subTest(scenario=scenario):self.run_case(scenario,code)

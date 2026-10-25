@@ -20,3 +20,5 @@ Validation covers the shipped release-feed parser with mocked responses, form/AP
 The candidate updater installs and verifies the protected `slsconsole` entrypoint with the runtime. Recovery captures its previous bytes or absence; no console command is run to alter admission during update. A configured `runtime_enabled: false` state remains false across an update and continues to block new notifications.
 
 Enterprise Labs presents its danger notice automatically until an administrator accepts it after five seconds. Updates preserve a current revision-bound page acknowledgment; native recovery clears Labs acknowledgments and disables Labs features. No update accepts the warning or enables a feature for the administrator.
+
+Update requests return to General Settings with the Updates and storage panel open. **Check for updates** queues a check-only request even when automatic updates are disabled. **Install Selected Release** is offered only for a known newer eligible release. A failed check can be retried without requesting installation. Save General Settings and Apply Config before using a changed automatic policy; checks use applied settings.

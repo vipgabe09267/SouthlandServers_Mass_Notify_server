@@ -1,0 +1,56 @@
+name: Attest immutable signed release
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing immutable SLS release tag
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  provenance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      SLS_RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate release identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SLS_RELEASE_TAG" =~ ^slsmassnotifyserver-[0-9]+\.[0-9]+\.[0-9]+(-beta)?$ ]]
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.SLS_RELEASE_TAG }}
+          persist-credentials: false
+      - name: Require immutable release and verify publisher signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$SLS_RELEASE_TAG" > release-metadata.json
+          python3 - <<'PY'
+          import json, os
+          release=json.load(open('release-metadata.json'))
+          if release.get('tag_name')!=os.environ['SLS_RELEASE_TAG'] or release.get('draft') is not False or release.get('immutable') is not True:
+              raise SystemExit('Enable immutable future releases in repository settings and publish this signed draft before attestation. No release was modified.')
+          PY
+          mkdir -m 0700 provenance-assets
+          version="${SLS_RELEASE_TAG#slsmassnotifyserver-}"
+          gh release download "$SLS_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir provenance-assets \
+            --pattern "$SLS_RELEASE_TAG.tgz" --pattern release-manifest.json --pattern release-manifest.sig
+          cp tools/install_release.sh provenance-assets/install_release.sh
+          python3 slsmassnotifyserver/bin/sls_mass_notify/sls_release_verify.py \
+            --manifest provenance-assets/release-manifest.json --signature provenance-assets/release-manifest.sig \
+            --installer provenance-assets/install_release.sh --package "provenance-assets/$SLS_RELEASE_TAG.tgz" --version "$version"
+      - name: Attest the verified release bytes
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: provenance-assets/*

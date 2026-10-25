@@ -20,7 +20,12 @@
     else if (!options.multiline) { control.type = options.type ?? 'text'; if (options.type === 'password') { control.autocomplete = 'new-password'; control.placeholder = 'Blank preserves saved secret'; } }
     control.value = value ?? ''; control.readOnly = options.readonly === true; control.addEventListener('input', () => change(options.type === 'number' ? Number(control.value) : control.value)); wrapper.append(control); parent.append(wrapper); return control;
   };
-  const toggle = (parent, label, enabled, change) => { const wrapper = node('label', undefined, 'sls-identity-toggle'), control = node('input'); control.type = 'checkbox'; control.checked = enabled === true; control.addEventListener('change', () => change(control.checked)); wrapper.append(control, document.createTextNode(label)); parent.append(wrapper); };
+  const toggle = (parent, label, enabled, change) => { const wrapper = node('label', undefined, 'sls-identity-toggle'), control = node('input'); control.type = 'checkbox'; control.checked = enabled === true;
+    if (['Enable directory synchronization','Enable verified browser subscribers','Enable encrypted browser Web Push'].includes(label)) {
+      control.dataset.labsMasterRequired = '1';
+      if (window.SlsEnterpriseMasterEnabled?.() === false) { control.disabled = true; control.title = 'Enable Enterprise Labs in Feature manager first.'; }
+    }
+    control.addEventListener('change', () => change(control.checked)); wrapper.append(control, document.createTextNode(label)); parent.append(wrapper); };
   const card = (parent, title, remove) => { const result = node('section', undefined, 'sls-identity-card'), heading = node('div', undefined, 'sls-identity-card-heading'), button = node('button', 'Remove', 'btn btn-link text-danger'); button.type = 'button'; button.addEventListener('click', remove); heading.append(node('h4', title), button); result.append(heading); parent.append(result); return result; };
   const call = async (action, inputValue) => {
     status.textContent = 'Working…';
@@ -68,6 +73,10 @@
         for (const [key, label] of [['discovery_url', 'Discovery URL'], ['client_id', 'Client ID'], ['client_secret', 'Client secret'], ['hosted_domain', 'Workspace domain (Google only)']]) input(fields, label, provider[key], value => change(key, value), { type: key === 'client_secret' ? 'password' : 'text' });
         input(fields, 'Allowed endpoint hostnames (one per line)', provider.endpoint_hosts.join('\n'), value => change('endpoint_hosts', value.split(/\s+/).filter(Boolean)), { multiline: true });
         input(fields, 'Private endpoint pins (host=IP, one per line)', (provider.private_endpoint_pins ?? []).map(pin => `${pin.host}=${pin.ip}`).join('\n'), value => change('private_endpoint_pins', value.split(/\r?\n/).map(line => line.trim()).filter(Boolean).map(line => { const split = line.lastIndexOf('='); return { host: split < 1 ? '' : line.slice(0, split).trim(), ip: split < 1 ? '' : line.slice(split + 1).trim() }; })), { multiline: true });
+        const trust = node('details'); trust.append(node('summary', 'Certificate trust for this provider')); section.append(trust);
+        input(trust, 'Private CA certificates (PEM, optional)', provider.tls?.ca_pem || '', value => change('tls', { ...(read('identity').providers[index].tls || {}), ca_pem: value }), { multiline: true });
+        input(trust, 'Public-key pin (sha256//…, optional)', provider.tls?.public_key_pin || '', value => change('tls', { ...(read('identity').providers[index].tls || {}), public_key_pin: value }));
+        trust.append(node('p', 'Hostname and certificate checks remain enabled. This trust applies only to the saved provider endpoints.', 'help-block'));
       } else {
         for (const [key, label] of [['idp_sso_url', 'IdP sign-in URL'], ['sp_entity_id', 'SP entity ID'], ['sp_certificate', 'SP certificate PEM'], ['sp_private_key', 'SP private key PEM']]) input(fields, label, provider[key], value => change(key, value), { multiline: key.includes('certificate') || key.includes('private_key') });
         input(section, 'Pinned IdP signing certificates (one complete PEM per block)', provider.idp_signing_certificates.join('\n'), value => change('idp_signing_certificates', value.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) ?? []), { multiline: true });
@@ -110,6 +119,20 @@
         for (const key of ['external_id', 'name', 'location', 'desktop_username']) input(fields, `${key.replaceAll('_', ' ')} JSON pointer`, source.scim_attributes?.[key] ?? ({ external_id: '/id', name: '/displayName' }[key] ?? ''), value => update('directory', config => { config.sources[index].scim_attributes ??= { external_id: '/id', name: '/displayName', location: '', desktop_username: '' }; config.sources[index].scim_attributes[key] = value; }));
         section.append(node('p', 'Mappings accept documented SCIM core fields and enterprise department, organization or employeeNumber. Remote partial results cannot remove people.', 'help-block'));
       }
+      if (source.type === 'entra') {
+        for (const [key, label] of [['tenant_id', 'Tenant ID'], ['client_id', 'Application ID'], ['cloud_client_secret', 'Application secret value']])
+          input(fields, label, source[key], value => change(key, value), { type: key === 'cloud_client_secret' ? 'password' : 'text' });
+        section.append(node('p', 'Labs · Microsoft Graph v1.0. Grant application User.Read.All with administrator consent. SLS only reads users; it cannot provision sign-ins or grant SMS consent. A complete preview is required before applying changes.', 'help-block'));
+      }
+      if (source.type === 'google') {
+        for (const [key, label] of [['google_client_email', 'Service-account email'], ['google_admin_subject', 'Delegated administrator email'], ['google_customer', 'Workspace customer ID']])
+          input(fields, label, source[key], value => change(key, value));
+        const label = node('label', 'Service-account RSA private key'), pem = node('textarea');
+        pem.rows = 5; pem.autocomplete = 'off'; pem.spellcheck = false; pem.value = source.google_private_key || '';
+        pem.placeholder = source.google_private_key_configured ? 'Key saved. Leave blank to retain it.' : '-----BEGIN PRIVATE KEY-----';
+        pem.addEventListener('change', () => change('google_private_key', pem.value)); label.append(pem); fields.append(label);
+        section.append(node('p', 'Labs · Authorize domain-wide delegation only for https://www.googleapis.com/auth/admin.directory.user.readonly. The delegated account needs directory read access. Phone values are candidates for review; no SMS recipient is created automatically.', 'help-block'));
+      }
     });
     const fill = (selector, rows, prompt) => { const select = find(selector), previous = select.value; select.replaceChildren(); choices(rows, prompt).forEach(choice => { const option = node('option', choice.name); option.value = choice.id; select.append(option); }); select.value = previous; };
     fill('[data-preview-source]', directory.sources, 'Select a saved source');
@@ -139,6 +162,9 @@
     if (key === 'identity' && config.enabled) { if (!window.SlsLabsSafety) throw new Error('Reload Operator Access to review the SSO warning.'); if (!await window.SlsLabsSafety.acknowledge()) return; }
     const result = await call({ identity: 'identity_save', directory: 'directory_save', subscriber: 'subscriber_save' }[key], { config, revision: boot.revisions[key] });
     write(key, result.config); boot.revisions[key] = result.revision; clearPlan(); render();
+    const section={directory:'directory_sync',subscriber:'subscriber_browser'}[key];
+    if(section)window.SlsLabsActivation?.(section,result.config);
+    window.SlsSaveState?.set(document.getElementById('sls-enterprise'),'saved');
   })));
   find('[data-add-provider]')?.addEventListener('click', run(() => {
     const config = read('identity'), vendor = find('[data-provider-vendor]').value, protocol = find('[data-provider-protocol]').value;
@@ -152,6 +178,8 @@
     const config = read('directory'), type = find('[data-source-type]').value, source = { id: randomId('dir_'), name: `New ${type} source`, type, enabled: false, template_ids: [], sync_subscribers: false, records: [], maximum_deactivation_percent: 25 };
     if (type === 'ldap') Object.assign(source, { ldap_url: '', ldap_starttls: true, ldap_bind_dn: '', ldap_password: '', ldap_base_dn: '', ldap_filter: '(objectClass=person)', ldap_attributes: { external_id: 'entryUUID', name: 'displayName', email: 'mail', location: 'l', desktop_username: 'uid', active: '' }, ldap_inactive_values: ['false', '0'], ldap_inactive_mask: 0 });
     if (type === 'scim') Object.assign(source, { scim_base_url: '', scim_token: '', scim_attributes: { external_id: '/id', name: '/displayName', location: '', desktop_username: '' } });
+    if (type === 'entra') Object.assign(source, { tenant_id: '', client_id: '', cloud_client_secret: '' });
+    if (type === 'google') Object.assign(source, { google_client_email: '', google_admin_subject: '', google_customer: 'my_customer', google_private_key: '' });
     config.sources.push(source); write('directory', config); render(); feedback('Source added disabled. Select its templates and complete connector settings before saving.');
   }));
   const preview = async deprovision => {
@@ -166,6 +194,7 @@
   find('[data-confirm-deactivation]')?.addEventListener('change', event => { find('[data-apply-directory]').disabled = !plan || (confirmationRequired && !event.target.checked); });
   find('[data-apply-directory]')?.addEventListener('click', run(async () => { if (!plan) throw new Error('Run a dry run first.'); await call('directory_apply', { plan_id: plan, confirm_deactivation: find('[data-confirm-deactivation]').checked }); clearPlan(); location.reload(); }));
   find('[data-add-subscriber]')?.addEventListener('click', run(() => { update('subscriber', config => config.people.push({ id: randomId('sub_'), person_id: '', name: '', email: '', enabled: false })); render(); }));
+  find('[data-enroll-subscriber-button]')?.addEventListener('click', run(() => call('subscriber_enroll', { subscriber_id: find('[data-invite-subscriber]').value })));
   find('[data-invite-subscriber-button]')?.addEventListener('click', run(() => call('subscriber_invite', { subscriber_id: find('[data-invite-subscriber]').value, incident_id: find('[data-invite-incident]').value })));
   find('[data-revoke-subscriber]')?.addEventListener('click', run(async () => { const result = await call('subscriber_revoke', { subscriber_id: find('[data-invite-subscriber]').value }); write('subscriber', result.config); boot.revisions.subscriber = result.revision; render(); }));
   find('[data-browser-key]')?.addEventListener('click', run(async () => { const result = await call('subscriber_push_key', {}); write('subscriber', result.config); boot.revisions.subscriber = result.revision; render(); }));

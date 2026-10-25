@@ -217,6 +217,11 @@ final class SlsConfigCrypto
         return self::decode(self::readProtected($path, self::MAX_FILE_BYTES, false), $keyringPath, $allowLegacy);
     }
 
+    public static function fileFingerprint(string $path): string
+    {
+        return hash('sha256', self::readProtected($path, self::MAX_FILE_BYTES, false));
+    }
+
     public static function encodeWithKeyring(array $settings, array $ring): string
     {
         self::validateKeyring($ring);

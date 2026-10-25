@@ -7,6 +7,12 @@ function check($ok,string $message): void { $GLOBALS['checks']++; if(!$ok)throw 
 $root=sys_get_temp_dir().'/sls-readiness-'.bin2hex(random_bytes(8));mkdir($root,0700);
 register_shutdown_function(static function()use($root){foreach(new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root,FilesystemIterator::SKIP_DOTS),RecursiveIteratorIterator::CHILD_FIRST)as $entry){if($entry->isDir()&&!$entry->isLink())rmdir($entry->getPathname());else unlink($entry->getPathname());}rmdir($root);});
 $path=$root.'/health.json';$now=1800000000;
+check(Readiness::runtimeCode(['label'=>_('Phone admission and outcome collector')])==='phone_collector','Phone health has no stable code.');
+check(Readiness::runtimeCode(['label'=>_('General announcement worker')])==='announcement_worker','Worker health has no stable code.');
+check(Readiness::runtimeCode(['code'=>'extension_probe','label'=>'arbitrary'])==='extension_probe','Explicit stable check code was lost.');
+check(Readiness::runtimeCode(['label'=>'Unknown extension'])==='unclassified_runtime_check','Unknown label was made into a stable code.');
+$stable=Readiness::check('sample','Sample','unknown','Not measured');
+check($stable['code']==='sample'&&$stable['reason_code']==='verification_unavailable','Typed readiness metadata was lost.');
 check(Readiness::snapshot($path)['error']==='missing','Missing snapshot was treated as healthy.');
 file_put_contents($path,json_encode(['checked_at'=>$now,'private_extra'=>'never projected']));chmod($path,0600);
 $before=[hash_file('sha256',$path),fileinode($path),filemtime($path)];
@@ -100,10 +106,12 @@ mkdir($root.'/announcement-jobs',0700);
 file_put_contents($root.'/storage-summary.json',json_encode(['checked_at'=>time(),'audit_failed_records'=>0,'audit_fault_active'=>false,'audit_at_capacity'=>false]));chmod($root.'/storage-summary.json',0600);
 file_put_contents($root.'/announcement-jobs/worker-probe.json',json_encode(['checked_at'=>gmdate('c')]));chmod($root.'/announcement-jobs/worker-probe.json',0600);
 $module=new \FreePBX\modules\ReadinessFixture();$report=$module->getDeploymentReadiness();
-check($report['operational_ready']===true&&count($report['checks'])===9,'Real report aggregation failed.');
+$phpOk=\SLS\MassNotify\PhpSecurityPolicy::evaluate(PHP_VERSION)['ok'];
+$baselineAttention=$phpOk?0:1;
+check($report['operational_ready']===$phpOk&&count($report['checks'])===10&&$report['attention_count']===$baselineAttention,'Real report aggregation failed.');
 file_put_contents($root.'/storage-summary.json',json_encode(['checked_at'=>time()-1000,'audit_failed_records'=>0,'audit_fault_active'=>false,'audit_at_capacity'=>false]));
 $before=hash_file('sha256',$root.'/storage-summary.json');$report=$module->getDeploymentReadiness();
-check($report['operational_ready']===false&&$report['attention_count']===1,'Stopped maintenance was not detected independently.');
+check($report['operational_ready']===false&&$report['attention_count']===$baselineAttention+1,'Stopped maintenance was not detected independently.');
 check($before===hash_file('sha256',$root.'/storage-summary.json'),'Report repaired or rewrote the missing heartbeat.');
 // The aggregate/export is a separate read path from the administrator form.
 $_SESSION['AMP_user']=(object)['username'=>'fixture'];

@@ -75,6 +75,13 @@ try {
     write_inventory_fixture($path, $value);
     check_inventory(!PhoneInventory::read($path, $now + 90)['available']);
 
+    foreach ([[], true, 123, null] as $invalidTransport) {
+        $invalid = $value;
+        $invalid['endpoints'][1000]['contacts'][0]['transport'] = $invalidTransport;
+        write_inventory_fixture($path, $invalid);
+        check_inventory(!PhoneInventory::read($path, $now)['available']);
+    }
+
     foreach ([
         ['expires_at' => NAN],
         ['expires_at' => $now + 1000],

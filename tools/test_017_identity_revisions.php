@@ -2,6 +2,7 @@
 declare(strict_types=1);
 require_once dirname(__DIR__).'/slsmassnotifyserver/EnterpriseIdentity.php';
 require_once dirname(__DIR__).'/slsmassnotifyserver/ImmediateSettings.php';
+require_once dirname(__DIR__).'/slsmassnotifyserver/EnterpriseIdentityManagement.php';
 use SLS\MassNotify\{EnterpriseIdentity,EnterpriseIdentityConfig,OperatorAuth,OperatorAccess};
 function confirmed(bool $condition,string $message): void { if(!$condition){throw new RuntimeException($message);} }
 $id='api_'.str_repeat('a',24);$now=time();
@@ -35,4 +36,56 @@ foreach (['active-first','pending-first'] as $order) {
     $fresh=$reviewed;$fresh['enterprise_identity']['enabled']=!$committedActive['enterprise_identity']['enabled'];
     confirmed(\SLS\MassNotify\ImmediateSettings::reconcile($committedActive,$fresh)['enterprise_identity']===$fresh['enterprise_identity'],'A fresh reviewed edit was overwritten: '.$order);
 }
-echo "SSO sessions: unchanged provider, provider replacement, mismatched revisions and explicit revocation passed.\n";
+define('IDENTITY_SAVE_FIXTURE', sys_get_temp_dir().'/sls-identity-save-'.bin2hex(random_bytes(8)));
+final class IdentitySaveFixture
+{
+    use \FreePBX\modules\SlsEnterpriseLabs;
+    public const SETTINGS_JSON=IDENTITY_SAVE_FIXTURE.'/active.config';
+    public const PENDING_SETTINGS_JSON=IDENTITY_SAVE_FIXTURE.'/pending.config';
+    public bool $failPending=false;
+    private function normalizeSettings(array $settings): array { return $settings; }
+    private function assertEnterpriseActivationSafe(array $settings): void {}
+    private function loadSettingsFile(string $path): array { return \FreePBX\modules\SlsConfigCrypto::decode(file_get_contents($path)); }
+    private function rememberSettingsFingerprint(string $path): void {}
+    private function writeSettingsFileUnlocked(string $path,array $settings,bool $backup): void
+    {
+        if($this->failPending&&$path===self::PENDING_SETTINGS_JSON){throw new RuntimeException('Injected pending identity save failure.');}
+        confirmed(file_put_contents($path,json_encode($settings,JSON_THROW_ON_ERROR))!==false,'Fixture settings write failed.');
+        confirmed(chmod($path,0600),'Fixture settings permissions failed.');
+    }
+    public function save(array $settings,array $keys): void { $this->enterpriseLabsWrite($settings,$keys); }
+}
+confirmed(mkdir(IDENTITY_SAVE_FIXTURE,0700),'Identity save fixture could not be created.');
+try {
+    $before=['enterprise_labs'=>['enabled'=>true],'subscriber_browser'=>['enabled'=>false],'unrelated'=>'active'];
+    $staged=$before;$staged['unrelated']='pending';
+    foreach([IdentitySaveFixture::SETTINGS_JSON=>$before,IdentitySaveFixture::PENDING_SETTINGS_JSON=>$staged] as $path=>$value){
+        confirmed(file_put_contents($path,json_encode($value,JSON_THROW_ON_ERROR))!==false&&chmod($path,0600),'Identity settings fixture could not be seeded.');
+    }
+    $activeBytes=file_get_contents(IdentitySaveFixture::SETTINGS_JSON);
+    $pendingBytes=file_get_contents(IdentitySaveFixture::PENDING_SETTINGS_JSON);
+    $next=$before;$next['subscriber_browser']['enabled']=true;
+    $fixture=new IdentitySaveFixture();$fixture->failPending=true;
+    try{$fixture->save($next,['subscriber_browser']);confirmed(false,'Pending failure was reported as a completed identity save.');}
+    catch(RuntimeException $error){confirmed($error->getMessage()==='Injected pending identity save failure.','Identity write failure was masked.');}
+    confirmed(file_get_contents(IdentitySaveFixture::SETTINGS_JSON)===$activeBytes
+        &&file_get_contents(IdentitySaveFixture::PENDING_SETTINGS_JSON)===$pendingBytes
+        &&!file_exists(IDENTITY_SAVE_FIXTURE.'/.sls-immediate-settings-transaction.json'),
+        'Identity save failure left a partial active/pending configuration.');
+    $fixture->failPending=false;$fixture->save($next,['subscriber_browser']);
+    $saved=json_decode(file_get_contents(IdentitySaveFixture::SETTINGS_JSON),true,512,JSON_THROW_ON_ERROR);
+    $savedPending=json_decode(file_get_contents(IdentitySaveFixture::PENDING_SETTINGS_JSON),true,512,JSON_THROW_ON_ERROR);
+    confirmed($saved['subscriber_browser']['enabled']&&$savedPending['subscriber_browser']['enabled']
+        &&$saved['unrelated']==='active'&&$savedPending['unrelated']==='pending'
+        &&$saved['immediate_config_revisions']===$savedPending['immediate_config_revisions'],
+        'Identity save did not preserve unrelated active and pending edits.');
+    confirmed(unlink(IdentitySaveFixture::PENDING_SETTINGS_JSON),'Pending fixture could not be removed.');
+    $next['subscriber_browser']['enabled']=false;$fixture->save($next,['subscriber_browser']);
+    confirmed(!json_decode(file_get_contents(IdentitySaveFixture::SETTINGS_JSON),true,512,JSON_THROW_ON_ERROR)['subscriber_browser']['enabled']
+        &&!file_exists(IdentitySaveFixture::PENDING_SETTINGS_JSON),'Active-only identity save created pending settings.');
+} finally {
+    foreach(glob(IDENTITY_SAVE_FIXTURE.'/*')?:[] as $path){unlink($path);}
+    foreach(glob(IDENTITY_SAVE_FIXTURE.'/.*')?:[] as $path){if(is_file($path)){unlink($path);}}
+    rmdir(IDENTITY_SAVE_FIXTURE);
+}
+echo "SSO sessions and identity saves: provider revisions, revocation, paired rollback and staged-edit preservation passed.\n";

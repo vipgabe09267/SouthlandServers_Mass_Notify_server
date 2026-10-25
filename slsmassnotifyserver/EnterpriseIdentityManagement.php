@@ -5,6 +5,7 @@ require_once __DIR__.'/ImmediateSettings.php';
 require_once __DIR__.'/EnterpriseIdentity.php';
 require_once __DIR__.'/DirectorySync.php';
 require_once __DIR__.'/SubscriberService.php';
+require_once __DIR__.'/EnterpriseLabsConfig.php';
 use SLS\MassNotify\{EnterpriseIdentityConfig,EnterpriseIdentityStore,DirectoryConfig,DirectorySync,SubscriberConfig,SubscriberService};
 
 /** Administrator-only Labs configuration and explicit connector/invite actions. */
@@ -23,22 +24,31 @@ trait SlsEnterpriseLabs
     }
     private function enterpriseLabsWrite(array $active,array $changedKeys,?array $directorySource=null,?array $incoming=null): void
     {
+        \SLS\MassNotify\EnterpriseLabsConfig::assertActivation($active);
         $active=$this->normalizeSettings($active);$this->assertEnterpriseActivationSafe($active);$pending=null;
         if(is_file(self::PENDING_SETTINGS_JSON)||is_link(self::PENDING_SETTINGS_JSON)){
-            $pending=$this->loadSettingsFile(self::PENDING_SETTINGS_JSON);if($directorySource!==null){$pending=DirectorySync::apply($pending,$directorySource,$incoming);}
+            $pending=$this->normalizeSettings($this->loadSettingsFile(self::PENDING_SETTINGS_JSON));if($directorySource!==null){$pending=DirectorySync::apply($pending,$directorySource,$incoming);}
             $keys=$directorySource===null?$changedKeys:array_values(array_diff($changedKeys,['incident_workflows']));foreach($keys as $key){$pending[$key]=$active[$key];}
+            \SLS\MassNotify\EnterpriseLabsConfig::assertActivation($pending);
             $pending=$this->normalizeSettings($pending);$this->assertEnterpriseActivationSafe($pending);
         }
         [$active,$pending]=\SLS\MassNotify\ImmediateSettings::prepare($active,$pending,$changedKeys);
-        $this->writeSettingsFileUnlocked(self::SETTINGS_JSON,$active,true);$this->rememberSettingsFingerprint(self::SETTINGS_JSON);
-        if($pending!==null){$this->writeSettingsFileUnlocked(self::PENDING_SETTINGS_JSON,$pending,false);$this->rememberSettingsFingerprint(self::PENDING_SETTINGS_JSON);}
+        \SLS\MassNotify\ImmediateSettings::commitFiles(self::SETTINGS_JSON,self::PENDING_SETTINGS_JSON,
+            $active,$pending,function(string $path,array $settings,bool $backup): void {
+                $this->writeSettingsFileUnlocked($path,$settings,$backup);
+            });
+        $this->rememberSettingsFingerprint(self::SETTINGS_JSON);
+        if($pending!==null){$this->rememberSettingsFingerprint(self::PENDING_SETTINGS_JSON);}
     }
     public function enterpriseLabsAction(string $action,array $input): array
     {
         $lock=null;$activity=null;
         try{
-            $this->enterpriseLabsAdmin();$allowed=['identity_save','directory_save','directory_preview','directory_apply','subscriber_save','subscriber_invite','subscriber_revoke','subscriber_push_key','subscriber_push_test'];
+            $this->enterpriseLabsAdmin();$allowed=['identity_save','directory_save','directory_preview','directory_apply','subscriber_save','subscriber_invite','subscriber_enroll','subscriber_revoke','subscriber_push_key','subscriber_push_test'];
             if(!in_array($action,$allowed,true)){throw new \DomainException('Unsupported enterprise Labs action.');}
+            if (in_array($action,['directory_preview','directory_apply','subscriber_invite','subscriber_enroll','subscriber_push_test'],true)) {
+                \SLS\MassNotify\EnterpriseLabsConfig::requireEnabled($this->getActiveSettings());
+            }
             if($action==='subscriber_push_test'){
                 $activity=$this->acquireAnnouncementActivityLock(false,5);
                 if($activity===null){throw new \DomainException('Browser test settings are busy. Retry after the current settings operation completes.');}
@@ -69,26 +79,29 @@ trait SlsEnterpriseLabs
                 }$settings=$this->getActiveSettings();$c=DirectoryConfig::normalize($settings['directory_sync']??[]);$deprovision=$input['deprovision_all']??false;
                 if(!$c['enabled']){throw new \DomainException('Directory sync is disabled.');}$source=null;foreach($c['sources'] as $s){if($s['id']===($input['source_id']??'')&&($s['enabled']||$deprovision)){$source=$s;}}
                 if(!$source){throw new \DomainException('This directory source is disabled or unavailable.');}
-                $records=$deprovision?[]:match($source['type']){'csv'=>DirectorySync::csv($input['csv']??''),'ldap'=>DirectorySync::ldap($source),'scim'=>DirectorySync::scim($source)};
+                require_once __DIR__.'/DirectoryCloud.php';
+                $records=$deprovision?[]:match($source['type']){'csv'=>DirectorySync::csv($input['csv']??''),'ldap'=>DirectorySync::ldap($source),'scim'=>DirectorySync::scim($source),
+                    'entra','google'=>\SLS\MassNotify\DirectoryCloud::fetch($source)};
                 $plan=DirectorySync::plan($settings,$source,$records);$plan['deprovision_all']=$deprovision;$id=bin2hex(random_bytes(32));$now=time();
                 $this->enterpriseLabsStore()->transaction('directory_plans',static function(array &$rows)use($plan,$id,$now):void{foreach($rows as $k=>$r){if($r['expires_at']<=$now){unset($rows[$k]);}}if(count($rows)>=20){throw new \DomainException('Too many pending directory previews.');}$rows[$id]=$plan+['created_at'=>$now,'expires_at'=>$now+900];});
                 unset($plan['records']);return ['success'=>true,'message'=>'Dry run complete. No roster or subscriber was changed.','plan_id'=>$id,'plan'=>$plan,'expires_at'=>gmdate('c',$now+900)];
             }
-            if($action==='subscriber_invite'){
-                if(count($input)!==2||array_diff(array_keys($input),['subscriber_id','incident_id'])
-                    ||!is_string($input['subscriber_id']??null)||!is_string($input['incident_id']??null)){
+            if($action==='subscriber_invite'||$action==='subscriber_enroll'){
+                $enrollment=$action==='subscriber_enroll';
+                if(count($input)!==($enrollment?1:2)||array_diff(array_keys($input),$enrollment?['subscriber_id']:['subscriber_id','incident_id'])
+                    ||!is_string($input['subscriber_id']??null)||(!$enrollment&&(!is_string($input['incident_id']??null)||!preg_match('/^inc_[a-f0-9]{32}$/D',$input['incident_id'])))){
                     throw new \DomainException('Select one subscriber and one open incident.');
                 }
-                $settings=$this->getActiveSettings();$service=$this->subscriberService();$issued=$service->issue($settings,$input['subscriber_id'],$input['incident_id'],time());
+                $settings=$this->getActiveSettings();$service=$this->subscriberService();$issued=$service->issue($settings,$input['subscriber_id'],$enrollment?'':$input['incident_id'],time());
                 // Persisted reservation precedes the single explicit transport
                 // submission. Failed/uncertain delivery never retries itself.
-                try{$delivery=$this->sendOperatorRecoveryEmail($settings,$issued['person']['email'],'SLS incident email verification',
-                    "Open this link to verify your email and respond to the incident:\n\n".$issued['url']."\n\nThis link expires at ".gmdate('c',$issued['expires_at'])." and works once. Your response is separate from message delivery. If you need emergency assistance, follow your organization's emergency procedures.");}catch(\Throwable $e){$delivery='unconfirmed';}
+                try{$delivery=$this->sendOperatorRecoveryEmail($settings,$issued['person']['email'],$enrollment?'SLS browser enrollment':'SLS incident email verification',
+                    ($enrollment?"Open this link to verify your saved email address and manage browser notifications:":"Open this link to verify your email and respond to the incident:")."\n\n".$issued['url']."\n\nThis link expires at ".gmdate('c',$issued['expires_at'])." and works once. Your response is separate from message delivery. If you need emergency assistance, follow your organization's emergency procedures.");}catch(\Throwable $e){$delivery='unconfirmed';}
                 $service->delivery($issued['token_hash'],$delivery);return ['success'=>$delivery==='accepted','message'=>$delivery==='accepted'?'One invitation was accepted by local Postfix; this is not proof of delivery or a human response.':'Invitation delivery failed or is unconfirmed. Its link was revoked; no automatic resend will occur.','delivery'=>$delivery,'expires_at'=>gmdate('c',$issued['expires_at'])];
             }
             $activity=$this->acquireAnnouncementActivityLock(true,5);
             if($activity===null){throw new \DomainException('An announcement is using these settings. Wait for delivery to finish, then try again.');}
-            $lock=$this->acquireSettingsLock(false);$active=$this->loadSettingsFile(self::SETTINGS_JSON);
+            $lock=$this->acquireSettingsLock(false);$active=$this->normalizeSettings($this->loadSettingsFile(self::SETTINGS_JSON));
             if(in_array($action,['identity_save','directory_save','subscriber_save'],true)){
                 if(count($input)!==2||array_diff(array_keys($input),['config','revision'])||!is_array($input['config']??null)
                     ||!is_string($input['revision']??null)||!preg_match('/^[a-f0-9]{64}$/D',$input['revision'])){throw new \DomainException('Submit the complete configuration and its current revision. Reload this editor before saving.');}
@@ -106,7 +119,8 @@ trait SlsEnterpriseLabs
             if($action==='directory_save'){
                 $config=$input['config'];$old=DirectoryConfig::normalize($active['directory_sync']??[]);$byId=array_column($old['sources'],null,'id');$kept=[];
                 if(!is_array($config)){throw new \DomainException('Configuration must be an object.');}$config['sources']??=[];if(!is_array($config['sources'])||!array_is_list($config['sources'])){throw new \DomainException('Directory sources must be a list.');}foreach($config['sources'] as &$s){if(!is_array($s)||array_is_list($s)){throw new \DomainException('Each directory source must be an object.');}if(!array_key_exists('id',$s)||$s['id']===''){$s['id']='dir_'.bin2hex(random_bytes(12));}elseif(!is_string($s['id'])){throw new \DomainException('Directory source identity is invalid.');}$kept[]=$s['id'];$prior=$byId[$s['id']]??null;
-                    foreach(['ldap_password','scim_token'] as $key){unset($s[$key.'_configured']);if(isset($prior[$key])&&($s[$key]??'')===''){$s[$key]=$prior[$key];}}
+                    if($prior&&($s['type']??'')!==$prior['type']){throw new \DomainException('Create a new directory source to change its connector type. Review deprovisioning before removing the previous source.');}
+                    foreach(['ldap_password','scim_token','cloud_client_secret','google_private_key'] as $key){unset($s[$key.'_configured']);if(isset($prior[$key])&&($s[$key]??'')===''){$s[$key]=$prior[$key];}}
                     if($prior&&$prior['records']&&($s['template_ids']??[])!==$prior['template_ids']){throw new \DomainException('First preview and apply deprovisioning for this source before changing its template assignments.');}$s['records']=$prior['records']??[];
                 }unset($s);foreach($byId as $id=>$s){if($s['records']&&!in_array($id,$kept,true)){throw new \DomainException('Deprovision all records before deleting their directory source.');}}
                 $active['directory_sync']=DirectoryConfig::normalize($config);

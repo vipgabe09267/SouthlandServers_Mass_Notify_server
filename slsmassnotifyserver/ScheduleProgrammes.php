@@ -134,6 +134,33 @@ final class ScheduleProgrammes
         return $out + ['selected_types'=>$selected];
     }
 
+    public static function visualPreview(array $row,string $focus,string $view): array
+    {
+        $row=self::normalize(['calendars'=>[$row]])['calendars'][0];$focus=self::date($focus);
+        if(!in_array($view,['month','week','list'],true)){throw new \DomainException('Select month, week or list view.');}
+        if(substr($focus,0,7)<substr($row['cycle_start'],0,7)||substr($focus,0,7)>substr($row['calendar']['until'],0,7)){
+            throw new \DomainException('Choose a date within this programme’s calendar months.');
+        }
+        $utc=new \DateTimeZone('UTC');$at=new \DateTimeImmutable($focus,$utc);
+        $first=$view==='week'?$at->modify('monday this week'):$at->modify('first day of this month')->modify('monday this week');
+        $programme=$row;unset($programme['calendar']);
+        $types=self::dateTypes($row['calendar']+['programme'=>self::snapshotProgramme($programme+['selected_types'=>$row['day_types']])]);
+        $overrides=array_column($row['calendar']['overrides'],'time','date');$days=[];$count=$view==='week'?7:42;
+        for($i=0;$i<$count;$i++){
+            $date=$first->modify('+'.$i.' days')->format('Y-m-d');$weekday=(int)$first->modify('+'.$i.' days')->format('N');
+            $status='outside';$reason='';$type=null;
+            if($date>=$row['cycle_start']&&$date<=$row['calendar']['until']){
+                $status='inactive';
+                foreach($row['calendar']['exclusions'] as $range){if($date>=$range['start']&&$date<=$range['end']){$status='holiday';$reason=$range['reason']??'';break;}}
+                if(array_key_exists($date,$types)){$type=$types[$date];$status=$type===''?'skipped':'active';}
+            }
+            $days[]=['date'=>$date,'weekday'=>$weekday,'day_type'=>$type,'status'=>$status,'reason'=>$reason,
+                'time_override'=>$status==='active'?($overrides[$date]??''):'','editable'=>array_key_exists($date,$types)];
+        }
+        return ['success'=>true,'timezone'=>$row['timezone'],'focus'=>$focus,'view'=>$view,'days'=>$days,
+            'minimum'=>$row['cycle_start'],'maximum'=>$row['calendar']['until'],'day_types'=>$row['day_types']];
+    }
+
     public static function dateTypes(array $calendar): array
     {
         $p = self::snapshotProgramme($calendar['programme']);

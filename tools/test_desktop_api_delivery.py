@@ -2,9 +2,12 @@
 """Desktop API regressions using private fixture data, without FreePBX bootstrap."""
 
 import json
+import os
 import re
+import selectors
 import subprocess
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +24,8 @@ class DesktopApiDeliveryTests(unittest.TestCase):
         source = API.read_text(encoding="utf-8")
         source = source.replace("dirname(__DIR__) . '/sls-mass-notify/security.php'", json.dumps(str(API.parent.parent / 'sls-mass-notify/security.php')))
         source = source.replace("dirname(__DIR__) . '/sls-mass-notify/config-crypto.php'", json.dumps(str(API.parent.parent / 'sls-mass-notify/config-crypto.php')))
+        source = source.replace("dirname(__DIR__) . '/sls-mass-notify/desktop-feed-cache.php'", json.dumps(str(API.parent.parent / 'sls-mass-notify/desktop-feed-cache.php')))
+        source = source.replace("dirname(__DIR__, 2) . '/EnterpriseLabsConfig.php'", json.dumps(str(ROOT / 'slsmassnotifyserver/EnterpriseLabsConfig.php')))
         self.prefix = source.split("\n\n$endpoint =", 1)[0]
         paths = {
             "EVENTS_FILE": self.directory / "events.jsonl",
@@ -82,6 +87,74 @@ class DesktopApiDeliveryTests(unittest.TestCase):
         """)
         self.assertEqual(result, {"failed": False, "valid_same_ip": True, "valid_other_ip": True, "exhausted_source_precheck": False, "other_source_precheck": True})
 
+    def test_browser_display_master_is_strict_and_ordinary_desktops_are_independent(self):
+        result = self.php("""
+            $config=['enterprise_integrations'=>['enabled'=>'1','browser_display'=>['enabled'=>'1']]];
+            $_SERVER['HTTP_X_SLS_BROWSER_DISPLAY']='1';$browser=[];$ordinary=[];
+            foreach([null,false,true,'1',1] as $master){
+                $settings=$config;if($master!==null){$settings['enterprise_labs']=['enabled'=>$master];}
+                $browser[]=desktop_browser_display_permitted($settings);
+                unset($_SERVER['HTTP_X_SLS_BROWSER_DISPLAY']);$ordinary[]=desktop_browser_display_permitted($settings);
+                $_SERVER['HTTP_X_SLS_BROWSER_DISPLAY']='1';
+            }
+            $config['enterprise_labs']=['enabled'=>true];$config['enterprise_integrations']['browser_display']['enabled']='0';
+            echo json_encode(['browser'=>$browser,'ordinary'=>$ordinary,'child_disabled'=>desktop_browser_display_permitted($config)]);
+        """)
+        self.assertEqual(result, {'browser': [False, False, True, False, False], 'ordinary': [True]*5, 'child_disabled': False})
+
+    def test_browser_poll_requires_master_but_old_receipts_still_persist(self):
+        setup=self.authenticated_endpoint_setup()+"""
+            $settings=json_decode(file_get_contents(SETTINGS_FILE),true);
+            $settings['enterprise_integrations']=['enabled'=>'1','browser_display'=>['enabled'=>'1']];
+            file_put_contents(SETTINGS_FILE,json_encode($settings));
+            $_SERVER['HTTP_X_SLS_BROWSER_DISPLAY']='1';
+        """
+        result=self.php(setup,endpoint=True)
+        self.assertEqual(result, {'ok':False,'error':'browser_display_disabled'})
+        result=self.php(setup+"$settings['enterprise_labs']=['enabled'=>true];file_put_contents(SETTINGS_FILE,json_encode($settings));",endpoint=True)
+        self.assertTrue(result['ok'])
+        self.endpoint=self.endpoint.replace("file_get_contents('php://input', false, null, 0, 4097)","json_encode(['event_id'=>'routed-event'])")
+        result=self.php(self.authenticated_endpoint_setup('desktop/ack','POST')+"""
+            $_SERVER['HTTP_X_SLS_BROWSER_DISPLAY']='1';
+            file_put_contents(EVENTS_FILE,json_encode(['id'=>'routed-event','created_at'=>gmdate('c'),
+                'kind'=>'announcement','title'=>'Fixture','message'=>'Fixture receipt',
+                'desktop_recipients'=>['alice'],'desktop_client_ids'=>['alice'=>'device-a']]) . "\\n");
+        """,endpoint=True)
+        self.assertEqual(result,{'ok':True,'event_id':'routed-event','receipt_type':'client_acknowledgement'})
+
+    def test_existing_browser_stream_closes_when_master_is_disabled(self):
+        setup=self.authenticated_endpoint_setup('desktop/stream')+"""
+            $settings=json_decode(file_get_contents(SETTINGS_FILE),true);
+            $settings['enterprise_labs']=['enabled'=>true];
+            $settings['enterprise_integrations']=['enabled'=>'1','browser_display'=>['enabled'=>'1']];
+            file_put_contents(SETTINGS_FILE,json_encode($settings));
+            $_SERVER['HTTP_X_SLS_BROWSER_DISPLAY']='1';$_GET['stream_seconds']='8';
+        """
+        harness=self.directory/'stream.php'
+        harness.write_text(self.prefix+"\numask(0027);\n"+setup+"\n$endpoint ="+self.endpoint,encoding='utf-8')
+        process=subprocess.Popen(['php',str(harness)],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        initial=b''
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout,selectors.EVENT_READ)
+                deadline=time.monotonic()+4
+                while b'event: authenticated' not in initial and time.monotonic()<deadline:
+                    for key,_ in selector.select(max(0,deadline-time.monotonic())):
+                        chunk=os.read(key.fileobj.fileno(),8192)
+                        if not chunk:break
+                        initial+=chunk
+            self.assertIn(b'event: authenticated',initial)
+            path=self.directory/'settings.json';settings=json.loads(path.read_text());settings['enterprise_labs']['enabled']=False
+            replacement=self.directory/'updated-settings.json';replacement.write_text(json.dumps(settings));replacement.chmod(0o640);os.replace(replacement,path)
+            remaining,errors=process.communicate(timeout=10)
+            self.assertEqual(process.returncode,0,errors.decode())
+            self.assertEqual(errors,b'')
+            self.assertIn(b'event: revoked\ndata: {"ok":false,"error":"browser_display_disabled"}',initial+remaining)
+            result=self.php("$slots=desktop_stream_slot('alice');echo json_encode(['held'=>count($slots)]);desktop_stream_release_slots($slots);")
+            self.assertEqual(result['held'],2,'Revoked browser stream leaked capacity slots')
+        finally:
+            if process.poll() is None:process.kill();process.communicate(timeout=5)
+
     def test_shared_nat_clients_have_independent_authenticated_budgets(self):
         result = self.php("""
             $allowed = true;
@@ -101,6 +174,69 @@ class DesktopApiDeliveryTests(unittest.TestCase):
             ]);
         """)
         self.assertEqual(result, {"shared_nat_allowed": True, "overactive_allowed": False, "another_client_allowed": True, "next_minute": True})
+
+    def test_registered_authenticated_reads_share_registry_without_bypassing_writers(self):
+        result = self.php("""
+            $now=1800000000;
+            $initial=desktop_auth_attempt_allowed('192.0.2.1','alice',true,$now);
+            $before=file_get_contents(DESKTOP_AUTH_RATE_FILE);
+            $lease=fopen(DESKTOP_AUTH_RATE_FILE.'.lock','r+b');flock($lease,LOCK_SH);
+            $authenticated=desktop_auth_attempt_allowed('192.0.2.1','alice',true,$now);
+            $precheck=desktop_auth_failure_budget_available('192.0.2.1','alice',$now);
+            $failed=desktop_auth_attempt_allowed('192.0.2.1','alice',false,$now);
+            $failureReason=$GLOBALS['sls_api_state_error'];
+            $newClient=desktop_auth_attempt_allowed('192.0.2.1','bob',true,$now);
+            $unchanged=file_get_contents(DESKTOP_AUTH_RATE_FILE)===$before;
+            flock($lease,LOCK_UN);fclose($lease);
+            $newClientRetry=desktop_auth_attempt_allowed('192.0.2.1','bob',true,$now);
+            echo json_encode(compact('initial','authenticated','precheck','failed','failureReason','newClient','unchanged','newClientRetry'));
+        """)
+        self.assertEqual(result, {'initial':True,'authenticated':True,'precheck':True,
+                                  'failed':False,'failureReason':'state_locked',
+                                  'newClient':False,'unchanged':True,'newClientRetry':True})
+
+    def test_registry_write_upgrade_reloads_a_concurrent_committed_change(self):
+        self.prefix=self.prefix.replace('function api_state_lock(', 'function fixture_api_state_lock(',1)
+        result=self.php("""
+            function api_state_lock($handle,float $deadline,int $operation=LOCK_EX): bool {
+                if($operation===LOCK_EX && !empty($GLOBALS['intervening_writer'])){
+                    $GLOBALS['intervening_writer']=false;
+                    if(!api_state_transaction(DESKTOP_AUTH_RATE_FILE,4096,static fn($data)=>[
+                        'allowed'=>true,'write'=>true,'data'=>$data+['concurrent'=>true]])){
+                        throw new RuntimeException('Shared lease was not released before the write upgrade');
+                    }
+                }
+                return fixture_api_state_lock($handle,$deadline,$operation);
+            }
+            file_put_contents(DESKTOP_AUTH_RATE_FILE,'{"prior":true}');
+            $GLOBALS['intervening_writer']=true;$invocations=0;
+            $ok=api_state_transaction(DESKTOP_AUTH_RATE_FILE,4096,static function($data)use(&$invocations){
+                $invocations++;
+                return ['allowed'=>true,'write'=>true,'data'=>$data+['requested'=>true]];
+            },250,true);
+            echo json_encode(['ok'=>$ok,'invocations'=>$invocations,'data'=>json_decode(file_get_contents(DESKTOP_AUTH_RATE_FILE),true)]);
+        """)
+        self.assertEqual(result, {'ok':True,'invocations':2,
+                                  'data':{'prior':True,'concurrent':True,'requested':True}})
+
+    def test_ack_retry_after_busy_lock_retains_all_exact_receipts(self):
+        result = self.php("""
+            $client=['client_id'=>'device-a','username'=>'alice'];
+            $first=['id'=>'first'];$second=['id'=>'second'];$now=1800000000;
+            $initial=record_desktop_acknowledgement([],$client,$first,$now);
+            $path=DESKTOP_ACK_DIRECTORY.'/'.hash('sha256','id:device-a').'.json';
+            $before=file_get_contents($path);
+            $lease=fopen($path.'.lock','r+b');flock($lease,LOCK_EX);
+            $busy=record_desktop_acknowledgement([],$client,$second,$now);
+            $unchanged=file_get_contents($path)===$before;
+            flock($lease,LOCK_UN);fclose($lease);
+            $retry=record_desktop_acknowledgement([],$client,$second,$now);
+            $duplicate=record_desktop_acknowledgement([],$client,$second,$now+1);
+            $ids=array_column(json_decode(file_get_contents($path),true)['acknowledgements'],'event_id');
+            echo json_encode(compact('initial','busy','unchanged','retry','duplicate','ids'));
+        """)
+        self.assertEqual(result, {'initial':True,'busy':False,'unchanged':True,
+                                  'retry':True,'duplicate':True,'ids':['first','second']})
 
     def test_authentication_decrypts_only_the_matching_enabled_username(self):
         self.prefix = self.prefix.replace(
@@ -126,6 +262,92 @@ class DesktopApiDeliveryTests(unittest.TestCase):
                 'disabled' => $disabled, 'decrypt_count' => $GLOBALS['decrypt_count']]);
         """)
         self.assertEqual(result, {"username": "client-999", "unknown": [], "disabled": [], "decrypt_count": 1})
+
+    def test_presence_coalesces_identical_polls_but_persists_identity_and_receipt_changes(self):
+        result = self.php("""
+            $_SERVER['REMOTE_ADDR']='192.0.2.1';
+            $client=['username'=>'alice','client_id'=>'first-device','name'=>'Desktop'];
+            update_desktop_seen($client);clearstatcache(true,DESKTOP_LAST_SEEN_FILE);$first=fileinode(DESKTOP_LAST_SEEN_FILE);
+            update_desktop_seen($client);clearstatcache(true,DESKTOP_LAST_SEEN_FILE);$same=fileinode(DESKTOP_LAST_SEEN_FILE)===$first;
+            update_desktop_seen($client,['ack_event_id'=>'event-a','ack_at'=>gmdate('c')]);
+            $ack=json_decode(file_get_contents(DESKTOP_LAST_SEEN_FILE),true)['alice'];
+            $client['client_id']='replacement-device';update_desktop_seen($client);
+            $replacement=json_decode(file_get_contents(DESKTOP_LAST_SEEN_FILE),true)['alice'];
+            echo json_encode(['coalesced'=>$same,'ack'=>$ack['ack_event_id'],'replacement'=>$replacement['client_id'],'old_receipt_retained'=>isset($replacement['ack_event_id'])]);
+        """)
+        self.assertEqual(result, {'coalesced': True, 'ack': 'event-a', 'replacement': 'replacement-device', 'old_receipt_retained': False})
+
+    def test_presence_report_timestamp_does_not_force_identical_app_poll_writes(self):
+        result=self.php("""
+            $_SERVER=['REMOTE_ADDR'=>'192.0.2.1','HTTP_X_SLS_CLIENT_VERSION'=>'1.0.12-beta',
+                'HTTP_X_SLS_PAYLOAD_SCHEMA'=>'1','HTTP_X_SLS_SSE_PROTOCOL'=>'2'];
+            $client=['username'=>'alice','client_id'=>'first-device','name'=>'Desktop'];
+            update_desktop_seen($client);
+            $saved=json_decode(file_get_contents(DESKTOP_LAST_SEEN_FILE),true);
+            $older=gmdate('c',time()-10);$saved['alice']['client_report']['reported_at']=$older;
+            file_put_contents(DESKTOP_LAST_SEEN_FILE,json_encode($saved));
+            clearstatcache(true,DESKTOP_LAST_SEEN_FILE);$inode=fileinode(DESKTOP_LAST_SEEN_FILE);
+            update_desktop_seen($client);clearstatcache(true,DESKTOP_LAST_SEEN_FILE);
+            $coalesced=fileinode(DESKTOP_LAST_SEEN_FILE)===$inode;
+            $same=json_decode(file_get_contents(DESKTOP_LAST_SEEN_FILE),true)['alice'];
+            $_SERVER['HTTP_X_SLS_CLIENT_VERSION']='1.0.13-beta';update_desktop_seen($client);
+            clearstatcache(true,DESKTOP_LAST_SEEN_FILE);$changed=fileinode(DESKTOP_LAST_SEEN_FILE)!==$inode;
+            $new=json_decode(file_get_contents(DESKTOP_LAST_SEEN_FILE),true)['alice'];
+            echo json_encode(['coalesced'=>$coalesced,'timestamp_retained'=>$same['client_report']['reported_at']===$older,
+                'changed'=>$changed,'version'=>$new['client_report']['version']]);
+        """)
+        self.assertEqual(result,{'coalesced':True,'timestamp_retained':True,'changed':True,'version':'1.0.13-beta'})
+
+    def test_poll_wire_budget_includes_duplicate_latest_and_metadata(self):
+        result=self.php("""
+            $events=[];for($i=0;$i<4;$i++){$events[]=['id'=>'event-'.$i,'message'=>str_repeat('x',262000)];}
+            $batch=['last_event_id'=>'event-3','has_more'=>false,'cursor_gap'=>false,'window_truncated'=>false,'eligible_count'=>4];
+            $page=desktop_bound_poll_page($events,$batch,true);
+            $wire=$page+['latest'=>end($page['events']),'metadata'=>str_repeat('x',8192)];
+            echo json_encode(['bytes'=>strlen(json_encode($wire,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)),'count'=>count($page['events']),'more'=>$page['has_more']]);
+        """)
+        self.assertLess(result['bytes'],1024*1024)
+        self.assertEqual(result['count'],2)
+        self.assertTrue(result['more'])
+
+    def test_poll_wire_budget_paginates_forward_and_preserves_snapshot_tail(self):
+        result=self.php("""
+            $events=[];for($index=0;$index<100;$index++){$events[]=['id'=>'event-'.$index,'message'=>str_repeat('猫',10000)];}
+            $batch=['last_event_id'=>'event-99','has_more'=>false,'cursor_gap'=>false,'window_truncated'=>false,'eligible_count'=>100];
+            $forward=desktop_bound_poll_page($events,$batch,true);
+            $snapshot=desktop_bound_poll_page($events,$batch,false);
+            echo json_encode(['count'=>count($forward['events']),'last'=>$forward['last_event_id'],
+                'actual_last'=>end($forward['events'])['id'],'more'=>$forward['has_more'],
+                'bytes'=>strlen(json_encode($forward['events'],JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)),
+                'snapshot_last'=>end($snapshot['events'])['id'],'snapshot_cursor'=>$snapshot['last_event_id'],
+                'snapshot_more'=>$snapshot['has_more'],'snapshot_truncated'=>$snapshot['window_truncated']]);
+        """)
+        self.assertTrue(0<result['count']<100);self.assertEqual(result['last'],result['actual_last'])
+        self.assertTrue(result['more']);self.assertLess(result['bytes'],786432)
+        self.assertEqual(result['snapshot_last'],'event-99');self.assertEqual(result['snapshot_cursor'],'event-99')
+        self.assertFalse(result['snapshot_more']);self.assertTrue(result['snapshot_truncated'])
+
+    def test_personalized_feed_does_not_disclose_other_desktop_recipients(self):
+        result=self.php("""
+            $event=['id'=>'event-a','desktop_all'=>true,'desktop_recipients'=>['alice','bob'],
+                'desktop_client_ids'=>['alice'=>'first','bob'=>'second'],'created_at'=>'2026-10-23T00:00:00Z'];
+            echo json_encode(desktop_event_public_payload($event,[],['username'=>'alice']));
+        """)
+        self.assertEqual(result['desktop_recipients'],['alice']);self.assertFalse(result['desktop_all'])
+        self.assertNotIn('bob',json.dumps(result));self.assertNotIn('desktop_client_ids',result)
+        self.assertEqual(result['created_at'],'2026-10-23T00:00:00Z')
+
+    def test_authenticated_requests_reuse_registry_and_preserve_preupgrade_counter(self):
+        result=self.php("""
+            $bucket=gmdate('YmdHi',1800000000);$id='ok:'.hash('sha256','authenticated:alice');
+            file_put_contents(DESKTOP_AUTH_RATE_FILE,json_encode([$id=>['bucket'=>$bucket,'count'=>119]]));chmod(DESKTOP_AUTH_RATE_FILE,0640);
+            $first=desktop_auth_attempt_allowed('192.0.2.1','alice',true,1800000000);
+            clearstatcache(true,DESKTOP_AUTH_RATE_FILE);$inode=fileinode(DESKTOP_AUTH_RATE_FILE);
+            $second=desktop_auth_attempt_allowed('192.0.2.1','alice',true,1800000000);
+            clearstatcache(true,DESKTOP_AUTH_RATE_FILE);
+            echo json_encode(['last_allowed'=>$first,'over_budget'=>$second,'registry_unchanged'=>$inode===fileinode(DESKTOP_AUTH_RATE_FILE)]);
+        """)
+        self.assertEqual(result, {'last_allowed': True, 'over_budget': False, 'registry_unchanged': True})
 
     def test_limiter_storage_capacity_tracks_configured_and_existing_fleet(self):
         result = self.php("""
@@ -321,6 +543,36 @@ class DesktopApiDeliveryTests(unittest.TestCase):
         self.assertEqual(result["error"], "stream_capacity_reached")
         self.assertEqual(result["fallback"]["transport"], "json_poll")
         self.assertEqual(result["fallback"]["cursor_parameter"], "last_event_id")
+
+    def test_stream_slot_directory_created_by_another_request_is_accepted(self):
+        self.prefix = self.prefix.replace(
+            "!@mkdir($directory, 0750)", "!@fixture_raced_mkdir($directory, 0750)", 1
+        )
+        result = self.php("""
+            function fixture_raced_mkdir(string $path, int $mode): bool {
+                // A second request wins creation between is_dir() and mkdir().
+                mkdir($path, $mode);
+                return false;
+            }
+            $slots = desktop_stream_slot('alice');
+            $held = count($slots); desktop_stream_release_slots($slots);
+            echo json_encode(['held'=>$held, 'released'=>count($slots)]);
+        """)
+        self.assertEqual(result, {'held': 2, 'released': 0})
+
+    def test_stream_directory_race_still_rejects_a_linked_replacement(self):
+        self.prefix = self.prefix.replace(
+            "!@mkdir($directory, 0750)", "!@fixture_raced_mkdir($directory, 0750)", 1
+        )
+        result = self.php("""
+            function fixture_raced_mkdir(string $path, int $mode): bool {
+                $replacement=dirname($path).'/replacement';mkdir($replacement,$mode);
+                symlink($replacement,$path);
+                return false;
+            }
+            desktop_stream_slot('alice');
+        """)
+        self.assertEqual(result, {'ok': False, 'error': 'stream_capacity_unavailable'})
 
     def test_stream_slots_skip_special_or_linked_files_without_changing_them(self):
         result = self.php("""

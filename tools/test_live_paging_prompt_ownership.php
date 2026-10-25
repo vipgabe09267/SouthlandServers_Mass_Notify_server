@@ -111,13 +111,19 @@ paging_ownership_check(glob(PagingPromptOwnershipFixture::SOUNDS_DIR . '/paging/
 $changedVoice = $settings; $changedVoice['announcement_piper_voice'] = 'changed-voice';
 paging_readiness_rejects(static function () use ($fixture, $changedVoice): void { $fixture->assertReady($changedVoice); }, 'Changed speech voice bypassed paging preparation');
 $files = glob(PagingPromptOwnershipFixture::SOUNDS_DIR . '/paging/*.wav');
-paging_ownership_check(count($files) === 10 && $fixture->generated === 10, 'Prepared prompts are incomplete');
+$requiredRoles = ['menu','pin','ready','recording','partial','text_failure','invalid','busy','no_receivers','unavailable','denied'];
+$promptFiles = \SLS\MassNotify\LivePagingConfig::promptFiles($settings);
+paging_ownership_check(array_keys($promptFiles) === $requiredRoles, 'The complete reviewed prompt roles, including voicemail recording instructions, are missing');
+$expectedCount = count($requiredRoles);
+$expectedFiles = array_map(static fn($sound) => PagingPromptOwnershipFixture::SOUNDS_DIR . '/paging/' . basename($sound) . '.wav', array_values($promptFiles));
+sort($files); sort($expectedFiles);
+paging_ownership_check($files === $expectedFiles && $fixture->generated === $expectedCount, 'Prepared prompts are incomplete');
 // Root-owned cached audio must also be repaired before dialplan activation.
 chown($files[0], 0); chgrp($files[0], 0); chmod($files[0], 0600);
 paging_readiness_rejects(static function () use ($fixture, $settings): void { $fixture->assertReady($settings); }, 'Root-only cached prompt passed the activation guard');
 $fixture->prepare($settings);
 $fixture->assertReady($settings);
-paging_ownership_check($fixture->generated === 10, 'Cached prompts were unnecessarily regenerated');
+paging_ownership_check($fixture->generated === $expectedCount, 'Cached prompts were unnecessarily regenerated');
 foreach ($files as $file) {
     clearstatcache(true, $file);
     $metadata = lstat($file);
@@ -130,26 +136,26 @@ os.setgroups([])
 os.setgid(account.pw_gid)
 os.setuid(account.pw_uid)
 paths = glob.glob(sys.argv[1] + '/paging/*.wav')
-assert len(paths) == 10
+assert len(paths) == int(sys.argv[2])
 for path in paths:
     with open(path, 'rb') as stream:
         header = stream.read(12)
     assert header[:4] == b'RIFF' and header[8:12] == b'WAVE'
 PY;
 $output = []; $status = 1;
-exec('/usr/bin/python3 -c ' . escapeshellarg($program) . ' ' . escapeshellarg(PagingPromptOwnershipFixture::SOUNDS_DIR) . ' 2>&1', $output, $status);
+exec('/usr/bin/python3 -c ' . escapeshellarg($program) . ' ' . escapeshellarg(PagingPromptOwnershipFixture::SOUNDS_DIR) . ' ' . escapeshellarg((string)$expectedCount) . ' 2>&1', $output, $status);
 paging_ownership_check($status === 0, 'The asterisk account cannot read prepared prompts: ' . implode("\n", $output));
 
 file_put_contents($files[0], str_repeat('invalid header ', 8));
 paging_readiness_rejects(static function () use ($fixture, $settings): void { $fixture->assertReady($settings); }, 'Invalid cached WAV passed the activation guard');
 $fixture->prepare($settings);
-paging_ownership_check($fixture->generated === 11, 'Applying configuration did not regenerate a corrupt cached prompt');
+paging_ownership_check($fixture->generated === $expectedCount + 1, 'Applying configuration did not regenerate a corrupt cached prompt');
 $fixture->assertReady($settings);
 $validPrompt=file_get_contents($files[0]);
 file_put_contents($files[0],substr($validPrompt,0,48));
 paging_readiness_rejects(static function()use($fixture,$settings):void{$fixture->assertReady($settings);},'Truncated cached WAV with a valid signature passed readiness');
 $fixture->prepare($settings);
-paging_ownership_check($fixture->generated===12,'A truncated cached prompt was reused instead of regenerated');
+paging_ownership_check($fixture->generated===$expectedCount + 2,'A truncated cached prompt was reused instead of regenerated');
 $fixture->assertReady($settings);
 $extraLink = PAGING_OWNERSHIP_FIXTURE_ROOT . '/linked-prompt'; link($files[0], $extraLink);
 paging_readiness_rejects(static function () use ($fixture, $settings): void { $fixture->assertReady($settings); }, 'Hardlinked cached WAV passed the activation guard');

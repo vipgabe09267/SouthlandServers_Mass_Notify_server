@@ -53,6 +53,11 @@ Type=simple
 User=asterisk
 Group=asterisk
 UMask=0027
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+CPUWeight=50
+IOWeight=50
 ExecStart=/usr/bin/python3 -I /usr/local/bin/sls_mass_notify/sls_phone_events.py
 Restart=on-failure
 RestartSec=5
@@ -93,7 +98,7 @@ APACHE = '''# Southland Servers Mass Notifications Server
     AllowOverride None
     RewriteEngine On
     RewriteRule ^assets/[A-Za-z0-9_.-]+\\.(?:png|jpg|svg|ico)$ - [END]
-    RewriteRule ^([A-Za-z0-9][A-Za-z0-9_.-]{0,179}\\.(?:png|xml))$ /api/sls-mass-notify/media.php?file=$1 [END]
+    RewriteRule ^([A-Za-z0-9][A-Za-z0-9_.-]{0,179}\\.(?:png|xml))$ /api/sls-mass-notify/media.php?file=$1 [END,QSA]
     RewriteRule ^ - [F,END]
 </Directory>
 '''
@@ -694,7 +699,7 @@ class PrivilegedInstall:
         # Source authentication completes in __init__ before any mutation.
         self.preflight()
         self.files.piper_compatibility(apply=True)
-        for path in (DATA, DATA + '/sipnotify', DATA + '/config-backups', DATA + '/piper', DATA + '/cron-diagnostics'):
+        for path in (DATA, DATA + '/sipnotify', DATA + '/sipnotify/history', DATA + '/config-backups', DATA + '/piper', DATA + '/cron-diagnostics'):
             self.files.mkdir(path, 0o750, user=True)
         self.files.mkdir(DATA + '/event-log-recovery', 0o700, user=True)
         self.files.mkdir(DATA + '/sounds/voicemail', 0o700, user=True)

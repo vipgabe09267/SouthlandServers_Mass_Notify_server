@@ -135,7 +135,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 		$updateResult = $action === 'check_updates'
 			? $slsmassnotifyserver->requestUpdateCheck() : $slsmassnotifyserver->requestManualUpdate();
 		$_SESSION['slsmassnotifyserver_other_save_result'] = $updateResult;
-		header('Location: config.php?display=slsmassnotifyserver_other' . (!empty($updateResult['success']) ? '&sls_update_queued=1' : ''));
+		header('Location: config.php?display=slsmassnotifyserver_other' . (!empty($updateResult['success']) ? '&sls_update_queued=1' : '') . '#settings-maintenance');
 		exit;
 	} elseif ($action === 'complete_uninstall') {
 		$uninstallResult = $slsmassnotifyserver->requestCompleteUninstall();

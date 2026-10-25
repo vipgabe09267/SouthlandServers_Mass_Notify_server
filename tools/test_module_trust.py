@@ -243,7 +243,7 @@ class ModuleTrust(unittest.TestCase):
         data['files']['amp_conf/htdocs/admin/images/spinner.gif']['link_target'] = '../../etc/shadow'
         with self.assertRaises(TRUST.TrustError): self.enroll(data)
 
-    def publisher_fixture(self):
+    def publisher_fixture(self, extra_files=0):
         private = self.base / 'fixture-private.pem'
         public = self.base / 'fixture-public.pem'
         subprocess.run(['/usr/bin/openssl', 'genpkey', '-algorithm', 'ED25519', '-out', str(private)], check=True, capture_output=True)
@@ -253,7 +253,9 @@ class ModuleTrust(unittest.TestCase):
         self.addCleanup(setattr, TRUST, 'PUBLIC_KEY', original)
         archive = self.base / 'release.tgz'
         with tarfile.open(archive, 'w:gz') as tar:
-            for name, body in [('module.xml', b'<module><rawname>slsmassnotifyserver</rawname><version>0.1.5-beta</version></module>'), ('bin/safe.py', b'print("immutable publisher source")\n')]:
+            entries=[('module.xml', b'<module><rawname>slsmassnotifyserver</rawname><version>0.1.5-beta</version></module>'), ('bin/safe.py', b'print("immutable publisher source")\n')]
+            entries.extend(('vendor/fixture-%04d.php' % index,b'<?php /* pinned fixture */') for index in range(extra_files))
+            for name, body in entries:
                 info = tarfile.TarInfo('slsmassnotifyserver/' + name)
                 info.size = len(body)
                 tar.addfile(info, io.BytesIO(body))
@@ -272,6 +274,17 @@ class ModuleTrust(unittest.TestCase):
         self.assertEqual(TRUST.enroll_sls(self.store, archive, manifest, signature), name)
         source.write_bytes(b'modified protected generation')
         with self.assertRaises(TRUST.TrustError): TRUST.enroll_sls(self.store, archive, manifest, signature)
+
+    def test_signed_dependency_payload_fits_but_member_limit_stays_enforced(self):
+        archive, manifest, signature = self.publisher_fixture(extra_files=2998)
+        generation = TRUST.enroll_sls(self.store, archive, manifest, signature)
+        approved, _ = TRUST.load(self.store, 'slsmassnotifyserver')
+        self.assertEqual(len(approved['files']), 3000)
+        pointer = (self.store / 'slsmassnotifyserver.active.json').read_bytes()
+        archive, manifest, signature = self.publisher_fixture(extra_files=4999)
+        with self.assertRaisesRegex(TRUST.TrustError, 'too many members'):
+            TRUST.enroll_sls(self.store, archive, manifest, signature)
+        self.assertEqual((self.store / 'slsmassnotifyserver.active.json').read_bytes(), pointer)
 
     def test_publisher_wrong_signature_archive_and_identity_fail_without_activation(self):
         archive, manifest, signature = self.publisher_fixture()

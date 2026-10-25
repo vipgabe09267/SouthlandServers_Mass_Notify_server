@@ -27,6 +27,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sls_nws_delivery_claims import _open_directory, _validate_parent_directory, _secure_file_metadata, _account_ids
+from sls_cluster_guard import labs_enabled
 
 DATA = Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin')
 MAX_BYTES = 16 * 1024 * 1024
@@ -1273,6 +1274,7 @@ ERROR_MESSAGES = {
     'phone_acknowledgement_invalid': 'The external keypad result could not be associated with this answered call. No acknowledgement was recorded; do not automatically redial.',
     'phone_outbound_answer_unconfirmed': 'External playback was withheld because this recipient\'s trunk answer could not be confirmed within five seconds of the Local channel answering. Check the trunk and SLS phone-events service; no automatic redial was attempted.',
     'phone_playback_identity_invalid': 'External playback did not match its admitted call. Audio was withheld; inspect the SLS phone evidence before sending again.',
+    'phone_outbound_origin_invalid': 'External routing requires its admitted SLS Local channel. The call was withheld; repair the signed SLS dialplan and review phone evidence before trying again.',
     'schedule_deadline_expired': 'The scheduled start deadline elapsed before this phone submission. Unstarted calls were rejected; calls already in progress were not interrupted.',
     'phone_outbound_evidence_gap': 'External call capacity is uncertain after a phone-event connection gap. New phone audio waits until a complete Asterisk inventory has no active calls; existing calls are not interrupted and playback remains unverified.',
     'outbound_route_changed': 'FreePBX outbound routing changed after this alert was admitted. The unstarted external call was rejected; review the routing before sending a new alert.',
@@ -1311,6 +1313,10 @@ ERROR_MESSAGES = {
 
 
 def operator_message(code):
+    if code == 'phone_radio_audio_limit_exceeded':
+        return 'The complete audio exceeds a selected radio gateway limit, or its duration is unknown. Shorten the message. For live paging, lower Maximum live paging duration to the gateway limit before retrying. No call was admitted.'
+    if code == 'phone_radio_profile_invalid':
+        return 'A saved radio gateway profile is invalid. Review and save its extension, enabled state and 5–120 second audio limit before sending audio.'
     if code == 'phone_live_contact_unidentified':
         return 'The paging caller could not be distinguished from other registered handsets. Check the caller contact address and SIP proxy registration; no page was started.'
     if code == 'phone_live_audience_changed':
@@ -1658,6 +1664,40 @@ def check_current_outbound(settings, target):
         raise PhoneAdmissionError('phone_outbound_disabled_or_changed')
 
 
+def check_radio_audio(settings, extensions, duration, service):
+    """Fence every audio producer before Asterisk, including weather and live pages."""
+    if not labs_enabled(settings):
+        return
+    integrations = settings.get('enterprise_integrations', {})
+    if not isinstance(integrations, dict) or integrations.get('enabled', '0') != '1':
+        return
+    radios = integrations.get('radios', {})
+    if not isinstance(radios, dict) or radios.get('enabled', '0') != '1':
+        return
+    devices = radios.get('devices', [])
+    if not isinstance(devices, list) or len(devices) > 25:
+        raise PhoneAdmissionError('phone_radio_profile_invalid')
+    limits = []
+    seen = set()
+    for row in devices:
+        if (not isinstance(row, dict) or not isinstance(row.get('extension'), str)
+                or not EXTENSION.fullmatch(row['extension']) or row['extension'] in seen
+                or row.get('enabled') not in ('0', '1')
+                or type(row.get('maximum_audio_seconds')) is not int
+                or not 5 <= row['maximum_audio_seconds'] <= 120):
+            raise PhoneAdmissionError('phone_radio_profile_invalid')
+        seen.add(row['extension'])
+        if row['enabled'] == '1' and row['extension'] in extensions:
+            limits.append(row['maximum_audio_seconds'])
+    if not limits:
+        return
+    paging = settings.get('live_paging', {})
+    measured = (paging.get('max_duration_seconds') if isinstance(paging, dict) else None) if service == 'live' else duration
+    if (isinstance(measured, bool) or not isinstance(measured, (int, float))
+            or not math.isfinite(measured) or not 0 < measured <= min(limits)):
+        raise PhoneAdmissionError('phone_radio_audio_limit_exceeded')
+
+
 def preserve_audio_media(directory, extensions, duration, sound):
     if duration is None and sound is None:
         return
@@ -1804,6 +1844,7 @@ def admit_audience(extensions, *, outbound=None, service, correlation='', wait_s
         if service != 'live':
             raise PhoneAdmissionError('phone_live_origin_invalid')
         check_live_audience(settings, extensions, live_origin, live_group, live_external, live_caller_number, contact_origin)
+    check_radio_audio(settings, extensions, duration, service)
     with ami_factory(settings) as ami:
         targets = ami.contacts(extensions) if extensions else {}
         if contact_origin:

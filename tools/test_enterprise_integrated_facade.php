@@ -82,10 +82,14 @@ eval('use SLS\\MassNotify\\{EnterpriseIntegrationsConfig as Config,IncidentConfi
 $module=new IntegratedLabsFixture();$smsId='sms_'.str_repeat('a',24);$voiceId='voice_'.str_repeat('b',24);$now=time();
 $sms=\SLS\MassNotify\Sms\Config::normalize(['enabled'=>true,'provider'=>'twilio','from'=>'+15555550101','organization'=>'Fixture','twilio_account_sid'=>'AC'.str_repeat('a',32),'twilio_auth_token'=>str_repeat('c',32),'twilio_key_sid'=>'SK'.str_repeat('d',32),'twilio_key_secret'=>'fixture','segment_cost_micros'=>10000,'max_segments'=>6,'recipients'=>[['id'=>$smsId,'name'=>'Fixture person','number'=>'+15555550102','enabled'=>true,'consent'=>true,'consent_note'=>'Isolated fixture','consent_at'=>gmdate('c',$now-60)]]]);
 $config=Config::defaults();$template=IncidentConfig::template(['id'=>'tpl_'.str_repeat('d',24),'name'=>'Fixture incident','title'=>'Fixture incident','message'=>'Fixture message','delivery'=>['audio_mode'=>'tts','extensions'=>['1000'],'sms_recipient_ids'=>[$smsId],'voice_recipient_ids'=>[$voiceId]],'roster'=>[['id'=>'person_a','name'=>'Fixture person']]]);
-$settings=['enabled'=>'0','runtime_enabled'=>true,'enterprise_integrations'=>$config,'labs_safety'=>LabsSafety::defaults(),'public_pbx_host'=>'pbx.example.org','control_api'=>['base_url'=>'https://pbx.example.org:8443/api/sls-mass-notify'],'announcement_sms'=>$sms,'outbound_voice'=>['enabled'=>'1','recipients'=>[['id'=>$voiceId,'name'=>'Fixture person','number'=>'+15555550102','enabled'=>'1']]],'incident_workflows'=>['schema'=>1,'templates'=>[$template]],'unrelated'=>'active-preserved'];file_put_contents(IntegratedLabsFixture::SETTINGS_JSON,json_encode($settings));chmod(IntegratedLabsFixture::SETTINGS_JSON,0600);$pending=$settings;$pending['unrelated']='pending-preserved';file_put_contents(IntegratedLabsFixture::PENDING_SETTINGS_JSON,json_encode($pending));chmod(IntegratedLabsFixture::PENDING_SETTINGS_JSON,0600);
+$settings=['enterprise_labs'=>['enabled'=>true],'enabled'=>'0','runtime_enabled'=>true,'enterprise_integrations'=>$config,'labs_safety'=>LabsSafety::defaults(),'public_pbx_host'=>'pbx.example.org','control_api'=>['base_url'=>'https://pbx.example.org:8443/api/sls-mass-notify'],'announcement_sms'=>$sms,'outbound_voice'=>['enabled'=>'1','recipients'=>[['id'=>$voiceId,'name'=>'Fixture person','number'=>'+15555550102','enabled'=>'1']]],'incident_workflows'=>['schema'=>1,'templates'=>[$template]],'unrelated'=>'active-preserved'];file_put_contents(IntegratedLabsFixture::SETTINGS_JSON,json_encode($settings));chmod(IntegratedLabsFixture::SETTINGS_JSON,0600);$pending=$settings;$pending['unrelated']='pending-preserved';file_put_contents(IntegratedLabsFixture::PENDING_SETTINGS_JSON,json_encode($pending));chmod(IntegratedLabsFixture::PENDING_SETTINGS_JSON,0600);
 $module->incidents=new IncidentService($module->incidentStore(),static fn($id)=>$template,static fn($delivery)=>$delivery,static fn(...$unused)=>['success'=>true,'job_id'=>'job_'.str_repeat('e',32)],static fn($id)=>['state'=>'queued']);
 $incident=$module->incidents->start(['template_id'=>$template['id'],'request_id'=>str_repeat('e',32),'fields'=>[],'is_test'=>true],['identity'=>'Fixture administrator','source'=>'fixture']);
 $token=$module->getCsrfToken();verify(strlen($token)===64&&$module->validateCsrfToken($token)&&!$module->validateCsrfToken('bad'),'Actual mainclass CSRF token validation');
+set_error_handler(static function(int $severity,string $message):never{throw new ErrorException($message,0,$severity);});
+try {
+ foreach([[],new stdClass(),false,123,null] as $malformedToken){verify(!$module->validateCsrfToken($malformedToken),'Malformed CSRF input must be rejected without warnings');}
+} finally {restore_error_handler();}
 $actions=['integrations_save'=>[],'integrations_meeting'=>[],'integrations_door'=>[],'integrations_speaker_send'=>[],'integrations_cap_export'=>[],'integrations_ipaws'=>[],'integrations_speaker_telemetry'=>[]];
 foreach(['sls_control_principal','sls_operator_portal_principal']as$key){$GLOBALS[$key]=['id'=>'fixture'];foreach($actions as$action=>$input)refused(fn()=>$module->enterpriseAdministratorAction($action,$input),'FreePBX administrator');unset($GLOBALS[$key]);}
 $module->principal['id']='portal_admin';foreach($actions as$action=>$input)refused(fn()=>$module->enterpriseAdministratorAction($action,$input),'current FreePBX');$module->principal['id']='recovery_admin';
@@ -181,3 +185,32 @@ $enabled['enterprise_integrations']['enabled']='0';file_put_contents(IntegratedL
 verify($module->receiveIncidentSmsResponse(array_replace($help,['event_id'=>'SMdisabled']))['state']==='ignored','Disabled response feature still accepted participant input');
 refused(fn()=>$module->controlIntegrationDoor(array_replace($door,['operation'=>'read'])),'disabled');
 echo "Actual mainclass facade fixtures passed: administrator/API/portal boundaries, CSRF, stale revision race, danger gates, frozen metadata, persisted incident reply/revocation and sensor operation contract; Weather-independent effects and paused-runtime evidence.\n";
+
+// Independent saved meeting accounts: redact, retain, select and clear only the chosen account.
+$state=$module->getEnterpriseIntegrationState();$meetingDraft=$state['config'];
+foreach(\SLS\MassNotify\MeetingAccounts::PROVIDERS as $provider){
+ $field=\SLS\MassNotify\MeetingAccounts::tokenField($provider);
+ $meetingDraft['meetings'][$field]='fixture-'.$provider.'-access';
+ $meetingDraft['meetings']['oauth_profiles'][$provider]=['oauth_refresh_enabled'=>'1','oauth_client_id'=>'client-'.$provider,
+  'oauth_client_secret'=>'secret-'.$provider,'oauth_refresh_token'=>'refresh-'.$provider,'oauth_expires_at'=>time()+3600];
+}
+$saved=$module->saveEnterpriseIntegrations(['revision'=>$state['revision'],'config'=>$meetingDraft]);
+verify(!str_contains(json_encode($saved),'secret-google_meet')&&!str_contains(json_encode($saved),'fixture-zoom-access'),'Meeting credentials leaked in the save response');
+$stored=$module->getActiveSettings()['enterprise_integrations']['meetings'];
+foreach(\SLS\MassNotify\MeetingAccounts::PROVIDERS as $provider){
+ $selected=\SLS\MassNotify\MeetingAccounts::select($stored,$provider);
+ verify($selected['oauth_client_secret']==='secret-'.$provider&&$selected[\SLS\MassNotify\MeetingAccounts::tokenField($provider)]==='fixture-'.$provider.'-access','Selected provider borrowed another account credential');
+ foreach(\SLS\MassNotify\MeetingAccounts::PROVIDERS as $other)if($other!==$provider)verify($selected[\SLS\MassNotify\MeetingAccounts::tokenField($other)]==='','Unused provider token reached a meeting operation');
+}
+$again=$module->saveEnterpriseIntegrations(['revision'=>$saved['state']['revision'],'config'=>$saved['state']['config']]);
+verify($module->getActiveSettings()['enterprise_integrations']['meetings']===$stored,'Saving a redacted editor erased saved OAuth credentials');
+$draft=$again['state']['config'];$draft['meetings']['oauth_profiles']['google_meet']['oauth_refresh_enabled']='0';
+$module->saveEnterpriseIntegrations(['revision'=>$again['state']['revision'],'config'=>$draft,
+ 'clear_secrets'=>['meetings.google_access_token','meetings.oauth_profiles.google_meet.oauth_client_secret','meetings.oauth_profiles.google_meet.oauth_refresh_token']]);
+$changed=$module->getActiveSettings()['enterprise_integrations']['meetings'];
+verify($changed['google_access_token']===''&&$changed['oauth_profiles']['google_meet']['oauth_client_secret']==='','Selected Google credentials were not removed');
+foreach(['zoom','webex'] as $other)verify($changed['oauth_profiles'][$other]===$stored['oauth_profiles'][$other]&&$changed[\SLS\MassNotify\MeetingAccounts::tokenField($other)]===$stored[\SLS\MassNotify\MeetingAccounts::tokenField($other)],'Clearing Google changed another provider');
+$legacy=\SLS\MassNotify\MeetingAccounts::select($stored,'webex');unset($legacy['oauth_profiles']);
+verify(\SLS\MassNotify\MeetingAccounts::profiles($legacy)['webex']['oauth_client_secret']==='secret-webex','Legacy selected account was not migrated');
+foreach([[],false,'unsupported',"zoom\n"] as $bad)refused(fn()=>\SLS\MassNotify\MeetingAccounts::provider($bad),'Choose Zoom');
+echo "Meeting accounts: three independent credentials, migration, redaction, saved-secret retention, selected removal and invalid-provider rejection passed.\n";

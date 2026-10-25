@@ -158,13 +158,11 @@ class ConfigFailClosedTest(unittest.TestCase):
         os.chown(cls.source, 0, cls.account.pw_gid)
         cls.source.chmod(0o750)
         (cls.source / "methods.json").write_text(extracted.stdout, encoding="utf-8")
+        # Keep the real validator dependency tree available to the unprivileged
+        # methods. A hand-maintained subset can fail before a storage guard runs.
+        shutil.copytree(ROOT / "slsmassnotifyserver", cls.source, dirs_exist_ok=True)
+        cls.source.chmod(0o750)
         shutil.copyfile(ROOT / "slsmassnotifyserver/api/sls-mass-notify/config-crypto.php", cls.source / "config-crypto.php")
-        for name in ("EnterpriseAdministration.php", "LabsSafety.php", "BetaNotice.php", "ImmediateSettings.php"):
-            shutil.copyfile(ROOT / "slsmassnotifyserver" / name, cls.source / name)
-        helper_directory = cls.source / "bin/sls_mass_notify"
-        helper_directory.mkdir(parents=True)
-        shutil.copyfile(ROOT / "slsmassnotifyserver/bin/sls_mass_notify/sls_atomic_json.php",
-                        helper_directory / "sls_atomic_json.php")
         for path in cls.source.rglob("*"):
             os.chown(path, 0, cls.account.pw_gid)
             path.chmod(0o750 if path.is_dir() else 0o640)

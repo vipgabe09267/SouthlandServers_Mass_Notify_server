@@ -39,6 +39,7 @@ class Fixture(unittest.TestCase):
         if args[1]=='is-enabled': return self.service['enabled']
         if args[1]=='is-active': return self.service['active']
         if args[1]=='show' and 'LoadState' in args[-1]: return 'LoadState='+('not-found' if self.service['enabled']=='not-found' else 'loaded')+'\nUnitFileState='+self.service['enabled']+'\nActiveState='+self.service['active']
+        if args[1]=='show' and args[-1]=='--property=DropInPaths': return 'DropInPaths='
         if args[1]=='show': return 'User=asterisk\nGroup=asterisk\nFragmentPath=/etc/systemd/system/'+r.SERVICE+'\nDropInPaths='
         if args[1] in ('enable','disable'): self.service['enabled']='enabled' if args[1]=='enable' else 'disabled'
         if args[1] in ('restart','stop'): self.service['active']='active' if args[1]=='restart' else 'inactive'
@@ -47,6 +48,38 @@ class Fixture(unittest.TestCase):
     def file(self,path,body,mode=0o644):
         dest=self.helper.dest(path); dest.parent.mkdir(parents=True,exist_ok=True); dest.write_bytes(body); dest.chmod(mode); return dest
     def snapshot(self): return self.helper.snapshot_create()
+    def test_current_service_template_matches_the_php_generator(self):
+        import subprocess
+        script=r'''require $argv[1];
+class ServiceTemplateFixture { use \FreePBX\modules\SlsPhoneEventService;
+public function contents(){return $this->phoneEventServiceContents();}}
+echo (new ServiceTemplateFixture())->contents();'''
+        body=subprocess.check_output(['php','-r',script,str(ROOT/'slsmassnotifyserver/PhoneEventService.php')])
+        self.assertEqual(body,r.SAFE_UNIT)
+
+    def test_exact_current_and_legacy_units_support_preflight_and_recovery(self):
+        for unit in r.SUPPORTED_UNITS:
+            with self.subTest(current=unit==r.SAFE_UNIT):
+                self.service={'enabled':'enabled','active':'active'}
+                path=self.file('/etc/systemd/system/'+r.SERVICE,unit)
+                self.assertTrue(self.helper.preflight_services()['rollback_supported'])
+                self.assertEqual(path.read_bytes(),unit)
+                self.assertFalse(any(row[1] in ('stop','disable','restart') for row in self.commands))
+                self.snapshot();self.helper.restore();self.helper.restore_services()
+                self.assertEqual(path.read_bytes(),unit)
+                self.assertEqual(self.service,{'enabled':'enabled','active':'active'})
+                import shutil
+                shutil.rmtree(self.private/'static');self.commands.clear()
+
+    def test_noncanonical_resource_and_execution_changes_require_review(self):
+        self.service={'enabled':'enabled','active':'active'}
+        for unit in (r.SAFE_UNIT.replace(b'CPUWeight=50',b'CPUWeight=100'),
+                     r.SAFE_UNIT+b'ExecStartPre=+/bin/true\n',
+                     r.LEGACY_SAFE_UNIT.replace(b'User=asterisk',b'User=root')):
+            self.file('/etc/systemd/system/'+r.SERVICE,unit)
+            with self.assertRaisesRegex(r.RecoveryError,'differs'):self.helper.preflight_services()
+        self.assertFalse(any(row[1] in ('stop','disable','restart') for row in self.commands))
+
     def test_unsupported_service_state_is_rejected_before_snapshot_or_changes(self):
         for enabled in ('masked', 'static', 'enabled-runtime', 'indirect'):
             self.service = {'enabled': enabled, 'active': 'inactive'}

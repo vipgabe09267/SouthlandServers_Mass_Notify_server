@@ -85,21 +85,25 @@ keys = ['announcement_extensions', 'announcement_groups', 'announcement_desktop_
 selection_html = render('views/recipient_selection.php', {'recipient_selection_form_id': 'fixture-form', 'recipient_selection_keys': keys})
 selection_fixture = r'''
 const vm=require('vm'), assert=require('assert'), keys=KEYS;
-const field={value:''}, complete={value:'0'}, timers=[], inputs={};
+const field={value:''}, complete={value:'0'}, timers=[], inputs={}, listeners={};
 keys.forEach(key=>{ inputs[key]=Array.from({length:1000},(_,i)=>({value:key+'_'+i,checked:true,disabled:false})); });
 const predisabled={value:'excluded',checked:true,disabled:true};inputs[keys[0]].push(predisabled);
 const unchecked={value:'unchecked',checked:false,disabled:false};inputs[keys[0]].push(unchecked);
 const unrelated={name:'announcement_message',disabled:false};
-const form={querySelector(selector){return selector.includes('_json')?field:complete;},querySelectorAll(selector){const match=/name="(.+)\[\]"/.exec(selector);assert(match);return inputs[match[1]];},addEventListener(event,callback,capture){assert(capture);this.submit=callback;}};
+const form={querySelector(selector){return selector.includes('_json')?field:complete;},querySelectorAll(selector){const match=/name="(.+)\[\]"/.exec(selector);assert(match);return inputs[match[1]];},addEventListener(event,callback,capture){assert.equal(Boolean(capture),event==='submit');listeners[event]=callback;}};
 vm.runInNewContext(SCRIPT,{document:{getElementById(id){assert.equal(id,'fixture-form');return form;}},window:{setTimeout(callback){timers.push(callback);}}});
-form.submit();let selection=JSON.parse(field.value);
+listeners.submit();let selection=JSON.parse(field.value);
 assert.equal(Object.keys(selection).length,keys.length);
 keys.forEach(key=>{assert.equal(selection[key].length,1000);assert.equal(selection[key][999],key+'_999');assert(inputs[key].every(input=>input.disabled));});
 assert.equal(complete.value,'1');assert(!unrelated.disabled);
 timers.splice(0).forEach(callback=>callback());
 assert(predisabled.disabled);assert(!unchecked.disabled);assert(!inputs[keys[0]][0].disabled);
-keys.forEach(key=>{inputs[key].forEach(input=>input.checked=false);});form.submit();
+keys.forEach(key=>{inputs[key].forEach(input=>input.checked=false);});listeners.submit();
 keys.forEach(key=>assert.equal(JSON.parse(field.value)[key].length,0));
+timers.splice(0).forEach(callback=>callback());
+inputs[keys[0]][0].checked=true;listeners['sls:collect-recipients']();
+assert.deepEqual(JSON.parse(field.value)[keys[0]],[keys[0]+'_0']);
+assert.equal(complete.value,'1');timers.splice(0).forEach(callback=>callback());
 console.log('Mixed recipient selections:5000 selected values serialized as one field,disabled exclusions,cancel recovery and explicit empty lists passed.');
 '''.replace('KEYS', json.dumps(keys)).replace('SCRIPT', json.dumps(scripts(selection_html)[0]))
 subprocess.run(['node', '-e', selection_fixture], check=True)

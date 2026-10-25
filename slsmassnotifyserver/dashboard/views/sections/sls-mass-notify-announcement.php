@@ -542,6 +542,18 @@ foreach ($desktopClients as $desktopClient) {
 			<div id="sls-preview-media"></div>
 			<div id="sls-preview-text" class="sls-preview-text"></div>
 		</div>
+        <div class="sls-rendered-preview" id="sls-delivery-review" role="status" aria-live="polite" hidden></div>
+        <details class="sls-rendered-preview">
+            <summary><?php echo _('Delivery rehearsal'); ?> <span class="label label-info"><i class="fa fa-flask" aria-hidden="true"></i> Labs</span></summary>
+            <p class="help-block"><?php echo _('Resolve this selection and simulate an outcome. No calls, messages or delivery jobs are created. This does not test a real provider.'); ?></p>
+            <label for="sls-rehearsal-outcome"><?php echo _('Simulated outcome'); ?></label>
+            <select id="sls-rehearsal-outcome" class="form-control">
+                <option value="accepted"><?php echo _('Submission accepted'); ?></option><option value="refused"><?php echo _('Refused before submission'); ?></option>
+                <option value="uncertain"><?php echo _('Timeout after possible submission'); ?></option><option value="unavailable"><?php echo _('Recipient unavailable'); ?></option><option value="expired"><?php echo _('Alert expired'); ?></option>
+            </select>
+            <button type="button" id="sls-rehearsal-run" class="btn btn-default btn-sm"><?php echo _('Run rehearsal — no delivery'); ?></button>
+            <pre id="sls-rehearsal-result" role="status" aria-live="polite" style="max-height:320px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere" hidden></pre>
+        </details>
 		<div class="sls-priority-field">
 			<label for="sls-announcement-priority"><?php echo _('Priority'); ?></label>
 			<select class="form-control" name="announcement_priority" id="sls-announcement-priority" aria-describedby="sls-priority-help">
@@ -552,7 +564,7 @@ foreach ($desktopClients as $desktopClient) {
 		</div>
 		<div class="sls-action-row">
 			<button type="submit" id="dashboard-sls-mass-notify-announcement-submit" class="btn btn-primary sls-send-button" <?php echo $announcementCooldown > 0 ? 'disabled' : ''; ?>>
-				<i class="fa fa-circle-o-notch fa-spin sls-submit-spinner" aria-hidden="true"></i><span class="sls-submit-label"><?php echo _('Send Announcement'); ?></span>
+				<i class="fa fa-circle-o-notch fa-spin sls-submit-spinner" aria-hidden="true"></i><span class="sls-submit-label"><?php echo _('Review and Send'); ?></span>
 			</button>
 			<span id="dashboard-sls-mass-notify-announcement-cooldown" class="text-muted sls-announcement-cooldown" data-remaining="<?php echo $announcementCooldown; ?>"><?php echo $announcementCooldown > 0 ? sprintf(_('Cooldown: %ss'), $announcementCooldown) : ''; ?></span>
 		</div>
@@ -846,6 +858,7 @@ foreach ($desktopClients as $desktopClient) {
 	var previewMedia = document.getElementById('sls-preview-media');
 	var previewText = document.getElementById('sls-preview-text');
 	var previewButtons = root.querySelectorAll('[data-announcement-preview]');
+    var speechMeasurements={};
 	function previewInputs() {
 		return {message: messageInput.value, title: titleInput.value, color: colorInput.value};
 	}
@@ -888,6 +901,7 @@ foreach ($desktopClients as $desktopClient) {
 						previewStatus.textContent = data.text_clipped ? 'This phone image cannot show the complete message. Shorten it or use speech for the full instructions.' : 'Phone image · 480 × 272. Text-only phone displays may differ.';
 					} else {
 						media.controls = true; media.preload = 'metadata';
+                        if(Number.isFinite(data.duration_seconds)&&data.duration_seconds>0&&typeof data.speech_revision==='string'){speechMeasurements[button.getAttribute('data-announcement-preview')]={snapshot:snapshot,revision:data.speech_revision,seconds:data.duration_seconds};}
 						previewStatus.textContent = 'Speech preview · ' + (button.getAttribute('data-announcement-preview') === 'external_speech' ? 'external calls' : 'internal phones') + '. Opening and closing tones are not included.';
 						previewText.textContent = data.speech_text || '';
 					}
@@ -1267,7 +1281,7 @@ foreach ($desktopClients as $desktopClient) {
 		submit.classList.toggle('sls-submit-busy', requestInFlight);
 		submit.setAttribute('aria-busy', requestInFlight ? 'true' : 'false');
 		if (submitLabel) {
-			submitLabel.textContent = requestInFlight ? 'Sending…' : 'Send Announcement';
+			submitLabel.textContent = requestInFlight ? 'Working…' : (deliveryReview ? 'Send Announcement' : 'Review and Send');
 		}
 	}
 	function setCooldownText(message, iconName) {
@@ -1337,6 +1351,31 @@ foreach ($desktopClients as $desktopClient) {
 	form.addEventListener('focusin', refreshFocusedWidget);
 	lifecycle.events.push([document, 'visibilitychange', refreshVisibleWidget], [form, 'focusin', refreshFocusedWidget]);
 	lifecycle.intervals.push(window.setInterval(refreshCooldown, 60000));
+    var deliveryReview=null, reviewSnapshot='';
+    var deliveryReviewPanel=root.querySelector('#sls-delivery-review');
+    function deliveryReviewInputs(){
+        // Submission briefly disables recipient checkboxes after serializing
+        // them. Compare their actual values, not that temporary transport state.
+        return JSON.stringify(Array.from(form.querySelectorAll('input[name],select[name],textarea[name]')).filter(function(control){
+            return !control.name.startsWith('sls_recipient_selection_')&&!['announcement_review_token','announcement_review','announcement_preview'].includes(control.name);
+        }).map(function(control){return [control.name,control.type==='checkbox'||control.type==='radio'?[control.value,control.checked]:control.multiple?Array.from(control.selectedOptions).map(function(option){return option.value;}):control.value];}));
+    }
+    function clearDeliveryReview(){deliveryReview=null;reviewSnapshot='';deliveryReviewPanel.hidden=true;if(submitLabel&&!requestInFlight)submitLabel.textContent='Review and Send';}
+    form.addEventListener('input',clearDeliveryReview);form.addEventListener('change',clearDeliveryReview);
+    var rehearsalButton=root.querySelector('#sls-rehearsal-run'),rehearsalResult=root.querySelector('#sls-rehearsal-result');
+    rehearsalButton.addEventListener('click',function(){
+        if(requestInFlight||!instanceActive()||!form.reportValidity())return;
+        clearDeliveryReview();setSubmitBusy(true);rehearsalButton.disabled=true;rehearsalResult.hidden=false;rehearsalResult.textContent='Preparing no-delivery rehearsal…';
+        form.dispatchEvent(new CustomEvent('sls:collect-recipients'));
+        var body=new FormData(form);body.set('announcement_rehearsal',root.querySelector('#sls-rehearsal-outcome').value);body.set('announcement_preview','1');
+        widgetRequest(form.action,{method:'POST',credentials:'same-origin',body:body},30000).then(function(data){
+            if(!instanceActive())return;
+            if(!data?.success||data.rehearsal?.simulated!==true||data.rehearsal.delivery_started!==false)throw Error(data?.message||'Rehearsal was not confirmed.');
+            var result=data.rehearsal,rows=result.simulated_receipts;
+            rehearsalResult.textContent=result.message+'\n\n'+Object.entries(result.counts).map(function(entry){return entry[0]+': '+entry[1];}).join(' · ')+'\n\n'+rows.slice(0,100).map(function(row){return row.channel+' · '+row.target+' · '+row.outcome+'\n'+row.detail;}).join('\n\n')+(rows.length>100?'\n\nFirst 100 of '+rows.length+' synthetic outcomes shown.':'');
+            scheduleDashboardLayout();
+        }).catch(function(error){if(instanceActive())rehearsalResult.textContent=error.message;}).finally(function(){if(instanceActive()){setSubmitBusy(false);rehearsalButton.disabled=false;renderCooldown();}});
+    });
 	form.addEventListener('submit', function(event) {
 		event.preventDefault();
 		if (!instanceActive()) {
@@ -1363,6 +1402,31 @@ foreach ($desktopClients as $desktopClient) {
 		setAnnouncementStatus('info', 'Queueing announcement…', true);
 		deliveryOutcomeUnknown = false;
 		var body = new FormData(form);
+        var currentReviewInputs=deliveryReviewInputs();
+        if(!deliveryReview||reviewSnapshot!==currentReviewInputs||Date.parse(deliveryReview.expires_at)<=Date.now()){
+            body.set('announcement_preview','1');body.set('announcement_review','1');
+            setAnnouncementStatus('info','Preparing delivery review…',true);
+            widgetRequest(form.action,{method:'POST',credentials:'same-origin',body:body},30000).then(function(data){
+                if(!instanceActive())return;
+                if(currentReviewInputs!==deliveryReviewInputs()){clearDeliveryReview();setAnnouncementStatus('warning','Selection changed. Send again to review the current recipients.');return;}
+                if(!data||data.success!==true||!data.review){throw new Error(data?.message||'Delivery review could not be prepared.');}
+                deliveryReview=data.review;reviewSnapshot=currentReviewInputs;deliveryReviewPanel.replaceChildren();
+                var heading=document.createElement('strong');heading.textContent='Delivery review';deliveryReviewPanel.append(heading);
+                var summary=document.createElement('p');summary.textContent=Object.entries(deliveryReview.counts).filter(function(entry){return entry[1]>0;}).map(function(entry){return entry[1]+' '+entry[0].replaceAll('_',' ');}).join(' · ');deliveryReviewPanel.append(summary);
+                if(deliveryReview.unavailable_phones.length){var offline=document.createElement('p');offline.textContent='Unavailable phone contacts: '+deliveryReview.unavailable_phones.join(', ');deliveryReviewPanel.append(offline);}
+                var detail=document.createElement('details'),caption=document.createElement('summary'),targets=document.createElement('ul');caption.textContent='Selected recipients';detail.append(caption);Object.entries(deliveryReview.recipients).forEach(function(entry){if(!entry[1].length)return;var line=document.createElement('li');line.textContent=entry[0].replaceAll('_',' ')+': '+entry[1].join(', ');targets.append(line);});detail.append(targets);deliveryReviewPanel.append(detail);
+                var speech=document.createElement('p');
+                var measured=speechMeasurements.internal_speech,externalMeasured=speechMeasurements.external_speech;
+                var duration=measured&&measured.snapshot===JSON.stringify(previewInputs())&&measured.revision===deliveryReview.speech.revision?' Measured speech: '+measured.seconds.toFixed(2)+' seconds.':'';
+                if(externalMeasured&&externalMeasured.snapshot===JSON.stringify(previewInputs())&&externalMeasured.revision===deliveryReview.speech.external_revision)duration+=' External speech: '+externalMeasured.seconds.toFixed(2)+' seconds.';
+                speech.textContent='Audio: '+deliveryReview.speech.mode+'. Speech limit: '+deliveryReview.speech.maximum_seconds+' seconds.'+(deliveryReview.speech.gateway_maximum_seconds?' Radio gateway full-sequence limit: '+deliveryReview.speech.gateway_maximum_seconds+' seconds.':'')+duration+(duration?' Opening and closing tones are additional.':' Listen to a speech preview to measure it.');deliveryReviewPanel.append(speech);
+                if(deliveryReview.sms){var cost=document.createElement('p');cost.textContent='SMS: '+deliveryReview.sms.segments_per_recipient+' unit(s) per recipient; estimated '+(deliveryReview.sms.estimated_cost_micros/1000000).toFixed(4)+' '+deliveryReview.sms.currency+'. Provider billing may differ.';deliveryReviewPanel.append(cost);}
+                var action=document.createElement('p');action.textContent='Check the selection, then press Send announcement again to submit. Changes require a new review.';deliveryReviewPanel.append(action);deliveryReviewPanel.hidden=false;
+                setAnnouncementStatus('info','Review ready. No delivery has started.');scheduleDashboardLayout();
+            }).catch(function(error){clearDeliveryReview();setAnnouncementStatus('danger',error.message);}).finally(function(){if(instanceActive()){setSubmitBusy(false);renderCooldown();}});
+            return;
+        }
+        body.set('announcement_review_token',deliveryReview.token);clearDeliveryReview();
 			widgetRequest(form.action, {method: 'POST', credentials: 'same-origin', body: body}, 30000)
 			.then(function(data) {
 				if (!instanceActive()) {

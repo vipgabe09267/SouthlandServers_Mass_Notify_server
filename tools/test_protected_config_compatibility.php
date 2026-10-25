@@ -100,7 +100,7 @@ namespace {
 	catch (\RuntimeException $expected) { $failed = true; }
 	$assert($failed, 'Native restore accepted a desktop selector that live configuration would rewrite.');
 	$media = $defaults;
-	$media['media_access'] = ['network_restricted'=>true, 'allowed_cidrs'=>['192.0.2.0/24','2001:db8::/32'], 'max_age_minutes'=>60];
+	$media['media_access'] = ['network_restricted'=>true, 'allowed_cidrs'=>['192.0.2.0/24','2001:db8::/32'], 'max_age_minutes'=>60, 'desktop_authentication'=>false, 'phone_capabilities'=>false,'phone_capability_generation'=>'0000000000000000'];
 	$assert($accept($media, 'Media policy')['media_access'] === $media['media_access'], 'Protected backup changed media policy.');
 	$assert($invoke('normalizeSettings', $media)['media_access'] === $media['media_access'], 'Normalizer lost media policy.');
 	foreach ([null, ['network_restricted'=>'1'], ['network_restricted'=>true,'allowed_cidrs'=>[]], ['max_age_minutes'=>1]] as $badMedia) {

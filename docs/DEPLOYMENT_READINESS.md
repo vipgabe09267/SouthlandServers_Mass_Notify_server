@@ -136,3 +136,5 @@ FastCGI route.
 Local success does not certify 1,000-client throughput, handset display, full
 audio playback, provider acceptance or human receipt. Perform those acceptance
 tests with the intended devices, routes and providers before operational use.
+
+Missing or stale worker/storage snapshots must remain unconfirmed for two minutes before a system email is sent. Dashboard diagnostics remain immediate. A brief recovery clears the pending observation; a confirmed disk, audit or delivery failure retains its normal reporting. Lock contention during retention is deferred without generating a failure alert.

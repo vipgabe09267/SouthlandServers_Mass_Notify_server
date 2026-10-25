@@ -3,6 +3,7 @@ declare(strict_types=1);
 namespace SLS\MassNotify;
 require_once __DIR__.'/EnterpriseIntegrationsConfig.php';
 require_once __DIR__.'/api/sls-mass-notify/security.php';
+require_once __DIR__.'/ScopedTls.php';
 
 /** Documented provider wire contracts; HTTPS, fixed paths, no redirects/retries. */
 class EnterpriseIntegrationsProvider
@@ -18,6 +19,7 @@ class EnterpriseIntegrationsProvider
                 if (strlen($response)+strlen($chunk)>131072) { return 0; } $response.=$chunk; return strlen($chunk);
             }];
         if ($device!==null) {
+            $options+=ScopedTls::curlOptions($device['tls']??[]);
             EnterpriseIntegrationsConfig::origin($device['origin'],$device['pinned_ipv4']);
             $host=parse_url($device['origin'],PHP_URL_HOST); $port=parse_url($device['origin'],PHP_URL_PORT)??443;
             $options[CURLOPT_RESOLVE]=[$host.':'.$port.':'.$device['pinned_ipv4']];
@@ -163,6 +165,7 @@ class EnterpriseIntegrationsProvider
     {
         if (($speaker['enabled']??'0')!=='1' || ($speaker['brand']??'')!=='axis' || ($speaker['telemetry_origin']??'')==='') { throw new \DomainException('This speaker has no enabled documented telemetry adapter.'); }
         $device=['origin'=>$speaker['telemetry_origin'],'pinned_ipv4'=>$speaker['telemetry_ipv4'],'username'=>$speaker['telemetry_username'],'password'=>$speaker['telemetry_password']];
+        if(isset($speaker['telemetry_tls'])){$device['tls']=$speaker['telemetry_tls'];}
         $body=self::jsonResult($this->request($device['origin'].'/vapix/axast','{"axast:GetSpeakerTestReport":{}}',['Content-Type: application/json','Accept: application/json'],$device),[200]);
         $report=$body['SpeakerTestReport']??null;
         if(!is_array($report)||array_is_list($report)){throw new \RuntimeException('Speaker telemetry returned an invalid report.');}

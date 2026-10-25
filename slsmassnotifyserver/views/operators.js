@@ -247,11 +247,11 @@
     button.disabled = true; result.textContent = 'Saving accounts…';
     try {
       const accounts = rows.map(row => Object.fromEntries([...keys,'rebind','password','reset_totp'].filter(key => row[key] !== undefined).map(key => [key,row[key]])));
-      const payload = JSON.stringify({revision:state.revision,enabled:root.querySelector('#ops-enforce').checked,portal_enabled:root.querySelector('#ops-portal-enabled').checked,accounts});
+      const payload = JSON.stringify({revision:state.revision,enabled:root.querySelector('#ops-enforce').checked,portal_enabled:root.querySelector('#ops-portal-enabled').checked,passkeys_enabled:root.querySelector('#ops-passkeys-enabled').checked,accounts});
       const maximum = data.endpoint.startsWith('/mass-notify/') ? 65536 : 131072;
       if (new TextEncoder().encode(payload).length > maximum) throw new Error('The account form exceeds '+(maximum/1024)+' KiB. Use site or audience grants for large device lists.');
       const answer = await request('save_access',payload);
-      rows.forEach(row => { delete row.password; }); dirty = false; result.textContent = answer.message; try { sessionStorage.setItem('sls-operator-save-success','1'); } catch (_) {} location.reload();
+      rows.forEach(row => { delete row.password; }); dirty = false; window.SlsSaveState?.set(root,'active'); result.textContent = answer.message; try { sessionStorage.setItem('sls-operator-save-success','1'); } catch (_) {} location.reload();
     } catch (error) { result.textContent = error.message; button.disabled = false; }
   });
   render();

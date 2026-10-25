@@ -1,6 +1,81 @@
 # Changelog
 
-## 0.1.7-beta — Unreleased
+## 0.1.8-beta — 2026-10-25
+
+### Installation and security
+
+- Update the pinned setuptools packaging dependency to 84.2.1 with verified wheel hashes and refreshed installer workspace measurements.
+- Accept both exact managed collector service templates during upgrade inspection and rollback, including the resource-accounting template. Continue rejecting custom commands, privilege changes and systemd overrides.
+- Make local uninstaller help read-only and reject unsupported arguments before host operations. Correct the disposable VM purge scenario to use the documented removal setting.
+- Preserve existing Postfix relay entries in the email setup instructions instead of replacing the credential file.
+- Supply the required Debian jQuery fixture to browser checks in CI, so dashboard qualification runs with its declared dependency.
+- Report missing offline release assets with explicit URL, manifest and checksum instructions; retain link, type, size and destination-overwrite checks.
+
+- Check reviewed PHP security floors before stock Dashboard bootstrap or pausing notification workers. Preserve the later extension and actual served-runtime checks.
+- Reconcile approved Framework/Dashboard updates against independently verified signed upstream packages; retain a bounded stock-package cache for offline local removal and recover active trust pointers after a partial reconciliation.
+- Add a checksum-pinned bootstrap that authenticates the signed installer before execution, honors signing expiry and refuses to bypass an initialized publisher policy. Future-release provenance requires immutable assets and retains the current self-signing key.
+- Include the isolated passkey dependencies in the locked-file baseline, license inventory and dependency advisory scan. Run every registered build fixture from a fresh isolated baseline.
+- Increase archive and measured-payload entry limits to 5,000 for the pinned dependency tree, retaining signature, ownership, link and byte bounds.
+
+### Delivery and performance
+
+- Delay the live paging ready tone until the admitted phones finish connecting. Keep input muted through the final readiness check and end the caller-only tone as input opens; preserve voicemail-only recording and end an unready call after a bounded setup timeout.
+- Show live paging SIP text after each selected audio handset joins the intercom. Text-only recipients wait for the first audio join. Replace only that page's owned popups with a quiet, one-second **Paging ended** message at completion.
+- Serialize popup ownership with permanent locks so page cleanup cannot displace a newer alert. Bound protected configuration reads, registration probes and optional cluster coordination; retain explicit uncertainty when evidence or cleanup is unavailable.
+- Recover the known zero-byte legacy paging PIN journal only while its initialization marker is empty. Preserve permanent locks and PIN limits; reject damaged initialized state. Record bounded paging failures in syslog and play the unavailable prompt for storage failures.
+- Accept dial-in group numbers with pound or a two-second pause, retaining group 10, mandatory external PINs and the caller’s original channel timers.
+- Permit extension-only predial callbacks only when their exact leading guards prove an SLS Local call returns before the callback body. Bind outbound AGI admission to its expected Local channel; retain rejection of arbitrary hooks and changed routes.
+- Restore minutely storage reporting when cron uses isolated Python; a failed retention step no longer prevents the other checks or the health summary. Show current faults separately from retained historical failures.
+- Add a cached Postfix service/queue check with specific recovery guidance, numbered per-contact phone diagnostics and scrollable desktop readiness. New installations default to desktop app 1.0.13-beta; missing or stale version reports require an update.
+
+- Coalesce advisory desktop presence, including requests with client-version headers; persist changed versions and receipts immediately. Shard authenticated traffic budgets and use shared read locks. Add an authenticated unchanged-feed validator and a generation-bound cache that stores repeated original recipient sets once.
+- Preserve live cursor pagination, stable IDs, original publication times and absolute expiry. Retain evicted receipt authorization evidence separately; count and byte pressure cannot silently remove a current announcement.
+- Add optional authenticated desktop images and short-lived file-scoped phone links with administrator revocation. Legacy media access remains available when these options are off.
+- Add read-only Postfix queue and journal evidence for local submission, deferral, bounce and relay acceptance. Never replay uncertain mail or claim mailbox placement or human reading.
+- Limit native Piper CPU sessions to one thread. Add optional pinned UK English and Mexican Spanish packs, measured speech preview duration and corrected announcement title/message limits.
+- Add stable readiness reason codes, privacy-limited JSON/Prometheus metrics, expiring/rotatable API credentials and explicit monitor/fleet/incident read scopes.
+- Preserve phone capability parameters through Apache rewriting and bind desktop image credentials to the original local account.
+- Preserve browser receipt polling after uncertain provider responses.
+- Reserve space for simultaneous atomic replacements across the sixteen browser evidence shards.
+- Use shared locks for unchanged desktop rate-limit registry reads. New registrations and failed-login counters still require exclusive locks and a fresh snapshot before writing.
+- Accept valid directories created concurrently by first-use announcement, SMS, floor-plan and stream requests; retain link, ownership and path checks.
+- Keep case-sensitive System Recording names distinct, prefer the supported codec for each name and exclude G.722 files when their decoder is unavailable.
+- Reject malformed phone transport metadata without PHP conversion warnings, and clarify that the notification log needs a refresh to show new delivery records.
+
+### Operators and coordination
+
+- Add optional user-verified passkeys for operator MFA, with fresh TOTP enrollment/revocation, one-use challenges and isolated dependency loading. SSO remains limited to the operator portal.
+- Add pre-enrolled email-verified browser subscriptions, exact-event links and separate software receive/display-request/click evidence. Subscription generation changes revoke old queued endpoint bindings.
+- Add conditional incident escalation for missing responses, assistance requests and count/percentage quorum. Human responses remain separate from desktop receipts.
+- Add reviewed Entra/Google directory imports, person profiles with explicit device ownership and language preferences, deactivation audience previews and 200 saved audiences.
+- Add month/week/list programme previews with day-type and time exceptions, consistent save-state indicators and a revision-bound delivery review using the existing Send control.
+- Add a no-delivery rehearsal with synthetic acceptance, refusal, timeout, unavailability and expiry scenarios for all nine channel models. Keep simulated outcomes separate from delivery history.
+- Keep selected recipients through both delivery-review clicks and rehearsals, including the bounded form envelope used for large audiences.
+- Apply the 200-audience limit consistently, show the remaining central configuration budget and count encoded Unicode correctly. Validate person profiles during Apply Config.
+- Abort obsolete browser-display requests and bind responses to the current connection, so an old login cannot replace a new cursor or disconnect a later login.
+- Reject non-string CSRF fields cleanly before token comparison.
+- Commit directory, subscriber and identity settings as a recoverable active/pending transaction; a failed second write restores the previous protected bytes and preserves unrelated staged edits.
+
+### Labs integrations and API
+
+- Add one Feature manager for the Labs master switch and 22 tool selections. Enforce the default-off master in administrator actions, workers and browser displays; keep ordinary paging, desktop delivery and operator SSO independent. Preserve configured values, revisions and valid receipts when disabling Labs. Require the warning agreement before each feature save.
+- Match the PBX theme without overriding its text colors. Use side navigation, collapsible continuity and provider settings, explicit saved On/Off indicators and responsive incident cards.
+- Show saved Labs activation separately from warning acceptance, with a direct configuration shortcut and per-section status. Group device/provider settings and separate saved-device operations from setup.
+- Replace native-only field hints with bounded, accessible hover/focus/tap help. Refine incident coordination cards, image storage and history controls.
+- Describe nullable announcement expiry in the generated schema and validate actual zero-timeout and timed producer payloads.
+- Require the timed Labs acknowledgment before returning settings or accepting administrator operations. Show Active only when the Enterprise Labs master switch is enabled; accepting the warning alone leaves it Inactive.
+- Reorganize continuity settings with field examples and contextual help. Use speaker and radio model selectors, collapsible device profiles and separate Zoom, Google Meet and Webex OAuth accounts selected per meeting. Preserve existing credentials and isolate provider renewal/revocation.
+- Clarify automatic-update policy and progress. Keep the update panel open after a request; a failed check offers another check without changing it into an installation request.
+- Add a trigger setup guide linking notification templates, enrolled sources and optional device/script actions.
+
+- Add PJSIP radio-gateway profiles with independent audio-duration limits and frozen authorization. Existing PIN-protected paging can provide an approved gateway's inbound path; no RF-control service or listener is added.
+- Enforce radio limits in common phone admission for Weather, Lightning, schedules and live paging, before contacting Asterisk.
+- Add Google Chat, Mattermost, bearer-authenticated Teams workflow and Matrix room adapters. Add adapter-scoped CA/pinning options without changing global TLS verification.
+- Add optional restricted local scripts with no host PBX-data mounts or host network and no unrestricted fallback. Approved scripts remain trusted code.
+- Publish OpenAPI 3.1 and notification JSON Schema documentation. Preserve notification schema 1, SSE protocol 2, existing endpoint paths and legacy authentication.
+- Prepare coordinated desktop cursor, authenticated-media and confirmed per-device panic support in the separate app handoff. Those client changes require their own app release.
+
+## 0.1.7-beta
 
 ### Installation, upgrades and removal
 

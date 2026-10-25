@@ -240,6 +240,7 @@ final class LivePagingConfig
         }
         $texts=['menu' => $menu, 'pin' => $config['pin_prompt'],
             'ready' => 'Paging will begin after the tone. Speak clearly, then hang up when finished.',
+            'recording' => 'No phones answered. After the tone, record your page for voicemail, then hang up when finished.',
             'partial' => 'Some phones in this group are unavailable. Paging will continue to the reachable phones.',
             'text_failure' => 'The paging text notification could not be confirmed. Audio paging will continue.',
             'invalid' => 'That selection or PIN was not accepted.',
@@ -289,6 +290,10 @@ class LivePagingAgi
     private array $originEnvironment = [];
     private bool $voicemailEnabled = false;
     private int $voicemailDuration = 300;
+    protected array $notificationAdmission = [];
+
+    public function setNotificationAdmission(array $admission): void { $this->notificationAdmission = $admission; }
+    protected function notificationOrigin(): array { return $this->originEnvironment; }
 
     public function setOriginEnvironment(array $environment): void { $this->originEnvironment = $environment; }
     public function configureVoicemail(bool $enabled, int $duration): void
@@ -399,7 +404,22 @@ class LivePagingAgi
         // Read supports a file sequence and DTMF during playback. Only prepared
         // local prompts for this caller's permitted groups enter the sequence.
         $this->command('SET VARIABLE SLS_PAGING_MENU ""');
-        $result = $this->command('EXEC Read ' . self::quote('SLS_PAGING_MENU,' . implode('&', $files) . ',3,,1,10'), 300);
+        $previousDigit = $this->variable('${TIMEOUT(digit)}');
+        $previousResponse = $this->variable('${TIMEOUT(response)}');
+        foreach ([$previousDigit, $previousResponse] as $timeout) {
+            if (!preg_match('/^[0-9]{1,5}(?:\.[0-9]{1,3})?$/D', $timeout)) { throw new \RuntimeException('agi_command_failed'); }
+        }
+        // A single group digit must advance without requiring pound. Leave
+        // time for group 10 and consume an optional terminator before the PIN.
+        // Keep a longer first-response window and restore the caller's timers.
+        try {
+            $this->command('SET VARIABLE TIMEOUT(digit) "2"');
+            $this->command('SET VARIABLE TIMEOUT(response) "10"');
+            $result = $this->command('EXEC Read ' . self::quote('SLS_PAGING_MENU,' . implode('&', $files) . ',3,,1'), 300);
+        } finally {
+            $this->command('SET VARIABLE TIMEOUT(digit) ' . self::quote($previousDigit));
+            $this->command('SET VARIABLE TIMEOUT(response) ' . self::quote($previousResponse));
+        }
         $status = $this->variable('${READSTATUS}');
         if (str_starts_with($result, '200 result=-1') || $status === 'HANGUP') { throw new \RuntimeException('agi_hangup'); }
         if (!in_array($status, ['OK', 'TIMEOUT'], true)) { throw new \RuntimeException('agi_command_failed'); }
@@ -409,7 +429,42 @@ class LivePagingAgi
 
     public function page(string $dial, int $answerTimeout, int $duration): void
     {
-        $this->command('EXEC Page ' . self::quote($dial . ',b(sls-live-paging-autoanswer^s^1)i,' . $answerTimeout), $duration + 15);
+        // Page's own beep precedes asynchronous answers. The admitted-origin
+        // companion supplies the caller-only cue after the cohort settles.
+        $this->command('EXEC Page ' . self::quote($dial . ',b(sls-live-paging-autoanswer^s^1)iq,' . $answerTimeout), $duration + 15);
+    }
+
+    public function preparePageInput(): bool
+    {
+        return !str_starts_with($this->command('SET VARIABLE MUTEAUDIO(in) "on"'), '200 result=-1');
+    }
+
+    public function playReadyTone(): bool
+    {
+        if (!preg_match('/^200 result=0(?:\s.*)?$/D', $this->command('EXEC PlayTones "880"'))) { return false; }
+        // Keep the caller's cue audible during the final protected-state
+        // check. This minimum is cue duration, never an answer-time guess.
+        $ready=preg_match('/^200 result=0(?:\s.*)?$/D', $this->command('EXEC Wait "0.3"')) === 1;
+        if (!$ready) { $this->stopReadyTone(); }
+        return $ready;
+    }
+
+    public function stopReadyTone(): bool
+    {
+        return preg_match('/^200 result=0(?:\s.*)?$/D', $this->command('EXEC StopPlayTones')) === 1;
+    }
+
+    public function openPageInput(): bool
+    {
+        return !str_starts_with($this->command('SET VARIABLE MUTEAUDIO(in) "off"'), '200 result=-1');
+    }
+
+    public function recordingReadyCue(int $deadline = PHP_INT_MAX): bool
+    {
+        if (!$this->playReadyTone()) { return false; }
+        try { $opened=time()<$deadline && $this->openPageInput(); }
+        finally { $stopped=$this->stopReadyTone(); }
+        return $opened && $stopped;
     }
 
     public function recordOnly(int $duration): void
@@ -754,7 +809,8 @@ class LivePagingState
 
     private function locked(string $name, array $defaults, callable $operation, int $maxBytes = 1048576)
     {
-        return \SlsAtomicJson::transaction($this->directory . '/' . $name, $defaults, $operation, $maxBytes);
+        return \SlsAtomicJson::transaction($this->directory . '/' . $name, $defaults, $operation, $maxBytes,
+            true, false, $name === 'live-paging-auth.json');
     }
 
     public function authenticationAllowed(string $caller, bool $recordFailure = false, ?int $now = null): bool
@@ -958,7 +1014,7 @@ final class LivePagingSession
         $externalMenu = $external ? array_merge([$prompts['external_menu']], array_map(static fn($number) => $prompts['external_group_' . $number], array_keys($groups))) : [];
         $group = null;
         for ($attempt = 0; $attempt < 3; $attempt++) {
-            $selection = $external ? $this->agi->menu($externalMenu) : $this->agi->digits($prompts['menu'], 3);
+            $selection = $this->agi->menu($external ? $externalMenu : [$prompts['menu']]);
             if (preg_match('/^(?:[1-9]|10)$/D', $selection) && isset($groups[$selection])) { $group = $groups[$selection]; break; }
             $this->agi->play($prompts['invalid']);
         }
@@ -1028,29 +1084,51 @@ final class LivePagingSession
             }
             $dial = $admission['live_dial'] === '' ? [] : explode('&', $admission['live_dial']);
             $unavailable = $admission['unavailable'];
+            $pageDeadline = time() + $config['max_duration_seconds'];
+            $this->agi->autoHangup($config['max_duration_seconds']);
+            if ($unavailable) { $this->agi->play($prompts['partial']); }
+            $this->agi->play($prompts['ready']);
+            if (!$this->agi->preparePageInput()) {
+                $this->agi->play($prompts['unavailable']);
+                return ['status' => 'paging_input_gate_unavailable'];
+            }
+            $voicemail = $this->agi->startVoicemailRecording($admission, $config['max_duration_seconds']);
+            $this->agi->setNotificationAdmission($admission + [
+                'paging_deadline' => $pageDeadline, 'voicemail_recording' => ($voicemail['status'] ?? '') === 'recording']);
             try { $notification = $this->agi->notifyGroup($group, $caller['extension'], $settings); }
             catch (\Throwable $error) {
-                $notification = ['status' => 'failed', 'requested' => count(array_diff($group['notify_extensions'], [$caller['extension']]))];
+                $notification = ['status' => 'failed', 'requested' => count(array_diff($group['notify_extensions'], [$caller['extension']])),
+                    'ready_gate'=>!$dial];
             }
             if (($notification['status'] ?? '') === 'configuration_changed') {
                 $this->agi->play($prompts['unavailable']);
                 return ['status' => 'configuration_changed', 'text_notification' => $notification];
             }
-            if (!in_array($notification['status'] ?? '', ['submitted', 'not_requested'], true)) {
+            if ($dial && ($notification['ready_gate'] ?? false) !== true) {
+                $this->agi->play($prompts['unavailable']);
+                return ['status' => 'paging_ready_gate_unavailable', 'text_notification' => $notification];
+            }
+            if (!in_array($notification['status'] ?? '', ['submitted', 'monitoring', 'not_requested'], true)) {
                 $this->agi->play($prompts['text_failure']);
             }
-            $this->agi->autoHangup($config['max_duration_seconds']);
-            if ($unavailable) { $this->agi->play($prompts['partial']); }
-            $this->agi->play($prompts['ready']);
-            $voicemail = $this->agi->startVoicemailRecording($admission, $config['max_duration_seconds']);
             if (!$dial) {
                 if (($voicemail['status'] ?? '') !== 'recording') {
                     $this->agi->play($prompts['unavailable']);
                     return ['status' => 'voicemail_recording_unavailable', 'voicemail' => $voicemail];
                 }
-                $this->agi->recordOnly($config['max_duration_seconds']);
+                $this->agi->play($prompts['recording']);
+                if (!$this->agi->recordingReadyCue($pageDeadline)) {
+                    $this->agi->play($prompts['unavailable']);
+                    return ['status' => 'paging_recording_cue_unavailable', 'voicemail' => $voicemail];
+                }
+                $this->agi->recordOnly(max(1, $pageDeadline - time()));
             } else {
-                $this->agi->page(implode('&', $dial), min(5, max(1, (int)($settings['paging_answer_timeout'] ?? 5))), $config['max_duration_seconds']);
+                $answerTimeout = min(5, max(1, (int)($settings['paging_answer_timeout'] ?? 5)));
+                // A failed companion must not strand a muted caller for the
+                // entire page limit. Successful cue playback restores only
+                // the remaining time within the original absolute deadline.
+                $this->agi->autoHangup(max(1, min($pageDeadline - time(), $answerTimeout + 8)));
+                $this->agi->page(implode('&', $dial), $answerTimeout, $config['max_duration_seconds']);
             }
         } finally {
             try { $completion = $this->agi->finishGroupNotification(); }

@@ -2,6 +2,8 @@
 declare(strict_types=1);
 namespace FreePBX\modules;
 require_once __DIR__ . '/LocationDirectory.php';
+require_once __DIR__ . '/AudienceLimits.php';
+require_once __DIR__ . '/api/sls-mass-notify/person-profiles.php';
 require_once __DIR__ . '/IncidentConfig.php';
 require_once __DIR__ . '/api/sls-mass-notify/security.php';
 require_once __DIR__ . '/bin/sls_mass_notify/sls_live_paging.php';
@@ -59,13 +61,13 @@ trait SlsLocations
         $revision = hash('sha256', json_encode([$directory, $catalog, $settings['announcement_groups'] ?? [],
             $settings['outbound_voice']['recipients'] ?? [], $settings['announcement_email']['recipients'] ?? [], $settings['announcement_sms']['recipients'] ?? [],
             \SLS\MassNotify\ApiSecurity::labsDirectory($settings)], JSON_THROW_ON_ERROR));
-        return ['directory' => $directory, 'catalog' => $catalog, 'revision' => $revision,
+        return ['pending'=>$this->getPendingSettings()!==null, 'configuration_budget'=>\SLS\MassNotify\AudienceLimits::budget($settings), 'directory' => $directory, 'catalog' => $catalog, 'revision' => $revision,
             'audiences' => $this->locationAudienceCards($settings),
             'positions' => GeographicTargeting::positions($directory), 'observed_at' => time(),
             'weather_routes' => array_merge(
                 array_map(static function($g){return ['site_id'=>$g['site_id']??'', 'name'=>$g['name']??'Weather', 'coverage'=>$g['zone']??''];}, $settings['nws_zones']??[]),
                 array_map(static function($g){return ['site_id'=>$g['site_id']??'', 'name'=>$g['name']??'Lightning', 'coverage'=>$g['location']??''];}, $settings['xweather']['groups']??[])),
-            'group_count' => count($settings['announcement_groups'] ?? []), 'max_locations' => LocationDirectory::MAX_NODES];
+            'people'=>array_values(\SLS\MassNotify\PersonProfiles::people($settings)), 'group_count' => count($settings['announcement_groups'] ?? []), 'group_limit'=>\SLS\MassNotify\AudienceLimits::SAVED, 'max_locations' => LocationDirectory::MAX_NODES];
     }
 
     public function getAudiencePickerChoices(): array
@@ -92,6 +94,7 @@ trait SlsLocations
             }
             $result[] = ['id' => $group['id'], 'name' => $group['name'], 'members' => $members,
                 'reviewed_location' => $group['location_snapshot']['path'] ?? '',
+                'person_profile'=>$group['person_profile']??null,
                 'identities_current' => \SLS\MassNotify\ApiSecurity::groupDesktopBindingsValid($group, $settings) && \SLS\MassNotify\ApiSecurity::groupLabsBindingsValid($group,$settings)];
         }
         return $result;
@@ -101,14 +104,14 @@ trait SlsLocations
     public function saveLocationAudience(array $input): array
     {
         return $this->locationResult(function () use ($input): array {
-            [$settings, $state] = $this->locationRequest($input, ['id', 'name', 'members']);
+            [$settings, $state] = $this->locationRequest($input, ['id', 'name', 'members', 'person_profile']);
             $id = $input['id'] ?? null;
             if (!is_string($id) || ($id !== '' && !preg_match('/^grp_[a-f0-9]{12,32}$/D', $id))) { throw new \InvalidArgumentException('The saved audience identifier is invalid. Reload Locations.'); }
             $groups = $settings['announcement_groups'] ?? []; $existing = null;
             foreach ($groups as $index => $group) { if ($group['id'] === $id) { $existing = $index; break; } }
             if ($id !== '' && $existing === null) { throw new \InvalidArgumentException('This audience was removed. Reload Locations.'); }
             if ($existing !== null && isset($groups[$existing]['location_snapshot'])) { throw new \InvalidArgumentException('This audience records a reviewed location selection. Create a new snapshot from the Directory tab to change its members.'); }
-            if ($existing === null && count($groups) >= 20) { throw new \InvalidArgumentException('All 20 saved audiences are in use. Remove an unused audience first.'); }
+            if ($existing === null && count($groups) >= \SLS\MassNotify\AudienceLimits::SAVED) { throw new \InvalidArgumentException('All 200 saved audiences are in use. Remove an unused audience first.'); }
             $name = LocationDirectory::text($input['name'] ?? null, 64, 'Audience name');
             foreach ($groups as $group) { if ($group['id'] !== $id && strcasecmp($group['name'], $name) === 0) { throw new \InvalidArgumentException('Another audience uses this name. Choose a distinct name.'); } }
             $members = LocationDirectory::node(['id' => LocationDirectory::DEFAULT_SITE_ID, 'type' => 'site', 'name' => $name, 'members' => $input['members'] ?? null])['members'];
@@ -129,8 +132,15 @@ trait SlsLocations
                 'sms_recipient_ids' => $members['sms_recipient_ids'], 'webhook_ids' => $members['webhook_ids'],
                 'desktop_bindings' => LocationDirectory::bindings($bindings, $desktops)];
             foreach (['browser_recipient_ids','connector_ids'] as $field) { $candidate[$field]=$members[$field]; }
+            if(($input['person_profile']??null)!==null){
+                $profile=$input['person_profile'];
+                if(!is_array($profile)||array_diff(array_keys($profile),['directory_person_id','language','ownership_reviewed'])){throw new \InvalidArgumentException('Person profile fields are invalid.');}
+                $candidate['person_profile']=\SLS\MassNotify\PersonProfiles::normalize($profile+['reviewed_at'=>time()]);
+                if(!\SLS\MassNotify\PersonProfiles::active($candidate,$settings)){throw new \InvalidArgumentException('The linked directory person is inactive or removed. Review their audience.');}
+            }
             $candidate['labs_bindings']=\SLS\MassNotify\ApiSecurity::labsBindings($members,$settings);
             if ($existing === null) { $groups[] = $candidate; } else { $groups[$existing] = $candidate; }
+            \SLS\MassNotify\AudienceLimits::assertGrowth($groups,$settings['announcement_groups']??[]);
             \SLS\MassNotify\LivePagingConfig::resolvedGroups(\SLS\MassNotify\LivePagingConfig::normalize($settings['live_paging'] ?? []), $groups);
             $settings['announcement_groups'] = $groups;
             $this->persistPendingSettings($settings);
@@ -339,7 +349,7 @@ trait SlsLocations
             }
             if ($preview['unavailable']) { throw new \InvalidArgumentException('The reviewed audience contains unavailable recipients. Correct their assignments or choose different recipient types before creating a group.'); }
             if (array_sum(array_map('count', $preview['members'])) === 0) { throw new \InvalidArgumentException('The selected locations have no recipients of the selected types. Assign recipients first.'); }
-            if ($state['group_count'] >= 20) { throw new \InvalidArgumentException('Announcement groups are limited to 20. Remove an unused group from the Dashboard before creating another.'); }
+            if ($state['group_count'] >= \SLS\MassNotify\AudienceLimits::SAVED) { throw new \InvalidArgumentException('Up to 200 saved audiences are supported. Remove an unused group before creating another.'); }
             $name = LocationDirectory::text($input['name'] ?? null, 64, 'Audience group name');
             foreach ($settings['announcement_groups'] ?? [] as $group) { if (strcasecmp($group['name'], $name) === 0) { throw new \InvalidArgumentException('An audience group already uses that name. Choose a distinct name.'); } }
             $members = $preview['members']; $bindings = []; $desktops = [];
@@ -360,7 +370,9 @@ trait SlsLocations
                 'location_snapshot' => LocationDirectory::snapshot($snapshot, $desktops)];
             foreach (['browser_recipient_ids','connector_ids'] as $field) { $group[$field]=$members[$field]; }
             $group['labs_bindings']=\SLS\MassNotify\ApiSecurity::labsBindings($members,$settings);
-            $settings['announcement_groups'][] = $group;
+            $groups=$settings['announcement_groups']??[];$groups[]=$group;
+            \SLS\MassNotify\AudienceLimits::assertGrowth($groups,$settings['announcement_groups']??[]);
+            $settings['announcement_groups']=$groups;
             $this->persistPendingSettings($settings);
             return ['success' => true, 'group_id' => $id, 'state' => $this->locationState($settings),
                 'message' => 'Audience group created in pending configuration. Apply Config, then select it on the Dashboard, in a schedule, or in an incident template. Location edits will not change this group. No announcement was sent.'];

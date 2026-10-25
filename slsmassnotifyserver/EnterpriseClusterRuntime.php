@@ -44,12 +44,19 @@ final class EnterpriseClusterRuntime
     }
     public function config(): array { return $this->config; }
     public function store(): EnterpriseClusterStore { return $this->store; }
-    public function initialize(): void { $this->store->initialize($this->config['spend_limit_cents']); }
+    public function initialize(): void
+    {
+        $this->admit(function(): void { $this->store->initialize($this->config['spend_limit_cents']); });
+    }
     /** Order durable admission against console stop; release before notification callbacks. */
     private function admit(callable $claim,bool $requireRunning=true)
     {
         $check=function(array $settings) use($claim,$requireRunning) {
-            if ($requireRunning) { RuntimeState::requireRunning($settings); }
+            if ($requireRunning) {
+                RuntimeState::requireLabsEnabled($settings);
+                RuntimeState::requireRunning($settings);
+                if (!EnterpriseClusterConfig::enabled($settings)) { throw new \DomainException('Enterprise cluster is disabled.'); }
+            }
             if (EnterpriseClusterConfig::normalize($settings['enterprise_cluster']??[])!==$this->config) {
                 throw new \DomainException('Enterprise cluster settings changed. Reload the worker before admitting further effects.');
             }

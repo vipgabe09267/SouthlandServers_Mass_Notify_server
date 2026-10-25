@@ -11,8 +11,10 @@ smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd
 smtp_sasl_security_options = noanonymous
 smtp_tls_security_level = secure
 smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt</pre>
-    <p><?php echo _('Create the credential file with private permissions before opening it in nano. Add one line: [smtp.provider.example]:587 username:password. Replace the example values with your provider’s settings. Then load it with a private umask:'); ?></p>
-    <pre>sudo install -o root -g root -m 600 /dev/null /etc/postfix/sasl_passwd
+    <p><?php echo _('Create the credential file if it is missing, then protect it before opening nano. Preserve existing relay entries. Add or update your relay line: [smtp.provider.example]:587 username:password. Replace the example values with your provider’s settings, then load the map with a private umask:'); ?></p>
+    <pre>sudo sh -c 'umask 077; touch /etc/postfix/sasl_passwd'
+sudo chown root:root /etc/postfix/sasl_passwd
+sudo chmod 600 /etc/postfix/sasl_passwd
 sudo nano /etc/postfix/sasl_passwd
 sudo sh -c 'umask 077; postmap /etc/postfix/sasl_passwd'
 sudo chmod 600 /etc/postfix/sasl_passwd.db

@@ -304,6 +304,26 @@ catch(DomainException $error){check(str_contains($error->getMessage(),'hourly li
 check($store->read('subscriber_tokens')===$invitationHistory,'Rejected hourly invitation changed prior token evidence');
 $afterHour=$subscriber->issue($settings,$person['id'],$incident['id'],$now+3602);
 check(is_string($afterHour['token'])&&count($store->read('subscriber_tokens'))===1,'Completed invitation window did not admit one new token');
+// Pre-enrollment is not an incident invitation and cannot submit a human response.
+require_once dirname(__DIR__).'/slsmassnotifyserver/BrowserPush.php';
+$pre=$settings;$prePerson=$person;$prePerson['id']='sub_'.str_repeat('e',24);$prePerson['person_id']='pre-enrolled';
+$prePerson['version']=str_repeat('e',64);$prePerson['registered_at']=$now-10;$pre['subscriber_browser']['people'][]=$prePerson;
+$preKey=\SLS\MassNotify\BrowserPush::generateKey();
+$pre['subscriber_browser']['push']=['enabled'=>true,'private_key_pem'=>$preKey['private_key_pem'],'subject'=>'mailto:fixture@example.test'];
+$invitation=$subscriber->issue($pre,$prePerson['id'],'',$now);$subscriber->delivery($invitation['token_hash'],'accepted');
+$enrolled=$subscriber->verify($pre,$invitation['token'],$now);
+check($subscriber->current($pre,$enrolled,$now)['state']==='preferences','Pre-enrollment required an incident.');
+reject(fn()=>$subscriber->respond($pre,$enrolled,['request_id'=>str_repeat('9',32),'response'=>'safe'],$now),'Pre-enrollment gained incident response authority.');
+$subscription=['endpoint'=>'https://fcm.googleapis.com/fcm/send/pre-enrollment-fixture',
+    'keys'=>['p256dh'=>$preKey['public_key'],'auth'=>\SLS\MassNotify\BrowserPush::encode(random_bytes(16))]];
+$endpoint=$subscriber->enrollPush($pre,$enrolled,$subscription,$now)['endpoint_id'];
+check($subscriber->pushTargets($pre,$prePerson['id'])===[$endpoint]&&count($subscriber->browserPreferences($pre,$enrolled,$now))===1,'Verified browser enrollment or preferences missing.');
+$subscriber->removeAllPush($pre,$enrolled,$now);check($subscriber->pushTargets($pre,$prePerson['id'])===[],'Unsubscribe did not revoke delivery targets.');
+$subscriber->enrollPush($pre,$enrolled,$subscription,$now);check(count($subscriber->pushTargets($pre,$prePerson['id']))===1,'Explicit browser reconsent failed.');
+$different=$pre;$different['subscriber_browser']['people'][array_key_last($different['subscriber_browser']['people'])]['version']=str_repeat('f',64);
+reject(fn()=>$subscriber->current($different,$enrolled,$now),'Changed subscriber identity retained pre-enrollment access.');
+reject(fn()=>$subscriber->current($pre,$enrolled,$now+901),'Pre-enrollment proof did not expire.');
+reject(fn()=>$subscriber->removePush($pre,$bound,$endpoint,$now),'Another subscriber removed a browser.');
 identityRestoreGlobals($originalPost,$originalServer);$globalsRestored=true;
 if(!defined('SLS_IDENTITY_FIXTURE_RETAIN')||SLS_IDENTITY_FIXTURE_RETAIN!==true){identityCleanup($root,true);$cleanupComplete=true;}
 echo "Enterprise identity: five synthetic OIDC providers, signed SAML/attack fixtures, directory snapshots, subscriber ownership and protected-ledger failures passed.\n";

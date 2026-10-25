@@ -13,7 +13,7 @@ The **Recipients** tab combines external calls and SMS in **Phone and SMS contac
 1. Select a saved location and choose whether to include its child locations.
 2. Select the recipient types to include. Channel delivery behavior still follows the eventual announcement, schedule, or incident settings.
 3. Choose **Review audience**. Inspect every recipient and any unavailable assignments. A group cannot be created while an included recipient is unavailable.
-4. Enter a distinct audience group name and choose **Create group**. This uses one of the existing 20 announcement-group slots.
+4. Enter a distinct audience group name and choose **Create group**. Up to 200 saved audiences are supported.
 5. Apply Config. Select the group on the Dashboard, in Scheduling, or in an incident template.
 
 A location group is a saved snapshot. Later location edits, moves, and removal do not change its membership. To use a revised audience, create another reviewed group and explicitly choose it for future announcements or schedules. The ordinary Dashboard group editor cannot silently detach a location snapshot. Deleting an unused snapshot uses the existing group-deletion safeguards.
@@ -21,6 +21,12 @@ A location group is a saved snapshot. Later location edits, moves, and removal d
 A snapshot preserves desktop username/client-ID pairs. If a desktop is renamed, disabled, removed, or replaced, the group cannot enter a new announcement or incident delivery; its group-scoped API permission also stops granting that audience. Create a new reviewed group after correcting the directory. Already submitted jobs retain their own immutable audiences and authorization checks.
 
 External voice, email and SMS assignments use saved recipient IDs. Their current channel configuration is validated when used, and the address, route, consent and provider identity are frozen by the existing submission workflow. A directory assignment is not recipient consent and cannot enable a disabled channel.
+
+## People and saved audiences
+
+The audience list supports name search and shows 25 matches at a time. **Show more audiences** adds the next page. Its configuration budget includes all saved central settings, not only audience memberships. Unsaved edits are excluded; saving rechecks the total encoded size before writing.
+
+For one person's devices, enable **Person profile · Labs**, select a directory identity or a manual profile, and confirm device ownership before saving. A language preference does not translate messages. Imported phone numbers remain suggestions until added as approved channel recipients; SMS consent is separate. Deactivating a linked directory person stops that audience from authorizing new delivery until reviewed. Changes require Apply Config.
 
 ## Geographic audiences
 

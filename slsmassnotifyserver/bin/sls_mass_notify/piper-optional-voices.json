@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "voices": [
+    {
+      "id": "es_MX-ald-medium",
+      "label": "Spanish (Mexico) \u00b7 Ald \u00b7 medium",
+      "locale": "es_MX",
+      "license": "Unlicense",
+      "model_card_url": "https://huggingface.co/rhasspy/piper-voices/resolve/e21c7de8d4eab79b902f0d61e662b3f21664b8d2/es/es_MX/ald/medium/MODEL_CARD",
+      "files": {
+        "es_MX-ald-medium.onnx.json": {
+          "sha256": "5a71498158e04afc8099bfd019c7e87c68eb9d042505a2b1a87e5c1ac2b1a61d",
+          "size": 4878,
+          "url": "https://huggingface.co/rhasspy/piper-voices/resolve/e21c7de8d4eab79b902f0d61e662b3f21664b8d2/es/es_MX/ald/medium/es_MX-ald-medium.onnx.json"
+        },
+        "es_MX-ald-medium.onnx": {
+          "url": "https://huggingface.co/rhasspy/piper-voices/resolve/e21c7de8d4eab79b902f0d61e662b3f21664b8d2/es/es_MX/ald/medium/es_MX-ald-medium.onnx",
+          "size": 63201294,
+          "sha256": "019b3803293c93e34a206dd2e53a3889209a514e786fd7144f7b70196c579b63"
+        }
+      }
+    },
+    {
+      "id": "en_GB-cori-high",
+      "label": "English (UK) \u00b7 Cori \u00b7 high",
+      "locale": "en_GB",
+      "license": "LicenseRef-Public-Domain",
+      "model_card_url": "https://huggingface.co/rhasspy/piper-voices/resolve/e21c7de8d4eab79b902f0d61e662b3f21664b8d2/en/en_GB/cori/high/MODEL_CARD",
+      "files": {
+        "en_GB-cori-high.onnx.json": {
+          "url": "https://huggingface.co/rhasspy/piper-voices/resolve/e21c7de8d4eab79b902f0d61e662b3f21664b8d2/en/en_GB/cori/high/en_GB-cori-high.onnx.json",
+          "size": 4963,
+          "sha256": "9e7fb5b5671612c22f3c81cbe46c1ae87b031a4632bcb509e499dad6f1e2adec"
+        },
+        "en_GB-cori-high.onnx": {
+          "url": "https://huggingface.co/rhasspy/piper-voices/resolve/e21c7de8d4eab79b902f0d61e662b3f21664b8d2/en/en_GB/cori/high/en_GB-cori-high.onnx",
+          "size": 114219352,
+          "sha256": "470b4dd634c98f8a4850d7626ffc3dfc90774628eeef6605a6dd8f88f30a5903"
+        }
+      }
+    }
+  ]
+}

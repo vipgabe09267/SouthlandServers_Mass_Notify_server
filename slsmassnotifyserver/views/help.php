@@ -30,6 +30,11 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 .sls-help-scroll-table table {
 	margin-bottom: 0;
 }
+.sls-help-checks { min-width:620px; }
+.sls-help-checks th:nth-child(2), .sls-help-checks td:nth-child(2) { min-width:76px; white-space:nowrap; overflow-wrap:normal; }
+.sls-phone-contact { display:block; min-height:32px; padding:5px 0; }
+.sls-phone-contact sub { margin-left:3px; font-size:10px; }
+.sls-phone-contact + .sls-phone-contact { border-top:1px solid #e8edf2; }
 .sls-help-scroll-table td,
 .sls-help-scroll-table th {
 	vertical-align: middle !important;
@@ -97,7 +102,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 		<li><?php echo _('The module is designed to keep deployment settings outside module code in a centralized .config file so updates do not overwrite local configuration.'); ?></li>
 		<li><?php echo _('Custom/local FreePBX module signatures normally show as Unknown. Altered means installed files differ from the signed inventory. Review the differences and run verified repair before signing; signing alone does not validate changed files.'); ?></li>
 		<li><?php echo _('General Settings shows the installed package version and whether the known release status is LATEST or an update is available.'); ?></li>
-		<li><?php echo _('Version 0.1.7-beta adds crash recovery, enrollment-bound desktop delivery, collector performance improvements and lightning coverage checks. See the changelog for the full list of changes.'); ?></li>
+		<li><?php echo _('Version 0.1.8-beta adds delivery review, larger audiences, calendar editing, optional radio gateways and operator passkeys. See the changelog for changes and qualification limits.'); ?></li>
 		<li><?php echo _('Device capacity checks, shared phone admission and call evidence apply across notification services. External voice remains experimental with restricted routing support. New integrations carry the Labs badge and require site acceptance.'); ?></li>
 		<li><?php echo _('Local signing now uses the web account, module root, and GPG home reported by FreePBX. Install, update, repair, and uninstall share a maintenance lock; each candidate signature must return trusted status 129 before it replaces the previous module.sig.'); ?></li>
 		<li><?php echo _('After a Dashboard or Framework upgrade, Repair Installation restores the managed announcement widget and menu placement, rebuilds the stored Dashboard hook index, and verifies that the announcement controls render. Framework 17.0.30 and earlier Framework 17 menu comparator forms are supported.'); ?></li>
@@ -113,12 +118,14 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 	<p><?php echo _('General Settings can save up to ten local channel-check profiles. Choose explicit phones and desktops, then audio-only, visual-only, or both. Save and apply the profile before running it. These checks use announcement settings and cooldown; they do not send email/webhooks or query Xweather.'); ?></p>
 	<p><?php echo _('Paging answer timeout is one through five seconds, default five. It limits unanswered invitations, not visual-message expiry or audio length. Phones still need auto-answer enabled.'); ?></p>
 	<p><?php echo _('Weather observations run separately from delivery. Queued alerts are checked for current routing, expiry, cancellation, and fresh observations before submission. Interrupted or uncertain deliveries are not automatically repeated. For general announcements, retry is available only for confirmed failed destinations; inspect the channel results first.'); ?></p>
+	<p><?php echo _('Storage and Postfix reports refresh through protected maintenance every minute. A missing or stale report includes the relevant log path. Fault detection shows current conditions; older delivery faults remain in notification history. System fault email is opt-in and the same condition is suppressed for at least 24 hours, including brief recovery gaps.'); ?></p>
+	<p><?php echo _('Each numbered phone contact keeps its own format, transport and User-Agent together. Mixed phone brands on one extension use their respective display format. Desktop clients below the default 1.0.13-beta minimum, or without a fresh version report, show Update required; delivery remains allowed.'); ?></p>
 	<div class="sls-help-diagnostics">
 		<div class="panel panel-default">
 			<div class="panel-heading"><h4><?php echo _('System Checks'); ?></h4></div>
 			<div class="panel-body">
 				<div class="sls-help-scroll-table">
-					<table class="table table-condensed table-striped">
+					<table class="table table-condensed table-striped sls-help-checks">
 						<thead><tr><th><?php echo _('Check'); ?></th><th><?php echo _('State'); ?></th><th><?php echo _('Detail'); ?></th></tr></thead>
 						<tbody>
 							<?php foreach ((array)($diagnostics['checks'] ?? []) as $check) { ?>
@@ -161,10 +168,11 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 									<tr>
 										<td><?php echo htmlspecialchars(($client['name'] ?? '') . ' (' . ($client['client_id'] ?? '') . ')'); ?></td>
 										<td>
-											<?php $readinessLabels = ['not_reported'=>_('Not reported'), 'stale_report'=>_('Report older than 24 hours'), 'protocol_not_reported'=>_('Protocol version not reported'), 'unsupported_protocol'=>_('Unsupported protocol reported'), 'upgrade_required'=>_('Upgrade required'), 'meets_minimum'=>_('Meets minimum version'), 'no_minimum'=>_('No minimum version set')];
+											<?php $readinessLabels = ['not_reported'=>_('Not reported'), 'stale_report'=>_('Report older than 24 hours'), 'protocol_not_reported'=>_('Protocol version not reported'), 'unsupported_protocol'=>_('Unsupported protocol reported'), 'invalid_version'=>_('Invalid version reported'), 'upgrade_required'=>_('Upgrade required'), 'meets_minimum'=>_('Meets minimum version'), 'no_minimum'=>_('No minimum version set')];
 											$readiness = $client['compatibility'] ?? 'not_reported'; ?>
 											<strong><?php echo htmlspecialchars(($client['client_version'] ?? '') ?: _('Unknown version')); ?></strong><br>
-											<span class="<?php echo in_array($readiness, ['upgrade_required', 'protocol_not_reported', 'unsupported_protocol'], true) ? 'text-warning' : 'text-muted'; ?>"><?php echo htmlspecialchars($readinessLabels[$readiness] ?? _('Not reported')); ?></span>
+											<?php if (!empty($client['upgrade_required'])) { ?><span class="text-danger"><i class="fa fa-arrow-circle-up" aria-hidden="true"></i> <?php echo _('Update required'); ?></span><br><?php } ?>
+											<span class="<?php echo in_array($readiness, ['upgrade_required', 'protocol_not_reported', 'unsupported_protocol', 'invalid_version'], true) ? 'text-warning' : 'text-muted'; ?>"><?php echo htmlspecialchars($readinessLabels[$readiness] ?? _('Not reported')); ?></span>
 										</td>
 										<td><?php echo htmlspecialchars(($client['last_seen_at'] ?? '') ?: _('Never')); ?> <?php echo !empty($client['last_seen_ip']) ? htmlspecialchars(' from ' . $client['last_seen_ip']) : ''; ?></td>
 										<td>
@@ -223,6 +231,7 @@ $controlApiAudit = array_values((array)($diagnostics['control_api_audit'] ?? [])
 	</div></details>
 
 	<details class="sls-help-section"><summary><?php echo _('Locations and Audiences'); ?> <?php include __DIR__ . '/labs.php'; ?></summary><div class="sls-help-section-body">
+<h3><i class="fa fa-map-marker" aria-hidden="true"></i> <?php echo _('Sites and weather routes'); ?></h3><p><?php echo _('Sites store devices, optional Weather.gov coverage and map coordinates. Weather and Lightning route editors can explicitly copy a location or saved audience, including SMS and external calls. Review and save the copied selections; later directory edits do not alter existing routes or queued alerts. Live-only source validation, recipient identity checks, quiet hours and expiry apply before channel submission. Manual weather tests use only selected internal phones and desktops.'); ?></p><p><?php echo _('The setup wizard selects the system timezone. An explicit change is applied by protected maintenance; review schedules after changing it. Capacity controls reject unsupported increases. Desktop enrollment stops at the saved device limit; phone destinations queue in batches and receive explicit timeout or failure records.'); ?></p>
 	<p><?php echo _('Build a site, building, floor and room directory, then assign existing phones, desktops and saved external recipients. Review a location and optional children before creating an audience group. Apply Config, then select that group on the Dashboard, in a schedule or in an incident template. These groups are snapshots: later location edits do not change them. Removed or replaced desktops require a new reviewed audience. An empty directory presents a Default site. Locations also manages saved external phone, email and SMS recipients and person/device audiences. Use the group or individual-device picker on announcements, Weather, Lightning and schedules; it shows unsupported producer channels explicitly. The directory stores configured locations and does not track devices. Operator Access assigns permissions separately.'); ?></p>
 	</div></details>
 
@@ -486,5 +495,3 @@ python3 -B -c "import ast,pathlib; ast.parse(pathlib.Path('/usr/local/bin/sls_ma
 		<p><?php echo _('Credits: Southland Servers Group, FreePBX/Asterisk, National Weather Service API, Piper TTS, and supported SIP phone vendors.'); ?></p>
 	</div></details>
 	</div>
-
-<div class="well"><h3><i class="fa fa-map-marker" aria-hidden="true"></i> <?php echo _('Sites and weather routes'); ?></h3><p><?php echo _('Sites store devices, optional Weather.gov coverage and map coordinates. Weather and Lightning route editors can explicitly copy a location or saved audience, including SMS and external calls. Review and save the copied selections; later directory edits do not alter existing routes or queued alerts. Live-only source validation, recipient identity checks, quiet hours and expiry apply before channel submission. Manual weather tests use only selected internal phones and desktops.'); ?></p><p><?php echo _('The setup wizard selects the system timezone. An explicit change is applied by protected maintenance; review schedules after changing it. Capacity controls reject unsupported increases. Desktop enrollment stops at the saved device limit; phone destinations queue in batches and receive explicit timeout or failure records.'); ?></p></div>

@@ -106,17 +106,17 @@
       "version": "7.36.2"
     },
     {
-      "bom-ref": "pkg:pypi/setuptools@84.0.0",
+      "bom-ref": "pkg:pypi/setuptools@84.2.1",
       "name": "setuptools",
       "properties": [
         {
           "name": "sls:required-version",
-          "value": "84.0.0"
+          "value": "84.2.1"
         }
       ],
-      "purl": "pkg:pypi/setuptools@84.0.0",
+      "purl": "pkg:pypi/setuptools@84.2.1",
       "type": "library",
-      "version": "84.0.0"
+      "version": "84.2.1"
     },
     {
       "bom-ref": "pkg:pypi/wheel@0.48.0",
@@ -558,6 +558,10 @@
         {
           "name": "sls:patched-files-sha256",
           "value": "{\"src/RFC4648.php\":\"56dae1fc2a4694c630f0708c7b195d6406f1aaacc04f89c56959c45cb4ad8f48\"}"
+        },
+        {
+          "name": "sls:also-used-by",
+          "value": "isolated-passkey-worker"
         }
       ],
       "purl": "pkg:composer/paragonie/constant_time_encoding@v3.1.3",
@@ -827,6 +831,936 @@
       "purl": "pkg:composer/symfony/polyfill-php82@v1.43.0",
       "type": "library",
       "version": "v1.43.0"
+    },
+    {
+      "bom-ref": "pkg:composer/brick/math@1.0.0",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/brick/math.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "brick/math",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "2effe05d2177c451b86c6a073196a4034c02f211"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/brick/math@1.0.0",
+      "type": "library",
+      "version": "1.0.0"
+    },
+    {
+      "bom-ref": "pkg:composer/doctrine/deprecations@1.1.6",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/doctrine/deprecations.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "doctrine/deprecations",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "d4fe3e6fd9bb9e72557a19674f44d8ac7db4c6ca"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/doctrine/deprecations@1.1.6",
+      "type": "library",
+      "version": "1.1.6"
+    },
+    {
+      "bom-ref": "pkg:composer/phpdocumentor/reflection-common@2.2.1",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/phpDocumentor/ReflectionCommon.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "phpdocumentor/reflection-common",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "ee15a5a2022c8383906b225055e9496a6a5e6e3b"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/phpdocumentor/reflection-common@2.2.1",
+      "type": "library",
+      "version": "2.2.1"
+    },
+    {
+      "bom-ref": "pkg:composer/phpdocumentor/reflection-docblock@6.0.3",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/phpDocumentor/ReflectionDocBlock.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "phpdocumentor/reflection-docblock",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "7bae67520aa9f5ecc506d646810bd40d9da54582"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/phpdocumentor/reflection-docblock@6.0.3",
+      "type": "library",
+      "version": "6.0.3"
+    },
+    {
+      "bom-ref": "pkg:composer/phpdocumentor/type-resolver@2.1.0",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/phpDocumentor/TypeResolver.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "phpdocumentor/type-resolver",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "dbe2133bb23e2e33a6834f4ed417f24a1b167769"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/phpdocumentor/type-resolver@2.1.0",
+      "type": "library",
+      "version": "2.1.0"
+    },
+    {
+      "bom-ref": "pkg:composer/phpstan/phpdoc-parser@2.3.6",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/phpstan/phpdoc-parser.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "phpstan/phpdoc-parser",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "1427af4647235b4a73b13940b1f1258d3584f36e"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/phpstan/phpdoc-parser@2.3.6",
+      "type": "library",
+      "version": "2.3.6"
+    },
+    {
+      "bom-ref": "pkg:composer/psr/clock@1.0.0",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/php-fig/clock.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "psr/clock",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "e41a24703d4560fd0acb709162f73b8adfc3aa0d"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/psr/clock@1.0.0",
+      "type": "library",
+      "version": "1.0.0"
+    },
+    {
+      "bom-ref": "pkg:composer/psr/container@2.0.2",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/php-fig/container.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "psr/container",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "c71ecc56dfe541dbd90c5360474fbc405f8d5963"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/psr/container@2.0.2",
+      "type": "library",
+      "version": "2.0.2"
+    },
+    {
+      "bom-ref": "pkg:composer/psr/event-dispatcher@1.0.0",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/php-fig/event-dispatcher.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "psr/event-dispatcher",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "dbefd12671e8a14ec7f180cab83036ed26714bb0"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/psr/event-dispatcher@1.0.0",
+      "type": "library",
+      "version": "1.0.0"
+    },
+    {
+      "bom-ref": "pkg:composer/psr/log@3.0.2",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/php-fig/log.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "psr/log",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "f16e1d5863e37f8d8c2a01719f5b34baa2b714d3"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/psr/log@3.0.2",
+      "type": "library",
+      "version": "3.0.2"
+    },
+    {
+      "bom-ref": "pkg:composer/spomky-labs/cbor-php@3.4.2",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Spomky-Labs/cbor-php.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "spomky-labs/cbor-php",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "8f5ea00a07ad529d20886505cdbeb2b9ac7bb2d6"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/spomky-labs/cbor-php@3.4.2",
+      "type": "library",
+      "version": "3.4.2"
+    },
+    {
+      "bom-ref": "pkg:composer/spomky-labs/pki-framework@1.6.3",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Spomky-Labs/pki-framework.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "spomky-labs/pki-framework",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "792e909d4e387adffe3c4f404451c7d57a3d2022"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/spomky-labs/pki-framework@1.6.3",
+      "type": "library",
+      "version": "1.6.3"
+    },
+    {
+      "bom-ref": "pkg:composer/symfony/clock@v7.4.21",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/symfony/clock.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "symfony/clock",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "07437f612dca89c1894c1db04491002b1e798f03"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/symfony/clock@v7.4.21",
+      "type": "library",
+      "version": "v7.4.21"
+    },
+    {
+      "bom-ref": "pkg:composer/symfony/deprecation-contracts@v3.7.1",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/symfony/deprecation-contracts.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "symfony/deprecation-contracts",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "f3202fa1b5097b0af062dc978b32ecf63404e31d"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/symfony/deprecation-contracts@v3.7.1",
+      "type": "library",
+      "version": "v3.7.1"
+    },
+    {
+      "bom-ref": "pkg:composer/symfony/polyfill-ctype@v1.37.0",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/symfony/polyfill-ctype.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "symfony/polyfill-ctype",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "141046a8f9477948ff284fa65be2095baafb94f2"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/symfony/polyfill-ctype@v1.37.0",
+      "type": "library",
+      "version": "v1.37.0"
+    },
+    {
+      "bom-ref": "pkg:composer/symfony/polyfill-intl-grapheme@v1.43.0",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/symfony/polyfill-intl-grapheme.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "symfony/polyfill-intl-grapheme",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "5cac8f4db97208823aa353f59a01faad2da52c75"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/symfony/polyfill-intl-grapheme@v1.43.0",
+      "type": "library",
+      "version": "v1.43.0"
+    },
+    {
+      "bom-ref": "pkg:composer/symfony/polyfill-intl-normalizer@v1.43.0",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/symfony/polyfill-intl-normalizer.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "symfony/polyfill-intl-normalizer",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "ebd57ccc7edb93d632e184efbe7693d2517bab3b"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/symfony/polyfill-intl-normalizer@v1.43.0",
+      "type": "library",
+      "version": "v1.43.0"
+    },
+    {
+      "bom-ref": "pkg:composer/symfony/polyfill-mbstring@v1.43.0",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/symfony/polyfill-mbstring.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "symfony/polyfill-mbstring",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "4d5d331bf731e0aedbc6b2f5e61135b7b7996a72"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/symfony/polyfill-mbstring@v1.43.0",
+      "type": "library",
+      "version": "v1.43.0"
+    },
+    {
+      "bom-ref": "pkg:composer/symfony/polyfill-php81@v1.38.1",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/symfony/polyfill-php81.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "symfony/polyfill-php81",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "6bfb9c766cacffbc8e118cb87217d08ed84e5cd7"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/symfony/polyfill-php81@v1.38.1",
+      "type": "library",
+      "version": "v1.38.1"
+    },
+    {
+      "bom-ref": "pkg:composer/symfony/polyfill-php83@v1.43.0",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/symfony/polyfill-php83.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "symfony/polyfill-php83",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "80ccff923a8d61f73ebe9da0aa94e25232f004ce"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/symfony/polyfill-php83@v1.43.0",
+      "type": "library",
+      "version": "v1.43.0"
+    },
+    {
+      "bom-ref": "pkg:composer/symfony/polyfill-php84@v1.43.0",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/symfony/polyfill-php84.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "symfony/polyfill-php84",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "22c6548499cbe5c5bb072fc0c42312dff062a015"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/symfony/polyfill-php84@v1.43.0",
+      "type": "library",
+      "version": "v1.43.0"
+    },
+    {
+      "bom-ref": "pkg:composer/symfony/polyfill-uuid@v1.43.0",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/symfony/polyfill-uuid.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "symfony/polyfill-uuid",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "b23ff8245cc5c4479ea2be3d0132d2e6dd433993"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/symfony/polyfill-uuid@v1.43.0",
+      "type": "library",
+      "version": "v1.43.0"
+    },
+    {
+      "bom-ref": "pkg:composer/symfony/property-access@v7.4.16",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/symfony/property-access.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "symfony/property-access",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "c3dce76a6697c6428f7d80d5cd1cf0aa5d9679f3"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/symfony/property-access@v7.4.16",
+      "type": "library",
+      "version": "v7.4.16"
+    },
+    {
+      "bom-ref": "pkg:composer/symfony/property-info@v7.4.20",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/symfony/property-info.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "symfony/property-info",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "d24c4c810b1285c5d8d77c6fd7b25e714479bd48"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/symfony/property-info@v7.4.20",
+      "type": "library",
+      "version": "v7.4.20"
+    },
+    {
+      "bom-ref": "pkg:composer/symfony/serializer@v7.4.21",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/symfony/serializer.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "symfony/serializer",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "2966bc53636dde874e63f8727da3aa306f479f4d"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/symfony/serializer@v7.4.21",
+      "type": "library",
+      "version": "v7.4.21"
+    },
+    {
+      "bom-ref": "pkg:composer/symfony/string@v7.4.21",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/symfony/string.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "symfony/string",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "9bc35d074ad16a58c21cd52b18c5cacc4f4c3981"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/symfony/string@v7.4.21",
+      "type": "library",
+      "version": "v7.4.21"
+    },
+    {
+      "bom-ref": "pkg:composer/symfony/type-info@v7.4.20",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/symfony/type-info.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "symfony/type-info",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "bbaaf3366400f5c85f66800b955c77b46e8abad2"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/symfony/type-info@v7.4.20",
+      "type": "library",
+      "version": "v7.4.20"
+    },
+    {
+      "bom-ref": "pkg:composer/symfony/uid@v7.4.21",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/symfony/uid.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "symfony/uid",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "3e706a245b5343ea93be9cafe84525bfb54e60fc"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/symfony/uid@v7.4.21",
+      "type": "library",
+      "version": "v7.4.21"
+    },
+    {
+      "bom-ref": "pkg:composer/web-auth/cose-lib@4.8.2",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/web-auth/cose-lib.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "web-auth/cose-lib",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "8849e8bf043a2d42d0bec5bda5db2469ad376148"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/web-auth/cose-lib@4.8.2",
+      "type": "library",
+      "version": "4.8.2"
+    },
+    {
+      "bom-ref": "pkg:composer/web-auth/webauthn-lib@5.3.9",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/web-auth/webauthn-lib.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "web-auth/webauthn-lib",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "727e378fb7a36c26be5c911e4a0120c146741ce7"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/web-auth/webauthn-lib@5.3.9",
+      "type": "library",
+      "version": "5.3.9"
+    },
+    {
+      "bom-ref": "pkg:composer/webmozart/assert@2.5.0",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/webmozarts/assert.git"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "webmozart/assert",
+      "properties": [
+        {
+          "name": "sls:source-revision",
+          "value": "8a163706bbcac613733dba03f51e13b5eb1bb819"
+        },
+        {
+          "name": "sls:execution-boundary",
+          "value": "isolated-passkey-worker"
+        }
+      ],
+      "purl": "pkg:composer/webmozart/assert@2.5.0",
+      "type": "library",
+      "version": "2.5.0"
     }
   ],
   "dependencies": [
@@ -850,7 +1784,7 @@
       ],
       "name": "slsmassnotifyserver",
       "type": "application",
-      "version": "0.1.7-beta"
+      "version": "0.1.8-beta"
     },
     "properties": [
       {
@@ -859,19 +1793,23 @@
       },
       {
         "name": "sls:requirements-sha256",
-        "value": "d4c29990080bb365d59bcd62e51d2223524c339c9944c74ddeb5bc7c96a5d574"
+        "value": "eb00461ddf3b4e1e6e43cf46e769504ebfc1730cd5ce4034a7368e3392be64b0"
       },
       {
         "name": "sls:composer-vendor-baseline-sha256",
         "value": "356e0e54bf08555a28e54a749dbaf93471e226a23c0b22ed95540a3e350647bf"
       },
       {
+        "name": "sls:passkey-vendor-baseline-sha256",
+        "value": "9b5a0afdde334687be3ceaace695cf48a71db45ea10c4569e52d5251bb772663"
+      },
+      {
         "name": "sls:scope",
-        "value": "Piper Python environment, PHP callback validator, locked PHP identity libraries and bundled dashboard chart library; OS packages, FreePBX modules and voice models are separate inventories."
+        "value": "Piper Python environment, PHP callback validator, locked PHP identity/passkey libraries and bundled dashboard chart library; OS packages, FreePBX modules and voice models are separate inventories."
       }
     ]
   },
-  "serialNumber": "urn:uuid:339515eb-9a48-57d0-889c-935def53d2f4",
+  "serialNumber": "urn:uuid:99cf9f4b-58b2-5ae0-893d-ddf8890c170e",
   "specVersion": "1.6",
   "version": 1
 }

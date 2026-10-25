@@ -134,8 +134,11 @@ def run_case(
         keyring.write_text(json.dumps(ring, separators=(',', ':')) + '\n', encoding='ascii')
         keyring.chmod(0o640)
         config = scratch / "mass-notifications.config"
+        policy = {'runtime_enabled': runtime_enabled, 'enterprise_cluster': cluster or {'enabled': False}}
+        if cluster and cluster.get('enabled') in (True, '1'):
+            policy['enterprise_labs'] = {'enabled': True}
         config.write_bytes(CRYPTO.encode_with_keyring(
-            {'runtime_enabled': runtime_enabled, 'enterprise_cluster': cluster or {'enabled': False}},
+            policy,
             ring,
         ))
         config.chmod(0o640)
@@ -168,6 +171,8 @@ if os.environ.get("CLUSTER_AFTER_TTS"):
     import sls_config_crypto
     settings = sls_config_crypto.read_config(config, allow_legacy=False)
     settings['enterprise_cluster'] = json.loads(os.environ['CLUSTER_AFTER_TTS'])
+    if settings['enterprise_cluster'].get('enabled') in (True, '1'):
+        settings['enterprise_labs'] = {'enabled': True}
     config.write_bytes(sls_config_crypto.encode_config(settings))
 """,
         )

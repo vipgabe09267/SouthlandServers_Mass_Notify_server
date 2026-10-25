@@ -7,10 +7,35 @@
   let config = structuredClone(state.config);
   let reviewedWarning = null;
   let inflight = false;
+  let settingsDirty = false;
+  const markSettingsDirty = () => {
+    settingsDirty = true;
+    window.SlsSaveState?.set(document.getElementById('sls-enterprise'), 'unsaved');
+  };
+  const meetingProviders = {zoom:"Zoom",google_meet:"Google Meet",webex:"Webex"};
+  const tokenField = provider => provider === "google_meet" ? "google_access_token" : provider + "_access_token";
   const requestId = () => { const bytes = new Uint8Array(16); crypto.getRandomValues(bytes); return [...bytes].map(value => value.toString(16).padStart(2, '0')).join(''); };
   const operationIds = { meeting: requestId(), ipaws: requestId() };
   const doorIds = new Map();
+  let expandedRows = new Set();
+  let fieldSequence = 0;
   const status = document.getElementById('sls-integration-status');
+  const categories = {
+    audio: ['speakers', 'radios'],
+    communications: ['meetings', 'mail_evidence', 'browser_display', 'connectors', 'responses'],
+    physical: ['access_control', 'sensors', 'public_warning']
+  };
+  let currentCategory = 'audio';
+  Object.entries(categories).forEach(([category, names]) => names.forEach(name => {
+    root.querySelector(`[data-setting="${name}.enabled"]`).closest('.sls-integration-card').dataset.providerSection = category;
+  }));
+  function showCategory(category) {
+    currentCategory = category;
+    root.querySelectorAll('[data-provider-section]').forEach(card => { card.hidden = category !== 'all' && card.dataset.providerSection !== category; });
+    root.querySelectorAll('[data-provider-category]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.providerCategory === category)));
+  }
+  root.querySelectorAll('[data-provider-category]').forEach(button => button.addEventListener('click', () => showCategory(button.dataset.providerCategory)));
+  showCategory(currentCategory);
   const read = path => path.split('.').reduce((value, key) => value?.[key], config);
   const write = (path, value) => {
     const keys = path.split('.');
@@ -30,15 +55,23 @@
     status.focus();
   };
   const field = (parent, label, value, update, options) => {
-    const wrapper = node('label', label);
-    const input = options?.choices ? node('select') : node('input');
+    const wrapper = node('div', undefined, 'sls-integration-field');
+    const caption = node('label',label);
+    if (options?.help) {
+      const tip = node('span', undefined, 'sls-field-help'); tip.tabIndex = 0; tip.dataset.help = options.help;
+      tip.setAttribute('aria-label', options.help); const icon = node('span', '?'); icon.setAttribute('aria-hidden','true'); tip.append(icon); caption.append(document.createTextNode(' '),tip);
+    }
+    const input = options?.choices ? node('select') : options?.multiline ? node('textarea') : node('input');
     input.className = 'form-control';
+    input.id = 'sls-provider-field-' + (++fieldSequence); caption.htmlFor = input.id;
     if (options?.choices) {
       options.choices.forEach(choice => {
         const option = node('option', choice.name ?? choice.label ?? choice.id);
         option.value = choice.id;
         input.append(option);
       });
+    } else if (options?.multiline) {
+      input.rows = 4; input.spellcheck = false;
     } else {
       input.type = options?.password ? 'password' : options?.number ? 'number' : 'text';
       if (options?.number) { input.min = String(options.min ?? 1); input.max = String(options.max ?? 60); }
@@ -47,11 +80,25 @@
         input.placeholder = 'Blank keeps saved credential';
       }
     }
+    if (options?.choices && value && !options.choices.some(choice => choice.id === value)) {
+      const saved = node('option', `Saved value (review): ${value}`); saved.value = value; input.append(saved);
+    }
     input.value = value ?? '';
+    if (options?.placeholder) input.placeholder = options.placeholder;
+    if (options?.required) input.required = true;
     input.addEventListener('input', () => update(input.value));
-    wrapper.append(input);
+    wrapper.append(caption,input);
     parent.append(wrapper);
     return input;
+  };
+  const tlsEditor = (parent, value, change) => {
+    const details = node('details'), fields = node('div', undefined, 'sls-integration-fields');
+    details.append(node('summary', 'Certificate trust for this integration'), fields);
+    const policy = { ...(value || {}) };
+    field(fields, 'Private CA certificates (PEM, optional)', policy.ca_pem || '', ca => { policy.ca_pem = ca; change(policy); }, { multiline: true });
+    field(fields, 'Public-key pin (sha256//…, optional)', policy.public_key_pin || '', pin => { policy.public_key_pin = pin; change(policy); });
+    details.append(node('p', 'Blank uses the system CA store. Hostname and certificate checks remain required. Trust saved here applies only to this integration.', 'help-block'));
+    parent.append(details);
   };
   const toggle = (parent, label, enabled, update) => {
     const wrapper = node('label');
@@ -64,11 +111,13 @@
     parent.append(wrapper);
   };
   const row = (parent, label, remove) => {
-    const result = node('div', undefined, 'sls-integration-row');
-    const heading = node('div', undefined, 'sls-integration-row-heading');
+    const result = node('details', undefined, 'sls-integration-row');
+    result.dataset.profileKey = parent.id + ':' + parent.children.length;
+    result.open = expandedRows.has(result.dataset.profileKey) || label.startsWith('New ');
+    const heading = node('summary', undefined, 'sls-integration-row-heading');
     const button = node('button', 'Remove', 'btn btn-link text-danger');
     button.type = 'button';
-    button.addEventListener('click', remove);
+    button.addEventListener('click', event => { event.preventDefault(); markSettingsDirty(); remove(); });
     heading.append(node('strong', label), button);
     result.append(heading);
     parent.append(result);
@@ -99,17 +148,29 @@
     }
   }
   function renderLists() {
+    expandedRows = new Set([...root.querySelectorAll('.sls-integration-row[open]')].map(entry => entry.dataset.profileKey));
     const speakers = document.getElementById('sls-integration-speakers');
+    const radios=document.getElementById('sls-integration-radios');radios.replaceChildren();
     const doors = document.getElementById('sls-integration-doors');
     const bindings = document.getElementById('sls-integration-bindings');
     const connectors = document.getElementById('sls-integration-connectors');
     speakers.replaceChildren(); doors.replaceChildren(); bindings.replaceChildren(); connectors.replaceChildren();
+    config.radios.devices.forEach((radio,index)=>{
+      const card=row(radios,radio.name||'New radio gateway',()=>{config.radios.devices.splice(index,1);renderLists();});
+      const fields=node('div',undefined,'sls-integration-fields');card.append(fields);
+      field(fields,'Name',radio.name,value=>{radio.name=value;});
+      field(fields,'Existing PJSIP extension',radio.extension,value=>{radio.extension=value;},{choices:[{id:'',name:'Select an extension'},...state.extensions.map(id=>({id,name:id}))]});
+      field(fields,'Gateway model / SIP profile',radio.model,value=>{radio.model=value;},{choices:[{id:'',name:'Select a gateway'},...(state.radio_catalog||[{model:'Generic SIP-to-radio gateway'}]).map(entry=>({id:entry.model,name:entry.model}))],required:true,help:'These devices expose SIP audio interfaces. SLS calls the registered PJSIP extension; the gateway must control auto-answer and PTT. Selecting a model does not configure the radio or certify RF operation.'});
+      field(fields,'Radio channel label',radio.channel_label,value=>{radio.channel_label=value;},{placeholder:'Maintenance — channel 2',help:'A descriptive label for the channel already configured on the gateway. SLS does not change radio frequency or talkgroup.'});
+      field(fields,'Maximum complete audio (seconds)',radio.maximum_audio_seconds,value=>{radio.maximum_audio_seconds=Number(value);},{number:true,min:5,max:120});
+      toggle(card,'Enabled',radio.enabled,value=>{radio.enabled=value?'1':'0';});
+    });
     config.speakers.devices.forEach((speaker, index) => {
       const card = row(speakers, speaker.name || 'New speaker', () => { config.speakers.devices.splice(index, 1); renderLists(); });
       const fields = node('div', undefined, 'sls-integration-fields'); card.append(fields);
       field(fields, 'Name', speaker.name, value => { speaker.name = value; });
-      field(fields, 'Representative brand', speaker.brand, value => { speaker.brand = value; speaker.model = state.catalog[value].model; renderLists(); }, { choices: Object.entries(state.catalog).map(([id, entry]) => ({ id, name: entry.brand })) });
-      field(fields, 'Model', speaker.model, value => { speaker.model = value; });
+      field(fields, 'Brand', speaker.brand, value => { speaker.brand = value; speaker.model = state.catalog[value].model; renderLists(); }, { choices: Object.entries(state.catalog).map(([id, entry]) => ({ id, name: entry.brand })) });
+      field(fields, 'Speaker model', speaker.model, value => { speaker.model = value; }, {choices:(state.catalog[speaker.brand].models||[state.catalog[speaker.brand].model]).map(model=>({id:model,name:model})),help:'Documented SIP-capable models use the existing FreePBX audio path. Register the device, enable auto-answer and verify its firmware and volume before enabling it.'});
       field(fields, 'Installed firmware', speaker.firmware, value => { speaker.firmware = value; });
       field(card, 'Local acceptance notes', speaker.acceptance_notes, value => { speaker.acceptance_notes = value; });
       card.append(node('p', 'Confirm registration, auto-answer, volume and the complete audio sequence on this model and firmware. Offline and busy results must be reviewed in delivery details.', 'help-block'));
@@ -123,15 +184,19 @@
         field(telemetry, 'Pinned private IPv4', speaker.telemetry_ipv4, value => { speaker.telemetry_ipv4 = value; });
         field(telemetry, 'Device user', speaker.telemetry_username, value => { speaker.telemetry_username = value; });
         field(telemetry, 'Device password', '', value => { speaker.telemetry_password = value; }, { password: true });
+        tlsEditor(details, speaker.telemetry_tls, value => { speaker.telemetry_tls = value; });
         const check = node('button', 'Read last report', 'btn btn-default btn-sm'); check.type = 'button';
         check.disabled = !speaker.id || speaker.enabled !== '1' || !speaker.telemetry_origin || config.speakers.enabled !== '1' || config.enabled !== '1';
         check.addEventListener('click', async () => {
+          if (settingsDirty) { feedback('Save integration settings before reading the saved device report.',true); return; }
           check.disabled = true;
           try { const result = await post('integrations_speaker_telemetry', { speaker_id: speaker.id }); feedback(result.detail + ' Device result: ' + (result.report?.SpeakerTestStatus ?? 'unconfirmed')); }
           catch (error) { feedback(error.message, true); } finally { renderLists(); }
         }); details.append(check);
       }
     });
+    const accessTrust = document.getElementById('sls-integration-access-tls');
+    if (accessTrust) { accessTrust.replaceChildren(); tlsEditor(accessTrust, config.access_control.tls, value => { config.access_control.tls = value; }); }
     config.access_control.doors.forEach((door, index) => {
       const card = row(doors, door.name || 'New permitted door', () => { config.access_control.doors.splice(index, 1); renderLists(); });
       const fields = node('div', undefined, 'sls-integration-fields'); card.append(fields);
@@ -144,11 +209,16 @@
       const card = row(connectors, destination.name || 'New connector', () => { config.connectors.destinations.splice(index, 1); renderLists(); });
       const fields = node('div', undefined, 'sls-integration-fields'); card.append(fields);
       field(fields, 'Name', destination.name, value => { destination.name = value; });
-      field(fields, 'Service', destination.provider, value => { destination.provider = value; if (value === 'gotify') destination.topic = ''; renderLists(); }, { choices: [{ id: 'ntfy', name: 'ntfy' }, { id: 'gotify', name: 'Gotify' }] });
+      field(fields, 'Service', destination.provider, value => { destination.provider = value; destination.topic = ''; renderLists(); }, { choices: [{ id: 'ntfy', name: 'ntfy' }, { id: 'gotify', name: 'Gotify' }, { id: 'matrix', name: 'Matrix · Labs' }] });
       field(fields, 'HTTPS origin', destination.origin, value => { destination.origin = value; });
       field(fields, 'Pinned private IPv4', destination.pinned_ipv4, value => { destination.pinned_ipv4 = value; });
       field(fields, 'Scoped token', destination.token ?? '', value => { destination.token = value; }, { password: true });
       if (destination.provider === 'ntfy') field(fields, 'Topic', destination.topic, value => { destination.topic = value; });
+      if (destination.provider === 'matrix') {
+        field(fields, 'Room ID (!room:server)', destination.topic, value => { destination.topic = value; });
+        card.append(node('p', 'Use a dedicated bot already joined to an unencrypted room. Encrypted Matrix rooms are not supported. SLS sends plain text with a stable transaction ID.', 'help-block'));
+      }
+      tlsEditor(card, destination.tls, value => { destination.tls = value; });
       toggle(card, 'Enabled', destination.enabled, value => { destination.enabled = value ? '1' : '0'; });
     });
     config.responses.bindings.forEach((binding, index) => {
@@ -159,13 +229,33 @@
     });
   }
   function render() {
+    const enabled = state.config.enabled === '1';
+    const count = Object.values(categories).flat().filter(name => state.config[name].enabled === '1').length;
+    const badge = root.querySelector('#sls-provider-activation');
+    badge.textContent = enabled ? `${count} integration${count === 1 ? '' : 's'} enabled` : 'Disabled';
+    badge.dataset.enabled = String(enabled && count > 0);
+    root.querySelectorAll('[data-provider-status]').forEach(label => {
+      const on = state.config.enabled === '1' && state.config[label.dataset.providerStatus].enabled === '1';
+      label.textContent = on ? 'On' : 'Off'; label.dataset.enabled = String(on);
+    });
     root.querySelectorAll('[data-setting]').forEach(input => {
       const value = read(input.dataset.setting);
       if (input.type === 'checkbox') input.checked = value === '1' || value === true;
       else input.value = value ?? '';
     });
     renderLists();
-    const expiry = document.getElementById('sls-oauth-expiry'); expiry.value = config.meetings.oauth_expires_at ? localTime(config.meetings.oauth_expires_at) : '';
+    root.querySelectorAll('[data-clear]').forEach(input => { input.checked = false; });
+    root.querySelectorAll('[data-oauth-expiry]').forEach(input => {
+      const profile = config.meetings.oauth_profiles[input.dataset.oauthExpiry];
+      input.value = profile.oauth_expires_at ? localTime(profile.oauth_expires_at) : '';
+    });
+    root.querySelectorAll('[data-meeting-account-status]').forEach(label => {
+      const provider=label.dataset.meetingAccountStatus;
+      const saved=state.config.meetings[tokenField(provider)+'_configured'];
+      const expires=state.config.meetings.oauth_profiles[provider].oauth_expires_at;
+      label.textContent=saved ? (expires && expires<=Date.now()/1000 ? 'Token expired' : 'Token saved') : 'Not configured';
+    });
+    settingsDirty = false;
     const usage = document.getElementById('sls-integration-journal-usage'); usage.replaceChildren();
     Object.entries(state.journal_usage ?? {}).forEach(([name, entry]) => {
       const allocation = entry.bytes ? ` · ${(entry.bytes / 1048576).toFixed(2)} / ${(entry.maximum_bytes / 1048576).toFixed(2)} MiB` : '';
@@ -203,6 +293,8 @@
     write(path, input.type === 'checkbox' ? (typeof read(path) === 'boolean' ? input.checked : input.checked ? '1' : '0') : input.type === 'number' ? Number(input.value) : input.value);
   }));
   root.querySelectorAll('[data-add]').forEach(button => button.addEventListener('click', () => {
+    markSettingsDirty();
+    if(button.dataset.add==='radio')config.radios.devices.push({id:'',name:'',enabled:'0',extension:'',model:'',channel_label:'',maximum_audio_seconds:30});
     if (button.dataset.add === 'speaker') config.speakers.devices.push({ id: '', name: '', enabled: '0', brand: 'algo', model: state.catalog.algo.model, extension: '', telemetry_origin: '', telemetry_ipv4: '', telemetry_username: '', telemetry_password: '' });
     if (button.dataset.add === 'door') config.access_control.doors.push({ id: '', name: '', token: '', allow_read: true, allow_lock: false, allow_unlock: false, allow_access: false, maximum_access_seconds: 10 });
     if (button.dataset.add === 'connector') config.connectors.destinations.push({ id: '', name: '', enabled: '0', provider: 'ntfy', origin: '', pinned_ipv4: '', token: '', topic: '' });
@@ -222,9 +314,20 @@
       const clear = [...root.querySelectorAll('[data-clear]:checked')].map(input => input.dataset.clear);
       const result = await post('integrations_save', { revision: state.revision, config, clear_secrets: clear });
       state = result.state; config = structuredClone(state.config); render(); feedback(result.message ?? 'Integration settings saved.');
+      window.SlsLabsActivation?.('enterprise_integrations',config); window.SlsSaveState?.set(document.getElementById('sls-enterprise'),'saved');
     } catch (error) { feedback(error.message, true); } finally { if (submit) submit.disabled = false; }
   });
+  document.getElementById('sls-integration-form').addEventListener('input', markSettingsDirty);
   function renderOperations() {
+    const providerChoice=document.getElementById('sls-integration-meeting-provider'),previousProvider=providerChoice.value;
+    providerChoice.replaceChildren();
+    const empty=node('option','Select a saved provider account');empty.value='';providerChoice.append(empty);
+    Object.entries(meetingProviders).forEach(([provider,label])=>{
+      if (!state.config.meetings[tokenField(provider)+'_configured']) return;
+      const option=node('option',label);option.value=provider;providerChoice.append(option);
+    });
+    providerChoice.value=previousProvider;
+    if(!providerChoice.value)providerChoice.value='';
     const incident = document.getElementById('sls-integration-meeting-incident');
     const chosen = incident.value; incident.replaceChildren();
     [{ id: '', name: 'Select an open incident' }, ...(state.incidents ?? [])].forEach(entry => {
@@ -236,6 +339,13 @@
       label.append(check, document.createTextNode(`${entry.name} · extension ${entry.extension}`)); speakers.append(label);
     });
     if (!speakers.childNodes.length) speakers.append(node('p', 'Save an enabled speaker before paging.', 'sls-integration-empty'));
+    const radios=document.getElementById('sls-integration-radio-selection');radios.replaceChildren();
+    state.config.radios.devices.filter(entry=>entry.enabled==='1').forEach(entry=>{
+      const label=node('label'),check=node('input');check.type='checkbox';check.value=entry.id;
+      label.append(check,document.createTextNode(`${entry.name} · extension ${entry.extension} · ${entry.maximum_audio_seconds}s maximum`));radios.append(label);
+    });
+    if(!radios.childNodes.length)radios.append(node('p','Save an enabled radio gateway before paging.','sls-integration-empty'));
+
     root.querySelectorAll('[data-operation-section]').forEach(button => { button.disabled = state.config.enabled !== '1' || state.config[button.dataset.operationSection].enabled !== '1'; });
     for (const [containerId, entries] of [['sls-integration-browser-selection', state.browser_people ?? []], ['sls-integration-connector-selection', state.config.connectors.destinations.filter(entry => entry.enabled === '1')]]) {
       const container = document.getElementById(containerId); container.replaceChildren();
@@ -266,10 +376,17 @@
   document.getElementById('sls-integration-meeting').addEventListener('submit', async event => {
     event.preventDefault();
     try {
-      const result = await post('integrations_meeting', { incident_id: document.getElementById('sls-integration-meeting-incident').value, input: { request_id: operationIds.meeting, start_at: Math.floor(new Date(start.value).getTime() / 1000), duration_minutes: Number(document.getElementById('sls-integration-meeting-duration').value) } });
+      const result = await post('integrations_meeting', { incident_id: document.getElementById('sls-integration-meeting-incident').value, input: { provider: document.getElementById('sls-integration-meeting-provider').value, request_id: operationIds.meeting, start_at: Math.floor(new Date(start.value).getTime() / 1000), duration_minutes: Number(document.getElementById('sls-integration-meeting-duration').value) } });
       feedback(result.detail ?? `Meeting operation: ${result.state}`);
       if (result.join_url) { const link = node('a', ' Open meeting'); link.href = result.join_url; link.target = '_blank'; link.rel = 'noopener noreferrer'; status.append(link); }
     } catch (error) { feedback(error.message, true); }
+  });
+  document.getElementById('sls-integration-radio-send').addEventListener('submit',async event=>{
+    event.preventDefault();const button=event.submitter;if(button)button.disabled=true;
+    try{
+      const result=await post('integrations_radio_send',{radio_ids:[...document.querySelectorAll('#sls-integration-radio-selection input:checked')].map(input=>input.value),title:document.getElementById('sls-integration-radio-title').value,message:document.getElementById('sls-integration-radio-message').value,is_test:document.getElementById('sls-integration-radio-test').checked});
+      feedback(result.message??'Radio audio submitted to the PBX queue. Review per-extension delivery evidence.');
+    }catch(error){feedback(error.message,true);}finally{if(button)button.disabled=state.config.enabled!=='1'||state.config.radios.enabled!=='1';}
   });
   document.getElementById('sls-integration-speaker-send').addEventListener('submit', async event => {
     event.preventDefault();
@@ -278,14 +395,19 @@
       feedback(result.message ?? 'Speaker announcement queued. Review its delivery details.');
     } catch (error) { feedback(error.message, true); }
   });
-  document.getElementById('sls-oauth-expiry').addEventListener('input', event => { config.meetings.oauth_expires_at = event.target.value ? Math.floor(new Date(event.target.value).getTime() / 1000) : 0; });
-  for (const [id, action] of [['sls-oauth-refresh', 'integrations_oauth_refresh'], ['sls-oauth-revoke', 'integrations_oauth_revoke']]) {
-    document.getElementById(id).addEventListener('click', async event => {
-      const button = event.currentTarget; button.disabled = true;
-      try { const result = await post(action, {}); feedback(result.message + (result.provider_revocation?.detail ? ' ' + result.provider_revocation.detail : '') + ' Reload this editor before another settings save.'); }
-      catch (error) { feedback(error.message, true); } finally { button.disabled = false; }
-    });
-  }
+  root.querySelectorAll('[data-oauth-expiry]').forEach(input => input.addEventListener('input', event => {
+    config.meetings.oauth_profiles[input.dataset.oauthExpiry].oauth_expires_at = event.target.value ? Math.floor(new Date(event.target.value).getTime()/1000) : 0;
+  }));
+  root.querySelectorAll('[data-oauth-action]').forEach(button => button.addEventListener('click', async () => {
+    if(settingsDirty){feedback('Save integration settings before renewing or removing an account.',true);return;}
+    if(button.dataset.oauthAction==='revoke'&&!window.confirm('Remove the saved '+meetingProviders[button.dataset.provider]+' account and request revocation? Other meeting accounts remain available.'))return;
+    button.disabled=true;
+    try {
+      const result=await post('integrations_oauth_'+button.dataset.oauthAction,{provider:button.dataset.provider});
+      state=result.state;config=structuredClone(state.config);render();
+      feedback(result.message+(result.provider_revocation?.detail?' '+result.provider_revocation.detail:''));
+    }catch(error){feedback(error.message,true);}finally{button.disabled=false;}
+  }));
   document.getElementById('sls-integration-labs-send').addEventListener('submit', async event => {
     event.preventDefault();
     try {

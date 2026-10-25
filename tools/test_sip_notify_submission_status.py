@@ -10,6 +10,7 @@ import logging
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -61,21 +62,24 @@ class SipSubmissionTests(unittest.TestCase):
         self.addCleanup(self.visual_guard.stop)
         self.addCleanup(self.visual_state.cleanup)
 
-    def batch(self, ami, info, capable=True, builder=None, unavailable_targets=None):
+    def batch(self, ami, info, capable=True, builder=None, unavailable_targets=None, **extra):
         output = io.StringIO()
         error = None
         legacy_count = None
         with mock.patch.object(MODULE, "pjsip_notify_capabilities", return_value={
             "contact_uri_usable": capable, "routing_mode": "contact_uri" if capable else "endpoint_fanout",
-        }), contextlib.redirect_stdout(output), self.assertLogs(level=logging.INFO) as logs:
+        }) as capabilities, contextlib.redirect_stdout(output), self.assertLogs(level=logging.INFO) as logs:
             try:
                 legacy_count = MODULE.send_notify_batch(
                     ami, info, builder or (lambda fmt: f"<payload vendor='{fmt}'/>"),
                     "fixture-alert-123", print_results=True,
                     unavailable_targets=unavailable_targets,
+                    **extra,
                 )
             except MODULE.NotifyBatchError as exc:
                 error = exc
+        if extra.get('strict_contacts'):
+            self.assertEqual(capabilities.call_count,0,'Strict live paging ran unbounded capability CLI probes')
         lines = output.getvalue().splitlines()
         summaries = [json.loads(line.split(" ", 1)[1]) for line in lines if line.startswith("SLS_NOTIFY_RESULT ")]
         self.assertEqual(len(summaries), 1)
@@ -103,6 +107,116 @@ class SipSubmissionTests(unittest.TestCase):
         self.assertEqual(target["actual_route"], "endpoint")
         self.assertEqual(target["target_field"], "Endpoint")
         self.assertEqual(target["registered_contacts"], 2)
+
+    def test_connected_scope_always_uses_exact_uri_without_endpoint_fallback(self):
+        for capable in (True,False):
+            with self.subTest(capable=capable):
+                ami=FixtureAmi(None if capable else [{'Response':'Error','Message':'URI target unavailable'}])
+                summary,error,count,_=self.batch(ami,{'1000':dict(endpoint([contact()]),all_registered_contacts=2)},capable=capable,strict_contacts=True)
+                if capable:
+                    self.assertIsNone(error);self.assertEqual(ami.actions[0]['URI'],contact()['contact'])
+                    self.assertNotIn('Endpoint',ami.actions[0])
+                else:
+                    self.assertIsNotNone(error);self.assertEqual(len(ami.actions),1)
+                    self.assertIn('URI',ami.actions[0]);self.assertNotIn('Endpoint',ami.actions[0])
+                    self.assertEqual(summary['status'],'failed')
+
+    def test_later_join_cannot_reclaim_a_newer_popup_owner(self):
+        owner='a'*32
+        with MODULE.phone_visual_owner('1000',owner) as lease:lease.commit()
+        with MODULE.phone_visual_owner('1000') as lease:lease.commit()
+        ami=FixtureAmi()
+        summary,error,count,_=self.batch(ami,{'1000':endpoint([contact()])},strict_contacts=True,
+            visual_owner=owner,continuation_extensions={'1000'})
+        self.assertIsNone(error);self.assertEqual(ami.actions,[])
+        self.assertEqual(summary['status'],'no_targets')
+
+    def test_live_submission_guard_stops_before_notify_action(self):
+        ami=FixtureAmi()
+        with mock.patch.object(MODULE,'pjsip_notify_capabilities',return_value={'contact_uri_usable':True}):
+            with self.assertRaisesRegex(RuntimeError,'no longer permits'):
+                MODULE.send_notify_batch(ami,{'1000':endpoint([contact()])},lambda fmt:'<fixture/>','fixture',
+                    strict_contacts=True,submission_guard=lambda:False)
+        self.assertEqual(ami.actions,[])
+
+    def test_live_contact_cli_is_cumulative_guarded_and_one_second_per_probe(self):
+        now=[100.0]
+        def stalled(argv,**kwargs):
+            self.assertLessEqual(kwargs['timeout'],1)
+            now[0]+=kwargs['timeout']
+            raise MODULE.subprocess.TimeoutExpired('private-fixture',kwargs['timeout'])
+        with mock.patch.object(MODULE.time,'monotonic',side_effect=lambda:now[0]),mock.patch.object(MODULE.subprocess,'run',side_effect=stalled) as cli:
+            with self.assertRaisesRegex(RuntimeError,'inventory lease expired'):
+                MODULE.asterisk_contact_uri_inventory(['1000','1001'],max_seconds=8,submission_guard=lambda:now[0]<100.5)
+        self.assertEqual(cli.call_count,1);self.assertEqual(now[0],101)
+
+    def test_live_coordination_uses_remaining_budget_and_preserves_uncertain_ami_result(self):
+        ami=FixtureAmi();now=[100.0]
+        def begin(*args,**kwargs):
+            self.assertAlmostEqual(kwargs['timeout'],.1)
+            now[0]=101.0
+            return {'id':'private-claim'}
+        with mock.patch.object(MODULE.time,'monotonic',side_effect=lambda:now[0]),mock.patch.object(MODULE._cluster_guard,'begin',side_effect=begin),mock.patch.object(MODULE._cluster_guard,'finish',side_effect=[MODULE.subprocess.TimeoutExpired('private-helper',.05),None]) as finish:
+            with self.assertRaises(MODULE.NotifySubmissionError) as error:
+                MODULE.send_notify(ami,contact()['contact'],'<fixture/>','yealink','URI',coordination_deadline=100.1)
+        self.assertEqual(len(ami.actions),1,'Uncertain receipt caused a repeated SIP submission')
+        self.assertEqual(finish.call_count,2)
+        self.assertFalse(finish.call_args_list[0].kwargs['uncertain'])
+        self.assertTrue(finish.call_args_list[1].kwargs['uncertain'])
+        self.assertTrue(all(call.kwargs['timeout']==.05 for call in finish.call_args_list))
+        self.assertEqual(error.exception.details['status'],'failed')
+
+    def test_cluster_helper_preserves_default_timeout_and_accepts_bounded_override(self):
+        guard=MODULE._cluster_guard
+        result=mock.Mock(returncode=0,stdout=b'{"ok":true}')
+        with mock.patch.object(guard.subprocess,'run',return_value=result) as process:
+            guard._call({'action':'fixture'});self.assertEqual(process.call_args.kwargs['timeout'],14)
+            guard._call({'action':'fixture'},timeout=2);self.assertEqual(process.call_args.kwargs['timeout'],2)
+            for invalid in [True,0,-1,15,float('nan')]:
+                with self.assertRaises(guard.ClusterFenced):guard._call({'action':'fixture'},timeout=invalid)
+            self.assertEqual(process.call_count,2)
+
+    def test_page_cleanup_and_queued_new_alert_share_a_permanent_mutex(self):
+        owner='c'*32
+        with MODULE.phone_visual_owner('1000',owner) as lease:lease.commit()
+        state=MODULE.PHONE_VISUAL_STATE
+        mutex=state/'1000.json.lock';inode=mutex.stat().st_ino
+        waiter_opened=threading.Event();results=[];errors=[]
+        real_open=MODULE.os.open
+        def tracked_open(name,*args,**kwargs):
+            fd=real_open(name,*args,**kwargs)
+            if threading.current_thread().name=='queued-alert' and str(name) in ('1000.json','1000.json.lock'):
+                waiter_opened.set()
+            return fd
+        def newer_alert():
+            try:
+                with MODULE.phone_visual_owner('1000') as lease:
+                    results.append(bool(lease));lease.commit()
+            except Exception as error:errors.append(type(error).__name__)
+        with mock.patch.object(MODULE.os,'open',side_effect=tracked_open):
+            with MODULE.phone_visual_owner('1000',expected_owner=owner) as lease:
+                worker=threading.Thread(target=newer_alert,name='queued-alert');worker.start()
+                self.assertTrue(waiter_opened.wait(1),'Concurrent alert did not reach the mutex')
+                self.assertEqual(results,[]);lease.commit()
+            worker.join(2)
+        self.assertFalse(worker.is_alive());self.assertEqual(errors,[]);self.assertEqual(results,[True])
+        self.assertEqual(mutex.stat().st_ino,inode);self.assertEqual(mutex.read_bytes(),b'')
+        with MODULE.phone_visual_owner('1000',expected_owner=owner) as lease:self.assertFalse(lease)
+
+    def test_visual_mutex_rejects_links_and_public_permissions(self):
+        state=MODULE.PHONE_VISUAL_STATE;state.mkdir(mode=0o750)
+        victim=state/'victim';victim.write_bytes(b'');victim.chmod(0o640)
+        lock=state/'1000.json.lock'
+        for kind in ('symlink','hardlink','public'):
+            with self.subTest(kind=kind):
+                if kind=='symlink':lock.symlink_to(victim)
+                elif kind=='hardlink':os.link(victim,lock)
+                else:lock.write_bytes(b'');lock.chmod(0o644)
+                try:
+                    with self.assertRaises(OSError):
+                        with MODULE.phone_visual_owner('1000'):pass
+                    self.assertEqual(victim.read_bytes(),b'')
+                finally:lock.unlink()
 
     def test_mixed_contacts_preserve_exact_uri_transports_and_vendor_payloads(self):
         contacts = [contact(), contact("poly", "sip:1000@192.0.2.11:5060;transport=TCP"),
@@ -310,6 +424,26 @@ class SipSubmissionTests(unittest.TestCase):
                               require_all_targets=True)
         self.assertEqual(ami.actions, [])
         publish.assert_not_called()
+
+    def test_radio_profiles_remain_audio_only_for_alert_and_announcement_producers(self):
+        settings={'enterprise_labs':{'enabled':True},'enterprise_integrations':{'enabled':'1','radios':{'enabled':'1','devices':[
+            {'extension':'1000','enabled':'1'}, {'extension':'1001','enabled':'0'}]}}}
+        self.assertEqual(MODULE.radio_gateway_extensions(settings),['1000'])
+        for enabled in [False,'1',1,None]:
+            with self.subTest(labs=enabled):
+                self.assertEqual(MODULE.radio_gateway_extensions(dict(settings,enterprise_labs={'enabled':enabled})),[])
+        for method in ('alert','announcement'):
+            with self.subTest(method=method):
+                ami=FixtureAmi(); config,publish=self.push_context(ami)
+                config['visual']['audio_only_extensions']='1000'
+                if method=='alert':
+                    MODULE.push_alert(config,{'id':'fixture-radio-alert','properties':{}},targets=['1000'],desktop_targets=['fixture-desktop'],retries=False)
+                else:
+                    self.assertEqual(MODULE.push_announcement(config,'Fixture',['1000'],print_results=False,desktop_targets=['fixture-desktop']),[])
+                self.assertEqual(ami.actions,[])
+                publish.assert_called_once()
+        config['visual']['audio_only_extensions']='../1000'
+        with self.assertRaises(ValueError):MODULE.audio_only_visual_exclusions(config)
 
     def test_ami_login_error_does_not_echo_secret(self):
         ami = MODULE.AmiClient("127.0.0.1", 5038, "fixture", "not-a-real-password")

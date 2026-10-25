@@ -129,7 +129,7 @@ foreach ([['preview_token' => str_repeat('0', 64)], ['include_descendants' => fa
 foreach ([['include_descendants' => 'true'], ['channels' => []], ['channels' => [null]], ['channels' => [['bad']]], ['channels' => ['extensions', 'extensions']], ['id' => '../bad']] as $patch) {
     location_check(!$m->previewLocationAudience(array_replace($input, $patch))['success'], 'Malformed audience request accepted.');
 }
-$m->active['announcement_groups'] = array_fill(0, 20, $group); $input['revision'] = $m->getLocationDirectoryState()['revision']; $preview = $m->previewLocationAudience($input);
+$m->active['announcement_groups'] = array_fill(0, \SLS\MassNotify\AudienceLimits::SAVED, $group); $input['revision'] = $m->getLocationDirectoryState()['revision']; $preview = $m->previewLocationAudience($input);
 location_check(!$m->createLocationAudienceGroup($input + ['name' => 'Overflow', 'preview_token' => $preview['preview']['token']])['success'], 'Group capacity overflow accepted.');
 
 // Execute the actual main-class normalizer with inert inventory only.

@@ -233,7 +233,9 @@ PY
       log() { :; }
       INSTALL_MAINTENANCE_LOCK_FD=""
       acquire_maintenance_coordination
-      [ -z "$INSTALL_MAINTENANCE_LOCK_FD" ]
+      [ -n "$INSTALL_MAINTENANCE_LOCK_FD" ]
+      [ "$(readlink -f "/proc/$$/fd/$INSTALL_MAINTENANCE_LOCK_FD")" = "$SLS_MASS_NOTIFY_MAINTENANCE_LOCK" ]
+      flock -n "$INSTALL_MAINTENANCE_LOCK_FD"
     '
 )
 
@@ -427,6 +429,13 @@ asterisk() {
         printf "Your application(s) is (are) not registered.\n"
       fi
       ;;
+    "manager show command ${mock_capability_name}")
+      if [ "$mock_capability_type" = "manager" ] && [ "$mock_available" -eq 1 ]; then
+        printf "  -= Info about Manager Command '%s' =-\n" "$heading_name"
+      else
+        printf 'No such command.\n'
+      fi
+      ;;
     "module load "*)
       mock_load_calls=$((mock_load_calls + 1))
       if [ "$mock_load_success" -eq 1 ]; then
@@ -497,6 +506,22 @@ asterisk_capability_available application Dial
 mock_heading_case="title"
 mock_heading_ansi=0
 asterisk_capability_available application Dial
+
+mock_capability_type="manager"
+mock_capability_name="MuteAudio"
+mock_available=1
+asterisk_capability_available manager MuteAudio
+mock_reported_capability_name="MuteAudioExtra"
+if asterisk_capability_available manager MuteAudio; then
+  printf 'A different manager command passed exact capability verification.\n' >&2
+  exit 1
+fi
+mock_reported_capability_name=""
+mock_available=0
+if asterisk_capability_available manager MuteAudio; then
+  printf 'An unavailable manager command passed capability verification.\n' >&2
+  exit 1
+fi
 
 mock_capability_type="function"
 mock_capability_name="PJSIP_HEADER"
@@ -950,7 +975,7 @@ for producer in \
   fi
 done
 
-expected_mapping=$'function|PJSIP_HEADER|res_pjsip_header_funcs.so\nfunction|PJSIP_CONTACT|func_pjsip_contact.so\nfunction|PJSIP_AOR|func_pjsip_aor.so\nfunction|PJSIP_DIAL_CONTACTS|chan_pjsip.so\nfunction|TOLOWER|func_strings.so\nfunction|CUT|func_strings.so\nfunction|FILTER|func_strings.so\nfunction|CHANNEL|func_channel.so\nfunction|IF|func_logic.so\nfunction|DB|func_db.so\nfunction|CALLERID|func_callerid.so\napplication|ConfBridge|app_confbridge.so\napplication|Page|app_page.so\napplication|AGI|res_agi.so\napplication|Playback|app_playback.so\napplication|Read|app_read.so\napplication|ExecIf|app_exec.so\napplication|Gosub|app_stack.so\napplication|Return|app_stack.so\napplication|Log|app_verbose.so\napplication|Verbose|app_verbose.so\nrequired|application|Wait'
+expected_mapping=$'function|PJSIP_HEADER|res_pjsip_header_funcs.so\nfunction|PJSIP_CONTACT|func_pjsip_contact.so\nfunction|PJSIP_AOR|func_pjsip_aor.so\nfunction|PJSIP_DIAL_CONTACTS|chan_pjsip.so\nfunction|TOLOWER|func_strings.so\nfunction|CUT|func_strings.so\nfunction|FILTER|func_strings.so\nfunction|CHANNEL|func_channel.so\nfunction|IF|func_logic.so\nfunction|DB|func_db.so\nfunction|CALLERID|func_callerid.so\nfunction|TIMEOUT|func_timeout.so\nfunction|MUTEAUDIO|res_mutestream.so\nfunction|CONFBRIDGE|app_confbridge.so\nmanager|MuteAudio|res_mutestream.so\nmanager|PlayDTMF|app_senddtmf.so\nrequired|manager|Setvar\nrequired|manager|Getvar\napplication|ConfBridge|app_confbridge.so\napplication|Page|app_page.so\napplication|AGI|res_agi.so\napplication|Playback|app_playback.so\napplication|PlayTones|app_playtones.so\napplication|StopPlayTones|app_playtones.so\napplication|Read|app_read.so\napplication|ExecIf|app_exec.so\napplication|Gosub|app_stack.so\napplication|Return|app_stack.so\napplication|Log|app_verbose.so\napplication|Verbose|app_verbose.so\nrequired|application|Wait'
 actual_mapping="$(
   ensure_asterisk_capability() {
     printf '%s|%s|%s\n' "$1" "$2" "$3"

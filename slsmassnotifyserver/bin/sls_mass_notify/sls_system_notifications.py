@@ -50,6 +50,7 @@ MAX_HEALTH_BYTES = 64 * 1024
 MAX_JSON_BYTES = 2 * 1024 * 1024
 RETRY_SECONDS = 15 * 60
 REPEAT_SUPPRESSION_SECONDS = 24 * 60 * 60
+HEALTH_CONFIRMATION_SECONDS = 120
 RETENTION_SECONDS = 90 * 86400
 MAX_XWEATHER_GROUP_FAULTS = 5
 MAX_ACTIVE_FAULTS = 24
@@ -236,6 +237,8 @@ def collect_health_faults(worker: dict | None, storage: dict | None, *,
     if worker_issues:
         faults["announcement_worker"] = _candidate("announcement_worker", "announcement worker health",
             " ".join(worker_issues), datetime.fromtimestamp(current, timezone.utc).isoformat())[1]
+        if worker_error or worker_time is None or worker_time > current+60 or current-worker_time >= 600:
+            faults['announcement_worker']['confirmation_seconds'] = HEALTH_CONFIRMATION_SECONDS
 
     storage_issues = []
     storage_time = _health_time(storage.get("checked_at"), iso=False) if isinstance(storage, dict) else None
@@ -257,6 +260,12 @@ def collect_health_faults(worker: dict | None, storage: dict | None, *,
                                                                         "media_scan_incomplete", "media_over_budget", "media_near_budget", "free_below_media_reserve")):
             storage_issues.append("Storage health contains invalid status flags. Check the maintenance log and regenerate diagnostics.")
         else:
+            failed_stages = storage.get('maintenance_failed_stages', [])
+            if (not isinstance(failed_stages, list) or len(failed_stages)>6
+                    or any(not isinstance(stage,str) or stage not in {'audit','security_audit','announcement_jobs','event_logs','generated_media','desktop_evidence'} for stage in failed_stages)):
+                storage_issues.append('Storage maintenance reported invalid stage results. Check the maintenance log.')
+            elif failed_stages:
+                storage_issues.append('Storage maintenance could not complete: '+', '.join(failed_stages)+'. Check /var/log/sls_mass_notify.log; delivery history was preserved.')
             if "free_bytes" not in storage:
                 storage_issues.append("Storage health cannot confirm available disk space. Check maintenance diagnostics.")
             elif storage["free_bytes"] == 0:
@@ -284,6 +293,8 @@ def collect_health_faults(worker: dict | None, storage: dict | None, *,
     if storage_issues:
         faults["storage"] = _candidate("storage", "storage and delivery health",
             " ".join(storage_issues), datetime.fromtimestamp(current, timezone.utc).isoformat())[1]
+        if storage_error or storage_time is None or storage_time > current+60 or current-storage_time > 300:
+            faults['storage']['confirmation_seconds'] = HEALTH_CONFIRMATION_SECONDS
     return faults
 
 
@@ -708,6 +719,16 @@ def process_faults(config: dict, faults: dict[str, dict], state_path: Path, *, s
             attempts.pop(channel, None)
             continue
         attempt = attempts.get(channel) if isinstance(attempts.get(channel), dict) else {}
+        if fault.get('confirmation_seconds') == HEALTH_CONFIRMATION_SECONDS:
+            observing = attempt.get('fingerprint') == fingerprint and attempt.get('submission_started') is False
+            if not observing:
+                if attempt.get('fingerprint') == fingerprint and current-_integer(attempt.get('at')) < RETRY_SECONDS:
+                    continue
+                attempts[channel] = {'fingerprint':fingerprint, 'at':current, 'submission_started':False}
+                continue
+            if current-_integer(attempt.get('at')) < HEALTH_CONFIRMATION_SECONDS:
+                continue
+            attempt = {}
         if attempt.get("fingerprint") == fingerprint and current - _integer(attempt.get("at")) < RETRY_SECONDS:
             continue
         attempts[channel] = {"fingerprint": fingerprint, "at": current}

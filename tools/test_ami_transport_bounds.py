@@ -19,6 +19,23 @@ class AmiBoundsTests(unittest.TestCase):
     def client(self, timeout=.15):
         return sender.AmiClient('127.0.0.1', 5038, 'fixture', 'fixture', timeout=timeout)
 
+    def test_paging_health_discovery_is_read_only_and_rejects_missing_or_ambiguous_actions(self):
+        required = ("MuteAudio", "PlayDTMF", "Setvar", "Getvar")
+        good = {"Response": "Success", **{name: "Fixture synopsis [Privilege: call,system]" for name in required}}
+        client = self.client()
+        with patch.object(client, 'action', return_value=(good, [])) as action:
+            self.assertEqual(sender.ami_live_paging_actions(client), {name: "authorized" for name in required})
+            action.assert_called_once_with({"Action": "ListCommands"})
+        bad_responses = [None, {}, {**good, "Response": "Error"}, {**good, "MuteAudio": []},
+                         {**good, "MuteAudio": ""}, {**good, "MuteAudio": "x" * 4097},
+                         {**good, "muteaudio": "duplicate"},
+                         {**good, **{f"Synthetic{i}": "extra" for i in range(513)}}]
+        for name in required:
+            missing = dict(good); del missing[name]; bad_responses.append(missing)
+        for response in bad_responses:
+            with self.subTest(response_type=type(response).__name__), patch.object(client, 'action', return_value=(response, [])):
+                with self.assertRaises(RuntimeError): sender.ami_live_paging_actions(client)
+
     def test_active_event_stream_cannot_extend_action_budget(self):
         client = self.client(1)
         clock = [0.0]
@@ -91,6 +108,7 @@ class AmiBoundsTests(unittest.TestCase):
                     b'Response: Success\r\n\r\n',
                     b'Response: Success\r\n\r\nEvent: ContactList\r\nEndpoint: 1000\r\nContact: sip:1000@192.0.2.10\r\n\r\nEvent: ContactListComplete\r\n\r\n',
                     b'Response: Success\r\nPing: Pong\r\n\r\n',
+                    b'Response: Success\r\nMuteAudio: Mute [Privilege: system]\r\nPlayDTMF: Play [Privilege: call]\r\nSetvar: Set [Privilege: call]\r\nGetvar: Read [Privilege: call]\r\n\r\n',
                 ):
                     lines = []
                     while True:
@@ -115,11 +133,13 @@ class AmiBoundsTests(unittest.TestCase):
             reply, events = client.action({'Action':'Ping'})
             self.assertEqual(reply['Ping'], 'Pong')
             self.assertEqual(events, [])
+            self.assertEqual(sender.ami_live_paging_actions(client), {name: "authorized" for name in ("MuteAudio", "PlayDTMF", "Setvar", "Getvar")})
         finally:
             client.close()
             worker.join(1)
         self.assertFalse(worker.is_alive())
-        self.assertEqual(len(requests), 3)
+        self.assertEqual(len(requests), 4)
+        self.assertIn(b'Action: ListCommands', requests[-1])
 
     def test_private_trickle_read_is_bounded_by_total_deadline(self):
         receiving, sending = socket.socketpair()

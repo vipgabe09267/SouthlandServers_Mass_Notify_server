@@ -7,17 +7,31 @@ $now = 1800000000;
 $client = ['client_id'=>'cli_fixture', 'enabled'=>'1'];
 $seen = ['client_id'=>'cli_fixture', 'seen_at'=>gmdate('c', $now), 'connected_until'=>$now+30,
     'client_report'=>['version'=>'1.2.3', 'payload_schema'=>1, 'sse_protocol'=>2, 'reported_at'=>gmdate('c', $now)]];
-foreach ([''=>'no_minimum', '1.2.2'=>'meets_minimum', '1.2.3'=>'meets_minimum', '1.2.4'=>'upgrade_required', '1.2.3-beta.1'=>'meets_minimum'] as $minimum=>$expected) {
+foreach ([''=>'meets_minimum', '1.2.2'=>'meets_minimum', '1.2.3'=>'meets_minimum', '1.2.4'=>'upgrade_required', '1.2.3-beta.1'=>'meets_minimum'] as $minimum=>$expected) {
     $result = DesktopFleet::readiness($client,$seen,$minimum,$now);
     fleetCheck($result['compatibility']===$expected && $result['connection']==='streaming', 'Incorrect compatibility: '.$minimum);
 }
 $changed=$seen; $changed['client_report']['version']='1.2.3-beta.2';
 fleetCheck(DesktopFleet::readiness($client,$changed,'1.2.3',$now)['compatibility']==='upgrade_required','Prerelease accepted as stable');
-$changed=$seen; $changed['client_report']['version']='1.0.10-beta';
-fleetCheck(DesktopFleet::readiness($client,$changed,DesktopFleet::DEFAULT_MINIMUM,$now)['compatibility']==='meets_minimum','Current published beta fails default version policy');
-$changed['client_report']['version']='1.0.9-beta';
+$changed=$seen; $changed['client_report']['version']='1.0.13-beta';
+fleetCheck(DesktopFleet::readiness($client,$changed,DesktopFleet::DEFAULT_MINIMUM,$now)['compatibility']==='meets_minimum','Current beta fails default version policy');
+$changed['client_report']['version']='1.0.12-beta';
 fleetCheck(DesktopFleet::readiness($client,$changed,DesktopFleet::DEFAULT_MINIMUM,$now)['compatibility']==='upgrade_required','Older beta meets current minimum');
 fleetCheck(DesktopFleet::readiness($client,$changed,'1.10.0',$now)['compatibility']==='upgrade_required','Explicit administrator minimum was weakened');
+foreach (['1.0.12-beta+build.7', '1.0.12-preview.1', '1.0.12+001'] as $reported) {
+    $changed=$seen; $changed['client_report']['version']=$reported;
+    fleetCheck(DesktopFleet::readiness($client,$changed,'1.0.10-beta',$now)['compatibility']==='meets_minimum','Valid reported SemVer was lost: '.$reported);
+}
+foreach (['1.0.12-beta.01', '01.0.12', '1.0.12+', '1.0.12-alpha..1'] as $reported) {
+    $changed=$seen; $changed['client_report']['version']=$reported;
+    fleetCheck(DesktopFleet::readiness($client,$changed,'1.0.10-beta',$now)['compatibility']==='invalid_version','Invalid reported version was not identified');
+}
+$precedence=['1.0.0-alpha','1.0.0-alpha.1','1.0.0-alpha.beta','1.0.0-beta','1.0.0-beta.2','1.0.0-beta.11','1.0.0-rc.1','1.0.0'];
+foreach ($precedence as $index=>$version) {
+    if ($index) { fleetCheck(DesktopFleet::compareVersions($precedence[$index-1],$version)<0,'SemVer prerelease order changed'); }
+}
+fleetCheck(DesktopFleet::compareVersions('1.2.3+build.8','1.2.3+build.1')===0,'Build metadata changed precedence');
+fleetCheck(DesktopFleet::compareVersions('12345678901234567890.0.0','12345678901234567891.0.0')<0,'Large numeric version overflow');
 $changed=$seen; $changed['client_report']['sse_protocol']=3;
 fleetCheck(DesktopFleet::readiness($client,$changed,'',$now)['compatibility']==='unsupported_protocol','Unknown protocol shown as supported');
 foreach ([['payload_schema'],['sse_protocol'],['payload_schema','sse_protocol']] as $missing) {
@@ -44,4 +58,17 @@ $class=new ReflectionClass(FreePBX\modules\Slsmassnotifyserver::class); $module=
 $patch=$class->getMethod('validateAndNormalizeControlConfigPatch');
 fleetCheck(!$patch->invoke($module,['desktop_minimum_version'=>'1.2.3-beta.1'])['errors'],'API rejected minimum policy');
 foreach ([null,'garbage',false,[]] as $bad) { fleetCheck((bool)$patch->invoke($module,['desktop_minimum_version'=>$bad])['errors'],'API accepted invalid minimum policy'); }
+fleetCheck(DesktopFleet::DEFAULT_MINIMUM==='1.0.13-beta','Default minimum changed');
+fleetCheck(DesktopFleet::readiness($client,[],DesktopFleet::DEFAULT_MINIMUM,$now)['upgrade_required']===true,'Unreported version did not require an update');
+$changed=$seen;$changed['client_report']['version']='1.0.13-beta';
+fleetCheck(!DesktopFleet::readiness($client,$changed,DesktopFleet::DEFAULT_MINIMUM,$now)['upgrade_required'],'Current minimum unnecessarily flagged');
+foreach (['1.0.2-beta','1.0.9-beta','1.0.10-beta','1.0.11-beta','1.0.12-beta','1.0.12'] as $version) {
+    $changed=$seen;$changed['client_report']['version']=$version;
+    $result=DesktopFleet::readiness($client,$changed,'',$now);
+    fleetCheck($result['upgrade_required'] && $result['compatibility']==='upgrade_required','Below-default app not flagged: '.$version);
+}
+foreach (['1.0.13-beta','1.0.13-beta+build.7','1.0.13','1.0.14-alpha'] as $version) {
+    $changed=$seen;$changed['client_report']['version']=$version;
+    fleetCheck(!DesktopFleet::readiness($client,$changed,'',$now)['upgrade_required'],'At/above-default app unnecessarily flagged: '.$version);
+}
 echo "Desktop readiness: identity, revocation, version policy, protocol, clock/staleness and API validation passed.\n";

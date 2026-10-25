@@ -68,14 +68,14 @@ class ControlIdempotencyHttpTests(unittest.TestCase):
         self.control['credentials'].append(issued['credential'])
         subscribers = {'enabled': True, 'push': {'enabled': True}, 'people': [
             {'id': browser, 'enabled': True, 'version': 'd' * 64, 'name': 'Fixture browser'}]}
-        self.api.write_config(control_api=self.control, subscriber_browser=subscribers)
+        self.api.write_config(control_api=self.control, subscriber_browser=subscribers, enterprise_labs={'enabled': True})
         payload = {**self.payload, 'browser_recipient_ids': [browser]}
         allowed = self.api.request(issued['secret'], payload, **{'Idempotency-Key': 'scoped-labs-fixture-0001'})
         self.assertEqual(allowed[0], 200, allowed)
         denied = self.api.request(issued['secret'], {**payload, 'browser_recipient_ids': ['sub_'+'e'*24]}, **{'Idempotency-Key': 'scoped-labs-fixture-0002'})
         self.assertEqual(denied[0], 403, denied)
         self.control['credentials'][-1]['revoked_at'] = '2026-10-09T00:00:00Z'
-        self.api.write_config(control_api=self.control, subscriber_browser=subscribers)
+        self.api.write_config(control_api=self.control, subscriber_browser=subscribers, enterprise_labs={'enabled': True})
         revoked = self.api.request(issued['secret'], payload, **{'Idempotency-Key': 'scoped-labs-fixture-0003'})
         self.assertEqual(revoked[0], 401, revoked)
         self.assertEqual(len((self.api.directory / 'module-calls.jsonl').read_text().splitlines()), 1)

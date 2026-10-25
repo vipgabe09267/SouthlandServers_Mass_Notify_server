@@ -14,6 +14,8 @@ import sys
 import types
 import hashlib
 import re
+import shutil
+import tempfile
 
 sys.dont_write_bytecode = True
 DATA = Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin')
@@ -112,6 +114,33 @@ def load_uninstall_trust(root=TRUST_ROOT):
     return trust
 
 
+def reconcile_stock_command(*, root=TRUST_ROOT, packages=None, online=False):
+    trust=load_uninstall_trust(root)
+    data,generation=trust.load(Path(root),'slsmassnotifyserver')
+    required=('sls_upgrade_trust.py','sls_release_trust.py','sls_module_trust.py','freepbx-mirror-signing.pub')
+    source=generation/'module/bin/sls_mass_notify'
+    for filename in required:
+        name='bin/sls_mass_notify/'+filename;entry=data['files'].get(name)
+        body=trust.read(source/filename,2*1024*1024,protected=True)
+        if not entry or trust.digest(body)!=entry['sha256']:
+            raise RuntimeError('The retained stock-reconciliation helper changed. Preserve the publisher evidence and run verified repair.')
+    path=source/'sls_upgrade_trust.py'
+    upgrade=types.ModuleType('_console_stock_reconciliation');upgrade.__file__=str(path)
+    exec(compile(trust.read(path,2*1024*1024,protected=True),str(path),'exec'),upgrade.__dict__)
+    lock=upgrade.coordination_lock(Path('/run/lock/sls-mass-notify-maintenance.lock'))
+    workspace=None
+    try:
+        workspace=Path(tempfile.mkdtemp(prefix='stock-review-',dir=root))
+        result=upgrade.reconcile_stock(workspace,Path(root),packages=packages,online=online)
+    except BaseException as error:
+        location=' Review evidence retained at '+str(workspace) if workspace is not None else ' The private review workspace could not be created.'
+        raise RuntimeError(str(error)+location) from error
+    else:
+        shutil.rmtree(workspace)
+        return result
+    finally:os.close(lock)
+
+
 class RuntimeConsole:
     def __init__(self, crypto, run, *, data=DATA, keyring=None):
         self.crypto, self.run, self.data, self.keyring = crypto, run, Path(data), keyring
@@ -199,10 +228,13 @@ class RuntimeConsole:
 
 def main():
     parser = argparse.ArgumentParser(prog='slsconsole', description=__doc__, epilog='stop pauses new SLS sends; existing calls and receipt tracking continue. reboot restarts only the SLS collector and preserves a stopped state. Configuration, credentials and PBX services remain intact.')
-    parser.add_argument('command', nargs='?', default='help', choices=('start', 'stop', 'reboot', 'status', 'doctor', 'uninstall', 'help'))
+    parser.add_argument('command', nargs='?', default='help', choices=('start', 'stop', 'reboot', 'status', 'doctor', 'reconcile-stock', 'uninstall', 'help'))
     parser.add_argument('--json', action='store_true', help='print a bounded, secret-free status object')
     parser.add_argument('--purge', action='store_true', help='with uninstall only: permanently delete retained SLS settings, media and history')
+    parser.add_argument('--online',action='store_true',help='with reconcile-stock only: obtain independently signed current and prior FreePBX stock packages')
+    parser.add_argument('--upstream-packages',type=Path,help='with reconcile-stock only: directory containing local signed FreePBX packages')
     args = parser.parse_args()
+    if (args.online or args.upstream_packages) and args.command!='reconcile-stock':parser.error('Stock package options require reconcile-stock')
     if args.purge and args.command != 'uninstall':
         parser.error('--purge is available only with uninstall')
     if args.json and args.command == 'uninstall':
@@ -213,6 +245,10 @@ def main():
     if os.geteuid() != 0:
         raise RuntimeError('Use sudo slsconsole ' + args.command + '; runtime control requires root.')
     protected_file(__file__)
+    if args.command=='reconcile-stock':
+        result=reconcile_stock_command(packages=args.upstream_packages,online=args.online)
+        print(json.dumps(result,separators=(',',':')) if args.json else 'Signed FreePBX stock approvals reconciled. Changed modules: '+(', '.join(result['changed_modules']) or 'none')+'. No PBX settings or delivery queues were changed.')
+        return 0
     if args.command == 'uninstall':
         path = authenticate_uninstaller(load_uninstall_trust())
         environment = dict(os.environ)

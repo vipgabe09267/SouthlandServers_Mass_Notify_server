@@ -1,15 +1,18 @@
 <?php
 declare(strict_types=1);
 namespace SLS\MassNotify;
+require_once __DIR__.'/ScopedTls.php';
 require_once __DIR__.'/IncidentConfig.php';
+require_once __DIR__.'/RadioGateway.php';
+require_once __DIR__.'/MeetingAccounts.php';
 
 /** Opt-in device/provider settings; the central AES config owns every secret. */
 final class EnterpriseIntegrationsConfig
 {
     public static function defaults(): array
     {
-        return ['enabled'=>'0','speakers'=>['enabled'=>'0','devices'=>[]],
-            'connectors'=>['enabled'=>'0','destinations'=>[]],
+        return ['enabled'=>'0','speakers'=>['enabled'=>'0','devices'=>[]],'radios'=>['enabled'=>'0','devices'=>[]],
+            'connectors'=>['enabled'=>'0','destinations'=>[]],'browser_display'=>['enabled'=>'0'],'mail_evidence'=>['enabled'=>'0'],
             'access_control'=>['enabled'=>'0','provider'=>'axis_vapix','origin'=>'','pinned_ipv4'=>'','username'=>'','password'=>'','doors'=>[]],
             'meetings'=>['enabled'=>'0','provider'=>'zoom','zoom_user'=>'me','zoom_access_token'=>'','google_access_token'=>'','webex_access_token'=>'',
                 'oauth_refresh_enabled'=>'0','oauth_client_id'=>'','oauth_client_secret'=>'','oauth_refresh_token'=>'','oauth_expires_at'=>0],
@@ -46,11 +49,11 @@ final class EnterpriseIntegrationsConfig
     public static function catalog(): array
     {
         return [
-            'algo'=>['brand'=>'Algo','model'=>'8180 G2','docs'=>'https://docs.algosolutions.com/v1/docs/8180-ip-audio-alerter-user-guide'],
-            'cyberdata'=>['brand'=>'CyberData','model'=>'011394','docs'=>'https://www.cyberdata.net/products/011394'],
-            'axis'=>['brand'=>'Axis','model'=>'SIP-capable network speaker','docs'=>'https://developer.axis.com/vapix/audio-systems/'],
-            'valcom'=>['brand'=>'Valcom','model'=>'VIP-120A-V4','docs'=>'https://www.valcom.com/vlc-product/ip-8-inch-round-ceiling-speaker-one-way-vip-120a-v4/'],
-            'atlasied'=>['brand'=>'AtlasIED','model'=>'IPX IP-SDM','docs'=>'https://www.atlasied.com/ip-sdm']];
+            'algo'=>['brand'=>'Algo','model'=>'8180 G2','models'=>['8180 G2','8186'],'docs'=>'https://docs.algosolutions.com/v1/docs/8180-ip-audio-alerter-user-guide'],
+            'cyberdata'=>['brand'=>'CyberData','model'=>'011394','models'=>['011394'],'docs'=>'https://www.cyberdata.net/products/011394'],
+            'axis'=>['brand'=>'Axis','model'=>'C1410','models'=>['C1410','C1410 Mk II'],'docs'=>'https://help.axis.com/en-us/axis-c1410'],
+            'valcom'=>['brand'=>'Valcom','model'=>'VIP-120A-V4','models'=>['VIP-120A-V4'],'docs'=>'https://www.valcom.com/vlc-product/ip-8-inch-round-ceiling-speaker-one-way-vip-120a-v4/'],
+            'atlasied'=>['brand'=>'AtlasIED','model'=>'IPX IP-SDM','models'=>['IPX IP-SDM'],'docs'=>'https://www.atlasied.com/ip-sdm']];
     }
     public static function origin($origin,$ip): void
     {
@@ -74,14 +77,15 @@ final class EnterpriseIntegrationsConfig
         $defaults=self::defaults(); $value=IncidentConfig::object($value,array_keys($defaults),'Enterprise integrations'); $out=$defaults; $out['enabled']=self::flag($value['enabled']??'0');
         foreach ($defaults as $kind=>$base) {
             if ($kind==='enabled') { continue; }
-            $row=IncidentConfig::object($value[$kind]??[],array_keys($base),$kind.' integration'); $out[$kind]=array_replace($base,$row);
+            $extra=$kind==='access_control'?['tls']:($kind==='meetings'?['oauth_profiles']:[]);
+            $row=IncidentConfig::object($value[$kind]??[],array_merge(array_keys($base),$extra),$kind.' integration'); $out[$kind]=array_replace($base,$row);
             $out[$kind]['enabled']=self::flag($out[$kind]['enabled']);
         }
         $ids=[]; $extensions=[]; $devices=[];
         require_once __DIR__.'/EnterpriseDeliveryConnector.php';$connectorIds=[];$destinations=[];
         foreach(IncidentConfig::listOf($out['connectors']['destinations'],20,'Notification connectors') as $row){$row=EnterpriseDeliveryConnector::normalize($row);if(isset($connectorIds[$row['id']])){throw new \InvalidArgumentException('Duplicate notification connector.');}$connectorIds[$row['id']]=true;$destinations[]=$row;}$out['connectors']['destinations']=$destinations;
         foreach (IncidentConfig::listOf($out['speakers']['devices'],100,'SIP speakers') as $row) {
-            $row=IncidentConfig::object($row,['id','name','enabled','brand','model','firmware','acceptance_notes','extension','telemetry_origin','telemetry_ipv4','telemetry_username','telemetry_password'],'SIP speaker');
+            $row=IncidentConfig::object($row,['id','name','enabled','brand','model','firmware','acceptance_notes','extension','telemetry_origin','telemetry_ipv4','telemetry_username','telemetry_password','telemetry_tls'],'SIP speaker');
             $id=self::id($row['id']??'','spk'); if (isset($ids[$id])) { throw new \InvalidArgumentException('Duplicate speaker identifier.'); } $ids[$id]=true;
             $brand=$row['brand']??''; if (!isset(self::catalog()[$brand])) { throw new \InvalidArgumentException('Choose a documented representative speaker brand.'); }
             $extension=IncidentConfig::identifier($row['extension']??'','/^[0-9]{1,12}$/D','Existing PBX extension');
@@ -93,9 +97,14 @@ final class EnterpriseIntegrationsConfig
                 'firmware'=>IncidentConfig::text($row['firmware']??'',100,'Speaker firmware',true),
                 'acceptance_notes'=>IncidentConfig::text($row['acceptance_notes']??'',1000,'Speaker acceptance notes',true),'extension'=>$extension,
                 'telemetry_origin'=>$origin,'telemetry_ipv4'=>$ip,'telemetry_username'=>self::secret($row['telemetry_username']??'',100),'telemetry_password'=>self::secret($row['telemetry_password']??'')];
+            $tls=ScopedTls::normalize($row['telemetry_tls']??[]);
+            if($tls){$devices[array_key_last($devices)]['telemetry_tls']=$tls;}
         }
         $out['speakers']['devices']=$devices;
+        $out['radios']=RadioGateway::normalize($out['radios']);
         $access=&$out['access_control']; if ($access['provider']!=='axis_vapix') { throw new \InvalidArgumentException('Only the documented Axis VAPIX door adapter is available.'); }
+        $tls=ScopedTls::normalize($access['tls']??[]);
+        if($tls){$access['tls']=$tls;}else{unset($access['tls']);}
         self::origin($access['origin'],$access['pinned_ipv4']); $access['username']=self::secret($access['username'],100); $access['password']=self::secret($access['password']);
         $doors=[]; $ids=[]; $tokens=[];
         foreach (IncidentConfig::listOf($access['doors'],50,'Allowed doors') as $row) {
@@ -112,10 +121,8 @@ final class EnterpriseIntegrationsConfig
         $meeting=&$out['meetings']; if (!in_array($meeting['provider'],['zoom','google_meet','webex'],true)) { throw new \InvalidArgumentException('Choose Zoom, Google Meet or Webex.'); }
         $meeting['zoom_user']=IncidentConfig::identifier($meeting['zoom_user'],'/^[A-Za-z0-9_.@+-]{1,128}$/D','Zoom host');
         foreach (['zoom_access_token','google_access_token','webex_access_token'] as $field) { $meeting[$field]=self::secret($meeting[$field]); if (preg_match('/[\r\n]/',$meeting[$field])) { throw new \InvalidArgumentException('OAuth access tokens cannot contain line breaks.'); } } unset($meeting);
-        $meeting=&$out['meetings'];$meeting['oauth_refresh_enabled']=self::flag($meeting['oauth_refresh_enabled']);
-        foreach(['oauth_client_id','oauth_client_secret','oauth_refresh_token'] as $field){$meeting[$field]=self::secret($meeting[$field],8192);if(preg_match('/[\r\n]/',$meeting[$field])){throw new \InvalidArgumentException('OAuth credentials cannot contain line breaks.');}}
-        $meeting['oauth_expires_at']=self::integer($meeting['oauth_expires_at'],0,4102444800,'OAuth expiry timestamp');
-        if($meeting['oauth_refresh_enabled']==='1'&&($meeting['oauth_client_id']===''||$meeting['oauth_client_secret']===''||$meeting['oauth_refresh_token']==='')){throw new \InvalidArgumentException('Automatic OAuth refresh requires client ID, client secret and refresh token.');}unset($meeting);
+        $out['meetings']['oauth_profiles']=MeetingAccounts::profiles($out['meetings']);
+        $out['meetings']=array_replace($out['meetings'],$out['meetings']['oauth_profiles'][$out['meetings']['provider']]);
         $response=&$out['responses']; $response['ttl_seconds']=self::integer($response['ttl_seconds'],60,86400,'Human response validity');
         $bindings=[]; $seen=[];
         foreach (IncidentConfig::listOf($response['bindings'],1000,'Participant response bindings') as $row) {
@@ -145,6 +152,9 @@ final class EnterpriseIntegrationsConfig
         foreach ($value['speakers']['devices'] as &$row) { $hide($row,'telemetry_password'); } unset($row);
         foreach ($value['connectors']['destinations'] as &$row) { $hide($row,'token'); } unset($row);
         foreach (['zoom_access_token','google_access_token','webex_access_token','oauth_client_secret','oauth_refresh_token'] as $field) { $hide($value['meetings'],$field); }
+        foreach ($value['meetings']['oauth_profiles'] as &$profile) {
+            foreach (['oauth_client_secret','oauth_refresh_token'] as $field) $hide($profile,$field);
+        } unset($profile);
         foreach (['certificate_pem','private_key_pem','private_key_password'] as $field) { $hide($value['public_warning'],$field); }
         return $value;
     }

@@ -23,6 +23,35 @@ backup = importlib.util.module_from_spec(SPEC); SPEC.loader.exec_module(backup)
 
 
 class OperationalBackupTests(unittest.TestCase):
+    def test_supported_large_desktop_journal_is_backed_up_exactly_without_activation(self):
+        name = 'sipnotify/sipnotify_events.jsonl'
+        original = b'{"id":"private-evidence"}\n' * (18 * 1024 * 1024 // 26)
+        self.assertGreater(len(original), 16 * 1024 * 1024)
+        path = self.data/name; path.write_bytes(original)
+        before = path.stat()
+        body = self.snapshot()
+        record = next(json.loads(line) for line in body.splitlines()[1:-1] if json.loads(line)['path'] == name)
+        self.assertEqual(record['codec'], 'zlib')
+        self.assertEqual(backup.record_bytes(record), original)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(path.stat().st_ino, before.st_ino)
+        self.assertTrue(backup.inspect(body)['ok'])
+        report = backup.archive(self.file, self.target)
+        self.assertTrue(report['ok'])
+        self.assertFalse((self.target/name).exists(), 'Restored evidence became a live desktop feed')
+
+    def test_v1_raw_archives_remain_compatible_and_compression_is_bounded(self):
+        body = self.snapshot()
+        rows = [json.loads(row) for row in body.splitlines()]
+        rows[0]['format'] = backup.LEGACY_FORMAT
+        for row in rows[1:-1]:
+            row.pop('codec'); row.pop('stored_bytes')
+        self.assertTrue(backup.inspect(b''.join(backup.line(row) for row in rows))['ok'])
+        compressed = zlib.compress(b'x'*(2*1024*1024))
+        bad = {'path':'weather-delivery.json','captured_at':1,'bytes':1,'sha256':hashlib.sha256(b'x').hexdigest(),
+               'codec':'zlib','stored_bytes':len(compressed),'base64':base64.b64encode(compressed).decode()}
+        with self.assertRaises(ValueError): backup.record_bytes(bad)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='sls-operational-backup-'); self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name); self.data = self.root / 'data'; self.data.mkdir(mode=0o700)
@@ -127,7 +156,7 @@ class OperationalBackupTests(unittest.TestCase):
                 self.assertFalse((target/'.incident-replay-initializing.json').exists())
 
     def test_aggregate_size_is_checked_before_any_output_is_created(self):
-        for index in range(5):
+        for index in range(9):
             path=self.data/('xweather-lightning-state-'+str(index)+'.json')
             with path.open('wb') as stream:stream.truncate(12*1024*1024)
             path.chmod(0o600)
@@ -249,7 +278,7 @@ class OperationalBackupTests(unittest.TestCase):
             with self.subTest(kind=kind), self.assertRaises((OSError, backup.RecoveryError)):
                 backup.snapshot(self.data, self.file)
             self.assertFalse(self.file.exists()); path.unlink()
-        with path.open('wb') as handle: handle.truncate(backup.MAX_FILE + 1)
+        with path.open('wb') as handle: handle.truncate(backup.source_bound('security-audit.jsonl') + 1)
         path.chmod(0o600)
         with self.assertRaises(backup.RecoveryError): backup.snapshot(self.data, self.file)
         self.assertFalse(self.file.exists())

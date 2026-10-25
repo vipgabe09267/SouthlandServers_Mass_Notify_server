@@ -37,7 +37,7 @@
   };
   async function showWarning() {
     const feature = data.feature, challenge = await post('danger_begin', { feature });
-    if (challenge.acknowledged) { data.acknowledged = true; pageAccess(true); return true; }
+    if (challenge.acknowledged) { data.acknowledged = true; pageAccess(true); if (data.reload_on_accept) window.location.reload(); return true; }
     find('title').textContent = challenge.title;
     find('body').textContent = challenge.body;
     find('agreement').textContent = challenge.agreement;
@@ -57,6 +57,7 @@
         danger.oncancel = null; danger.onclose = null;
         pageAccess(result || !data.automatic); danger.close(); resolve(result);
         if (!result) window.location.replace('config.php?display=index');
+        else if (data.reload_on_accept) window.location.reload();
       };
       agree.onchange = () => { accept.disabled = !agree.checked || performance.now() < deadline; };
       cancel.onclick = () => cleanup(false);

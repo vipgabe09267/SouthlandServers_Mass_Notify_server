@@ -22,6 +22,16 @@ class PhoneMediaUrlTests(unittest.TestCase):
     def url(self, scheme="https", override=""):
         return notify.phone_media_base_url(self.host, scheme, override)
 
+    def test_scoped_phone_capability_is_exact_and_bounded(self):
+        import base64, configparser, hashlib, hmac
+        config=configparser.ConfigParser();config['visual']={'phone_capabilities':'yes','phone_capability_key':base64.b64encode(b'k'*32).decode()}
+        url=notify.phone_media_url(config,'https://pbx.example.test:8443/sls_mass_notify','fixture.png',now=1800000000)
+        expected=hmac.new(b'k'*32,b'sls-phone-media-v2\nfixture.png\n1800000600\n0000000000000000',hashlib.sha256).hexdigest()
+        self.assertEqual(url,'https://pbx.example.test:8443/sls_mass_notify/fixture.png?sls_exp=1800000600&sls_sig='+expected+'&sls_gen=0000000000000000')
+        with self.assertRaises(ValueError):notify.phone_media_url(config,'https://pbx.example.test','../secret.png')
+        config['visual']['phone_capability_key']='invalid'
+        with self.assertRaises(ValueError):notify.phone_media_url(config,'https://pbx.example.test','fixture.png')
+
     def test_legacy_default_urls_unchanged(self):
         for scheme in ("http", "https"):
             for override in ("", None, {}, [], 8443,

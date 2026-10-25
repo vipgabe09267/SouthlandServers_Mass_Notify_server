@@ -10,7 +10,7 @@ unset($_SESSION['slsmassnotifyserver_scheduling_result']);
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 	$action = (string)($_POST['slsmassnotifyserver_action'] ?? '');
-	$calendarRequest = in_array($action, ['preview_schedule_calendar', 'import_schedule_calendar'], true);
+    $calendarRequest = in_array($action, ['preview_schedule_calendar', 'import_schedule_calendar','preview_programme_calendar'], true);
 	if ($calendarRequest) { \SLS\MassNotify\AdminResponse::requireClearBuffers(); }
 	$respond = static function (array $body, int $status = 200): void {
 		http_response_code($status); header('Content-Type: application/json; charset=UTF-8');
@@ -32,6 +32,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 	if ($calendarRequest) {
 		if (session_status() === PHP_SESSION_ACTIVE) { session_write_close(); }
 		try {
+            if($action==='preview_programme_calendar'){$respond($slsmassnotifyserver->previewProgrammeCalendar($_POST));}
 			if ($action === 'preview_schedule_calendar') { $respond($slsmassnotifyserver->previewScheduleCalendar($_POST)); }
 			require_once __DIR__ . '/ScheduleCalendar.php';
 			if (!is_string($_POST['calendar_text'] ?? null) || !is_string($_POST['calendar_format'] ?? null)) {

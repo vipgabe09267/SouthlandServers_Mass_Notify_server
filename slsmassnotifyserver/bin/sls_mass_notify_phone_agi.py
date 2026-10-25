@@ -16,6 +16,7 @@ if not (library / 'sls_phone_admission.py').is_file():
     library = library / 'sls_mass_notify'
 sys.path.insert(0, str(library))
 from sls_phone_admission import PhoneAdmissionError, PhoneAdmissionStore, PhoneAmi, accountcode, operator_message, read_settings, check_current_outbound, checked_incident_response
+from sls_cluster_guard import labs_enabled
 
 ACK_PROMPT = library / 'external-acknowledgement.wav'
 ACK_PROMPT_SHA256 = '6c3113fd43d1c4fbd0d1a76fcfcddb9ffe9f2549bc084613a35e5cf93d18bb95'
@@ -155,7 +156,7 @@ def handle(mode, agi, store):
             return True
         settings = read_settings(store.directory)
         config = settings.get('enterprise_integrations', {})
-        if (str(config.get('enabled', '0')) != '1'
+        if (not labs_enabled(settings) or str(config.get('enabled', '0')) != '1'
                 or str(config.get('responses', {}).get('enabled', '0')) != '1'):
             agi.set('SLS_PHONE_ALLOW', '1')
             return True
@@ -221,6 +222,8 @@ def handle(mode, agi, store):
         agi.set('SLS_ACK_PROMPT', str(ACK_PROMPT.with_suffix('')))
     elif mode == 'outbound':
         from sls_outbound_routes import validate_route, channel_trunk_options, OutboundRouteError
+        if not re.fullmatch(r'Local/' + re.escape(recipient) + r'@sls-outbound-voice-[a-f0-9]{1,32};2', channel):
+            raise PhoneAdmissionError('phone_outbound_origin_invalid')
         target = store.outbound_target(token, recipient)
         if target['outbound'].get('acknowledgement_required', False): check_ack_prompt()
         settings = read_settings(store.directory)

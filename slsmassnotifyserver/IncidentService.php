@@ -322,9 +322,7 @@ final class IncidentService
     }
     private function counts(array $record): array
     {
-        $counts = ['expected' => count($record['template']['roster']), 'no_response' => 0, 'received' => 0, 'safe' => 0, 'needs_assistance' => 0, 'missing' => 0];
-        foreach ($record['template']['roster'] as $person) { $counts[$record['responses'][$person['id']]['response'] ?? 'no_response']++; }
-        return $counts;
+        return IncidentConfig::responseCounts($record);
     }
     private function summary(array $record): array
     {
@@ -513,6 +511,8 @@ final class IncidentService
                         $record['operations'][$claimed]['escalation_step'] = $step['number'];
                         $record['operations'][$claimed]['escalation_name'] = $step['name'];
                         $record['timeline'][array_key_last($record['timeline'])]['details']['escalation_step'] = $step['number'];
+                        $record['timeline'][array_key_last($record['timeline'])]['details']['condition'] = $step['condition'];
+                        $record['timeline'][array_key_last($record['timeline'])]['details']['human_response_counts'] = $counts;
                     }
                     return $record;
                 });

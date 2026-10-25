@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import fcntl
 import types
 import io
 import json
@@ -774,6 +775,161 @@ def prepare(args):
                       'candidate_version': candidate_data['version'], 'live_trust_changed': False}))
 
 
+def stock_package(module, version, workspace, root, *, packages=None, online=False):
+    name=module+'-'+version+'.tgz.gpg'
+    destination=workspace/name
+    candidates=[destination]
+    if packages is not None:candidates.append(Path(packages)/name)
+    candidates.append(root/'stock-packages'/name)
+    for path in candidates:
+        try:body=TRUST.read(path,TRUST.MAX_ARCHIVE,protected=True)
+        except FileNotFoundError:continue
+        if path!=destination:TRUST.atomic(destination,body)
+        return destination
+    if not online:
+        raise UpgradeError('A verified local '+name+' is required. Use slsconsole reconcile-stock --online while online, or supply its independently signed package with --upstream-packages. Live hashes were not approved.')
+    download('https://mirror.freepbx.org/modules/packages/'+module+'/'+name,destination,TRUST.MAX_ARCHIVE)
+    return destination
+
+
+def cache_stock_packages(workspace, root):
+    """Retain at most two signed package versions per module for offline removal."""
+    folder=root/'stock-packages';TRUST.prepare_root(root);TRUST.prepare_root(folder)
+    pending={}
+    for module in ('dashboard','framework'):
+        for path in workspace.glob(module+'-*.tgz.gpg'):
+            match=re.fullmatch(module+r'-(17\.[0-9]+(?:\.[0-9]+){1,3})\.tgz\.gpg',path.name)
+            if not match:raise UpgradeError('Unsafe stock cache source name')
+            upstream_contents(path,module,match[1],workspace)
+            pending[path.name]=TRUST.read(path,TRUST.MAX_ARCHIVE,protected=True)
+    descriptor=TRUST.directory(folder,protected=True)
+    try:
+        cached={}
+        with os.scandir(descriptor) as entries:
+            for index,entry in enumerate(entries):
+                if index>=6:raise UpgradeError('The stock package cache exceeds its bounded interrupted-update allowance; preserve it for review')
+                match=re.fullmatch(r'(dashboard|framework)-(17\.[0-9]+(?:\.[0-9]+){1,3})\.tgz\.gpg',entry.name)
+                if not match:raise UpgradeError('Unknown stock cache entry; preserve it for review')
+                body=TRUST.read(folder/entry.name,TRUST.MAX_ARCHIVE,protected=True)
+                upstream_contents(folder/entry.name,match[1],match[2],workspace)
+                cached[entry.name]=body
+        for name,body in pending.items():
+            if name in cached and cached[name]!=body:raise UpgradeError('A signed stock version has conflicting cached packages; preserve both for review')
+        keep=set()
+        for module in ('dashboard','framework'):
+            names=[name for name in set(cached)|set(pending) if name.startswith(module+'-')]
+            pointer=root/(module+'.active.json')
+            active=TRUST.load(root,module)[0]['version'] if pointer.exists() or pointer.is_symlink() else None
+            required={module+'-'+active+'.tgz.gpg'} if active else set()
+            required.update(name for name in pending if name.startswith(module+'-'))
+            if len(required)>2:raise UpgradeError('Too many active stock package versions for bounded caching')
+            keep.update(required)
+            for name in sorted(names,key=lambda value:tuple(map(int,value[len(module)+1:-8].split('.'))),reverse=True):
+                if len([item for item in keep if item.startswith(module+'-')])>=2:break
+                keep.add(name)
+        # Pending bytes have already passed independent signature verification.
+        # Retire only reviewed, obsolete packages before adding replacements;
+        # the active installed version always remains in keep.
+        for name in set(cached)-keep:
+            current=TRUST.read(folder/name,TRUST.MAX_ARCHIVE,protected=True)
+            if current!=cached[name]:raise UpgradeError('Stock cache changed during retention; no further recovery files were deleted')
+            os.unlink(name,dir_fd=descriptor)
+        for name,body in pending.items():
+            if name not in cached:TRUST.atomic(folder/name,body)
+        os.fsync(descriptor)
+    finally:os.close(descriptor)
+
+
+def carry_reviewed_overlays(previous, previous_base, candidate):
+    """Carry a reviewed local file only when its independent upstream base did not change."""
+    for name,entry in previous['files'].items():
+        if name in WIDGETS or name==MENU_NAME:continue
+        base=previous_base['files'].get(name)
+        if base==entry:continue
+        replacement=candidate['files'].get(name)
+        if base is None and replacement is None:
+            candidate['files'][name]=copy.deepcopy(entry)
+        elif base is not None and replacement==base:
+            candidate['files'][name]=copy.deepcopy(entry)
+        else:
+            raise UpgradeError('A reviewed local overlay intersects changed upstream source: '+name+'. Preserve it and review the merge independently.')
+
+
+def reconcile_stock(workspace, root, *, web=WEB, packages=None, online=False):
+    """Approve independent current stock plus authenticated SLS overlays, never observed hashes."""
+    TRUST.prepare_root(workspace)
+    sls,contents=authenticated_generation(root)
+    TRUST.check(root,'slsmassnotifyserver',web)
+    approvals={};changed=[];references={}
+    for module in ('dashboard','framework'):
+        previous,_=TRUST.load(root,module);version=identity(web,module)
+        references[module]=TRUST.read(root/(module+'.active.json'),1024,protected=True)
+        if previous['version']==version:
+            approvals[module]=copy.deepcopy(previous)
+        else:
+            package=stock_package(module,version,workspace,root,packages=packages,online=online)
+            stock,source=upstream_contents(package,module,version,workspace)
+            candidate,_=upstream_inventory(stock,source,module,version,contents,contents,web)
+            old_package=stock_package(module,previous['version'],workspace,root,packages=packages,online=online)
+            old_stock,old_source=upstream_contents(old_package,module,previous['version'],workspace)
+            if previous['source'].get('archive_sha256')!=old_source['archive_sha256']:
+                raise UpgradeError('The previous reviewed '+module+' inventory does not identify this signed upstream base; independent review is required')
+            old_base,_=upstream_inventory(old_stock,old_source,module,previous['version'],contents,contents,web)
+            carry_reviewed_overlays(previous,old_base,candidate)
+            approvals[module]=candidate;changed.append(module)
+        issues=compare_stock(approvals[module],approvals[module],web,contents)
+        if issues:
+            write_json(workspace/'review-required.json',{'schema':1,'approved':False,'differences':issues})
+            raise UpgradeError('Unreviewed '+module+' differences remain. Review '+str(workspace/'review-required.json')+'; no active approval was replaced.')
+    # Detect an intervening SLS/stock update before publishing any authority.
+    if authenticated_generation(root)[0]!=sls:raise UpgradeError('SLS changed during stock review; retry without approving new live hashes')
+    for module in approvals:
+        if identity(web,module)!=approvals[module]['version'] or TRUST.read(root/(module+'.active.json'),1024,protected=True)!=references[module]:
+            raise UpgradeError('Stock installation or approval changed during review; retry')
+        if compare_stock(approvals[module],approvals[module],web,contents):raise UpgradeError('Stock files changed during final review; prior authority retained')
+    cache_stock_packages(workspace,root)
+    if authenticated_generation(root)[0]!=sls:raise UpgradeError('SLS changed while retaining recovery packages; prior stock authority retained')
+    TRUST.check(root,'slsmassnotifyserver',web)
+    for module in approvals:
+        if identity(web,module)!=approvals[module]['version'] or TRUST.read(root/(module+'.active.json'),1024,protected=True)!=references[module] or compare_stock(approvals[module],approvals[module],web,contents):
+            raise UpgradeError('Stock files or approvals changed while retaining signed recovery packages; prior authority retained')
+    committed=[]
+    try:
+        for module in changed:
+            path=workspace/(module+'.json');digest=write_json(path,approvals[module]);committed.append(module);TRUST.enroll_reviewed(root,path,digest)
+    except BaseException:
+        failures=[]
+        for module in reversed(committed):
+            try:TRUST.atomic(root/(module+'.active.json'),references[module])
+            except BaseException:failures.append(module)
+        if failures:
+            write_json(workspace/'previous-stock-references.json',{'schema':1,'references':{key:json.loads(value) for key,value in references.items()}})
+            raise UpgradeError('Stock approval rollback was incomplete for '+', '.join(failures)+'. Preserve '+str(workspace)+' for reviewed recovery.')
+        raise
+    return {'ok':True,'changed_modules':changed,'source':'independently_signed_upstream_and_authenticated_overlays','network_allowed':online}
+
+
+def coordination_lock(path, inherited=None):
+    """Join the existing root maintenance fence without replacing its inode."""
+    if not path.is_absolute() or '..' in path.parts:raise UpgradeError('Unsafe stock-reconciliation lock path')
+    for parent in reversed(path.parents):
+        info=parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or (info.st_mode&0o022 and not info.st_mode&stat.S_ISVTX):
+            raise UpgradeError('Unprotected stock-reconciliation lock directory')
+    descriptor=os.dup(inherited) if inherited is not None else os.open(path,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC,0o600)
+    try:
+        opened=os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink!=1 or opened.st_uid!=0 or opened.st_mode&0o077 or opened.st_size:
+            raise UpgradeError('Unsafe stock-reconciliation coordination lock')
+        try:fcntl.flock(descriptor,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:raise UpgradeError('SLS installation or maintenance is active. Retry stock reconciliation after it finishes.') from None
+        current=path.lstat()
+        if (opened.st_dev,opened.st_ino,opened.st_mode,opened.st_uid,opened.st_nlink)!=(current.st_dev,current.st_ino,current.st_mode,current.st_uid,current.st_nlink):
+            raise UpgradeError('Stock-reconciliation coordination lock changed')
+        return descriptor
+    except BaseException:os.close(descriptor);raise
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--workspace', type=Path, required=True)
@@ -784,13 +940,29 @@ def main():
     parser.add_argument('--verify-previous', action='store_true')
     parser.add_argument('--normalize-runtime', action='store_true')
     parser.add_argument('--bootstrap-dashboard-version')
+    parser.add_argument('--cache-stock',action='store_true')
+    parser.add_argument('--reconcile-stock',action='store_true')
+    parser.add_argument('--upstream-packages',type=Path)
+    parser.add_argument('--online',action='store_true',help='Explicitly allow verified FreePBX stock package downloads for reconciliation')
+    parser.add_argument('--coordination-fd',type=int)
+    parser.add_argument('--coordination-lock',type=Path,default=Path('/run/lock/sls-mass-notify-maintenance.lock'))
     args = parser.parse_args()
     if os.geteuid() != 0:
         raise UpgradeError('Upgrade trust preparation requires root')
     TRUST.read(HERE / 'sls_upgrade_trust.py', TRUST.MAX_ARCHIVE, protected=True)
-    if sum(bool(item) for item in (args.verify_previous, args.normalize_runtime, args.bootstrap_dashboard_version)) > 1:
+    if sum(bool(item) for item in (args.verify_previous, args.normalize_runtime, args.bootstrap_dashboard_version,args.cache_stock,args.reconcile_stock)) > 1:
         parser.error('Select only one recovery action')
-    if args.bootstrap_dashboard_version:
+    if (args.online or args.upstream_packages) and not args.reconcile_stock:parser.error('Stock package options require --reconcile-stock')
+    if args.coordination_fd is not None and (not (args.reconcile_stock or args.cache_stock) or not 3<=args.coordination_fd<=65535):parser.error('A stock action requires a valid inherited coordination descriptor')
+    if args.cache_stock:
+        lock=coordination_lock(args.coordination_lock,args.coordination_fd)
+        try:cache_stock_packages(args.workspace,args.trust_root)
+        finally:os.close(lock)
+    elif args.reconcile_stock:
+        lock=coordination_lock(args.coordination_lock,args.coordination_fd)
+        try:print(json.dumps(reconcile_stock(args.workspace,args.trust_root,packages=args.upstream_packages,online=args.online)))
+        finally:os.close(lock)
+    elif args.bootstrap_dashboard_version:
         bootstrap_dashboard(args.workspace, args.bootstrap_dashboard_version)
     elif args.normalize_runtime:
         normalize_previous_runtime(args.workspace)

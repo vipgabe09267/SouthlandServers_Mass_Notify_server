@@ -118,7 +118,7 @@ namespace {
             'tls_cert'=>$directory.'/cert','tls_key'=>$directory.'/key','tls_ca'=>$directory.'/ca',
             'mirror_fields'=>['quiet_hours_start'],'peers'=>$peers]);
         $receipt=['revision'=>\SLS\MassNotify\LabsSafety::revision(),'accepted_at'=>time(),'actor'=>'pbx:deadline-fixture'];
-        $fanoutSettings=['enterprise_cluster'=>$fanoutConfig,'labs_safety'=>['schema'=>1,'receipts'=>['enterprise_cluster'=>$receipt]],
+        $fanoutSettings=['enterprise_labs'=>['enabled'=>true],'enterprise_cluster'=>$fanoutConfig,'labs_safety'=>['schema'=>1,'receipts'=>['enterprise_cluster'=>$receipt]],
             'quiet_hours_start'=>'22:00'];
         $runtime=new \SLS\MassNotify\EnterpriseClusterRuntime($fanoutSettings,$directory.'/unused-journal',str_repeat('e',64),null,
             static fn():array=>$fanoutSettings);

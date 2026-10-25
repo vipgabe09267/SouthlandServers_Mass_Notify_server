@@ -1,0 +1,15 @@
+{
+  "name": "southlandservers/mass-notify-passkeys",
+  "description": "WebAuthn verification for optional local SLS operator authentication",
+  "license": "AGPL-3.0-or-later",
+  "require": {
+    "php": ">=8.2",
+    "web-auth/webauthn-lib": "5.3.9"
+  },
+  "config": {
+    "allow-plugins": {},
+    "platform": {"php": "8.2.35"},
+    "sort-packages": true,
+    "optimize-autoloader": true
+  }
+}

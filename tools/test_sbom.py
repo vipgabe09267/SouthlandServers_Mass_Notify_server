@@ -20,7 +20,9 @@ class InventoryTests(unittest.TestCase):
                              relative + ' must match the current release version and dependency inventory')
         self.assertEqual(a['specVersion'], '1.6')
         lock = json.loads((sbom.ROOT / 'slsmassnotifyserver/identity-libs/composer.lock').read_text())
-        self.assertEqual(len(a['components']), 17 + len(lock['packages']))
+        passkeys=json.loads((sbom.ROOT/'slsmassnotifyserver/passkey-libs/composer.lock').read_text())
+        php_packages={(row['name'],row['version']) for row in lock['packages']+passkeys['packages']}
+        self.assertEqual(len(a['components']),17+len(php_packages))
         by_name = {row['name']: row for row in a['components']}
         self.assertEqual(by_name['chart.js']['version'], '2.9.4')
         self.assertNotIn('moment', by_name)
@@ -29,6 +31,7 @@ class InventoryTests(unittest.TestCase):
         self.assertIn('pkg:npm/color-name@1.1.3', embedded)
         self.assertIn('pkg:npm/color-name@1.1.4', embedded)
         for package in lock['packages']:
+            by_name[package['name']]=next(row for row in a['components'] if row['name']==package['name'] and row['version']==package['version'])
             self.assertEqual(by_name[package['name']]['version'], package['version'])
             self.assertEqual(by_name[package['name']]['properties'][0]['value'], package['source']['reference'])
             properties = {row['name']: row['value'] for row in by_name[package['name']]['properties']}

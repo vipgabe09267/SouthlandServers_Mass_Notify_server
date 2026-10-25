@@ -133,5 +133,71 @@ class InstallerCryptoHelperTest(unittest.TestCase):
         self.assertEqual(self.stage.stat().st_mode & 0o777, 0o700)
 
 
+class InstallerLocalAssetTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="sls-local-release-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        match = re.search(r"^copy_private_release_asset\(\) \{\n.*?^\}",
+                          SOURCE, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(match, "The actual local-asset copy helper is missing.")
+        self.helper = match.group(0)
+
+    def copy(self, source, target, bound=4096):
+        return subprocess.run(
+            ["bash", "-c", self.helper + '\ncopy_private_release_asset "$1" "$2" "$3"',
+             "fixture", str(source), str(target), str(bound)],
+            capture_output=True, text=True, timeout=5)
+
+    def test_missing_asset_has_actionable_error_without_traceback(self):
+        source = self.root / "missing.tgz"
+        target = self.root / "copy.tgz"
+        result = self.copy(source, target)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn(str(source), result.stderr)
+        self.assertIn("SLS_MASS_NOTIFY_TGZ_URL", result.stderr)
+        self.assertIn("release-manifest.json", result.stderr)
+        self.assertIn("SLS_MASS_NOTIFY_SHA256", result.stderr)
+        self.assertFalse(target.exists())
+
+    def test_valid_copy_preserves_source_and_refuses_existing_destination(self):
+        source = self.root / "package.tgz"
+        target = self.root / "copy.tgz"
+        source.write_bytes(b"synthetic authenticated-package workspace fixture")
+        original = source.read_bytes()
+        result = self.copy(source, target)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(target.read_bytes(), original)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(source.read_bytes(), original)
+        target.write_bytes(b"existing destination")
+        result = self.copy(source, target)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(target.read_bytes(), b"existing destination")
+        self.assertEqual(source.read_bytes(), original)
+
+    def test_links_special_files_empty_and_oversized_assets_remain_rejected(self):
+        original = self.root / "original"
+        original.write_bytes(b"preserved")
+        link = self.root / "link"
+        link.symlink_to(original)
+        hardlink = self.root / "hardlink"
+        os.link(original, hardlink)
+        fifo = self.root / "fifo"
+        os.mkfifo(fifo, 0o600)
+        empty = self.root / "empty"
+        empty.touch()
+        oversized = self.root / "oversized"
+        oversized.write_bytes(b"x" * 4097)
+        target = self.root / "copy.tgz"
+        for source in (link, hardlink, fifo, empty, oversized):
+            with self.subTest(source=source.name):
+                result = self.copy(source, target)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(target.exists())
+        self.assertEqual(original.read_bytes(), b"preserved")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

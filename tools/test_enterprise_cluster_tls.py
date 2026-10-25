@@ -83,7 +83,7 @@ def run():
                     'peers':peers,'initial_owner':'node-a','auto_failover':False,'lease_seconds':5,'pbx_contract':pbx,
                     'spend_limit_cents':100,'remote_enabled':role!='witness','site_recipients':[] if role=='witness' else ['device-a'],'offline_cache_enabled':role!='witness',
                     'mirroring_enabled':role=='node','mirror_authority':'node-a','mirror_epoch':mirror_epoch}
-            settings={'enterprise_cluster':config,'labs_safety':{'schema':1,'receipts':{'enterprise_cluster':{'revision':revision,'accepted_at':int(time.time()),'actor':'isolated test'}}}}
+            settings={'enterprise_labs':{'enabled':True},'enterprise_cluster':config,'labs_safety':{'schema':1,'receipts':{'enterprise_cluster':{'revision':revision,'accepted_at':int(time.time()),'actor':'isolated test'}}}}
             parent=base/(identity+'-data'); parent.mkdir(mode=0o700); data=parent/'enterprise-cluster'; data.mkdir(mode=0o700)
             fixture={'settings':settings,'directory':str(data),'boot_id':hashlib.sha256((identity+'-boot').encode()).hexdigest(),
                      'pbx_files':evidence,'port':ports[identity]}

@@ -1,6 +1,10 @@
 # Enterprise Labs device and provider adapters
 
-These opt-in adapters start disabled: `enterprise_integrations.enabled`, every section's `enabled`, and `public_warning.ipaws_enabled` are `"0"`. Settings, credentials and signing material use the existing protected central AES config. Saving and rendering the administrator editor send no device or provider requests. No additional packages are installed by these adapters.
+These opt-in adapters require the default-off `enterprise_labs.enabled` master. Their own `enterprise_integrations.enabled`, section `enabled`, and `public_warning.ipaws_enabled` flags also start disabled. Settings, credentials and signing material use the protected central AES config.
+
+After accepting the timed first-use warning, open **Feature manager**. Check **Enable Enterprise Labs**, choose the tools you need, review the warning at the bottom and agree before saving. The master controls the page's Active/Inactive status. Feature choices apply together; required parent features are selected automatically. Turning Labs off disables the tools while retaining their addresses, credentials and other configuration. Ordinary paging, desktop delivery and operator SSO remain independent.
+
+Prepare profiles and credentials in the page sections before enabling tools that require them. The manager reports missing prerequisites rather than enabling an incomplete adapter. Audio, communications and physical-system categories retain unsaved edits when switching; save those edits before changing feature choices. Explicit meeting/page/door/test operations remain in a separate expandable panel.
 
 The Weather Alerts switch controls NWS delivery and manual Weather tests. Ordinary notifications, enrolled triggers and Labs adapters use their own saved enablement and the SLS runtime switch. Stopping SLS blocks new notifications and physical actuation. Authorized delivery receipts, participant responses, sensor heartbeats, status queries, read-only device telemetry and local CAP validation/export remain available; their current identity and feature permissions still apply. Lightning has its own enablement.
 
@@ -34,7 +38,7 @@ No controller provisioning, schedules or identities are exposed. Command accepta
 
 ## OAuth incident meetings
 
-An administrator selects an incident and supplies a fixed start time, duration and stable request ID. Authorized OAuth access tokens are saved centrally. Initial application registration, consent and token acquisition remain external; SLS supplies no bundled credentials or invitation service.
+An administrator selects an incident and a saved provider account, then supplies a fixed start time, duration and stable request ID. Authorized OAuth access tokens are saved centrally. Initial application registration, consent and token acquisition remain external; SLS supplies no bundled credentials or invitation service.
 
 | Provider | Exact creation contract | Required creation scope |
 | --- | --- | --- |
@@ -44,17 +48,27 @@ An administrator selects an incident and supplies a fixed start time, duration a
 
 Google Meet creates a restricted space; the supplied coordination start/duration do not create a Calendar event. Receipt links are restricted to the provider's HTTPS join hosts. Host-start URLs, host keys and tokens are excluded from receipts. [Zoom creation API](https://developers.zoom.us/docs/api/meetings/), [Meet spaces.create](https://developers.google.com/workspace/meet/api/reference/rest/v2/spaces/create), [Webex meetings](https://developer.webex.com/meeting/docs/meetings)
 
-Optional renewal uses `oauth_refresh_enabled`, `oauth_client_id`, `oauth_client_secret`, `oauth_refresh_token` and absolute Unix timestamp `oauth_expires_at`. Renewal stays disabled until explicitly enabled with complete credentials. Before meeting creation, a configured token expiring within 60 seconds is renewed using the selected provider's fixed HTTPS token endpoint. The response expiry and any rotated refresh token are saved atomically to encrypted configuration. An administrator can also request one explicit renewal. A known expired access token is rejected when renewal is unavailable.
+Save independent renewal profiles at `meetings.oauth_profiles.zoom`, `meetings.oauth_profiles.google_meet` and `meetings.oauth_profiles.webex`. Each profile uses `oauth_refresh_enabled`, `oauth_client_id`, `oauth_client_secret`, `oauth_refresh_token` and absolute Unix timestamp `oauth_expires_at`. Renewal stays disabled until explicitly enabled with complete credentials. Before meeting creation, a configured token expiring within 60 seconds is renewed using the selected provider's fixed HTTPS token endpoint. The response expiry and any rotated refresh token are saved atomically to encrypted configuration. An administrator can also request one explicit renewal. A known expired access token is rejected when renewal is unavailable.
 
-Refresh attempts are durably claimed before contacting the provider. An interrupted or uncertain rotating-token request is not automatically repeated; review the provider authorization and save replacement credentials. Revocation first disables local meeting access and removes its access/refresh tokens. Zoom and Google revocation is then attempted at their documented endpoint; Webex app authorization must be revoked in its provider portal. Provider renewal/revocation and real meeting creation still require account-specific acceptance.
+Refresh attempts are durably claimed before contacting the provider. An interrupted or uncertain rotating-token request is not automatically repeated; review the provider authorization and save replacement credentials. Revocation first removes only the selected account’s local access and renewal credentials; other provider accounts remain available. Zoom and Google revocation is then attempted at their documented endpoint; Webex app authorization must be revoked in its provider portal. Provider renewal/revocation and real meeting creation still require account-specific acceptance.
 
-## ntfy and Gotify notifications
+## ntfy, Gotify and Matrix notifications
 
 `enterprise_integrations.connectors` holds at most 20 saved destinations. Each has `id`, `name`, `enabled`, `provider`, `origin`, `pinned_ipv4`, `token` and `topic`. IDs use `conn_<24 hex>`. Use a self-hosted HTTPS origin, trusted matching certificate, pinned private IPv4 and scoped token. ntfy requires a topic and uses Bearer authentication; Gotify requires an application token in `X-Gotify-Key` and an empty topic. Tokens never enter request URLs or queue snapshots. Public ntfy hosting is not supported by this private-address adapter.
+
+Matrix uses a dedicated bot token and the exact `!room:server` room ID in `topic`. Invite the bot to an unencrypted room on the configured private homeserver. SLS sends plain text with a transaction ID derived from the destination and original event ID; it does not implement Matrix end-to-end encryption or room administration.
+
+An optional per-destination `tls` object accepts `ca_pem` (one to four CA certificates, at most 16 KiB) and `public_key_pin` (`sha256//` followed by the base64 SHA-256 public-key digest). These settings preserve certificate and hostname verification and apply only to that saved destination. They do not change the PBX trust store. Certificate expiry, unsupported libcurl features and pin mismatches fail the request; TLS verification cannot be disabled.
 
 Select explicit saved destinations in Devices and providers, or submit `connector_ids` through an unrestricted named Control API sender. The normal announcement queue freezes each destination's configuration fingerprint and checks current authorization before submission. Changed or disabled destinations cannot receive an old queued alert. Accepted provider message IDs appear in the `connector` delivery row; this is distinct from client display or human receipt. Uncertain submissions are not automatically replayed.
 
 Verified browser Web Push uses the same queued selection flow with `browser_recipient_ids`; its enrollment, encryption and permissions are documented in [Enterprise identity](ENTERPRISE_IDENTITY.md). See [ntfy publication](https://docs.ntfy.sh/publish/) and [Gotify messages](https://gotify.net/docs/pushmsg) for service configuration.
+
+## SIP radio gateways — Labs
+
+Radio integration starts disabled. Configure the gateway as an existing FreePBX PJSIP extension before adding its profile under Enterprise Labs. Up to 25 profiles can identify the gateway, radio channel and maximum audio duration: 5–120 seconds, default 30. Selecting a gateway uses the existing phone admission and audio-delivery path; SLS sends no handset SIP NOTIFY to that endpoint. A queued alert retains its original profile and is rejected if that profile changes before delivery.
+
+For inbound radio paging, use the existing authorized dial-in paging extension and required PIN; this feature creates no unauthenticated radio listener. Configure PTT, radio licensing, channel access and transmit behavior on the gateway. Protocol fixtures cover admission, recipient isolation and duration limits; physical gateway operation and radio airtime require hardware acceptance before enabling this Labs feature.
 
 ## Explicit participant responses
 
@@ -117,8 +131,8 @@ These are the authenticated FreePBX administrator dispatcher actions, using the 
 | Action | Input | Effect |
 | --- | --- | --- |
 | `integrations_labs_send` | `{browser_recipient_ids,connector_ids,title,message,is_test}` | Queues explicitly selected enabled destinations; test defaults true. |
-| `integrations_oauth_refresh` | `{}` | One durably claimed provider renewal. |
-| `integrations_oauth_revoke` | `{}` | Disables local access, clears tokens and attempts supported provider revocation. |
+| `integrations_oauth_refresh` | `{provider:"zoom"|"google_meet"|"webex"}` | One durably claimed provider renewal. |
+| `integrations_oauth_revoke` | `{provider:"zoom"|"google_meet"|"webex"}` | Clears the selected account and attempts supported provider revocation. |
 | `integrations_door` | `{request_id,door_id,operation}` | Saved permitted `read`, `lock`, `unlock` or timed `access`; actuation requires danger acknowledgment. |
 | `integrations_continuity` | `{}` | Configuration-only channel dependencies and local recovery readiness; no network or outage test. |
 | `integrations_report` | `{}` | Bounded active/full-detail evidence plus replay tombstones, without authentication fingerprints. Use protected backup for the complete retained set. |
@@ -142,3 +156,11 @@ php tools/test_enterprise_continuity.php
 ```
 
 These tests use fake provider responses, temporary protected journals, generated fixture certificates, TLS MemoryBIO without sockets, signed SMS fixtures and fake AGI calls. They never send alerts or act on devices. The facade fixture executes actual mainclass CSRF/trigger methods, administrator traits, locked saves, frozen delivery snapshots and IncidentService against temporary storage. Existing SMS, BulkVS, outbound voice, route and phone-admission regressions were also exercised. The isolated real Asterisk playback regression passed with disposable Local calls and synthetic carrier-answer events; it made no external call.
+
+### Model choices and acceptance
+
+Speaker profiles offer documented SIP-capable model choices for Algo, CyberData, Axis, Valcom and AtlasIED. They use the existing registered FreePBX extension and audio queue. Selecting a model does not provision firmware, change credentials or certify audibility. Previously saved model labels are retained for review.
+
+Radio choices include [JPS ACU-Z1](https://jps.com/products/acu-z1/), [Omnitronics IPR110+](https://www.omnitronicsworld.com/radio-over-ip-roip/hardware-roip-gateways/ipr110-roip-gateway/) and [Cubic Vocality RoIP](https://www.cubic.com/support/defense/vocality), plus a generic SIP gateway profile. The vendor documents these SIP interfaces; local hardware qualification remains required. Register the gateway as its own PJSIP extension, configure auto-answer/PTT and a radio-side transmit timeout, and test with RF disabled first. The channel label is descriptive; SLS does not retune the radio.
+
+All three meeting access tokens can be saved simultaneously. Creation accepts an optional `provider` field; omitting it preserves the legacy selected-provider behavior. Existing flat renewal settings migrate to that provider’s profile. Secret fields are redacted in browser/API state; leaving a replacement field blank preserves its saved credential. Remove controls clear only the named account. Save edits before renewing, removing or querying a saved device.

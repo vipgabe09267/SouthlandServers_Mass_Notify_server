@@ -5,15 +5,45 @@ require_once __DIR__.'/api/sls-mass-notify/security.php';
 /** Read-only observations; no repair, notification, clock or service changes. */
 final class SlsDeploymentReadiness
 {
-    public static function snapshot(string $path): array
+    private const RUNTIME_CODES = [
+        'Central config'=>'central_config', 'Central config loader'=>'central_config_loader',
+        'SIP NOTIFY sender'=>'sip_notify_sender', 'NWS poller'=>'weather_observer',
+        'Weather scheduler'=>'weather_scheduler', 'Weather delivery worker'=>'weather_worker',
+        'Announcement scheduler'=>'announcement_scheduler', 'General announcement worker'=>'announcement_worker',
+        'Phone admission and outcome collector'=>'phone_collector', 'Xweather poller'=>'lightning_observer',
+        'Branded email sender'=>'email_sender', 'Branded Discord sender'=>'discord_sender',
+        'Notification destination dispatcher'=>'destination_dispatcher', 'System/error email notifier'=>'fault_email',
+        'Weather zone status helper'=>'weather_status', 'Weather cross-zone delivery coordinator'=>'weather_deduplication',
+        'Maintenance worker'=>'maintenance_worker', 'Piper binary'=>'speech_binary',
+        'Executable runtime ownership'=>'runtime_permissions', 'Piper voice'=>'speech_voice',
+        'Notification log'=>'notification_log', 'Desktop journal'=>'desktop_journal',
+        'Local email transport'=>'local_mail', 'Postfix service and queue'=>'postfix_service', 'Storage and delivery monitor'=>'storage_monitor', 'Control API'=>'control_api',
+        'Storage free-space measurement'=>'storage_measurement', 'External delivery queue'=>'external_queue',
+        'Weather delivery queue'=>'weather_queue',
+    ];
+
+    public static function runtimeCode(array $check): string
     {
+        if (is_string($check['code'] ?? null) && preg_match('/^[a-z][a-z0-9_]{0,63}$/D', $check['code'])) {
+            return $check['code'];
+        }
+        foreach (self::RUNTIME_CODES as $label=>$code) {
+            if (($check['label'] ?? null) === _($label)) { return $code; }
+        }
+        // Unknown legacy checks remain visible, but cannot acquire a misleading
+        // stable identity from a translated label or their position in a list.
+        return 'unclassified_runtime_check';
+    }
+    public static function snapshot(string $path,int $maximum=65536): array
+    {
+        if($maximum<1||$maximum>4194304){return ['error'=>'invalid_limit'];}
         clearstatcache(true, $path);
         $named = @lstat($path);
         if ($named === false) { return ['error'=>'missing']; }
         $runtime=function_exists('posix_getpwnam')?posix_getpwnam('asterisk'):false;
         $owners=array_values(array_unique([0,function_exists('posix_geteuid')?posix_geteuid():-1,is_array($runtime)?$runtime['uid']:-1]));
         $safe=static fn($meta): bool=>is_array($meta)&&($meta['mode']&0170000)===0100000&&$meta['nlink']===1
-            && !($meta['mode']&0037)&&in_array($meta['uid'],$owners,true)&&$meta['size']<=65536;
+            && !($meta['mode']&0037)&&in_array($meta['uid'],$owners,true)&&$meta['size']<=$maximum;
         $parent=@lstat(dirname($path));
         if (!$safe($named) || !$parent || ($parent['mode']&0170000)!==0040000 || ($parent['mode']&0022)
             || !in_array($parent['uid'],$owners,true) || realpath(dirname($path))!==dirname($path) || realpath($path) !== $path) {
@@ -28,13 +58,13 @@ final class SlsDeploymentReadiness
                 return ['error'=>'changed'];
             }
             if (!flock($handle, LOCK_SH | LOCK_NB)) { return ['error'=>'busy']; }
-            $raw = stream_get_contents($handle, 65537);
+            $raw = stream_get_contents($handle, $maximum+1);
             $after=fstat($handle);clearstatcache(true, $path); $current = @lstat($path);
             foreach(['dev','ino','mode','uid','gid','nlink','size','mtime','ctime'] as $field){
                 if(!$safe($after)||!$safe($current)||$named[$field]!==$opened[$field]
                     ||$opened[$field]!==$after[$field]||$after[$field]!==$current[$field]){return ['error'=>'changed'];}
             }
-            if (!is_string($raw) || strlen($raw) > 65536) { return ['error'=>'oversized']; }
+            if (!is_string($raw) || strlen($raw) > $maximum) { return ['error'=>'oversized']; }
             $data = \SLS\MassNotify\ApiSecurity::jsonObject($raw,false,32);
             return ['data'=>$data];
         } catch (\Throwable $error) { return ['error'=>'invalid']; }
@@ -53,7 +83,8 @@ final class SlsDeploymentReadiness
 
     public static function check(string $id, string $label, string $state, string $detail): array
     {
-        return ['id'=>$id, 'label'=>$label, 'state'=>$state, 'detail'=>$detail];
+        return ['id'=>$id, 'code'=>$id, 'label'=>$label, 'state'=>$state, 'detail'=>$detail,
+            'reason_code'=>$state === 'ok' ? 'healthy' : ($state === 'unknown' ? 'verification_unavailable' : 'attention_required')];
     }
 
     public static function heartbeat(string $id, string $label, array $snapshot, int $maximumAge, int $now): array

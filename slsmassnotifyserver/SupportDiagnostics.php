@@ -24,13 +24,22 @@ trait SlsSupportDiagnostics
     {
         require_once __DIR__ . '/DeploymentReadiness.php';
         $now = time(); $checks = []; $settings = $this->getActiveSettings();
+        require_once __DIR__.'/api/sls-mass-notify/runtime-security.php';
+        $phpSecurity = \SLS\MassNotify\PhpSecurityPolicy::evaluate(PHP_VERSION);
+        $checks[] = SlsDeploymentReadiness::check('php_security', _('PHP security updates'), $phpSecurity['ok'] ? 'ok' : 'warning',
+            $phpSecurity['ok'] ? sprintf(_('PHP %s meets the reviewed security floor.'), PHP_VERSION)
+                : ($phpSecurity['minimum'] !== ''
+                    ? sprintf(_('PHP %s requires %s or a newer security update on the same branch. Update through trusted vendor packages and reload the affected PHP workers.'), PHP_VERSION, $phpSecurity['minimum'])
+                    : _('This PHP build needs independent vendor security review; it is outside the reviewed policy.')));
         // Monitoring does not need a live AMI device scan. Existing diagnostics
         // and bounded snapshots remain useful when maintenance has stopped.
         $summary = $this->getDiagnosticsSummary(false);
         foreach (array_slice((array)($summary['checks'] ?? []), 0, 64) as $index => $check) {
             if (!is_array($check)) { continue; }
-            $checks[] = SlsDeploymentReadiness::check('runtime_' . $index, (string)($check['label'] ?? ''),
+            $runtimeCheck = SlsDeploymentReadiness::check('runtime_' . $index, (string)($check['label'] ?? ''),
                 ($check['ok'] ?? false) === true ? 'ok' : 'warning', (string)($check['detail'] ?? ''));
+            $runtimeCheck['code'] = SlsDeploymentReadiness::runtimeCode($check);
+            $checks[] = $runtimeCheck;
         }
         $storage = SlsDeploymentReadiness::snapshot(self::PLUGIN_DATA_DIR . '/storage-summary.json');
         $checks[] = SlsDeploymentReadiness::heartbeat('maintenance', _('Maintenance heartbeat'), $storage, 300, $now);
@@ -46,7 +55,7 @@ trait SlsSupportDiagnostics
         $checks = array_merge($checks, $this->automationDependencyChecks($settings));
         $attention = count(array_filter($checks, static function ($check) { return $check['state'] === 'warning'; }));
         $unknown = count(array_filter($checks, static function ($check) { return $check['state'] === 'unknown'; }));
-        $report = ['schema'=>'sls-deployment-readiness-v1', 'generated_at'=>gmdate('c'), 'version'=>self::MODULE_VERSION,
+        $report = ['schema'=>'sls-deployment-readiness-v1', 'check_schema_version'=>2, 'generated_at'=>gmdate('c'), 'version'=>self::MODULE_VERSION,
             'operational_ready'=>$attention === 0 && $unknown === 0,
             'attention_count'=>$attention, 'unknown_count'=>$unknown, 'checks'=>$checks,
             'verification_scope'=>_('Read-only local PBX checks. Test the advertised address from a desktop to verify external routing. Handset display, complete audio playback and enabled provider delivery need separate device or provider acceptance tests.')];
@@ -92,7 +101,7 @@ trait SlsSupportDiagnostics
             'Branded email sender', 'Branded Discord sender', 'Notification destination dispatcher',
             'System/error email notifier', 'Weather zone status helper', 'Weather cross-zone delivery coordinator',
             'Maintenance worker', 'Piper binary', 'Executable runtime ownership', 'Piper voice',
-            'Notification log', 'Desktop journal', 'Local email transport', 'Control API',
+            'Notification log', 'Desktop journal', 'Local email transport', 'Postfix service and queue', 'Storage and delivery monitor', 'Control API',
             'Storage free-space measurement', 'External delivery queue', 'Weather delivery queue'];
         try {
             $summary = $this->getDiagnosticsSummary();
@@ -161,6 +170,15 @@ trait SlsSupportDiagnostics
                     'complete'=>($row['complete']??false)===true];
             }
         } catch (\Throwable $error) { $report['queue_counts_available'] = false; }
+        require_once __DIR__.'/Monitoring.php';
+        $snapshot=SlsDeploymentReadiness::snapshot(self::PLUGIN_DATA_DIR.'/support-snapshot.json');
+        $report['runtime_environment']=\SLS\MassNotify\Monitoring::report($snapshot);
+        $recovery=$snapshot['data']['installer_transactions']??[];
+        $report['installer_recovery']=['complete'=>($recovery['complete']??false)===true,'counts'=>[]];
+        foreach(['preparing','prepared','mutating','recovering','recovery_failed','committed','rolled_back','abandoned'] as $phase){
+            $value=$recovery['counts'][$phase]??null;
+            if(is_int($value)&&$value>=0&&$value<=256){$report['installer_recovery']['counts'][$phase]=$value;}
+        }
         return $report;
     }
 }

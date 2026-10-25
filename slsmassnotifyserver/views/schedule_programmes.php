@@ -22,4 +22,4 @@ $programmeEscape = static fn($value)=>htmlspecialchars((string)$value, ENT_QUOTE
     </div>
 </details>
 <script type="application/json" id="sls-programme-data"><?php echo json_encode(['settings'=>$programmeSettings, 'timezone'=>$timezoneName], JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_THROW_ON_ERROR); ?></script>
-<script><?php readfile(__DIR__.'/schedule_programmes.js'); ?></script>
+<script><?php readfile(__DIR__.'/programme_visual_calendar.js'); readfile(__DIR__.'/schedule_programmes.js'); ?></script>

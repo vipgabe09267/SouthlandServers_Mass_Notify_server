@@ -25,6 +25,14 @@ $dialplan=new DialplanGeneration();$module->doDialplanHook($dialplan,'asterisk',
 $pairs=array_map(static fn($row)=>array_slice($row,0,2),$dialplan->entries);
 if (!in_array(['sls-live-paging','799'],$pairs,true) || !in_array(['ivr-2','799'],$pairs,true) || in_array(['ivr-1','799'],$pairs,true)
     || !in_array(['from-internal-additional','sls-live-paging'],$dialplan->includes,true) || $module->prepared!==$module->pending) { throw new RuntimeException('Pending paging settings did not generate the selected internal/IVR routes.'); }
+$ready=array_values(array_filter($dialplan->entries,static fn($row)=>$row[0]==='sls-live-paging-ready'));
+if(count($ready)!==2 || $ready[0][1]!=='s' || $ready[1][1]!=='s'
+    || get_class($ready[0][2])!==extension::class || get_class($ready[1][2])!==extension::class
+    || $ready[0][2]->arguments!==['AGI(/fixture/runtime/sls_mass_notify_live_paging.php,--ready)']
+    || $ready[1][2]->arguments!==['StopPlayTones()']) {
+    throw new RuntimeException('Caller-ready menu context must invoke the fixed AGI, stop its tone last, and fall through without consuming the IVR/Gosub stack.');
+}
+foreach($dialplan->includes as $include){if($include[1]==='sls-live-paging-ready'){throw new RuntimeException('Caller-ready callback was exposed through a general dialplan include.');}}
 $module->active=$module->pending;$module->pending=['live_paging'=>array_replace(\SLS\MassNotify\LivePagingConfig::defaults(),['enabled'=>'0'])];
 $dialplan=new DialplanGeneration();$module->doDialplanHook($dialplan,'asterisk',500);
 if ($dialplan->entries) { throw new RuntimeException('Pending disable kept the old active paging route.'); }

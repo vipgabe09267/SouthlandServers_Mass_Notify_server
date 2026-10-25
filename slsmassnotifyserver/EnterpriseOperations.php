@@ -235,11 +235,19 @@ trait SlsEnterpriseOperations
             $this->releaseNativeBackupFileLock($activity);
         }
     }
-    public function enterpriseOperationsState(): array
+    public function enterpriseOperationsPeople(): array
     {
         $this->assertEnterpriseAdministrator();$settings=$this->getActiveSettings();
         $people=[];foreach($this->operatorDirectory()['accounts'] as $p){if(!empty($p['administrator'])){$people[]=['id'=>'pbx:'.$p['username'],'name'=>$p['username'].' · FreePBX'];}}
         foreach(OperatorAccess::normalize($settings['operator_access']??[])['accounts'] as $p){if($p['enabled']){$people[]=['id'=>$p['id'],'name'=>$p['name'].' · '.$p['username']];}}
+        return $people;
+    }
+    public function enterpriseOperationsState(): array
+    {
+        $this->assertEnterpriseAdministrator();$settings=$this->getActiveSettings();
+        // Account eligibility is expensive on large PBXs. It is queried only
+        // when an administrator opens an editor that actually needs people.
+        $people=[];
         $cfg=EnterpriseOperationsConfig::normalize($settings['enterprise_operations']??[]);
         $incidents=[];
         if($cfg['enabled']&&$cfg['floorplans']['enabled']){

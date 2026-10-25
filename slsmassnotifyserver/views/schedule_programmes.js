@@ -45,12 +45,24 @@
                 fields[col.key] = input; cell.append(input); row.append(cell);
             });
             const record = {row, fields}; const cell = node('td');
-            const remove = button('', 'fa-times', ()=>{ records.splice(records.indexOf(record),1); row.remove(); });
+            const remove = button('', 'fa-times', ()=>{ records.splice(records.indexOf(record),1); row.remove(); parent.dispatchEvent(new CustomEvent('sls-programme-draft-change',{bubbles:true})); });
             remove.setAttribute('aria-label', 'Remove ' + title.toLowerCase() + ' row'); cell.append(remove); row.append(cell);
-            records.push(record); body.append(row);
+            records.push(record); body.append(row);return record;
         }
         (initial || []).forEach(add); parent.append(button('Add ' + title.toLowerCase(), 'fa-plus', ()=>add({})));
-        return ()=>records.map((record)=>Object.fromEntries(Object.entries(record.fields).map(([key,input])=>[key,input.value.trim()])));
+        const read=()=>records.map((record)=>Object.fromEntries(Object.entries(record.fields).map(([key,input])=>[key,input.value.trim()])));
+        read.canUpsert=(key,value)=>records.some(record=>record.fields[key]?.value===value)||records.length<limit;
+        read.upsert=(key,value,row)=>{
+            if(!read.canUpsert(key,value))throw Error(title+' supports at most '+limit+' dates. Remove an unused row first.');
+            const record=records.find(record=>record.fields[key]?.value===value)||add(row);
+            for(const [field,value] of Object.entries(row))if(record.fields[field])record.fields[field].value=value;
+            parent.dispatchEvent(new CustomEvent('sls-programme-draft-change',{bubbles:true}));
+        };
+        read.remove=(key,value)=>{
+            for(let i=records.length-1;i>=0;i--)if(records[i].fields[key]?.value===value){records[i].row.remove();records.splice(i,1);}
+            parent.dispatchEvent(new CustomEvent('sls-programme-draft-change',{bubbles:true}));
+        };
+        return read;
     }
     function empty() { document.getElementById('sls-programme-empty').hidden = entries.length > 0; }
     function create(value) {
@@ -70,20 +82,23 @@
             input.checked = (value.calendar && value.calendar.weekdays || [1,2,3,4,5]).includes(index+1);
             wrap.append(input, document.createTextNode(' ' + label)); days.append(wrap); dayInputs.push(input);
         }); editor.append(days);
-        const holidays = table(editor, 'Holiday ranges', [{key:'start',label:'First date',type:'date'},{key:'end',label:'Last date',type:'date'},{key:'reason',label:'Reason',type:'text',required:false}], value.calendar && value.calendar.exclusions,100);
-        const replacements = table(editor, 'Whole-day substitutions', [{key:'date',label:'Date',type:'date'},{key:'day_type',label:'Day type, or empty to skip',type:'text',required:false}],value.date_types,100);
-        const timeChanges = table(editor, 'Time overrides', [{key:'date',label:'Date',type:'date'},{key:'time',label:'Replacement time',type:'time'},{key:'reason',label:'Reason',type:'text',required:false}],value.calendar && value.calendar.overrides,100);
+        const advanced=node('details');advanced.append(node('summary','Date and exception lists'));editor.append(advanced);
+        const holidays = table(advanced, 'Holiday ranges', [{key:'start',label:'First date',type:'date'},{key:'end',label:'Last date',type:'date'},{key:'reason',label:'Reason',type:'text',required:false}], value.calendar && value.calendar.exclusions,100);
+        const replacements = table(advanced, 'Whole-day substitutions', [{key:'date',label:'Date',type:'date'},{key:'day_type',label:'Day type, or empty to skip',type:'text',required:false}],value.date_types,100);
+        const timeChanges = table(advanced, 'Time overrides', [{key:'date',label:'Date',type:'date'},{key:'time',label:'Replacement time',type:'time'},{key:'reason',label:'Reason',type:'text',required:false}],value.calendar && value.calendar.overrides,100);
         const id = value.id || 'cal_' + Array.from(crypto.getRandomValues(new Uint8Array(12)),(b)=>b.toString(16).padStart(2,'0')).join('');
         const entry = {card, value:()=>({id,name:name.value.trim(),timezone:zone.value.trim(),cycle_start:start.value,cycle_mode:mode.value,
             day_types:types.value.split(',').map((v)=>v.trim()).filter(Boolean),date_types:replacements(),
             calendar:{until:end.value,weekdays:dayInputs.filter((i)=>i.checked).map((i)=>Number(i.value)),exclusions:holidays(),overrides:timeChanges()}})};
+        const visual=slsProgrammeVisualCalendar(editor,entry.value,replacements,timeChanges,form.elements.slsmassnotifyserver_csrf.value);
+        editor.insertBefore(visual,advanced);
         editor.append(node('p','Shared calendars do not edit dates already saved in schedules. Reopen affected schedules and review their new dates.','sls-programme-notice'));
         editor.append(button('Remove calendar','fa-trash-o',()=>{if (!window.confirm('Remove this shared calendar? Existing schedules keep their saved dates.')) return; entries.splice(entries.indexOf(entry),1);card.remove();empty();}));
         card.append(summary,editor); list.append(card); entries.push(entry); card.open = !value.id; empty();
     }
     boot.settings.calendars.forEach(create); empty();
     document.getElementById('sls-programme-add').addEventListener('click',()=>create({}));
-    form.addEventListener('invalid',function(event){var panel=event.target.closest('details');if(panel)panel.open=true;},true);
+    form.addEventListener('invalid',function(event){let panel=event.target.closest('details');while(panel){panel.open=true;panel=panel.parentElement?.closest('details');}},true);
     form.addEventListener('submit',()=>{
         document.getElementById('sls-programmes-json').value = JSON.stringify({schema:1,enabled:document.getElementById('sls-programmes-enabled').checked,calendars:entries.map((entry)=>entry.value())});
     });

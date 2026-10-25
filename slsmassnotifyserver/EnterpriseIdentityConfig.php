@@ -78,11 +78,14 @@ final class EnterpriseIdentityConfig
         if (!is_array($providers) || !array_is_list($providers) || count($providers)>10) { throw new \DomainException('Configure at most ten enterprise providers.'); }
         foreach ($providers as $row) {
             $allowed=['id','vendor','protocol','name','enabled','issuer','callback_url','discovery_url','client_id','client_secret','token_auth','endpoint_hosts','private_endpoint_pins','hosted_domain',
-                'idp_sso_url','idp_signing_certificates','sp_entity_id','sp_certificate','sp_private_key','nameid_format'];
+                'idp_sso_url','idp_signing_certificates','sp_entity_id','sp_certificate','sp_private_key','nameid_format','tls'];
             if (!is_array($row) || array_diff(array_keys($row),$allowed) || !is_string($row['id']??null) || !preg_match('/^idp_[a-f0-9]{24}$/D',$row['id']) || isset($seen[$row['id']])
                 || !in_array($row['vendor']??'',self::VENDORS,true) || !in_array($row['protocol']??'',['oidc','saml'],true) || !is_bool($row['enabled']??false)) { throw new \DomainException('An enterprise provider has invalid identity or protocol fields.'); }
             $p=['id'=>$row['id'],'vendor'=>$row['vendor'],'protocol'=>$row['protocol'],'name'=>self::text($row['name']??'',80,'Provider name'),
                 'enabled'=>$row['enabled']??false,'issuer'=>self::text($row['issuer']??'',2048,'Exact issuer'),'callback_url'=>self::url($row['callback_url']??'','Callback URL')];
+            require_once __DIR__.'/ScopedTls.php';$tls=ScopedTls::normalize($row['tls']??[]);
+            if($tls&&$p['protocol']!=='oidc'){throw new \DomainException('Scoped TLS trust applies to OIDC server requests. SAML browser connections use the browser trust store.');}
+            if($tls){$p['tls']=$tls;}
             if (!str_ends_with($p['callback_url'],'/mass-notify/sso.php')) { throw new \DomainException('Register a callback ending /mass-notify/sso.php.'); }
             if ($p['protocol']==='oidc') {
                 $p['issuer']=self::url($p['issuer'],'OIDC issuer');self::hostname(parse_url($p['issuer'],PHP_URL_HOST),'OIDC issuer hostname');

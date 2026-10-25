@@ -1,12 +1,12 @@
 # SLS Mass Notifications Control API
 
-This document describes the unpublished `0.1.7-beta` candidate API. Its changes are additive
+This document describes the published `0.1.8-beta` API. Its changes are additive
 to the existing routes and authentication. Notification payload schema **1** and
 desktop SSE protocol **2** are retained. Features marked **Labs** in the module
 need acceptance with the actual devices, providers and desktop client before
 operational use.
 
-The candidate adds bounded pre-authentication admission and sampled rejection
+`0.1.8-beta` adds bounded pre-authentication admission and sampled rejection
 auditing. Successful and attributable authenticated operations retain individual
 audit records. Anonymous rejection bursts cannot launch one audit process per
 request; busy admission returns a retryable response.
@@ -125,18 +125,19 @@ them with saved IDs from your own PBX.
 
 | Resource | Query fields | Requirements and result |
 | --- | --- | --- |
-| `status` | None | `read`; restricted credentials receive only whether Control API access is enabled |
-| `capabilities` | None | `read`; available actions/resources, scopes, schema/protocol versions, body/page limits and endpoint paths |
+| `status` | None | `read` or `monitor`; restricted credentials receive only whether Control API access is enabled |
+| `capabilities` | None | Any named read-capable scope; available actions/resources, scopes, schema/protocol versions, body/page limits and endpoint paths |
 | `audiences` | None | `read`; permitted saved IDs/names, desktop usernames and configured phone targets; no external numbers, mail addresses, webhook URLs or credentials |
 | `delivery` | `job_id` | `read`; announcement state and independent channel receipts; restricted credentials see only their own jobs |
 | `events` | Optional `limit`, `cursor` | Unrestricted `read`; bounded newest-first operational history |
-| `readiness` | None | Unrestricted `read`; deployment readiness checks; no alert is sent |
-| `desktop_fleet` | None | Unrestricted `read`; saved fleet, recent authenticated activity and client-reported versions/protocols |
+| `metrics` | Optional `format=json` or `prometheus` | `monitor` or `read`; bounded cached numeric telemetry, no names, addresses or message content |
+| `readiness` | None | Unrestricted `read` or narrow `monitor`; deployment readiness checks; no alert is sent |
+| `desktop_fleet` | None | Unrestricted `read` or narrow `fleet_read`; saved fleet, recent authenticated activity and client-reported versions/protocols |
 | `config` | None | Unrestricted `read` and `config`; secret-redacted active configuration and whether staged changes exist |
-| `incidents` | Optional `limit`, `cursor`, `archived=0` or `1` | Unrestricted `read`; incident list, with separate archived view |
-| `incident` | `incident_id` | Unrestricted `read`; incident record, timeline and response state |
-| `incident_report` | `incident_id`, optional `job_offset`, `revision` | Unrestricted `read`; paginated report with live job evidence |
-| `recordings` | Optional `query`, `offset`, `limit` | Unrestricted `read` and `config`; bounded System Recording catalogue and scan-completeness evidence |
+| `incidents` | Optional `limit`, `cursor`, `archived=0` or `1` | Unrestricted `read` or unrestricted `incident_read`; incident list, with separate archived view |
+| `incident` | `incident_id` | Unrestricted `read` or unrestricted `incident_read`; incident record, timeline and response state |
+| `incident_report` | `incident_id`, optional `job_offset`, `revision` | Unrestricted `read` or unrestricted `incident_read`; paginated report with live job evidence |
+| `recordings` | Optional `query`, `offset`, `limit` | Unrestricted `config`; bounded System Recording catalogue and scan-completeness evidence |
 | `enterprise_capabilities` | None | Named `read`; enabled Labs capability booleans and supported contracts; no credentials or integration configuration |
 | `incident_templates` | None | Named `read`; templates whose primary, shifted and escalation audiences all fit this credential |
 
@@ -152,6 +153,7 @@ routing; it is not a complete PJSIP registration inventory or a delivery promise
 | --- | --- | --- |
 | `send_announcement` | `send` | Submit one immutable announcement using saved/authorized recipients |
 | `preview_announcement` | `send` | Resolve and validate recipients/options; return a preview without creating a delivery job or submitting any channel |
+| `rehearse_announcement` | `send` | Resolve current permissions through the no-delivery preview branch, then return explicitly synthetic channel outcomes. No queued job, publication, audio or provider request |
 | `retry_announcement` | `send` | Deliberately retry eligible confirmed failures for an existing `job_id` |
 | `test_nws`, `trigger_nws_test` | `test` | Start a marked Weather test using current permitted zone routing |
 | `get_config` | `config` | Return the same redacted active configuration as the GET resource |
@@ -195,6 +197,7 @@ not prove audio synthesis, provider availability or physical delivery.
 | `tts_volume` | Optional integer 1–200; 100 represents the configured nominal amplitude |
 | `is_test` | Explicit boolean; marks the announcement as a test without inferring intent from its wording |
 | `preview` | Optional boolean equivalent to previewing this request; `preview_announcement` always forces preview |
+| `simulation` | `rehearse_announcement` only: optional object with `default` and per-channel `channels` outcomes. Choose `accepted`, `refused`, `uncertain`, `unavailable` or `expired` |
 
 The `options` object accepts `style`, `image`, `title`, `background_color`,
 `audio_mode`, `opening_tone`, `closing_tone`, `priority`, `desktop_all`,
@@ -237,6 +240,29 @@ curl --fail-with-body --silent --show-error \
 ```
 
 ### Submit and inspect delivery
+
+For an inert failure rehearsal, select permitted recipients and set
+`"action":"rehearse_announcement"`:
+
+```json
+{
+  "action": "rehearse_announcement",
+  "message": "Reviewed test message",
+  "targets": ["1000"],
+  "audio_mode": "tones_tts",
+  "is_test": true,
+  "simulation": {
+    "default": "accepted",
+    "channels": {"audio": "unavailable", "sms": "uncertain"}
+  }
+}
+```
+
+`rehearsal.simulated_receipts` contains synthetic outcomes for up to 5,000 channel
+destinations. It has no delivery event or job IDs and is never stored as real
+receipt history. Offline phones stay unavailable even in an acceptance scenario.
+No live provider, handset playback or retry implementation is qualified by this
+planning rehearsal. The dashboard provides the same controls under Delivery rehearsal.
 
 Submitting this example sends to the selected saved recipients. Run it only
 against an authorized test audience after replacing its placeholder IDs.
@@ -441,6 +467,9 @@ handling. Review [SMS.md](SMS.md) for setup, consent, budgets, MMS and limitatio
 
 ## Desktop compatibility
 
+Desktop transport preferences, PHP-FPM fallback, SSE capability fields and the
+unchanged-poll response are documented in [Desktop readiness](DESKTOP_READINESS.md#transport-negotiation).
+
 The desktop API retains existing HTTPS Basic authentication, paths, payload schema
 1 and SSE protocol 2. SSE `notification` IDs match the published event's ID.
 SSE heartbeat activity is sent approximately every 15 seconds, and disconnected
@@ -532,7 +561,7 @@ using the workflow for operational alerts.
 
 These additions preserve notification payload schema 1, SSE protocol 2 and existing endpoint paths. Every new feature starts disabled. Only the FreePBX administrator panel can activate Labs namespaces or acknowledge dangerous features; `update_config` cannot do so.
 
-Discover `?resource=enterprise_capabilities` and `?resource=incident_templates` using a named `read` credential. The template list filters every primary, active-shift and escalation audience. Launch requires the same current named credential with `send`, enabled incident coordination and a fresh immutable request identifier:
+Discover `?resource=enterprise_capabilities` and `?resource=incident_templates` using a named `read` credential. `features.enterprise_labs` reports the saved master switch; dependent feature booleans are false when it is off. Operator SSO remains independent. API keys cannot change the master or acknowledge its warning; use Feature manager in the FreePBX administrator panel. The template list filters every primary, active-shift and escalation audience. Launch requires the same current named credential with `send`, enabled Labs and incident coordination, and a fresh immutable request identifier:
 
 ```json
 {
@@ -576,7 +605,7 @@ curl --fail-with-body 'https://pbx.example.org/api/sls-mass-notify/' \
 
 ## Recording catalogue
 
-An unrestricted credential with both `read` and `config` scopes can read
+An unrestricted credential with `config` scope can read
 `?resource=recordings&query=evacuation&offset=0&limit=100`. Limits are 1–500 rows
 and offsets 0–5000. The response includes `items`, `total`, `has_more`,
 `next_offset`, `scan_complete`, `truncated`, `observed_at` and `warning`.
@@ -629,3 +658,74 @@ Shared calendar definitions use `schedule_programmes` in the same encrypted
 configuration; schedules freeze their calendar snapshot at review/save time.
 Reviewed incident locale preferences and translated update inputs are documented
 in [the incident API](INCIDENT_API.md).
+
+## 0.1.8 additive contracts
+
+Machine-readable descriptions are provided in [openapi.json](openapi.json) and
+[notification.schema.json](schemas/notification.schema.json). Action/resource
+discovery is generated from the same scope checks used by the server. Detailed
+action options remain documented above and validated by the server; accepting
+additional properties in a description does not grant authority or permit
+unknown server options.
+
+### Named-key lifecycle and read scopes
+
+Administrators can set an absolute expiry, disable a key, revoke it, or rotate
+its secret. Rotation overlap is explicit and bounded to 86,400 seconds; zero
+ends the old credential immediately. Current enabled state, expiry and audience
+authority are checked again before queued work. An expired original key cannot
+be revived by its successor. Last-used values are sampled operational evidence,
+not an exact login or billing ledger. Legacy keys keep their original scopes.
+
+`monitor` reads status, stable-code readiness and cached metrics. `fleet_read`
+reads the reduced fleet projection. `incident_read` requires an unrestricted
+audience and reads incident data. These scopes do not grant configuration, send
+or test authority. `capabilities` is available to discover the named key's own
+contracts. No Control API key authenticates a FreePBX or operator-portal login.
+
+```bash
+curl --fail-with-body --silent --show-error \
+  -H "Authorization: Bearer $SLS_API_KEY" \
+  'https://pbx.example.test/api/sls-mass-notify/?resource=metrics&format=prometheus'
+```
+
+Readiness schema 2 preserves existing fields and adds stable check codes, age,
+reason and remediation. A missing or stale observation is not a healthy result.
+Metrics and support exports use a bounded maintenance snapshot and never start a
+repair or contact devices during a dashboard render.
+
+### Cursor polling and authenticated images
+
+Consumers must drain `has_more` pages using each returned `last_event_id` before
+waiting for the next poll. Retain original IDs, timestamps and absolute expiry.
+Establish a fresh baseline after disconnection or sleep; do not replay history.
+An optional returned `ETag` can be sent as `If-None-Match` with that exact cursor.
+The authenticated unchanged response is HTTP 200 with an empty `events` array
+and `unchanged:true`, never a cached HTTP 304. Authentication and revocation are
+still checked. The signed derived feed cache is optional and never authoritative.
+
+When `image_authentication` is `desktop_basic`, use the current enrollment's
+Basic credentials only for the exact same HTTPS origin and
+`/api/sipnotify/desktop/media?event_id=...`. Preserve the configured public port.
+Reject cross-origin redirects and never attach these credentials to ordinary
+image URLs. The endpoint checks original recipient enrollment, current authority,
+alert expiry and a ten-minute maximum; files are at most 5 MiB. Enabling this
+option requires the coordinated desktop release.
+
+`POST /api/sipnotify/desktop/ack` continues to return `ok:true` with the matching
+`event_id`. This means received by the desktop app. Explicit human incident
+responses remain under `/desktop/incident/respond`, with independent current
+incident authorization; image downloads and receipts never record a response.
+
+### Radio and other Labs routing
+
+Saved radio profiles resolve to approved PJSIP targets and enforce the shortest
+selected full-sequence audio limit. They do not grant a new network or RF
+control API. Directory, browser, collaboration and physical-trigger integrations
+retain their explicit enabled state and frozen recipient snapshots. No imported
+phone number silently becomes an authorized SMS recipient. See the
+[qualification matrix](QUALIFICATION_MATRIX.md) for exact deployment boundaries.
+
+### Meeting account selection
+
+Meeting creation uses the FreePBX administrator's Enterprise Labs action `integrations_meeting`; it is not a Control API endpoint. The request accepts the additive `provider` value `zoom`, `google_meet` or `webex`. Each account keeps independent renewal settings in encrypted `enterprise_integrations.meetings.oauth_profiles`. Omitting `provider` retains the saved legacy default. Provider choice is part of the immutable operation fingerprint; reusing a request ID with another account is rejected. An account’s tokens never appear in returned configuration or receipts.

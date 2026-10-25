@@ -113,25 +113,38 @@ final class EnterpriseIdentityStore
         }
         if($name==='directory_plans'){
             $required=['source_id','revision','records','changes','active','template_ids','deactivation_count','deactivation_percent','requires_deactivation_confirmation','deprovision_all','created_at','expires_at'];
-            if(!self::exact($row,$required)||!preg_match('/^dir_[a-f0-9]{24}$/D',$row['source_id']??'')||!self::hashValue($row['revision']??null)
+            if(!self::exact($row,$required,['affected_audiences'])||!preg_match('/^dir_[a-f0-9]{24}$/D',$row['source_id']??'')||!self::hashValue($row['revision']??null)
                 ||!is_array($row['records']??null)||DirectoryConfig::records($row['records'])!==$row['records']||!is_array($row['changes']??null)||!array_is_list($row['changes'])||count($row['changes'])>2000
                 ||!is_int($row['active']??null)||$row['active']<0||$row['active']>1000||$row['active']!==count(array_filter($row['records'],static fn($record)=>$record['active']))
                 ||!is_array($row['template_ids']??null)||!array_is_list($row['template_ids'])||count($row['template_ids'])>50||count(array_unique($row['template_ids']))!==count($row['template_ids'])
                 ||!is_int($row['deactivation_count']??null)||$row['deactivation_count']<0||$row['deactivation_count']>1000||!is_int($row['deactivation_percent']??null)||$row['deactivation_percent']<0||$row['deactivation_percent']>100
                 ||!is_bool($row['requires_deactivation_confirmation']??null)||!is_bool($row['deprovision_all']??null)||!is_int($row['created_at']??null)||$row['created_at']<1||($row['expires_at']??null)!==$row['created_at']+900){throw new \RuntimeException('Directory preview history is invalid. Preserve it for recovery.');}
+            if(array_key_exists('affected_audiences',$row)){
+                if(!is_array($row['affected_audiences'])||!array_is_list($row['affected_audiences'])||count($row['affected_audiences'])>200){throw new \RuntimeException('Directory audience preview is invalid.');}
+                $seen=[];
+                foreach($row['affected_audiences'] as $audience){
+                    if(!is_array($audience)||!self::exact($audience,['id','name','members'])||!is_string($audience['id'])||!preg_match('/^grp_[a-f0-9]{12,32}$/D',$audience['id'])||isset($seen[$audience['id']])
+                        ||!is_string($audience['name'])||mb_strlen($audience['name'])>64||preg_match('/[\p{C}]/u',$audience['name'])||!is_array($audience['members'])
+                        ||!self::exact($audience['members'],['extensions','desktop_clients','voice_recipient_ids','sms_recipient_ids','email_recipient_ids','webhook_ids','browser_recipient_ids','connector_ids'])){throw new \RuntimeException('Directory audience preview is invalid.');}
+                    foreach($audience['members'] as $members){if(!is_array($members)||!array_is_list($members)||count($members)>1000){throw new \RuntimeException('Directory audience members are invalid.');}
+                        foreach($members as $member){if(!is_string($member)||strlen($member)>128||preg_match('/[\x00-\x1f\x7f]/',$member)){throw new \RuntimeException('Directory audience identity is invalid.');}}}
+                    $seen[$audience['id']]=true;
+                }
+            }
             foreach($row['template_ids'] as $id){if(!is_string($id)||!preg_match('/^tpl_[a-f0-9]{24}$/D',$id)){throw new \RuntimeException('Directory preview template history is invalid. Preserve it for recovery.');}}
             foreach($row['changes'] as $change){$external=$change['external_id']??null;$legacyNumeric=is_int($external)&&$external>=0;
                 if(!is_array($change)||array_is_list($change)||!self::exact($change,['kind','external_id','person_id','name'])||!in_array($change['kind']??null,['add','inactive','deactivate','update','remove_inactive'],true)||(!$legacyNumeric&&!self::textValue($external,256))||!preg_match('/^dirp_[a-f0-9]{40}$/D',$change['person_id']??'')||!self::textValue($change['name']??null,100)){throw new \RuntimeException('Directory preview change history is invalid. Preserve it for recovery.');}}return;
         }
         if($name==='subscriber_tokens'){
             $required=['subscriber_id','identity','incident_id','person_id','roster_identity','created_at','expires_at','delivery'];
-            if(!self::exact($row,$required,['revoked','used'])||!preg_match('/^sub_[a-f0-9]{24}$/D',$row['subscriber_id']??'')||!self::hashValue($row['identity']??null)
-                ||!preg_match('/^inc_[a-f0-9]{32}$/D',$row['incident_id']??'')||!preg_match('/^[A-Za-z0-9_-]{1,64}$/D',$row['person_id']??'')||!self::hashValue($row['roster_identity']??null)
+            $enrollment=($row['purpose']??'incident')==='enrollment';
+            if(!self::exact($row,$required,['revoked','used','purpose'])||!in_array($row['purpose']??'incident',['incident','enrollment'],true)||!preg_match('/^sub_[a-f0-9]{24}$/D',$row['subscriber_id']??'')||!self::hashValue($row['identity']??null)
+                ||($enrollment?(($row['incident_id']??null)!==''||($row['roster_identity']??null)!==''):(!preg_match('/^inc_[a-f0-9]{32}$/D',$row['incident_id']??'')||!self::hashValue($row['roster_identity']??null)))||!preg_match('/^[A-Za-z0-9_-]{1,64}$/D',$row['person_id']??'')
                 ||!is_int($row['created_at']??null)||$row['created_at']<1||!is_int($row['expires_at']??null)||$row['expires_at']<=$row['created_at']||$row['expires_at']>$row['created_at']+3600
                 ||!in_array($row['delivery']??null,['reserved','accepted','unconfirmed','failed'],true)||(isset($row['revoked'])&&!is_bool($row['revoked']))||(isset($row['used'])&&!is_bool($row['used']))){throw new \RuntimeException('Subscriber proof history is invalid. Preserve it for recovery.');}return;
         }
         if($name==='browser_subscriptions'){
-            if(!self::exact($row,['subscriber_id','identity','subscription','created_at','enabled'])||!preg_match('/^sub_[a-f0-9]{24}$/D',$row['subscriber_id']??'')||!self::hashValue($row['identity']??null)
+            if(!self::exact($row,['subscriber_id','identity','subscription','created_at','enabled'],['version'])||(array_key_exists('version',$row)&&!self::hashValue($row['version']))||!preg_match('/^sub_[a-f0-9]{24}$/D',$row['subscriber_id']??'')||!self::hashValue($row['identity']??null)
                 ||!self::endpointSubscription($row['subscription']??null)||!is_int($row['created_at']??null)||$row['created_at']<1||!is_bool($row['enabled']??null)){throw new \RuntimeException('Browser subscription history is invalid. Preserve it for recovery.');}return;
         }
         if($name==='browser_push_claims'){
@@ -169,8 +182,14 @@ final class EnterpriseIdentityStore
             'directory_plans'=>'/^[a-f0-9]{64}$/D','subscriber_tokens'=>'/^[a-f0-9]{64}$/D','browser_subscriptions'=>'/^[a-f0-9]{64}$/D',
             'browser_push_claims'=>'/^[a-f0-9]{64}$/D','browser_test_events'=>'/^[a-f0-9]{32}$/D','connector_claims'=>'/^[a-f0-9]{64}$/D',
             'oauth_refresh'=>'/^[a-f0-9]{64}$/D','announcement_claims'=>'/^[a-f0-9]{64}$/D'];
+        $browserEvents=preg_match('/^browser_events_[a-f0-9]$/D',$name)===1;
+        if($browserEvents&&count($rows)>1000){throw new \RuntimeException('Browser event allocation exceeded.');}
         $nodes=0;self::value($rows,0,$nodes);
         foreach($rows as $key=>$row){if(isset($patterns[$name])&&(!is_string($key)||!preg_match($patterns[$name],$key))){throw new \RuntimeException('Enterprise ledger record identity is invalid. Preserve it for recovery.');}
+            if($browserEvents){
+                if(!is_string($key)||!preg_match('/^[a-f0-9]{64}$/D',$key)||substr($key,0,1)!==substr($name,-1)||!is_array($row)){throw new \RuntimeException('Browser event identity is invalid.');}
+                require_once __DIR__.'/BrowserEvents.php';BrowserEvents::validateRow($key,$row);continue;
+            }
             if($name==='replay'){if(!is_int($row)||$row<1){throw new \RuntimeException('Enterprise replay history is invalid. Preserve it for recovery.');}continue;}
             if(in_array($name,['login','identity_audit','directory_plans','subscriber_tokens','browser_subscriptions','browser_push_claims','browser_test_events','connector_claims','oauth_refresh','announcement_claims'],true)){
                 if(!is_array($row)||array_is_list($row)){throw new \RuntimeException('Enterprise ledger record is invalid. Preserve it for recovery.');}
@@ -180,7 +199,8 @@ final class EnterpriseIdentityStore
     }
     private static function compactRows(string $name,array &$rows,int $now): int
     {
-        $removed=0;foreach($rows as $key=>$row){$expired=match($name){
+        $removed=0;foreach($rows as $key=>$row){$expired=preg_match('/^browser_events_[a-f0-9]$/D',$name)===1
+                ?is_array($row)&&is_int($row['expires_at']??null)&&$row['expires_at']<=$now:match($name){
                 'login','directory_plans','browser_push_claims','browser_test_events','connector_claims','announcement_claims'=>is_array($row)&&is_int($row['expires_at']??null)&&$row['expires_at']<=$now,
                 'subscriber_tokens'=>is_array($row)&&is_int($row['created_at']??null)&&is_int($row['expires_at']??null)&&max($row['expires_at'],$row['created_at']+3600)<=$now,
                 'replay'=>is_int($row)&&$row<=$now,
@@ -202,7 +222,7 @@ final class EnterpriseIdentityStore
     public function compact(int $now): array
     {
         if($now<1){throw new \InvalidArgumentException('Enterprise retention time is invalid.');}$counts=[];
-        foreach(['login','replay','directory_plans','subscriber_tokens','browser_push_claims','browser_test_events','connector_claims','announcement_claims'] as $name){
+        foreach(array_merge(['login','replay','directory_plans','subscriber_tokens','browser_push_claims','browser_test_events','connector_claims','announcement_claims'],array_map(static fn($hex)=>'browser_events_'.$hex,str_split('0123456789abcdef'))) as $name){
             $counts[$name]=$this->ledgerExists($name)?$this->transaction($name,static fn(array &$rows):int=>self::compactRows($name,$rows,$now),false,false):0;
         }
         return $counts;

@@ -227,6 +227,7 @@ acquire_maintenance_coordination() {
     [ "$descriptor_target" = "$lock_file" ] || continue
     descriptor="${descriptor_path##*/}"
     if [[ "$descriptor" =~ ^[0-9]+$ ]] && flock -n "$descriptor"; then
+      UNINSTALL_MAINTENANCE_LOCK_FD="$descriptor"
       return 0
     fi
   done
@@ -368,6 +369,9 @@ names = {'bin/sign_sls_mass_notify_local_sig.sh':'sign_sls_mass_notify_local_sig
          'PhoneEventService.php':'PhoneEventService.php'}
 optional = 'bin/sls_mass_notify/sls_legacy_permissions.py'
 if optional in data['files']: names[optional] = 'sls_legacy_permissions.py'
+for filename in ('sls_upgrade_trust.py','sls_release_trust.py','sls_installer_recovery.py','freepbx-mirror-signing.pub'):
+    name='bin/sls_mass_notify/'+filename
+    if name in data['files']:names[name]=filename
 for name, filename in names.items():
     entry = data['files'].get(name)
     if not entry: raise SystemExit('Signed uninstall helper is missing: ' + name)
@@ -1836,6 +1840,27 @@ remove_sls_chown_exclusion() {
   fi
 }
 
+refresh_uninstall_stock_approvals() {
+  local module helper="$RECOVERY_SIGNER_DIR/sls_upgrade_trust.py" workspace
+  local trust="$RECOVERY_SIGNER_DIR/sls_module_trust.py"
+  for module in dashboard framework; do
+    if /usr/bin/python3 -I "$trust" --root /var/lib/sls-mass-notify-trust check --module "$module" --web-root /var/www/html >/dev/null 2>&1 \
+      || /usr/bin/python3 -I "$trust" --root /var/lib/sls-mass-notify-trust check --module "$module" --web-root /var/www/html --uninstalled >/dev/null 2>&1; then
+      continue
+    fi
+    [ -f "$helper" ] && [ ! -L "$helper" ] || return 0
+    workspace="$(uninstall_recovery_workspace sls-uninstall-stock-review)" || return 1
+    log "Reviewing changed FreePBX stock using retained local signed packages. Evidence: $workspace"
+    /usr/bin/python3 -I "$helper" --workspace "$workspace" --reconcile-stock \
+      --coordination-fd "$UNINSTALL_MAINTENANCE_LOCK_FD" \
+      --coordination-lock "${SLS_MASS_NOTIFY_MAINTENANCE_LOCK:-/run/lock/sls-mass-notify-maintenance.lock}" || {
+      log "Offline stock reconciliation could not approve the changed source. Unknown local differences were preserved. Use sudo slsconsole reconcile-stock --online while online, or provide independently signed local packages; the uninstaller does not download software."
+      return 1
+    }
+    break
+  done
+}
+
 verify_uninstall_inventories() {
   local module_dir='/var/www/html/admin/modules/slsmassnotifyserver' reviewed_module
   local helper="$RECOVERY_SIGNER_DIR/sls_module_trust.py"
@@ -1860,7 +1885,24 @@ verify_uninstall_inventories() {
   done
 }
 
+uninstall_usage() {
+  printf '%s\n' \
+    'Usage: sls_mass_notify_uninstall.sh' \
+    '       sls_mass_notify_uninstall.sh --help' \
+    'Normal removal preserves SLS settings, media and delivery history.' \
+    'For deliberate removal of retained data, use sudo slsconsole uninstall --purge.'
+}
+
 main() {
+  if [ "$#" -gt 0 ]; then
+    if [ "$#" -eq 1 ] && { [ "$1" = --help ] || [ "$1" = -h ]; }; then
+      uninstall_usage
+      return 0
+    fi
+    printf '%s\n' 'Unsupported uninstaller arguments. No removal was started.' >&2
+    uninstall_usage >&2
+    return 64
+  fi
   require_freepbx
   admit_root_runtime || { log "Signed uninstall evidence is missing or changed. Preserve the trust store and review the named file; no uninstall changes were made. Missing stock inventories require independently verified local packages, not approval of live hashes."; return 1; }
   acquire_maintenance_coordination
@@ -1868,6 +1910,7 @@ main() {
   trap handle_uninstall_exit EXIT
   snapshot_local_signer
   [ -n "$RECOVERY_SIGNER" ] || { log "An approved-inventory signer is required before uninstall can preserve the reviewed FreePBX modules."; return 1; }
+  refresh_uninstall_stock_approvals
   verify_uninstall_inventories
   verify_uninstall_cron_access
   capture_signing_fingerprint

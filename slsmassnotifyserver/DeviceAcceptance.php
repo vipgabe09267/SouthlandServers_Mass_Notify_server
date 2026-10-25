@@ -117,7 +117,7 @@ final class DeviceAcceptance
             if ($name === 'module.sig' || preg_match('~(?:^|/)__pycache__/|\.pyc$~D', $name)) { continue; }
             $meta = lstat($path);
             if (!$meta || ($meta['mode'] & 0170000) !== 0100000 || $meta['nlink'] !== 1
-                || $meta['size'] > 8388608 || ($bytes += $meta['size']) > 33554432 || count($files) >= 2048) {
+                || $meta['size'] > 8388608 || ($bytes += $meta['size']) > 67108864 || count($files) >= 5000) {
                 throw new \DomainException('The installed SLS payload contains an unsafe file or exceeds its identification bounds.');
             }
             $digest = hash_file('sha256', $path);

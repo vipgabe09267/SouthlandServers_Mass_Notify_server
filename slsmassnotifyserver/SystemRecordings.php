@@ -66,10 +66,10 @@ final class SystemRecordings
                     if (++$count > 5000 || microtime(true) > $deadline) { $complete = false; break 2; }
                     $relative = substr($file->getPathname(), strlen($root));
                     if (!self::validPath($relative) || $file->isLink() || !$file->isFile() || !$file->isReadable() || $file->getSize() < 1 || $file->getSize() > 20*1024*1024) { continue; }
-                    $resolved = $file->getRealPath();
-                    if (!$resolved || !str_starts_with($resolved, $root) || ($file->getExtension() === 'g722' && !is_executable('/usr/bin/ffmpeg'))) { continue; }
-                    $base = preg_replace('/\.[^.]+$/', '', $relative); $key = strtolower($base);
-                    $rank = array_search(strtolower($file->getExtension()), self::FORMATS, true);
+                    $resolved = $file->getRealPath(); $format = strtolower($file->getExtension());
+                    if (!$resolved || !str_starts_with($resolved, $root) || ($format === 'g722' && !is_executable('/usr/bin/ffmpeg'))) { continue; }
+                    $base = preg_replace('/\.[^.]+$/', '', $relative); $key = $base;
+                    $rank = array_search($format, self::FORMATS, true);
                     if (isset($seen[$key]) && $seen[$key]['rank'] <= $rank) { continue; }
                     $label = $labels[$base] ?? $base;
                     if (!is_string($label) || !preg_match('//u', $label)) { $label = $base; }

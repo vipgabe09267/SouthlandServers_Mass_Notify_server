@@ -96,7 +96,7 @@ class ApiSecurityTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(result.stderr, '')
                 self.assertEqual(json.loads(result.stdout), {'same_definition': True, 'api_first': order == 'api-first',
-                    'rejected': 2, 'classes': True, 'scopes': ['read', 'send', 'test', 'config']})
+                    'rejected': 2, 'classes': True, 'scopes': ['read', 'send', 'test', 'config', 'monitor', 'fleet_read', 'incident_read']})
 
     def test_weather_cli_guard_rejects_http_before_loading_runtime_dependencies(self):
         self.start_api()
@@ -137,7 +137,8 @@ class ApiSecurityTests(unittest.TestCase):
         source = api.read_text().replace("dirname(__DIR__) . '/sls-mass-notify/security.php'", json.dumps(str(HELPER)))
         source = source.replace("__DIR__ . '/event-log.php'", json.dumps(str(ROOT / 'slsmassnotifyserver/api/sls-mass-notify/event-log.php')))
         source = source.replace("__DIR__ . '/security.php'", json.dumps(str(HELPER)))
-        for helper in ['contract.php', 'config-crypto.php']:
+        source=source.replace("dirname(__DIR__,2).'/admin/modules/slsmassnotifyserver/Monitoring.php'", json.dumps(str(ROOT/'slsmassnotifyserver/Monitoring.php')))
+        for helper in ['contract.php', 'config-crypto.php', 'desktop-feed-cache.php']:
             helper_path = json.dumps(str(HELPER.parent / helper))
             source = source.replace("__DIR__ . '/" + helper + "'", helper_path)
             source = source.replace("dirname(__DIR__) . '/sls-mass-notify/" + helper + "'", helper_path)
@@ -229,6 +230,25 @@ class ApiSecurityTests(unittest.TestCase):
         self.assertTrue(all(value for key, value in result.items() if key != 'id'))
         self.assertRegex(result['id'], r'^api_[a-f0-9]{24}$')
 
+    def test_monitor_scope_exposes_only_redacted_status_and_cached_metrics_without_bootstrap(self):
+        issued=self.issue(scopes=('monitor',))
+        self.write_config(control_api={'enabled':True,'credentials':[issued['credential']]})
+        (self.directory/'status.json').write_text(json.dumps({'host':'SECRET_HOST','message':'SECRET_MESSAGE'}))
+        (self.directory/'status.json').chmod(0o640)
+        self.start_api()
+        code,report=self.request(issued['secret'])
+        self.assertEqual(code,200);self.assertNotIn('SECRET',json.dumps(report))
+        code,metrics=self.request(issued['secret'],path='/?resource=metrics')
+        self.assertEqual(code,200);self.assertEqual(metrics['metrics'],{'snapshot_available':0})
+        for resource in ['audiences','events','config','desktop_fleet','incidents']:
+            self.assertEqual(self.request(issued['secret'],path='/?resource='+resource)[0],403)
+        self.assertEqual(self.request(issued['secret'],{'action':'send_announcement','message':'Denied'})[0],403)
+        self.assertFalse((self.directory/'module-calls.jsonl').exists())
+        request=urllib.request.Request(self.url+'/?resource=metrics&format=prometheus',headers={'Authorization':'Bearer '+issued['secret']})
+        with urllib.request.urlopen(request,timeout=3) as response:
+            self.assertEqual(response.status,200);self.assertEqual(response.headers.get_content_type(),'text/plain')
+            self.assertIn(b'sls_snapshot_available 0\n',response.read())
+
     def test_restricted_config_and_malformed_permission_shapes_rejected(self):
         result = self.php('''
             $bad=[['scopes'=>['config'],'audience'=>['unrestricted'=>false]],
@@ -277,9 +297,9 @@ class ApiSecurityTests(unittest.TestCase):
         code, capabilities = self.request(issued['secret'], path='/?resource=capabilities')
         self.assertEqual(code, 200)
         self.assertEqual((capabilities['api_version'], capabilities['notification_payload_schema'], capabilities['desktop_sse_protocol']), (1, 1, 2))
-        self.assertEqual(capabilities['resources'], ['status', 'capabilities', 'audiences', 'delivery',
+        self.assertEqual(capabilities['resources'], ['status', 'capabilities', 'audiences', 'delivery', 'metrics',
                                                     'enterprise_capabilities', 'incident_templates'])
-        self.assertEqual([item['action'] for item in capabilities['actions']], ['send_announcement', 'preview_announcement', 'retry_announcement',
+        self.assertEqual([item['action'] for item in capabilities['actions']], ['send_announcement', 'preview_announcement', 'rehearse_announcement', 'retry_announcement',
                                                                              'enterprise_template_start'])
         code, audience = self.request(issued['secret'], path='/?resource=audiences')
         self.assertEqual(code, 200)

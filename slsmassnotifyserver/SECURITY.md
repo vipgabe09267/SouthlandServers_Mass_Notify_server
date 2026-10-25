@@ -12,7 +12,7 @@ Do not publish configuration, API keys, passwords, authenticator seeds, AMI cred
 
 ## Supported releases
 
-Security fixes target the latest corrected release. `0.1.6-beta` is the current published prerelease; `0.1.7-beta` is an unpublished source candidate. Earlier beta releases should be upgraded after reviewing the supported installation profile. A signature identifies approved bytes; it does not certify security or delivery reliability.
+Security fixes target the latest published prerelease, currently `0.1.8-beta`. Earlier betas should be upgraded after reviewing the supported installation profile. A signature authenticates release bytes; it does not certify security, performance or delivery reliability.
 
 Corrections receive a new version and signed assets. The updater does not replace equal versions. See [release trust](docs/RELEASE_TRUST.md) and [installation](INSTALL.md).
 
@@ -20,7 +20,7 @@ Corrections receive a new version and signed assets. The updater does not replac
 
 FreePBX administration and the SLS operator portal have separate authentication. SLS does not replace FreePBX or UCP login and exposes administration through the PBX administrator panel. Operator logins grant only their saved roles, actions, channels and recipients. Current permissions and identity are rechecked before queued delivery. Disabled, expired or replaced identities cannot authorize old work.
 
-Operator passwords use salted Argon2id with 64 MiB and four passes, or PBKDF2-HMAC-SHA256 with 600,000 iterations when Argon2id is unavailable. Two concurrent password slots bound derivation memory to 128 MiB. Mandatory TOTP or an unused recovery code follows password verification. Seeds are account-bound encrypted values; recovery codes are hashed. Consumption and credential changes commit under the configuration lock.
+Operator passwords use salted Argon2id with 64 MiB and four passes, or PBKDF2-HMAC-SHA256 with 600,000 iterations when Argon2id is unavailable. Two concurrent password slots bound derivation memory to 128 MiB. TOTP, an unused recovery code or an explicitly enabled, enrolled passkey follows password verification. Initial authenticator enrollment and passkey management require TOTP. Seeds are account-bound encrypted values; recovery codes are hashed. Consumption and credential changes commit under the configuration lock.
 
 Portal sessions use HTTPS, Secure/HttpOnly cookies, session rotation, expiry, CSRF, origin checks, no-store responses and a restrictive Content Security Policy. Password and MFA limits are separate. Failed passwords are limited per IP to six in five minutes, twelve in ten minutes and twenty in 24 hours; the twentieth failure starts a 24-hour address lock. Pending checks reserve budget before hashing. Throttled or busy work returns `Retry-After`.
 
@@ -28,13 +28,21 @@ Password-reset credentials are random, hashed, single-use, revocable and expire 
 
 SSO administration is in **Operator Access**. OIDC/SAML verifies the configured provider, signature, issuer, audience, nonce and explicit local account grant, then requires the local operator authenticator. Provider role/email claims cannot create accounts or grant authority. Enabling SSO requires an enabled, enrolled, unexpired local recovery administrator. Portal accounts, Control API keys and UCP users cannot configure federation. See [operator SSO](docs/ENTERPRISE_IDENTITY.md).
 
-The beta warning requires a separate, one-time acknowledgment from each FreePBX administrator, a session-bound challenge and five seconds of visible/server-verified delay. Valid acknowledgments survive upgrades, including receipts saved by 0.1.6-beta and the 0.1.7-beta candidate. Labs activation has its own revision-bound receipt. Neither acknowledgment enables a feature or authorizes a notification.
+Operator, API, directory and subscriber changes use recoverable active/pending settings transactions under the central configuration lock. A failed second write restores the prior protected files; crash recovery refuses unknown intervening changes. Unrelated staged edits are retained.
+
+The beta warning requires a separate, one-time acknowledgment from each FreePBX administrator, a session-bound challenge and five seconds of visible/server-verified delay. Valid acknowledgments survive upgrades, including receipts saved by 0.1.6-beta and 0.1.7-beta. Labs activation has its own revision-bound receipt. Neither acknowledgment enables a feature or authorizes a notification.
+
+Paging adopts a zero-byte legacy PIN-attempt file only when its permanent sidecar is also uninitialized. File type, ownership, permissions, link count and stable identity checks still apply. A durable or partial initialization marker prevents reinitializing empty state; malformed nonempty history remains blocked. Paging outcomes are recorded without entered PINs or raw AGI responses.
+
+Live paging keeps caller input muted until a one-shot readiness callback verifies the admitted origin, current configuration and recipient outcomes. The caller-only tone continues through the final protected check and stops as input opens, avoiding a verification delay after the cue. Missing evidence or a failed cue leaves input muted, with a bounded setup timeout.
 
 ## APIs, recipients and proxy trust
 
 Desktop clients use individual credentials over HTTPS. Polling, SSE and acknowledgments enforce enrollment-bound recipient authorization; a reused username cannot inherit another enrollment's events. Event IDs, publication times and absolute expiry remain stable. An application receipt does not mean a person read a message. Notification schema 1 and SSE protocol 2 remain compatible.
 
 Streams and authenticated traffic have per-client/global limits; failed-login protection is separate. PHP-FPM uses cursor-aware polling to avoid holding shared PBX workers. Throttling returns `Retry-After`. Fleet limits are admission budgets, not throughput certification.
+
+Unchanged desktop rate-limit registry reads share locks. A request requiring a write releases its shared leases, then rereads under exclusive locks before committing. Current authentication remains mandatory on every request. Browser-display responses are bound to the active connection and credentials; disconnecting aborts obsolete requests.
 
 The Control API starts disabled. Named credentials contain hashed secrets and explicit scopes/audiences, can be revoked independently, and are rechecked before queued effects. Empty restricted audiences grant no sending authority. Config responses redact secrets; named config credentials cannot manage API credentials, trusted proxies or the advertised hostname.
 
@@ -43,6 +51,8 @@ The Control API starts disabled. Named credentials contain hashed secrets and ex
 Forwarded addresses/schemes are accepted only from explicitly configured immediate proxy networks. SLS validates the chain from its trusted end; trusted proxies must overwrite incoming forwarding headers. Forwarded hostnames are not an authority, and forwarded requests receive no direct-loopback plaintext exemption. SLS address changes use protected administrator settings; DNS/OS hostname changes do not migrate them automatically.
 
 Administrator and API inputs enforce object, depth and byte limits, reject duplicate keys/nonfinite values, and retain role/CSRF checks. Recipient envelopes prevent native PHP form-variable limits from silently dropping a selection. Scoped locations use stable device identities and reviewed snapshots; assignments alone do not establish consent or presence.
+
+External voice admission inspects the supported FreePBX route before queuing and again on its bound SLS Local channel. Arbitrary predial hooks remain unsupported. An extension-only callback is accepted only when its leading user/channel guards prove that every SLS Local call returns before the callback body. The full observed context remains in the route fingerprint; SLS does not change or execute custom callback files during inspection.
 
 ## Configuration, secrets and backups
 
@@ -72,7 +82,7 @@ Static web and Asterisk integration snapshots accept standard FreePBX group-writ
 
 Legacy permission repair is narrowly scoped to known root/Asterisk ownership and modes after previous-release/configuration authentication. It preserves bytes and lock inodes and rejects links, special files and unknown contents. FreePBX's chown exclusion protects the SLS data directory. New phone admission requires a fresh authenticated collector heartbeat; an unavailable collector remains nonfatal to ordinary FreePBX reloads.
 
-The included uninstaller works locally without downloads or a healthy speech engine. It authenticates teardown helpers, drains SLS work, refuses active delivery and preserves configuration, media, history, logs and recovery keys by default. Destructive purge requires a separate explicit request. Failed cron reads do not erase unrelated jobs. See [installer recovery and removal](docs/INSTALLER_OPERATIONS.md).
+The included uninstaller works locally without downloads or a healthy speech engine. It authenticates teardown helpers, drains SLS work, refuses active delivery and preserves configuration, media, history, logs and recovery keys by default. Help and unsupported arguments never begin host operations. Destructive purge requires a separate explicit request. Failed cron reads do not erase unrelated jobs. See [installer recovery and removal](docs/INSTALLER_OPERATIONS.md).
 
 Publisher Ed25519 signing and PBX-local module signing are distinct. Private release keys stay outside the repository; bounded validated key bytes feed OpenSSL without reopening the selected path. Publisher rotation, expiry, irreversible retirement and emergency recovery require explicit root review. Downloaded metadata and `.config` cannot establish signing authority.
 
@@ -84,7 +94,7 @@ Queues claim irreversible work before submission. Accepted or uncertain calls, S
 
 Speech/recording conversion has process, duration, output-byte and free-space bounds. Oversized speech is rejected rather than cut off. Cleanup preserves active references and incomplete inventories. Phone input/AMI operations use cumulative monotonic deadlines and bounded buffers, including partial lines. Handset provisioning and physical outcomes still require acceptance testing.
 
-Generated image/XML URLs remain anonymous for compatible phones/desktops. Optional network and absolute download-expiry policies apply through the verified route; malformed policy fails closed. Random URLs do not prove recipient identity. Private floor plans use authenticated, permission-checked responses outside document roots. See [media access](docs/MEDIA_ACCESS.md).
+Generated image/XML URLs retain anonymous compatibility access by default. Administrators can require event-bound desktop authentication and short-lived exact-file phone capabilities. Network and absolute download-expiry policies still apply; malformed policy fails closed. Random URLs do not prove recipient identity. Private floor plans use authenticated, permission-checked responses outside document roots. See [media access](docs/MEDIA_ACCESS.md).
 
 Generic webhooks use verified HTTPS, public-address validation/pinning, no redirects and bounded payloads. Optional HMAC-SHA256 covers `timestamp + "." + event_id + "." + raw_request_body`; receivers must verify freshness and deduplicate IDs. Discord URL tokens and provider-specific formats retain their own contracts. One-way acceptance is not human receipt.
 
@@ -104,6 +114,8 @@ Dashboard/admin requests have complete-response deadlines and do not automatical
 
 Additional enterprise integrations start disabled and create no listener, firewall rule, peer enrollment or PBX restart merely through configuration. Only current FreePBX administrators can activate them. Failover/mirroring, enterprise login, door actuation and public-warning origination require the Labs danger acknowledgment and must remain confined to nonproduction qualification.
 
+The default-off Enterprise Labs master is separate from warning acceptance. Feature manager requires the current administrator, CSRF protection, a complete allowlisted boolean selection, a revision check and explicit agreement to the displayed warning. Master and child changes commit together to active and pending settings while preserving their separate configured values. Disabling Labs stops new Labs effects and browser-display streams; bounded valid receipts and authenticated removal remain available. Ordinary phone/desktop alerts and the separate operator SSO policy remain independent.
+
 Notification HA requires pinned mutual TLS, signed messages, an independent witness, durable replay/uncertainty evidence and authority before effects. It is not full PBX failover. Missing authority/history suspends delivery; copying a configuration or restoring an old witness does not grant sending authority.
 
 Directories require complete reviewed snapshots and revision checks. Subscriber proofs are hashed, expiring and person-bound. Web Push uses RFC8291/RFC8292, freezes subscription identities and retains absolute expiry. Private images and participant responses enforce current site/audience permissions. Physical/public actions require explicit capabilities and immutable claims.
@@ -113,3 +125,21 @@ Approved scripts execute sealed reviewed bytes as Asterisk, with a restricted en
 The dependency inventory covers declared Python, vendored PHP and embedded JavaScript components with their licenses and provenance. Advisory scans are point-in-time checks; OS packages and other FreePBX modules need their own maintenance. The local dashboard Chart.js bundle replaces only the exact legacy CDN request. See [dependencies](docs/DEPENDENCIES.md).
 
 Isolated fixtures use private mount/network/PID namespaces, read-only inherited storage and disposable writable overlays. They are trusted project fixtures, not a boundary against hostile root code. Local tests and advisory checks do not constitute an independent external penetration test, compliance certification, physical-device acceptance or full-PBX disaster-recovery/fleet qualification. See [qualification boundaries](docs/QUALIFICATION_MATRIX.md).
+
+## 0.1.8-beta qualification boundaries
+
+New optional authentication, browser, directory, radio, media, mail-evidence and
+script features start disabled. Passkeys affect the separate operator portal,
+not FreePBX authentication. Current recipient identity and credential expiry
+remain authoritative even when polling uses a derived cache. Provider acceptance,
+software receipts and a completed browser notification request do not prove that
+a human received or acted on an alert.
+
+Opt-in phone capabilities are short-lived exact-file URLs and should be treated
+as secrets. Scoped CA enrollment never disables TLS verification or modifies
+global trust. Restricted scripts still require administrator-approved code and
+positive target-host isolation qualification. Hardware, provider and paired-host
+Labs acceptance is documented separately; private fixtures are not an external
+penetration-test certification.
+
+Enterprise Labs administrator routes require the persisted timed warning acknowledgment before returning configuration or executing an operation. Warning acceptance requires the existing authenticated administrator, CSRF token, session-bound single-use challenge and server-enforced delay. Acknowledgment does not enable an integration. Meeting accounts isolate credentials, renewal claims and local revocation by provider; settings responses redact every saved secret.

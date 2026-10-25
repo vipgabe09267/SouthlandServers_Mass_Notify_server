@@ -31,7 +31,8 @@ class PortalHttpTests(unittest.TestCase):
           "'/var/lib/asterisk/SLS_Mass_Notifications_Plugin/operator-mfa-rate.json'":json.dumps(str(cls.root/'mfa-rate.json')),
           "'/var/lib/asterisk/SLS_Mass_Notifications_Plugin/operator-password-work'":json.dumps(str(cls.root/'password-work')),
           "'/etc/freepbx.conf'":json.dumps(str(cls.root/'bootstrap.php')),
-          "'/var/www/html/admin/libraries/ampuser.class.php'":json.dumps(str(cls.root/'ampuser.php'))}
+          "'/var/www/html/admin/libraries/ampuser.class.php'":json.dumps(str(cls.root/'ampuser.php')),
+          "'/var/www/html/admin/modules/slsmassnotifyserver/OperatorPasskeyView.php'":json.dumps(str(MODULE/'OperatorPasskeyView.php'))}
         for old,new in replacements.items():
             assert source.count(old)==1,old; source=source.replace(old,new)
         (cls.root/'mass-notify/index.php').write_text(source); (cls.root/'ampuser.php').write_text('<?php')
@@ -339,5 +340,85 @@ if(parse_url($_SERVER['REQUEST_URI'],PHP_URL_PATH)!=='/mass-notify/'){http_respo
             replies.append(re.search(r'<p class="portal-notice" role="status">(.*?)</p>',body)[1])
         self.assertEqual(replies[0],replies[1]);self.assertFalse((self.root/'mail.jsonl').exists())
         self.assertNotIn('password_recovery',json.loads((self.root/'settings.json').read_text())['operator_access']['accounts'][0]['auth'])
+
+    def authenticator(self, public_key, register=False, counter=1):
+        key = self.root/'passkey-fixture.key'
+        if not key.exists():
+            subprocess.run(['openssl','genpkey','-algorithm','EC','-pkeyopt','ec_paramgen_curve:prime256v1','-out',str(key)],check=True,capture_output=True)
+        credential_id = b'fixed-private-fixture-passkey-id!'
+        encode = lambda value: base64.urlsafe_b64encode(value).decode().rstrip('=')
+        origin = 'https://pbx.example.test'
+        client = json.dumps({'type':'webauthn.create' if register else 'webauthn.get','challenge':public_key['challenge'],'origin':origin,'crossOrigin':False},separators=(',',':')).encode()
+        auth = hashlib.sha256(b'pbx.example.test').digest()+bytes([0x45 if register else 0x05])+struct.pack('>I',0 if register else counter)
+        response = {'clientDataJSON':encode(client)}
+        if register:
+            der = subprocess.check_output(['openssl','pkey','-in',str(key),'-pubout','-outform','DER'])
+            self.assertEqual(der[-65],4);point=der[-64:]
+            cose=b'\xa5\x01\x02\x03\x26\x20\x01\x21\x58\x20'+point[:32]+b'\x22\x58\x20'+point[32:]
+            auth+=bytes(16)+struct.pack('>H',len(credential_id))+credential_id+cose
+            attestation=b'\xa3\x63fmt\x64none\x67attStmt\xa0\x68authData\x58'+bytes([len(auth)])+auth
+            response.update(attestationObject=encode(attestation),transports=['usb'])
+        else:
+            signature=subprocess.run(['openssl','dgst','-sha256','-sign',str(key)],input=auth+hashlib.sha256(client).digest(),capture_output=True,check=True).stdout
+            settings=json.loads((self.root/'settings.json').read_text());owner=next(row for row in settings['operator_access']['accounts'] if row['username']=='owner')
+            handle=hashlib.sha256(('SLS_OPERATOR_PASSKEY_V1|'+owner['id']).encode()).digest()
+            response.update(authenticatorData=encode(auth),signature=encode(signature),userHandle=encode(handle))
+        return json.dumps({'id':encode(credential_id),'rawId':encode(credential_id),'type':'public-key','response':response,'clientExtensionResults':{}})
+
+    def test_passkey_revoke_requires_totp_and_invalidates_pending_assertion(self):
+        settings=json.loads((self.root/'settings.json').read_text());settings['operator_access']['passkeys_enabled']=True
+        owner=next(row for row in settings['operator_access']['accounts'] if row['username']=='owner')
+        prefix='require '+json.dumps(str(MODULE/'OperatorAccess.php'))+'; require '+json.dumps(str(MODULE/'OperatorPasskeys.php'))+'; $d=json_decode(stream_get_contents(STDIN),true); '
+        begin=json.loads(subprocess.run(['php','-r',prefix+'echo json_encode(\\SLS\\MassNotify\\OperatorPasskeys::begin($d["settings"],$d["account"],"register",time()));'],
+            input=json.dumps({'settings':settings,'account':owner}),text=True,capture_output=True,check=True).stdout)
+        credential=self.authenticator(begin['public_key'],True)
+        key=json.loads(subprocess.run(['php','-r',prefix+'echo json_encode(\\SLS\\MassNotify\\OperatorPasskeys::register($d["settings"],$d["account"],$d["state"],$d["credential"],"Fixture saved key",time()));'],
+            input=json.dumps({'settings':settings,'account':owner,'state':begin['state'],'credential':credential}),text=True,capture_output=True,check=True).stdout)
+        owner['auth']['passkeys']=[key];self.write_settings(settings)
+        cookie,token,_=self.password_login();status,_,raw=self.request('POST',{'portal_action':'passkey_authenticate_begin','portal_csrf':token},cookie);self.assertEqual(status,200,raw)
+        status,_,raw=self.request('POST',{'portal_action':'passkey_authenticate_finish','portal_csrf':token,'credential':self.authenticator(json.loads(raw)['public_key'])},cookie);self.assertEqual(status,200,raw)
+        status,h,_=self.request(cookie=cookie);self.assertEqual(status,303);authenticated=self.cookie(h,cookie)
+        pending,pending_token,_=self.password_login();status,_,raw=self.request('POST',{'portal_action':'passkey_authenticate_begin','portal_csrf':pending_token},pending);self.assertEqual(status,200,raw)
+        assertion=self.authenticator(json.loads(raw)['public_key'],counter=2)
+        _,_,body=self.request(cookie=authenticated,query='?view=security');csrf=self.token(body)
+        post={'portal_action':'passkey_revoke','portal_csrf':csrf,'credential_id':key['credential_id'],'code':'not-totp'}
+        self.assertEqual(self.request('POST',post,authenticated,query='?view=security')[0],400)
+        post['code']=self.otp();status,h,raw=self.request('POST',post,authenticated,query='?view=security');self.assertEqual(status,200,raw)
+        saved=json.loads((self.root/'settings.json').read_text());self.assertFalse(next(row for row in saved['operator_access']['accounts'] if row['username']=='owner')['auth']['passkeys'])
+        status,_,raw=self.request('POST',{'portal_action':'passkey_authenticate_finish','portal_csrf':pending_token,'credential':assertion},pending)
+        self.assertNotEqual(status,200,raw);self.assertIn('operator_passkey_revoked',(self.root/'audit.jsonl').read_text())
+
+    def test_passkey_registration_signin_replay_and_disabled_state(self):
+        settings=json.loads((self.root/'settings.json').read_text());settings['operator_access']['passkeys_enabled']=True;self.write_settings(settings)
+        owner=self.login();_,_,body=self.request(cookie=owner,query='?view=security');self.assertIn('Enroll a passkey',body);csrf=self.token(body)
+        counter=int(time.time())//30+1;digest=hmac.new(base64.b32decode('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ'),struct.pack('>Q',counter),hashlib.sha1).digest();at=digest[-1]&15
+        fresh=str((struct.unpack('>I',digest[at:at+4])[0]&0x7fffffff)%1000000).zfill(6)
+        post={'portal_action':'passkey_register_begin','portal_csrf':csrf,'code':fresh}
+        self.assertEqual(self.request('POST',post,owner,origin='https://other.example.test',query='?view=security')[0],403)
+        status,_,raw=self.request('POST',post,owner,query='?view=security');self.assertEqual(status,200,raw);begin=json.loads(raw)
+        finish={'portal_action':'passkey_register_finish','portal_csrf':csrf,'name':'Fixture key','credential':self.authenticator(begin['public_key'],True)}
+        status,h,raw=self.request('POST',finish,owner,query='?view=security');self.assertEqual(status,200,raw);renewed=self.cookie(h,owner)
+        self.assertNotEqual(renewed,owner);self.assertTrue(json.loads(raw)['success'])
+        self.assertNotIn('sls-operations-data',self.request(cookie=owner)[2])
+        self.assertEqual(self.request('POST',finish,renewed,query='?view=security')[0],400)
+        saved=json.loads((self.root/'settings.json').read_text());row=next(x for x in saved['operator_access']['accounts'] if x['username']=='owner');self.assertEqual(len(row['auth']['passkeys']),1)
+        cookie,token,body=self.password_login();self.assertIn('Use a passkey instead',body)
+        status,_,raw=self.request('POST',{'portal_action':'passkey_authenticate_begin','portal_csrf':token},cookie);self.assertEqual(status,200,raw)
+        assertion={'portal_action':'passkey_authenticate_finish','portal_csrf':token,'credential':self.authenticator(json.loads(raw)['public_key'])}
+        status,_,raw=self.request('POST',assertion,cookie);self.assertEqual(status,200,raw)
+        status,h,_=self.request(cookie=cookie);self.assertEqual(status,303);authenticated=self.cookie(h,cookie)
+        self.assertIn('sls-operations-data',self.request(cookie=authenticated)[2])
+        self.assertNotEqual(self.request('POST',assertion,cookie)[0],200)
+        audit=(self.root/'audit.jsonl').read_text();self.assertIn('operator_passkey_enrolled',audit);self.assertIn('operator_passkey_authenticated',audit)
+        # Clearing the option blocks both an existing session's key management
+        # and a newly password-authenticated session's passkey challenge.
+        saved=json.loads((self.root/'settings.json').read_text());saved['operator_access']['passkeys_enabled']=False;self.write_settings(saved)
+        # Advance only this private fixture's rate windows. Do not remove an
+        # established ledger while retaining its lock/initialization evidence.
+        rates=json.loads((self.root/'mfa-rate.json').read_text())
+        for window in rates.values():window['start']=int(time.time())-3601
+        (self.root/'mfa-rate.json').write_text(json.dumps(rates))
+        cookie,token,_=self.password_login();status,_,raw=self.request('POST',{'portal_action':'passkey_authenticate_begin','portal_csrf':token},cookie)
+        self.assertEqual(status,400,raw);self.assertNotIn('public_key',raw)
 
 if __name__=='__main__':unittest.main()

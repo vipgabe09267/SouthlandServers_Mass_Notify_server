@@ -69,6 +69,7 @@ class DesktopIncidentEndpointTests(unittest.TestCase):
         source = API.read_text()
         source = source.replace("dirname(__DIR__) . '/sls-mass-notify/security.php'", json.dumps(str(API.parent.parent / 'sls-mass-notify/security.php')))
         source = source.replace("dirname(__DIR__) . '/sls-mass-notify/config-crypto.php'", json.dumps(str(API.parent.parent / 'sls-mass-notify/config-crypto.php')))
+        source = source.replace("dirname(__DIR__) . '/sls-mass-notify/desktop-feed-cache.php'", json.dumps(str(API.parent.parent / 'sls-mass-notify/desktop-feed-cache.php')))
         for name, relative in {'EVENTS_FILE': 'events.jsonl', 'SETTINGS_FILE': 'settings.json', 'DESKTOP_LAST_SEEN_FILE': 'seen.json', 'DESKTOP_AUTH_RATE_FILE': 'rate.json', 'DESKTOP_ACK_DIRECTORY': 'acks'}.items():
             source, count = re.subn(rf"const {name} = '[^']*';", f'const {name} = {json.dumps(str(self.directory / relative))};', source, count=1)
             self.assertEqual(count, 1)

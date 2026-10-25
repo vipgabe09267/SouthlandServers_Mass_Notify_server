@@ -58,8 +58,8 @@ class FirstInstallDocumentationTests(unittest.TestCase):
             self.assertEqual(public_der.returncode, 0, public_der.stderr)
             der = public_der.stdout
             write_bytes('sls-install.sh', b'fixture installer, never executed')
-            valid = {'schema': 1, 'version': '0.1.7-beta', 'tag': 'slsmassnotifyserver-0.1.7-beta',
-                     'package': 'slsmassnotifyserver-0.1.7-beta.tgz',
+            valid = {'schema': 1, 'version': '0.1.8-beta', 'tag': 'slsmassnotifyserver-0.1.8-beta',
+                     'package': 'slsmassnotifyserver-0.1.8-beta.tgz',
                      'package_sha256': '1' * 64,
                      'installer_sha256': hashlib.sha256((directory / 'sls-install.sh').read_bytes()).hexdigest(),
                      'signing': {'key_id': hashlib.sha256(der).hexdigest(), 'issued_at': int(time.time()) - 60, 'expires_at': int(time.time()) + 3600}}
@@ -86,7 +86,7 @@ class FirstInstallDocumentationTests(unittest.TestCase):
                 verified = openssl('pkeyutl', '-verify', '-pubin', '-inkey', 'publisher.pub', '-rawin', '-in', 'release-manifest.json', '-sigfile', 'release-manifest.sig')
                 self.assertEqual(verified.returncode, 0, verified.stderr)
                 result = subprocess.run(
-                    [sys.executable, '-I', '-O', '-', '0.1.7-beta'],
+                    [sys.executable, '-I', '-O', '-', '0.1.8-beta'],
                     cwd=directory,
                     input=code,
                     text=True,
@@ -105,7 +105,7 @@ class FirstInstallDocumentationTests(unittest.TestCase):
             for raw, diagnostic in malformed.items():
                 write_text('release-manifest.json', raw)
                 result = subprocess.run(
-                    [sys.executable, '-I', '-O', '-', '0.1.7-beta'], cwd=directory, input=code,
+                    [sys.executable, '-I', '-O', '-', '0.1.8-beta'], cwd=directory, input=code,
                     text=True, capture_output=True, timeout=10, env=ENVIRONMENT,
                 )
                 self.assertNotEqual(result.returncode, 0, raw)

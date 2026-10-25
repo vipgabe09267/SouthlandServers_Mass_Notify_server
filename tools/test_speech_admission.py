@@ -18,9 +18,23 @@ from unittest import mock
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'slsmassnotifyserver/bin/sls_mass_notify'))
 import sls_speech_admission as speech
+import sls_piper_worker as worker
 
 
 class SpeechTests(unittest.TestCase):
+    def test_native_session_has_explicit_bounded_threads_without_spinning(self):
+        class Options:
+            def __init__(self): self.entries = {}
+            def add_session_config_entry(self, name, value): self.entries[name] = value
+        class Runtime:
+            SessionOptions = Options
+            class ExecutionMode:
+                ORT_SEQUENTIAL = object()
+        options = worker.session_options(Runtime)
+        self.assertEqual((options.intra_op_num_threads, options.inter_op_num_threads), (1, 1))
+        self.assertIs(options.execution_mode, Runtime.ExecutionMode.ORT_SEQUENTIAL)
+        self.assertEqual(options.entries, {'session.intra_op.allow_spinning':'0', 'session.inter_op.allow_spinning':'0'})
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='sls-speech-admission-')
         self.addCleanup(self.temp.cleanup)

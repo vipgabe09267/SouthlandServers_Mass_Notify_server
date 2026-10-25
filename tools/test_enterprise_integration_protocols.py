@@ -56,6 +56,8 @@ class ProtocolTests(unittest.TestCase):
             calls.append(json.loads(options['input']))
             return subprocess.CompletedProcess(command, 0, '{"ok":true,"state":"ignored"}', '')
         settings = {'enterprise_integrations': {'enabled': '1' if enabled else '0', 'responses': {'enabled': '1'}}}
+        if enabled:
+            settings['enterprise_labs'] = {'enabled': True}
         with mock.patch.object(agi_module, 'read_settings', return_value=settings), mock.patch.object(agi_module, 'check_ack_prompt'), mock.patch.object(agi_module.subprocess, 'run', side_effect=submit):
             agi_module.handle('incident-response', agi, store)
         return calls

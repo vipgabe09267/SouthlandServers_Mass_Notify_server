@@ -916,5 +916,57 @@ class PhoneAmiTests(unittest.TestCase):
         self.assertEqual(targets['1001'], [])
 
 
+class RadioAdmissionTests(unittest.TestCase):
+    def settings(self):
+        return {'enterprise_labs': {'enabled': True}, 'enterprise_integrations': {'enabled': '1', 'radios': {'enabled': '1', 'devices': [
+            {'extension': '1000', 'enabled': '1', 'maximum_audio_seconds': 30},
+            {'extension': '1001', 'enabled': '1', 'maximum_audio_seconds': 10}]}}}
+
+    def test_all_prerecorded_producers_share_the_strictest_limit(self):
+        for producer in ('announcement', 'weather', 'lightning', 'schedule'):
+            with self.subTest(producer=producer):
+                phone.check_radio_audio(self.settings(), ['1000', '1001'], 10, producer)
+                for duration in (10.01, None, True, float('nan'), float('inf'), 0):
+                    with self.assertRaisesRegex(phone.PhoneAdmissionError, 'phone_radio_audio_limit_exceeded'):
+                        phone.check_radio_audio(self.settings(), ['1000', '1001'], duration, producer)
+
+    def test_live_paging_requires_its_enforced_timeout_within_the_radio_limit(self):
+        settings = self.settings()
+        for duration in (None, 300, '30'):
+            settings['live_paging'] = {'max_duration_seconds': duration}
+            with self.assertRaisesRegex(phone.PhoneAdmissionError, 'phone_radio_audio_limit_exceeded'):
+                phone.check_radio_audio(settings, ['1000'], None, 'live')
+        settings['live_paging']['max_duration_seconds'] = 30
+        phone.check_radio_audio(settings, ['1000'], None, 'live')
+
+    def test_radio_refusal_precedes_any_ami_connection(self):
+        ami = mock.Mock()
+        with mock.patch.object(phone, 'PhoneAdmissionStore'):
+            with self.assertRaisesRegex(phone.PhoneAdmissionError, 'phone_radio_audio_limit_exceeded'):
+                phone.admit_audience(['1000'], service='weather', settings=self.settings(), duration=31, ami_factory=ami)
+        ami.assert_not_called()
+
+    def test_unrelated_phone_and_disabled_integration_keep_existing_behavior(self):
+        phone.check_radio_audio(self.settings(), ['1002'], None, 'announcement')
+        settings = self.settings()
+        settings['enterprise_integrations']['radios']['enabled'] = '0'
+        phone.check_radio_audio(settings, ['1000'], None, 'announcement')
+
+    def test_labs_master_is_required_for_radio_policy(self):
+        for master in (None, {'enabled': False}, {'enabled': '1'}, {'enabled': True, 'unknown': True}):
+            settings = self.settings()
+            settings.pop('enterprise_labs')
+            if master is not None:
+                settings['enterprise_labs'] = master
+            phone.check_radio_audio(settings, ['1000'], None, 'announcement')
+
+    def test_invalid_enabled_profiles_are_refused(self):
+        for field, value in [('maximum_audio_seconds', '30'), ('enabled', True), ('extension', '../1000')]:
+            settings = self.settings()
+            settings['enterprise_integrations']['radios']['devices'][0][field] = value
+            with self.assertRaisesRegex(phone.PhoneAdmissionError, 'phone_radio_profile_invalid'):
+                phone.check_radio_audio(settings, ['1000'], 1, 'announcement')
+
+
 if __name__ == '__main__':
     unittest.main()

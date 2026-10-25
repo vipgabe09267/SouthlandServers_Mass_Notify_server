@@ -100,7 +100,7 @@ class EnterpriseHttp(unittest.TestCase):
   cls.seed='''<?php
 require MODULE.'/SubscriberService.php';require MODULE.'/IncidentService.php';require MODULE.'/ConfigCrypto.php';require MODULE.'/EnterpriseIdentity.php';
 use SLS\\MassNotify\\{SubscriberConfig,SubscriberService,EnterpriseIdentityStore,IncidentStore,IncidentConfig,IncidentService};
-$root=$argv[1];$now=time();$settings=['public_pbx_host'=>'pbx.example.test','control_api'=>['base_url'=>'https://pbx.example.test/api/sls-mass-notify'],'subscriber_browser'=>['schema'=>1,'enabled'=>true,'public_base_url'=>'https://pbx.example.test/mass-notify/subscriber.php','link_ttl_seconds'=>900,'people'=>[['id'=>'sub_'.bin2hex(random_bytes(12)),'person_id'=>'fixture-person','name'=>'Fixture Person','email'=>'person@example.test','enabled'=>true,'version'=>str_repeat('a',64),'registered_at'=>$now-60]]],'enterprise_identity'=>['schema'=>1,'enabled'=>false,'providers'=>[],'grants'=>[]],'operator_access'=>['schema'=>1,'enabled'=>false,'portal_enabled'=>true,'accounts'=>[]]];
+$root=$argv[1];$now=time();$settings=['enterprise_labs'=>['enabled'=>true],'public_pbx_host'=>'pbx.example.test','control_api'=>['base_url'=>'https://pbx.example.test/api/sls-mass-notify'],'subscriber_browser'=>['schema'=>1,'enabled'=>true,'public_base_url'=>'https://pbx.example.test/mass-notify/subscriber.php','link_ttl_seconds'=>900,'people'=>[['id'=>'sub_'.bin2hex(random_bytes(12)),'person_id'=>'fixture-person','name'=>'Fixture Person','email'=>'person@example.test','enabled'=>true,'version'=>str_repeat('a',64),'registered_at'=>$now-60]]],'enterprise_identity'=>['schema'=>1,'enabled'=>false,'providers'=>[],'grants'=>[]],'operator_access'=>['schema'=>1,'enabled'=>false,'portal_enabled'=>true,'accounts'=>[]]];
 $t=IncidentConfig::template(['id'=>'tpl_'.str_repeat('a',24),'name'=>'Fixture','title'=>'Fixture <incident>','message'=>'Fixture message','delivery'=>['extensions'=>['1000']],'roster'=>[['id'=>'fixture-person','name'=>'Fixture Person'],['id'=>'another-person','name'=>'Private Person']]]);
 $store=new IncidentStore($root.'/incidents');$service=new IncidentService($store,fn()=>$t,fn($d)=>$d,fn()=>['success'=>true,'job_id'=>'job_'.str_repeat('a',32)],fn()=>[],fn()=>$now);
 $incident=$service->start(['template_id'=>$t['id'],'request_id'=>bin2hex(random_bytes(16)),'fields'=>[],'is_test'=>true],['identity'=>'Fixture admin']);
@@ -123,7 +123,7 @@ if(in_array($p,['/fixture-login','/fixture-current'])){
 require MODULE.'/OperatorPortal.php';session_name(SLS\\MassNotify\\OperatorPortal::COOKIE);session_set_cookie_params(['lifetime'=>0,'path'=>'/mass-notify/','secure'=>true,'httponly'=>true,'samesite'=>'Strict']);if(!session_start()){throw new RuntimeException('Fixture session unavailable.');}header('Content-Type: application/json');
 if($p==='/fixture-login'){echo json_encode(['csrf'=>SLS\\MassNotify\\OperatorPortal::csrf($_SESSION)],JSON_THROW_ON_ERROR);exit;}
 $settings=SLS\\MassNotify\\LivePagingSession::loadSettings(__DIR__.'/mass-notifications.config');$b=$_SESSION['portal_identity']??[];$account=$settings['operator_access']['accounts'][0];$valid=SLS\\MassNotify\\OperatorPortal::current($b,$account,1800,time())&&SLS\\MassNotify\\EnterpriseIdentity::current($settings,$b['enterprise_identity']??[],$account['id'],time());http_response_code($valid?200:401);echo json_encode(['valid'=>$valid,'pending'=>isset($_SESSION['portal_pending']),'principal'=>$valid?SLS\\MassNotify\\OperatorAccess::principal($settings,$account['id']):null],JSON_THROW_ON_ERROR);exit;}
-if(!in_array($p,['/mass-notify/subscriber.php','/mass-notify/sso.php'])){http_response_code(404);exit;}require $_SERVER['DOCUMENT_ROOT'].$p;
+if(!in_array($p,['/mass-notify/subscriber.php','/mass-notify/sso.php','/mass-notify/display.php'])){http_response_code(404);exit;}require $_SERVER['DOCUMENT_ROOT'].$p;
 '''.replace('MODULE',json.dumps(str(cls.module)))
   if (cls.root/'router.php').write_text(cls.router,encoding='utf-8')!=len(cls.router):raise RuntimeError('Router fixture write was incomplete.')
   (cls.root/'router.php').chmod(0o600)
@@ -217,12 +217,41 @@ class FreePBX{public static function create(){return (object)['Slsmassnotifyserv
   self.assertEqual(self.request('/mass-notify/subscriber.php?insecure=1')[0],403)
   self.assertEqual(self.request('/mass-notify/sso.php')[0],404)
   self.settings['subscriber_browser']['enabled']=False;self.write_settings();self.assertEqual(self.request()[0],404);self.assertEqual(self.request(post=post,cookie=cookie)[0],404)
+ def test_master_disables_subscriber_effects_but_preserves_authenticated_cleanup(self):
+  cookie,csrf,_=self.verify()
+  before=self.bounded_bytes(self.root/'incidents'/(self.fixture['incident_id']+'.json'),4*1024*1024)
+  for master in [None,False]:
+   if master is None:self.settings.pop('enterprise_labs',None)
+   else:self.settings['enterprise_labs']={'enabled':master}
+   self.write_settings()
+   self.assertEqual(self.request(cookie=cookie)[0],404)
+   for action in ['verify','respond','push_enroll']:
+    status,_,_=self.request(post={'subscriber_action':action,'portal_csrf':csrf},cookie=cookie)
+    self.assertEqual(status,404)
+  self.settings['subscriber_browser']['enabled']=False;self.settings['subscriber_browser']['push']={'enabled':False};self.write_settings()
+  cleanup={'subscriber_action':'push_remove_all','portal_csrf':csrf}
+  self.assertEqual(self.request(post=cleanup,cookie=cookie,origin='https://attacker.example.test',site='cross-site')[0],403)
+  self.assertEqual(self.request(post=cleanup|{'portal_csrf':'0'*64},cookie=cookie)[0],403)
+  status,_,body=self.request(post=cleanup,cookie=cookie,extra_headers={'Accept':'application/json'})
+  self.assertEqual(status,200);self.assertEqual(decode_json(body),{'success':True})
+  self.assertEqual(self.bounded_bytes(self.root/'incidents'/(self.fixture['incident_id']+'.json'),4*1024*1024),before)
+  self.settings['subscriber_browser']['people'][0]['enabled']=False;self.write_settings()
+  self.assertEqual(self.request(post=cleanup,cookie=cookie,extra_headers={'Accept':'application/json'})[0],400)
+ def test_browser_display_requires_explicit_master(self):
+  self.settings['enterprise_integrations']={'enabled':'1','browser_display':{'enabled':'1'}}
+  for master,expected in [(None,404),(False,404),(True,200)]:
+   if master is None:self.settings.pop('enterprise_labs',None)
+   else:self.settings['enterprise_labs']={'enabled':master}
+   self.write_settings();status,_,body=self.request('/mass-notify/display.php')
+   self.assertEqual(status,expected)
+   self.assertEqual('id="display-login"' in body,expected==200)
  def test_sso_rejects_non_boolean_portal_enablement(self):
   rate_path=self.root/'operator-sso-rate.json';before=self.bounded_bytes(rate_path,65536) if rate_path.exists() else None
   self.settings['enterprise_identity']['enabled']=True;self.settings['operator_access']['portal_enabled']='true';self.write_settings()
   status,_,body=self.request('/mass-notify/sso.php');self.assertEqual(status,404);self.assertNotIn('boolean enable settings',body)
   self.assertEqual(self.bounded_bytes(rate_path,65536) if rate_path.exists() else None,before)
  def test_oidc_actual_http_callback_local_grant_and_revocation(self):
+  self.settings['enterprise_labs']={'enabled':False}
   control_path=self.root/'control-api-audit.jsonl';control_before=self.bounded_bytes(control_path,4*1024*1024) if control_path.exists() else None
   self.settings['enterprise_identity']['enabled']=True;self.write_settings()
   self.assertEqual(self.request('/mass-notify/sso.php',host='attacker.example.test')[0],403)

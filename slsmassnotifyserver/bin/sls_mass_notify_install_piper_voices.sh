@@ -219,7 +219,7 @@ PYVOICECACHE
     for ((attempt = 0; attempt < 2; attempt++)); do
       if /usr/bin/timeout --signal=TERM --kill-after=5 95 /usr/bin/curl -fL --proto '=https' --proto-redir '=https' \
         --max-filesize "$expected_bytes" --connect-timeout 20 --max-time 90 \
-        -A "SouthlandServers-Mass-Notifications-Server/0.1.7-beta" \
+        -A "SouthlandServers-Mass-Notifications-Server/0.1.8-beta" \
         -o - "$url" | bounded_voice_stream "$tmp" "$expected_bytes"; then
         downloaded=1
         break
@@ -922,20 +922,36 @@ declare -A hashes=(
   ["pt_BR-faber-medium.onnx.json"]="7e694de195ae3fc36dd732c445eb04fb49b649854893cb5506b978f0d50a1d6f"
 )
 
+optional_records="$(/usr/bin/python3 -I - <<'SLS_OPTIONAL_VOICES'
+import json,re,sys
+from pathlib import Path
+sys.path.insert(0,'/usr/local/bin/sls_mass_notify')
+from sls_config_crypto import read_config
+path=Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin/mass-notifications.config')
+config=read_config(path) if path.exists() else {}
+selected=config.get('speech_optional_voice_packs',[])
+if not isinstance(selected,list) or len(selected)>2 or len(set(selected))!=len(selected) or any(name not in ('en_GB-cori-high','es_MX-ald-medium') for name in selected):raise SystemExit('Invalid optional speech pack selection.')
+if selected:
+    raw=Path('/usr/local/bin/sls_mass_notify/piper-optional-voices.json').read_bytes()
+    if len(raw)>32768:raise SystemExit('Regional speech catalogue is oversized.')
+    catalog=json.loads(raw)
+    if catalog.get('schema')!=1 or not isinstance(catalog.get('voices'),list):raise SystemExit('Invalid regional speech catalogue.')
+    voices={v['id']:v for v in catalog['voices']}
+    for name in selected:
+        files=voices[name]['files']
+        if set(files)!={name+'.onnx',name+'.onnx.json'}:raise SystemExit('Invalid regional speech files.')
+        for file,meta in files.items():
+            if not isinstance(meta.get('size'),int) or not 0<meta['size']<=134217728 or not re.fullmatch(r'[a-f0-9]{64}',meta.get('sha256','')) or not isinstance(meta.get('url'),str) or not meta['url'].startswith('https://huggingface.co/rhasspy/piper-voices/resolve/e21c7de8d4eab79b902f0d61e662b3f21664b8d2/') or meta['url'].split('/')[-1]!=file:raise SystemExit('Invalid regional speech artifact.')
+            print(file,meta['url'],meta['sha256'],meta['size'],sep='\t')
+SLS_OPTIONAL_VOICES
+)" || { log "Optional speech configuration could not be read safely."; exit 1; }
+selected_files=(en_US-lessac-low.onnx en_US-lessac-low.onnx.json en_US-lessac-medium.onnx en_US-lessac-medium.onnx.json en_US-amy-low.onnx en_US-amy-low.onnx.json en_US-ryan-low.onnx en_US-ryan-low.onnx.json es_ES-davefx-medium.onnx es_ES-davefx-medium.onnx.json fr_FR-siwis-medium.onnx fr_FR-siwis-medium.onnx.json de_DE-thorsten-low.onnx de_DE-thorsten-low.onnx.json pt_BR-faber-medium.onnx pt_BR-faber-medium.onnx.json)
+while IFS=$'\t' read -r file url digest bytes; do
+  [ -n "$file" ] || continue
+  files["$file"]="$url"; hashes["$file"]="$digest"; voice_bytes["$file"]="$bytes"; selected_files+=("$file")
+done <<< "$optional_records"
 failures=()
-for file in \
-  en_US-lessac-low.onnx en_US-lessac-low.onnx.json \
-  en_US-lessac-medium.onnx en_US-lessac-medium.onnx.json \
-  en_US-amy-low.onnx en_US-amy-low.onnx.json \
-  en_US-ryan-low.onnx en_US-ryan-low.onnx.json \
-  es_ES-davefx-medium.onnx \
-  es_ES-davefx-medium.onnx.json \
-  fr_FR-siwis-medium.onnx \
-  fr_FR-siwis-medium.onnx.json \
-  de_DE-thorsten-low.onnx \
-  de_DE-thorsten-low.onnx.json \
-  pt_BR-faber-medium.onnx \
-  pt_BR-faber-medium.onnx.json
+for file in "${selected_files[@]}"
 do
   target="$VOICE_DIR/$file"
   if voice_file_is_current "$target" "${hashes[$file]}" "${voice_bytes[$file]}"; then

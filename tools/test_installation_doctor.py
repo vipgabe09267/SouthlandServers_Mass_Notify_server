@@ -33,13 +33,32 @@ VM=load('vm_fixture',ROOT/'tools/qualify_installer_vm.py')
 
 
 class Doctor(unittest.TestCase):
+    def test_security_policy_has_matching_php_python_and_installer_floors(self):
+        policy = load('php_security_fixture', ROOT/'slsmassnotifyserver/bin/sls_mass_notify/sls_php_security.py')
+        versions = ['8.2.34','8.2.35','8.2.35-1~deb12u1','8.3.36','8.4.26','8.5.12','8.2.35RC1','8.2.35-dev','8.6.0','invalid']
+        php = ROOT/'slsmassnotifyserver/api/sls-mass-notify/runtime-security.php'
+        result = subprocess.run(['php','-r','require $argv[1]; echo json_encode(array_map(static fn($v)=>\\SLS\\MassNotify\\PhpSecurityPolicy::evaluate($v),json_decode($argv[2],true)));',str(php),json.dumps(versions)],capture_output=True,text=True,check=True)
+        self.assertEqual(json.loads(result.stdout), [policy.evaluate(version) for version in versions])
+        catalog = json.loads((ROOT/'slsmassnotifyserver/bin/sls_mass_notify/php-security-policy.json').read_text())
+        source = (ROOT/'tools/install_release.sh').read_text()
+        literal = re.search(r'\$securityFloors=(\[[^\n]+\]);',source).group(1)
+        self.assertEqual(dict(re.findall(r'"([0-9.]+)"=>"([0-9.]+)"',literal)),catalog['branches'])
+        self.assertFalse(policy.evaluate('8.2.34')['ok'])
+        self.assertFalse(policy.evaluate('8.2.35RC1')['ok'])
+        self.assertTrue(policy.evaluate('8.2.35-1~deb12u1')['ok'])
+
+    def test_stale_served_php_cannot_pass_a_patched_cli_policy(self):
+        payload=self.php_payload();payload['php_version']='8.2.34';payload['ok']=False;payload['missing']=['php_security_floor']
+        value=DOCTOR.served_php_probe(self.php_server(payload,503))
+        self.assertTrue(value['available']);self.assertFalse(value['ok'])
+
     def test_diagnostic_and_transaction_stages_share_the_installer_contract(self):
         transaction=load('transaction_stages',ROOT/'slsmassnotifyserver/bin/sls_mass_notify/sls_install_transaction.py')
         self.assertEqual(DOCTOR.STAGES,transaction.STAGES)
         emitted=set(re.findall(r"""^\s*set_install_stage ['"]([^'"$]+)['"]""", (ROOT/'tools/install_release.sh').read_text(), re.M))
         self.assertLessEqual(emitted,DOCTOR.STAGES)
     def php_payload(self):
-        return {'probe':'sls_served_php_v1','ok':True,'missing':[],'php_version':'8.2.29','php_sapi':'fpm-fcgi',
+        return {'probe':'sls_served_php_v1','ok':True,'missing':[],'php_version':'8.2.35','php_sapi':'fpm-fcgi',
                 'runtime_account_ok':True,'extensions':dict.fromkeys(DOCTOR.PHP_EXTENSIONS,True),
                 'functions':dict.fromkeys(DOCTOR.PHP_FUNCTIONS,True),'api_key':'must-not-appear','uid':999}
     def php_server(self,payload,status=200,slow=False):
@@ -82,7 +101,7 @@ class Doctor(unittest.TestCase):
         self.assertEqual(result.returncode,2)
     def test_served_runtime_uses_local_wire_evidence_and_redacts_extra_fields(self):
         value=DOCTOR.served_php_probe(self.php_server(self.php_payload()))
-        self.assertTrue(value['ok']);self.assertEqual(value['php_version'],'8.2.29');self.assertEqual(value['php_sapi'],'fpm-fcgi')
+        self.assertTrue(value['ok']);self.assertEqual(value['php_version'],'8.2.35');self.assertEqual(value['php_sapi'],'fpm-fcgi')
         self.assertNotIn('must-not-appear',json.dumps(value));self.assertNotIn('uid',value)
         payload=self.php_payload();payload['ok']=False;payload['runtime_account_ok']=False;payload['functions']['exec']=False
         value=DOCTOR.served_php_probe(self.php_server(payload,503));self.assertTrue(value['available']);self.assertFalse(value['ok'])
@@ -217,6 +236,30 @@ class Doctor(unittest.TestCase):
         result=subprocess.run(['python3','-I',str(ROOT/'tools/qualify_installer_vm.py'),'--image','/nonexistent','--image-sha256','a'*64,'--bundle','/nonexistent','--baseline','fresh','--report','/nonexistent'],capture_output=True,text=True,timeout=5)
         self.assertEqual(result.returncode,2)
         self.assertIn('--allow-disposable-vm',result.stderr)
+
+
+class DisposableVmScenarios(unittest.TestCase):
+    def test_purge_scenario_uses_the_documented_uninstaller_environment(self):
+        class Guest:
+            def __init__(self): self.commands=[]
+            def start(self): pass
+            def copy(self, bundle): pass
+            def ssh(self, command, **options):
+                self.commands.append(command)
+                output='fresh\n' if 'xml.etree.ElementTree' in command else '{}'
+                return subprocess.CompletedProcess(command,0,stdout=output,stderr='')
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle=Path(temporary)
+            (bundle/'slsmassnotifyserver-0.1.8-beta.tgz').touch()
+            for name in ('uninstall','purge'):
+                with self.subTest(scenario=name):
+                    guest=Guest()
+                    result=VM.scenario(guest,bundle,name,'fresh',{})
+                    self.assertTrue(result['ok'])
+                    commands=[row for row in guest.commands if 'sls_mass_notify_uninstall.sh' in row]
+                    expected='bash /usr/local/bin/sls_mass_notify/sls_mass_notify_uninstall.sh'
+                    if name=='purge': expected='SLS_MASS_NOTIFY_PURGE_CONFIG=1 '+expected
+                    self.assertEqual(commands,[expected])
 
 
 class OfflineBundle(unittest.TestCase):

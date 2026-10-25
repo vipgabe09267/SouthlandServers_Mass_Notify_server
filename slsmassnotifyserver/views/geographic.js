@@ -168,7 +168,7 @@
         }
         function allowCreate() {
             el('create').disabled = !preview || !el('confirm').checked || preview.unavailable.length > 0 ||
-                Object.values(preview.members).every(ids => !ids.length) || state().group_count >= 20;
+                Object.values(preview.members).every(ids => !ids.length) || state().group_count >= (state().group_limit || 200);
         }
         el('confirm').addEventListener('change', allowCreate);
         el('preview').addEventListener('click', async () => {
@@ -188,12 +188,12 @@
                     if (ids.length) details(el('review-members'), options.channels[key][0] + ' · ' + ids.length,
                         ids.map(id => Object.prototype.hasOwnProperty.call(state().catalog[key], id) ? state().catalog[key][id].label : 'Unavailable · ' + id), ids.length <= 10);
                 });
-                el('unavailable').hidden = !preview.unavailable.length && state().group_count < 20; el('unavailable').replaceChildren();
+                el('unavailable').hidden = !preview.unavailable.length && state().group_count < (state().group_limit || 200); el('unavailable').replaceChildren();
                 if (preview.unavailable.length) {
                     el('unavailable').append(node('strong', 'Resolve unavailable recipients before creating this audience.'));
                     const list = node('ul'); preview.unavailable.forEach(row => list.append(node('li', row.location + ': ' + row.id + ' · ' + row.reason))); el('unavailable').append(list);
                 }
-                if (state().group_count >= 20) el('unavailable').append(node('p', 'All 20 announcement groups are in use. Remove an unused group on the Dashboard first.'));
+                if (state().group_count >= (state().group_limit || 200)) el('unavailable').append(node('p', 'All saved audience slots are in use. Remove an unused audience first.'));
                 el('result').hidden = false; allowCreate();
             } catch (error) { invalidate(); options.announce(error.message, false); }
         });

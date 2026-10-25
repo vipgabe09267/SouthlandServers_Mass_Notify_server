@@ -19,11 +19,14 @@ import sys
 import time
 import tempfile
 
-MAX_ARCHIVE = 64 * 1024 * 1024
+MAX_ARCHIVE = 128 * 1024 * 1024
 MAX_FILE = 16 * 1024 * 1024
+MAX_LARGE_FILE = 64 * 1024 * 1024
+MAX_SOURCE_BYTES = 256 * 1024 * 1024
 MAX_FILES = 25000
 MAX_ARCHIVES = 5
-FORMAT = 'sls-operational-recovery-v1'
+FORMAT = 'sls-operational-recovery-v2'
+LEGACY_FORMAT = 'sls-operational-recovery-v1'
 ENTERPRISE_FENCES = {
     '.automations-required': b'SLS_AUTOMATION_STATE_V1\n',
     '.enterprise-state-required': b'SLS_ENTERPRISE_STATE_V1\n',
@@ -36,6 +39,7 @@ EXACT = {
     'operator-login-failures.json',
     'system-notification-email-state.json', 'system-notification-email-state.lock',
     'mail-admission.json', 'mail-admission.lock', '.mail-admission-initializing',
+    'mail-evidence.json', 'mail-evidence.lock',
     'seen_alerts.txt', 'processed_alert_keys.txt', 'audio_delivered_alert_keys.txt', 'event_cooldowns.txt',
     'seen_alerts.txt.lock', 'processed_alert_keys.txt.lock', 'audio_delivered_alert_keys.txt.lock',
     'nws-local-dispatch-intents.json', 'nws-cross-zone-delivery-claims.json', 'nws-cross-zone-delivery-claims.json.lock',
@@ -73,19 +77,20 @@ EXACT = {
     'enterprise-integrations/announcement-send.lock',
 }
 PATTERNS = [
+    re.compile(r'sipnotify/history/[a-f0-9]{64}\.json'),
     re.compile(r'(?:seen-alerts|processed-alerts|audio-delivered|event-cooldowns)-[A-Za-z0-9_-]{1,64}\.txt(?:\.lock)?'),
     re.compile(r'(?:xweather-lightning-state|nws-lightning-gate)-[A-Za-z0-9_-]{1,64}\.json'),
     re.compile(r'announcement-jobs/job_[a-f0-9]{32}\.json'),
     re.compile(r'incidents/inc_[a-f0-9]{32}\.json'),
     re.compile(r'sipnotify/acknowledgements/[a-f0-9]{64}\.json'),
-    re.compile(r'enterprise-state/(?:login|replay|directory_plans|subscriber_tokens|identity_audit|browser_subscriptions|browser_push_claims|browser_test_events|connector_claims|oauth_refresh)\.(?:json|required)'),
+    re.compile(r'enterprise-state/(?:login|replay|directory_plans|subscriber_tokens|identity_audit|browser_subscriptions|browser_push_claims|browser_events_[a-f0-9]|browser_test_events|connector_claims|oauth_refresh)\.(?:json|required)'),
     re.compile(r'enterprise-floorplans/img_[a-f0-9]{64}'),
     re.compile(r'control-idempotency/announcement_claims\.(?:json|required)'),
     re.compile(r'enterprise-operations/archive/(?:approvals|drills|floorplan_retirements)\.(?:json|required)'),
     re.compile(r'enterprise-integrations/archive/(?:operations|responses)(?:_[a-f0-9]{2})?\.(?:json|required)'),
     re.compile(r'enterprise-integrations/archive/(?:operation|response)_tombstones_[a-f0-9]{2}\.(?:json|required)'),
 ]
-DIRECTORIES = ['', 'automations', 'announcement-jobs', 'incidents', 'incidents/archive', 'sipnotify', 'sipnotify/acknowledgements',
+DIRECTORIES = ['', 'automations', 'announcement-jobs', 'incidents', 'incidents/archive', 'sipnotify', 'sipnotify/acknowledgements', 'sipnotify/history',
                'enterprise-state', 'control-idempotency', 'enterprise-integrations/archive', 'enterprise-operations/archive', 'enterprise-cluster', 'enterprise-operations', 'enterprise-integrations', 'enterprise-floorplans']
 
 
@@ -242,6 +247,8 @@ def compact_enterprise_payload(name, raw, now):
         'control-idempotency/announcement_claims.json': 'expires_at',
     }
     policy = policies.get(name)
+    if re.fullmatch(r'enterprise-state/browser_events_[a-f0-9]\.json', name):
+        policy = 'expires_at'
     if policy is None:
         return raw
     try: rows = strict_json(raw)
@@ -264,6 +271,40 @@ def compact_enterprise_payload(name, raw, now):
 
 def allowed(name):
     return isinstance(name, str) and (name in EXACT or any(pattern.fullmatch(name) for pattern in PATTERNS))
+
+
+def source_bound(name):
+    return MAX_LARGE_FILE if name in ('sipnotify/sipnotify_events.jsonl', 'control-api-audit.jsonl', 'security-audit.jsonl') else MAX_FILE
+
+
+def record_bytes(row):
+    """Decode one bounded evidence record, preserving v1 archive compatibility."""
+    base = {'path', 'captured_at', 'bytes', 'sha256', 'base64'}
+    if not isinstance(row, dict) or set(row) not in (base, base | {'codec', 'stored_bytes'}):
+        raise ValueError('invalid record fields')
+    if (not allowed(row['path']) or type(row['bytes']) is not int or not 0 <= row['bytes'] <= source_bound(row['path'])
+            or not isinstance(row['base64'], str) or not isinstance(row['sha256'], str)
+            or re.fullmatch(r'[a-f0-9]{64}', row['sha256']) is None):
+        raise ValueError('invalid record bounds')
+    stored = row.get('stored_bytes', row['bytes'])
+    if type(stored) is not int or not 0 <= stored <= source_bound(row['path']) or len(row['base64']) != 4 * ((stored + 2) // 3):
+        raise ValueError('invalid encoded size')
+    encoded = base64.b64decode(row['base64'], validate=True)
+    if len(encoded) != stored or base64.b64encode(encoded).decode('ascii') != row['base64']:
+        raise ValueError('invalid base64')
+    codec = row.get('codec', 'raw')
+    if codec == 'zlib':
+        decoder = zlib.decompressobj()
+        decoded = decoder.decompress(encoded, row['bytes'] + 1)
+        if not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
+            raise ValueError('invalid compressed evidence')
+    elif codec == 'raw':
+        decoded = encoded
+    else:
+        raise ValueError('unsupported evidence codec')
+    if len(decoded) != row['bytes'] or hashlib.sha256(decoded).hexdigest() != row['sha256']:
+        raise ValueError('changed record')
+    return decoded
 
 
 def directory(path):
@@ -310,7 +351,7 @@ def read(path, maximum):
 
 
 def write_new(path, body):
-    if len(body) > MAX_ARCHIVE: raise RecoveryError('Operational recovery evidence exceeds 64 MiB. Review retention before backing up; no records were silently omitted.')
+    if len(body) > MAX_ARCHIVE: raise RecoveryError('Operational recovery evidence exceeds 128 MiB. Review retention before backing up; no records were silently omitted.')
     parent = directory(Path(path).parent); descriptor = -1; created = False
     try:
         descriptor = os.open(Path(path).name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent)
@@ -436,15 +477,15 @@ def snapshot_plan(data, names):
         parent = directory((Path(data) / name).parent)
         try:
             meta = os.stat(Path(name).name, dir_fd=parent, follow_symlinks=False)
-            if (not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1 or meta.st_size > MAX_FILE
+            if (not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1 or meta.st_size > source_bound(name)
                     or meta.st_uid not in (0, os.geteuid()) or meta.st_mode & 0o022):
                 raise RecoveryError('Operational backup source is unsafe or exceeds its per-file bound: ' + Path(name).name)
             total += meta.st_size
             estimated += 4 * ((meta.st_size + 2) // 3) + 256 + len(name.encode('utf-8')) * 6
         finally:
             os.close(parent)
-    if estimated > MAX_ARCHIVE:
-        raise RecoveryError('Operational backup requires about %.1f MiB including encoding, above its 64 MiB bound. Export retained evidence and review retention before retrying. Nothing was omitted or deleted.' % (estimated / 1048576))
+    if total > MAX_SOURCE_BYTES or estimated > MAX_ARCHIVE:
+        raise RecoveryError('Operational backup requires about %.1f MiB including encoding, above its bounded workspace. Export retained evidence and review retention before retrying. Nothing was omitted or deleted.' % (estimated / 1048576))
     return {'files': len(names), 'source_bytes': total, 'estimated_archive_bytes': estimated, 'maximum_archive_bytes': MAX_ARCHIVE}
 
 
@@ -464,14 +505,20 @@ def captured_snapshot(data, output):
                 nonlocal written
                 written += len(row)
                 if written > MAX_ARCHIVE:
-                    raise RecoveryError('Operational backup grew beyond 64 MiB during capture. No partial backup was accepted; retry after activity settles or review retention.')
+                    raise RecoveryError('Operational backup grew beyond 128 MiB during capture. No partial backup was accepted; retry after activity settles or review retention.')
                 if stream.write(row) != len(row):
                     raise RecoveryError('Operational backup write failed. Check available space; source evidence was preserved.')
             append(line({'format': FORMAT, 'started_at': start, 'policy': 'evidence_only_no_replay'}))
             for name in names:
-                raw = compact_enterprise_payload(name, read(Path(data) / name, MAX_FILE), start)
+                raw = compact_enterprise_payload(name, read(Path(data) / name, source_bound(name)), start)
+                if total + len(raw) > MAX_SOURCE_BYTES:
+                    raise RecoveryError('Operational evidence grew beyond its source-byte bound during capture; no partial archive was accepted.')
+                encoded = zlib.compress(raw, 1) if len(raw) > 65536 else raw
+                codec = 'zlib' if len(encoded) < len(raw) else 'raw'
+                if codec == 'raw': encoded = raw
                 append(line({'path': name, 'captured_at': int(time.time()), 'bytes': len(raw),
-                             'sha256': hashlib.sha256(raw).hexdigest(), 'base64': base64.b64encode(raw).decode('ascii')}))
+                             'sha256': hashlib.sha256(raw).hexdigest(), 'codec': codec, 'stored_bytes': len(encoded),
+                             'base64': base64.b64encode(encoded).decode('ascii')}))
                 total += len(raw)
             append(line({'complete': True, 'files': len(names), 'source_bytes': total, 'finished_at': int(time.time())}))
             stream.flush()
@@ -501,14 +548,14 @@ def captured_snapshot(data, output):
 
 def inspect(body):
     if not body or len(body) > MAX_ARCHIVE or not body.endswith(b'\n'):
-        raise RecoveryError('Operational evidence is truncated or exceeds 64 MiB.')
+        raise RecoveryError('Operational evidence is truncated or exceeds 128 MiB.')
     rows = body.splitlines()
     if not 2 <= len(rows) <= MAX_FILES + 2:
         raise RecoveryError('Operational evidence has an invalid record count.')
     try:
         header, trailer = strict_json(rows[0]), strict_json(rows[-1])
         if (not isinstance(header, dict) or set(header) != {'format', 'started_at', 'policy'}
-                or header['format'] != FORMAT or header['policy'] != 'evidence_only_no_replay'
+                or header['format'] not in (FORMAT, LEGACY_FORMAT) or header['policy'] != 'evidence_only_no_replay'
                 or type(header['started_at']) is not int or not 0 < header['started_at'] < 32503680000
                 or not isinstance(trailer, dict) or set(trailer) != {'complete', 'files', 'source_bytes', 'finished_at'}
                 or trailer['complete'] is not True or type(trailer['files']) is not int
@@ -518,18 +565,13 @@ def inspect(body):
         seen = set(); total = 0
         for raw in rows[1:-1]:
             row = strict_json(raw)
-            if (not isinstance(row, dict) or set(row) != {'path', 'captured_at', 'bytes', 'sha256', 'base64'}
-                    or not allowed(row['path']) or row['path'] in seen or type(row['bytes']) is not int
-                    or not 0 <= row['bytes'] <= MAX_FILE or type(row['captured_at']) is not int
+            if (not isinstance(row, dict) or (header['format'] == LEGACY_FORMAT and set(row) != {'path', 'captured_at', 'bytes', 'sha256', 'base64'})
+                    or not allowed(row.get('path')) or row['path'] in seen or type(row.get('bytes')) is not int
+                    or not 0 <= row['bytes'] <= source_bound(row['path']) or type(row.get('captured_at')) is not int
                     or not header['started_at'] <= row['captured_at'] <= trailer['finished_at']
-                    or not isinstance(row['base64'], str)
-                    or len(row['base64']) != 4 * ((row['bytes'] + 2) // 3)
-                    or not isinstance(row['sha256'], str)):
+                    or total + row['bytes'] > MAX_SOURCE_BYTES):
                 raise ValueError('invalid record')
-            decoded = base64.b64decode(row['base64'], validate=True)
-            if (len(decoded) != row['bytes'] or base64.b64encode(decoded).decode('ascii') != row['base64']
-                    or hashlib.sha256(decoded).hexdigest() != row['sha256']):
-                raise ValueError('changed record')
+            decoded = record_bytes(row)
             if row['path'].startswith('enterprise-floorplans/'):
                 image = Path(row['path']).name
                 if image != 'img_' + row['sha256']:
@@ -546,7 +588,7 @@ def inspect(body):
                     raise ValueError('invalid cluster replay fence')
             seen.add(row['path']); total += len(decoded)
         if total != trailer['source_bytes']: raise ValueError('invalid total')
-    except (ValueError, TypeError, KeyError, OverflowError) as error:
+    except (ValueError, TypeError, KeyError, OverflowError, zlib.error) as error:
         raise RecoveryError('Operational evidence failed its format, path, completeness or content checks; no operational files were restored.') from error
     return {'ok': True, 'files': len(seen), 'source_bytes': total, 'started_at': header['started_at'],
             'finished_at': trailer['finished_at'], 'policy': 'evidence_only_no_replay'}
@@ -581,12 +623,12 @@ def incident_replay_ids(body):
         if match:
             ids.add(match[1])
         elif name == '.incident-replay-blocked.json':
-            ids.update(inspect_replay_guard(base64.b64decode(row['base64'], validate=True)))
+            ids.update(inspect_replay_guard(record_bytes(row)))
         elif name == 'incidents/archive/reports.sqlite':
             # Only this bounded, private backup is opened, read-only. No live
             # database, queues or desktop journal is opened or imported.
             with tempfile.TemporaryDirectory(prefix='sls-incident-replay-') as temporary:
-                path = Path(temporary) / 'archive.sqlite'; path.write_bytes(base64.b64decode(row['base64'], validate=True)); path.chmod(0o600)
+                path = Path(temporary) / 'archive.sqlite'; path.write_bytes(record_bytes(row)); path.chmod(0o600)
                 db = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=.25)
                 try:
                     deadline = time.monotonic() + 2
@@ -747,7 +789,7 @@ def retain_enterprise_fences(body, data):
     directory_fd = directory(data)
     try:
         for row in fences:
-            path = Path(data) / row['path']; raw = base64.b64decode(row['base64'], validate=True)
+            path = Path(data) / row['path']; raw = record_bytes(row)
             try:
                 if read(path, 1024) != raw:
                     raise RecoveryError('A restored enterprise replay fence conflicts with current evidence. Preserve both for reviewed recovery.')
@@ -804,7 +846,7 @@ def restore_private_images(body, data):
             raise RecoveryError('Private image restore lock disappeared during inspection.')
         for row in images:
             name = Path(row['path']).name; target = Path(data) / 'enterprise-floorplans' / name
-            raw = base64.b64decode(row['base64'], validate=True)
+            raw = record_bytes(row)
             try: private_image_info(raw)
             except ValueError as error: raise RecoveryError('A restored private image is invalid.') from error
             try:

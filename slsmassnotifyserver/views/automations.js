@@ -43,6 +43,7 @@
     function field(key, label, help, options = {}) {
         const wrap = make('div', undefined, 'form-group' + (options.wide ? ' sls-auto-wide' : ''));
         const caption = make('label', label), control = make(options.choices ? 'select' : 'input', undefined, 'form-control');
+        if (help) { const tip=make('span','?', 'sls-auto-help');tip.tabIndex=0;tip.title=help;tip.setAttribute('aria-label',help);caption.append(document.createTextNode(' '),tip); }
         control.id = 'sls-auto-input-' + key; caption.htmlFor = control.id;
         if (options.choices) { for (const [value, text] of options.choices) { const option = make('option', text); option.value = value; control.append(option); } }
         else { control.type = options.type || 'text'; control.maxLength = options.max || 512; control.autocomplete = 'off'; }
@@ -101,6 +102,8 @@
             field('max_age_seconds','Maximum event age (seconds)','Late or expired source events are rejected; accepted work retains an absolute deadline.',{type:'number',min:30,max:600});
             field('cooldown_seconds','Minimum interval (seconds)','Limits repeated activation from this one source; duplicate event IDs remain idempotent.',{type:'number',min:10,max:3600});
         } else if (draft.kind === 'script') {
+            if(!draft.execution_mode)draft.execution_mode='trusted';
+            field('execution_mode','Execution boundary','Restricted mode (Labs) requires bubblewrap and working user namespaces. It has no host data mounts or network. It refuses to run if isolation is unavailable. Approved scripts remain trusted code.',{choices:[['trusted','Trusted runtime account'],['restricted','Restricted filesystem and network · Labs']]});
             field('path','Absolute script path','Use a root-owned .sh or .js file and protected parent directories, for example /usr/local/lib/sls-mass-notify/actions/alert.sh. Scripts run as asterisk, with its permissions, for at most 10 seconds.',{max:512,wide:true});
             check('approve_script','I reviewed and approve the current script file','SLS records the exact file fingerprint. Editing or replacing it requires approval again. Event JSON arrives on standard input; arbitrary shell command strings are not accepted.');
         } else {
@@ -135,7 +138,7 @@
             if (draft.kind === 'cap') keys.push('feed_url','sender','language');
             if (draft.kind === 'panic') { keys.push('dial_extension','confirmation_prompt'); item.callers=draft.callers_text.split(',').map(v=>v.trim()).filter(Boolean); }
             if (draft.kind === 'emergency_call') { for (const key of ['callers','numbers']) item[key] = draft[key + '_text'].split(',').map(v => v.trim()).filter(Boolean); }
-        } else if (draft.kind === 'script') keys.push('path','sha256');
+        } else if (draft.kind === 'script') keys.push('path','sha256','execution_mode');
         else { keys.push('host','port'); keys.push(...(draft.kind === 'brightsign_udp' ? ['message'] : ['scheme','led','clear'])); }
         for (const key of keys) item[key] = draft[key];
         return {revision:state.revision,kind:category,item,rotate_secret:draft.rotate_secret === true,approve_script:draft.approve_script === true};

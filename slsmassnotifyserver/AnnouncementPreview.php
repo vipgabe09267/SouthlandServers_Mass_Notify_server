@@ -1,6 +1,7 @@
 <?php
 declare(strict_types=1);
 namespace FreePBX\modules;
+require_once __DIR__.'/DeliveryReview.php';
 
 /** Authenticated operator previews. This path never queues a delivery. */
 trait SlsAnnouncementPreview
@@ -50,6 +51,7 @@ trait SlsAnnouncementPreview
             }
             if (substr($data, 0, 4) !== 'RIFF' || substr($data, 8, 4) !== 'WAVE') { throw new \RuntimeException('Invalid preview audio'); }
             return ['success'=>true, 'mime'=>'audio/wav', 'data'=>base64_encode($data),
+                'duration_seconds'=>\SLS\MassNotify\DeliveryReview::waveSeconds($data),'speech_revision'=>\SLS\MassNotify\DeliveryReview::speechRevision((string)$voice,$settings['announcement_pronunciation']??[],(int)($settings['tts_max_seconds']??30)),
                 'speech_text'=>$this->buildAnnouncementTtsText($message, $settings['tts_max_seconds'] ?? 30, $settings['announcement_pronunciation'] ?? [], (string)$voice), 'voice'=>basename($voice)];
         } catch (\DomainException $error) {
             return ['success'=>false, 'message'=>$error->getMessage()];

@@ -6,7 +6,8 @@ use SLS\MassNotify\{OperatorPortal, OperatorLoginRate, LivePagingSession, ApiSec
 
 $nonce=base64_encode(random_bytes(18)); OperatorPortal::headers($nonce);
 $module=null; $principal=[]; $content=''; $csrf=''; $view='operations';
-$json=(($_SERVER['REQUEST_METHOD'] ?? '')==='POST' && isset($_POST['slsmassnotifyserver_action']));
+$json=(($_SERVER['REQUEST_METHOD'] ?? '')==='POST' && (isset($_POST['slsmassnotifyserver_action'])
+    ||(is_string($_POST['portal_action']??null)&&str_starts_with($_POST['portal_action'],'passkey_'))));
 $reply=static function(int $status,array $body): void {
     unset($_SESSION['AMP_user'],$GLOBALS['sls_operator_portal_principal']);
     if (session_status()===PHP_SESSION_ACTIVE) { session_write_close(); }
@@ -35,10 +36,15 @@ try {
     unset($_SESSION['AMP_user']); // Never accept a PBX session or serialized user here.
     $csrf=OperatorPortal::csrf($_SESSION);
     $requestedView=$_GET['view'] ?? 'operations';
-    if (!is_string($requestedView) || !in_array($requestedView,['operations','access','forgot'],true) || array_diff(array_keys($_GET),['view','cursor'])) {
+    if (!is_string($requestedView) || !in_array($requestedView,['operations','access','forgot','security'],true) || array_diff(array_keys($_GET),['view','cursor','incident_id'])) {
         http_response_code(404); throw new DomainException('That operator page does not exist.');
     }
     $view=$requestedView;
+    $focusedIncident = $_GET['incident_id'] ?? '';
+    if (!is_string($focusedIncident) || ($focusedIncident !== '' && ($view !== 'operations' || !preg_match('/^inc_[a-f0-9]{32}$/D', $focusedIncident)))) {
+        http_response_code(404); throw new DomainException('That incident page does not exist.');
+    }
+    if ($focusedIncident !== '') { $_SESSION['portal_destination_incident'] = $focusedIncident; }
     $post=($_SERVER['REQUEST_METHOD'] ?? '')==='POST';
     if ($post && !OperatorPortal::validPost($_SERVER,$_SESSION,$_POST['portal_csrf'] ?? $_POST['slsmassnotifyserver_csrf'] ?? null)) {
         http_response_code(403); throw new DomainException('The security token expired. Reload the page before submitting.');
@@ -55,8 +61,10 @@ try {
     $passwordWork=static fn(callable $work)=>OperatorPortal::passwordWork('/var/lib/asterisk/SLS_Mass_Notifications_Plugin/operator-password-work',$work);
     $failurePath='/var/lib/asterisk/SLS_Mass_Notifications_Plugin/operator-login-failures.json';
     $generalRatePath='/var/lib/asterisk/SLS_Mass_Notifications_Plugin/operator-login-rate.json';
+    $mfaRatePath='/var/lib/asterisk/SLS_Mass_Notifications_Plugin/operator-mfa-rate.json';
     $error=''; $now=time();
     $action=$post?($_POST['portal_action']??''):'';
+    if(!is_string($action)||strlen($action)>80){throw new DomainException('The portal action is invalid.');}
     $finish=static function(array $account) use($now,$module): void {
         if (!\SLS\MassNotify\OperatorAuth::ready($account)) { throw new DomainException('Finish your password and authenticator setup before signing in.'); }
         $federation=$_SESSION['portal_pending']['enterprise_identity']??null;
@@ -65,10 +73,13 @@ try {
             throw new DomainException('Enterprise sign-in expired or changed. Start again and verify your authenticator.');
         }
         if (!session_regenerate_id(true)) { throw new RuntimeException('portal_session_rotation_failed'); }
+        $destination = $_SESSION['portal_destination_incident'] ?? '';
         $_SESSION=[]; $_SESSION['portal_identity']=OperatorPortal::binding($account,$now); OperatorPortal::csrf($_SESSION);
         if ($federation!==null) { $_SESSION['portal_identity']['enterprise_identity']=$federation; }
         $module->operatorSecurityEvent('operator_sign_in_completed',$account);
-        header('Location: '.OperatorPortal::BASE,true,303); exit;
+        $target = is_string($destination) && preg_match('/^inc_[a-f0-9]{32}$/D', $destination)
+            ? OperatorPortal::BASE.'?view=operations&incident_id='.$destination : OperatorPortal::BASE;
+        header('Location: '.$target,true,303); exit;
     };
     if ($action==='request_reset') {
         $started=microtime(true);
@@ -133,7 +144,10 @@ try {
         if (function_exists('sodium_memzero')) { sodium_memzero($password); } unset($_POST['password'],$password);
         if ($accepted) {
             if (!session_regenerate_id(true)) { throw new RuntimeException('portal_session_rotation_failed'); }
-            $_SESSION=[]; $_SESSION['portal_pending']=['id'=>$account['id'],'username'=>$account['username'],
+            $destination = $_SESSION['portal_destination_incident'] ?? '';
+            $_SESSION=[];
+            if (is_string($destination) && preg_match('/^inc_[a-f0-9]{32}$/D', $destination)) { $_SESSION['portal_destination_incident']=$destination; }
+            $_SESSION['portal_pending']=['id'=>$account['id'],'username'=>$account['username'],
                 'identity'=>\SLS\MassNotify\OperatorAuth::identity($account),'started_at'=>$now,'mfa_passed'=>false];
             OperatorPortal::csrf($_SESSION); header('Location: '.OperatorPortal::BASE,true,303); exit;
         }
@@ -156,11 +170,30 @@ try {
                 ($auth['totp_secret_enc']!=='' && empty($pending['mfa_passed'])?'totp':($auth['force_password_change']?'password':($auth['totp_secret_enc']===''?'enroll':'complete')));
         }
     }
+    if(in_array($action,['passkey_authenticate_begin','passkey_authenticate_finish'],true)){
+        if(!$pending||$stage!=='totp'||array_diff(array_keys($_POST),['portal_action','portal_csrf','credential'])){throw new DomainException('Passkey verification requires the current password or enterprise sign-in step.');}
+        $retry=OperatorPortal::loginAttempt($mfaRatePath,$network['ip'],$account['username'],$now);
+        if($retry){header('Retry-After: '.$retry);http_response_code(429);throw new DomainException('Too many verification attempts. Wait before trying again.');}
+        $operation=$action==='passkey_authenticate_begin'?'authenticate_begin':'authenticate_finish';$input=[];
+        $challenge=$_SESSION['portal_passkey_challenge']??null;unset($_SESSION['portal_passkey_challenge']);
+        if($operation==='authenticate_finish'){
+            if(!is_array($challenge)||!is_string($_POST['credential']??null)){throw new DomainException('The passkey challenge expired or was already used.');}
+            $input=['state'=>$challenge,'credential'=>$_POST['credential']];
+        }
+        try{
+            $updated=$passwordWork(static fn()=>$module->operatorPasskeyOperation($account['id'],$pending['identity'],$operation,$input));
+            if($operation==='authenticate_begin'){
+                $_SESSION['portal_passkey_challenge']=$updated['state'];$reply(200,['success'=>true,'public_key'=>$updated['public_key']]);
+            }
+            $_SESSION['portal_pending']['identity']=\SLS\MassNotify\OperatorAuth::identity($updated['account']);$_SESSION['portal_pending']['mfa_passed']=true;
+            $module->operatorSecurityEvent('operator_passkey_authenticated',$updated['account']);$reply(200,['success'=>true]);
+        }catch(DomainException $e){$module->operatorSecurityEvent('operator_passkey_failed',$account,false);throw $e;}
+    }
     if (in_array($action,['totp','password','enroll','recovery'],true)) {
         $fields=['totp'=>['code'],'password'=>['new_password','confirm_password'],'enroll'=>['code'],'recovery'=>[]][$action];
         if (!$pending || $stage!==$action || array_diff(array_keys($_POST),array_merge(['portal_action','portal_csrf'],$fields))) { throw new DomainException('This sign-in step expired. Start again.'); }
         // OTP guesses are bounded independently from the password stage.
-        $retry=OperatorPortal::loginAttempt('/var/lib/asterisk/SLS_Mass_Notifications_Plugin/operator-mfa-rate.json',$network['ip'],$account['username'],$now);
+        $retry=OperatorPortal::loginAttempt($mfaRatePath,$network['ip'],$account['username'],$now);
         if ($retry) { header('Retry-After: '.$retry); http_response_code(429); throw new DomainException('Too many verification attempts. Try again in '.$retry.' seconds.'); }
         try {
             if ($action==='recovery') { $finish($account); }
@@ -239,9 +272,33 @@ try {
             $federation=\SLS\MassNotify\EnterpriseIdentityConfig::normalize($settings['enterprise_identity']??[]);
             if($federation['enabled']){foreach($federation['providers'] as $provider){if(!$provider['enabled']){continue;}$content.='<form method="post" action="'.OperatorPortal::BASE.'sso.php"><input type="hidden" name="portal_csrf" value="'.$escape($csrf).'"><input type="hidden" name="provider_id" value="'.$escape($provider['id']).'"><button type="submit" class="btn btn-default">Sign in with '.$escape($provider['name']).'</button></form>';}}
         }
+        if($stage==='totp'&&($settings['operator_access']['passkeys_enabled']??false)===true&&!empty($account['auth']['passkeys'])){
+            $content.='<section id="sls-passkeys" data-mode="authenticate" data-csrf="'.$escape($csrf).'"><button type="button" class="btn btn-default" id="passkey-authenticate">Use a passkey instead</button><p id="passkey-status" role="status" aria-live="polite"></p></section><script nonce="'.$escape($nonce).'" src="/mass-notify/passkeys.js" defer></script>';
+        }
         $content.='</section>';
     } else {
         if ($view==='access' && $principal['operator_role']!=='administrator') { http_response_code(403); throw new DomainException('Only an SLS administrator can manage operator access.'); }
+        if(str_starts_with($action,'passkey_')){
+            if($view!=='security'||!in_array($action,['passkey_register_begin','passkey_register_finish','passkey_revoke'],true)
+                ||array_diff(array_keys($_POST),['portal_action','portal_csrf','code','credential_id','credential','name'])){throw new DomainException('Unsupported operator security request.');}
+            $local=$module->portalAccount($principal['username']);
+            if(!$local||$local['id']!==$principal['id']){throw new DomainException('This local operator login is unavailable.');}
+            $retry=OperatorPortal::loginAttempt($mfaRatePath,$network['ip'],$local['username'],$now);
+            if($retry){header('Retry-After: '.$retry);http_response_code(429);throw new DomainException('Too many authenticator attempts. Wait before trying again.');}
+            $operation=substr($action,8);$input=[];
+            if($operation==='register_begin'){$input=['code'=>$_POST['code']??''];unset($_SESSION['portal_passkey_challenge']);}
+            elseif($operation==='revoke'){$input=['code'=>$_POST['code']??'','credential_id'=>$_POST['credential_id']??''];unset($_SESSION['portal_passkey_challenge']);}
+            else{$challenge=$_SESSION['portal_passkey_challenge']??null;unset($_SESSION['portal_passkey_challenge']);if(!is_array($challenge)){throw new DomainException('The passkey registration expired or was already used.');}$input=['state'=>$challenge,'credential'=>$_POST['credential']??'','name'=>$_POST['name']??''];}
+            try{$updated=$passwordWork(static fn()=>$module->operatorPasskeyOperation($local['id'],\SLS\MassNotify\OperatorAuth::identity($local),$operation,$input));}
+            catch(DomainException $e){$module->operatorSecurityEvent('operator_passkey_failed',$local,false);throw $e;}
+            if($operation==='register_begin'){$_SESSION['portal_passkey_challenge']=$updated['state'];$reply(200,['success'=>true,'public_key'=>$updated['public_key']]);}
+            $federation=$_SESSION['portal_identity']['enterprise_identity']??null;
+            if(!session_regenerate_id(true)){throw new RuntimeException('portal_session_rotation_failed');}
+            $_SESSION['portal_identity']=OperatorPortal::binding($updated['account'],$now);
+            if($federation!==null){$_SESSION['portal_identity']['enterprise_identity']=$federation;}
+            $module->operatorSecurityEvent($operation==='revoke'?'operator_passkey_revoked':'operator_passkey_enrolled',$updated['account']);
+            $reply(200,['success'=>true]);
+        }
         if ($json) {
             $action=$_POST['slsmassnotifyserver_action']; $raw=$_POST['payload'] ?? null;
             if (!is_string($action) || !is_string($raw) || strlen($raw)>65536) { throw new DomainException('The request is missing or exceeds 64 KiB.'); }
@@ -253,9 +310,16 @@ try {
             $reply(200,$result);
         }
         if ($post) { throw new DomainException('Unsupported operator portal action.'); }
+        if($view==='security'){
+            $local=$module->portalAccount($principal['username']);if(!$local||$local['id']!==$principal['id']){throw new DomainException('This page requires a dedicated local operator login.');}
+            require_once '/var/www/html/admin/modules/slsmassnotifyserver/OperatorPasskeyView.php';
+            $content=\SLS\MassNotify\OperatorPasskeyView::render($settings,$local,$csrf,$nonce);
+        }else{
         $endpoint=OperatorPortal::BASE.'?view='.$view;
+        if ($focusedIncident !== '') { $endpoint.='&incident_id='.$focusedIncident; }
         $content=$view==='access'?$module->renderOperatorsPage($endpoint,$csrf)
-            :$module->renderOperationsPage(is_string($_GET['cursor'] ?? null)?$_GET['cursor']:'',$endpoint,$csrf);
+            :$module->renderOperationsPage(is_string($_GET['cursor'] ?? null)?$_GET['cursor']:'',$endpoint,$csrf,$focusedIncident);
+        }
     }
 } catch (DomainException|InvalidArgumentException|JsonException $error) {
     $status=http_response_code(); if (!is_int($status) || $status<400) { $status=400; }

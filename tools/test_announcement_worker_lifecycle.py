@@ -368,7 +368,7 @@ class FixtureAnnouncementModule {
         # The complete module ships the disabled-by-default delivery fence too.
         for dependency in CANDIDATE.glob("EnterpriseCluster*.php"):
             (packaged / dependency.name).write_bytes(dependency.read_bytes())
-        for name in ("LabsSafety.php", "IncidentStore.php", "ConfigCrypto.php"):
+        for name in ("LabsSafety.php", "IncidentStore.php", "ConfigCrypto.php", "RadioGateway.php", "MailEvidence.php", "DeploymentReadiness.php", "IncidentConfig.php"):
             (packaged / name).write_bytes((CANDIDATE / name).read_bytes())
         packaged_security = packaged / "api/sls-mass-notify/security.php"
         packaged_security.parent.mkdir(parents=True)

@@ -121,7 +121,7 @@ class CollaborationWebhooks(unittest.TestCase):
     def test_incident_links_use_the_configured_origin_and_exact_typed_identity(self):
         incident_id = 'inc_' + 'a' * 32
         self.config.update(public_pbx_host='pbx.example.org', control_api={'base_url': 'https://pbx.example.org:8443/api/sls-mass-notify'})
-        url = 'https://pbx.example.org:8443/admin/config.php?display=slsmassnotifyserver_incidents&incident_id=' + incident_id
+        url = 'https://pbx.example.org:8443/mass-notify/?view=operations&incident_id=' + incident_id
         results = m.dispatch_announcement_webhooks(self.config, 'Incident <@U123>', 'Go to <https://evil.invalid|here> & stay safe.',
             timestamp='2026-09-27T12:00:00Z', event_id='announcement-fixed', destination_ids=[r['id'] for r in self.rows],
             expected_fingerprints={r['id']: m.destination_fingerprint(r) for r in self.rows}, incident_id=incident_id,
@@ -205,7 +205,7 @@ class CollaborationWebhooks(unittest.TestCase):
         for host in ('pbx.example.org><@U123>', '', None, 'x' * 254, 'pbx.example.org\n'):
             self.assertEqual(m.incident_operator_link({'public_pbx_host': host}, incident_id), '')
         good = {'public_pbx_host': 'PBX.EXAMPLE.ORG', 'control_api': {'base_url': 'https://pbx.example.org:443/api/sls-mass-notify/'}}
-        self.assertTrue(m.incident_operator_link(good, incident_id).startswith('https://pbx.example.org/admin/'))
+        self.assertTrue(m.incident_operator_link(good, incident_id).startswith('https://pbx.example.org/mass-notify/'))
         for value in ('inc_' + 'a' * 31, 'inc_' + 'a' * 32 + '\n', 'https://evil.invalid', None, {}, []):
             with self.assertRaises(m.DestinationError) as error:
                 m.build_collaboration_payload('slack', 'Title', 'Body', incident_id=value, config=good)
@@ -298,6 +298,22 @@ rows.forEach((row,index)=>assert.equal(row.fields.payload_format.name,`generic_w
 assert.equal(rows[0].auth.hidden,true);assert.equal(rows[1].auth.hidden,false);assert.equal(rows[2].auth.hidden,true);
 '''
         subprocess.run(['node'], input=fixture.replace('SCRIPT', json.dumps(script)), text=True, capture_output=True, check=True)
+
+    def test_google_chat_mattermost_and_explicit_tenant_bearer(self):
+        for adapter in ('google_chat', 'mattermost'):
+            value = m.build_collaboration_payload(adapter, 'Fixture', '@channel <users/all> instructions',
+                incident_id='inc_'+'a'*32, config={'public_pbx_host':'pbx.example.org', 'control_api':{'base_url':'https://pbx.example.org:8443/api/sls-mass-notify'}})
+            self.assertNotIn('@channel', value['text'])
+            self.assertNotIn('<users/all>', value['text'])
+            self.assertIn('/mass-notify/?view=operations&incident_id=inc_', value['text'])
+            self.assertIn('instructions', value['text'])
+        row = {'kind':'generic', 'id':'tenant', 'name':'Tenant workflow','url':'https://hooks.example.com/tenant',
+               'payload_format':'teams_bearer','authentication':{'bearer_token':'x'*2048,'signing_secret':'must-not-forward'}}
+        result = m._deliver(row, m.build_collaboration_payload('teams_bearer','Title','Full instructions'),
+                            'fixture', self.transport, lambda *args: [], lambda *args: None, 100, lambda: 1)
+        self.assertEqual(result['status'],'accepted')
+        self.assertEqual(self.calls[-1][1]['authentication'],{'bearer_token':'x'*2048})
+        self.assertEqual(m.webhook_auth_headers({'bearer_token':'x'*2048},b'{}','fixture')['Authorization'],'Bearer '+'x'*2048)
 
     def test_manual_tests_never_contact_providers(self):
         self.assertEqual(self.dispatch(test=True), [])

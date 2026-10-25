@@ -7,10 +7,27 @@ if (!class_exists(ControlContract::class, false)) {
 /** Read-only API discovery. Recipient projections never contain delivery addresses or secrets. */
 final class ControlContract
 {
+    public static function labsEnabled(array $settings): bool
+    {
+        $value = $settings['enterprise_labs'] ?? [];
+        return is_array($value) && !array_diff(array_keys($value), ['enabled']) && ($value['enabled'] ?? false) === true;
+    }
+
+    /** API readers see effective flags; settings storage and SSO stay independent. */
+    public static function effectiveLabs(array $settings): array
+    {
+        if (!self::labsEnabled($settings)) {
+            foreach (['enterprise_cluster','directory_sync','subscriber_browser','enterprise_integrations','enterprise_operations'] as $key) {
+                if (is_array($settings[$key] ?? null)) { $settings[$key]['enabled'] = $key === 'enterprise_integrations' ? '0' : false; }
+            }
+        }
+        return $settings;
+    }
+
     public static function capabilities(array $principal): array
     {
-        $resources = ['status', 'capabilities', 'audiences', 'delivery', 'events', 'readiness', 'desktop_fleet', 'config', 'incidents', 'incident', 'incident_report', 'enterprise_capabilities', 'incident_templates', 'recordings'];
-        $actions = ['send_announcement' => 'send', 'preview_announcement' => 'send', 'retry_announcement' => 'send', 'test_nws' => 'test',
+        $resources = ['status', 'capabilities', 'audiences', 'delivery', 'events', 'readiness', 'metrics', 'desktop_fleet', 'config', 'incidents', 'incident', 'incident_report', 'enterprise_capabilities', 'incident_templates', 'recordings'];
+        $actions = ['send_announcement' => 'send', 'preview_announcement' => 'send', 'rehearse_announcement'=>'send', 'retry_announcement' => 'send', 'test_nws' => 'test',
             'trigger_nws_test' => 'test', 'get_config' => 'config', 'update_config' => 'config',
             'start_incident' => 'send', 'update_incident' => 'send', 'incident_roll_call' => 'config', 'incident_checklist' => 'config', 'enterprise_template_start' => 'send'];
         $unrestricted = ($principal['audience']['unrestricted'] ?? false) === true;
@@ -26,32 +43,56 @@ final class ControlContract
             }
         }
         $availableResources = [];
-        if (ApiSecurity::permits($principal, 'read')) {
-            foreach ($resources as $resource) {
-                if (in_array($resource, ['config', 'recordings'], true) && !ApiSecurity::permits($principal, 'config')) { continue; }
-                if (in_array($resource, ['enterprise_capabilities','incident_templates'], true) && ($principal['id'] ?? '') === 'legacy') { continue; }
-                if (!$unrestricted && !in_array($resource, ['status', 'capabilities', 'audiences', 'delivery','enterprise_capabilities','incident_templates'], true)) { continue; }
-                $availableResources[] = $resource;
-            }
+        foreach ($resources as $resource) {
+            if (!ApiSecurity::permitsReadResource($principal, $resource)) { continue; }
+            if (in_array($resource, ['config', 'recordings'], true) && !ApiSecurity::permits($principal, 'config')) { continue; }
+            if (in_array($resource, ['enterprise_capabilities','incident_templates'], true) && ($principal['id'] ?? '') === 'legacy') { continue; }
+            $narrowRead = ($resource === 'readiness' && ApiSecurity::permits($principal, 'monitor'))
+                || ($resource === 'desktop_fleet' && ApiSecurity::permits($principal, 'fleet_read'));
+            if (!$unrestricted && !$narrowRead && !in_array($resource, ['status', 'capabilities', 'metrics', 'audiences', 'delivery','enterprise_capabilities','incident_templates'], true)) { continue; }
+            $availableResources[] = $resource;
         }
         return ['api_version' => 1, 'notification_payload_schema' => 1, 'desktop_sse_protocol' => 2,
             'resources' => $availableResources, 'actions' => $available,
             'credential' => ['id' => (string)($principal['id'] ?? ''), 'scopes' => array_values($principal['scopes'] ?? []), 'unrestricted_audience' => $unrestricted],
             'limits' => ['announcement_idempotency_retention_seconds'=>2592000,'event_page_records' => 100, 'event_page_scan_bytes' => 524288, 'incident_page_records' => 200,
+                'saved_audiences'=>ApiSecurity::MAX_SAVED_AUDIENCES,
                 'sms_recipients' => 50, 'email_recipients' => 50],
             'paths' => ['control' => '/api/sls-mass-notify/', 'desktop' => '/api/sipnotify/desktop',
                 'desktop_acknowledgement' => '/api/sipnotify/desktop/ack', 'desktop_stream' => '/api/sipnotify/desktop/stream',
+                'desktop_media'=>'/api/sipnotify/desktop/media', 'desktop_incident'=>'/api/sipnotify/desktop/incident', 'desktop_human_response'=>'/api/sipnotify/desktop/incident/respond',
                 'signed_trigger' => '/api/sls-mass-notify/trigger.php', 'sms_callback' => '/api/sls-mass-notify/sms-callback.php']];
+    }
+
+    public static function fleet(array $principal,array $settings,array $report): array
+    {
+        if(!ApiSecurity::permitsReadResource($principal,'desktop_fleet')){throw new \DomainException('Fleet read permission is required.');}
+        $unrestricted=($principal['audience']['unrestricted']??false)===true;
+        $permitted=[];
+        if(!$unrestricted){
+            $users=ApiSecurity::allowedAudience($principal,$settings)['desktops'];
+            foreach($settings['desktop_clients']??[] as $row){
+                if(is_array($row)&&!empty($row['enabled'])&&in_array($row['username']??null,$users,true)){$permitted[$row['client_id']]=true;}
+            }
+        }
+        $result=array_intersect_key($report,array_flip(['schema','generated_at','minimum_version']));$result['clients']=[];
+        $fields=array_flip(['name','client_id','username','enabled','last_seen_at','last_seen_ip','connected','last_acknowledged_event',
+            'last_acknowledged_at','state','connection','client_version','compatibility','client_reported_at','payload_schema','sse_protocol']);
+        foreach(array_slice($report['clients']??[],0,1000) as $row){
+            if(is_array($row)&&($unrestricted||isset($permitted[$row['client_id']??'']))){$result['clients'][]=array_intersect_key($row,$fields);}
+        }
+        return $result;
     }
 
     /** Feature switches only. Configuration, identity grants and secrets are never discovery data. */
     public static function enterpriseCapabilities(array $principal, array $settings): array
     {
         if (($principal['id'] ?? '') === 'legacy' || !ApiSecurity::permits($principal, 'read')) { throw new \DomainException('A named read credential is required.'); }
+        $settings = self::effectiveLabs($settings);
         $enabled = static fn(string $key): bool => self::enabled((array)($settings[$key] ?? []));
         $operations = $enabled('enterprise_operations');
         return ['success'=>true,'schema'=>1,'labs_warning'=>'DO NOT USE ON PRODUCTION SERVERS',
-            'features'=>['identity'=>$enabled('enterprise_identity'),'directory'=>$enabled('directory_sync'),
+            'features'=>['enterprise_labs'=>self::labsEnabled($settings),'identity'=>$enabled('enterprise_identity'),'directory'=>$enabled('directory_sync'),
                 'subscriber_browser'=>$enabled('subscriber_browser'),'integrations'=>$enabled('enterprise_integrations'),
                 'cluster'=>$enabled('enterprise_cluster'),'operations'=>$operations,
                 'dual_approval'=>$operations && ($settings['enterprise_operations']['dual_approval']['enabled'] ?? false) === true,
@@ -125,7 +166,7 @@ final class ControlContract
         }
         $options['_is_test'] = ($body['is_test'] ?? $options['is_test'] ?? false) === true;
         unset($body['is_test'], $options['is_test']);
-        if (($body['action'] ?? '') === 'preview_announcement') { $options['preview'] = true; }
+        if (in_array($body['action'] ?? '', ['preview_announcement','rehearse_announcement'],true)) { $options['preview'] = true; }
         $body['options'] = $options;
         return $body;
     }

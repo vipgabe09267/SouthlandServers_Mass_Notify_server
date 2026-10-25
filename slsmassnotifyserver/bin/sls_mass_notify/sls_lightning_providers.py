@@ -65,7 +65,7 @@ def distance(center, lat, lon):
 
 def request(url, headers=None, opener=None):
     client = opener or urllib.request.build_opener(NoRedirect())
-    req=urllib.request.Request(url,headers={'User-Agent':'SLS-Mass-Notify/0.1.7-beta', 'Accept':'application/json, application/xml', **(headers or {})})
+    req=urllib.request.Request(url,headers={'User-Agent':'SLS-Mass-Notify/0.1.8-beta', 'Accept':'application/json, application/xml', **(headers or {})})
     # Transport errors must not expose credential-bearing URLs or headers.
     try:
         with client.open(req,timeout=20) as response:

@@ -94,7 +94,7 @@ check(C::normalize($mirrorBase)['mirror_authority']==='mirror-source','A complet
 reject(static fn()=>C::normalize(array_replace($mirrorBase,['mirror_authority'=>'missing'])),'An unknown mirror authority was accepted.');
 reject(static fn()=>C::normalize(array_replace($mirrorBase,['mirror_epoch'=>''])),'Mirroring without a reviewed authority epoch was accepted.');
 $mirrorSourceReceipt=['revision'=>\SLS\MassNotify\LabsSafety::revision(),'accepted_at'=>time(),'actor'=>'pbx:fixture'];
-$mirrorSourceSettings=['enterprise_cluster'=>$mirrorBase,'labs_safety'=>['schema'=>1,'receipts'=>['enterprise_cluster'=>$mirrorSourceReceipt]]];
+$mirrorSourceSettings=['enterprise_labs'=>['enabled'=>true],'enterprise_cluster'=>$mirrorBase,'labs_safety'=>['schema'=>1,'receipts'=>['enterprise_cluster'=>$mirrorSourceReceipt]]];
 $mirrorSourceRuntime=new R($mirrorSourceSettings,$temporary.'/mirror-source-journal',str_repeat('8',64),null,static fn()=>$mirrorSourceSettings);
 reject(static fn()=>$mirrorSourceRuntime->mirror($mirrorSourceSettings,0),'A nonpositive mirror revision reached cluster fanout.');
 $admin=new class {
@@ -169,7 +169,7 @@ $haPeers=[
 $haConfig=array_replace(C::defaults(),['enabled'=>true,'mode'=>'notification_ha','role'=>'node','cluster_id'=>'ha-test','node_id'=>'node-a',
     'site_id'=>'site','witness_id'=>'witness','witness_epoch'=>str_repeat('5',64),'initial_owner'=>'node-a','pbx_contract'=>$pbxAfter['contract'],
     'tls_cert'=>'/fixture-cert','tls_key'=>'/fixture-key','tls_ca'=>'/fixture-ca','peers'=>$haPeers]);
-$haSettings=['runtime_enabled'=>true,'enterprise_cluster'=>$haConfig,'labs_safety'=>['schema'=>1,'receipts'=>['enterprise_cluster'=>[
+$haSettings=['enterprise_labs'=>['enabled'=>true],'runtime_enabled'=>true,'enterprise_cluster'=>$haConfig,'labs_safety'=>['schema'=>1,'receipts'=>['enterprise_cluster'=>[
     'revision'=>\SLS\MassNotify\LabsSafety::revision(),'accepted_at'=>time(),'actor'=>'pbx:fixture']]]];
 mkdir($temporary.'/ha-outbox',0700);
 $haRuntime=new R($haSettings,$temporary.'/ha-outbox/enterprise-cluster',str_repeat('6',64),$pbxPaths,static fn()=>$haSettings);
@@ -203,11 +203,24 @@ $config=['enabled'=>true,'remote_enabled'=>true,'mode'=>'edge','role'=>'node','c
     'peers'=>[['node_id'=>'coordinator','site_id'=>'site-a','role'=>'coordinator','https_url'=>'https://localhost/peer',
         'cert_sha256'=>str_repeat('a',64),'hmac_secret'=>str_repeat('b',64)]]];
 mkdir($temporary.'/edge',0700);
-$runtime=new R(['enterprise_cluster'=>$config],$temporary.'/edge/enterprise-cluster',str_repeat('c',64),null,static fn()=>['enterprise_cluster'=>$config]);
+check(!C::enabled(['enterprise_cluster'=>$config])
+    &&!C::enabled(['enterprise_labs'=>['enabled'=>false],'enterprise_cluster'=>$config])
+    &&!C::enabled(['enterprise_labs'=>['enabled'=>'1'],'enterprise_cluster'=>$config]),
+    'Cluster activation accepted a missing, disabled or non-boolean Labs master.');
+foreach ([null,false] as $index=>$master) {
+    $policy=['enterprise_cluster'=>$config,'runtime_enabled'=>true];
+    if ($master!==null) { $policy['enterprise_labs']=['enabled'=>$master]; }
+    mkdir($temporary.'/master-off-'.$index,0700);
+    $disabled=new R($policy,$temporary.'/master-off-'.$index.'/enterprise-cluster',str_repeat('8',64),null,static fn()=>$policy);
+    reject(static fn()=>$disabled->initialize(),'Disabled Labs initialized cluster authority state.');
+    check(!is_file($temporary.'/master-off-'.$index.'/enterprise-cluster/worker-state.json'),
+        'Refused initialization created a cluster journal.');
+}
+$runtime=new R(['enterprise_labs'=>['enabled'=>true],'enterprise_cluster'=>$config],$temporary.'/edge/enterprise-cluster',str_repeat('c',64),null,static fn()=>['enterprise_labs'=>['enabled'=>true],'enterprise_cluster'=>$config]);
 $productionFactory=new class($config) {
     use \FreePBX\modules\SlsEnterpriseCluster;
     public function __construct(private array $cluster) {}
-    private function getActiveSettings():array{return ['enterprise_cluster'=>$this->cluster];}
+    private function getActiveSettings():array{return ['enterprise_labs'=>['enabled'=>true],'enterprise_cluster'=>$this->cluster];}
     private function validateConfigSchema(array $candidate):array{return [];}
     private function normalizeSettings(array $candidate):array{return $candidate;}
     public function make():R{return $this->enterpriseClusterRuntime($this->getActiveSettings());}
@@ -240,7 +253,7 @@ reject(static fn()=>$runtime->store()->transaction(static function(array &$state
     'A transaction callback removed protected cluster identity.');
 check(file_get_contents($statePath)===$beforeInvalidTransaction,'Rejected cluster postcondition was written to disk.');
 $runtime->store()->transaction(static function(array &$state):void{$state['control']['stopped']=true;});
-reject(static fn()=>\SLS\MassNotify\EnterpriseClusterIntegration::authority(['enterprise_cluster'=>$config],$runtime),
+reject(static fn()=>\SLS\MassNotify\EnterpriseClusterIntegration::authority(['enterprise_labs'=>['enabled'=>true],'enterprise_cluster'=>$config],$runtime),
     'Non-HA authority preflight ignored durable STOP.');
 $runtime->store()->transaction(static function(array &$state):void{$state['control']['stopped']=false;});
 $stateBytes=file_get_contents($statePath); $markerBytes=file_get_contents($markerPath);
@@ -266,7 +279,7 @@ rejectWithoutWarning(static fn()=>$runtime->store()->read(),'Incomplete replica 
 file_put_contents($statePath,$stateBytes);
 check($runtime->store()->read()['control']['stopped']===false,'Complete restored evidence did not retain original identity.');
 $differentIdentityConfig=array_replace($config,['cluster_id'=>'different-cluster']);
-$differentIdentity=new R(['enterprise_cluster'=>$differentIdentityConfig],$temporary.'/edge/enterprise-cluster',str_repeat('c',64),null,static fn()=>['enterprise_cluster'=>$differentIdentityConfig]);
+$differentIdentity=new R(['enterprise_labs'=>['enabled'=>true],'enterprise_cluster'=>$differentIdentityConfig],$temporary.'/edge/enterprise-cluster',str_repeat('c',64),null,static fn()=>['enterprise_labs'=>['enabled'=>true],'enterprise_cluster'=>$differentIdentityConfig]);
 reject(static fn()=>$differentIdentity->initialize(),'New cluster identity overwrote existing authority evidence instead of requiring separate reviewed recovery.');
 echo "PASS permanent required marker, same-epoch reset prevention, partial recovery and corrupt authority schema fence\n";
 $job=['id'=>'job-a','delivery_id'=>'delivery-a','site_id'=>'site-a','created_at'=>$now,'expires_at'=>$now+60,
@@ -281,7 +294,7 @@ reject(static fn()=>R::job(array_replace($job,['recipients'=>['z-device','a-devi
 reject(static fn()=>R::job(array_replace($job,['channels'=>['webhook','desktop']])),'Noncanonical remote channel ordering was accepted.');
 $request=['source'=>'coordinator','action'=>'site.enqueue','payload'=>$job];
 rejectWithoutWarning(static fn()=>\SLS\MassNotify\EnterpriseClusterIntegration::command(
-    ['delivery_id'=>'bad-time','delivery_timestamp'=>[],'schedule_deadline_at'=>$now+60],'true',['enterprise_cluster'=>$config]),
+    ['delivery_id'=>'bad-time','delivery_timestamp'=>[],'schedule_deadline_at'=>$now+60],'true',['enterprise_labs'=>['enabled'=>true],'enterprise_cluster'=>$config]),
     'Malformed cluster command time emitted a warning or was accepted.');
 $replicaBuilder=new ReflectionMethod(\SLS\MassNotify\EnterpriseClusterIntegration::class,'jobReplicaRecord');
 $replicaJob=['id'=>'replica-job','state'=>'complete','created_at'=>gmdate('c',$now),
@@ -295,7 +308,7 @@ rejectWithoutWarning(static fn()=>\SLS\MassNotify\EnterpriseClusterIntegration::
     'A timezone-ambiguous cluster effect creation time was accepted.');
 rejectWithoutWarning(static fn()=>\SLS\MassNotify\EnterpriseClusterIntegration::command(
     ['delivery_id'=>'ambiguous-command','delivery_timestamp'=>'2026-10-15T12:00:00','schedule_deadline_at'=>$now+60],
-    'true',['enterprise_cluster'=>$config]),'A timezone-ambiguous cluster command time was accepted.');
+    'true',['enterprise_labs'=>['enabled'=>true],'enterprise_cluster'=>$config]),'A timezone-ambiguous cluster command time was accepted.');
 rejectWithoutWarning(static fn()=>$replicaBuilder->invoke(null,array_replace($replicaJob,['result'=>'invalid'])),
     'A scalar job result crossed the pre-reservation replica validator.');
 check($runtime->dispatch($request)['state']==='queued','Site enqueue failed.');
@@ -305,7 +318,7 @@ $policyEffect=R::intent(['delivery_id'=>'paused-direct','channel'=>'desktop','ta
     'created_at'=>$now,'expires_at'=>$now+60,'content_sha256'=>$hash,'estimated_cost_cents'=>0,'schedule_id'=>'','incident_id'=>'']);
 $policyCallbacks=0;
 foreach([false,'0',null] as $policy){
-    $pausedRuntime=new R(['enabled'=>'0','runtime_enabled'=>$policy,'enterprise_cluster'=>$config],$temporary.'/edge/enterprise-cluster',str_repeat('c',64),null,static fn()=>['enabled'=>'0','runtime_enabled'=>$policy,'enterprise_cluster'=>$config]);
+    $pausedRuntime=new R(['enterprise_labs'=>['enabled'=>true],'enabled'=>'0','runtime_enabled'=>$policy,'enterprise_cluster'=>$config],$temporary.'/edge/enterprise-cluster',str_repeat('c',64),null,static fn()=>['enterprise_labs'=>['enabled'=>true],'enabled'=>'0','runtime_enabled'=>$policy,'enterprise_cluster'=>$config]);
     $pausedEdge=new E($pausedRuntime);$beforePolicy=file_get_contents($statePath);
     foreach([static fn()=>$pausedEdge->drain(false),static fn()=>$pausedRuntime->executeEffect($policyEffect,static function() use(&$policyCallbacks):array{++$policyCallbacks;return ['state'=>'accepted'];})] as $attempt){
         $rejected=false;
@@ -318,7 +331,7 @@ foreach([false,'0',null] as $policy){
         ['id'=>'paused-'.$policy,'delivery_id'=>'paused-delivery-'.$policy])]),'Paused runtime admitted a new remote-site notification.');
     check($pausedRuntime->store()->read()['queue']['job-a']['job']['expires_at']===$job['expires_at'],'Pause renewed or altered queued expiry.');
 }
-$pausedRuntime=new R(['runtime_enabled'=>false,'enterprise_cluster'=>$config],$temporary.'/edge/enterprise-cluster',str_repeat('c',64),null,static fn()=>['runtime_enabled'=>false,'enterprise_cluster'=>$config]);
+$pausedRuntime=new R(['enterprise_labs'=>['enabled'=>true],'runtime_enabled'=>false,'enterprise_cluster'=>$config],$temporary.'/edge/enterprise-cluster',str_repeat('c',64),null,static fn()=>['enterprise_labs'=>['enabled'=>true],'runtime_enabled'=>false,'enterprise_cluster'=>$config]);
 $pausedEdge=new E($pausedRuntime);
 $edge->drain(false); $device=$edge->authenticate('desktop-a',$deviceToken); $events=$edge->poll($device);
 check(count($events)===1 && $events[0]['message']===$intent['message'],'Approved offline cache did not serve LAN event.');
@@ -334,10 +347,25 @@ reject(static fn()=>$edge->receipt($device,['id'=>'job-a','kind'=>'audio_played'
 check($edge->drain(true)===[],'Resumed runtime replayed an already completed publication or paused receipt.');
 echo "PASS Weather-independent edge dispatch, strict stopped/malformed runtime fences, unchanged queue claims/expiry, paused status and actual device receipt\n";
 $changingConfig=array_replace($config,['max_queue'=>2]);mkdir($temporary.'/changing-policy',0700);
-$currentPolicy=['runtime_enabled'=>true,'enterprise_cluster'=>$changingConfig];
+$currentPolicy=['enterprise_labs'=>['enabled'=>true],'runtime_enabled'=>true,'enterprise_cluster'=>$changingConfig];
 $changingRuntime=new R($currentPolicy,$temporary.'/changing-policy/enterprise-cluster',str_repeat('f',64),null,
     static function() use(&$currentPolicy):array{return $currentPolicy;});
 $changingRuntime->initialize();
+$masterReceipt=R::intent(['delivery_id'=>'master-receipt','channel'=>'desktop','target'=>'desktop-a','site_id'=>'site-a',
+    'created_at'=>$now,'expires_at'=>$now+60,'content_sha256'=>$hash,'estimated_cost_cents'=>0,'schedule_id'=>'','incident_id'=>'']);
+$masterClaim=$changingRuntime->begin($masterReceipt);$masterBefore=$changingRuntime->store()->read();
+$currentPolicy['enterprise_labs']['enabled']=false;$masterEffects=0;
+reject(static fn()=>$changingRuntime->initialize(),'Dynamically disabled Labs reinitialized cluster authority.');
+reject(static fn()=>$changingRuntime->executeEffect($policyEffect,static function()use(&$masterEffects):array{++$masterEffects;return ['state'=>'accepted'];}),
+    'Dynamically disabled Labs admitted an effect through a cached runtime.');
+check($masterEffects===0&&$changingRuntime->store()->read()['effects']===$masterBefore['effects'],
+    'Master-disabled effect consumed history or executed its callback.');
+check($changingRuntime->dispatch(['source'=>'coordinator','action'=>'status','payload'=>[]])['queued']===0,
+    'Master disable blocked read-only cluster status.');
+$changingRuntime->finish($masterClaim,['uncertain'=>false,'state'=>'accepted']);
+check(($changingRuntime->store()->read()['effects'][$masterClaim['id']]['receipt']['state']??'')==='accepted',
+    'Master disable prevented recording an already admitted effect receipt.');
+$currentPolicy['enterprise_labs']['enabled']=true;
 foreach(['first','second'] as $suffix){$changingRuntime->dispatch(['source'=>'coordinator','action'=>'site.enqueue','payload'=>array_replace($job,['id'=>'changing-'.$suffix,'delivery_id'=>'changing-delivery-'.$suffix])]);}
 $currentPolicy['enterprise_cluster']['max_queue']=3;
 $beforePolicyMismatch=file_get_contents($temporary.'/changing-policy/enterprise-cluster/worker-state.json');
@@ -399,19 +427,19 @@ check(($runtime->store()->read()['queue']['job-after-compaction']['receipt']['de
     'Final queue receipt overwrote device evidence recorded during publication.');
 echo "PASS bounded owned-site queue, approved offline LAN cache, local device authentication, immutable receipts and expired replay rejection\n";
 $unapproved=array_replace($config,['approved_cache'=>[],'max_queue'=>2]); mkdir($temporary.'/unapproved',0700);
-$r2=new R(['enterprise_cluster'=>$unapproved],$temporary.'/unapproved/enterprise-cluster',str_repeat('d',64),null,static fn()=>['enterprise_cluster'=>$unapproved]); $r2->initialize();
+$r2=new R(['enterprise_labs'=>['enabled'=>true],'enterprise_cluster'=>$unapproved],$temporary.'/unapproved/enterprise-cluster',str_repeat('d',64),null,static fn()=>['enterprise_labs'=>['enabled'=>true],'enterprise_cluster'=>$unapproved]); $r2->initialize();
 $r2->dispatch($request); check((new E($r2))->drain(false)===[],'Unapproved cache was played offline.');
 $r2->store()->transaction(static function(array &$s): void { $s['queue']['job-a']['state']='uncertain'; });
 check((new E($r2))->drain(true)===[],'Interrupted site action was automatically replayed after reconnect.');
 reject(static fn()=>$r2->dispatch(['source'=>'coordinator','action'=>'site.enqueue','payload'=>array_replace($job,['id'=>'expired','created_at'=>$now-120,'expires_at'=>$now-1])]),'Expired WAN job replay accepted.');
 reject(static fn()=>$r2->dispatch(['source'=>'coordinator','action'=>'site.enqueue','payload'=>array_replace($job,['id'=>'telephone','channels'=>['phones']])]),'Linux edge pretended to provide phone/PBX service.');
 $ha=array_replace($config,['mode'=>'notification_ha','mirroring_enabled'=>true]);
-reject(static fn()=>new R(['enterprise_cluster'=>$ha],$temporary.'/danger'),'Dangerous feature was enabled without prerequisites/receipt.');
+reject(static fn()=>new R(['enterprise_labs'=>['enabled'=>true],'enterprise_cluster'=>$ha],$temporary.'/danger'),'Dangerous feature was enabled without prerequisites/receipt.');
 echo "PASS offline approval boundary, reconnect uncertainty, edge/PBX separation and dangerous activation rejection\n";
 $cycle=new class {
     use \FreePBX\modules\SlsEnterpriseCluster;
     public array $calls=[];
-    private function getActiveSettings(): array { return ['enterprise_cluster'=>['enabled'=>true]]; }
+    private function getActiveSettings(): array { return ['enterprise_labs'=>['enabled'=>true],'enterprise_cluster'=>['enabled'=>true]]; }
     public function enterpriseApplyPendingMirrors(): array { $this->calls[]='mirrors'; throw new RuntimeException('poisoned mirror'); }
     public function enterpriseFlushReplicationOutbox(): array { $this->calls[]='replication_outbox'; return ['flushed'=>true]; }
     public function enterpriseRecoverPendingJobs(): array { $this->calls[]='recovery'; return ['job'=>'recovered']; }
@@ -426,8 +454,8 @@ echo "PASS poisoned mirror isolation and continued recovery/site processing\n";
 $localConfig=array_replace($config,['mode'=>'standalone','remote_enabled'=>false,'offline_cache_enabled'=>false,'site_recipients'=>[],
     'edge_devices'=>[],'approved_cache'=>[]]);
 mkdir($temporary.'/local-effect',0700);
-$localRuntime=new R(['enterprise_cluster'=>$localConfig],$temporary.'/local-effect/enterprise-cluster',str_repeat('9',64),null,
-    static fn()=>['enterprise_cluster'=>$localConfig]);
+$localRuntime=new R(['enterprise_labs'=>['enabled'=>true],'enterprise_cluster'=>$localConfig],$temporary.'/local-effect/enterprise-cluster',str_repeat('9',64),null,
+    static fn()=>['enterprise_labs'=>['enabled'=>true],'enterprise_cluster'=>$localConfig]);
 $localRuntime->initialize();
 $reviewIntent=R::intent(['delivery_id'=>'reconciliation-schema','channel'=>'desktop','target'=>'desktop-a','site_id'=>'site-a',
     'created_at'=>time(),'expires_at'=>time()+60,'content_sha256'=>str_repeat('6',64),'estimated_cost_cents'=>0,'schedule_id'=>'','incident_id'=>'']);
@@ -478,7 +506,7 @@ check($bulkState['effects']===[] && count($bulkState['effect_history'][$bulkDeli
 echo "PASS exact journal postconditions, non-HA STOP preflight, expired preparation cleanup, immutable receipts and 1,000-destination effect rollover\n";
 $mirrorTarget=array_replace($mirrorBase,['node_id'=>'mirror-target','mirror_authority'=>'peer-a','peers'=>[$peerA]]);
 $mirrorReceipt=['revision'=>\SLS\MassNotify\LabsSafety::revision(),'accepted_at'=>time(),'actor'=>'pbx:fixture'];
-$mirrorSettings=['enterprise_cluster'=>$mirrorTarget,'labs_safety'=>['schema'=>1,'receipts'=>['enterprise_cluster'=>$mirrorReceipt]]];
+$mirrorSettings=['enterprise_labs'=>['enabled'=>true],'enterprise_cluster'=>$mirrorTarget,'labs_safety'=>['schema'=>1,'receipts'=>['enterprise_cluster'=>$mirrorReceipt]]];
 mkdir($temporary.'/mirror-target',0700);$mirrorRuntime=new R($mirrorSettings,$temporary.'/mirror-target/enterprise-cluster',str_repeat('5',64),null,static fn()=>$mirrorSettings);
 $mirrorRuntime->initialize();$shared=['quiet_hours_start'=>'20:00'];$mirror=['schema'=>1,'authority'=>'peer-a','epoch'=>$mirrorTarget['mirror_epoch'],'revision'=>1,
     'shared'=>$shared,'content_sha256'=>hash('sha256',P::canonical($shared)),'state'=>'pending','reason'=>''];

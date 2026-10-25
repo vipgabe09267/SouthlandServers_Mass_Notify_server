@@ -63,7 +63,7 @@ namespace {
     $activationBody = implode('', array_slice($activationSource, $activationMethod->getStartLine() - 1,
         $activationMethod->getEndLine() - $activationMethod->getStartLine() + 1));
     $activationBody = str_replace('LabsSafety::', '\\SLS\\MassNotify\\LabsSafety::', $activationBody);
-    eval('namespace SlsConfigDurabilityFixture; class Writer {
+    eval('namespace SlsConfigDurabilityFixture; use SLS\MassNotify\EnterpriseLabsConfig; class Writer {
         const SETTINGS_JSON = ' . var_export($directory . '/active.config', true) . ';
         const PENDING_SETTINGS_JSON = ' . var_export($directory . '/pending.config', true) . ';
         const NATIVE_BACKUP_MAX_CONFIG_BYTES = 1024;

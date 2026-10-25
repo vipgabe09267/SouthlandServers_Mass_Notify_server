@@ -2,6 +2,7 @@
 declare(strict_types=1);
 namespace SLS\MassNotify;
 require_once __DIR__ . '/LocationDirectory.php';
+require_once __DIR__ . '/AudienceLimits.php';
 require_once __DIR__ . '/OperatorAuth.php';
 require_once __DIR__ . '/api/sls-mass-notify/security.php';
 
@@ -34,9 +35,9 @@ final class OperatorAccess
 
     public static function normalize($value): array
     {
-        if (!is_array($value) || ($value && array_is_list($value)) || array_diff(array_keys($value), ['schema', 'enabled', 'portal_enabled', 'accounts'])
+        if (!is_array($value) || ($value && array_is_list($value)) || array_diff(array_keys($value), ['schema', 'enabled', 'portal_enabled', 'passkeys_enabled', 'accounts'])
             || ($value['schema'] ?? 1) !== 1 || !is_bool($value['enabled'] ?? false)
-            || !is_bool($value['portal_enabled'] ?? false)) { throw new \DomainException('Operator access must use schema 1 and boolean enable settings.'); }
+            || !is_bool($value['portal_enabled'] ?? false)||!is_bool($value['passkeys_enabled']??false)) { throw new \DomainException('Operator access must use schema 1 and boolean enable settings.'); }
         $rows = $value['accounts'] ?? [];
         if (!is_array($rows) || !array_is_list($rows) || count($rows) > 100) { throw new \DomainException('Operator access supports up to 100 local accounts.'); }
         $accounts = []; $ids = []; $users = [];
@@ -50,7 +51,7 @@ final class OperatorAccess
             $expiry = array_key_exists('expires_at', $row) ? $row['expires_at'] : 0;
             if (!is_int($expiry) || $expiry < 0 || $expiry > 253402300799) { throw new \DomainException('Operator expiry must be a UTC timestamp, or zero for no expiry.'); }
             $sites = self::ids($row['site_ids'] ?? [], '/^loc_[a-f0-9]{24}$/D', 500);
-            $groups = self::ids($row['group_ids'] ?? [], '/^grp_[a-f0-9]{12,32}$/D', 20);
+            $groups = self::ids($row['group_ids'] ?? [], '/^grp_[a-f0-9]{12,32}$/D', AudienceLimits::SAVED);
             $locations=self::ids($row['location_ids']??[], '/^loc_[a-f0-9]{24}$/D',500);
             $members=self::personal($row['personal_members']??[]);
             $defaults=match($row['role']) {'sender'=>['view','send'],'scheduler'=>['view','schedule'],'warden'=>['view','roll_call'],'administrator'=>OperatorAuth::ACTIONS,default=>['view']};
@@ -69,7 +70,7 @@ final class OperatorAccess
                 'source'=>$row['source'], 'identity'=>$row['identity']] + ($auth===null?[]:['auth'=>$auth]);
             $ids[$row['id']] = true; $users[strtolower($row['username'])] = true;
         }
-        return ['schema'=>1, 'enabled'=>$value['enabled'] ?? false, 'portal_enabled'=>$value['portal_enabled'] ?? false, 'accounts'=>$accounts];
+        return ['schema'=>1, 'enabled'=>$value['enabled'] ?? false, 'portal_enabled'=>$value['portal_enabled'] ?? false, 'passkeys_enabled'=>$value['passkeys_enabled']??false, 'accounts'=>$accounts];
     }
 
     /** Saved past dates remain valid configuration but grant no access. */

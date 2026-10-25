@@ -47,7 +47,7 @@ with tempfile.TemporaryDirectory(prefix='sls-asterisk-playback-') as directory:
     (root/'etc/modules.conf').write_text('[modules]\nautoload=no\n'+''.join('load='+name+'.so\n' for name in
         ['res_timing_timerfd','res_speech','res_agi','app_playback','app_read','app_senddtmf','app_exec','app_verbose','pbx_config','pbx_spool','func_channel','format_wav','codec_ulaw','codec_alaw']))
     (root/'etc/logger.conf').write_text('[general]\n[logfiles]\nevidence => notice,warning,error,verbose\n')
-    for name in ['sls_phone_admission.py','sls_nws_delivery_claims.py','sls_config_crypto.py']:
+    for name in ['sls_phone_admission.py','sls_nws_delivery_claims.py','sls_config_crypto.py','sls_cluster_guard.py']:
         content = (library/name).read_text()
         if name == 'sls_phone_admission.py':
             setting = "DATA = Path('/var/lib/asterisk/SLS_Mass_Notifications_Plugin')"
@@ -57,6 +57,11 @@ with tempfile.TemporaryDirectory(prefix='sls-asterisk-playback-') as directory:
     gate = root/'agi/sls_mass_notify_phone_agi.py'
     shutil.copyfile(repo/'slsmassnotifyserver/bin/sls_mass_notify_phone_agi.py',gate); gate.chmod(0o755)
     shutil.copyfile(library/'external-acknowledgement.wav',root/'agi/external-acknowledgement.wav')
+    imported = subprocess.run([sys.executable,'-I','-B','-c',
+        'import sys;sys.path.insert(0,'+repr(str(root/'agi'))+');import sls_mass_notify_phone_agi'],
+        capture_output=True,text=True,timeout=5)
+    if imported.returncode:
+        raise RuntimeError('Staged phone AGI helper import failed: '+imported.stderr[-1500:])
     origin = root/'agi/fixture_origin.py'
     origin.write_text('''#!/usr/bin/python3
 import sys

@@ -30,6 +30,26 @@ try {
     recordingCheck($search['total']===1 && str_contains($search['items'][0]['value'], 'Spanish'), 'Cached recording search lost a matching item');
     $absent = Recordings::cataloguePage($root.'/missing');
     recordingCheck(!$absent['scan_complete'] && $absent['warning']!=='', 'Unavailable catalogue silently returned an empty list');
+    mkdir($root.'/case/custom',0700,true);
+    foreach (['Alert.wav','alert.wav','Alert.ulaw','Wideband.G722'] as $filename) {
+        copy($source,$root.'/case/custom/'.$filename);
+    }
+    $variants=Recordings::catalogue($root.'/case');
+    $values=array_column($variants,'value');
+    recordingCheck(in_array('system:custom/Alert.wav',$values,true)
+        && in_array('system:custom/alert.wav',$values,true)
+        && !in_array('system:custom/Alert.ulaw',$values,true),
+        'Distinct case-sensitive recording names were merged or a lower-ranked codec was selected');
+    $withoutFfmpeg='namespace SLS\\MassNotify { function is_executable($path) { return $path === "/usr/bin/ffmpeg" ? false : \\is_executable($path); } } namespace { require '
+        .var_export(dirname(__DIR__).'/slsmassnotifyserver/SystemRecordings.php',true).'; echo json_encode(\\SLS\\MassNotify\\SystemRecordings::catalogue('
+        .var_export($root.'/case',true).')); }';
+    $process=proc_open([PHP_BINARY,'-r',$withoutFfmpeg],[0=>['file','/dev/null','r'],1=>['pipe','w'],2=>['pipe','w']],$pipes);
+    recordingCheck(is_resource($process),'Cannot start the decoder-capability fixture');
+    $withoutFfmpegResult=stream_get_contents($pipes[1]);fclose($pipes[1]);
+    $fixtureErrors=stream_get_contents($pipes[2]);fclose($pipes[2]);
+    recordingCheck(proc_close($process)===0 && $fixtureErrors==='', 'Decoder-capability fixture failed: '.$fixtureErrors);
+    recordingCheck(!in_array('system:custom/Wideband.G722',array_column(json_decode($withoutFfmpegResult,true,512,JSON_THROW_ON_ERROR),'value'),true),
+        'Uppercase G.722 recordings were offered without the required decoder');
     file_put_contents($cache, '{broken');
     recordingCheck(Recordings::cataloguePage($root.'/sounds', [], '', 0, 50, $cache)['total']===2, 'Corrupt catalogue cache was trusted');
     $tone=importRecording('system:custom/uploads/Fire drill.wav',$root.'/sounds',$root.'/tones');

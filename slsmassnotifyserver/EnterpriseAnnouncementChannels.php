@@ -19,8 +19,8 @@ trait SlsEnterpriseAnnouncementChannels
         }
         $request['browser_targets']=[];$request['connector_fingerprints']=[];
         if(!$browser&&!$connectors){return $request;}
-        if($browser){BrowserPush::validateContent($request['title'],$request['message'],($request['is_test']??false)===true);}
-        if($connectors){EnterpriseDeliveryConnector::validateContent((($request['is_test']??false)===true?'TEST · ':'').$request['title'],$request['message']);}
+        if($browser){BrowserPush::validateContent($request['title'],$request['message'],($request['is_test']??false)===true,$request['incident_context']??null);}
+        if($connectors){EnterpriseDeliveryConnector::validateContent($request['title'],$request['message']);}
         $principal=$GLOBALS['sls_control_principal']??null;
         if(is_array($principal)&&(($principal['id']??'')==='legacy'||!ApiSecurity::permitsResolvedAnnouncement($principal,$request,$settings))){throw new \DomainException('These Labs recipients are outside this named sender’s current permissions.');}
         $subscriber=SubscriberConfig::normalize($settings['subscriber_browser']??[]);
@@ -53,6 +53,7 @@ trait SlsEnterpriseAnnouncementChannels
         if($deadline!==null){$expires=min($expires,$deadline);}
         if(isset($request['incident_context']['expires_at'])){$incidentExpiryText=$request['incident_context']['expires_at'];if(!is_string($incidentExpiryText)||($incidentExpiry=strtotime($incidentExpiryText))===false){throw new \DomainException('Incident expiry is invalid; Labs delivery was fenced.');}$expires=min($expires,$incidentExpiry);}
         $event=['event_id'=>$request['delivery_id'],'title'=>$request['title'],'message'=>$request['message'],'expires_at'=>$expires,'is_test'=>($request['is_test']??false)===true];
+        if(isset($request['incident_context'])){$event['incident']=\SLS\MassNotify\IncidentConfig::context($request['incident_context']);}
         $only=$request['only_channels']??null;
         $phaseDeadline=min($expires,time()+90);
         foreach($request['browser_targets']??[] as $id=>$target){
@@ -73,7 +74,9 @@ trait SlsEnterpriseAnnouncementChannels
                 };
                 $outcome=$this->subscriberService()->push($settings,$id,$event,time(),$transport,$endpointSnapshot);$accepted=0;$uncertain=0;
                 foreach($outcome['receipts'] as $receipt){$accepted+=$receipt['state']==='accepted'?1:0;$uncertain+=$receipt['state']==='unconfirmed'?1:0;}
-                $record('browser_push',$id,$uncertain?'uncertain':($accepted?'accepted':'cancelled'),$accepted.' push-service acceptance(s); browser display and human response are not confirmed.',false,['event_id'=>$event['event_id']]);
+                $detail=$accepted.' push-service acceptance(s); browser display and human response are not confirmed.';
+                if(($outcome['software_evidence_available']??false)!==true){$detail.=' Supplemental browser receipt tracking is unavailable for this publication.';}
+                $record('browser_push',$id,$uncertain?'uncertain':($accepted?'accepted':'cancelled'),$detail,false,['event_id'=>$event['event_id']]);
             }catch(\DomainException $error){$record('browser_push',$id,'cancelled',$error->getMessage(),false);}catch(\Throwable $error){$record('browser_push',$id,'uncertain','Browser submission completion is unconfirmed. No automatic replay.',false);}
         }
         foreach($request['connector_fingerprints']??[] as $id=>$fingerprint){

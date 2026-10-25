@@ -15,6 +15,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# Cron runs Python with -I. Only authenticated siblings belong on this path;
+# neither the working directory nor PYTHONPATH can supply runtime helpers.
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import sys as _config_sys
 _config_sys.dont_write_bytecode = True
 _config_crypto_spec = importlib.util.spec_from_file_location("sls_config_crypto", Path(__file__).resolve().with_name("sls_config_crypto.py"))
@@ -44,7 +49,7 @@ TERMINAL_JOBS = {'complete', 'failed', 'partial_or_failed', 'cancelled', 'expire
 AUDIO_NAME = re.compile(r'(?:announcement_(?:tts|sequence|tone)_[A-Za-z0-9_-]+|nws_[A-Za-z0-9_-]+|test_(?:piper_tts|sequence)_[A-Za-z0-9_-]+|xweather_(?:tts|sequence)_[A-Za-z0-9_-]+)\.wav')
 IMPORTED_AUDIO_NAME = re.compile(r'recording_[a-f0-9]{32}\.wav')
 VOICEMAIL_AUDIO_NAME = re.compile(r'[a-f0-9]{32}(?:-(?:receive|mix))?\.wav')
-IMAGE_NAME = re.compile(r'(?:mms_[0-9]{14}_[a-f0-9]{32}\.png|alert_[a-f0-9]{12}(?:_[a-f0-9]{20})?\.png|announcement_[0-9]{14}_[a-f0-9]{6,32}\.png|phone_payload_[a-f0-9]{12}(?:_[a-f0-9]{20})?\.xml)')
+IMAGE_NAME = re.compile(r'(?:mms_[0-9]{14}_[a-f0-9]{32}\.png|alert_[a-f0-9]{12}(?:_[a-f0-9]{20})?\.png|announcement_[0-9]{14}_[a-f0-9]{6,32}(?:_desktop)?\.png|phone_payload_[a-f0-9]{12}(?:_[a-f0-9]{20})?\.xml)')
 
 def runtime_json(raw):
     """Unknown or ambiguous evidence cannot authorize retention or a receipt."""
@@ -750,7 +755,8 @@ def record_audit_failure(directory, error_code, security=False):
 
 OPERATOR_AUDIT_ACTIONS = frozenset([
     'operator_login_unknown_or_disabled', 'operator_login_failed_password', 'operator_login_password_accepted',
-    'operator_sign_in_completed', 'operator_authenticator_failed', 'operator_reset_link_issued', 'operator_reset_link_revoked',
+    'operator_sign_in_completed', 'operator_authenticator_failed', 'operator_passkey_enrolled', 'operator_passkey_revoked',
+    'operator_passkey_authenticated', 'operator_passkey_failed', 'operator_reset_link_issued', 'operator_reset_link_revoked',
     'operator_reset_link_issue_authorized', 'operator_reset_link_revoke_authorized', 'operator_password_reset_authorized',
     'operator_reset_email_reserved', 'operator_reset_email_accepted', 'operator_reset_email_failed',
     'operator_password_reset_failed', 'operator_password_reset_completed', 'operator_reset_confirmation_failed'])
@@ -766,7 +772,7 @@ def human_audit_record(record):
 def encode_audit(record, security=False):
     required = {'created_at', 'ip', 'method', 'action', 'status', 'ok'}
     if (not isinstance(record, dict) or not required <= set(record)
-            or set(record) - required - {'credential_id', 'event_id', 'actor', 'credentials_present'} - ({'operator_id', 'operator_username'} if security else set())
+            or set(record) - required - {'credential_id', 'event_id', 'actor', 'credentials_present', 'duration_ms'} - ({'operator_id', 'operator_username'} if security else set())
             or not all(isinstance(record[key], str) for key in ('created_at', 'ip', 'method', 'action'))
             or not isinstance(record['ok'], bool) or type(record['status']) is not int
             or not 100 <= record['status'] <= 599
@@ -777,6 +783,7 @@ def encode_audit(record, security=False):
             or ('credential_id' in record and (not isinstance(record['credential_id'], str)
                 or re.fullmatch(r'(?:legacy|api_[0-9a-f]{24})', record['credential_id']) is None))
             or ('credentials_present' in record and type(record['credentials_present']) is not bool)
+            or ('duration_ms' in record and (type(record['duration_ms']) is not int or not 0 <= record['duration_ms'] <= 600000))
             or ('operator_id' in record and (not isinstance(record['operator_id'], str)
                 or re.fullmatch(r'api_[0-9a-f]{24}', record['operator_id']) is None))
             or ('operator_username' in record and (not isinstance(record['operator_username'], str)
@@ -1028,23 +1035,23 @@ def retained_usage(directory):
     finally:os.close(descriptor)
     return result
 
-def storage_summary(directory=DATA, now=None):
+def storage_summary(directory=DATA, now=None, failed_stages=()):
     destination = open_directory(directory)
     try:
         account = pwd.getpwnam('asterisk'); metadata = os.fstat(destination)
         if (metadata.st_uid not in (0, account.pw_uid) or metadata.st_gid not in (0, account.pw_gid)
                 or metadata.st_mode & 0o022):
             raise RuntimeError('Storage summary directory ownership or permissions are unsafe')
-        return collect_storage_summary(directory, now, destination)
+        return collect_storage_summary(directory, now, destination, failed_stages)
     finally:
         os.close(destination)
 
-def collect_storage_summary(directory, now, destination):
+def collect_storage_summary(directory, now, destination, failed_stages=()):
     now = time.time() if now is None else now
     filesystem = os.statvfs(directory)
     free = filesystem.f_bavail * filesystem.f_frsize
     total = filesystem.f_blocks * filesystem.f_frsize
-    summary = {'checked_at': int(now), 'free_bytes': free, 'total_bytes': total,
+    summary = {'checked_at': int(now), 'maintenance_failed_stages': list(failed_stages), 'free_bytes': free, 'total_bytes': total,
                'pending_external': 0, 'expired_external': 0, 'recent_expired_external': 0, 'oldest_pending_at': 0, 'queue_errors': 0,
                'queue_scan_incomplete': False, 'queue_files_scanned': 0, 'queue_files_seen': 0}
     summary['retained_components']=retained_usage(directory)
@@ -1280,8 +1287,15 @@ def prune_audit(path, now=None):
         os.close(parent)
 
 
+def prune_desktop_evidence():
+    from sls_desktop_history import prune
+    config=_config_crypto.read_config(DATA/'mass-notifications.config')
+    return prune(DATA/'sipnotify/sipnotify_events.jsonl',config.get('log_retention_days',90))
+
+
 def main():
     failed = False
+    failed_stages = []
     # A full event log must not disable independent generated-media retention.
     for stage, action in (
         ('audit', lambda: prune_audit(DATA / 'control-api-audit.jsonl')),
@@ -1289,13 +1303,17 @@ def main():
         ('announcement_jobs', lambda: prune_announcement_jobs(DATA / 'announcement-jobs')),
         ('event_logs', prune_configured_event_logs),
         ('generated_media', prune_generated_media),
-        ('summary', lambda: storage_summary(directory=DATA)),
+        ('desktop_evidence',prune_desktop_evidence),
+        ('summary', lambda: storage_summary(directory=DATA, failed_stages=failed_stages)),
     ):
         try:
             action()
-        except (OSError, ValueError, RuntimeError, TypeError, AttributeError, OverflowError) as error:
+        except BlockingIOError:
+            print('Storage retention %s deferred while another SLS writer holds its lock.' % stage)
+        except (OSError, ValueError, RuntimeError, TypeError, AttributeError, OverflowError, ImportError) as error:
             detail = str(error) if isinstance(error, RuntimeError) else type(error).__name__
             print('Storage retention %s deferred: %s' % (stage, detail))
+            failed_stages.append(stage)
             failed = True
     return 1 if failed else 0
 

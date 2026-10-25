@@ -44,7 +44,7 @@ $connector=['id'=>'conn_'.str_repeat('7',24),'name'=>'Local ntfy','enabled'=>'1'
 $config=EnterpriseIntegrationsConfig::normalize([]);$config['enabled']='1';$config['connectors']=['enabled'=>'1','destinations'=>[$connector]];$settings['enterprise_integrations']=EnterpriseIntegrationsConfig::normalize($config);
 $wire=[];$acceptedTitle=EnterpriseDeliveryConnector::send($connector,['title'=>str_repeat('T',73),'message'=>'Fixture only','is_test'=>true],static function($url,$body)use(&$wire):array{$wire=json_decode($body,true);return ['status'=>200,'error'=>0,'body'=>'{"id":"Abc123xyZ9"}'];});
 check($acceptedTitle['state']==='accepted'&&mb_strlen($wire['title'],'UTF-8')===80,'Exact decorated connector title boundary failed');
-reject(fn()=>EnterpriseDeliveryConnector::send($connector,['title'=>str_repeat('T',74),'message'=>'Fixture only','is_test'=>true],static fn()=>['status'=>200,'error'=>0,'body'=>'{"id":"Abc123xyZ9"}']),'Decorated connector title exceeded its wire limit');
+reject(fn()=>EnterpriseDeliveryConnector::send($connector,['title'=>str_repeat('T',81),'message'=>'Fixture only','is_test'=>true],static fn()=>['status'=>200,'error'=>0,'body'=>'{"id":"Abc123xyZ9"}']),'Source connector title exceeded its input limit');
 foreach(['{"id":"first","id":"last"}','{"id":"valid","extra":1e309}','{"id":"valid","extra":NaN}','[ {"id":"valid"} ]'] as $ambiguousReply){
     $receipt=EnterpriseDeliveryConnector::send($connector,['title'=>'Fixture','message'=>'Fixture only','is_test'=>true],static fn()=>['status'=>200,'error'=>0,'body'=>$ambiguousReply]);
     check($receipt['state']==='uncertain','Ambiguous connector reply was reported accepted');
@@ -59,7 +59,8 @@ $connectorOnly=array_replace($request,['browser_recipient_ids'=>[]]);
 reject(fn()=>$fixture->freeze(array_replace($connectorOnly,['message'=>str_repeat('A',4001)])),'Oversized connector content reached queue admission');
 reject(fn()=>$fixture->freeze(array_replace($request,['browser_recipient_ids'=>[[]]])),'Non-text Labs recipient reached queue admission');
 check(count($fixture->effects)===$beforeContent,'Rejected Labs content caused a transport effect');
-reject(fn()=>$fixture->freeze(array_replace($connectorOnly,['title'=>str_repeat('T',74)])),'Decorated connector title reached the queue');
+check($fixture->freeze(array_replace($connectorOnly,['title'=>str_repeat('T',80)]))['force_queue'],'An 80-character source title was rejected because of the test label');
+reject(fn()=>$fixture->freeze(array_replace($connectorOnly,['title'=>str_repeat('T',81)])),'Oversized source connector title reached the queue');
 $validContent=$fixture->freeze(array_replace($request,['connector_ids'=>[],'title'=>str_repeat('😀',80),'message'=>str_repeat('A',2000)]));
 check($validContent['force_queue'],'Valid Unicode browser content was rejected');
 $frozen=$fixture->freeze($request);check($frozen['force_queue']&&count($frozen['browser_targets'][$person['id']]['endpoint_ids'])===1,'Labs destination snapshot was not frozen');
@@ -93,9 +94,11 @@ $fixture->settings=$settings;$fixture->effects=array_slice($fixture->effects,0,$
 $only=$frozen;$only['delivery_id']='announcement-'.str_repeat('b',32);$only['only_channels']=['connector'=>[$connector['id']]];$fixture->deliver($only);check(count($fixture->effects)===3&&$fixture->effects[2][0]==='connector','Explicit partial channel selection leaked browser delivery');
 $fixture->approvalAllowed=false;$invalidApproval=$frozen;$invalidApproval['delivery_id']='announcement-'.str_repeat('f',32);check(array_column($fixture->deliver($invalidApproval),'state')===['cancelled','cancelled']&&count($fixture->effects)===3,'Revoked dual approval allowed browser or connector effects');$fixture->approvalAllowed=true;
 $fixture->settings['runtime_enabled']=false;$paused=$frozen;$paused['delivery_id']='announcement-'.str_repeat('0',32);check(array_column($fixture->deliver($paused),'state')===['cancelled','cancelled']&&count($fixture->effects)===3,'Stopped notifications allowed browser or connector effects');$fixture->settings['runtime_enabled']=true;
-$incidentExpired=$frozen;$incidentExpired['delivery_id']='announcement-'.str_repeat('d',32);$incidentExpired['incident_context']=['expires_at'=>gmdate('c',time()-1)];check(array_column($fixture->deliver($incidentExpired),'state')===['cancelled','cancelled']&&count($fixture->effects)===3,'Shared incident expiry was extended by a later browser or connector cohort');
+$incidentExpired=$frozen;$incidentExpired['delivery_id']='announcement-'.str_repeat('d',32);$incidentExpired['incident_context']=['schema'=>1,'incident_id'=>'inc_'.str_repeat('a',32),'sequence'=>1,'kind'=>'initial','severity'=>'critical','is_test'=>false,'operation_request_id'=>str_repeat('e',32),'language_variant'=>'','language_batch'=>1,'language_batches'=>1,'expires_at'=>gmdate('c',time()-1)];check(array_column($fixture->deliver($incidentExpired),'state')===['cancelled','cancelled']&&count($fixture->effects)===3,'Shared incident expiry was extended by a later browser or connector cohort');
 $replacement=$subscription;$replacement['keys']['auth']=BrowserPush::encode(random_bytes(16));$subscriber->enrollPush($settings,$bound,$replacement,$now);$changedEndpoint=$frozen;$changedEndpoint['delivery_id']='announcement-'.str_repeat('e',32);$changedEndpoint['connector_fingerprints']=[];check(array_column($fixture->deliver($changedEndpoint),'state')===['cancelled']&&count($fixture->effects)===3,'New subscription keys received an old frozen announcement');
 $subscriber->enrollPush($settings,$bound,$subscription,$now);
+$frozen=$fixture->freeze($request); // New jobs use the new explicit subscription generation.
+$originalEndpoint=hash('sha256',$subscription['endpoint']);$frozen['browser_targets'][$person['id']]['endpoint_ids']=[$originalEndpoint];$frozen['browser_targets'][$person['id']]['endpoint_fingerprints']=array_intersect_key($frozen['browser_targets'][$person['id']]['endpoint_fingerprints'],[$originalEndpoint=>true]);
 $boundaryFailures=[];
 foreach(['expiry','credential','runtime'] as $boundaryCase){
     $fixture->settings=$settings;$beforeBoundary=count($fixture->effects);

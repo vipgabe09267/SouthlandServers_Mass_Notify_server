@@ -65,8 +65,10 @@ function /usr/bin/timeout {
     return 3
   elif [ "$FAKE_AMI" = "invalid" ]; then
     printf '{}\n'
+  elif [ "$FAKE_AMI" = "paging_missing" ]; then
+    printf '%s\n' '{"status":"ok","ami":"authenticated","ping":"pong","pjsip_show_contacts":"authorized_empty","pjsip_notify":"authorized","live_paging_actions":{"PlayDTMF":"authorized","Setvar":"authorized","Getvar":"authorized"}}'
   else
-    printf '%s\n' '{"status":"ok","ami":"authenticated","ping":"pong","pjsip_show_contacts":"authorized_empty","pjsip_notify":"authorized"}'
+    printf '%s\n' '{"status":"ok","ami":"authenticated","ping":"pong","pjsip_show_contacts":"authorized_empty","pjsip_notify":"authorized","live_paging_actions":{"MuteAudio":"authorized","PlayDTMF":"authorized","Setvar":"authorized","Getvar":"authorized"}}'
   fi
 }
 asterisk() {
@@ -339,6 +341,11 @@ verify_ami_with_repair
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('Fixture media route cannot read protected configuration.', self.log.read_text())
         self.assertIn('Generated-media access enforcement could not be verified', result.stdout)
+
+    def test_missing_caller_ready_action_cannot_pass_authenticated_health(self):
+        result = self.run_helper("verify_ami_with_repair\n", FAKE_AMI="paging_missing")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("live-paging authorization", self.log.read_text())
 
     def test_render_probe_accepts_only_exact_bytes_or_explicit_policy_denial(self):
         block = SOURCE.split('  verify_media_access || { rm -f "$media_probe" "$media_fetch"; exit 1; }', 1)[1]

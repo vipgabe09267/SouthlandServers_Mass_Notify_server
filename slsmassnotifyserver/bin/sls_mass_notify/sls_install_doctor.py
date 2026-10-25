@@ -22,6 +22,9 @@ import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sls_php_security import evaluate as php_security
 
 PROFILE = {'id': 'freepbx17-debian12-amd64', 'freepbx_major': 17,
            'os_id': 'debian', 'os_version': '12', 'python': 'CPython 3.11',
@@ -147,7 +150,7 @@ def served_php_probe(targets,timeout=4):
             if type(value.get('runtime_account_ok')) is not bool:continue
             maps={name:value.get(name) for name in ('extensions','functions')}
             if any(not isinstance(maps[name],dict) or set(maps[name])!=set(keys) or any(type(v) is not bool for v in maps[name].values()) for name,keys in [('extensions',PHP_EXTENSIONS),('functions',PHP_FUNCTIONS)]):continue
-            expected=not all(maps['extensions'].values()) or not all(maps['functions'].values()) or not value['runtime_account_ok'] or tuple(map(int,value['php_version'].split('.',2)[:2]))<(8,2)
+            expected=not all(maps['extensions'].values()) or not all(maps['functions'].values()) or not value['runtime_account_ok'] or not php_security(value['php_version'])['ok']
             if value['ok'] is expected or (response.status==200)!=value['ok']:continue
             return {'available':True,'ok':value['ok'],'php_version':value['php_version'],'php_sapi':value['php_sapi'],
                     'runtime_account_ok':value['runtime_account_ok'],'extensions':maps['extensions'],'functions':maps['functions']}

@@ -6,7 +6,7 @@ downloaded public key. Module signatures and publisher verification are separate
 this procedure changes publisher authority, not the existing local module signer.
 
 Verify a first installer before execution using [trusted host tools](FIRST_INSTALL_VERIFICATION.md).
-Published releases are immutable: a corrected package uses a newer version.
+The release policy for new versions is immutable publication: use a newer version for corrections. Earlier beta assets, including 0.1.7, were mutable. Enable GitHub release immutability before publishing the next release; the provenance workflow refuses a mutable release.
 Installed identity includes its authenticated inventory digest. The protected
 updater does not replace equal versions.
 

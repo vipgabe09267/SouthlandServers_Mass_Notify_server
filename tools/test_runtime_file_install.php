@@ -81,6 +81,9 @@ try {
             if (is_file($helper)) {
                 $target = $root . '/runtime/' . basename($helper);
                 runtime_install_assert(is_file($target) && hash_file('sha256', $helper) === hash_file('sha256', $target), $phase . ' nested helper omitted or changed: ' . basename($helper));
+                if (in_array(basename($helper), ['sls_piper_worker.py', 'sls_desktop_history.py', 'sls_desktop_feed_cache.py', 'sls_php_security.py'], true)) {
+                    runtime_install_assert((fileperms($target) & 0777) === 0755, $phase . ' executable helper lost its required mode: ' . basename($helper));
+                }
             }
         }
         foreach (['sipnotify', 'sls-mass-notify'] as $api) {

@@ -135,6 +135,96 @@ class UpgradeTrustTests(unittest.TestCase):
         for name, body in self.preserved.items(): self.assertEqual((self.data / name).read_bytes(), body)
         self.assertFalse(self.args.trust_root.exists())
 
+    def seed_current_stock_cache(self):
+        self.prepare()
+        self.trust.enroll_sls(self.args.trust_root,*self.previous)
+        for module in ('dashboard','framework'):
+            data=json.loads((self.workspace/(module+'.json')).read_bytes())
+            if module=='dashboard':
+                for name in self.upgrade.WIDGETS:data['files'][name]['sha256']=self.trust.digest(self.old['dashboard/'+name])
+            body=json.dumps(data).encode();self.trust.store_manifest(self.args.trust_root,data,body)
+        self.upgrade.cache_stock_packages(self.workspace,self.args.trust_root)
+
+    def next_framework(self,extra=None):
+        contents=dict(self.stock['framework']);contents['module.xml']=b'<module><rawname>framework</rawname><version>17.0.6</version></module>'
+        contents.update(extra or {'amp_conf/htdocs/admin/i18n/amp.pot':b'independently signed new translations'})
+        plain=self.root/'framework-next.tgz';package(plain,'framework',contents)
+        signed=self.offline/'framework-17.0.6.tgz.gpg'
+        subprocess.run(self.gpg_command+['--output',str(signed),'--sign',str(plain)],check=True,capture_output=True,timeout=20)
+        for name,body in contents.items():
+            if not self.upgrade.deployed_framework(name):continue
+            target=self.web/(name[16:] if name.startswith('amp_conf/htdocs/') else 'admin/modules/framework/'+name)
+            target.parent.mkdir(parents=True,exist_ok=True)
+            target.write_bytes(self.upgrade.menu_overlay(body) if name==self.upgrade.MENU_NAME else body)
+        return signed
+
+    def test_stock_reconciliation_accepts_signed_new_version_and_retains_offline_evidence(self):
+        self.seed_current_stock_cache();self.next_framework()
+        review=self.root/'stock-review'
+        result=self.upgrade.reconcile_stock(review,self.args.trust_root,web=self.web,packages=self.offline)
+        self.assertEqual(result['changed_modules'],['framework']);self.assertFalse(result['network_allowed'])
+        self.assertEqual(self.trust.load(self.args.trust_root,'framework')[0]['version'],'17.0.6')
+        self.trust.check(self.args.trust_root,'framework',self.web)
+        self.assertTrue((self.args.trust_root/'stock-packages/framework-17.0.6.tgz.gpg').is_file())
+        again=self.upgrade.reconcile_stock(self.root/'stock-review-again',self.args.trust_root,web=self.web)
+        self.assertEqual(again['changed_modules'],[])
+        for name,body in self.preserved.items():self.assertEqual((self.data/name).read_bytes(),body)
+
+    def test_stock_reconciliation_restores_a_pointer_when_enrollment_fails_after_publication(self):
+        self.seed_current_stock_cache();self.next_framework()
+        pointers={module:(self.args.trust_root/(module+'.active.json')).read_bytes() for module in ('dashboard','framework')}
+        original=self.upgrade.TRUST.enroll_reviewed
+        def interrupted(root,path,digest):
+            original(root,path,digest)
+            if Path(path).name=='framework.json':raise OSError('fixture post-publication durability failure')
+        with patch.object(self.upgrade.TRUST,'enroll_reviewed',side_effect=interrupted):
+            with self.assertRaises(OSError):self.upgrade.reconcile_stock(self.root/'interrupted-stock',self.args.trust_root,web=self.web,packages=self.offline)
+        for module,body in pointers.items():self.assertEqual((self.args.trust_root/(module+'.active.json')).read_bytes(),body)
+        retry=self.upgrade.reconcile_stock(self.root/'retry-stock',self.args.trust_root,web=self.web)
+        self.assertEqual(retry['changed_modules'],['framework'])
+        for name,body in self.preserved.items():self.assertEqual((self.data/name).read_bytes(),body)
+
+    def test_stock_cache_refuses_a_dangling_approval_pointer_without_retiring_packages(self):
+        self.seed_current_stock_cache()
+        folder=self.args.trust_root/'stock-packages';before={p.name:p.read_bytes() for p in folder.iterdir()}
+        pointer=self.args.trust_root/'framework.active.json';pointer.unlink();pointer.symlink_to('missing-reference.json')
+        with self.assertRaises(Exception):self.upgrade.cache_stock_packages(self.workspace,self.args.trust_root)
+        self.assertEqual({p.name:p.read_bytes() for p in folder.iterdir()},before)
+
+    def test_stock_reconciliation_refuses_unknown_bytes_and_missing_offline_package(self):
+        self.seed_current_stock_cache();self.next_framework()
+        pointers={module:(self.args.trust_root/(module+'.active.json')).read_bytes() for module in ('dashboard','framework')}
+        with self.assertRaisesRegex(self.upgrade.UpgradeError,'verified local'):
+            self.upgrade.reconcile_stock(self.root/'no-package',self.args.trust_root,web=self.web)
+        (self.web/'admin/modules/framework/install.php').write_bytes(b'unreviewed local change')
+        with self.assertRaisesRegex(self.upgrade.UpgradeError,'Unreviewed'):
+            self.upgrade.reconcile_stock(self.root/'unknown-stock',self.args.trust_root,web=self.web,packages=self.offline)
+        for module,body in pointers.items():self.assertEqual((self.args.trust_root/(module+'.active.json')).read_bytes(),body)
+
+    def test_stock_reconciliation_carries_only_reviewed_unchanged_upstream_overlays(self):
+        old={'files':{'a':{'sha256':'approved-local','target':'a'}}}
+        base={'files':{'a':{'sha256':'signed-base','target':'a'}}}
+        current={'files':{'a':{'sha256':'signed-base','target':'a'}}}
+        self.upgrade.carry_reviewed_overlays(old,base,current)
+        self.assertEqual(current['files']['a'],old['files']['a'])
+        with self.assertRaisesRegex(self.upgrade.UpgradeError,'intersects changed upstream'):
+            self.upgrade.carry_reviewed_overlays(old,base,{'files':{'a':{'sha256':'changed-signed-base','target':'a'}}})
+
+    def test_reconciliation_lock_keeps_inode_and_accepts_only_verified_inherited_description(self):
+        import os
+        path=self.root/'maintenance.lock';lock=self.upgrade.coordination_lock(path)
+        try:
+            inode=path.stat().st_ino
+            with self.assertRaisesRegex(self.upgrade.UpgradeError,'maintenance is active'):self.upgrade.coordination_lock(path)
+            inherited=self.upgrade.coordination_lock(path,lock);os.close(inherited)
+            self.assertEqual(path.stat().st_ino,inode)
+            other=self.root/'other.lock';other.write_bytes(b'');other.chmod(0o600)
+            descriptor=os.open(other,os.O_RDWR)
+            try:
+                with self.assertRaisesRegex(self.upgrade.UpgradeError,'lock changed'):self.upgrade.coordination_lock(path,descriptor)
+            finally:os.close(descriptor)
+        finally:os.close(lock)
+
     def test_absent_trust_signed_previous_overlays_and_mappings_bootstrap_without_mutation(self):
         self.prepare(); self.assert_preserved()
         approved = json.loads((self.workspace / 'approvals.json').read_bytes())

@@ -57,7 +57,7 @@ try{
             ['name'=>'Off-site','after_seconds'=>120,'delivery'=>['extensions'=>['2000']]]]]]);
     $shifted=IncidentConfig::template(['id'=>'tpl_'.str_repeat('c',24),'name'=>'Shifted fixture','title'=>'Shift','message'=>'No','delivery'=>['extensions'=>['1000']]]);
     $operations=EnterpriseOperationsConfig::defaults();$operations['enabled']=true;
-    $fixture->settings=['control_api'=>['enabled'=>true,'credentials'=>[$issued['credential'],$readOnly['credential']]],
+    $fixture->settings=['enterprise_labs'=>['enabled'=>true],'control_api'=>['enabled'=>true,'credentials'=>[$issued['credential'],$readOnly['credential']]],
         'incident_workflows'=>['schema'=>1,'templates'=>[$template,$offsite,$shifted]],'enterprise_operations'=>$operations];
     $principal=ApiSecurity::authenticate($fixture->settings['control_api'],$issued['secret']);$GLOBALS['sls_control_principal']=$principal;
     $listing=$fixture->enterpriseControlTemplates($principal);
